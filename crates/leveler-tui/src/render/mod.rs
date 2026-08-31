@@ -1262,7 +1262,7 @@ mod tests {
         // A user turn suppresses the splash card so only overlay chrome remains.
         s.transcript.push_user("推送一下".into());
         let text = render_text(&mut s, 80, 30);
-        assert!(text.contains("等待授权"), "{text}");
+        assert!(text.contains("等待审批"), "{text}");
         assert!(text.contains("拒绝"), "{text}");
         assert!(text.contains("git push"), "{text}");
         // The overlay takes the composer's slot: no composer prompt on screen.

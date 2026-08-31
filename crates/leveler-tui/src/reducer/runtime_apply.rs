@@ -563,9 +563,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 label
             };
-            state
-                .background_task_labels
-                .insert(task_id.clone(), label.clone());
+            state.background_task_labels.insert(
+                task_id.clone(),
+                crate::state::BackgroundTaskChrome {
+                    label: label.clone(),
+                    started_elapsed_secs: state.elapsed_secs,
+                },
+            );
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
                 message: state.t().background_task_started.replace("{}", &label),
@@ -597,6 +601,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let label = state
                 .background_task_labels
                 .remove(&task_id)
+                .map(|chrome| chrome.label)
                 .unwrap_or_else(|| t.background_task_generic.to_string());
             let message = if ok {
                 t.background_task_done.replace("{}", &label)

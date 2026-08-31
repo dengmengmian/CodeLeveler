@@ -323,7 +323,7 @@ mod tests {
             }),
         )));
         let mut p = TerminalTitleProjection::default();
-        assert_eq!(p.project(&state), "! Task · 等待授权");
+        assert_eq!(p.project(&state), "! Task · 等待审批");
     }
 
     #[test]
@@ -371,9 +371,13 @@ mod tests {
         let mut state = test_state();
         state.transcript.push_user("Task".to_string());
         state.status = RuntimeStatus::Idle;
-        state
-            .background_task_labels
-            .insert("bg-1".into(), "cargo test".into());
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            crate::state::BackgroundTaskChrome {
+                label: "cargo test".into(),
+                started_elapsed_secs: 0,
+            },
+        );
         let mut p = TerminalTitleProjection::default();
         assert_eq!(p.project(&state), "◌ Task · 等待后台任务");
     }

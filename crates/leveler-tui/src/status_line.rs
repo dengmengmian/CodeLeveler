@@ -332,27 +332,37 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
     }
 }
 
+/// First status-strip row. Prefer [`status_lines`] when the wait disclosure
+/// may occupy more than one row.
 pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'static> {
+    status_lines(state, width)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Line::from(""))
+}
+
+/// Status strip: one headline, then a compact disclosure of the wait target.
+pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     // Phase first: never paint a busy spinner while blocked on the user.
     match status_phase(state) {
         StatusPhase::AwaitingUser => {
             if let Some(overlay) = &state.overlay {
                 if matches!(overlay, crate::overlay::Overlay::Clarification(_)) {
-                    return turn_marker(
+                    return vec![turn_marker(
                         state.t().waiting_reply.to_string(),
                         theme.accent.primary,
                         width,
                         state,
-                    );
+                    )];
                 }
                 // Interrupting overlays: static waiting copy, no spinner.
                 // Pickers return None and fall through to the normal strip.
                 if let Some(hint) = overlay.status_hint(state.t()) {
-                    return Line::from(Span::styled(
+                    return vec![Line::from(Span::styled(
                         hint,
                         Style::default().fg(theme.status.warning),
-                    ));
+                    ))];
                 }
             }
         }
@@ -361,61 +371,121 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
     // Notifications are floating toasts in the workbench; never put them in
     // the layout status strip (that reflows Conversation under a selection).
     match state.status {
-        RuntimeStatus::Busy => {
-            let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
-            let t = state.t();
-            let label = state
-                .activity
-                .clone()
-                .unwrap_or_else(|| t.waiting_model.to_string());
-            let turn_mode = if state.goal_mode_active {
-                format!("{} · ", t.goal_mode)
-            } else {
-                String::new()
-            };
-            let mut parts = vec![
-                format!("{frame} {turn_mode}{label}"),
-                fmt_elapsed(state.elapsed_secs),
-            ];
-            // Totals are only reported when a round ENDS, so on their own they
-            // freeze for the whole of the next round. Show them, then always
-            // append the live estimate for the round in flight — that is the
-            // only number that moves while the model is thinking.
-            if state.token_input > 0 || state.token_output > 0 {
-                parts.push(format!(
-                    "↑{} ↓{}",
-                    fmt_tokens(state.token_input),
-                    fmt_tokens(state.token_output)
-                ));
-            }
-            if let Some(est) = streaming_output_estimate(state) {
-                parts.push(format!("↓~{}", fmt_tokens(est)));
-            }
-            let text = fit_status(&parts, width);
-            // Give the moving spinner glyph an accent color so "still working"
-            // reads at a glance; keep the rest of the line low-key.
-            let rest = text.strip_prefix(frame).unwrap_or(&text);
-            Line::from(vec![
-                Span::styled(
-                    frame.to_string(),
-                    Style::default()
-                        .fg(theme.accent.primary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
-            ])
-        }
+        RuntimeStatus::Busy => busy_status_lines(state, width),
         RuntimeStatus::Error | RuntimeStatus::Idle => {
             if let Some(label) = &state.activity {
-                Line::from(Span::styled(
+                vec![Line::from(Span::styled(
                     format!("… {label}"),
                     Style::default().fg(theme.text.secondary),
-                ))
+                ))]
             } else {
-                Line::from("")
+                vec![Line::from("")]
             }
         }
     }
+}
+
+const WAIT_MARKER: &str = "◌";
+
+fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let theme = &state.theme;
+    let t = state.t();
+    let wait = crate::wait_status::project(state);
+    if let Some(view) = wait.as_ref()
+        && !matches!(
+            view.kind,
+            crate::wait_status::WaitKind::Model | crate::wait_status::WaitKind::Approval
+        )
+    {
+        return blocked_wait_lines(state, view, width);
+    }
+
+    let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
+    let label = match wait.as_ref() {
+        Some(view) if view.kind == crate::wait_status::WaitKind::Model => {
+            t.waiting_model.to_string()
+        }
+        _ => state
+            .activity
+            .clone()
+            .unwrap_or_else(|| t.waiting_model.to_string()),
+    };
+    let turn_mode = if state.goal_mode_active {
+        format!("{} · ", t.goal_mode)
+    } else {
+        String::new()
+    };
+    let mut parts = vec![
+        format!("{frame} {turn_mode}{label}"),
+        fmt_elapsed(state.elapsed_secs),
+    ];
+    // Totals are only reported when a round ENDS, so on their own they
+    // freeze for the whole of the next round. Show them, then always
+    // append the live estimate for the round in flight — that is the
+    // only number that moves while the model is thinking.
+    if state.token_input > 0 || state.token_output > 0 {
+        parts.push(format!(
+            "↑{} ↓{}",
+            fmt_tokens(state.token_input),
+            fmt_tokens(state.token_output)
+        ));
+    }
+    if let Some(est) = streaming_output_estimate(state) {
+        parts.push(format!("↓~{}", fmt_tokens(est)));
+    }
+    let text = fit_status(&parts, width);
+    let rest = text.strip_prefix(frame).unwrap_or(&text);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            frame.to_string(),
+            Style::default()
+                .fg(theme.accent.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
+    ])];
+    let leftover = crate::wait_status::non_blocking_background_count(state);
+    if leftover > 0 {
+        let note = t
+            .background_still_running
+            .replace("{}", &leftover.to_string());
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&format!("  └─ {note}"), width),
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    lines
+}
+
+fn blocked_wait_lines(
+    state: &AppState,
+    view: &crate::wait_status::WaitView,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let theme = &state.theme;
+    let t = state.t();
+    let turn_mode = if state.goal_mode_active {
+        format!("{} · ", t.goal_mode)
+    } else {
+        String::new()
+    };
+    let headline = crate::wait_status::headline(view, t);
+    let text = truncate_to_width(&format!("{WAIT_MARKER} {turn_mode}{headline}"), width);
+    let rest = text.strip_prefix(WAIT_MARKER).unwrap_or(&text);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            WAIT_MARKER.to_string(),
+            Style::default().fg(theme.accent.primary),
+        ),
+        Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
+    ])];
+    for row in crate::wait_status::disclosure_plain(view, t, width) {
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&row, width),
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    lines
 }
 
 /// Sparse top chrome: `⑂ branch · ~/path` only. Trust signals sit by the
@@ -727,5 +797,67 @@ mod tests {
             status.contains('~'),
             "a live round must show a live estimate, not only frozen totals: {status}"
         );
+    }
+
+    fn status_text(state: &AppState) -> String {
+        status_lines(state, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn status_strip_names_a_background_wait_and_its_target() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.elapsed_secs = 54;
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 10,
+            },
+        );
+        state.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({ "task_id": "bg-2" }).to_string(),
+            false,
+            12,
+        );
+        state.activity = Some("等待任务".into());
+        let text = status_text(&state);
+        assert!(text.contains("等待后台任务"), "{text}");
+        assert!(text.contains("cargo test --workspace"), "{text}");
+        assert!(text.contains("运行中"), "{text}");
+        assert!(text.contains(WAIT_MARKER), "{text}");
+        for line in text.lines() {
+            if line.contains("等待任务") {
+                assert!(line.contains("等待后台任务"), "{text}");
+            }
+        }
+        assert!(!text.contains("可能卡住"), "{text}");
+        assert!(!text.contains("最近活动"), "{text}");
+    }
+
+    #[test]
+    fn status_strip_does_not_treat_background_as_a_main_wait() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.activity = Some("正在汇总审计结果".into());
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+            },
+        );
+        let text = status_text(&state);
+        assert!(text.contains("正在汇总审计结果"), "{text}");
+        assert!(text.contains("后台仍有 1 个任务运行"), "{text}");
+        assert!(!text.contains("等待后台任务"), "{text}");
     }
 }

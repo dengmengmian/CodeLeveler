@@ -197,8 +197,8 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "wait_task",
         kind: ToolKind::Execute,
-        presentation_en: "Wait Task",
-        presentation_zh: "等待任务",
+        presentation_en: "Waiting for background task",
+        presentation_zh: "等待后台任务",
         read_only_default: true,
         visibility: ActivityVisibility::Important,
     },

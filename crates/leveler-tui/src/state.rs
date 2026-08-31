@@ -87,6 +87,17 @@ pub struct RemoteState {
     pub outcome: Option<String>,
 }
 
+/// Live background-process chrome derived from `BackgroundTaskStarted`.
+///
+/// `started_elapsed_secs` is the turn clock when the TUI applied the start
+/// event — a projection timestamp, not a process clock, and never refreshed
+/// by redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskChrome {
+    pub label: String,
+    pub started_elapsed_secs: u64,
+}
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct AppState {
@@ -102,12 +113,13 @@ pub struct AppState {
     /// start, turn end). Raw reasoning is not conversation content, and there
     /// is deliberately no historical representation of it at all.
     pub live_reasoning: String,
-    /// Background task id → human label, remembered from the task's start
-    /// event so its exit can name what finished. The exit event carries only
-    /// the id, and an opaque id is not a user-facing name. Entries are
-    /// removed on exit and cleared on session switch, so the map holds only
-    /// tasks currently in flight.
-    pub background_task_labels: std::collections::HashMap<String, String>,
+    /// Background task id → live chrome, remembered from the start event so
+    /// the status line can name what is running and its exit can name what
+    /// finished. The exit event carries only the id. Entries are removed on
+    /// exit and cleared on session switch, so the map holds only tasks
+    /// currently in flight. Presentation-only; the runtime remains the
+    /// lifecycle authority.
+    pub background_task_labels: HashMap<String, BackgroundTaskChrome>,
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
     pub team: crate::multi_agent::TaskTeamView,

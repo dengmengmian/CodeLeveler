@@ -5,7 +5,7 @@
 //!
 //! `/btw` is a floating card over the Conversation bottom — not main history.
 
-use leveler_client_protocol::{PlanStepStatus, UiPlan, UiPlanStep};
+use leveler_client_protocol::{PlanStepStatus, UiPlan};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -20,7 +20,7 @@ use crate::render::{
 };
 use crate::screen::Screen;
 use crate::state::AppState;
-use crate::status_line::status_line_content;
+use crate::status_line::status_lines;
 use crate::transcript::TranscriptItem;
 
 /// Done-count / total for a multi-step plan (`k/n`).
@@ -55,39 +55,43 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     !all_success
 }
 
-/// The step the user should look at: running, else next pending, else first failed.
-pub(crate) fn plan_current_step(plan: &UiPlan) -> Option<&UiPlanStep> {
-    plan.steps
+/// Summary after `计划`/`plan`: active item when one is actually Running,
+/// otherwise the completed count. Never claims item #1 is in progress just
+/// because nothing is done yet.
+pub(crate) fn plan_summary_label(plan: &UiPlan, t: &UiText) -> String {
+    let (done, total) = plan_done_total(plan);
+    if total == 0 {
+        return t.active_plan.to_string();
+    }
+    if let Some(step) = plan
+        .steps
         .iter()
         .find(|s| s.status == PlanStepStatus::Running)
-        .or_else(|| {
-            plan.steps
-                .iter()
-                .find(|s| s.status == PlanStepStatus::Pending)
-        })
-        .or_else(|| {
-            plan.steps
-                .iter()
-                .find(|s| s.status == PlanStepStatus::Failed)
-        })
+    {
+        t.plan_item_in_progress
+            .replace("{current}", &(step.index + 1).to_string())
+            .replace("{total}", &total.to_string())
+    } else {
+        t.plan_n_done
+            .replace("{done}", &done.to_string())
+            .replace("{total}", &total.to_string())
+    }
 }
 
-/// One-line plan chrome title. Always includes `k/n` and the current step when
-/// the plan has steps — including when the panel is collapsed — so progress is
-/// scannable from the conversation chrome.
+/// One-line plan chrome title. A Running step reads as "第 n/N 项进行中"
+/// rather than "0/N", which looked like zero progress while work was underway.
 pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, t: &UiText) -> String {
     let disclosure = if collapsed { "▶" } else { "▼" };
-    let (k, n) = plan_done_total(plan);
-    let mut title = format!("{disclosure} {} {k}/{n}", t.active_plan);
-    if let Some(step) = plan_current_step(plan) {
-        let desc = step.description.trim();
-        if !desc.is_empty() {
-            // No "N. " here: the expanded list numbers every step, so the
-            // title would repeat the row directly under it verbatim.
-            title.push_str(&format!(" · {desc}"));
-        }
+    let summary = plan_summary_label(plan, t);
+    if plan
+        .steps
+        .iter()
+        .any(|s| s.status == PlanStepStatus::Running)
+    {
+        format!("{disclosure} {} · {summary}", t.active_plan)
+    } else {
+        format!("{disclosure} {} {summary}", t.active_plan)
     }
-    title
 }
 
 /// Paint the conversation workbench into `frame`.
@@ -131,13 +135,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Notifications are painted as a floating toast (see
     // `render_notification_toast`) so they never grow this strip and reflow
     // the Conversation under a live text selection / copy.
-    let status_line = status_line_content(state, area.width as usize);
-    let status_rows: u16 = if status_line
-        .spans
+    let status_block = status_lines(state, area.width as usize);
+    let status_rows: u16 = if status_block
         .iter()
-        .any(|span| !span.content.is_empty())
+        .any(|line| line.spans.iter().any(|span| !span.content.is_empty()))
     {
-        1
+        status_block.len().min(5) as u16
     } else {
         0
     };
@@ -190,7 +193,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     // chunks[2] = gap (leave blank)
     if status_rows > 0 {
-        frame.render_widget(Paragraph::new(status_line), chunks[3]);
+        frame.render_widget(Paragraph::new(status_block), chunks[3]);
     }
     render_plan_panel(frame, chunks[4], state);
     render_attachments(frame, chunks[5], state);
@@ -1642,10 +1645,13 @@ mod tests {
         let t = crate::i18n::Locale::Zh.text();
         let title = plan_chrome_title(&sample_plan(), false, t);
         assert!(title.starts_with('▼'), "{title}");
-        assert!(title.contains("1/3"), "done/total: {title}");
         assert!(
-            title.contains("edit module"),
-            "current running step: {title}"
+            title.contains("第 2/3 项进行中"),
+            "running item, not a zero-progress fraction: {title}"
+        );
+        assert!(
+            !title.contains("edit module"),
+            "the numbered list under the header already carries the description: {title}"
         );
         assert!(
             !title.contains("2."),
@@ -2048,8 +2054,42 @@ mod tests {
         let t = crate::i18n::Locale::Zh.text();
         let title = plan_chrome_title(&sample_plan(), true, t);
         assert!(title.starts_with('▶'), "{title}");
-        assert!(title.contains("1/3"), "{title}");
-        assert!(title.contains("edit module"), "{title}");
+        assert!(title.contains("第 2/3 项进行中"), "{title}");
+    }
+
+    #[test]
+    fn plan_chrome_does_not_fabricate_an_active_item() {
+        let t = crate::i18n::Locale::Zh.text();
+        let plan = UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "侦察仓库结构".into(),
+                    status: PlanStepStatus::Pending,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "验证构建".into(),
+                    status: PlanStepStatus::Pending,
+                },
+                UiPlanStep {
+                    index: 2,
+                    description: "深挖发布流程".into(),
+                    status: PlanStepStatus::Pending,
+                },
+                UiPlanStep {
+                    index: 3,
+                    description: "综合证据".into(),
+                    status: PlanStepStatus::Pending,
+                },
+            ],
+        };
+        let title = plan_chrome_title(&plan, true, t);
+        assert!(title.contains("0/4 完成"), "{title}");
+        assert!(
+            !title.contains("进行中"),
+            "pending is not in-progress: {title}"
+        );
     }
 
     #[test]
@@ -2070,8 +2110,15 @@ mod tests {
             ],
         };
         let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("1/2"), "{title}");
-        assert!(title.contains("next work"), "{title}");
+        assert!(title.contains("1/2 done"), "{title}");
+        assert!(
+            !title.contains("in progress"),
+            "a pending step is not claimed as active: {title}"
+        );
+        assert!(
+            !title.contains("next work"),
+            "do not promote the next pending description to the title: {title}"
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub mod tool_taxonomy;
 pub mod transcript;
 pub mod unfinished_goals;
 mod url_link;
+mod wait_status;
 mod workbench;
 
 mod run;
