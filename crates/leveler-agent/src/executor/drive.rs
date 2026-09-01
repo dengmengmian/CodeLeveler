@@ -1871,6 +1871,10 @@ impl Executor {
                             let mut rejected_not_accounted = 0usize;
                             let mut rejected_missing_evidence = 0usize;
                             let mut rejected_blocked = 0usize;
+                            // F6: obligations whose declared mechanical
+                            // condition the runtime's own record refutes,
+                            // after the judge accounted for them as satisfied.
+                            let mut rejected_mechanical_violation = 0usize;
                             let open_obligations: Vec<String> = match completion_contract.as_ref() {
                                 None => vec![
                                     "the completion contract could not be established, so no \
@@ -1913,13 +1917,27 @@ impl Executor {
                                         }
                                     }
                                     let open = accounted.open_detail(&ledger);
-                                    for (_, _, why) in &open {
+                                    for (id, _, why) in &open {
                                         match why {
                                             leveler_lifecycle::OpenReason::NotAccountedFor => {
                                                 rejected_not_accounted += 1
                                             }
                                             leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
                                                 rejected_missing_evidence += 1
+                                            }
+                                            leveler_lifecycle::OpenReason::MechanicalConstraintViolation => {
+                                                rejected_mechanical_violation += 1;
+                                                // The judge said this
+                                                // obligation held and the
+                                                // record says it does not. A
+                                                // reading contradicted by a
+                                                // fact is its own event, not
+                                                // another unfinished item.
+                                                tracing::warn!(
+                                                    requirement_id = %id,
+                                                    policy = "mutation_scope",
+                                                    "judge result conflicted with mechanical fact"
+                                                );
                                             }
                                             leveler_lifecycle::OpenReason::Blocked => {
                                                 rejected_blocked += 1
@@ -1935,6 +1953,9 @@ impl Executor {
                                                 }
                                                 leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
                                                     "no check demonstrates it over the current tree"
+                                                }
+                                                leveler_lifecycle::OpenReason::MechanicalConstraintViolation => {
+                                                    "the runtime's own record of this run says this condition does not hold"
                                                 }
                                                 leveler_lifecycle::OpenReason::Blocked => "blocked",
                                             };
@@ -1968,6 +1989,8 @@ impl Executor {
                                 rejected_not_accounted,
                                 rejected_missing_evidence,
                                 rejected_blocked,
+                                reconciliation_mechanical_conflict_count =
+                                    rejected_mechanical_violation,
                                 omitted = omitted.len(),
                                 "completion contract gate"
                             );

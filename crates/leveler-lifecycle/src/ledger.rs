@@ -731,6 +731,9 @@ impl EvidenceLedger {
                         crate::OpenReason::MissingMechanicalEvidence => {
                             "no check demonstrates it over the current tree"
                         }
+                        crate::OpenReason::MechanicalConstraintViolation => {
+                            "the runtime's own record says this condition does not hold"
+                        }
                         crate::OpenReason::Blocked => "blocked",
                     };
                     format!("{} ({}) — {}", r.id, r.text, why)
@@ -783,6 +786,53 @@ mod completion_debt_tests {
         };
         let debt = ledger.completion_debt().expect("open obligation is debt");
         assert!(debt.contains("R1"), "the debt names what is owed: {debt}");
+    }
+
+    /// F6 at the terminal boundary: a violated file scope is debt at whatever
+    /// door the run leaves by, forced closeout included. The boundary asks
+    /// this one predicate, so a mechanically refuted obligation cannot be
+    /// walked past by ending the run some other way.
+    #[test]
+    fn a_violated_scope_is_debt_at_the_terminal_boundary() {
+        let mut ledger = EvidenceLedger {
+            completion_contract: Some(CompletionContract::new(vec![CompletionRequirement {
+                id: "R_SCOPE".into(),
+                text: "no files outside internal/window may be modified".into(),
+                kind: RequirementKind::Constraint,
+                source: RequirementSource::OriginalGoal,
+                // The judge already accounted for it as satisfied.
+                status: RequirementStatus::Satisfied,
+                evidence_policy: Some(crate::EvidencePolicy::MutationScope {
+                    allowed_paths: vec!["internal/window".into()],
+                }),
+                evidence: Vec::new(),
+                acceptance_facets: Vec::new(),
+            }])),
+            ..Default::default()
+        };
+        ledger.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        assert_eq!(
+            ledger.completion_debt(),
+            None,
+            "in-scope work owes nothing at the boundary either"
+        );
+        ledger.record_mutation(
+            "c2",
+            "apply_patch",
+            vec!["cmd/telemetryd/testdata/boundary_events.txt".into()],
+        );
+        let debt = ledger
+            .completion_debt()
+            .expect("a scope the record refutes is debt");
+        assert!(debt.contains("R_SCOPE"), "{debt}");
+        assert!(
+            debt.contains("record says this condition does not hold"),
+            "the debt says the record refutes it, not that proof is missing: {debt}"
+        );
     }
 
     /// A chat turn has no obligations and owes nothing. Absence of a contract

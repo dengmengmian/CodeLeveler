@@ -8992,3 +8992,262 @@ impl ModelRuntime for CheckpointProbeRuntime {
         unimplemented!()
     }
 }
+
+/// F6, END TO END through the real outcome-application path: the judge
+/// accounts for a declared file-scope obligation as satisfied and reports no
+/// contradiction, while the ledger records a mutation outside that scope. The
+/// judge's reading is not what settles a mechanically decided condition, so
+/// the completion is refused and the obligation is named.
+///
+/// This is `scale-s800` Run 07's grounding failure, reduced to something
+/// deterministic: no live model, a fixed parsed verdict, and the runtime's own
+/// mutation record as the only other input.
+#[tokio::test]
+async fn a_judge_cannot_complete_a_run_that_broke_a_declared_file_scope() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f6-scope-violated-{}",
+        std::process::id() as u64 * 97 + 5
+    ));
+    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
+    std::fs::create_dir_all(dir.join("cmd/telemetryd/testdata")).unwrap();
+    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
+    std::fs::write(
+        dir.join("cmd/telemetryd/testdata/boundary_events.txt"),
+        "old\n",
+    )
+    .unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R_SCOPE".into(),
+            text: "no files outside internal/window may be modified".into(),
+            kind: leveler_lifecycle::RequirementKind::Constraint,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: Some(leveler_lifecycle::EvidencePolicy::MutationScope {
+                allowed_paths: vec!["internal/window".into()],
+            }),
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window.go\n-old\n+new\n*** End Patch"}),
+        ),
+        assistant_tool_call(
+            "c2",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: cmd/telemetryd/testdata/boundary_events.txt\n-old\n+new\n*** End Patch"}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "fixed the window boundary"}),
+        ),
+        // The Run 07 shape: a confident account of a scope the record refutes,
+        // and not one contradiction reported.
+        assistant_text(
+            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R_SCOPE","satisfied":true,"evidence":"only window.go and test files were modified","evidence_strength":"mechanical"}
+                ],
+                "reason":"the change is contained"}"#,
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "touched a file outside the scope"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "fix the window boundary rule; do not modify files outside internal/window",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a scope the record says was broken cannot be judged satisfied"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, is_error: true, preview, .. }
+                if id == "g1" && preview.contains("R_SCOPE")
+        )),
+        "the refusal names the obligation the record refutes: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The positive control for the same path: identical obligation, identical
+/// judgment, and every mutation inside the scope the user allowed. The guard
+/// must not cost an honest run its completion.
+#[tokio::test]
+async fn a_run_that_stayed_inside_its_declared_scope_still_completes() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f6-scope-clean-{}",
+        std::process::id() as u64 * 97 + 7
+    ));
+    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
+    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
+    std::fs::write(dir.join("internal/window/window_test.go"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R_SCOPE".into(),
+            text: "no files outside internal/window may be modified".into(),
+            kind: leveler_lifecycle::RequirementKind::Constraint,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: Some(leveler_lifecycle::EvidencePolicy::MutationScope {
+                allowed_paths: vec!["internal/window".into()],
+            }),
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window.go\n-old\n+new\n*** End Patch"}),
+        ),
+        assistant_tool_call(
+            "c2",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window_test.go\n-old\n+new\n*** End Patch"}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "fixed the window boundary"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R_SCOPE","satisfied":true,"evidence":"only files under internal/window changed","evidence_strength":"mechanical"}
+                ],
+                "reason":"the change is contained"}"#,
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "fix the window boundary rule; do not modify files outside internal/window",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "work that respected the scope completes: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A behavioural constraint keeps its old meaning. "Nothing else about the
+/// report changes" carries no scope, so the run's mutations are none of the
+/// guard's business and the semantic judgment stands — the Run 07 task itself
+/// must not become retroactively unsatisfiable.
+#[tokio::test]
+async fn a_behavioural_constraint_is_still_settled_semantically() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f6-behavioural-{}",
+        std::process::id() as u64 * 97 + 9
+    ));
+    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
+    std::fs::create_dir_all(dir.join("cmd/telemetryd/testdata")).unwrap();
+    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
+    std::fs::write(
+        dir.join("cmd/telemetryd/testdata/boundary_events.txt"),
+        "old\n",
+    )
+    .unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "nothing else about the report changes".into(),
+            kind: leveler_lifecycle::RequirementKind::Constraint,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: cmd/telemetryd/testdata/boundary_events.txt\n-old\n+new\n*** End Patch"}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "boundary events regenerated"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,"evidence":"the report's other columns are unchanged","evidence_strength":"observed"}
+                ],
+                "reason":"nothing else about the report moved"}"#,
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "regenerate the boundary events; nothing else about the report changes",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a behavioural constraint is not a file-scope restriction: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

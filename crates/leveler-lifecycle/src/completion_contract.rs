@@ -162,10 +162,80 @@ pub enum EvidencePolicy {
     /// the required case exists, and a cited test that never ran proves
     /// nothing about whether it passes.
     TestCoverage,
+    /// The run may not have modified anything outside these paths. Decided by
+    /// the runtime against its own mutation record — no reading of the work is
+    /// involved, and the judge's account of which files it touched is not
+    /// consulted.
+    ///
+    /// This is the only obligation whose truth the runtime already knows
+    /// completely, which is why it stopped being the judge's to state: a
+    /// reconciliation that named `window.go and test files` while the ledger
+    /// held a third path outside them reported no contradiction at all
+    /// (scale-s800 Run 07). Nothing about that reading was checkable, so the
+    /// obligation is now answered from the record instead.
+    ///
+    /// The paths are what the derivation read out of the user's own wording,
+    /// frozen with the contract. An entry names a file or a directory, always
+    /// repo-relative; a mutated path is inside the scope when it equals an
+    /// entry or sits under one.
+    MutationScope {
+        /// Normalized repo-relative paths the work may touch. Empty is not
+        /// "anything goes" — see [`super::CompletionContract`]'s fail-closed
+        /// rule: a scope that permits nothing can never be discharged.
+        allowed_paths: Vec<String>,
+    },
     /// The proof standard could not be determined. Fails closed — guessing
     /// "any green check" here is exactly how a missing test gets waved
     /// through.
     Unresolved,
+}
+
+/// Whether the run's mutations stayed inside a declared scope.
+///
+/// The authoritative fact is [`EvidenceLedger::mutations`]: every path this run
+/// mutated, first touch, in the order the work happened. That — not a final
+/// workspace diff — is what the constraint means here, and it is the same set
+/// the judge was shown. A file that was edited and later edited back was still
+/// modified by this run, and the runtime has no other authoritative path-set to
+/// appeal to.
+///
+/// Fails closed in both directions that matter: an empty scope permits nothing,
+/// and a path the runtime cannot read as repo-relative (absolute, or climbing
+/// out with `..`) counts as outside rather than being waved through.
+pub fn mutations_outside_scope(allowed_paths: &[String], ledger: &EvidenceLedger) -> Vec<String> {
+    let allowed: Vec<String> = allowed_paths
+        .iter()
+        .map(|p| normalize_scope_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut outside = Vec::new();
+    for path in ledger.mutations.iter().flat_map(|m| m.paths.iter()) {
+        let candidate = normalize_scope_path(path);
+        let escapes = candidate.is_empty()
+            || path.starts_with('/')
+            || candidate.split('/').any(|part| part == "..");
+        let inside = !escapes
+            && allowed
+                .iter()
+                .any(|a| candidate == *a || candidate.starts_with(&format!("{a}/")));
+        if !inside && !outside.iter().any(|p| p == path) {
+            outside.push(path.clone());
+        }
+    }
+    outside
+}
+
+/// One spelling for a path so a scope written `./internal/window/` and a
+/// mutation recorded `internal/window/window.go` are comparable. Only shape is
+/// touched — no resolution, no filesystem, no guessing at what was meant.
+fn normalize_scope_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('`')
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +260,10 @@ pub enum OpenReason {
     /// Claimed satisfied, but a demonstrable obligation with nothing that
     /// demonstrates it over the tree as it stands.
     MissingMechanicalEvidence,
+    /// Claimed satisfied, and the runtime's own record says the mechanical
+    /// condition the obligation declares does not hold. Distinct from missing
+    /// evidence: nothing is missing, the fact is present and it disagrees.
+    MechanicalConstraintViolation,
 }
 
 /// The material obligations of one goal, derived once and carried for its
@@ -349,9 +423,31 @@ fn open_reason_for(
         RequirementStatus::Blocked => Some(OpenReason::Blocked),
         RequirementStatus::Pending => Some(OpenReason::NotAccountedFor),
         RequirementStatus::Satisfied if !discharged(kind, status, policy, evidence, ledger) => {
-            Some(OpenReason::MissingMechanicalEvidence)
+            // Two different failures wear the same "still open" label
+            // otherwise, and they need different words: one obligation is
+            // waiting for proof that does not exist yet, the other is
+            // contradicted by proof that does.
+            Some(if mechanically_refuted(policy, ledger) {
+                OpenReason::MechanicalConstraintViolation
+            } else {
+                OpenReason::MissingMechanicalEvidence
+            })
         }
         RequirementStatus::Satisfied => None,
+    }
+}
+
+/// Whether the runtime's own record refutes a mechanically decided obligation.
+///
+/// Not "is there no evidence" — "is there evidence, and does it say no". A
+/// scope that permits nothing counts: the runtime cannot evaluate it into a
+/// pass, and an unevaluatable mechanical condition fails closed.
+fn mechanically_refuted(policy: Option<&EvidencePolicy>, ledger: &EvidenceLedger) -> bool {
+    match policy {
+        Some(EvidencePolicy::MutationScope { allowed_paths }) => {
+            allowed_paths.is_empty() || !mutations_outside_scope(allowed_paths, ledger).is_empty()
+        }
+        _ => false,
     }
 }
 
@@ -367,6 +463,15 @@ fn discharged(
 ) -> bool {
     if status != RequirementStatus::Satisfied {
         return false;
+    }
+    // A mechanically decided condition is answered by the record, whatever the
+    // obligation is otherwise about. This runs before the kind rules because
+    // the kind describes what is owed and the policy describes what settles it
+    // — and when the runtime already knows the answer, a reading of the work
+    // cannot supply a different one.
+    if let Some(EvidencePolicy::MutationScope { allowed_paths }) = policy {
+        return !allowed_paths.is_empty()
+            && mutations_outside_scope(allowed_paths, ledger).is_empty();
     }
     match kind {
         // The proof standard was fixed when the obligation was derived. Asking
@@ -393,8 +498,10 @@ fn discharged(
                     && ledger.has_fresh_successful_verify()
             }
             // No policy is not a licence. Guessing "any green check" here is
-            // precisely how a missing test gets waved through.
-            Some(EvidencePolicy::Unresolved) | None => false,
+            // precisely how a missing test gets waved through. A scope is not
+            // one either — where the work happened does not demonstrate that
+            // it works — though the check above has already settled that one.
+            Some(EvidencePolicy::MutationScope { .. } | EvidencePolicy::Unresolved) | None => false,
         },
         // Nothing changed means nothing was delivered, and the judge must still
         // have claimed mechanical backing. What proves a specific deliverable
@@ -1182,5 +1289,220 @@ mod facet_tests {
         let json = r#"{"requirements":[{"id":"R1","text":"do it","kind":"behavior","source":"original_goal","status":"pending","evidence":[]}]}"#;
         let contract: CompletionContract = serde_json::from_str(json).unwrap();
         assert!(contract.requirements[0].acceptance_facets.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mutation_scope_tests {
+    use super::*;
+    use crate::EvidenceLedger;
+
+    fn requirement(id: &str, kind: RequirementKind) -> CompletionRequirement {
+        CompletionRequirement {
+            id: id.to_string(),
+            text: format!("requirement {id}"),
+            kind,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Pending,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        }
+    }
+
+    /// Run 07's scope facts, as the runtime recorded them: the work touched
+    /// two files inside the windowing package and one outside it.
+    fn run07_mutations() -> EvidenceLedger {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        led.record_mutation(
+            "c2",
+            "apply_patch",
+            vec!["internal/window/window_test.go".into()],
+        );
+        led.record_mutation(
+            "c3",
+            "apply_patch",
+            vec!["cmd/telemetryd/testdata/boundary_events.txt".into()],
+        );
+        led
+    }
+
+    fn scope(id: &str, allowed: &[&str], status: RequirementStatus) -> CompletionRequirement {
+        let mut r = requirement(id, RequirementKind::Constraint);
+        r.text = "no files outside internal/window may be modified".into();
+        r.status = status;
+        r.evidence_policy = Some(EvidencePolicy::MutationScope {
+            allowed_paths: allowed.iter().map(|p| p.to_string()).collect(),
+        });
+        r
+    }
+
+    /// F6, THE MATERIAL CONTRADICTION. The judge accounted for the scope
+    /// obligation as satisfied and reported no contradiction; the ledger says
+    /// a third file outside the scope was modified. The judge's reading is not
+    /// what decides this — the record is — so the obligation stays open, and
+    /// it is open for saying so, not for missing evidence.
+    #[test]
+    fn a_judge_cannot_satisfy_a_scope_the_mutations_violate() {
+        let contract = CompletionContract::new(vec![scope(
+            "R_SCOPE",
+            &["internal/window/"],
+            RequirementStatus::Satisfied,
+        )]);
+        let ledger = run07_mutations();
+        let open = contract.open_detail(&ledger);
+        assert_eq!(open.len(), 1, "the violated scope must stay open: {open:?}");
+        assert_eq!(open[0].0, "R_SCOPE");
+        assert_eq!(open[0].2, OpenReason::MechanicalConstraintViolation);
+        assert!(
+            !contract.unsatisfied_material(&ledger).is_empty(),
+            "completion is impossible while the scope is violated"
+        );
+    }
+
+    /// The positive control: the same obligation, the same judgment, and
+    /// mutations that stayed where the user allowed them. The guard must not
+    /// refuse honest work.
+    #[test]
+    fn a_scope_the_mutations_respect_is_satisfied() {
+        let contract = CompletionContract::new(vec![scope(
+            "R_SCOPE",
+            &["internal/window/"],
+            RequirementStatus::Satisfied,
+        )]);
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        ledger.record_mutation(
+            "c2",
+            "apply_patch",
+            vec!["internal/window/window_test.go".into()],
+        );
+        assert!(contract.open_detail(&ledger).is_empty());
+        assert!(contract.unsatisfied_material(&ledger).is_empty());
+    }
+
+    /// The judge and the record agree that the scope was broken. Nothing
+    /// exotic happens: this is the ordinary unsatisfied path, and the reason
+    /// reported is the ordinary one.
+    #[test]
+    fn a_scope_the_judge_already_refused_stays_ordinary() {
+        let contract = CompletionContract::new(vec![scope(
+            "R_SCOPE",
+            &["internal/window/"],
+            RequirementStatus::Pending,
+        )]);
+        let open = contract.open_detail(&run07_mutations());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].2, OpenReason::NotAccountedFor);
+    }
+
+    /// A constraint with no mechanical policy is exactly as semantic as it was
+    /// before F6 existed. "Nothing else about the report changes" is a
+    /// behavioural sentence; the runtime has no path set to check it against
+    /// and does not invent one.
+    #[test]
+    fn a_constraint_without_a_declared_scope_stays_semantic() {
+        let mut r = requirement("R1", RequirementKind::Constraint);
+        r.text = "nothing else about the report changes".into();
+        r.status = RequirementStatus::Satisfied;
+        let contract = CompletionContract::new(vec![r]);
+        assert!(contract.open_detail(&run07_mutations()).is_empty());
+    }
+
+    /// A declared scope the runtime cannot evaluate is not a pass. An empty
+    /// allow-list permits nothing, and "permits nothing" is not "permits
+    /// everything".
+    #[test]
+    fn a_scope_that_permits_nothing_cannot_be_discharged() {
+        let contract =
+            CompletionContract::new(vec![scope("R_SCOPE", &[], RequirementStatus::Satisfied)]);
+        let open = contract.open_detail(&run07_mutations());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].2, OpenReason::MechanicalConstraintViolation);
+    }
+
+    /// One violated scope keeps the whole goal open even when every other
+    /// obligation is discharged.
+    #[test]
+    fn one_violated_scope_blocks_a_goal_whose_other_obligations_hold() {
+        let mut behaviour = requirement("R1", RequirementKind::Behavior);
+        behaviour.status = RequirementStatus::Satisfied;
+        let contract = CompletionContract::new(vec![
+            behaviour,
+            scope("R2", &["internal/window/"], RequirementStatus::Satisfied),
+        ]);
+        let open = contract.open_detail(&run07_mutations());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, "R2");
+    }
+
+    /// The semantics the policy enforces, stated as a test: the ledger's
+    /// mutation record is every path this run touched, so a file edited and
+    /// then edited again — or edited outside the scope early and never
+    /// mentioned again — is still a modification. There is no final-diff
+    /// authority in the runtime for this to mean instead.
+    #[test]
+    fn scope_means_every_path_the_run_mutated() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["cmd/telemetryd/testdata/boundary_events.txt".into()],
+        );
+        ledger.record_mutation(
+            "c2",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        ledger.record_mutation(
+            "c3",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        let outside = mutations_outside_scope(&["internal/window".to_string()], &ledger);
+        assert_eq!(outside, vec!["cmd/telemetryd/testdata/boundary_events.txt"]);
+    }
+
+    /// A path the runtime cannot read as repo-relative is outside every scope.
+    /// Guessing what an absolute path or a `..` climb "really" refers to is
+    /// how a scope check gets talked out of a violation.
+    #[test]
+    fn paths_that_escape_the_repo_are_outside_every_scope() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("c1", "apply_patch", vec!["/etc/hosts".into()]);
+        ledger.record_mutation(
+            "c2",
+            "apply_patch",
+            vec!["internal/window/../../elsewhere.go".into()],
+        );
+        let outside = mutations_outside_scope(&["internal/window".to_string()], &ledger);
+        assert_eq!(outside.len(), 2, "{outside:?}");
+    }
+
+    /// The policy rides the durable contract: a restart cannot lose the scope
+    /// and leave the obligation semantic.
+    #[test]
+    fn a_declared_scope_survives_serialization() {
+        let contract = CompletionContract::new(vec![scope(
+            "R_SCOPE",
+            &["internal/window/"],
+            RequirementStatus::Satisfied,
+        )]);
+        let round: CompletionContract =
+            serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
+        assert_eq!(round, contract);
+        assert_eq!(
+            round.open_detail(&run07_mutations())[0].2,
+            OpenReason::MechanicalConstraintViolation
+        );
     }
 }

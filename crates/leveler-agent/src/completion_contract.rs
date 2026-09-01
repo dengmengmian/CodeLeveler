@@ -66,6 +66,21 @@ fn instruction(goal: &str) -> String {
          is not by itself that coverage.\n\
          - if neither fits, omit \"proof\".\n\
          \n\
+         For a \"constraint\" obligation, say so mechanically ONLY when the \
+         task names the part of the tree the work may touch — \"only change \
+         files under internal/window\", \"do not modify anything outside \
+         cmd/\". Then set \"proof\": \"mutation_scope\" and list in \
+         \"allowed_paths\" the files or directories that MAY be modified, \
+         repo-relative, as the task names them. Anything the run modifies \
+         outside that list will be treated as breaking the constraint.\n\
+         - A constraint about BEHAVIOUR is not a file scope. \"Nothing else \
+         about the report changes\", \"do not break existing callers\" and \
+         \"existing tests must not be modified\" say what must remain true, \
+         not which files exist; they get no \"proof\" and no \
+         \"allowed_paths\".\n\
+         - If the task restricts the work but you cannot name the paths from \
+         the user's own words, omit both. A guessed scope is worse than none.\n\
+         \n\
          Group what you list. One entry per INDEPENDENT objective — something \
          the user could accept, reject or change on its own. Conditions that \
          belong to one objective (its details, constraints, and the proofs it \
@@ -78,7 +93,8 @@ fn instruction(goal: &str) -> String {
          {{\n\
            \"requirements\": [\n\
              {{\"text\": \"...\", \"kind\": \"behavior\", \"conditions\": [\n\
-               {{\"text\": \"...\", \"kind\": \"verification\", \"proof\": \"command_success\", \"commands\": [\"go test ./...\"]}}\n\
+               {{\"text\": \"...\", \"kind\": \"verification\", \"proof\": \"command_success\", \"commands\": [\"go test ./...\"]}},\n\
+               {{\"text\": \"...\", \"kind\": \"constraint\", \"proof\": \"mutation_scope\", \"allowed_paths\": [\"internal/window/\"]}}\n\
              ]}}\n\
            ]\n\
          }}"
@@ -101,6 +117,11 @@ struct RawRequirement {
     proof: String,
     #[serde(default)]
     commands: Vec<String>,
+    /// Paths a `mutation_scope` constraint allows the work to touch. Only ever
+    /// what the task itself named — the derivation is forbidden to invent one,
+    /// and an empty list is not a scope.
+    #[serde(default)]
+    allowed_paths: Vec<String>,
     /// Conditions inside this objective, when the model nests them.
     #[serde(default)]
     conditions: Vec<RawRequirement>,
@@ -170,6 +191,28 @@ impl DerivationFailure {
 /// standard is `Unresolved` rather than a guess: assuming "any green check"
 /// is how an unwritten test gets waved through.
 fn policy_from(raw: &RawRequirement, kind: RequirementKind) -> Option<EvidencePolicy> {
+    // A boundary on which files may change is the one obligation the runtime
+    // can settle from its own record, so it is written down as a mechanical
+    // condition rather than left for a reading of the work (F6). Only when the
+    // task named the paths: a constraint the derivation cannot ground stays
+    // semantic, because a scope invented here would be enforced as if the user
+    // had asked for it.
+    if kind == RequirementKind::Constraint {
+        if !raw.proof.trim().eq_ignore_ascii_case("mutation_scope") {
+            return None;
+        }
+        let allowed: Vec<String> = raw
+            .allowed_paths
+            .iter()
+            .map(|p| p.trim().trim_matches('`').trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        // "mutation_scope over nothing" is not a scope. Left semantic rather
+        // than persisted as a policy that can never be discharged.
+        return (!allowed.is_empty()).then_some(EvidencePolicy::MutationScope {
+            allowed_paths: allowed,
+        });
+    }
     if kind != RequirementKind::Verification {
         return None;
     }
@@ -530,6 +573,7 @@ mod derivation_reliability_tests {
             kind: "verification".into(),
             proof: proof.into(),
             commands: commands.iter().map(|c| c.to_string()).collect(),
+            allowed_paths: Vec::new(),
             conditions: Vec::new(),
             objective: String::new(),
         }
@@ -636,6 +680,7 @@ mod granularity_tests {
             kind: kind.into(),
             proof: String::new(),
             commands: Vec::new(),
+            allowed_paths: Vec::new(),
             conditions: Vec::new(),
             objective: String::new(),
         }
@@ -777,5 +822,74 @@ mod granularity_tests {
             }
             other => panic!("expected CommandSuccess, got {other:?}"),
         }
+    }
+
+    /// A constraint that names where the work may happen becomes a condition
+    /// the runtime can settle from its own mutation record — not a sentence
+    /// for the completion judge to have an opinion about (F6).
+    #[test]
+    fn a_named_file_scope_becomes_a_mechanical_policy() {
+        let out = canonicalize(vec![RawRequirement {
+            proof: "mutation_scope".into(),
+            allowed_paths: vec!["internal/window/".into(), "`cmd/telemetryd/`".into()],
+            ..item(
+                "do not modify files outside internal/window and cmd/telemetryd",
+                "constraint",
+            )
+        }]);
+        match out[0].evidence_policy.as_ref() {
+            Some(EvidencePolicy::MutationScope { allowed_paths }) => {
+                assert_eq!(allowed_paths, &["internal/window/", "cmd/telemetryd/"]);
+            }
+            other => panic!("expected MutationScope, got {other:?}"),
+        }
+    }
+
+    /// THE RUN 07 DISTINCTION. "Nothing else about the report changes" is a
+    /// statement about behaviour, and it was never a file-scope restriction —
+    /// reading it as one would retroactively invent an obligation the user did
+    /// not write. Without a scope the derivation could name, the obligation
+    /// stays semantic and nothing mechanical is enforced against it.
+    #[test]
+    fn a_behavioural_constraint_is_not_turned_into_a_file_scope() {
+        let out = canonicalize(vec![
+            item("nothing else about the report changes", "constraint"),
+            item("do not break existing callers", "constraint"),
+        ]);
+        assert!(
+            out.iter().all(|r| r.evidence_policy.is_none()),
+            "behavioural constraints carry no mechanical policy: {out:?}"
+        );
+    }
+
+    /// A scope the task never named is not a scope. Rather than persist a
+    /// policy that permits nothing — and so could never be discharged — the
+    /// obligation is left where it was, semantic.
+    #[test]
+    fn a_scope_without_paths_is_not_invented() {
+        let out = canonicalize(vec![RawRequirement {
+            proof: "mutation_scope".into(),
+            allowed_paths: vec!["  ".into()],
+            ..item("keep the change contained", "constraint")
+        }]);
+        assert!(out[0].evidence_policy.is_none());
+    }
+
+    /// A scope declared on a condition inside an objective is carried the same
+    /// way an objective's own policy is.
+    #[test]
+    fn a_condition_can_carry_its_own_scope() {
+        let out = canonicalize(vec![RawRequirement {
+            conditions: vec![RawRequirement {
+                proof: "mutation_scope".into(),
+                allowed_paths: vec!["internal/window/".into()],
+                ..item("only files under internal/window may change", "constraint")
+            }],
+            ..item("fix the boundary rule", "behavior")
+        }]);
+        assert!(matches!(
+            out[0].acceptance_facets[0].evidence_policy.as_ref(),
+            Some(EvidencePolicy::MutationScope { .. })
+        ));
     }
 }
