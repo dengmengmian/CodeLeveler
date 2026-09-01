@@ -68,6 +68,19 @@ pub struct ModelRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub metadata: RequestMetadata,
+    /// Absolute wall-clock deadline for this ONE request, set by a caller that
+    /// owns a budget of its own.
+    ///
+    /// A completion gate that gives itself 180s must not have its request
+    /// killed by a generic 120s transport default and restarted from zero: the
+    /// caller's budget is the one that means something, and the layers under
+    /// it spend what is left of it rather than enforcing a shorter number
+    /// nobody asked for. `None` keeps the provider's configured default.
+    ///
+    /// Never persisted: a monotonic instant means nothing in another process,
+    /// so a replayed or restored request carries no deadline.
+    #[serde(skip)]
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl ModelRequest {
@@ -84,6 +97,7 @@ impl ModelRequest {
             reasoning_effort: None,
             stop: Vec::new(),
             metadata: RequestMetadata::default(),
+            deadline: None,
         }
     }
 }

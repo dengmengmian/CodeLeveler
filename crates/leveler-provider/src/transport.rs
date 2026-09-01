@@ -62,7 +62,7 @@ pub(crate) async fn send_with_retry(
     body: &serde_json::Value,
     context: &ProtocolContext,
     retry: &RetryConfig,
-    per_request_timeout: Option<Duration>,
+    budget: RequestBudget,
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response, ModelError> {
     let max_attempts = retry.max_attempts.max(1);
@@ -75,6 +75,12 @@ pub(crate) async fn send_with_retry(
             return Err(ModelError::cancelled());
         }
 
+        // Every attempt, and every backoff before one, spends the SAME
+        // budget: a retry that started its own fresh clock would let a
+        // caller's deadline be exceeded by the number of attempts.
+        let Some(per_request_timeout) = budget.remaining() else {
+            return Err(deadline_exceeded(last_error));
+        };
         let request = build_request(client, url, body, context, per_request_timeout);
         let send = tokio::select! {
             biased;
@@ -123,6 +129,11 @@ pub(crate) async fn send_with_retry(
             .and_then(|e| e.retry_after_ms)
             .map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER))
             .unwrap_or(backoff);
+        // Sleeping past the caller's deadline would burn the remainder of its
+        // budget on waiting rather than on an answer.
+        if budget.remaining_after(wait).is_none() {
+            return Err(deadline_exceeded(last_error));
+        }
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
@@ -133,6 +144,57 @@ pub(crate) async fn send_with_retry(
 
     Err(last_error
         .unwrap_or_else(|| ModelError::new(ModelErrorKind::Other, "request failed with no error")))
+}
+
+/// What a single provider call may spend: the caller's remaining deadline when
+/// it set one, otherwise the provider's configured per-request default.
+///
+/// The distinction matters at the retry loop: a `Deadline` shrinks with every
+/// attempt and every backoff, while a `PerRequest` default applies afresh to
+/// each attempt exactly as it always has.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RequestBudget {
+    /// No caller budget: each attempt gets the provider's configured timeout.
+    PerRequest(Option<Duration>),
+    /// The caller owns the clock; attempts spend what is left of it.
+    Deadline(std::time::Instant),
+}
+
+impl RequestBudget {
+    /// What this attempt may take, or `None` when the deadline has passed.
+    fn remaining(&self) -> Option<Option<Duration>> {
+        match self {
+            Self::PerRequest(timeout) => Some(*timeout),
+            Self::Deadline(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                (!left.is_zero()).then_some(Some(left))
+            }
+        }
+    }
+
+    /// Whether anything would still be left after waiting `wait`.
+    fn remaining_after(&self, wait: Duration) -> Option<Duration> {
+        match self {
+            Self::PerRequest(_) => Some(wait),
+            Self::Deadline(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                left.checked_sub(wait).filter(|rest| !rest.is_zero())
+            }
+        }
+    }
+}
+
+/// The caller's budget ran out. Carries the last provider error when there was
+/// one, so a deadline reached mid-retry still explains what was failing.
+fn deadline_exceeded(last_error: Option<ModelError>) -> ModelError {
+    let mut error = last_error.unwrap_or_else(|| {
+        ModelError::new(
+            ModelErrorKind::Timeout,
+            "request deadline elapsed before a response",
+        )
+    });
+    error.provider_retries_exhausted = true;
+    error
 }
 
 /// Hard cap on a provider-advertised wait so a hostile/buggy `Retry-After`
@@ -179,6 +241,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn truncate_respects_char_boundaries() {
@@ -241,6 +304,55 @@ mod tests {
         assert_eq!(
             req.headers().get("anthropic-version").unwrap(),
             "2023-06-01"
+        );
+    }
+
+    /// A caller that owns a deadline spends it down across attempts; one that
+    /// does not keeps the provider default on every attempt, exactly as before.
+    #[test]
+    fn a_deadline_shrinks_across_attempts_and_a_default_does_not() {
+        let default = RequestBudget::PerRequest(Some(Duration::from_secs(120)));
+        assert_eq!(
+            default.remaining(),
+            Some(Some(Duration::from_secs(120))),
+            "no caller budget: the configured timeout applies to each attempt"
+        );
+
+        let deadline = RequestBudget::Deadline(Instant::now() + Duration::from_millis(200));
+        let first = deadline.remaining().expect("budget left").expect("bounded");
+        std::thread::sleep(Duration::from_millis(50));
+        let second = deadline.remaining().expect("budget left").expect("bounded");
+        assert!(
+            second < first,
+            "a retry may only spend what is left: {first:?} then {second:?}"
+        );
+        assert!(
+            second <= Duration::from_millis(160),
+            "and not a fresh full budget: {second:?}"
+        );
+    }
+
+    /// Past the deadline nothing starts, and a wait that would cross it is
+    /// refused rather than slept through.
+    #[test]
+    fn an_elapsed_deadline_permits_neither_a_request_nor_a_backoff() {
+        let spent = RequestBudget::Deadline(Instant::now() - Duration::from_secs(1));
+        assert!(spent.remaining().is_none(), "no attempt may start");
+
+        let short = RequestBudget::Deadline(Instant::now() + Duration::from_millis(30));
+        assert!(
+            short.remaining_after(Duration::from_millis(100)).is_none(),
+            "a backoff longer than the remaining budget must not be waited out"
+        );
+        assert!(
+            short.remaining_after(Duration::from_millis(5)).is_some(),
+            "a backoff that still leaves budget is fine"
+        );
+        assert!(
+            RequestBudget::PerRequest(None)
+                .remaining_after(Duration::from_secs(3600))
+                .is_some(),
+            "without a caller deadline the backoff schedule is unchanged"
         );
     }
 }

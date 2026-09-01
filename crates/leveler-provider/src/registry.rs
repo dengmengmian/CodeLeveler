@@ -21,7 +21,7 @@ use leveler_protocol::{AnthropicMessagesAdapter, OpenAiChatAdapter};
 
 use crate::catalog::ModelConfigFile;
 use crate::config::ProviderConfig;
-use crate::transport::{response_to_byte_stream, send_with_retry};
+use crate::transport::{RequestBudget, response_to_byte_stream, send_with_retry};
 
 /// A fully-wired provider: config, resolved API key, HTTP client, adapter.
 struct Provider {
@@ -186,7 +186,12 @@ impl ModelRuntime for ProviderRegistry {
             &encoded.body,
             &context,
             &provider.config.retry,
-            None, // streaming relies on the client's idle read timeout
+            // Streaming relies on the client's idle read timeout, but a caller
+            // that set a deadline still owns the clock for its own request.
+            request
+                .deadline
+                .map(RequestBudget::Deadline)
+                .unwrap_or(RequestBudget::PerRequest(None)),
             &cancellation,
         )
         .await?;
@@ -230,9 +235,18 @@ impl ModelRuntime for ProviderRegistry {
             &encoded.body,
             &context,
             &provider.config.retry,
-            Some(Duration::from_secs(
-                provider.config.timeouts.request_seconds,
-            )),
+            // The caller's deadline wins over the generic default when it has
+            // one — including when it is LONGER. A completion gate that budgets
+            // 180s was previously cut at the 120s default and restarted from
+            // zero, so its own budget bought it nothing (F2).
+            request
+                .deadline
+                .map(RequestBudget::Deadline)
+                .unwrap_or_else(|| {
+                    RequestBudget::PerRequest(Some(Duration::from_secs(
+                        provider.config.timeouts.request_seconds,
+                    )))
+                }),
             &cancellation,
         )
         .await?;

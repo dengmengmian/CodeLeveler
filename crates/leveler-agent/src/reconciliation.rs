@@ -624,10 +624,24 @@ async fn one_call(
     runtime: &dyn ModelRuntime,
     model: &ModelRef,
     messages: Vec<Message>,
-    timeout: std::time::Duration,
+    deadline: std::time::Instant,
     cancellation: &CancellationToken,
 ) -> Result<String, ReconcileOutcome> {
+    // One gate, one clock. The first judgment and any format repair spend the
+    // same budget, and a request is not started at all once it is gone.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ReconcileOutcome::refused(
+            ReconcileVerdict::Unavailable,
+            "timeout",
+            "reconciliation budget was already spent",
+        ));
+    }
     let mut request = ModelRequest::new(model.clone(), messages);
+    // The transport spends what is left of THIS budget instead of enforcing
+    // the generic per-request default, which was shorter than the gate's own
+    // deadline and so cut valid judgments off mid-answer and restarted them.
+    request.deadline = Some(deadline);
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(MAX_OUTPUT_TOKENS);
     // The gate's own effort, NOT the main policy's: this is a
@@ -635,7 +649,7 @@ async fn one_call(
     // spends the completion budget on reasoning before any content (HC002-F1).
     request.reasoning_effort = Some(RECONCILE_EFFORT);
     match tokio::time::timeout(
-        timeout,
+        remaining,
         runtime.generate(request, cancellation.child_token()),
     )
     .await
@@ -643,7 +657,10 @@ async fn one_call(
         Err(_) => Err(ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
             "timeout",
-            format!("reconciliation timed out after {}s", timeout.as_secs()),
+            format!(
+                "reconciliation ran out of its {}s budget",
+                remaining.as_secs()
+            ),
         )),
         Ok(Err(error)) => Err(ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
@@ -680,13 +697,17 @@ pub(crate) async fn reconcile_completion(
     cancellation: &CancellationToken,
 ) -> ReconcileOutcome {
     let started = std::time::Instant::now();
+    // The gate's budget is one absolute deadline from here on: retries inside
+    // the provider, the format repair, and the waiting between them all come
+    // out of it, so the total stays what the caller asked for.
+    let deadline = started + timeout;
     let prompt = instruction(&input);
     let latency = |s: &std::time::Instant| s.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let first_text = match one_call(
         runtime,
         model,
         vec![Message::text(Role::User, prompt.clone())],
-        timeout,
+        deadline,
         cancellation,
     )
     .await
@@ -726,7 +747,8 @@ pub(crate) async fn reconcile_completion(
             Message::text(Role::User, REPAIR_ASK.to_string()),
         ]
     };
-    let second_text = match one_call(runtime, model, repair_messages, timeout, cancellation).await {
+    let second_text = match one_call(runtime, model, repair_messages, deadline, cancellation).await
+    {
         Ok(text) => text,
         Err(mut refused) => {
             refused.latency_ms = latency(&started);
@@ -1343,6 +1365,257 @@ mod evidence_identity {
             contract: Some(&contract),
         });
         assert!(without.contains("(none)"), "{without}");
+    }
+}
+
+/// F2 (scale-s800): the completion gate budgeted 180s while the transport
+/// under it enforced its generic 120s default, so a judgment that needed
+/// 120–180s was killed mid-answer and restarted from zero — and the gate
+/// expired during the restart. The budget the caller set bought it nothing.
+///
+/// The ratios below are the real ones in milliseconds — 120 default, 180 gate,
+/// a 145 answer — so the budget hierarchy is proven without waiting minutes.
+///
+/// A higher-level operation owns its deadline; the layers under it spend what
+/// is left of that deadline, and retries do not reset it.
+#[cfg(test)]
+mod request_budget {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A runtime that answers after `answer_after`, honouring whatever budget
+    /// the caller put on the request — the way a transport does.
+    struct SlowProvider {
+        answer_after: Duration,
+        /// The per-request budget each attempt was given.
+        budgets: std::sync::Mutex<Vec<Option<Duration>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelRuntime for SlowProvider {
+        async fn generate(
+            &self,
+            request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+            // What the transport would enforce for this attempt: the caller's
+            // remaining deadline when it set one, else the generic default.
+            let budget = request
+                .deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(DEFAULT_PROVIDER_REQUEST_TIMEOUT);
+            self.budgets.lock().unwrap().push(Some(budget));
+            if budget < self.answer_after {
+                return Err(leveler_model::ModelError::new(
+                    leveler_model::ModelErrorKind::Timeout,
+                    "request timed out",
+                ));
+            }
+            tokio::time::sleep(self.answer_after).await;
+            Ok(leveler_model::ModelResponse {
+                request_id: request.request_id,
+                message: Message::text(
+                    Role::Assistant,
+                    r#"{"verdict":"satisfied","requirements":[{"requirement":"a","satisfied":true}],"contradictions":[],"reason":"ok"}"#,
+                ),
+                finish_reason: leveler_model::FinishReason::Stop,
+                usage: leveler_model::TokenUsage::default(),
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+            unreachable!("the gate uses generate")
+        }
+
+        async fn profile(
+            &self,
+            _model: &ModelRef,
+        ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+            unreachable!()
+        }
+    }
+
+    /// The generic per-request transport default the gate used to be cut by,
+    /// at the same ratio to the gate budget as the shipped 120s : 180s.
+    const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_millis(120);
+
+    fn input() -> ReconcileInput<'static> {
+        ReconcileInput {
+            original_goal: "fix the boundary",
+            claimed_summary: "fixed",
+            recent_claims: "",
+            recent_evidence: "",
+            modified_files: &[],
+            fresh_verification: true,
+            evidence_candidates: &[],
+            contract: None,
+        }
+    }
+
+    /// RED before the fix: a judgment needing 145s died on the 120s default
+    /// even though the gate had 180s to give. GREEN now: the request carries
+    /// the gate's remaining budget, so it is allowed to finish.
+    #[tokio::test]
+    async fn a_judgment_between_the_default_and_the_gate_budget_completes() {
+        let runtime = SlowProvider {
+            answer_after: Duration::from_millis(145),
+            budgets: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            Duration::from_millis(180),
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            outcome.verdict,
+            ReconcileVerdict::Satisfied,
+            "145ms < 180ms gate: the answer must not be cut off ({})",
+            outcome.reason
+        );
+        let budgets = runtime.budgets.lock().unwrap();
+        assert_eq!(budgets.len(), 1, "one attempt, no restart: {budgets:?}");
+        assert!(
+            budgets[0].unwrap() > DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+            "the request must carry the gate's budget, not the generic default: {budgets:?}"
+        );
+    }
+
+    /// The gate is still a ceiling: past it, no verdict.
+    #[tokio::test]
+    async fn a_judgment_past_the_gate_budget_still_fails_closed() {
+        let runtime = SlowProvider {
+            answer_after: Duration::from_millis(210),
+            budgets: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            Duration::from_millis(180),
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, ReconcileVerdict::Unavailable);
+        assert!(!outcome.allows_completion());
+    }
+
+    /// The repair is not a second budget: it spends what the first judgment
+    /// left, and the whole gate stays inside its deadline.
+    #[tokio::test]
+    async fn a_format_repair_spends_only_what_is_left() {
+        /// Answers unparseable prose after 150s, then records the second
+        /// attempt's budget.
+        struct RepairProvider {
+            budgets: std::sync::Mutex<Vec<Duration>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelRuntime for RepairProvider {
+            async fn generate(
+                &self,
+                request: ModelRequest,
+                _cancellation: CancellationToken,
+            ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+                let budget = request
+                    .deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .expect("the gate sets a deadline");
+                self.budgets.lock().unwrap().push(budget);
+                tokio::time::sleep(Duration::from_millis(150).min(budget)).await;
+                Ok(leveler_model::ModelResponse {
+                    request_id: request.request_id,
+                    message: Message::text(Role::Assistant, "no object here"),
+                    finish_reason: leveler_model::FinishReason::Stop,
+                    usage: leveler_model::TokenUsage::default(),
+                })
+            }
+            async fn stream(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+                unreachable!()
+            }
+            async fn profile(
+                &self,
+                _m: &ModelRef,
+            ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+                unreachable!()
+            }
+        }
+        let started = Instant::now();
+        let runtime = RepairProvider {
+            budgets: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            Duration::from_millis(180),
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(!outcome.allows_completion(), "prose is not a verdict");
+        let budgets = runtime.budgets.lock().unwrap();
+        assert_eq!(budgets.len(), 2, "one judgment, one repair: {budgets:?}");
+        assert!(
+            budgets[1] <= Duration::from_millis(60),
+            "the repair gets the remainder of the gate, not a fresh full budget: {budgets:?}"
+        );
+        assert!(
+            started.elapsed() <= Duration::from_millis(400),
+            "the whole gate stays inside its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A budget already spent starts nothing at all.
+    #[tokio::test]
+    async fn an_exhausted_budget_starts_no_request() {
+        struct NeverCalled;
+        #[async_trait::async_trait]
+        impl ModelRuntime for NeverCalled {
+            async fn generate(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+                panic!("no request may start once the budget is gone")
+            }
+            async fn stream(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+                unreachable!()
+            }
+            async fn profile(
+                &self,
+                _m: &ModelRef,
+            ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+                unreachable!()
+            }
+        }
+        let outcome = reconcile_completion(
+            &NeverCalled,
+            &ModelRef::new("mock", "m"),
+            None,
+            Duration::ZERO,
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, ReconcileVerdict::Unavailable);
+        assert_eq!(outcome.failure_kind, Some("timeout"));
     }
 }
 
