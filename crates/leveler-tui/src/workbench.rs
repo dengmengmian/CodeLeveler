@@ -1105,6 +1105,20 @@ mod tests {
         }
     }
 
+    /// The agent ROSTER row for `activity`.
+    ///
+    /// The Activity strip above the roster mentions the same tool with the
+    /// child's nickname (`● Newton · read_file 55s ↗`), so "the line that
+    /// contains read_file" stopped identifying one row the moment that strip
+    /// existed. The roster is the surface these layout rules belong to, and it
+    /// names agents by role.
+    fn roster_row<'a>(lines: &'a [String], activity: &str) -> &'a String {
+        lines
+            .iter()
+            .find(|l| l.contains(activity) && l.contains("agent"))
+            .unwrap_or_else(|| panic!("no roster row for {activity}: {lines:#?}"))
+    }
+
     /// A row whose usage is genuinely zero shows elapsed only — the column
     /// never invents a token figure to fill itself.
     #[test]
@@ -1117,14 +1131,27 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 0)]),
             false,
         );
-        let row = lines
-            .iter()
-            .find(|l| l.contains("read_file"))
-            .expect("child row renders");
+        let row = roster_row(&lines, "read_file");
         assert!(row.contains("55s"), "elapsed still shown: {row:?}");
         assert!(
             !row.contains('·'),
             "no `· tokens` half for a zero-usage child: {row:?}"
+        );
+
+        // Control: real usage still renders, so the rule above is "do not
+        // invent a number", not "never show one".
+        let reported = render_workbench(
+            120,
+            30,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
+            false,
+        );
+        let row = roster_row(&reported, "read_file");
+        assert!(
+            row.contains("55s ·"),
+            "a child with usage keeps its `elapsed · tokens` meta: {row:?}"
         );
     }
 
@@ -1167,11 +1194,27 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = lines
-            .iter()
-            .find(|l| l.contains("read_file"))
-            .expect("child row renders");
+        let row = roster_row(&lines, "read_file");
         assert!(!row.contains("55s"), "narrow width drops the meta: {row:?}");
+
+        // The other side of the rule: given room, the same row shows the same
+        // meta. The exact cut is content-dependent — the meta is dropped when
+        // it cannot fit beside head and activity, not at a fixed column — so
+        // this pins the behaviour from both sides rather than one boundary
+        // cell that would move with the label.
+        let wide = render_workbench(
+            72,
+            30,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
+            false,
+        );
+        let row = roster_row(&wide, "read_file");
+        assert!(
+            row.contains("55s"),
+            "given room, the meta is shown: {row:?}"
+        );
     }
 
     fn team_with(children: &[(&str, &str, &str)]) -> crate::multi_agent::TaskTeamView {

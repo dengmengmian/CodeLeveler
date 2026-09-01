@@ -2865,7 +2865,7 @@ fn bare_collab_opens_picker() {
 }
 
 #[test]
-fn permission_picker_selects_ask_and_updates_chip() {
+fn permission_picker_selects_ask_and_the_chip_follows_the_ack() {
     let mut s = opened();
     typed(&mut s, "/permission");
     reduce(&mut s, key(KeyCode::Enter));
@@ -2873,8 +2873,29 @@ fn permission_picker_selects_ask_and_updates_chip() {
     // Default assisted=auto; first row is ask (request_approval).
     reduce(&mut s, key(KeyCode::Up));
     reduce(&mut s, key(KeyCode::Enter));
+    // The picker records the choice; the chip does not lead the runtime.
+    assert_eq!(
+        s.pending_permission,
+        Some(PermissionProfile::RequestApproval)
+    );
+    assert_eq!(
+        s.mode,
+        PermissionProfile::Assisted,
+        "the chip waits for SessionUpdated, not the selection"
+    );
+
+    let mut snap = snapshot();
+    snap.mode = PermissionProfile::RequestApproval;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
     assert_eq!(s.mode, PermissionProfile::RequestApproval);
     assert_eq!(s.mode_label, "RequestApproval");
+    assert_eq!(
+        s.pending_permission, None,
+        "the ack clears what was pending"
+    );
 }
 
 #[test]
