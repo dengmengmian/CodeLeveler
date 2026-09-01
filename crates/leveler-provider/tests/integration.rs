@@ -411,3 +411,117 @@ async fn done_sentinel_with_no_content_is_still_an_interruption() {
         "an empty [DONE]-only stream has no answer to accept: {events:?}"
     );
 }
+
+/// A provider whose idle watchdog fires quickly, so a silent gap is decided in
+/// milliseconds instead of the shipped minute. Retries are off: this is about
+/// the FIRST attempt surviving, not about recovering from a kill.
+fn impatient_config(base_url: String) -> ProviderConfig {
+    ProviderConfig {
+        timeouts: Timeouts {
+            connect_seconds: 5,
+            request_seconds: 30,
+            idle_stream_seconds: 1,
+        },
+        retry: RetryConfig {
+            max_attempts: 1,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 20,
+        },
+        ..provider_config(base_url)
+    }
+}
+
+fn impatient_registry(server: &MockServer) -> ProviderRegistry {
+    ProviderRegistry::build(RegistryInputs {
+        providers: vec![(impatient_config(server.base_url()), None)],
+        models: vec![model_config()],
+    })
+    .expect("build registry")
+}
+
+/// The provider that thinks for longer than the idle watchdog allows.
+fn thinks_for(ms: u64) -> MockResponse {
+    MockResponse::SilentThenJson {
+        silent_ms: ms,
+        body: r#"{"id":"r1","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#
+            .to_string(),
+    }
+}
+
+/// F5: a non-streaming model call produces NO bytes while it reasons, so the
+/// read-idle watchdog reads thinking as a dead connection and kills it — which
+/// is what turned a 20-78s judgment into a 243.5s wall of four killed attempts.
+/// A request that says its silence is expected survives it.
+#[tokio::test]
+async fn a_long_thinking_request_outlives_the_idle_watchdog() {
+    let server = MockServer::start_one(thinks_for(1_500)).await;
+    let reg = impatient_registry(&server);
+
+    let mut req = request();
+    req.transport = leveler_model::TransportPolicy::LongThinkingNonStreaming;
+    req.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    let resp = reg
+        .generate(req, CancellationToken::new())
+        .await
+        .expect("silence while thinking is not a dead connection");
+    assert_eq!(resp.message.text_content(), "answer");
+    assert_eq!(server.request_count(), 1, "and it is not retried");
+}
+
+/// Control: an ordinary request keeps the watchdog it always had.
+#[tokio::test]
+async fn an_ordinary_request_still_dies_on_the_idle_watchdog() {
+    let server = MockServer::start_one(thinks_for(1_500)).await;
+    let reg = impatient_registry(&server);
+
+    let error = reg
+        .generate(request(), CancellationToken::new())
+        .await
+        .expect_err("the default policy is unchanged");
+    assert!(
+        format!("{error}").to_lowercase().contains("timeout")
+            || format!("{error}").to_lowercase().contains("error sending"),
+        "expected an idle timeout, got: {error}"
+    );
+}
+
+/// The relaxed watchdog is not a licence to wait forever: the caller's
+/// deadline still ends it, and nothing is returned.
+#[tokio::test]
+async fn a_long_thinking_request_still_dies_at_its_deadline() {
+    let server = MockServer::start_one(thinks_for(3_000)).await;
+    let reg = impatient_registry(&server);
+
+    let mut req = request();
+    req.transport = leveler_model::TransportPolicy::LongThinkingNonStreaming;
+    req.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+    let started = std::time::Instant::now();
+    let error = reg
+        .generate(req, CancellationToken::new())
+        .await
+        .expect_err("the deadline is the bound");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2_000),
+        "it must end at its own deadline, not at the provider's pace: {:?}",
+        started.elapsed()
+    );
+    assert!(!format!("{error}").is_empty());
+}
+
+/// Two policies, one registry: the patient request must not lend its patience
+/// to anyone else.
+#[tokio::test]
+async fn the_two_policies_do_not_share_a_watchdog() {
+    let server = MockServer::start_one(thinks_for(1_500)).await;
+    let reg = impatient_registry(&server);
+
+    let mut patient = request();
+    patient.transport = leveler_model::TransportPolicy::LongThinkingNonStreaming;
+    patient.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    let (patient_result, ordinary_result) = tokio::join!(
+        reg.generate(patient, CancellationToken::new()),
+        reg.generate(request(), CancellationToken::new()),
+    );
+    assert!(patient_result.is_ok(), "{patient_result:?}");
+    assert!(ordinary_result.is_err(), "{ordinary_result:?}");
+}

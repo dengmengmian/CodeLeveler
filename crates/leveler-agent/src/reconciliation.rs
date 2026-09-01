@@ -642,6 +642,11 @@ async fn one_call(
     // the generic per-request default, which was shorter than the gate's own
     // deadline and so cut valid judgments off mid-answer and restarted them.
     request.deadline = Some(deadline);
+    // And it must not read the judge's thinking as a dead connection: this
+    // call is not a stream, so it produces nothing until it produces the
+    // verdict. Sixty seconds of that silence used to kill the attempt and
+    // start the judgment over, four times, for a wall at 243.5s.
+    request.transport = leveler_model::TransportPolicy::LongThinkingNonStreaming;
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(MAX_OUTPUT_TOKENS);
     // The gate's own effort, NOT the main policy's: this is a

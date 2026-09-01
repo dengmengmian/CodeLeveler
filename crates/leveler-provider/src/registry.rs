@@ -28,7 +28,23 @@ struct Provider {
     config: ProviderConfig,
     api_key: Option<String>,
     client: reqwest::Client,
+    /// Same provider, same everything, except the read-idle watchdog: a
+    /// non-streaming request whose model is still reasoning sends no bytes for
+    /// as long as it thinks, and killing it for that is a false positive. Its
+    /// caller's deadline is what bounds it. Built once and reused; a client
+    /// per request would throw away the connection pool.
+    patient_client: reqwest::Client,
     adapter: Arc<dyn ProtocolAdapter>,
+}
+
+impl Provider {
+    /// The client this request's transport policy asks for.
+    fn client_for(&self, policy: leveler_model::TransportPolicy) -> &reqwest::Client {
+        match policy {
+            leveler_model::TransportPolicy::Default => &self.client,
+            leveler_model::TransportPolicy::LongThinkingNonStreaming => &self.patient_client,
+        }
+    }
 }
 
 /// A resolved model: its capability profile.
@@ -80,13 +96,15 @@ impl ProviderRegistry {
         let mut providers = HashMap::new();
         for (config, api_key) in inputs.providers {
             let adapter = adapter_for(&config)?;
-            let client = build_client(&config)?;
+            let client = build_client(&config, IdleWatchdog::Configured)?;
+            let patient_client = build_client(&config, IdleWatchdog::Off)?;
             providers.insert(
                 config.id.clone(),
                 Provider {
                     config,
                     api_key,
                     client,
+                    patient_client,
                     adapter,
                 },
             );
@@ -181,7 +199,7 @@ impl ModelRuntime for ProviderRegistry {
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
-            &provider.client,
+            provider.client_for(request.transport),
             &url,
             &encoded.body,
             &context,
@@ -230,7 +248,7 @@ impl ModelRuntime for ProviderRegistry {
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
-            &provider.client,
+            provider.client_for(request.transport),
             &url,
             &encoded.body,
             &context,
@@ -324,7 +342,20 @@ fn base_url_is_loopback(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_client(config: &ProviderConfig) -> Result<reqwest::Client, RegistryError> {
+/// Whether a client enforces the configured read-idle timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleWatchdog {
+    /// `timeouts.idle_stream_seconds`, as configured.
+    Configured,
+    /// None. For requests that legitimately produce no bytes while working;
+    /// the caller's deadline is the bound.
+    Off,
+}
+
+fn build_client(
+    config: &ProviderConfig,
+    idle: IdleWatchdog,
+) -> Result<reqwest::Client, RegistryError> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
     let mut headers = HeaderMap::new();
@@ -336,10 +367,14 @@ fn build_client(config: &ProviderConfig) -> Result<reqwest::Client, RegistryErro
         headers.insert(name, value);
     }
 
+    // Connection establishment stays bounded either way: a socket that never
+    // opens is dead regardless of how long the model would have thought.
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(config.timeouts.connect_seconds))
-        .read_timeout(Duration::from_secs(config.timeouts.idle_stream_seconds))
         .default_headers(headers);
+    if idle == IdleWatchdog::Configured {
+        builder = builder.read_timeout(Duration::from_secs(config.timeouts.idle_stream_seconds));
+    }
     // Never proxy a loopback provider endpoint (see `base_url_is_loopback`).
     if base_url_is_loopback(&config.base_url) {
         builder = builder.no_proxy();

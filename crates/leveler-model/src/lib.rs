@@ -36,7 +36,7 @@ pub use profile::{
 pub use protocol::{
     EncodedRequest, ProtocolAdapter, ProtocolContext, ProtocolError, RawByteStream,
 };
-pub use request::{ModelRef, ModelRequest, RequestMetadata};
+pub use request::{ModelRef, ModelRequest, RequestMetadata, TransportPolicy};
 pub use response::ModelResponse;
 pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
 pub use tool_catalog::{

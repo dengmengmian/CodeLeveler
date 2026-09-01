@@ -48,6 +48,24 @@ pub struct RequestMetadata {
     pub turn_id: Option<TurnId>,
 }
 
+/// How the transport should treat silence on this request.
+///
+/// The generic read-idle watchdog answers "has this connection stopped making
+/// progress?", and for a stream it answers it well. A non-streaming request to
+/// a model that is still reasoning sends no bytes at all until it is done, so
+/// the same watchdog answers a question nobody asked: sixty seconds of silence
+/// there is the model thinking, not a dead socket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransportPolicy {
+    /// The provider's configured idle timeout applies, as it always has.
+    #[default]
+    Default,
+    /// No response bytes are expected until the answer is complete, so the
+    /// idle watchdog is not evidence of anything. The caller's own deadline
+    /// bounds the request instead — and it must have one.
+    LongThinkingNonStreaming,
+}
+
 /// A fully-formed, provider-agnostic model request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
@@ -81,6 +99,9 @@ pub struct ModelRequest {
     /// so a replayed or restored request carries no deadline.
     #[serde(skip)]
     pub deadline: Option<std::time::Instant>,
+    /// How the transport should read silence on this request.
+    #[serde(default)]
+    pub transport: TransportPolicy,
 }
 
 impl ModelRequest {
@@ -98,6 +119,7 @@ impl ModelRequest {
             stop: Vec::new(),
             metadata: RequestMetadata::default(),
             deadline: None,
+            transport: TransportPolicy::Default,
         }
     }
 }

@@ -19,6 +19,10 @@ pub enum MockResponse {
     /// 200 stream written as separate raw byte chunks (to force fragmentation),
     /// each flushed with a small delay, then a clean close.
     RawChunks { chunks: Vec<Vec<u8>> },
+    /// A 200 JSON body preceded by `silent_ms` of complete silence — no
+    /// headers, no bytes — the shape of a non-streaming provider whose model
+    /// is still thinking.
+    SilentThenJson { silent_ms: u64, body: String },
     /// A non-2xx status with a JSON body.
     Status { code: u16, body: String },
     /// A non-2xx status with a JSON body and extra response headers.
@@ -262,6 +266,19 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
                 stream.flush().await?;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+        }
+        MockResponse::SilentThenJson { silent_ms, body } => {
+            tokio::time::sleep(Duration::from_millis(silent_ms)).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body.as_bytes()).await?;
+            stream.flush().await?;
         }
         MockResponse::Status { code, body } => {
             let reason = reason_phrase(code);
