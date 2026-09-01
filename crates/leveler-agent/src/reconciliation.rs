@@ -1683,7 +1683,15 @@ mod probe {
             api_key_env: String::new(),
             api_key: None,
             headers: Default::default(),
-            timeouts: Default::default(),
+            // Diagnosis knob: the client-level IDLE read timeout is what a
+            // non-streaming judgment actually runs into while the model is
+            // still thinking, so a measurement has to be able to move it.
+            timeouts: leveler_provider::Timeouts {
+                idle_stream_seconds: env("LEVELER_F2_IDLE_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(60),
+                ..Default::default()
+            },
             retry: Default::default(),
         };
         // The judged model as the lab configures it: a thinking-flag model with
