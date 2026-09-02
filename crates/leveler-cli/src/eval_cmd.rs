@@ -615,10 +615,14 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.adaptive_context = Some(true);
             (false, true)
         }
+        "prune_tool_results" => {
+            o.prune_tool_results = Some(true);
+            (false, true)
+        }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
              completion_evidence, repeated_read_guard, progress_guards, \
-             adaptive_context"
+             adaptive_context, prune_tool_results"
         ),
     };
     Ok((o, before, after))
@@ -1263,10 +1267,12 @@ async fn run_eval_case(
         }
     };
     // Ablation arm: pin the flipped resolver input on every execution path.
-    let app = match overrides {
-        Some(overrides) => app.with_execution_overrides(overrides.clone()),
-        None => app,
-    };
+    // Every eval run (control included) also traces the per-round context:
+    // `scripts/analyze_context.py` attributes cost from those snapshots, and
+    // production only persists a context that diverged from the transcript.
+    let mut overrides = overrides.cloned().unwrap_or_default();
+    overrides.context_trace = Some(true);
+    let app = app.with_execution_overrides(overrides);
     // Fold the event stream into trajectory signals for failure attribution
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
     let mut collector = crate::eval_signals::SignalCollector::with_navigation_paths(

@@ -871,6 +871,19 @@ pub struct TurnPolicy {
     /// Budget the engine recovered from prior `ContextExpanded` events, so a
     /// resumed task does not silently shrink back to the initial tier.
     pub restored_context_budget: Option<u32>,
+    /// Reclaim context by trimming the middle out of oversized tool results
+    /// that have left the working set, BEFORE folding the transcript. The
+    /// cheap tier: no model call, nothing dropped, and the request prefix
+    /// keeps its structure. Off by default — the value is unmeasured on real
+    /// workloads (C2.2 showed the lossless variant reclaimed nothing), so it
+    /// ships behind the eval seam until an A/B says otherwise.
+    pub prune_tool_results: bool,
+    /// Persist the exact model context after EVERY round (`ContextSnapshot`),
+    /// not only when it diverges from the durable transcript. Measurement
+    /// seam for `leveler eval` (context-cost attribution reads those rows);
+    /// production leaves it off — a per-round copy of a derivable context is
+    /// O(rounds × context) of near-duplicate log rows.
+    pub context_trace: bool,
 
     // ── Completion gates ────────────────────────────────────────────────────
     /// The run ends only when the model explicitly calls
@@ -913,6 +926,8 @@ impl Default for TurnPolicy {
             reliable_context: 0,
             repair_expansion_evidence: false,
             restored_context_budget: None,
+            prune_tool_results: false,
+            context_trace: false,
             goal_mode: false,
             // Matches the historical `Executor::new` default — the gate is ON.
             goal_todo_gate: true,
@@ -1468,6 +1483,8 @@ impl Executor {
                 reliable_context: self.policy.reliable_context,
                 repair_expansion_evidence: false,
                 restored_context_budget: None,
+                prune_tool_results: self.policy.prune_tool_results,
+                context_trace: self.policy.context_trace,
                 max_concurrent_agents: self.policy.max_concurrent_agents,
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
@@ -1528,6 +1545,21 @@ impl Executor {
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
         self.policy.max_concurrent_agents = max_concurrent.max(1);
         self.policy.max_total_agents = max_total;
+        self
+    }
+
+    /// Trim oversized old tool results before folding the transcript (see
+    /// [`TurnPolicy::prune_tool_results`]).
+    pub fn with_tool_result_pruning(mut self, prune: bool) -> Self {
+        self.policy.prune_tool_results = prune;
+        self
+    }
+
+    /// Persist the model context after every round instead of only when it
+    /// diverges from the transcript (eval measurement seam; see
+    /// [`TurnPolicy::context_trace`]).
+    pub fn with_context_trace(mut self, trace: bool) -> Self {
+        self.policy.context_trace = trace;
         self
     }
 

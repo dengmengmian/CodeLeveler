@@ -143,6 +143,13 @@ pub struct ExecutionOverrides {
     /// C5-S3 ablation knob: switch the candidate adaptive-context behavior on.
     /// Production default stays Disabled until the eval verdict flips it.
     pub adaptive_context: Option<bool>,
+    /// Candidate knob: trim oversized old tool results before folding.
+    /// Production default stays off until an A/B demonstrates the value.
+    pub prune_tool_results: Option<bool>,
+    /// Measurement knob: persist the model context after every round
+    /// (`ContextSnapshot`), not only when it diverges from the transcript.
+    /// Context-cost attribution reads those rows; production never sets it.
+    pub context_trace: Option<bool>,
     /// H-C ablation knob: WHEN the keep-vs-delegate surface is raised. `None`
     /// (everywhere except a configured experiment) keeps the shipped
     /// `PlanRegistration`. Measuring delegation timing is an experiment, not a
@@ -267,6 +274,10 @@ pub struct ResolvedExecutionPolicy {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte budget for a single tool result (the central output cap).
     pub max_tool_output_bytes: usize,
+    /// Trim oversized old tool results before folding (candidate; default off).
+    pub prune_tool_results: bool,
+    /// Persist the model context every round (eval measurement seam).
+    pub context_trace: bool,
 }
 
 /// min over concurrency caps where `0` means "no opinion / unlimited".
@@ -347,6 +358,8 @@ pub fn resolve_execution_policy(
                 leveler_tools::registry::MIN_TOOL_OUTPUT,
                 leveler_tools::registry::MAX_TOOL_OUTPUT,
             ),
+        prune_tool_results: o.prune_tool_results.unwrap_or(false),
+        context_trace: o.context_trace.unwrap_or(false),
     }
 }
 
@@ -497,6 +510,40 @@ mod tests {
         );
         // The compatibility mirror follows INITIAL, never a live budget.
         assert_eq!(adaptive.context_budget, adaptive.context.initial_budget);
+    }
+
+    #[test]
+    fn tool_result_pruning_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert!(
+            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None)
+                .prune_tool_results,
+            "an unmeasured candidate never ships on by default"
+        );
+        let o = ExecutionOverrides {
+            prune_tool_results: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        assert!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o))
+                .prune_tool_results
+        );
+    }
+
+    #[test]
+    fn context_trace_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert!(
+            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None).context_trace,
+            "production never persists the context every round"
+        );
+        let o = ExecutionOverrides {
+            context_trace: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        assert!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o)).context_trace
+        );
     }
 
     #[test]

@@ -10,6 +10,11 @@ Nothing is re-run and no model is called. The source is the persisted
 every round, plus the `model_requests` table for what the provider actually
 billed.
 
+Per-round snapshots exist only for `leveler eval` runs (the eval command sets
+the `context_trace` execution override). A production session persists a
+snapshot only when its context diverged from the transcript — a compaction
+fold or a transient nudge — so this script is not meaningful on those.
+
 Token counts replicate the product's own estimator (leveler-agent
 compaction.rs): ascii_bytes/4 + non_ascii_bytes/3, with a flat charge per
 image. Using the same function means the numbers here line up with the ones

@@ -9251,3 +9251,336 @@ async fn a_behavioural_constraint_is_still_settled_semantically() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Six read rounds followed by an answer. The only thing the model sees that
+/// the durable transcript does not hold is the drive-start task contract, so
+/// exactly one `ContextSnapshot` is owed — after round one. The five rounds
+/// that merely appended durable messages are reconstructible from the
+/// transcript and must not each persist a copy of the whole context.
+#[tokio::test]
+async fn only_a_diverged_context_is_snapshotted() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-diverged-snapshot-{}",
+        std::process::id() as u64 * 23 + 29
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let mut responses: Vec<ModelResponse> = (0..6)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("done"));
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    // (round, tail of the snapshotted context) — the tail names what diverged.
+    let mut snapshots: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut rounds = 0usize;
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_delegation(false)
+    .run(
+        "read the files",
+        &mut |event| match event {
+            AgentEvent::StreamAttemptStarted => rounds += 1,
+            AgentEvent::ContextSnapshot { messages } => snapshots.push((
+                rounds,
+                messages
+                    .iter()
+                    .map(|m| format!("{:?}: {}", m.role, truncate_for_log(&m.text_content())))
+                    .collect(),
+            )),
+            _ => {}
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let rounds_with_snapshot: Vec<usize> = snapshots.iter().map(|(r, _)| *r).collect();
+    assert_eq!(
+        rounds_with_snapshot,
+        vec![1],
+        "the task contract diverges the context once at drive start; got {snapshots:#?}"
+    );
+    assert!(
+        snapshots[0]
+            .1
+            .iter()
+            .any(|m| m.contains("## Task contract")),
+        "the snapshot must carry what the transcript lacks: {snapshots:#?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Context tracing (the eval measurement seam) restores the per-round
+/// snapshot: every round that has a next round persists the exact context.
+#[tokio::test]
+async fn context_trace_persists_the_context_every_round() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-context-trace-{}",
+        std::process::id() as u64 * 23 + 37
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let mut responses: Vec<ModelResponse> = (0..6)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("done"));
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    let mut context_snapshots = 0usize;
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_delegation(false)
+    .with_context_trace(true)
+    .run(
+        "read the files",
+        &mut |event| {
+            if matches!(event, AgentEvent::ContextSnapshot { .. }) {
+                context_snapshots += 1;
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        context_snapshots, 6,
+        "tracing persists the context after each of the six tool rounds"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A nested `AGENTS.md` discovered mid-turn is a standing constraint the model
+/// saw. It belongs in the durable transcript like every other injected
+/// message, not only in a snapshot — otherwise a crash after the round loses
+/// the fact that the rule was ever shown.
+#[tokio::test]
+async fn scoped_rules_reach_the_durable_transcript() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-scoped-rules-durable-{}",
+        std::process::id() as u64 * 23 + 41
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/AGENTS.md"), "Nested src rule.").unwrap();
+    std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/a.rs"})),
+        assistant_text("done"),
+    ]));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "read it",
+        &mut |_| {},
+        &mut RecordingSink(recorded.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let durable = recorded.lock().unwrap();
+    let rule_rows = durable
+        .iter()
+        .filter(|m| {
+            m.role == Role::System && m.text_content().contains("--- from src/AGENTS.md ---")
+        })
+        .count();
+    assert_eq!(
+        rule_rows, 1,
+        "the scoped rule must be appended to the transcript exactly once"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn truncate_for_log(text: &str) -> String {
+    text.chars().take(80).collect()
+}
+
+/// A runtime that counts `generate` calls (the compaction summary path) and
+/// streams scripted answers with a large reported usage so the fold decision
+/// fires every round.
+struct SummaryCountingRuntime {
+    responses: Mutex<VecDeque<ModelResponse>>,
+    summaries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelRuntime for SummaryCountingRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(canned);
+        }
+        self.summaries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(assistant_text("a briefing of the elided middle"))
+    }
+
+    async fn stream(
+        &self,
+        _request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+        })?;
+        let mut events = vec![Ok(ModelEvent::MessageStarted {
+            request_id: response.request_id.clone(),
+        })];
+        for part in &response.message.content {
+            match part {
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
+                ContentPart::ToolCall { call } => {
+                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                }
+                _ => {}
+            }
+        }
+        events.push(Ok(ModelEvent::MessageCompleted {
+            finish_reason: response.finish_reason,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+/// The claim the deterministic tier makes: trimming stale tool results before
+/// the fold buys back context that would otherwise have been paid for with a
+/// summarization call. Same workload, same budget, pruning the only variable —
+/// the pruned run must issue strictly fewer summaries and reach the same
+/// answer. (It cannot reach zero: while a big read is still inside the working
+/// set, trimming is not allowed to touch it, and those rounds still fold.)
+#[tokio::test]
+async fn pruning_stale_tool_results_buys_back_summarization_calls() {
+    async fn run_with_pruning(prune: bool, tag: u64) -> (usize, StopReason) {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-agent-prune-ab-{}-{tag}",
+            std::process::id() as u64
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // Reads a little over the prune trigger each. The budget is only blown
+        // after enough of them that the earliest results have left the working
+        // set — which is the situation the deterministic tier is for.
+        let line = format!("// {}\n", "x".repeat(120));
+        let body = line.repeat(leveler_agent::PRUNE_TRIGGER_BYTES / line.len() + 8);
+        for i in 0..12 {
+            std::fs::write(dir.join(format!("src/f{i}.rs")), &body).unwrap();
+        }
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+        let mut responses: Vec<ModelResponse> = (0..12)
+            .map(|i| {
+                assistant_tool_call(
+                    &format!("c{i}"),
+                    "read_file",
+                    serde_json::json!({"path": format!("src/f{i}.rs")}),
+                )
+            })
+            .collect();
+        responses.push(assistant_text("done"));
+
+        let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = Arc::new(SummaryCountingRuntime {
+            responses: Mutex::new(VecDeque::from(responses)),
+            summaries: summaries.clone(),
+        });
+        let outcome = Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            20,
+        )
+        .with_delegation(false)
+        .with_tool_result_pruning(prune)
+        .with_context_budget(45_000)
+        .run(
+            "read them all",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (
+            summaries.load(std::sync::atomic::Ordering::SeqCst),
+            outcome.stop_reason,
+        )
+    }
+
+    let (control, control_stop) = run_with_pruning(false, 51).await;
+    let (pruned, pruned_stop) = run_with_pruning(true, 53).await;
+
+    assert_eq!(control_stop, StopReason::Answered);
+    assert_eq!(
+        pruned_stop, control_stop,
+        "pruning must not change the outcome"
+    );
+    assert!(control > 0, "the control run must actually fold");
+    assert!(
+        pruned < control,
+        "pruning must buy back summarization calls: {pruned} vs {control}"
+    );
+}

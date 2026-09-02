@@ -224,6 +224,12 @@ impl Executor {
             }
             None => None,
         };
+        // Set whenever the model-visible `messages` gain something the durable
+        // transcript (`sink`) does not hold — a transient nudge, a fold. That
+        // is the only time a `ContextSnapshot` carries information; a round
+        // that only appended durable messages is reconstructible from the
+        // transcript alone.
+        let mut context_diverged = false;
         // Task contract → user turn (never system prefix) so prefix cache stays stable.
         let task_contract = TaskContract::parse(&original_task);
         let contract_injection = task_contract.user_injection();
@@ -233,6 +239,7 @@ impl Executor {
                 .any(|m| m.role == Role::User && m.text_content().contains("## Task contract"))
         {
             messages.push(Message::text(Role::User, contract_injection));
+            context_diverged = true;
         }
         // The obligations stay visible for the whole run. This is what stops a
         // requirement from being quietly rescoped: the executor cannot retire
@@ -253,6 +260,7 @@ impl Executor {
                     text.push_str(&format!("- {}: {}\n", r.id, r.text));
                 }
                 messages.push(Message::text(Role::User, text));
+                context_diverged = true;
             }
         }
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
@@ -266,6 +274,7 @@ impl Executor {
             })
         {
             messages.push(Message::text(Role::User, multi_agent_steer_hint()));
+            context_diverged = true;
         }
         let mut session_approved: HashSet<String> = HashSet::new();
         if let Some(dir) = &self.grants_state_dir {
@@ -783,10 +792,16 @@ impl Executor {
             );
             if !fresh.is_empty() {
                 injected_rule_sources.extend(fresh.iter().map(|r| r.source.clone()));
-                messages.push(Message::text(
+                let rules = Message::text(
                     Role::System,
                     format!("Project rules:\n{}", render_instructions(&fresh)),
-                ));
+                );
+                // Durable like every other injected message: a standing
+                // constraint the model saw must survive in the transcript, not
+                // only in a snapshot (the seed drops stale System rows on the
+                // next turn, so this never duplicates the system prompt).
+                sink.append(std::slice::from_ref(&rules)).await?;
+                messages.push(rules);
             }
 
             // C2.3A: after enough plan-less explore rounds, suggest updating the
@@ -1002,6 +1017,7 @@ impl Executor {
                         Role::User,
                         "Continue exactly from the cutoff. Do not repeat prior text. Complete every open list, code block, sentence, and conclusion.",
                     ));
+                    context_diverged = true;
                     continue;
                 }
                 FinishReason::ContentFilter => {
@@ -3544,6 +3560,7 @@ impl Executor {
                                 &parent_edited,
                             ),
                         ));
+                        context_diverged = true;
                     }
                     DelegationRoundAction::Offer { trigger, steps } => {
                         progress.delegation_decision_offered = true;
@@ -3558,6 +3575,7 @@ impl Executor {
                             Role::User,
                             delegation_decision_request(&steps),
                         ));
+                        context_diverged = true;
                     }
                 }
             }
@@ -3626,6 +3644,7 @@ impl Executor {
                          not re-inspect files; the work is done."
                             .to_string(),
                     ));
+                    context_diverged = true;
                 }
                 if progress.should_hard_stop_closeout(progress_caps) {
                     stop_now!(
@@ -3659,6 +3678,7 @@ impl Executor {
                                  say what is known and what is still unknown."
                             ),
                         ));
+                        context_diverged = true;
                         // Continue the drive so the model can synthesize.
                     } else {
                         stop_now!(
@@ -3864,7 +3884,7 @@ impl Executor {
             // the request prefix (cache-preserving); folding rewrites it — so
             // expand-before-compact whenever the evidence supports it.
             let guard_trips = self.tool_context.execution.read_guard.total_trips();
-            let context_action = if has_next_round {
+            let mut context_action = if has_next_round {
                 crate::context_budget::decide_context_action(
                     self.policy.adaptive_context,
                     &self.policy.context_tiers,
@@ -3896,6 +3916,30 @@ impl Executor {
                     crossed_reliable,
                     guard_trips,
                 );
+            }
+            if context_action == crate::context_budget::ContextAction::Compact
+                && self.policy.prune_tool_results
+            {
+                // Cheap tier first: trimming the middle out of tool results
+                // that have left the working set costs no model call and
+                // leaves every message and pairing in place. When it alone
+                // brings the request under budget, the fold — which rewrites
+                // the prefix and pays for a summary — is not needed at all.
+                let pruned = crate::compaction::prune_tool_results(&messages, COMPACT_KEEP_RECENT);
+                let pruned_tokens = estimate_tokens(&pruned);
+                if pruned_tokens < context_tokens {
+                    let reclaimed = context_tokens - pruned_tokens;
+                    messages = pruned;
+                    context_diverged = true;
+                    tracing::debug!(
+                        reclaimed,
+                        budget = context_state.current_budget,
+                        "trimmed stale tool results before folding"
+                    );
+                    if pruned_tokens <= u64::from(context_state.current_budget) {
+                        context_action = crate::context_budget::ContextAction::Keep;
+                    }
+                }
             }
             if context_action == crate::context_budget::ContextAction::Compact {
                 let before = messages.len();
@@ -3960,6 +4004,7 @@ impl Executor {
                         summary.as_deref(),
                         Some(objective.text()),
                     );
+                    context_diverged = true;
                 }
                 if self.hook_runner.has_lifecycle() {
                     self.hook_runner
@@ -3985,12 +4030,17 @@ impl Executor {
             }
 
             // Persist the exact next-request context through the engine event
-            // log. This includes compaction breadcrumbs and transient execution
-            // nudges that do not exist in the append-only raw transcript.
-            if has_next_round {
+            // log — but only when it holds something the append-only raw
+            // transcript does not: a compaction fold or a transient nudge.
+            // A round that merely appended durable messages is reconstructed
+            // from the transcript, and snapshotting it anyway made the log
+            // grow by the whole context every round. `context_trace` (eval
+            // measurement) restores the per-round copy on request.
+            if has_next_round && (context_diverged || self.policy.context_trace) {
                 observer(AgentEvent::ContextSnapshot {
                     messages: messages.clone(),
                 });
+                context_diverged = false;
             }
         }
 
