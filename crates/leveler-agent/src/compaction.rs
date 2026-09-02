@@ -97,6 +97,66 @@ pub(crate) fn compaction_span(
     Some((head_end, tail_start))
 }
 
+/// A tool result larger than this is worth trimming when it is no longer in
+/// the working set. Below it the marker costs more than the trim saves.
+pub const PRUNE_TRIGGER_BYTES: usize = 8 * 1024;
+/// Head bytes kept from a trimmed result: enough for the shape of the output
+/// (a file's opening lines, a command's banner and first errors).
+const PRUNE_HEAD_BYTES: usize = 4 * 1024;
+/// Tail bytes kept: failures and totals land at the end.
+const PRUNE_TAIL_BYTES: usize = 1024;
+/// The text that replaces a trimmed middle. Also the idempotence key: a
+/// result already carrying it is at its floor and is never trimmed again.
+pub const PRUNE_MARKER: &str = "… [tool result middle trimmed to fit the context";
+
+/// The deterministic tier of context reclamation: trim the middle out of
+/// oversized tool results that have left the working set, in place.
+///
+/// This is not compaction. Nothing is dropped, no message or content part
+/// disappears, every `tool_result` keeps its `call_id` and `is_error` (an
+/// orphaned result is a provider 400), and the head/tail that survive keep the
+/// result readable. It costs no model call, and — unlike a fold — it does not
+/// rewrite the prefix's structure, only the bytes inside already-old results.
+///
+/// The last `keep_recent` messages are the working set and are left whole: the
+/// model is still acting on them. Returns the input unchanged when there is
+/// nothing over `PRUNE_TRIGGER_BYTES` to reclaim, so a caller can distinguish
+/// "pruning was not enough" from "pruning did nothing".
+pub fn prune_tool_results(messages: &[Message], keep_recent: usize) -> Vec<Message> {
+    let working_set_start = messages.len().saturating_sub(keep_recent);
+    let mut out = messages.to_vec();
+    for msg in out.iter_mut().take(working_set_start) {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        for part in &mut msg.content {
+            let ContentPart::ToolResult { result } = part else {
+                continue;
+            };
+            if result.content.len() <= PRUNE_TRIGGER_BYTES || result.content.contains(PRUNE_MARKER)
+            {
+                continue;
+            }
+            result.content = trim_middle(&result.content);
+        }
+    }
+    out
+}
+
+/// Head + marker + tail, sliced on char boundaries.
+fn trim_middle(content: &str) -> String {
+    let head = leveler_core::floor_char_boundary(content, PRUNE_HEAD_BYTES);
+    let tail = leveler_core::ceil_char_boundary(content, content.len() - PRUNE_TAIL_BYTES);
+    let dropped = tail - head;
+    format!(
+        "{}\n{PRUNE_MARKER}: {dropped} bytes (~{} tokens). Re-read the source \
+         with read_file/grep if you need what was here.] …\n{}",
+        &content[..head],
+        dropped.div_ceil(3),
+        &content[tail..]
+    )
+}
+
 /// Marker for the host-pinned active objective re-injected after compaction.
 pub(crate) const ACTIVE_OBJECTIVE_MARKER: &str = "[Active objective — host-pinned]";
 
@@ -530,6 +590,128 @@ mod span_tests {
             msg(Role::Assistant, "more work"),
         ];
         assert_eq!(summary_prompt_for(&with_prior), COMPACT_UPDATE_PROMPT);
+    }
+
+    fn tool_result_text(msg: &Message) -> String {
+        msg.content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_msg(call_id: &str, content: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new(call_id),
+                    content: content.to_string(),
+                    is_error: false,
+                },
+            }],
+        }
+    }
+
+    /// The cheap tier: an oversized OLD tool result is trimmed head+tail with
+    /// a marker naming what was dropped and where to read it again. No model
+    /// call, no message dropped, no pairing disturbed.
+    #[test]
+    fn pruning_trims_old_oversized_tool_results_in_place() {
+        let big = "x".repeat(PRUNE_TRIGGER_BYTES * 2);
+        let msgs = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "call"),
+            tool_msg("c1", &big),
+            msg(Role::Assistant, "recent"),
+            tool_msg("c2", &big),
+        ];
+        let out = prune_tool_results(&msgs, 2);
+
+        assert_eq!(out.len(), msgs.len(), "pruning never drops a message");
+        for (before, after) in msgs.iter().zip(out.iter()) {
+            assert_eq!(before.role, after.role);
+            assert_eq!(before.content.len(), after.content.len());
+        }
+        let pruned = tool_result_text(&out[3]);
+        assert!(
+            pruned.len() < big.len(),
+            "the old result must shrink: {} bytes",
+            pruned.len()
+        );
+        assert!(
+            pruned.contains(PRUNE_MARKER),
+            "the trim must say what was dropped: {pruned}"
+        );
+        assert_eq!(
+            tool_result_text(&out[5]).len(),
+            big.len(),
+            "the recent result is the working set and is left whole"
+        );
+        assert!(
+            estimate_tokens(&out) < estimate_tokens(&msgs),
+            "pruning must actually reclaim context"
+        );
+    }
+
+    /// Nothing to reclaim → the input is returned untouched, so the caller can
+    /// tell "pruning was not enough" from "pruning changed nothing".
+    #[test]
+    fn pruning_leaves_small_results_alone() {
+        let msgs = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "call"),
+            tool_msg("c1", "small output"),
+            msg(Role::Assistant, "done"),
+        ];
+        assert_eq!(prune_tool_results(&msgs, 2), msgs);
+    }
+
+    /// Pruning is idempotent: a marker-bearing result is already at its
+    /// floor and must not be trimmed again into nonsense.
+    #[test]
+    fn pruning_is_idempotent() {
+        let big = "y".repeat(PRUNE_TRIGGER_BYTES * 3);
+        let msgs = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "call"),
+            tool_msg("c1", &big),
+            msg(Role::Assistant, "done"),
+        ];
+        let once = prune_tool_results(&msgs, 1);
+        assert_eq!(prune_tool_results(&once, 1), once);
+    }
+
+    /// An error result is the diagnostic the model is acting on; trimming its
+    /// middle is allowed, but the flag and the pairing must survive.
+    #[test]
+    fn pruning_preserves_call_pairing_and_error_flags() {
+        let big = "z".repeat(PRUNE_TRIGGER_BYTES * 2);
+        let mut failing = tool_msg("c1", &big);
+        if let ContentPart::ToolResult { result } = &mut failing.content[0] {
+            result.is_error = true;
+        }
+        let msgs = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "call"),
+            failing,
+            msg(Role::Assistant, "done"),
+        ];
+        let out = prune_tool_results(&msgs, 1);
+        match &out[3].content[0] {
+            ContentPart::ToolResult { result } => {
+                assert_eq!(result.call_id.as_str(), "c1");
+                assert!(result.is_error, "the error flag must survive the trim");
+                assert!(result.content.contains(PRUNE_MARKER));
+            }
+            other => panic!("the result part must stay a tool result: {other:?}"),
+        }
     }
 
     #[test]
