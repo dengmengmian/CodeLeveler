@@ -31,17 +31,18 @@ pub use budget::{
 };
 pub use child_profile::child_profile_trace;
 pub use compaction::{
-    COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, PRUNE_MARKER, PRUNE_TRIGGER_BYTES,
-    compact_messages, estimate_tokens, prune_tool_results, summarize_with_model,
+    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, PRUNE_MARKER,
+    PRUNE_TRIGGER_BYTES, compact_messages, estimate_tokens, prune_tool_results,
+    summarize_with_model,
 };
 pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
     ChildToolEvent, ClarificationRequest, Clarifier, ClarifyOutcome, CompactionCheckpoint,
-    ContinuationPolicy, EventBarrier, ExecutionFence, Executor, ModelRequestRecord, NoopSink,
-    SteeringSource, StepLimits, StopReason, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
-    TranscriptSink, TurnPolicy, closeout,
+    ContinuationPolicy, EventBarrier, ExecutionFence, Executor, ModelCallKind, ModelRequestRecord,
+    NoopSink, SteeringSource, StepLimits, StopReason, SubAgentExecutionPolicies,
+    SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };
 pub use leveler_lifecycle::{
     CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,

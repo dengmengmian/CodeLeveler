@@ -903,6 +903,7 @@ mod tests {
             error_kind: None,
             latency_ms: Some(7100),
             retry_count: 0,
+            kind: leveler_storage::ModelCallKind::Round,
             created_at: now(),
         })
         .await

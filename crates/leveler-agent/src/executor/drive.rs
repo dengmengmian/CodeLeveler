@@ -915,6 +915,7 @@ impl Executor {
                 finish_reason: stream_result.finish_reason,
                 latency_ms: stream_result.latency_ms,
                 retry_count: stream_result.retry_count,
+                kind: crate::ModelCallKind::Round,
             })
             .await?;
             // Zero-usage gateways must not disable the token budget: fall back
@@ -3968,7 +3969,7 @@ impl Executor {
                         )
                         .await;
                 }
-                let mut summary = self
+                let summarized = self
                     .summarize_for_compaction(
                         &messages,
                         COMPACT_KEEP_RECENT,
@@ -3976,6 +3977,23 @@ impl Executor {
                         &cancellation,
                     )
                     .await;
+                // A fold's summarization is a provider call, and until it was
+                // recorded a session that folded reported fewer tokens than it
+                // spent — precisely in the lane a fold is the cost of.
+                if let Some(summarized) = &summarized {
+                    sink.record_model_request(&ModelRequestRecord {
+                        id: summarized.request_id.to_string(),
+                        provider: self.model.provider.clone(),
+                        model: self.model.model.clone(),
+                        usage: summarized.usage,
+                        finish_reason: summarized.finish_reason,
+                        latency_ms: summarized.latency_ms,
+                        retry_count: 0,
+                        kind: crate::ModelCallKind::Compaction,
+                    })
+                    .await?;
+                }
+                let mut summary = summarized.map(|s| s.text);
                 // Long-goal P3: before old context is folded away, the host
                 // cuts a durable checkpoint and hands back its context block
                 // — the fold's summary becomes persisted truth. If the

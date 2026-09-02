@@ -4,6 +4,42 @@ use leveler_core::{SessionId, Timestamp};
 
 use crate::{Database, StorageError};
 
+/// Which lane a model call belongs to. The drive loop's rounds are the work;
+/// everything else is overhead the runtime chose to spend, and cost
+/// attribution has to be able to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCallKind {
+    /// A main-loop round: the model deciding what to do next.
+    Round,
+    /// The summarization behind a compaction fold.
+    Compaction,
+    /// A bounded call the runtime makes on its own account — contract
+    /// derivation, the completion reconciliation judge.
+    Advisory,
+}
+
+impl ModelCallKind {
+    /// The stored token. Stable: it is a persisted value, not a display name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Round => "round",
+            Self::Compaction => "compaction",
+            Self::Advisory => "advisory",
+        }
+    }
+
+    /// Parse a stored token. An unknown one reads as `Round`, matching the
+    /// migration's backfill: every row written before the column existed was
+    /// a main-loop round.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "compaction" => Self::Compaction,
+            "advisory" => Self::Advisory,
+            _ => Self::Round,
+        }
+    }
+}
+
 /// One completed model call, recorded for diagnostics rather than replay: this
 /// row holds no prompt or response text, only the shape of the exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +70,11 @@ pub struct ModelRequestRecord {
     /// Wall-clock duration of the call. `None` when it was never measured
     /// (for example a request that failed before being sent).
     pub latency_ms: Option<u64>,
-    /// Retries *before* this outcome; `0` means it succeeded first try.
+    /// Retries *before* this outcome; `0` means it succeeded first try. One
+    /// row is one LOGICAL call; physical traffic is `1 + retry_count`.
     pub retry_count: u32,
+    /// Which lane this call belongs to.
+    pub kind: ModelCallKind,
     /// When the call finished. Stored as RFC 3339 text and re-parsed on read,
     /// so an unparseable value surfaces as [`StorageError::InvalidData`].
     pub created_at: Timestamp,
@@ -63,8 +102,8 @@ impl<'a> ModelRequestRepository<'a> {
         sqlx::query(
             "INSERT INTO model_requests \
              (id, session_id, provider, model, input_tokens, output_tokens, finish_reason, \
-              error_kind, latency_ms, retry_count, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              error_kind, latency_ms, retry_count, created_at, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -81,6 +120,7 @@ impl<'a> ModelRequestRepository<'a> {
         )
         .bind(i64::from(record.retry_count))
         .bind(record.created_at.to_rfc3339())
+        .bind(record.kind.as_str())
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -110,10 +150,11 @@ impl<'a> ModelRequestRepository<'a> {
                 Option<i64>,
                 i64,
                 String,
+                String,
             ),
         >(
             "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, error_kind, \
-                    latency_ms, retry_count, created_at \
+                    latency_ms, retry_count, created_at, kind \
              FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
         )
         .bind(session_id.as_str())
@@ -133,6 +174,7 @@ impl<'a> ModelRequestRepository<'a> {
                     latency_ms,
                     retry_count,
                     created_at,
+                    kind,
                 )| {
                     Ok(ModelRequestRecord {
                         id,
@@ -145,6 +187,7 @@ impl<'a> ModelRequestRepository<'a> {
                         error_kind,
                         latency_ms: latency_ms.map(|value| value.max(0) as u64),
                         retry_count: retry_count.clamp(0, i64::from(u32::MAX)) as u32,
+                        kind: ModelCallKind::from_stored(&kind),
                         created_at: created_at.parse::<Timestamp>().map_err(|error| {
                             StorageError::InvalidData(format!("model request timestamp: {error}"))
                         })?,
@@ -177,6 +220,7 @@ mod tests {
             error_kind: None,
             latency_ms: Some(42),
             retry_count: 1,
+            kind: ModelCallKind::Round,
             created_at: leveler_core::now(),
         };
 
@@ -188,5 +232,79 @@ mod tests {
         assert_eq!(loaded[0].finish_reason.as_deref(), Some("length"));
         assert_eq!(loaded[0].output_tokens, 20);
         assert_eq!(loaded[0].retry_count, 1);
+    }
+
+    /// Every lane survives the round trip, and each row stays one LOGICAL
+    /// call: the physical traffic behind it is `1 + retry_count`, which is
+    /// what separates "three summaries" from "one summary retried twice".
+    #[tokio::test]
+    async fn each_call_kind_round_trips_and_stays_one_logical_call() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "provider/model", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let session_id = SessionId::new(session.id);
+        let repo = ModelRequestRepository::new(&db);
+        for (id, kind, retries) in [
+            ("r-1", ModelCallKind::Round, 2u32),
+            ("c-1", ModelCallKind::Compaction, 0),
+            ("a-1", ModelCallKind::Advisory, 1),
+        ] {
+            repo.insert(&ModelRequestRecord {
+                id: id.to_string(),
+                session_id: session_id.clone(),
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 10,
+                output_tokens: 2,
+                finish_reason: Some("stop".to_string()),
+                error_kind: None,
+                latency_ms: Some(1),
+                retry_count: retries,
+                kind,
+                created_at: leveler_core::now(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let loaded = repo.load_for_session(&session_id).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                ModelCallKind::Round,
+                ModelCallKind::Compaction,
+                ModelCallKind::Advisory
+            ]
+        );
+        let logical = loaded.len();
+        let physical: u32 = loaded.iter().map(|r| 1 + r.retry_count).sum();
+        assert_eq!((logical, physical), (3, 6));
+    }
+
+    /// A row written before the column existed is a main-loop round, because
+    /// that is all the old writer could produce. The migration's backfill says
+    /// so, and reading must agree with it.
+    #[tokio::test]
+    async fn a_pre_migration_row_reads_as_a_round() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "provider/model", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let session_id = SessionId::new(session.id);
+        sqlx::query(
+            "INSERT INTO model_requests \
+             (id, session_id, provider, model, input_tokens, output_tokens, created_at) \
+             VALUES ('legacy', ?1, 'p', 'm', 1, 1, ?2)",
+        )
+        .bind(session_id.as_str())
+        .bind(leveler_core::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let loaded = ModelRequestRepository::new(&db)
+            .load_for_session(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded[0].kind, ModelCallKind::Round);
     }
 }

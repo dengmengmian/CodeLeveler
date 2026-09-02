@@ -9584,3 +9584,90 @@ async fn pruning_stale_tool_results_buys_back_summarization_calls() {
         "pruning must buy back summarization calls: {pruned} vs {control}"
     );
 }
+
+/// A sink that records the model-call ledger the runtime keeps.
+struct LedgerSink(Arc<Mutex<Vec<(String, leveler_agent::ModelCallKind)>>>);
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for LedgerSink {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), AgentError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((record.id.clone(), record.kind));
+        Ok(())
+    }
+}
+
+/// A fold's summarization is a provider call. Until it was recorded, a session
+/// that folded reported fewer tokens than it spent — and the missing tokens
+/// were exactly the ones a fold costs, which is the number any "cheaper than
+/// folding" claim has to be measured against.
+#[tokio::test]
+async fn a_folds_summarization_is_recorded_as_a_compaction_call() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-fold-ledger-{}",
+        std::process::id() as u64 * 23 + 47
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let mut responses: Vec<ModelResponse> = (0..16)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": "src/lib.rs"}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("done reading"));
+    let runtime = Arc::new(CompactingRuntime {
+        responses: Mutex::new(VecDeque::from(responses)),
+        saw_breadcrumb: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+
+    let ledger = Arc::new(Mutex::new(Vec::new()));
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    // 500k reported usage against this budget folds every round.
+    .with_context_budget(1000)
+    .run(
+        "read it many times",
+        &mut |_| {},
+        &mut LedgerSink(ledger.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let ledger = ledger.lock().unwrap();
+    let rounds = ledger
+        .iter()
+        .filter(|(_, k)| *k == leveler_agent::ModelCallKind::Round)
+        .count();
+    let compactions = ledger
+        .iter()
+        .filter(|(_, k)| *k == leveler_agent::ModelCallKind::Compaction)
+        .count();
+    assert!(rounds > 0, "the loop's own rounds are still recorded");
+    assert!(
+        compactions > 0,
+        "every fold's summary call must be on the ledger: {ledger:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

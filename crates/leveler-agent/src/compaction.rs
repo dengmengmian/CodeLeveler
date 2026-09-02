@@ -311,6 +311,19 @@ pub(crate) fn summary_prompt_for(to_summarize: &[Message]) -> &'static str {
 /// is about to elide. Returns `None` when there is nothing to fold or the
 /// call fails/times out — callers then fold with a bare breadcrumb, which
 /// still beats overflowing the window (and the loss stays explicit).
+/// A handoff briefing plus what producing it cost. The cost travels with the
+/// text because a fold's summarization is a real provider call that nothing
+/// else records: without this the token totals of a session that folded are
+/// short by exactly the calls a fold makes.
+#[derive(Debug, Clone)]
+pub struct CompactionSummary {
+    pub text: String,
+    pub usage: leveler_model::TokenUsage,
+    pub request_id: leveler_core::RequestId,
+    pub finish_reason: leveler_model::FinishReason,
+    pub latency_ms: u64,
+}
+
 pub async fn summarize_with_model(
     runtime: &dyn leveler_model::ModelRuntime,
     model: &leveler_model::ModelRef,
@@ -319,7 +332,7 @@ pub async fn summarize_with_model(
     keep_recent: usize,
     keep_recent_tokens: u64,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> Option<String> {
+) -> Option<CompactionSummary> {
     // Advisory call: never let a slow summarizer stall the main loop.
     const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let (_, tail_start) = compaction_span(messages, keep_recent, keep_recent_tokens)?;
@@ -332,6 +345,7 @@ pub async fn summarize_with_model(
     request.max_output_tokens = Some(1024);
     request.reasoning_effort = reasoning_effort;
 
+    let started = std::time::Instant::now();
     let response = tokio::time::timeout(
         SUMMARY_TIMEOUT,
         runtime.generate(request, cancellation.child_token()),
@@ -339,8 +353,15 @@ pub async fn summarize_with_model(
     .await
     .ok()?
     .ok()?;
+    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let text = response.message.text_content().trim().to_string();
-    (!text.is_empty()).then_some(text)
+    (!text.is_empty()).then_some(CompactionSummary {
+        text,
+        usage: response.usage,
+        request_id: response.request_id,
+        finish_reason: response.finish_reason,
+        latency_ms,
+    })
 }
 
 /// Coarse token estimate over a transcript's textual content. A fallback for

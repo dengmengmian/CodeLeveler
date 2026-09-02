@@ -41,7 +41,7 @@ pub use message_repo::MessageRepository;
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,
 };
-pub use model_request_repo::{ModelRequestRecord, ModelRequestRepository};
+pub use model_request_repo::{ModelCallKind, ModelRequestRecord, ModelRequestRepository};
 pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };

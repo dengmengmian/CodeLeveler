@@ -322,7 +322,7 @@ impl Executor {
         keep_recent: usize,
         keep_recent_tokens: u64,
         cancellation: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Option<crate::compaction::CompactionSummary> {
         crate::compaction::summarize_with_model(
             self.runtime.as_ref(),
             &self.model,

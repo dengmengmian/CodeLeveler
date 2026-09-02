@@ -15,21 +15,35 @@ those would bury a millisecond-scale effect under model variance.
 | 7 | Is re-sending the reasoning chain worth its own re-billing? | Model behaviour, A/B | Paid + one implementation |
 | 9 | How much turn-start latency does the full-transcript load cost? | Latency, benchmark | Free |
 
-## 0. Shared instrumentation (prerequisite, unpaid)
+## 0. Shared instrumentation (prerequisite) — done
 
-`model_requests` records one row per completed request with a summary
-`retry_count`, so a logical round and the HTTP traffic behind it cannot be
-told apart. Neither A/B below is readable without that split:
+The gap was worse than "the lanes are unlabelled". `model_requests` only ever
+held main-loop rounds: the drive loop recorded one row per streamed round,
+while the summarization behind a compaction fold went straight to the runtime
+and was **not recorded at all**. A session that folded reported fewer tokens
+than it spent, and the missing tokens were exactly the ones a fold costs —
+the number any "cheaper than folding" claim has to be measured against. An
+A/B read off that table would have understated the control arm precisely
+where the ablated arm claims to save.
 
-| Counter | Counts |
+Shipped: a `kind` column (`round` | `compaction` | `advisory`), the fold's
+summary call recorded under `compaction`, and a stated meaning for the row —
+one row is one LOGICAL call, so physical traffic is `SUM(1 + retry_count)`
+and logical calls are `COUNT(*)`, per lane. Pre-migration rows read as
+`round`, which is a fact about what the old writer could produce, not a guess.
+
+| Counter | Read as |
 | --- | --- |
-| `logical_rounds` | Model turns the drive loop took |
-| `physical_attempts` | Requests actually sent, retries included |
-| `advisory_calls` | Contract derivation, completion judge, closeout nudge |
-| `compaction_calls` | Summarization for a fold |
+| Logical rounds | `COUNT(*) WHERE kind='round'` |
+| Physical attempts | `SUM(1 + retry_count)` over the lane |
+| Compaction calls | `COUNT(*) WHERE kind='compaction'` |
 
-Item 6's whole claim is "fewer `compaction_calls` for the same result". Today
-that is only observable by counting mock calls in a test.
+**Known gap.** Contract derivation and the completion reconciliation judge
+are still unrecorded; the `advisory` lane exists but nothing writes it yet.
+Both arms of both A/Bs pay those equally, so they do not bias a comparison —
+but a session's absolute token total is still short by them, and a
+cost-attribution report must say so rather than present the total as
+complete.
 
 ## 1. Item 6 — deterministic trimming
 

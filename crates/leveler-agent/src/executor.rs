@@ -716,7 +716,25 @@ pub struct ModelRequestRecord {
     pub usage: TokenUsage,
     pub finish_reason: FinishReason,
     pub latency_ms: u64,
+    /// Retries *before* this outcome. One record is one LOGICAL call, so the
+    /// physical traffic behind it is `1 + retry_count`.
     pub retry_count: u32,
+    /// Which lane this call belongs to. A fold's summarization is a provider
+    /// call like any other; recording it under its own lane is what lets a
+    /// session's cost be attributed to the work versus the overhead.
+    pub kind: ModelCallKind,
+}
+
+/// Which lane a model call belongs to. The drive loop's rounds are the work;
+/// a fold's summarization is overhead the runtime chose to spend, and cost
+/// attribution has to be able to tell them apart. Mapped onto the storage
+/// enum at the engine boundary — this crate does not depend on storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCallKind {
+    /// A main-loop round: the model deciding what to do next.
+    Round,
+    /// The summarization behind a compaction fold.
+    Compaction,
 }
 
 /// A sink that discards everything (non-persistent runs, tests).

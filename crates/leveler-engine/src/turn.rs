@@ -90,6 +90,12 @@ impl TranscriptSink for TurnSink {
                 error_kind: None,
                 latency_ms: Some(record.latency_ms),
                 retry_count: record.retry_count,
+                kind: match record.kind {
+                    leveler_agent::ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
+                    leveler_agent::ModelCallKind::Compaction => {
+                        leveler_storage::ModelCallKind::Compaction
+                    }
+                },
                 created_at: leveler_core::now(),
             })
             .await

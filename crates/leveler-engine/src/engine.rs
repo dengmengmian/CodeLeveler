@@ -492,6 +492,7 @@ impl crate::ContextSummarizer for ModelSummarizer<'_> {
             self.cancellation,
         )
         .await
+        .map(|summary| summary.text)
     }
 }
 
@@ -1250,6 +1251,7 @@ impl TaskEngine {
             cancellation,
         )
         .await
+        .map(|summary| summary.text)
     }
 
     /// The explicit reconciliation flow behind `RecoveryConfirmationRequired`:
