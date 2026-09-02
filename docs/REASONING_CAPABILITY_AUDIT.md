@@ -193,3 +193,50 @@ Shipped in this tree:
   and never infers from the model name.
 - `leveler models show` / `leveler doctor` print the matrix.
 - Contract test walks `configs/models/*`.
+
+## 9. Open question: the pass-back reasoning chain is always empty (2026-09-02)
+
+Found while auditing token cost, not fixed here — the right answer needs
+a measurement this audit cannot supply.
+
+**The mechanism.** `configs/models/deepseek-v4-pro.yaml` and
+`deepseek-v4-flash.yaml` both set `compatibility.passback_reasoning_content:
+true`, so the OpenAI Chat adapter attaches `reasoning_content` to every
+assistant message that carries tool calls (`openai_chat/mod.rs`, the
+`passback_reasoning` branch). That is the contract DeepSeek's thinking mode
+asks for.
+
+**The gap.** The streaming path never stores what it received. `stream_round`
+observes `ReasoningDelta` for the UI and drops it; the message it returns
+holds only `Text` and `ToolCall` parts (`executor/stream.rs`). So the key is
+always present and always `""`. The non-streaming `decode_response` does keep
+`Reasoning` parts, but the drive loop does not use it.
+
+Net effect: on a thinking model, every tool-calling round pays for reasoning
+output tokens and then discards the chain before the next request. The wire
+stays valid — DeepSeek accepts the empty string — so nothing fails loudly.
+
+**Why this is not obviously a bug.** Re-sending the chain is not free: those
+tokens re-enter the input of every subsequent request in the turn, and they
+accumulate exactly like tool results do (see C2.1 §12). DeepSeek Harness
+takes the opposite position — it replays `reasoning_content` in full and
+relies solely on a 0.8-of-window compaction trigger, with no progressive
+decay. Neither position has been measured here.
+
+**What would settle it.** One ablation on the existing eval seam, thinking
+model only, single variable:
+
+| Arm | Assistant message keeps reasoning | Wire carries it |
+| --- | --- | --- |
+| control | no (today) | `reasoning_content: ""` |
+| ablated | yes, for the current tool loop | the captured chain |
+
+Report per arm: completion rate, rounds to first edit, provider
+`input_tokens` and `cached_input_tokens` totals, and output tokens. The
+question is whether the chain buys enough continuity to pay for its own
+re-billing. If the arms tie, keep today's behaviour and delete the
+pass-back flag from both profiles rather than leaving a contract that
+carries nothing.
+
+Blocked on: capturing reasoning in `stream_round` (the ablated arm cannot
+exist without it) and a real-API budget for the run.

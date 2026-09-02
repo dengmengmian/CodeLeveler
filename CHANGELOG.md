@@ -6,6 +6,59 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **A context snapshot is persisted only when the context diverges from the
+  transcript.** The drive loop wrote `ContextSnapshot` — the whole model
+  context — after every round with a next round. Each one was cloned,
+  serialized, scanned for secrets, and fsynced, so a long turn wrote the
+  transcript back to the event log once per round and the log grew with the
+  square of the turn. Almost all of it was reconstructible: the loop already
+  persists its nudges, settlements and directives through the transcript
+  sink. Only a compaction fold or a transient injection puts something in the
+  context that the transcript does not hold, and only those now snapshot.
+  Scoped `AGENTS.md` rules join the transcript like every other injected
+  message. `leveler eval` sets the new `context_trace` override, which
+  restores the per-round copy that `scripts/analyze_context.py` reads.
+- **Turn-start reconciliation reads the event types it pairs on.** Finding
+  ghost children, dangling tool calls and a session's reviewer each scanned
+  and decoded the whole event log, which included every context snapshot
+  above. They use the indexed by-type query and its existing
+  `(session_id, type, sequence)` index instead. Behaviour is unchanged; a
+  corrupt row of a type a scan depends on still fails closed with the same
+  provenance.
+- **A chat turn summarizes only the context it is about to fold.** Over the
+  pre-request threshold, every chat, resume and goal-continuation turn made a
+  summarization call before assembling. Assembly then usually found that the
+  latest snapshot plus its tail already fit and discarded the summary — so a
+  long session paid for a large model call per turn and threw the result
+  away. The briefing is now produced through a `ContextSummarizer` that
+  assembly consults only when the merged context is still oversized, over the
+  messages actually being folded.
+- **`read_file` pages at the budget the registry enforces.** The tool built up
+  to 256 KiB and the central cap then cut the result to the turn's budget,
+  keeping head and tail. The surviving paging marker said `start_line=N` for
+  an `N` past the elided middle, so the model's next page skipped lines it had
+  never seen. The tool now pages at the effective budget, so its own marker is
+  the only truncation and the pointer names the first unread line.
+- **Only the leading system block reaches Anthropic's `system` field.** The
+  adapter hoisted every `Role::System` message. The drive loop appends
+  standing constraints (nested rules, memory recall) at the tail precisely to
+  keep the cached prefix intact, and hoisting them rewrote that prefix on
+  every discovery. A later system message is conversation and stays in place.
+- **An event append no longer reads its own row back.** `append_owned` did an
+  INSERT and then a SELECT; the INSERT returns the row.
+
+### Added
+- **Deterministic tool-result trimming before a fold** (`prune_tool_results`,
+  off by default). When the context is over budget, the middle of oversized
+  tool results that have left the working set can be trimmed in place — no
+  model call, no message dropped, every `tool_result` keeping its `call_id`
+  and error flag. When that alone brings the request under budget the fold,
+  which rewrites the prefix and pays for a summary, does not happen. The value
+  on real workloads is unmeasured (C2.2 found the lossless variant reclaimed
+  almost nothing), so it ships behind the `prune_tool_results` eval knob until
+  an A/B says otherwise.
+
 ### Fixed
 - **`leveler upgrade` understands pre-releases.** Publishing `0.2.0-beta.1` and
   then running the binary exposed four defects with one root cause: the version
