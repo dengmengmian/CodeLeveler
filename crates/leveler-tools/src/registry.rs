@@ -624,7 +624,19 @@ mod tests {
 
     #[tokio::test]
     async fn per_context_budget_caps_tool_output() {
-        // A model-specific budget on the context must shrink the central cap.
+        // A model-specific budget on the context must shrink what a tool
+        // returns. It used to be the central cap that did the shrinking, and
+        // this asserted its "elided" marker. `read_file` now pages at the same
+        // budget itself, so the cap has nothing left to chop and the marker is
+        // the tool's own — which is the point of that change: the central
+        // cap's marker carried a `start_line` past the middle it had just
+        // removed, so the model paged over lines it never saw.
+        //
+        // The obligation is unchanged and still asserted: the budget binds,
+        // and the truncation says so. This fixture is one 16 KB line, so it
+        // takes the within-a-line branch, which deliberately points at grep
+        // rather than at a next line that does not exist — the paging pointer
+        // itself is covered where it applies, in `read_file`'s own tests.
         let dir = std::env::temp_dir().join(format!("leveler-reg-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("big.txt"), "x".repeat(16 * 1024)).unwrap();
@@ -646,7 +658,11 @@ mod tests {
             "output must respect the per-context budget, got {} bytes",
             out.content.len()
         );
-        assert!(out.content.contains("elided"), "must mark the elision");
+        assert!(
+            out.content.contains("truncated"),
+            "a truncated result must say so: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

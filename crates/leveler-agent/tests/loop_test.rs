@@ -9447,63 +9447,6 @@ fn truncate_for_log(text: &str) -> String {
     text.chars().take(80).collect()
 }
 
-/// A runtime that counts `generate` calls (the compaction summary path) and
-/// streams scripted answers with a large reported usage so the fold decision
-/// fires every round.
-struct SummaryCountingRuntime {
-    responses: Mutex<VecDeque<ModelResponse>>,
-    summaries: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait]
-impl ModelRuntime for SummaryCountingRuntime {
-    async fn generate(
-        &self,
-        request: ModelRequest,
-        _c: CancellationToken,
-    ) -> Result<ModelResponse, ModelError> {
-        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(canned);
-        }
-        self.summaries
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(assistant_text("a briefing of the elided middle"))
-    }
-
-    async fn stream(
-        &self,
-        _request: ModelRequest,
-        _c: CancellationToken,
-    ) -> Result<ModelEventStream, ModelError> {
-        use leveler_model::ModelEvent;
-        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
-        })?;
-        let mut events = vec![Ok(ModelEvent::MessageStarted {
-            request_id: response.request_id.clone(),
-        })];
-        for part in &response.message.content {
-            match part {
-                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
-                    delta: text.clone(),
-                })),
-                ContentPart::ToolCall { call } => {
-                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
-                }
-                _ => {}
-            }
-        }
-        events.push(Ok(ModelEvent::MessageCompleted {
-            finish_reason: response.finish_reason,
-        }));
-        Ok(Box::pin(futures::stream::iter(events)))
-    }
-
-    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
-    }
-}
-
 /// The claim the deterministic tier makes, on its own trigger: stale tool
 /// results are reclaimed even when the fold never comes due. That is the
 /// whole point of the retrigger — the fold does not happen on real task runs,
@@ -9824,8 +9767,7 @@ async fn run_with_kept_reasoning(keep: bool, tag: u64) -> Vec<Vec<Message>> {
     .await
     .unwrap();
     std::fs::remove_dir_all(&dir).ok();
-    let out = seen.lock().unwrap().clone();
-    out
+    seen.lock().unwrap().clone()
 }
 
 /// Today's behaviour, and the control arm: the reasoning a round produced is
