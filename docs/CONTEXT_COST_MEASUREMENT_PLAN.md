@@ -45,6 +45,41 @@ but a session's absolute token total is still short by them, and a
 cost-attribution report must say so rather than present the total as
 complete.
 
+## 0b. What the first run found: the fold does not fire (2026-09-02)
+
+The item 6 ablation ran and answered a different question than it asked.
+
+Four runs (two cases x two arms, frozen `670329b08742`, v4-flash) folded
+**zero** times. Single-round context peaked at 84,560 tokens against a
+`reliable_context` fold threshold of 786,432 — 10.8 %. Trimming is wired
+*inside* the fold decision, so it never executed, and the arms differ only by
+run-to-run variance. Verdict: INCONCLUSIVE, default stays off. Evidence and
+per-run numbers: `DOGFOOD_ROOT/eval/state/prune-ab-670329b08742/REPORT.md`.
+
+**This supersedes the assumption under §1 and §2.** C2.1 §8 had already
+recorded it (gate at 524k, runs reaching 19–24 %, zero `Compacted` events) and
+C5's closeout recorded it from the other side: agents suppress their own
+context demand with grep and range reads rather than accumulating toward the
+window. This is the third observation, and the first with the fold lane
+instrumented well enough to prove the absence rather than infer it.
+
+What follows from it:
+
+- **A fold-triggered mechanism has no surface on the task path.** Trimming, a
+  cheaper summarizer, a smarter retention rule — none of them can help or be
+  measured where the fold never runs.
+- **The compaction machinery is unexercised in production task runs.** Not
+  dead code (chat's 24k threshold reaches it), but its task-path behaviour is
+  not exercised by real usage, which is worth knowing before relying on it.
+- **Measuring one requires changing the trigger.** Either lower the threshold —
+  a second variable, so a three-arm design that separates "the mechanism" from
+  "folding earlier" — or find a workload that genuinely reaches ~786k, which
+  C5's E2 found agents actively avoid producing.
+
+The process lesson is cheaper than the run: verify that a mechanism's trigger
+fires on the chosen cases before paying for arms. The information needed was
+already in C2.1 §8.
+
 ## 1. Item 6 — deterministic trimming
 
 Mechanism shipped, default off, behind the `prune_tool_results` eval knob.
