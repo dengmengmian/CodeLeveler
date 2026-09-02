@@ -23,6 +23,13 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         1,
         "side-question context assembly: reads the latest snapshot, never appends",
     ),
+    (
+        "leveler-engine/src/engine.rs",
+        1,
+        "bounded transcript load: reads the latest snapshot's watermark to decide \
+         how much history to read, before the turn's ownership token exists, and \
+         never appends",
+    ),
 ];
 
 const SCANNED: &[&str] = &["src", "../leveler-app/src"];

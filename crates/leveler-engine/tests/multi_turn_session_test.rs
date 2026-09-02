@@ -770,3 +770,206 @@ async fn second_chat_after_compact_does_not_summarize_again() {
         "chat2 fits under the budget from the snapshot; it must not pay for a summary it discards"
     );
 }
+
+/// A counting message store: the point of a bounded load is what it does NOT
+/// read, and only the store can say.
+struct CountingMessageStore {
+    inner: leveler_storage::MemoryMessageStore,
+    full_loads: std::sync::atomic::AtomicUsize,
+    rows_read: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingMessageStore {
+    fn new() -> Self {
+        Self {
+            inner: leveler_storage::MemoryMessageStore::new(),
+            full_loads: std::sync::atomic::AtomicUsize::new(0),
+            rows_read: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl leveler_storage::MessageStore for CountingMessageStore {
+    async fn append_in_turn(
+        &self,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        payloads: &[String],
+        now: leveler_core::Timestamp,
+    ) -> Result<(), leveler_storage::StorageError> {
+        self.inner
+            .append_in_turn(session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        payloads: &[String],
+        now: leveler_core::Timestamp,
+    ) -> Result<(), leveler_storage::OwnershipError> {
+        self.inner
+            .append_in_turn_owned(token, session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn load(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<Vec<String>, leveler_storage::StorageError> {
+        self.full_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.inner.load(session_id).await?;
+        self.rows_read
+            .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(rows)
+    }
+
+    async fn load_from(
+        &self,
+        session_id: &leveler_core::SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, leveler_storage::StorageError> {
+        let rows = self.inner.load_from(session_id, from).await?;
+        self.rows_read
+            .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(rows)
+    }
+
+    /// A size query, not a read: it must not count as either.
+    async fn total_bytes(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<u64, leveler_storage::StorageError> {
+        self.inner.total_bytes(session_id).await
+    }
+}
+
+/// A watermarked snapshot says the rows before it are already represented, and
+/// a transcript this size provably cannot fit the fold threshold whole. The
+/// load reads the tail, not the session.
+#[tokio::test]
+async fn a_watermarked_snapshot_bounds_what_a_turn_reads() {
+    use leveler_storage::MessageStore;
+
+    let store = CountingMessageStore::new();
+    let session = leveler_core::SessionId::generate();
+    let turn = leveler_core::TurnId::new("t1");
+    let pad = "detail-about-the-login-timeout-and-the-retry-policy ".repeat(60);
+    let payloads: Vec<String> = (0..400)
+        .map(|i| {
+            serde_json::to_string(&Message::text(Role::Assistant, format!("note {i} {pad}")))
+                .unwrap()
+        })
+        .collect();
+    store
+        .append_in_turn(&session, &turn, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    let threshold = 24_000u64;
+    let bounded = leveler_engine::RawTranscript::load_bounded(
+        &store,
+        &session,
+        threshold,
+        Some(380),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bounded.offset(), 380, "the tail begins at the watermark");
+    assert_eq!(bounded.messages.len(), 20);
+    assert_eq!(bounded.stored_len(), 400, "the full length is still known");
+    assert_eq!(
+        store.rows_read.load(std::sync::atomic::Ordering::SeqCst),
+        20,
+        "only the tail was read"
+    );
+    assert_eq!(
+        store.full_loads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a bounded load must not fall through to the full one"
+    );
+}
+
+/// Under the threshold the transcript may still be sent whole, so it is read
+/// whole — a snapshot is never a permanent replacement for a later turn.
+#[tokio::test]
+async fn a_transcript_that_may_still_fit_is_read_whole() {
+    use leveler_storage::MessageStore;
+
+    let store = CountingMessageStore::new();
+    let session = leveler_core::SessionId::generate();
+    let turn = leveler_core::TurnId::new("t1");
+    let payloads: Vec<String> = (0..10)
+        .map(|i| {
+            serde_json::to_string(&Message::text(Role::Assistant, format!("short {i}"))).unwrap()
+        })
+        .collect();
+    store
+        .append_in_turn(&session, &turn, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    let bounded =
+        leveler_engine::RawTranscript::load_bounded(&store, &session, 24_000, Some(8), None, None)
+            .await
+            .unwrap();
+
+    assert_eq!(bounded.offset(), 0);
+    assert_eq!(bounded.messages.len(), 10);
+    assert_eq!(
+        store.full_loads.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+/// A checkpoint reaches further back than the snapshot, so it is the binding
+/// watermark. Loading from the snapshot's instead would hand the checkpoint
+/// path a delta that starts after the point it splices from.
+#[tokio::test]
+async fn the_checkpoint_watermark_binds_when_it_reaches_further_back() {
+    use leveler_storage::MessageStore;
+
+    let store = CountingMessageStore::new();
+    let session = leveler_core::SessionId::generate();
+    let turn = leveler_core::TurnId::new("t1");
+    let pad = "detail-about-the-login-timeout-and-the-retry-policy ".repeat(60);
+    let payloads: Vec<String> = (0..400)
+        .map(|i| {
+            serde_json::to_string(&Message::text(Role::Assistant, format!("note {i} {pad}")))
+                .unwrap()
+        })
+        .collect();
+    store
+        .append_in_turn(&session, &turn, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    let bounded = leveler_engine::RawTranscript::load_bounded(
+        &store,
+        &session,
+        24_000,
+        Some(380),
+        Some(200),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bounded.offset(), 200, "the earlier watermark wins");
+    assert_eq!(bounded.messages.len(), 200);
+    assert!(
+        bounded.slice_from_ordinal(200).is_some(),
+        "the checkpoint's own splice point must be servable"
+    );
+    assert!(
+        bounded.slice_from_ordinal(199).is_none(),
+        "anything earlier is honestly reported as unavailable"
+    );
+}

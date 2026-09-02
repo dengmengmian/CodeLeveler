@@ -929,8 +929,7 @@ impl TaskEngine {
         };
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
-        let raw =
-            crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
+        let raw = self.load_request_transcript(session_id, None).await?;
         let token = self.mark_running(session_id).await?;
         let log = EventLog::new_owned(
             self.stores.events.as_ref(),
@@ -952,7 +951,7 @@ impl TaskEngine {
             .checkpointed_prior(
                 &log,
                 session_id,
-                &raw.messages,
+                &raw,
                 Some(&spec.coding.repository),
                 &cancellation,
                 observer,
@@ -1059,12 +1058,9 @@ impl TaskEngine {
                 outcome.map(|o| o.as_str()).unwrap_or_default()
             )));
         }
-        let raw = crate::RawTranscript::load_strict(
-            self.stores.messages.as_ref(),
-            session_id,
-            "transcript",
-        )
-        .await?;
+        let raw = self
+            .load_request_transcript(session_id, Some("transcript"))
+            .await?;
         if raw.is_empty() {
             return Err(EngineError::Config(format!(
                 "session {session_id} has no transcript to resume; \
@@ -1082,12 +1078,8 @@ impl TaskEngine {
         // transcript after its watermark. No usable checkpoint (none written,
         // corrupt, future version, stale watermark) falls back to the
         // pre-checkpoint full-history path below.
-        let checkpoint_prior = crate::checkpoint::resume_prior_from_checkpoint(
-            &self.stores,
-            session_id,
-            &raw.messages,
-        )
-        .await?;
+        let checkpoint_prior =
+            crate::checkpoint::resume_prior_from_checkpoint(&self.stores, session_id, &raw).await?;
         let prior = if let Some(prior) = checkpoint_prior {
             prior
         } else {
@@ -1150,17 +1142,44 @@ impl TaskEngine {
     /// threshold, no goal in scope, or checkpoint creation failed — every
     /// fold leaves the durable transcript untouched, so the fallback
     /// degrades only to exactly the pre-P3 context, never to lost history.
+    /// Load the transcript a request needs, reading only the tail when both
+    /// watermarks prove the earlier rows unreachable. Falls back to the full
+    /// load whenever either is unknown; see
+    /// [`crate::session_context::RawTranscript::load_bounded`].
+    async fn load_request_transcript(
+        &self,
+        session_id: &SessionId,
+        strict: Option<&str>,
+    ) -> Result<crate::RawTranscript, EngineError> {
+        let threshold = u64::from(crate::ContextPolicy::chat_default().initial_budget);
+        let snapshot_ordinal = EventLog::new(self.stores.events.as_ref(), session_id.clone())
+            .latest_context_snapshot(None)
+            .await?
+            .and_then(|view| view.through_ordinal);
+        let checkpoint_ordinal =
+            crate::checkpoint::checkpoint_transcript_ordinal(&self.stores, session_id).await?;
+        crate::RawTranscript::load_bounded(
+            self.stores.messages.as_ref(),
+            session_id,
+            threshold,
+            snapshot_ordinal,
+            checkpoint_ordinal,
+            strict,
+        )
+        .await
+    }
+
     async fn checkpointed_prior(
         &self,
         log: &EventLog<'_>,
         session_id: &SessionId,
-        raw: &[leveler_model::Message],
+        raw: &crate::RawTranscript,
         repo: Option<&std::path::Path>,
         cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
         let threshold = u64::from(crate::ContextPolicy::chat_default().initial_budget);
-        if leveler_agent::estimate_tokens(raw) <= threshold {
+        if leveler_agent::estimate_tokens(&raw.messages) <= threshold {
             return Ok(None);
         }
         // Cheap goal probe BEFORE any model call: a session with no goal
@@ -1178,7 +1197,7 @@ impl TaskEngine {
         {
             return Ok(Some(prior));
         }
-        let summary = self.summarize_if_over(raw, cancellation).await;
+        let summary = self.summarize_if_over(&raw.messages, cancellation).await;
         match crate::checkpoint::create_goal_checkpoint(
             &self.stores,
             session_id,
@@ -1193,15 +1212,18 @@ impl TaskEngine {
                 log.append(None, event, observer).await?;
                 // The checkpoint block, plus a bounded raw tail for local
                 // continuity — the same recency window the pre-P3 fold kept.
-                let tail_start = raw.len().saturating_sub(leveler_agent::COMPACT_KEEP_RECENT);
-                let mut prior = Vec::with_capacity(1 + raw.len() - tail_start);
+                let tail_start = raw
+                    .messages
+                    .len()
+                    .saturating_sub(leveler_agent::COMPACT_KEEP_RECENT);
+                let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
                 prior.push(leveler_model::Message {
                     role: leveler_model::Role::User,
                     content: vec![leveler_model::ContentPart::Text {
                         text: record.payload.context_block(),
                     }],
                 });
-                prior.extend_from_slice(&raw[tail_start..]);
+                prior.extend_from_slice(&raw.messages[tail_start..]);
                 Ok(Some(prior))
             }
             Ok(None) => Ok(None),
@@ -1493,8 +1515,7 @@ impl TaskEngine {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
-        let raw =
-            crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
+        let raw = self.load_request_transcript(session_id, None).await?;
         if raw.is_empty() {
             return Ok(Vec::new());
         }
@@ -1503,7 +1524,7 @@ impl TaskEngine {
         // continues from a durable checkpoint (fresh or cut here) instead of
         // a blunt last-N tail of replayed history.
         if let Some(prior) = self
-            .checkpointed_prior(log, session_id, &raw.messages, repo, cancellation, observer)
+            .checkpointed_prior(log, session_id, &raw, repo, cancellation, observer)
             .await?
         {
             return Ok(prior);
@@ -1681,12 +1702,12 @@ impl TaskEngine {
                 .as_key()
                 .to_string(),
         });
-        let raw = crate::RawTranscript::load_strict(
-            self.stores.messages.as_ref(),
-            &runner.session_id,
-            "goal transcript during continuation",
-        )
-        .await?;
+        let raw = self
+            .load_request_transcript(
+                &runner.session_id,
+                Some("goal transcript during continuation"),
+            )
+            .await?;
         // Long-goal P3: a window boundary over the fold threshold continues
         // from a durable checkpoint (fresh or cut here) instead of replaying
         // the earlier windows' history.
@@ -1694,7 +1715,7 @@ impl TaskEngine {
             .checkpointed_prior(
                 log,
                 &runner.session_id,
-                &raw.messages,
+                &raw,
                 Some(&spec.coding.repository),
                 cancellation,
                 observer,
@@ -1772,6 +1793,14 @@ impl TaskEngine {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
+        // Deliberately the FULL transcript, not the bounded load the other
+        // paths use: this hands the messages straight to `TurnInput::Resume`
+        // without assembling them, so no snapshot or checkpoint stands in for
+        // the earlier rows and every one of them is still reachable.
+        //
+        // That also means a long session's budget-extension turn resends its
+        // whole raw history. Bounding it needs the same assembly the other
+        // paths go through, which is a behaviour change, not a load change.
         let raw = crate::RawTranscript::load_strict(
             self.stores.messages.as_ref(),
             &runner.session_id,

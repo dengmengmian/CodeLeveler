@@ -124,7 +124,7 @@ async fn resume_receives_checkpoint_plus_exact_delta() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript.messages)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
         .await
         .unwrap()
         .expect("a valid checkpoint must be consumed");
@@ -204,7 +204,7 @@ async fn no_checkpoint_yields_no_prior() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript.messages)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
         .await
         .unwrap();
     assert!(prior.is_none());
@@ -246,7 +246,7 @@ async fn a_cursor_beyond_the_log_fails_closed() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript.messages)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
         .await
         .unwrap();
     assert!(
@@ -361,7 +361,7 @@ async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
         "grown past the old watermark"
     );
 
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript.messages)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
         .await
         .unwrap();
     assert!(

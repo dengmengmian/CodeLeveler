@@ -35,6 +35,39 @@ pub trait MessageStore: Send + Sync {
     /// The session's full transcript payloads, in append order.
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError>;
 
+    /// Total bytes of the session's stored payloads.
+    ///
+    /// A size the caller can decide on without deserializing anything. The
+    /// token estimator charges at least one token per four bytes for every
+    /// kind of content, so `bytes / 4` is a lower bound on the estimate — a
+    /// caller that only needs to know "is this provably over the fold
+    /// threshold" can answer it with this instead of a full load.
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        Ok(self
+            .load(session_id)
+            .await?
+            .iter()
+            .map(|p| p.len() as u64)
+            .sum())
+    }
+
+    /// Payloads at ordinal `from` and later, in append order.
+    ///
+    /// A caller that already knows a durable watermark — a context snapshot's
+    /// `through_ordinal` — needs only what came after it, and on a long
+    /// session that is the difference between reading the whole transcript
+    /// every turn and reading a handful of rows. The default keeps every
+    /// implementation correct by slicing a full load; a store backed by an
+    /// ordered table overrides it with a query.
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        let all = self.load(session_id).await?;
+        Ok(all.into_iter().skip(from as usize).collect())
+    }
+
     /// Fenced append: the ownership check and the inserts share one atomic
     /// persistence boundary. A stale runtime cannot extend the transcript.
     async fn append_in_turn_owned(
@@ -77,6 +110,20 @@ impl MessageStore for Database {
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
         MessageRepository::new(self).load(session_id).await
+    }
+
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        MessageRepository::new(self)
+            .load_from(session_id, from)
+            .await
+    }
+
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        MessageRepository::new(self).total_bytes(session_id).await
     }
 
     async fn append_in_turn_owned(
@@ -196,6 +243,34 @@ impl MessageStore for MemoryMessageStore {
             .filter(|(s, _)| s == session_id.as_str())
             .map(|(_, p)| p.clone())
             .collect())
+    }
+
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, _)| sid == session_id.as_str())
+            .skip(from as usize)
+            .map(|(_, payload)| payload.clone())
+            .collect())
+    }
+
+    /// Summed without cloning a payload: a size question answered as one.
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, _)| sid == session_id.as_str())
+            .map(|(_, payload)| payload.len() as u64)
+            .sum())
     }
 }
 

@@ -48,6 +48,34 @@ All notable changes to CodeLeveler are documented here. The format follows
 - **An event append no longer reads its own row back.** `append_owned` did an
   INSERT and then a SELECT; the INSERT returns the row.
 
+### Changed
+- **A turn reads the transcript it can reach, not the whole session.** Every
+  chat, resume and goal-continuation turn loaded and deserialized the entire
+  `session_messages` table, even when a watermarked context snapshot meant
+  only the tail after it could ever be sent. The cost grew with the session on
+  every turn, so the oldest sessions paid the most — pure latency, no tokens
+  and no behaviour change, which is why nothing surfaced it.
+
+  A load is bounded only when both watermarks agree it is safe. The token
+  estimator charges at least one token per four bytes for every kind of
+  content, so a `SUM(LENGTH(payload))` under four times the fold threshold
+  means the transcript *might* still be sent whole — and a transcript that
+  fits is sent whole, because a snapshot is never a permanent replacement for
+  a later turn. Only when it provably cannot fit does a watermark bind, and
+  then the earlier of the snapshot's and the goal checkpoint's wins: a
+  checkpoint splices the transcript from its own ordinal, and starting after
+  that would hand it a silently shorter history. Anything unknown — no
+  watermark, a legacy snapshot without one — falls back to the full load.
+
+  `RawTranscript` carries the ordinal its first message sits at, so a consumer
+  that indexes by ordinal subtracts it instead of guessing, and asking for a
+  slice the load cannot serve returns nothing rather than something shorter.
+  `extend_budget` deliberately keeps the full load: it hands the transcript
+  straight to a resume turn without assembling it, so no snapshot stands in
+  for the earlier rows. That path also resends a long session's whole raw
+  history, which is a behaviour question, not a load one, and is left alone
+  here.
+
 ### Added
 - **Deterministic tool-result trimming before a fold** (`prune_tool_results`,
   off by default). When the context is over budget, the middle of oversized

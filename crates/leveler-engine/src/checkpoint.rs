@@ -202,10 +202,39 @@ pub fn checkpoint_created_event(record: &GoalCheckpointRecord) -> EngineEvent {
 /// `Ok(None)` = no usable checkpoint; the caller keeps the pre-checkpoint
 /// full-history path (backward compatibility, and the fail-closed answer to
 /// a corrupt/stale/future checkpoint — trust nothing, fall back).
+/// The transcript watermark of the checkpoint a resume would continue from,
+/// when there is one. A cheap indexed probe: it answers "how far back can the
+/// checkpoint path reach" without loading a message, which is what lets a
+/// bounded transcript load know it is safe.
+///
+/// `None` covers every case where the checkpoint path will not fire or its
+/// reach is unknown — no task, no goal, no checkpoint, no watermark — and the
+/// caller reads that as "impose no bound", never as "bound at zero".
+pub async fn checkpoint_transcript_ordinal(
+    stores: &EngineStores,
+    session_id: &SessionId,
+) -> Result<Option<u64>, EngineError> {
+    let Some(task) = stores.tasks.task_for_session(session_id).await? else {
+        return Ok(None);
+    };
+    let goals = stores.goals.for_task(&task).await?;
+    let goal = goals
+        .iter()
+        .find(|g| g.state == GoalState::Running)
+        .or_else(|| goals.first());
+    let Some(goal) = goal else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = stores.goal_checkpoints.latest_for_goal(&goal.id).await? else {
+        return Ok(None);
+    };
+    Ok(checkpoint.payload.transcript_ordinal)
+}
+
 pub async fn resume_prior_from_checkpoint(
     stores: &EngineStores,
     session_id: &SessionId,
-    transcript: &[leveler_model::Message],
+    transcript: &crate::RawTranscript,
 ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
     let Some(task) = stores.tasks.task_for_session(session_id).await? else {
         return Ok(None);
@@ -242,24 +271,29 @@ pub async fn resume_prior_from_checkpoint(
     let Some(ordinal) = checkpoint.payload.transcript_ordinal else {
         return Ok(None);
     };
-    let ordinal = ordinal as usize;
-    if ordinal > transcript.len() {
+    // The delta this checkpoint stands in front of. `None` means the loaded
+    // transcript cannot serve it — the watermark is past its end, or a bounded
+    // load began after it. Falling back to full history is the safe answer;
+    // splicing a shorter delta would silently drop work the checkpoint does
+    // not describe.
+    let Some(delta) = transcript.slice_from_ordinal(ordinal) else {
         tracing::warn!(
             checkpoint = %checkpoint.id,
             ordinal,
-            transcript = transcript.len(),
-            "checkpoint transcript watermark is beyond the transcript; falling back"
+            transcript_offset = transcript.offset(),
+            transcript_len = transcript.stored_len(),
+            "checkpoint watermark is outside the loaded transcript; falling back"
         );
         return Ok(None);
-    }
-    let mut prior = Vec::with_capacity(1 + transcript.len() - ordinal);
+    };
+    let mut prior = Vec::with_capacity(1 + delta.len());
     prior.push(leveler_model::Message {
         role: leveler_model::Role::User,
         content: vec![leveler_model::ContentPart::Text {
             text: checkpoint.payload.context_block(),
         }],
     });
-    prior.extend_from_slice(&transcript[ordinal..]);
+    prior.extend_from_slice(delta);
     Ok(Some(prior))
 }
 

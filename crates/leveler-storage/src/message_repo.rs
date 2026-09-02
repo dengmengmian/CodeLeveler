@@ -212,6 +212,36 @@ impl<'a> MessageRepository<'a> {
         Ok(count.max(0) as u64)
     }
 
+    /// Total bytes of a session's stored payloads, without reading them.
+    pub async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        let (total,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM session_messages \
+             WHERE session_id = ?1",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(self.db.pool())
+        .await?;
+        Ok(total.max(0) as u64)
+    }
+
+    /// Payloads at ordinal `from` and later, in order. Ordinals are dense and
+    /// assigned on append, so this is the transcript tail after a watermark.
+    pub async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload FROM session_messages \
+             WHERE session_id = ?1 AND ordinal >= ?2 ORDER BY ordinal ASC",
+        )
+        .bind(session_id.as_str())
+        .bind(from.min(i64::MAX as u64) as i64)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
     /// Load all message payloads for a session, in order.
     pub async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
         let rows: Vec<(String,)> = sqlx::query_as(
