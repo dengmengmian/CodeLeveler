@@ -246,6 +246,18 @@ eval knob. The parts are ordered reasoning-then-text so the OpenAI-chat
 encoder, which joins by kind, presents the chain as preceding the answer it
 produced.
 
-Blocked on: a real-API budget for the run. Until it happens, neither position
-is evidence-backed, and the flag stays off rather than being deleted on the
-assumption that empty is correct.
+**Measured (2026-09-03): sending the chain back costs 34 % more input and
+buys nothing.** Frozen `dcb51f4d7ee5`, v4-flash, `scale-s800`, one repetition
+per arm: input 573,329 → 765,726, output 19,325 → 31,128, rounds 19 → 22,
+first edit round 6 → 11, cost $0.085 → $0.115, acceptance unchanged (both
+failed). Evidence:
+`DOGFOOD_ROOT/eval/state/f7-followup-dcb51f4d7ee5/REPORT.md`.
+
+So today's behaviour — show the chain, drop it — is the cheaper position on
+this evidence, and DeepSeek Harness's full replay is the more expensive one.
+`keep_reasoning` stays off.
+
+What remains open is the flag, not the behaviour: `passback_reasoning_content`
+on both profiles now declares a contract that carries `""` and, on this
+measurement, should carry nothing. Removing it is a product decision; one
+repetition of one case does not license deleting a provider contract.

@@ -100,6 +100,47 @@ in a few rounds; one break per round does not.
 Still default off, still behind `prune_tool_results`. What changed is that the
 knob now has a surface, so the A/B in §1 can actually measure something.
 
+## 0d. Both A/Bs ran after F7 (2026-09-03)
+
+Frozen `dcb51f4d7ee5`, v4-flash, `scale-s800`, one repetition per arm.
+Evidence: `DOGFOOD_ROOT/eval/state/f7-followup-dcb51f4d7ee5/REPORT.md`.
+
+**The instrumentation earned its keep.** This is the first cohort where the
+`advisory` lane is populated: 2 to 3 calls per run, 2,500 to 5,000 tokens that
+`model_requests` previously did not record at all.
+
+**`keep_reasoning`: FAIL.** Every metric the promotion rule named moved the
+wrong way.
+
+| Metric | control | ablated | Δ |
+| --- | ---: | ---: | ---: |
+| Input tokens | 573,329 | 765,726 | **+34 %** |
+| Output tokens | 19,325 | 31,128 | +61 % |
+| Rounds | 19 | 22 | +16 % |
+| First edit | round 6 | round 11 | 5 later |
+| Cost | $0.085 | $0.115 | +35 % |
+| Acceptance | not passed | not passed | tie |
+
+The chain accumulates like a tool result, exactly as predicted, and buys
+nothing back. One repetition is not a rate, but the rule was fixed in advance
+and no metric it names is ambiguous. The knob stays off; whether
+`passback_reasoning_content` should be removed from both profiles rather than
+declare a contract carrying `""` is a product decision this run does not
+settle.
+
+**`prune_tool_results`: INCONCLUSIVE, and now quantified.** Reclaimable bytes
+measured from each run's final context: 25,542 and 28,613, against a
+`PRUNE_BATCH_BYTES` threshold of 64 KiB. The trim did not run. The gap is a
+factor of two — against the fold it was a factor of ten — so the retrigger in
+§0c moved the mechanism much closer to a surface without reaching one.
+
+The threshold was chosen by arithmetic, not measurement, and this says the
+arithmetic was too conservative for this workload class. **It is not being
+retuned to fit this run.** Picking 24 KiB because 25.5 KiB was observed is
+fitting a constant to a single sample of a single case. What would justify a
+change: a reclaimable-bytes distribution across several cases and run lengths,
+plus a cache-hit measurement that prices the prefix break the trim costs.
+
 ## 1. Item 6 — deterministic trimming
 
 Mechanism shipped, default off, behind the `prune_tool_results` eval knob.
