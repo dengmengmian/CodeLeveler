@@ -238,5 +238,14 @@ re-billing. If the arms tie, keep today's behaviour and delete the
 pass-back flag from both profiles rather than leaving a contract that
 carries nothing.
 
-Blocked on: capturing reasoning in `stream_round` (the ablated arm cannot
-exist without it) and a real-API budget for the run.
+**Status (2026-09-02): both arms exist.** `stream_round` keeps the chain on
+the assistant message that produced it when `TurnPolicy::keep_reasoning` is
+set, so the pass-back key carries what the provider asked for instead of `""`.
+Default off — today's behaviour — and reachable through the `keep_reasoning`
+eval knob. The parts are ordered reasoning-then-text so the OpenAI-chat
+encoder, which joins by kind, presents the chain as preceding the answer it
+produced.
+
+Blocked on: a real-API budget for the run. Until it happens, neither position
+is evidence-backed, and the flag stays off rather than being deleted on the
+assumption that empty is correct.

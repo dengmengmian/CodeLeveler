@@ -143,6 +143,10 @@ pub struct ExecutionOverrides {
     /// C5-S3 ablation knob: switch the candidate adaptive-context behavior on.
     /// Production default stays Disabled until the eval verdict flips it.
     pub adaptive_context: Option<bool>,
+    /// Candidate knob: keep a streamed round's reasoning on its assistant
+    /// message, so a pass-back provider is given the chain instead of an
+    /// empty string. Unmeasured in both directions; default off.
+    pub keep_reasoning: Option<bool>,
     /// Candidate knob: trim oversized old tool results before folding.
     /// Production default stays off until an A/B demonstrates the value.
     pub prune_tool_results: Option<bool>,
@@ -274,6 +278,8 @@ pub struct ResolvedExecutionPolicy {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte budget for a single tool result (the central output cap).
     pub max_tool_output_bytes: usize,
+    /// Keep a round's reasoning in history (candidate; default off).
+    pub keep_reasoning: bool,
     /// Trim oversized old tool results before folding (candidate; default off).
     pub prune_tool_results: bool,
     /// Persist the model context every round (eval measurement seam).
@@ -358,6 +364,7 @@ pub fn resolve_execution_policy(
                 leveler_tools::registry::MIN_TOOL_OUTPUT,
                 leveler_tools::registry::MAX_TOOL_OUTPUT,
             ),
+        keep_reasoning: o.keep_reasoning.unwrap_or(false),
         prune_tool_results: o.prune_tool_results.unwrap_or(false),
         context_trace: o.context_trace.unwrap_or(false),
     }
@@ -510,6 +517,23 @@ mod tests {
         );
         // The compatibility mirror follows INITIAL, never a live budget.
         assert_eq!(adaptive.context_budget, adaptive.context.initial_budget);
+    }
+
+    #[test]
+    fn keeping_reasoning_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert!(
+            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None).keep_reasoning,
+            "an unmeasured candidate never ships on by default"
+        );
+        let o = ExecutionOverrides {
+            keep_reasoning: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        assert!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o))
+                .keep_reasoning
+        );
     }
 
     #[test]

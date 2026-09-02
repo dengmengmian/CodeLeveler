@@ -619,10 +619,14 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.prune_tool_results = Some(true);
             (false, true)
         }
+        "keep_reasoning" => {
+            o.keep_reasoning = Some(true);
+            (false, true)
+        }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
              completion_evidence, repeated_read_guard, progress_guards, \
-             adaptive_context, prune_tool_results"
+             adaptive_context, prune_tool_results, keep_reasoning"
         ),
     };
     Ok((o, before, after))

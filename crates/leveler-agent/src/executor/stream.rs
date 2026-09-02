@@ -169,6 +169,7 @@ impl Executor {
         };
 
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         // Some providers (and some gateways) emit `usage` in a chunk *after*
         // `finish_reason`. Breaking at MessageCompleted drops that chunk and the
@@ -214,6 +215,9 @@ impl Executor {
                 }
                 Ok(ModelEvent::ReasoningDelta { delta }) if !completed => {
                     if !delta.is_empty() {
+                        if self.policy.keep_reasoning {
+                            reasoning.push_str(&delta);
+                        }
                         observer(AgentEvent::ReasoningDelta(delta));
                     }
                 }
@@ -292,6 +296,12 @@ impl Executor {
         }
 
         let mut content = Vec::new();
+        // Reasoning goes FIRST: the OpenAI-chat encoder joins the parts by
+        // kind, and a provider with the pass-back contract reads the chain as
+        // preceding the answer it produced.
+        if !reasoning.is_empty() {
+            content.push(ContentPart::Reasoning { text: reasoning });
+        }
         if !text.is_empty() {
             content.push(ContentPart::Text { text });
         }

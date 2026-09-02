@@ -160,6 +160,7 @@ impl ExecutorFactory {
         .with_reasoning_effort(resolved.reasoning_effort)
         .with_context_trace(resolved.context_trace)
         .with_tool_result_pruning(resolved.prune_tool_results)
+        .with_kept_reasoning(resolved.keep_reasoning)
         .with_reconciliation_model_opt(self.completion_judge_model.clone())
         .with_reconciliation_timeout_opt(self.completion_judge_timeout)
         // A model profile may ship its own system prompt; None keeps the default.
