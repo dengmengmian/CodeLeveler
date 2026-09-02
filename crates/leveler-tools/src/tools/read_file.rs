@@ -9,8 +9,17 @@ use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// Maximum bytes of file content returned per call; ranges page through the rest.
+/// Ceiling on the bytes of file content returned per call; ranges page through
+/// the rest. The effective budget is the turn's tool-result budget
+/// ([`ToolContext::tool_output_budget`]) minus [`MARKER_RESERVE`], so this
+/// tool's own paging marker is the only truncation the model sees: a result
+/// the registry's central cap had to chop would carry a `start_line=N` that
+/// points past an elided middle, and the model would page over lines it never
+/// saw. This ceiling still applies when a budget is larger than it.
 const MAX_BYTES: usize = 256 * 1024;
+/// Bytes held back from the budget for the truncation/paging marker and the
+/// repeated-read note, so appending them cannot push the result over the cap.
+const MARKER_RESERVE: usize = 512;
 /// Maximum file size read into memory; larger files are refused with guidance.
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -118,6 +127,14 @@ impl Tool for ReadFileTool {
 
         let start = input.start_line.unwrap_or(1).max(1);
         let end = input.end_line.unwrap_or(usize::MAX);
+        // Page at the budget the registry will enforce, less the room the
+        // markers need. `saturating_sub` keeps a pathologically small budget
+        // from wrapping; the registry's own floor keeps it sane in practice.
+        let max_bytes = context
+            .policy
+            .tool_output_budget
+            .saturating_sub(MARKER_RESERVE)
+            .clamp(1, MAX_BYTES);
         let mut out = String::new();
         let mut reader = tokio::io::BufReader::new(file);
         let mut line = Vec::new();
@@ -160,7 +177,7 @@ impl Tool for ReadFileTool {
             }
 
             let prefix = format!("{lineno:>6}\t");
-            if out.len() + prefix.len() + 1 > MAX_BYTES {
+            if out.len() + prefix.len() + 1 > max_bytes {
                 clipped = true;
                 continue;
             }
@@ -172,7 +189,7 @@ impl Tool for ReadFileTool {
                 content_end = &content_end[..content_end.len() - 1];
             }
             let rendered = String::from_utf8_lossy(content_end);
-            let remaining = MAX_BYTES - out.len() - prefix.len() - 1;
+            let remaining = max_bytes - out.len() - prefix.len() - 1;
             if rendered.len() > remaining && !out.is_empty() {
                 clipped = true;
                 continue;
@@ -294,11 +311,11 @@ mod tests {
 
     #[tokio::test]
     async fn range_past_the_byte_cap_still_returns_lines() {
-        // Lock the bug: a line range that starts past MAX_BYTES must still
-        // return content — the byte cap limits the *output*, not which part
-        // of the file is reachable.
+        // Lock the bug: a line range that starts past the output cap must
+        // still return content — the byte cap limits the *output*, not which
+        // part of the file is reachable.
         let per_line = 58;
-        let n = MAX_BYTES / per_line + 200;
+        let n = crate::registry::MAX_TOOL_OUTPUT / per_line + 200;
         let mut content = String::new();
         for i in 0..n {
             content.push_str(&format!("l{i:06}-{}\n", "x".repeat(per_line - 9)));
@@ -326,7 +343,7 @@ mod tests {
         // A truncated read must tell the model how big the file is and how to
         // page through it, not a bare "[truncated]".
         let per_line = 58;
-        let n = MAX_BYTES / per_line + 200;
+        let n = crate::registry::MAX_TOOL_OUTPUT / per_line + 200;
         let mut content = String::new();
         for i in 0..n {
             content.push_str(&format!("l{i:06}-{}\n", "x".repeat(per_line - 9)));
@@ -354,9 +371,69 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The registry caps every result at the per-turn budget. `read_file`
+    /// must page at that same budget so its own marker is the only
+    /// truncation the model sees: a `start_line=N` that points past a
+    /// middle the central cap elided would make the model skip lines it
+    /// never saw.
+    #[tokio::test]
+    async fn paging_marker_points_at_the_first_unseen_line_under_the_central_cap() {
+        let budget = 8 * 1024;
+        let per_line = 58;
+        let n = budget * 3 / per_line;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("l{i:06}-{}\n", "x".repeat(per_line - 9)));
+        }
+        let (mut ctx, dir) = ctx_with("big.txt", &content).await;
+        ctx.policy.tool_output_budget = budget;
+        let out = crate::default_registry()
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "big.txt"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("elided to fit the context"),
+            "the tool must page under the budget itself, not be chopped by the central cap"
+        );
+        let marker = out
+            .content
+            .rfind("continue with start_line=")
+            .expect("paging marker");
+        let next: usize = out.content[marker + "continue with start_line=".len()..]
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .trim_end_matches(']')
+            .trim_end()
+            .parse()
+            .expect("start_line number");
+        // Every line before the pointer was shown, contiguously, so the model
+        // resumes exactly where it stopped reading.
+        for line in 1..next {
+            assert!(
+                out.content
+                    .contains(&format!("{line:>6}\tl{:06}-", line - 1)),
+                "line {line} must be present before start_line={next}"
+            );
+        }
+        assert!(
+            !out.content.contains(&format!("{next:>6}\t")),
+            "start_line={next} must be the first line NOT shown"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn one_very_long_line_is_clipped_before_formatting() {
-        let (ctx, dir) = ctx_with("long.txt", &"x".repeat(MAX_BYTES * 2)).await;
+        let (ctx, dir) = ctx_with(
+            "long.txt",
+            &"x".repeat(crate::registry::MAX_TOOL_OUTPUT * 2),
+        )
+        .await;
         let out = ReadFileTool
             .execute(
                 serde_json::json!({"path": "long.txt"}),
@@ -367,7 +444,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            out.content.len() <= MAX_BYTES + 512,
+            out.content.len() <= crate::registry::MAX_TOOL_OUTPUT + MARKER_RESERVE,
             "a single line must not allocate/return the whole file: {} bytes",
             out.content.len()
         );
