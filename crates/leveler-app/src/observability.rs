@@ -894,6 +894,7 @@ mod tests {
         .await;
         db.insert(&ModelRequestRecord {
             id: "req-1".into(),
+            provider_request_id: None,
             session_id: sid.clone(),
             provider: "glm".into(),
             model: "glm-5.2".into(),

@@ -209,6 +209,7 @@ mod usage_tests {
     fn req(model: &str, input: u64, output: u64) -> ModelRequestRecord {
         ModelRequestRecord {
             id: "r".into(),
+            provider_request_id: None,
             session_id: leveler_core::SessionId::new("s"),
             provider: "p".into(),
             model: model.into(),
@@ -218,6 +219,7 @@ mod usage_tests {
             error_kind: None,
             latency_ms: None,
             retry_count: 0,
+            kind: leveler_storage::ModelCallKind::Round,
             created_at: leveler_core::now(),
         }
     }
