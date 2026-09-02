@@ -223,18 +223,37 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
 }
 
 /// Split unified messages into Anthropic's `system` field plus `user`/`assistant`
-/// messages. `Role::System` text is hoisted to `system`; `Role::Tool` results
-/// become `tool_result` blocks inside a `user` message.
+/// messages. The LEADING run of `Role::System` messages is hoisted to `system`;
+/// `Role::Tool` results become `tool_result` blocks inside a `user` message.
+///
+/// A `Role::System` message that appears later is conversation, not prefix: the
+/// drive loop appends standing constraints (nested `AGENTS.md` rules, per-turn
+/// memory recall) at the tail exactly so the provider's cached prefix survives.
+/// Hoisting those would rewrite the prefix on every discovery and re-bill the
+/// whole transcript, so they stay in place as `user` turns.
 fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ReqMessage>) {
     let mut system_parts = Vec::new();
     let mut out = Vec::new();
+    let mut prefix_open = true;
 
     for msg in messages {
+        if msg.role != Role::System {
+            prefix_open = false;
+        }
         match msg.role {
-            Role::System => {
+            Role::System if prefix_open => {
                 let text = collect_text(&msg.content);
                 if !text.is_empty() {
                     system_parts.push(text);
+                }
+            }
+            Role::System => {
+                let text = collect_text(&msg.content);
+                if !text.is_empty() {
+                    out.push(ReqMessage {
+                        role: "user".to_string(),
+                        content: vec![ReqBlock::Text { text }],
+                    });
                 }
             }
             Role::Tool => {
@@ -414,6 +433,88 @@ mod tests {
         // The system turn must NOT appear as a message.
         assert_eq!(enc.body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(enc.body["messages"][0]["role"], "user");
+    }
+
+    /// The drive loop appends standing constraints (nested `AGENTS.md`
+    /// rules, per-turn memory recall) as `Role::System` messages at the TAIL,
+    /// precisely so the cached prefix survives. Hoisting those into the
+    /// top-level `system` field would rewrite the prefix on every discovery
+    /// and re-bill the whole transcript. Only the leading system block is a
+    /// prefix; a later one is conversation.
+    #[test]
+    fn only_the_leading_system_block_is_hoisted() {
+        let req = ModelRequest::new(
+            ModelRef::new("anthropic", "claude-sonnet-5"),
+            vec![
+                Message::text(Role::System, "base instructions"),
+                Message::text(Role::System, "skill injection"),
+                Message::text(Role::User, "read src/a.rs"),
+                Message::text(Role::Assistant, "reading"),
+                Message::text(Role::System, "Project rules:\n--- from src/AGENTS.md ---"),
+            ],
+        );
+        let enc = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap();
+        assert_eq!(
+            enc.body["system"], "base instructions\n\nskill injection",
+            "the leading system run is the cacheable prefix"
+        );
+        let messages = enc.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{:#?}", messages);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"][0]["text"], "Project rules:\n--- from src/AGENTS.md ---",
+            "a mid-transcript system message stays in place, as a user turn"
+        );
+    }
+
+    /// Two adjacent user turns are legal for Anthropic, but a tail rule that
+    /// lands next to a tool result must not be merged into that result's
+    /// block list — the pairing of tool_use and tool_result is what the API
+    /// validates.
+    #[test]
+    fn a_tail_rule_after_a_tool_result_is_its_own_turn() {
+        let call = ToolCall {
+            id: ToolCallId::new("c1"),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        let req = ModelRequest::new(
+            ModelRef::new("anthropic", "claude-sonnet-5"),
+            vec![
+                Message::text(Role::System, "base"),
+                Message::text(Role::User, "go"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::ToolCall { call }],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: ToolCallId::new("c1"),
+                            content: "fn a() {}".into(),
+                            is_error: false,
+                        },
+                    }],
+                },
+                Message::text(Role::System, "Project rules:\nno unwrap"),
+            ],
+        );
+        let enc = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap();
+        let messages = enc.body["messages"].as_array().unwrap();
+        assert_eq!(enc.body["system"], "base");
+        assert_eq!(messages.len(), 4, "{:#?}", messages);
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            messages[2]["content"].as_array().unwrap().len(),
+            1,
+            "the rule must not join the tool_result block list"
+        );
+        assert_eq!(messages[3]["content"][0]["type"], "text");
     }
 
     #[test]
