@@ -109,6 +109,41 @@ const PRUNE_TAIL_BYTES: usize = 1024;
 /// result already carrying it is at its floor and is never trimmed again.
 pub const PRUNE_MARKER: &str = "… [tool result middle trimmed to fit the context";
 
+/// Reclaimable bytes that make a trim worth its prefix-cache break.
+///
+/// One trim invalidates the provider's cached prefix from the first rewritten
+/// result onward. At DeepSeek's measured 96.8 % hit rate that is a real cost,
+/// so the trim waits until it can reclaim a batch worth paying it for.
+pub const PRUNE_BATCH_BYTES: u64 = 64 * 1024;
+
+/// Bytes a trim would reclaim right now, without building the trimmed copy.
+///
+/// The trigger, not the trim. Trimming rewrites bytes inside messages the
+/// provider has already cached, so it costs one prefix-cache break each time
+/// it runs. Running it every round would pay that repeatedly as the working
+/// set slides and results go stale one at a time; running it when a batch has
+/// accumulated pays it once for a large reclaim.
+pub fn reclaimable_tool_result_bytes(messages: &[Message], keep_recent: usize) -> u64 {
+    let working_set_start = messages.len().saturating_sub(keep_recent);
+    let mut total = 0u64;
+    for msg in messages.iter().take(working_set_start) {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        for part in &msg.content {
+            let ContentPart::ToolResult { result } = part else {
+                continue;
+            };
+            if result.content.len() <= PRUNE_TRIGGER_BYTES || result.content.contains(PRUNE_MARKER)
+            {
+                continue;
+            }
+            total += (result.content.len() - PRUNE_HEAD_BYTES - PRUNE_TAIL_BYTES) as u64;
+        }
+    }
+    total
+}
+
 /// The deterministic tier of context reclamation: trim the middle out of
 /// oversized tool results that have left the working set, in place.
 ///

@@ -76,7 +76,27 @@ All notable changes to CodeLeveler are documented here. The format follows
   history, which is a behaviour question, not a load one, and is left alone
   here.
 
+### Fixed
+- **A budget extension no longer resends the whole raw transcript.** Every
+  path that supplies a model with prior context assembled it — snapshot merge,
+  checkpoint block, fold if still oversized — except `resume_with_limits`,
+  which handed `TurnInput::Resume` the raw messages. A long session therefore
+  resent its entire history on every budget extension, the one model request
+  bounded by nothing. The four paths now share one assembly, so the exception
+  cannot come back by omission, and a source tripwire pins it.
+
 ### Added
+- **Every model call the runtime makes on its own account is recorded.**
+  Contract derivation and the completion reconciliation judge wrote nothing to
+  `model_requests`, so a goal session's reported cost was short by all of
+  them. Both now write the `advisory` lane, including on the paths that spend
+  tokens and then fail — a reply the judge could not parse is still a reply
+  the provider billed.
+- **`keep_reasoning`** (off by default, eval knob): keep a streamed round's
+  reasoning on the assistant message that produced it, so a provider with the
+  pass-back contract receives the chain instead of the empty string it gets
+  today. This exists so the question can be measured; neither direction is
+  evidence-backed yet (`docs/REASONING_CAPABILITY_AUDIT.md` §9).
 - **Deterministic tool-result trimming before a fold** (`prune_tool_results`,
   off by default). When the context is over budget, the middle of oversized
   tool results that have left the working set can be trimmed in place — no
@@ -86,6 +106,14 @@ All notable changes to CodeLeveler are documented here. The format follows
   on real workloads is unmeasured (C2.2 found the lossless variant reclaimed
   almost nothing), so it ships behind the `prune_tool_results` eval knob until
   an A/B says otherwise.
+
+  Its trigger moved off the fold after the first run showed the fold does not
+  happen: a real task run peaks near a tenth of the threshold, so a mechanism
+  wired to the fold never executed. It now fires on a batch of reclaimable
+  bytes instead. Batching is deliberate — a trim rewrites bytes the provider
+  has already cached, so it costs one prefix-cache break each time, and one
+  break for a large reclaim pays for itself where one break per round does
+  not.
 
 ### Fixed
 - **`leveler upgrade` understands pre-releases.** Publishing `0.2.0-beta.1` and

@@ -38,12 +38,10 @@ and logical calls are `COUNT(*)`, per lane. Pre-migration rows read as
 | Physical attempts | `SUM(1 + retry_count)` over the lane |
 | Compaction calls | `COUNT(*) WHERE kind='compaction'` |
 
-**Known gap.** Contract derivation and the completion reconciliation judge
-are still unrecorded; the `advisory` lane exists but nothing writes it yet.
-Both arms of both A/Bs pay those equally, so they do not bias a comparison —
-but a session's absolute token total is still short by them, and a
-cost-attribution report must say so rather than present the total as
-complete.
+Contract derivation and the completion reconciliation judge now write the
+`advisory` lane too, including on the paths that spend tokens and then return
+an error: a reply the judge could not parse is still a reply the provider
+billed. A session's recorded cost is the cost.
 
 ## 0b. What the first run found: the fold does not fire (2026-09-02)
 
@@ -80,9 +78,33 @@ The process lesson is cheaper than the run: verify that a mechanism's trigger
 fires on the chosen cases before paying for arms. The information needed was
 already in C2.1 §8.
 
+## 0c. The trimming trigger was moved off the fold (2026-09-02)
+
+§0b's finding made the mechanism unreachable, so the mechanism moved rather
+than the finding being filed away.
+
+Trimming was wired *inside* the fold decision: fold comes due, try trimming
+first, skip the fold if trimming is enough. The fold never comes due, so it
+never ran. But what it reclaims — stale tool results that have left the
+working set — is worth reclaiming whether or not the window is ever
+threatened. The fold is an overflow guard; recycling is a different job and
+needs its own trigger.
+
+It now fires on a **batch of reclaimable bytes** (`PRUNE_BATCH_BYTES`,
+64 KiB), independent of the fold. Batching is the point: a trim rewrites bytes
+the provider has already cached, so it costs one prefix-cache break each time
+it runs. Every round would pay that repeatedly as the working set slides and
+results go stale one at a time. One break for a large reclaim pays for itself
+in a few rounds; one break per round does not.
+
+Still default off, still behind `prune_tool_results`. What changed is that the
+knob now has a surface, so the A/B in §1 can actually measure something.
+
 ## 1. Item 6 — deterministic trimming
 
 Mechanism shipped, default off, behind the `prune_tool_results` eval knob.
+Since §0c it triggers on reclaimable bytes rather than on a fold, so the arms
+now differ in behaviour on any run that accumulates stale results.
 
 | Arm | `prune_tool_results` |
 | --- | --- |
@@ -109,18 +131,19 @@ mechanism costs information and must earn it back.
 
 ## 2. Item 7 — reasoning pass-back
 
-The ablated arm does not exist yet. `stream_round` discards reasoning
-deltas after showing them, so the pass-back contract that
-`deepseek-v4-pro` / `deepseek-v4-flash` declare always carries `""`. See
-`docs/REASONING_CAPABILITY_AUDIT.md` §9 for the mechanism and the gap.
+Both arms now exist. `stream_round` keeps the reasoning on the assistant
+message that produced it when `keep_reasoning` is set, so a pass-back provider
+receives the chain instead of the empty string it gets today. Default off; eval
+knob `keep_reasoning`. See `docs/REASONING_CAPABILITY_AUDIT.md` §9 for the
+mechanism and why neither direction is obviously right.
 
 | Arm | Assistant message keeps reasoning | Wire |
 | --- | --- | --- |
 | control | no (production default) | `reasoning_content: ""` |
 | ablated | yes, within the current tool loop | the captured chain |
 
-Implementation first (capture in `stream_round`, bounded to the live tool
-loop), then the same single-variable ablation. Thinking model only.
+Thinking model only. The arms differ in one resolver input, as every
+ablation here does.
 
 **Promotion rule.** Completion rate or rounds-to-first-edit must improve
 enough to pay for the extra input tokens the chain adds to every later
