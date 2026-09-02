@@ -181,17 +181,26 @@ Commands and cargo's own exit status.
 | lifecycle | `cargo test -p leveler-lifecycle` | **152 passed, 0 failed**, exit 0 |
 | agent | `cargo test -p leveler-agent` | **560 passed, 0 failed, 1 ignored** |
 | engine | `cargo test -p leveler-engine` | **231 passed, 0 failed** |
-| workspace | `cargo test --workspace --no-fail-fast` | **60 suites passed, 0 failed — STOPPED before completion** |
-| clippy | `cargo clippy` | **NOT RUN — skipped at the owner's instruction** |
+| workspace | `cargo test --workspace --no-fail-fast` | **97 suites, 0 failed** after the fix below |
+| clippy | `CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets` | clean |
+| tools | `cargo test -p leveler-tools` | **275 passed, 0 failed** |
 
-The workspace run reached 60 green suites with zero failures across ~1h50m and
-was stopped at the owner's instruction while running `leveler-tui`; the
-remaining crates (tui, web, media, browser) have no dependency on the changed
-code. Clippy was skipped the same way. Both are reported as what they are.
+A first workspace attempt was stopped at ~60 suites; it was rerun to
+completion. That full run found one failure, in a crate outside the three F7
+touches: `leveler-tools`'s `per_context_budget_caps_tool_output` asserted the
+central cap's "elided" marker, and an earlier change in this batch made
+`read_file` page at the same budget itself, so the cap has nothing left to
+chop and the marker is the tool's own. Obsolete behaviour, changed with its
+test and explained at the assertion (`dcb51f4`). Nothing in F7's own change
+was implicated.
+
+Clippy raised two warnings, both mine and both dead weight left by an earlier
+rewrite in this batch — an unused test runtime and a redundant binding. Both
+removed; clippy is clean.
 
 ```
-FULL_WORKSPACE_GREEN=NO   (not run to completion; 60/60 observed suites green)
-CLIPPY=SKIPPED
+FULL_WORKSPACE_GREEN=YES
+CLIPPY=PASS
 ```
 
 ### F7 controls
@@ -242,7 +251,7 @@ F3_REGRESSION_GATE=PASS
 F5_REGRESSION_GATE=PASS
 F6_REGRESSION_GATE=PASS
 TERMINAL_TRUTH_REGRESSION_GATE=PASS
-FULL_WORKSPACE_GREEN=NO
+FULL_WORKSPACE_GREEN=YES
 SECOND_RUNTIME=NO
 SECOND_EVENTLOG=NO
 SECOND_EVIDENCE_LEDGER=NO
@@ -261,9 +270,8 @@ OPEN_BETA_REQUIRED=1
 PHASE_B=HOLD
 ```
 
-`FULL_WORKSPACE_GREEN=NO` records a run that was stopped, not a run that
-failed. `F7_ENGINEERING_GATE=PASS` rests on the three crates the change
-touches, all green in full, plus 60 green workspace suites before the stop.
+`F7_ENGINEERING_GATE=PASS` rests on the three crates the change touches, all
+green in full, and on a completed workspace run with clippy clean.
 
 ## 8. Not done here, by instruction
 
