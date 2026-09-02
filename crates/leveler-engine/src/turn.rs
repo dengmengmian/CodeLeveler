@@ -1003,7 +1003,10 @@ pub(crate) async fn session_had_review(
     session_id: &SessionId,
 ) -> Result<bool, EngineError> {
     let mut reviewers: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for row in events.load(session_id).await? {
+    let rows = events
+        .load_by_types(session_id, &["sub_agent_started", "sub_agent_finished"])
+        .await?;
+    for row in rows {
         match row.event_type.as_str() {
             "sub_agent_started" => {
                 if let Ok(EngineEvent::SubAgentStarted { id, role, .. }) =

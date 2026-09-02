@@ -485,9 +485,9 @@ impl InProcessRuntimeClient {
     async fn checkpoint_before_turn(&self, session_id: &SessionId, label: &str) {
         let loaded = match self.app.open_database().await {
             Ok(db) => MessageRepository::new(&db)
-                .load(session_id)
+                .count(session_id)
                 .await
-                .map(|m| m.len())
+                .map(|n| n as usize)
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };

@@ -312,15 +312,19 @@ impl EventStore for Database {
             .map_err(crate::OwnershipError::Storage)?;
         // One guarded statement: sequence assignment AND the ownership check
         // happen inside the INSERT itself, so there is no window between
-        // "token verified" and "row written".
-        let inserted = sqlx::query(
+        // "token verified" and "row written". `RETURNING` hands back the row
+        // from the same statement; a stale token inserts nothing and returns
+        // no row, so there is no second round-trip on either path.
+        let inserted = sqlx::query_as::<_, EventRecord>(
             "INSERT INTO events \
              (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
              SELECT ?1, ?2, ?3, \
                     (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?2), \
                     ?4, ?5, ?6, ?7 \
              WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
-                           AND id = ?8 AND owner_runtime_id = ?9 AND owner_epoch = ?10)",
+                           AND id = ?8 AND owner_runtime_id = ?9 AND owner_epoch = ?10) \
+             RETURNING id, session_id, turn_id, sequence, type AS event_type, payload, \
+                       created_at, schema_version",
         )
         .bind(&id)
         .bind(session_id.as_str())
@@ -332,20 +336,13 @@ impl EventStore for Database {
         .bind(token.task_id.as_str())
         .bind(token.runtime_id.as_str())
         .bind(token.owner_epoch.get() as i64)
-        .execute(self.pool())
+        .fetch_optional(self.pool())
         .await
         .map_err(StorageError::from)?;
-        if inserted.rows_affected() != 1 {
-            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        match inserted {
+            Some(record) => Ok(record),
+            None => Err(crate::ownership_store::sqlite_stale_error(self, token).await),
         }
-        Ok(sqlx::query_as::<_, EventRecord>(
-            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
-             schema_version FROM events WHERE id = ?1",
-        )
-        .bind(&id)
-        .fetch_one(self.pool())
-        .await
-        .map_err(StorageError::from)?)
     }
 
     async fn append_batch_owned(

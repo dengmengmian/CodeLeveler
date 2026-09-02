@@ -241,8 +241,17 @@ impl<'a> EventLog<'a> {
         &self,
     ) -> Result<(Vec<UnfinishedChild>, Vec<FinishedChildFact>), EngineError> {
         // Raw rows, not `replay`: the reconciling event has to be attributed to
-        // the turn the child was started in.
-        let rows = self.store.load(&self.session_id).await?;
+        // the turn the child was started in. Indexed by type: the log also
+        // holds `context_snapshot` rows carrying whole model contexts, and a
+        // per-turn scan that decoded those to find a few child events grew
+        // with the session.
+        let rows = self
+            .store
+            .load_by_types(
+                &self.session_id,
+                &["sub_agent_started", "sub_agent_finished"],
+            )
+            .await?;
         let mut open: Vec<UnfinishedChild> = Vec::new();
         let mut finished: Vec<FinishedChildFact> = Vec::new();
         for row in &rows {
@@ -287,8 +296,21 @@ impl<'a> EventLog<'a> {
     pub async fn dangling_tool_calls(&self) -> Result<Vec<DanglingCall>, EngineError> {
         // Must go through the raw rows (not `replay`) to keep each event's
         // `turn_id`, which the recovery step needs to attribute the reconciling
-        // event to the crashed turn.
-        let rows = self.store.load(&self.session_id).await?;
+        // event to the crashed turn. Indexed by type for the same reason as
+        // `child_reconciliation_view`: the whole log is much larger than the
+        // four event kinds this pairs on.
+        let rows = self
+            .store
+            .load_by_types(
+                &self.session_id,
+                &[
+                    "tool_call_started",
+                    "tool_call_finished",
+                    "approval_requested",
+                    "approval_resolved",
+                ],
+            )
+            .await?;
         let mut open: Vec<DanglingCall> = Vec::new();
         for row in &rows {
             match decode_row(row)? {
@@ -456,6 +478,244 @@ mod tests {
                 stop: None,
             }],
             "transient delta is skipped; the canonical event replays"
+        );
+    }
+
+    /// A store that refuses whole-log scans: every reader under test must
+    /// come through the indexed by-type query. A session's log carries the
+    /// full model context in its `context_snapshot` rows, so a scan that only
+    /// wants a handful of child or tool events would decode all of that on
+    /// every turn.
+    struct TypedOnlyStore {
+        inner: MemoryEventStore,
+        whole_log_loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TypedOnlyStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+                whole_log_loads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn whole_log_loads(&self) -> usize {
+            self.whole_log_loads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl leveler_storage::EventStore for TypedOnlyStore {
+        async fn append(
+            &self,
+            session_id: &SessionId,
+            turn_id: Option<&TurnId>,
+            event_type: &str,
+            payload: &str,
+            now: leveler_core::Timestamp,
+        ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
+            self.inner
+                .append(session_id, turn_id, event_type, payload, now)
+                .await
+        }
+
+        async fn load(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Vec<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+            self.whole_log_loads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load(session_id).await
+        }
+
+        async fn load_after(
+            &self,
+            session_id: &SessionId,
+            after: i64,
+        ) -> Result<Vec<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+            self.inner.load_after(session_id, after).await
+        }
+
+        async fn load_last_by_type(
+            &self,
+            session_id: &SessionId,
+            event_type: &str,
+            turn_id: Option<&TurnId>,
+        ) -> Result<Option<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+            self.inner
+                .load_last_by_type(session_id, event_type, turn_id)
+                .await
+        }
+
+        async fn load_by_types(
+            &self,
+            session_id: &SessionId,
+            types: &[&str],
+        ) -> Result<Vec<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+            self.inner.load_by_types(session_id, types).await
+        }
+
+        async fn append_owned(
+            &self,
+            token: &leveler_core::OwnershipToken,
+            session_id: &SessionId,
+            turn_id: Option<&TurnId>,
+            event_type: &str,
+            payload: &str,
+            now: leveler_core::Timestamp,
+        ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+            self.inner
+                .append_owned(token, session_id, turn_id, event_type, payload, now)
+                .await
+        }
+    }
+
+    fn child_started(id: &str, nickname: &str, role: &str) -> EngineEvent {
+        EngineEvent::SubAgentStarted {
+            id: id.into(),
+            nickname: nickname.into(),
+            role: role.into(),
+            task: "look around".into(),
+            profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn child_finished(id: &str, nickname: &str, ok: bool) -> EngineEvent {
+        EngineEvent::SubAgentFinished {
+            id: id.into(),
+            nickname: nickname.into(),
+            ok,
+            summary: "done".into(),
+            contribution: None,
+        }
+    }
+
+    /// Reconciling children reads child events only — never the whole log.
+    #[tokio::test]
+    async fn child_reconciliation_reads_only_child_events() {
+        let store = TypedOnlyStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(None, child_started("a1", "Euclid", "explorer"), &mut sink)
+            .await
+            .unwrap();
+        log.append(
+            None,
+            EngineEvent::ContextSnapshot {
+                messages: vec![leveler_model::Message::text(
+                    leveler_model::Role::User,
+                    "a big context",
+                )],
+                through_ordinal: None,
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(None, child_started("a2", "Newton", "reviewer"), &mut sink)
+            .await
+            .unwrap();
+        log.append(None, child_finished("a1", "Euclid", true), &mut sink)
+            .await
+            .unwrap();
+
+        let (open, finished) = log.child_reconciliation_view().await.unwrap();
+        assert_eq!(
+            open.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["a2"]
+        );
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].id, "a1");
+        assert_eq!(log.unfinished_children().await.unwrap().len(), 1);
+        assert!(
+            !crate::turn::session_had_review(&store, &session)
+                .await
+                .unwrap(),
+            "the reviewer has not finished"
+        );
+        assert_eq!(
+            store.whole_log_loads(),
+            0,
+            "child reconciliation must use the indexed by-type query"
+        );
+    }
+
+    /// Crash-window reconciliation reads tool-call and approval events only.
+    #[tokio::test]
+    async fn dangling_tool_calls_read_only_tool_and_approval_events() {
+        let store = TypedOnlyStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("t1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        for call_id in ["c1", "c2"] {
+            log.append(
+                Some(&turn),
+                EngineEvent::ToolCallStarted {
+                    call_id: call_id.into(),
+                    name: "run_command".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                    risk: None,
+                    agent_id: None,
+                },
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        }
+        log.append(
+            Some(&turn),
+            EngineEvent::ContextSnapshot {
+                messages: Vec::new(),
+                through_ordinal: None,
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn),
+            EngineEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                is_error: false,
+                preview: "ok".into(),
+                agent_id: None,
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn),
+            EngineEvent::ApprovalRequested {
+                id: leveler_core::ApprovalId::generate(),
+                call_id: Some("c2".into()),
+                agent_id: None,
+                tool: "run_command".into(),
+                summary: "rm".into(),
+                command: None,
+                risk: "dangerous".into(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        let dangling = log.dangling_tool_calls().await.unwrap();
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].call_id, "c2");
+        assert!(dangling[0].pending_approval);
+        assert_eq!(dangling[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(
+            store.whole_log_loads(),
+            0,
+            "crash-window reconciliation must use the indexed by-type query"
         );
     }
 
@@ -1151,8 +1411,31 @@ mod tests {
             !msg.contains("[REDACTED]") && !msg.contains("PASSWORD"),
             "diagnostics must not echo payload bytes: {msg}"
         );
-        // The same fail-close applies to the dangling-call scan on resume.
+        // The dangling-call scan reads only the event types it pairs on
+        // (indexed by type), so this unrelated corrupt row is never consulted
+        // by it — replay stays the whole-log gate.
+        assert!(log.dangling_tool_calls().await.unwrap().is_empty());
+        // A corrupt row of a type the scan DOES depend on still fails closed
+        // with the same provenance discipline.
+        let corrupt_call = r#"{"payload":{"call_id":"c9","name":"run_command""[REDACTED]"type":"tool_call_started"}"#;
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: None,
+            sequence: 3,
+            event_type: "tool_call_started".to_string(),
+            payload: corrupt_call.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
         let err = log.dangling_tool_calls().await.expect_err("fail closed");
-        assert!(err.to_string().contains("corrupt authoritative event"));
+        let msg = err.to_string();
+        assert!(msg.contains("corrupt authoritative event"), "{msg}");
+        assert!(msg.contains("sequence 3"), "sequence provenance: {msg}");
+        assert!(msg.contains("tool_call_started"), "type provenance: {msg}");
+        assert!(
+            !msg.contains("[REDACTED]"),
+            "diagnostics must not echo payload bytes: {msg}"
+        );
     }
 }
