@@ -304,7 +304,7 @@ async fn second_chat_after_compact_still_sees_first_chat_turn() {
     let h = harness(vec![
         text("summary of chat1 history"),
         text("compact-aware answer about login"),
-        text("summary of chat2 history"),
+        // chat2 assembles from chat1's snapshot and fits: no summary call.
         text("I still remember UNIQUE_CHAT1_MARKER"),
     ])
     .await;
@@ -417,13 +417,12 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     let h = harness(vec![
         text("summary of chat1 history"),
         text("compact-aware answer"),
-        text("summary of chat2 history"),
+        // chat2 assembles from chat1's snapshot and fits: no summary call.
         text("follow-up still knows UNIQUE_CHAT1_MARKER"),
         // Goal: exhaust rounds without terminal complete → BudgetLimited.
         // (Goal prior injection uses the bounded-history path: no summarize.)
         text("working on timeout, not done yet"),
-        // Resume summarizes its oversized transcript, then the resume turn.
-        text("summary of the resumed history"),
+        // Resume also fits from the snapshot: only the resume turn itself.
         text("resumed with prior login context"),
     ])
     .await;
@@ -707,5 +706,67 @@ async fn chat_anchors_a_baseline_for_pre_existing_failures() {
     assert!(
         head.status.success() && !head.stdout.is_empty(),
         "fixture must have a resolvable HEAD for this test to mean anything"
+    );
+}
+
+/// Once a chat turn has folded an oversized history into a persisted
+/// snapshot, the next turn assembles from that snapshot plus the new tail.
+/// When that fits the budget there is nothing to fold, so no summarization
+/// call is made: exactly one model request per turn.
+#[tokio::test]
+async fn second_chat_after_compact_does_not_summarize_again() {
+    let h = harness(vec![
+        text("summary of chat1 history"),
+        text("answer one"),
+        text("answer two"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+    seed_oversized_login_history(&h.db, &session).await;
+
+    let mut events = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "小结一下登录改动".into(),
+            }],
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat1");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ContextSnapshot { .. })),
+        "chat1 must compact oversized history"
+    );
+    let after_chat1 = h.requests.lock().unwrap().len();
+    assert_eq!(
+        after_chat1, 2,
+        "chat1 = one summary call + one chat request"
+    );
+
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "刚才那句小结说了什么？".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat2");
+
+    let reqs = h.requests.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        after_chat1 + 1,
+        "chat2 fits under the budget from the snapshot; it must not pay for a summary it discards"
     );
 }

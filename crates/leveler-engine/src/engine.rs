@@ -228,6 +228,10 @@ fn chat_profile(spec: &TaskSpec) -> TurnProfile {
 /// snapshot with a `through_ordinal` watermark appends exactly `raw[n..]`;
 /// only watermark-less legacy snapshots use suffix-overlap inference.
 ///
+/// `summary` is a handoff briefing for the fold; callers that can produce
+/// one lazily go through [`crate::RawTranscript::assemble`], which asks for
+/// it only when the merged base is still over `threshold`.
+///
 /// Returns `(messages_for_model, wrote_compact)` — `wrote_compact` means the
 /// caller should persist a new ContextSnapshot.
 pub fn budget_prior_messages(
@@ -237,9 +241,35 @@ pub fn budget_prior_messages(
     active_objective: Option<&str>,
     threshold: u64,
 ) -> (Vec<leveler_model::Message>, bool) {
+    match merge_prior_messages(raw, snapshot, threshold) {
+        (base, PriorMerge::Fits { merged }) => (base, merged),
+        (base, PriorMerge::Over { base_tokens }) => {
+            fold_prior_messages(base, base_tokens, summary, active_objective, threshold)
+        }
+    }
+}
+
+/// What [`merge_prior_messages`] found: the merged base fits (and whether a
+/// snapshot was merged into it, i.e. a shorter snapshot is worth persisting),
+/// or it is still over threshold and must be folded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorMerge {
+    Fits { merged: bool },
+    Over { base_tokens: u64 },
+}
+
+/// Step one of [`budget_prior_messages`]: the raw transcript under threshold,
+/// or the latest snapshot merged with its post-snapshot tail. No model call
+/// is needed to get here, so a caller decides whether a summary is worth
+/// producing only after seeing `PriorMerge::Over`.
+pub(crate) fn merge_prior_messages(
+    raw: Vec<leveler_model::Message>,
+    snapshot: Option<SnapshotView>,
+    threshold: u64,
+) -> (Vec<leveler_model::Message>, PriorMerge) {
     let raw_tokens = leveler_agent::estimate_tokens(&raw);
     if raw_tokens <= threshold {
-        return (raw, false);
+        return (raw, PriorMerge::Fits { merged: false });
     }
 
     let base = match snapshot {
@@ -272,8 +302,25 @@ pub fn budget_prior_messages(
     let tokens = leveler_agent::estimate_tokens(&base);
     if tokens <= threshold {
         // Snapshot+tail already fits: persist so next request starts shorter.
-        return (base, true);
+        return (base, PriorMerge::Fits { merged: true });
     }
+    (
+        base,
+        PriorMerge::Over {
+            base_tokens: tokens,
+        },
+    )
+}
+
+/// Step two of [`budget_prior_messages`]: fold a merged base that is still
+/// over threshold.
+pub(crate) fn fold_prior_messages(
+    base: Vec<leveler_model::Message>,
+    base_tokens: u64,
+    summary: Option<&str>,
+    active_objective: Option<&str>,
+    threshold: u64,
+) -> (Vec<leveler_model::Message>, bool) {
     // HCH-FIX-2: bound the retained tail by TOKENS as well as by count —
     // half the fold threshold, mirroring the agent loop's `budget / 2`
     // (drive loop passes `current_budget / 2`). With `0` here, a single
@@ -286,8 +333,9 @@ pub fn budget_prior_messages(
         summary,
         active_objective,
     );
-    let changed = leveler_agent::estimate_tokens(&folded) < tokens || folded.len() < base.len();
-    (folded, changed || tokens > threshold)
+    let changed =
+        leveler_agent::estimate_tokens(&folded) < base_tokens || folded.len() < base.len();
+    (folded, changed || base_tokens > threshold)
 }
 
 /// Append raw messages that post-date the snapshot. Snapshot is often a
@@ -422,6 +470,30 @@ pub struct TaskEngine {
 /// replaceable; this bound is not — it guarantees the supervision loop
 /// terminates even if a policy keeps asking for another turn.
 const MAX_SUPERVISED_TURNS: u32 = 32;
+
+/// [`crate::ContextSummarizer`] backed by the engine's own model runtime:
+/// one bounded, tool-free request over the messages about to be folded.
+struct ModelSummarizer<'a> {
+    runtime: &'a dyn leveler_model::ModelRuntime,
+    model: &'a leveler_model::ModelRef,
+    cancellation: &'a CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl crate::ContextSummarizer for ModelSummarizer<'_> {
+    async fn summarize(&self, messages: &[leveler_model::Message]) -> Option<String> {
+        leveler_agent::summarize_with_model(
+            self.runtime,
+            self.model,
+            None,
+            messages,
+            leveler_agent::COMPACT_KEEP_RECENT,
+            0,
+            self.cancellation,
+        )
+        .await
+    }
+}
 
 impl TaskEngine {
     /// Attach mid-turn user input for this engine's runs.
@@ -888,7 +960,6 @@ impl TaskEngine {
         let prior = if let Some(prior) = checkpoint_prior {
             prior
         } else {
-            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
             let objective_hint = content
                 .iter()
                 .filter_map(|p| match p {
@@ -899,7 +970,7 @@ impl TaskEngine {
             let context = raw
                 .assemble(
                     &log,
-                    summary.as_deref(),
+                    Some(&self.context_summarizer(&cancellation)),
                     objective_hint,
                     u64::from(crate::ContextPolicy::chat_default().initial_budget),
                 )
@@ -1019,12 +1090,11 @@ impl TaskEngine {
         let prior = if let Some(prior) = checkpoint_prior {
             prior
         } else {
-            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
             // Same merge rules as chat: never drop post-snapshot transcript rows.
             let context = raw
                 .assemble(
                     &log,
-                    summary.as_deref(),
+                    Some(&self.context_summarizer(&cancellation)),
                     Some(spec.runtime.goal.as_str()),
                     u64::from(crate::ContextPolicy::chat_default().initial_budget),
                 )
@@ -1147,6 +1217,19 @@ impl TaskEngine {
     /// Best-effort model handoff briefing for a pre-request fold: only called
     /// when the raw history exceeds the compact threshold, and any failure
     /// degrades to the bare-breadcrumb fold (never blocks the turn).
+    /// The handoff-briefing producer [`crate::RawTranscript::assemble`] calls
+    /// only when the merged context is still over the fold threshold.
+    fn context_summarizer<'a>(
+        &'a self,
+        cancellation: &'a CancellationToken,
+    ) -> ModelSummarizer<'a> {
+        ModelSummarizer {
+            runtime: self.factory.runtime.as_ref(),
+            model: &self.factory.model,
+            cancellation,
+        }
+    }
+
     async fn summarize_if_over(
         &self,
         raw: &[leveler_model::Message],
@@ -1618,11 +1701,10 @@ impl TaskEngine {
         let prior = if let Some(prior) = checkpoint_prior {
             prior
         } else {
-            let summary = self.summarize_if_over(&raw.messages, cancellation).await;
             let context = raw
                 .assemble(
                     log,
-                    summary.as_deref(),
+                    Some(&self.context_summarizer(cancellation)),
                     Some(spec.runtime.goal.as_str()),
                     u64::from(crate::ContextPolicy::chat_default().initial_budget),
                 )

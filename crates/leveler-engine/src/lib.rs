@@ -46,7 +46,7 @@ pub use policy_resolver::{
     ResolvedExecutionPolicy, RetentionPolicy, resolve_execution_policy, resolve_tool_limits,
 };
 pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
-pub use session_context::{RawTranscript, SessionContext};
+pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{TurnInput, TurnRecordedOutcome, TurnRunner};
 
 /// Engine-level errors. Persistence and replay failures are hard errors —

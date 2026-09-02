@@ -13,8 +13,18 @@
 use leveler_core::SessionId;
 use leveler_storage::MessageStore;
 
+use crate::engine::{PriorMerge, fold_prior_messages, merge_prior_messages};
 use crate::log::EventLog;
-use crate::{EngineError, EngineEvent, budget_prior_messages};
+use crate::{EngineError, EngineEvent};
+
+/// Produces the model handoff briefing for messages about to be folded away.
+/// [`RawTranscript::assemble`] asks for one only after merging the latest
+/// snapshot with its tail still leaves the context over threshold — so a
+/// turn that fits from the snapshot never pays for a summary it would drop.
+#[async_trait::async_trait]
+pub trait ContextSummarizer: Send + Sync {
+    async fn summarize(&self, messages: &[leveler_model::Message]) -> Option<String>;
+}
 
 /// The parsed transcript of a session, in ordinal order.
 pub struct RawTranscript {
@@ -70,24 +80,33 @@ impl RawTranscript {
 
     /// Assemble the model-visible context: latest snapshot (with watermark)
     /// plus the post-snapshot tail, folded under `threshold` if needed.
-    /// `summary` is an optional model handoff briefing the caller produced
-    /// for oversized histories.
+    /// `summarizer` is consulted for a handoff briefing only when that fold
+    /// is actually needed; `None` folds with a bare breadcrumb.
     pub async fn assemble(
         self,
         log: &EventLog<'_>,
-        summary: Option<&str>,
+        summarizer: Option<&dyn ContextSummarizer>,
         active_objective: Option<&str>,
         threshold: u64,
     ) -> Result<SessionContext, EngineError> {
         let through_ordinal = self.messages.len() as u64;
         let snapshot = log.latest_context_snapshot(None).await?;
-        let (prior, compacted) = budget_prior_messages(
-            self.messages,
-            snapshot,
-            summary,
-            active_objective,
-            threshold,
-        );
+        let (prior, compacted) = match merge_prior_messages(self.messages, snapshot, threshold) {
+            (base, PriorMerge::Fits { merged }) => (base, merged),
+            (base, PriorMerge::Over { base_tokens }) => {
+                let summary = match summarizer {
+                    Some(summarizer) => summarizer.summarize(&base).await,
+                    None => None,
+                };
+                fold_prior_messages(
+                    base,
+                    base_tokens,
+                    summary.as_deref(),
+                    active_objective,
+                    threshold,
+                )
+            }
+        };
         Ok(SessionContext {
             prior,
             compacted,
