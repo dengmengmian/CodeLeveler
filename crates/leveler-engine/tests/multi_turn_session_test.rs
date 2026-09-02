@@ -973,3 +973,45 @@ async fn the_checkpoint_watermark_binds_when_it_reaches_further_back() {
         "anything earlier is honestly reported as unavailable"
     );
 }
+
+/// Every engine path that hands a model prior context goes through the one
+/// assembly, so none of them can send an unbounded transcript.
+///
+/// `resume_with_limits` used to be the exception: it passed the raw
+/// transcript straight to `TurnInput::Resume`, so a long session resent its
+/// entire history on every budget extension. Nothing bounded it, and no test
+/// covered it because the path only opens on budget exhaustion — which is
+/// why this is a source tripwire, in the same spirit as the ownership one.
+#[test]
+fn no_engine_path_hands_a_model_an_unassembled_transcript() {
+    const MARKER: &str = "TurnInput::Resume(";
+    let source = include_str!("../src/engine.rs");
+    // Split at the test MODULE, not at any `#[cfg(test)]` attribute: the file
+    // carries a cfg-gated field mid-implementation, and cutting there would
+    // hide most of the production code from this scan.
+    let production = source
+        .split("\n#[cfg(test)]\nmod ")
+        .next()
+        .expect("engine.rs has production code");
+
+    let mut inputs = Vec::new();
+    for (at, _) in production.match_indices(MARKER) {
+        let tail = &production[at + MARKER.len()..];
+        let end = tail.find(')').expect("a closing paren");
+        inputs.push(&tail[..end]);
+    }
+    assert!(!inputs.is_empty(), "the resume path should still exist");
+    for input in &inputs {
+        assert!(
+            !input.contains("raw"),
+            "a resumed turn is given assembled prior context, never the raw \
+             transcript; got `{input}`"
+        );
+    }
+
+    // chat, resume, goal continuation, budget extension.
+    assert!(
+        production.matches("assembled_prior(").count() >= 4,
+        "every path that supplies prior context assembles it"
+    );
+}

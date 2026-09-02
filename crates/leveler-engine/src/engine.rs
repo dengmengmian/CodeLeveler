@@ -947,39 +947,24 @@ impl TaskEngine {
         // durable checkpoint (fresh existing one, or one cut right here)
         // instead of replayed old history. Under the threshold — or with no
         // goal — the pre-checkpoint path stands unchanged.
-        let checkpoint_prior = self
-            .checkpointed_prior(
+        let objective_hint = content
+            .iter()
+            .filter_map(|p| match p {
+                leveler_model::ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .next();
+        let prior = self
+            .assembled_prior(
                 &log,
                 session_id,
-                &raw,
+                raw,
+                objective_hint,
                 Some(&spec.coding.repository),
                 &cancellation,
                 observer,
             )
             .await?;
-        let prior = if let Some(prior) = checkpoint_prior {
-            prior
-        } else {
-            let objective_hint = content
-                .iter()
-                .filter_map(|p| match p {
-                    leveler_model::ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .next();
-            let context = raw
-                .assemble(
-                    &log,
-                    Some(&self.context_summarizer(&cancellation)),
-                    objective_hint,
-                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
-                )
-                .await?;
-            if context.compacted {
-                log.append(None, context.snapshot_event(), observer).await?;
-            }
-            context.prior
-        };
         let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
@@ -1078,25 +1063,19 @@ impl TaskEngine {
         // transcript after its watermark. No usable checkpoint (none written,
         // corrupt, future version, stale watermark) falls back to the
         // pre-checkpoint full-history path below.
-        let checkpoint_prior =
-            crate::checkpoint::resume_prior_from_checkpoint(&self.stores, session_id, &raw).await?;
-        let prior = if let Some(prior) = checkpoint_prior {
-            prior
-        } else {
-            // Same merge rules as chat: never drop post-snapshot transcript rows.
-            let context = raw
-                .assemble(
-                    &log,
-                    Some(&self.context_summarizer(&cancellation)),
-                    Some(spec.runtime.goal.as_str()),
-                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
-                )
-                .await?;
-            if context.compacted {
-                log.append(None, context.snapshot_event(), observer).await?;
-            }
-            context.prior
-        };
+        // Same rules as chat: a checkpoint's block when one is fresh, else the
+        // snapshot merged with the post-snapshot rows, folded if still oversized.
+        let prior = self
+            .assembled_prior(
+                &log,
+                session_id,
+                raw,
+                Some(spec.runtime.goal.as_str()),
+                Some(&spec.coding.repository),
+                &cancellation,
+                observer,
+            )
+            .await?;
         let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
@@ -1142,6 +1121,44 @@ impl TaskEngine {
     /// threshold, no goal in scope, or checkpoint creation failed — every
     /// fold leaves the durable transcript untouched, so the fallback
     /// degrades only to exactly the pre-P3 context, never to lost history.
+    /// The model-visible prior context for a turn: the ONE assembly every
+    /// path shares.
+    ///
+    /// A checkpoint's block wins when one is fresh enough; otherwise the
+    /// transcript is merged with the latest snapshot and folded if it still
+    /// does not fit. No caller assembles its own, and none hands a model the
+    /// raw transcript — an unassembled history is unbounded by construction,
+    /// and on a long session that is the whole history resent every turn.
+    async fn assembled_prior(
+        &self,
+        log: &EventLog<'_>,
+        session_id: &SessionId,
+        raw: crate::RawTranscript,
+        objective: Option<&str>,
+        repo: Option<&std::path::Path>,
+        cancellation: &CancellationToken,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<Vec<leveler_model::Message>, EngineError> {
+        if let Some(prior) = self
+            .checkpointed_prior(log, session_id, &raw, repo, cancellation, observer)
+            .await?
+        {
+            return Ok(prior);
+        }
+        let context = raw
+            .assemble(
+                log,
+                Some(&self.context_summarizer(cancellation)),
+                objective,
+                u64::from(crate::ContextPolicy::chat_default().initial_budget),
+            )
+            .await?;
+        if context.compacted {
+            log.append(None, context.snapshot_event(), observer).await?;
+        }
+        Ok(context.prior)
+    }
+
     /// Load the transcript a request needs, reading only the tail when both
     /// watermarks prove the earlier rows unreachable. Falls back to the full
     /// load whenever either is unknown; see
@@ -1646,7 +1663,7 @@ impl TaskEngine {
                         ),
                     });
                     match self
-                        .resume_with_limits(runner, spec, limits, observer, &cancellation)
+                        .resume_with_limits(log, runner, spec, limits, observer, &cancellation)
                         .await?
                     {
                         Some(continued) => continued,
@@ -1711,32 +1728,17 @@ impl TaskEngine {
         // Long-goal P3: a window boundary over the fold threshold continues
         // from a durable checkpoint (fresh or cut here) instead of replaying
         // the earlier windows' history.
-        let checkpoint_prior = self
-            .checkpointed_prior(
+        let prior = self
+            .assembled_prior(
                 log,
                 &runner.session_id,
-                &raw,
+                raw,
+                Some(spec.runtime.goal.as_str()),
                 Some(&spec.coding.repository),
                 cancellation,
                 observer,
             )
             .await?;
-        let prior = if let Some(prior) = checkpoint_prior {
-            prior
-        } else {
-            let context = raw
-                .assemble(
-                    log,
-                    Some(&self.context_summarizer(cancellation)),
-                    Some(spec.runtime.goal.as_str()),
-                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
-                )
-                .await?;
-            if context.compacted {
-                log.append(None, context.snapshot_event(), observer).await?;
-            }
-            context.prior
-        };
         // Full objective restatement — not a vague "Continue…" only. When
         // the previous drive recorded WHY its closeout stalled, name that
         // gap so the continuation addresses it instead of repeating the
@@ -1787,27 +1789,38 @@ impl TaskEngine {
     /// transcript to resume from.
     async fn resume_with_limits(
         &self,
+        log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         limits: StepLimits,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
-        // Deliberately the FULL transcript, not the bounded load the other
-        // paths use: this hands the messages straight to `TurnInput::Resume`
-        // without assembling them, so no snapshot or checkpoint stands in for
-        // the earlier rows and every one of them is still reachable.
-        //
-        // That also means a long session's budget-extension turn resends its
-        // whole raw history. Bounding it needs the same assembly the other
-        // paths go through, which is a behaviour change, not a load change.
-        let raw = crate::RawTranscript::load_strict(
-            self.stores.messages.as_ref(),
-            &runner.session_id,
-            "transcript during budget extension",
-        )
-        .await?;
+        let raw = self
+            .load_request_transcript(
+                &runner.session_id,
+                Some("transcript during budget extension"),
+            )
+            .await?;
         if raw.is_empty() {
+            return Ok(None);
+        }
+        // Assembled like every other resumed turn. This used to hand
+        // `TurnInput::Resume` the raw transcript, so a long session resent its
+        // entire history on every budget extension — the one path where a
+        // model request was not bounded by anything.
+        let prior = self
+            .assembled_prior(
+                log,
+                &runner.session_id,
+                raw,
+                Some(spec.runtime.goal.as_str()),
+                Some(&spec.coding.repository),
+                cancellation,
+                observer,
+            )
+            .await?;
+        if prior.is_empty() {
             return Ok(None);
         }
         let recorded = runner
@@ -1817,7 +1830,7 @@ impl TaskEngine {
                     continuation: spec.runtime.continuation,
                     limits,
                 },
-                TurnInput::Resume(raw.messages),
+                TurnInput::Resume(prior),
                 observer,
                 cancellation.clone(),
             )
