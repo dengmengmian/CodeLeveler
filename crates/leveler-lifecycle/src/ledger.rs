@@ -149,6 +149,25 @@ impl EvidenceLedger {
             || self.verifications.iter().any(|v| v.tool_call_id == id)
     }
 
+    /// Whether `id` names an OBSERVATION this ledger holds: a command that
+    /// ran green over the tree as it now stands.
+    ///
+    /// The distinction a citation needs. `resolves_evidence_ref` answers "does
+    /// the runtime know this id at all" — F3's rule, which an invented id
+    /// fails. This answers "can this id witness what the code does", which a
+    /// file edit fails: a path changing is a fact about the tree, not about
+    /// its behaviour. Stale and failing runs are not witnesses either; they
+    /// describe a tree that no longer exists, or one that did not work.
+    pub fn witnesses_behavior(&self, id: &str) -> bool {
+        let last_mutation = self.last_mutation_seq();
+        self.verifications.iter().any(|v| {
+            v.tool_call_id == id
+                && v.exit_code == 0
+                && v.after_mutation_seq >= last_mutation
+                && last_mutation > 0
+        })
+    }
+
     pub fn has_fresh_successful_verify(&self) -> bool {
         let last_mut = self.last_mutation_seq();
         self.verifications

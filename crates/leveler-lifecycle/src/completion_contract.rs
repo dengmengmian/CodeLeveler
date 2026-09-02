@@ -512,7 +512,27 @@ fn discharged(
                 .any(|e| e.strength == EvidenceStrength::Mechanical)
                 && !ledger.mutations.is_empty()
         }
-        // Not everything a user asks for is machine-checkable.
+        // Not everything a user asks for is machine-checkable, so a
+        // behavioural obligation has no mechanical floor to meet. It does have
+        // to mean what it cites.
+        //
+        // F7: run-02 discharged three behavioural obligations by naming the
+        // `apply_patch` call that made the edit — one of them describing a
+        // program run that never happened. The runtime knew the cited id was a
+        // mutation and threw that away, because `resolve_refs` keeps the
+        // tool_call_id and drops the candidate's kind. A file changing is not
+        // the behaviour changing, and that is decidable here without reading a
+        // word of the claim.
+        //
+        // Only a citation is judged, never its absence: requiring a witness
+        // would block 22 of the 32 behavioural obligations in the preserved
+        // successful cohort. Uncited semantic discharge stays open by
+        // measurement, not by oversight — see
+        // `docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md` §7.
+        RequirementKind::Behavior => {
+            let cited: Vec<&String> = evidence.iter().flat_map(|e| e.refs.iter()).collect();
+            cited.is_empty() || cited.into_iter().any(|id| ledger.witnesses_behavior(id))
+        }
         _ => true,
     }
 }
@@ -565,6 +585,225 @@ mod tests {
                 .unsatisfied_material(&EvidenceLedger::default())
                 .is_empty()
         );
+    }
+
+    // ── F7: a cited witness must be able to witness the claim ─────────────
+    //
+    // The shape, with no fixture in it: an obligation asks for behaviour over
+    // category A; the run observed something about category B; the judge says
+    // B proves A and cites the edit it made. The runtime cannot referee the
+    // semantics — but it can see that the id cited is a file that changed, and
+    // a file changing is not a behaviour being observed.
+
+    fn behaviour_citing(refs: Vec<String>, strength: EvidenceStrength) -> CompletionRequirement {
+        let mut r = requirement("r1", RequirementKind::Behavior);
+        r.status = RequirementStatus::Satisfied;
+        r.evidence.push(RequirementEvidence {
+            strength,
+            detail: "the change makes category A behave as asked".into(),
+            refs,
+        });
+        r
+    }
+
+    /// A ledger in the shape of the defect: one edit, one green check after it.
+    fn edit_then_check() -> EvidenceLedger {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger.record_verify("call-check", "check\u{1f}all", 0);
+        ledger
+    }
+
+    /// THE BEHAVIOURAL FLOOR. An obligation about behaviour, discharged on a
+    /// citation that names the edit and nothing else, is not discharged: an
+    /// edit is not an observation of what the code does. This is the run-02
+    /// shape — three behavioural obligations, each citing exactly the
+    /// `apply_patch` call, each accepted.
+    #[test]
+    fn a_behaviour_citing_only_a_mutation_is_not_discharged() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-edit".into()],
+            EvidenceStrength::Semantic,
+        )]);
+        let open = contract.unsatisfied_material(&edit_then_check());
+        assert_eq!(open.len(), 1, "the obligation must stay open");
+        assert_eq!(open[0].id, "r1");
+    }
+
+    /// The judge's own strength label is not what settles it: the same
+    /// citation claimed as a direct observation is still only an edit.
+    #[test]
+    fn calling_a_mutation_an_observation_does_not_make_it_one() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-edit".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(contract.unsatisfied_material(&edit_then_check()).len(), 1);
+    }
+
+    /// TRUE POSITIVE. Citing a command the runtime recorded running over the
+    /// tree is a witness the judge may interpret, so this discharges. Without
+    /// this the fix would buy truth by making semantic completion impossible.
+    #[test]
+    fn a_behaviour_citing_a_recorded_check_is_discharged() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert!(
+            contract.unsatisfied_material(&edit_then_check()).is_empty(),
+            "a recorded check is a witness a behaviour claim may rest on"
+        );
+    }
+
+    /// A citation naming both keeps the witness: the edit alongside the check
+    /// is how a correct run in the preserved cohort cited its work.
+    #[test]
+    fn a_citation_naming_both_keeps_its_witness() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-edit".into(), "call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert!(contract.unsatisfied_material(&edit_then_check()).is_empty());
+    }
+
+    /// An id the runtime never issued is not a witness either — F3's rule,
+    /// restated where F7 now looks.
+    #[test]
+    fn an_invented_citation_is_not_a_witness() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-that-never-ran".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(contract.unsatisfied_material(&edit_then_check()).len(), 1);
+    }
+
+    /// A check that predates the last edit is not a witness for the tree as it
+    /// now stands.
+    #[test]
+    fn a_check_from_before_the_last_edit_is_not_a_witness() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_verify("call-check", "check\u{1f}all", 0);
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "stale observation cannot discharge a behaviour claim"
+        );
+    }
+
+    /// A failed check is not a witness that the behaviour is right.
+    #[test]
+    fn a_failed_check_is_not_a_witness() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger.record_verify("call-check", "check\u{1f}all", 1);
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(contract.unsatisfied_material(&ledger).len(), 1);
+    }
+
+    /// THE MEASURED LIMIT, pinned so it is not mistaken for an oversight: an
+    /// obligation that cites NOTHING still discharges. Requiring a witness
+    /// blocks 22 of the 32 behavioural obligations in the preserved successful
+    /// cohort, so this step closes mis-kinded citation only. See
+    /// `docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md` §7.
+    #[test]
+    fn an_uncited_behaviour_claim_still_discharges_and_that_is_the_known_limit() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert!(contract.unsatisfied_material(&edit_then_check()).is_empty());
+    }
+
+    /// A facet is held to the same standard as the objective it sits under —
+    /// run-02's false discharge was two facets and their parent.
+    #[test]
+    fn a_facet_citing_only_a_mutation_is_not_discharged() {
+        let mut parent = requirement("r1", RequirementKind::Behavior);
+        parent.status = RequirementStatus::Satisfied;
+        parent.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Semantic,
+            detail: "covered by its conditions".into(),
+            refs: Vec::new(),
+        });
+        parent.acceptance_facets.push(AcceptanceFacet {
+            id: "r1.f1".into(),
+            text: "category A is absent from the surface".into(),
+            kind: RequirementKind::Behavior,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: None,
+            evidence: vec![RequirementEvidence {
+                strength: EvidenceStrength::Observed,
+                detail: "the run printed only the category B row".into(),
+                refs: vec!["call-edit".into()],
+            }],
+        });
+        let ledger = edit_then_check();
+        let contract = CompletionContract::new(vec![parent.clone()]);
+        let open = contract.unsatisfied_material(&ledger);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(
+            open[0].id, "r1",
+            "the objective is open because a condition inside it is"
+        );
+
+        // Contrast: the same objective, the same parent evidence, with the
+        // condition citing a witness instead of the edit — it closes. So it is
+        // the citation that decides, not the shape of the contract.
+        let mut witnessed = parent;
+        witnessed.acceptance_facets[0].evidence[0].refs = vec!["call-check".into()];
+        assert!(
+            CompletionContract::new(vec![witnessed])
+                .unsatisfied_material(&ledger)
+                .is_empty()
+        );
+    }
+
+    /// DURABILITY. A restart re-reads the contract and the ledger from their
+    /// snapshots and re-runs the same predicate, so an obligation that is open
+    /// stays open — a crash cannot launder a mis-kinded citation into a
+    /// discharge.
+    #[test]
+    fn a_mis_cited_obligation_is_still_open_after_a_round_trip() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-edit".into()],
+            EvidenceStrength::Observed,
+        )]);
+        let ledger = edit_then_check();
+
+        let contract: CompletionContract =
+            serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
+        let ledger: EvidenceLedger =
+            serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "debt survives the round trip"
+        );
+    }
+
+    /// A constraint about where work happened is legitimately witnessed by the
+    /// edit itself; F7 must not spill onto it.
+    #[test]
+    fn a_constraint_citing_a_mutation_is_untouched() {
+        let mut r = requirement("r1", RequirementKind::Constraint);
+        r.status = RequirementStatus::Satisfied;
+        r.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Mechanical,
+            detail: "only the one file changed".into(),
+            refs: vec!["call-edit".into()],
+        });
+        let contract = CompletionContract::new(vec![r]);
+        assert!(contract.unsatisfied_material(&edit_then_check()).is_empty());
     }
 
     /// THE MECHANICAL FLOOR. A verification obligation ("covered by a test")

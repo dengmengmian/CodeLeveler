@@ -170,8 +170,24 @@ No provider is involved, so this runs in minutes and costs nothing. It is
 listed with 6 and 7 because the same runs will show it as wall-clock once
 implemented, not because it needs the paid lane.
 
+## 3b. Both A/Bs wait for F7
+
+Neither run may be taken before F7 lands.
+
+The completion gate decides task success, and F7 changes what it accepts: a
+behavioural obligation can no longer be discharged by citing the edit that was
+made (`docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md`). Task success is the
+primary metric of §1 and a promotion condition of §2, so a number taken before
+F7 is a number from a gate that is known to accept false completions and is
+about to stop.
+
+This is a sequencing dependency, not a scope change. The designs, the promotion
+rules and the case selection above stand as written.
+
 ## 4. Order
 
+0. **F7 lands** (§3b) — otherwise both A/Bs measure success against a gate
+   that is about to change.
 1. Instrumentation (§0) — unpaid, unblocks reading both A/Bs.
 2. Item 6 A/B — the mechanism already exists; the first money is spent on
    something finished.

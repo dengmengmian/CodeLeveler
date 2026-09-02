@@ -9875,3 +9875,94 @@ async fn kept_reasoning_travels_with_the_message_that_produced_it() {
         "and the tool call it led to is still there"
     );
 }
+
+/// F7, on the real completion path: a behavioural obligation discharged by
+/// citing the edit that was made, rather than any observation of what the code
+/// now does. This is icg-6r run-02's shape with the fixture removed — the
+/// judge names a runtime-issued id, and the id is the `apply_patch` call.
+///
+/// The runtime must refuse: a file changing is not the behaviour changing, and
+/// it knows which of the two that id is.
+#[tokio::test]
+async fn a_behaviour_obligation_citing_the_edit_cannot_complete() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f7-cites-edit-{}",
+        std::process::id() as u64 * 73 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "records of category A must be absent from every summary".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
+        ),
+        // The judge cites the only candidate there is — the edit — and calls
+        // it an observation of the behaviour.
+        assistant_text(
+            r#"{"verdict":"satisfied",
+                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
+                "contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,
+                   "evidence":"the recorded run printed only the category B row",
+                   "evidence_strength":"observed","evidence_refs":["E1"]}
+                ],
+                "reason":"done"}"#,
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "cannot show the behaviour"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "make records of category A absent from every summary",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "an edit is not an observation of the behaviour it was meant to change"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("R1")
+        )),
+        "and the refusal names the obligation still open: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
