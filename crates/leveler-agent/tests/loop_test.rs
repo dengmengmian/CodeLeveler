@@ -9504,25 +9504,26 @@ impl ModelRuntime for SummaryCountingRuntime {
     }
 }
 
-/// The claim the deterministic tier makes: trimming stale tool results before
-/// the fold buys back context that would otherwise have been paid for with a
-/// summarization call. Same workload, same budget, pruning the only variable —
-/// the pruned run must issue strictly fewer summaries and reach the same
-/// answer. (It cannot reach zero: while a big read is still inside the working
-/// set, trimming is not allowed to touch it, and those rounds still fold.)
+/// The claim the deterministic tier makes, on its own trigger: stale tool
+/// results are reclaimed even when the fold never comes due. That is the
+/// whole point of the retrigger — the fold does not happen on real task runs,
+/// so a mechanism wired to it never executed.
+///
+/// Same workload, same generous budget, trimming the only variable. The
+/// pruned run must send a materially smaller context and reach the same
+/// answer, with no fold on either side.
 #[tokio::test]
-async fn pruning_stale_tool_results_buys_back_summarization_calls() {
-    async fn run_with_pruning(prune: bool, tag: u64) -> (usize, StopReason) {
+async fn trimming_reclaims_stale_results_without_any_fold() {
+    async fn run(prune: bool, tag: u64) -> (usize, u64, StopReason, usize) {
         let dir = std::env::temp_dir().join(format!(
-            "leveler-agent-prune-ab-{}-{tag}",
+            "leveler-agent-prune-trigger-{}-{tag}",
             std::process::id() as u64
         ));
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        // Reads a little over the prune trigger each. The budget is only blown
-        // after enough of them that the earliest results have left the working
-        // set — which is the situation the deterministic tier is for.
         let line = format!("// {}\n", "x".repeat(120));
-        let body = line.repeat(leveler_agent::PRUNE_TRIGGER_BYTES / line.len() + 8);
+        // Big enough that a handful of stale results clear the batch
+        // threshold; the trim waits for a batch worth a cache break.
+        let body = line.repeat(leveler_agent::PRUNE_TRIGGER_BYTES * 4 / line.len());
         for i in 0..12 {
             std::fs::write(dir.join(format!("src/f{i}.rs")), &body).unwrap();
         }
@@ -9539,12 +9540,13 @@ async fn pruning_stale_tool_results_buys_back_summarization_calls() {
             })
             .collect();
         responses.push(assistant_text("done"));
-
-        let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let runtime = Arc::new(SummaryCountingRuntime {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(RecordingRuntime {
             responses: Mutex::new(VecDeque::from(responses)),
-            summaries: summaries.clone(),
+            seen: seen.clone(),
         });
+
+        let mut folds = 0usize;
         let outcome = Executor::new(
             runtime,
             Arc::new(default_registry()),
@@ -9554,39 +9556,47 @@ async fn pruning_stale_tool_results_buys_back_summarization_calls() {
         )
         .with_delegation(false)
         .with_tool_result_pruning(prune)
-        .with_context_budget(45_000)
+        // Deliberately generous: a real task run peaks around a tenth of its
+        // budget, so a fold must not be what makes this fire.
+        .with_context_budget(1_000_000)
         .run(
             "read them all",
-            &mut |_| {},
+            &mut |event| {
+                if matches!(event, AgentEvent::Compacted { .. }) {
+                    folds += 1;
+                }
+            },
             &mut NoopSink,
             CancellationToken::new(),
         )
         .await
         .unwrap();
+
+        let last = seen.lock().unwrap().last().cloned().unwrap_or_default();
+        let bytes = leveler_agent::estimate_tokens(&last);
         std::fs::remove_dir_all(&dir).ok();
-        (
-            summaries.load(std::sync::atomic::Ordering::SeqCst),
-            outcome.stop_reason,
-        )
+        (folds, bytes, outcome.stop_reason, last.len())
     }
 
-    let (control, control_stop) = run_with_pruning(false, 51).await;
-    let (pruned, pruned_stop) = run_with_pruning(true, 53).await;
+    let (control_folds, control_tokens, control_stop, control_len) = run(false, 71).await;
+    let (pruned_folds, pruned_tokens, pruned_stop, pruned_len) = run(true, 73).await;
 
+    assert_eq!(control_folds, 0, "the budget is far too large to fold");
+    assert_eq!(pruned_folds, 0, "and trimming must not induce one");
     assert_eq!(control_stop, StopReason::Answered);
+    assert_eq!(pruned_stop, control_stop, "the answer is unchanged");
     assert_eq!(
-        pruned_stop, control_stop,
-        "pruning must not change the outcome"
+        pruned_len, control_len,
+        "trimming drops no message; only bytes inside old results"
     );
-    assert!(control > 0, "the control run must actually fold");
     assert!(
-        pruned < control,
-        "pruning must buy back summarization calls: {pruned} vs {control}"
+        pruned_tokens < control_tokens,
+        "trimming must reclaim without a fold: {pruned_tokens} vs {control_tokens}"
     );
 }
 
 /// A sink that records the model-call ledger the runtime keeps.
-struct LedgerSink(Arc<Mutex<Vec<(String, leveler_agent::ModelCallKind)>>>);
+struct LedgerSink(Arc<Mutex<Vec<(Option<String>, leveler_agent::ModelCallKind)>>>);
 
 #[async_trait]
 impl leveler_agent::TranscriptSink for LedgerSink {
@@ -9601,7 +9611,7 @@ impl leveler_agent::TranscriptSink for LedgerSink {
         self.0
             .lock()
             .unwrap()
-            .push((record.id.clone(), record.kind));
+            .push((record.provider_request_id.clone(), record.kind));
         Ok(())
     }
 }
@@ -9670,4 +9680,198 @@ async fn a_folds_summarization_is_recorded_as_a_compaction_call() {
         "every fold's summary call must be on the ledger: {ledger:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Contract derivation is a provider call the runtime makes on its own
+/// account. It went unrecorded, so a goal session's reported cost was short by
+/// every derivation it made — and by the judge, on the same path.
+#[tokio::test]
+async fn contract_derivation_is_recorded_as_an_advisory_call() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-advisory-ledger-{}",
+        std::process::id() as u64 * 23 + 53
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "done"}),
+    )]));
+    let ledger = Arc::new(Mutex::new(Vec::new()));
+    let _ = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        6,
+    )
+    .with_goal_mode(true)
+    .run(
+        "make src/lib.rs export a mul function and cover it with a test",
+        &mut |_| {},
+        &mut LedgerSink(ledger.clone()),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let ledger = ledger.lock().unwrap();
+    let advisories = ledger
+        .iter()
+        .filter(|(_, k)| *k == leveler_agent::ModelCallKind::Advisory)
+        .count();
+    assert!(
+        advisories > 0,
+        "the derivation the goal path always makes must be on the ledger: {ledger:?}"
+    );
+}
+
+/// A runtime that emits a reasoning delta before its answer, and records what
+/// each request carried back.
+struct ThinkingRuntime {
+    responses: Mutex<VecDeque<ModelResponse>>,
+    seen: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl ModelRuntime for ThinkingRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(canned);
+        }
+        Ok(assistant_text("advisory"))
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        self.seen.lock().unwrap().push(request.messages.clone());
+        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+        })?;
+        let mut events = vec![
+            Ok(ModelEvent::MessageStarted {
+                request_id: response.request_id.clone(),
+            }),
+            Ok(ModelEvent::ReasoningDelta {
+                delta: "THINKING_CHAIN".to_string(),
+            }),
+        ];
+        for part in &response.message.content {
+            match part {
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
+                ContentPart::ToolCall { call } => {
+                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                }
+                _ => {}
+            }
+        }
+        events.push(Ok(ModelEvent::MessageCompleted {
+            finish_reason: response.finish_reason,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+async fn run_with_kept_reasoning(keep: bool, tag: u64) -> Vec<Vec<Message>> {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-keep-reasoning-{}-{tag}",
+        std::process::id() as u64
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(ThinkingRuntime {
+        responses: Mutex::new(VecDeque::from(vec![
+            assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/a.rs"})),
+            assistant_text("done"),
+        ])),
+        seen: seen.clone(),
+    });
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_delegation(false)
+    .with_kept_reasoning(keep)
+    .run(
+        "read it",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let out = seen.lock().unwrap().clone();
+    out
+}
+
+/// Today's behaviour, and the control arm: the reasoning a round produced is
+/// shown and dropped, so the next request carries no chain.
+#[tokio::test]
+async fn reasoning_is_dropped_from_history_by_default() {
+    let requests = run_with_kept_reasoning(false, 61).await;
+    let second = requests.get(1).expect("a second round");
+    assert!(
+        !second.iter().any(|m| m
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Reasoning { .. }))),
+        "no reasoning part may reach the next request: {second:?}"
+    );
+}
+
+/// The measurable arm: the chain stays on the assistant message that produced
+/// it, which is what a provider with the pass-back contract expects to be
+/// given back. Nothing else about the turn changes.
+#[tokio::test]
+async fn kept_reasoning_travels_with_the_message_that_produced_it() {
+    let requests = run_with_kept_reasoning(true, 63).await;
+    let second = requests.get(1).expect("a second round");
+    let assistant = second
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("the first round's assistant message");
+    let reasoning: Vec<&String> = assistant
+        .content
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Reasoning { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasoning,
+        vec!["THINKING_CHAIN"],
+        "the chain belongs to the message it produced: {assistant:?}"
+    );
+    assert!(
+        assistant
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolCall { .. })),
+        "and the tool call it led to is still there"
+    );
 }

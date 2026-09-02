@@ -318,6 +318,7 @@ pub(crate) async fn derive_contract(
     timeout: std::time::Duration,
     goal: &str,
     cancellation: &CancellationToken,
+    spend: &mut crate::AdvisorySpend,
 ) -> Result<CompletionContract, DerivationFailure> {
     if goal.trim().is_empty() {
         return Err(DerivationFailure::EmptyRequirements);
@@ -329,6 +330,7 @@ pub(crate) async fn derive_contract(
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(MAX_OUTPUT_TOKENS);
     request.reasoning_effort = Some(DERIVE_EFFORT);
+    let started = std::time::Instant::now();
     let response = match tokio::time::timeout(
         timeout,
         runtime.generate(request, cancellation.child_token()),
@@ -339,6 +341,13 @@ pub(crate) async fn derive_contract(
         Ok(Err(_)) => return Err(DerivationFailure::ProviderError),
         Ok(Ok(response)) => response,
     };
+    // Recorded BEFORE the reply is judged: a malformed one still cost what it
+    // cost, and the derivation returns an error from several points below.
+    spend.push(crate::executor::advisory_record(
+        model,
+        &response,
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    ));
     let text = response.message.text_content();
     classify_reply(&text, response.finish_reason)?;
     // Same acceptance shape as the reconciliation gate: a bare object, a
@@ -471,6 +480,7 @@ mod tests {
             std::time::Duration::from_secs(30),
             goal(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await
         .expect("a well-formed derivation yields a contract");
@@ -503,6 +513,7 @@ mod tests {
                 std::time::Duration::from_secs(30),
                 goal(),
                 &CancellationToken::new(),
+                &mut crate::AdvisorySpend::new(),
             )
             .await
             .is_err()
@@ -519,6 +530,7 @@ mod tests {
                 std::time::Duration::from_secs(30),
                 goal(),
                 &CancellationToken::new(),
+                &mut crate::AdvisorySpend::new(),
             )
             .await
             .is_err()
@@ -539,6 +551,7 @@ mod tests {
             std::time::Duration::from_secs(30),
             goal(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await
         .expect("contract");

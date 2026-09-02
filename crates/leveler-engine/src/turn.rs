@@ -80,7 +80,11 @@ impl TranscriptSink for TurnSink {
             .and_then(|value| value.as_str().map(ToOwned::to_owned));
         self.model_requests
             .insert(&leveler_storage::ModelRequestRecord {
-                id: record.id.clone(),
+                // The engine owns the row's identity; the provider's id rides
+                // along as a diagnostic. Two calls that report the same id are
+                // two rows, not a persistence failure that ends the turn.
+                id: leveler_core::EventId::generate().into_inner(),
+                provider_request_id: record.provider_request_id.clone(),
                 session_id: self.session_id.clone(),
                 provider: record.provider.clone(),
                 model: record.model.clone(),
@@ -94,6 +98,9 @@ impl TranscriptSink for TurnSink {
                     leveler_agent::ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
                     leveler_agent::ModelCallKind::Compaction => {
                         leveler_storage::ModelCallKind::Compaction
+                    }
+                    leveler_agent::ModelCallKind::Advisory => {
+                        leveler_storage::ModelCallKind::Advisory
                     }
                 },
                 created_at: leveler_core::now(),

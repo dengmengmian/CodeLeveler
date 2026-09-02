@@ -710,7 +710,10 @@ pub trait TranscriptSink: Send {
 /// finish reason makes truncation distinguishable from semantic completion.
 #[derive(Debug, Clone)]
 pub struct ModelRequestRecord {
-    pub id: String,
+    /// The provider's request id, when it reported one. A diagnostic, not a
+    /// key: the engine generates the row's identity, because a repeated
+    /// provider id used to abort the turn on a UNIQUE violation.
+    pub provider_request_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub usage: TokenUsage,
@@ -735,6 +738,38 @@ pub enum ModelCallKind {
     Round,
     /// The summarization behind a compaction fold.
     Compaction,
+    /// A bounded call the runtime makes on its own account: deriving the
+    /// completion contract, or the reconciliation judge. Both arms of any
+    /// comparison pay these equally, but a session's absolute cost is short
+    /// by them until they are recorded.
+    Advisory,
+}
+
+/// Where a bounded advisory call reports what it cost.
+///
+/// These calls are made by free functions that have no transcript sink, and
+/// several of their paths spend tokens and then return an error — a reply the
+/// judge could not parse is still a reply the provider billed. Returning the
+/// cost would lose exactly those; a collector the call pushes into before it
+/// returns does not.
+pub type AdvisorySpend = Vec<ModelRequestRecord>;
+
+/// Build the record for one completed advisory call.
+pub(crate) fn advisory_record(
+    model: &leveler_model::ModelRef,
+    response: &leveler_model::ModelResponse,
+    latency_ms: u64,
+) -> ModelRequestRecord {
+    ModelRequestRecord {
+        provider_request_id: Some(response.request_id.to_string()),
+        provider: model.provider.clone(),
+        model: model.model.clone(),
+        usage: response.usage,
+        finish_reason: response.finish_reason,
+        latency_ms,
+        retry_count: 0,
+        kind: ModelCallKind::Advisory,
+    }
 }
 
 /// A sink that discards everything (non-persistent runs, tests).
@@ -889,6 +924,17 @@ pub struct TurnPolicy {
     /// Budget the engine recovered from prior `ContextExpanded` events, so a
     /// resumed task does not silently shrink back to the initial tier.
     pub restored_context_budget: Option<u32>,
+    /// Keep the reasoning a streamed round produced on the assistant message,
+    /// so a provider with the pass-back contract receives the chain it asked
+    /// for instead of an empty string.
+    ///
+    /// Off by default, which is today's behaviour: the deltas are shown and
+    /// dropped. Keeping them is not free — the chain re-enters the input of
+    /// every later request in the turn and accumulates like a tool result —
+    /// and whether that buys enough continuity to pay for itself is
+    /// unmeasured in both directions. See `docs/REASONING_CAPABILITY_AUDIT.md`
+    /// §9 and the measurement plan.
+    pub keep_reasoning: bool,
     /// Reclaim context by trimming the middle out of oversized tool results
     /// that have left the working set, BEFORE folding the transcript. The
     /// cheap tier: no model call, nothing dropped, and the request prefix
@@ -944,6 +990,7 @@ impl Default for TurnPolicy {
             reliable_context: 0,
             repair_expansion_evidence: false,
             restored_context_budget: None,
+            keep_reasoning: false,
             prune_tool_results: false,
             context_trace: false,
             goal_mode: false,
@@ -1501,6 +1548,7 @@ impl Executor {
                 reliable_context: self.policy.reliable_context,
                 repair_expansion_evidence: false,
                 restored_context_budget: None,
+                keep_reasoning: self.policy.keep_reasoning,
                 prune_tool_results: self.policy.prune_tool_results,
                 context_trace: self.policy.context_trace,
                 max_concurrent_agents: self.policy.max_concurrent_agents,
@@ -1563,6 +1611,13 @@ impl Executor {
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
         self.policy.max_concurrent_agents = max_concurrent.max(1);
         self.policy.max_total_agents = max_total;
+        self
+    }
+
+    /// Keep a streamed round's reasoning on the assistant message (see
+    /// [`TurnPolicy::keep_reasoning`]).
+    pub fn with_kept_reasoning(mut self, keep: bool) -> Self {
+        self.policy.keep_reasoning = keep;
         self
     }
 

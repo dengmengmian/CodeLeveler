@@ -36,7 +36,9 @@ use crate::authorization::{
     collect_scoped_paths_from_call, is_observe_result_tool, is_pure_observe_call, is_search_tool,
     is_verification_program, observe_class, push_unique_path,
 };
-use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
+use crate::compaction::{
+    COMPACT_KEEP_RECENT, PRUNE_BATCH_BYTES, compact_messages, estimate_tokens,
+};
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL,
     REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
@@ -199,14 +201,19 @@ impl Executor {
                 let judge_timeout = self
                     .reconciliation_timeout
                     .unwrap_or(crate::reconciliation::DEFAULT_RECONCILE_TIMEOUT);
+                let mut spend = crate::AdvisorySpend::new();
                 let derived = crate::completion_contract::derive_contract(
                     self.runtime.as_ref(),
                     &self.model,
                     judge_timeout,
                     &original_task,
                     &cancellation,
+                    &mut spend,
                 )
                 .await;
+                for record in &spend {
+                    sink.record_model_request(record).await?;
+                }
                 // Failures used to be one indistinguishable `None`, so a
                 // budget ceiling read the same as a provider outage and the
                 // real cause had to be reconstructed by hand afterwards.
@@ -908,7 +915,7 @@ impl Executor {
             };
 
             sink.record_model_request(&ModelRequestRecord {
-                id: stream_result.request_id.clone(),
+                provider_request_id: Some(stream_result.request_id.clone()),
                 provider: self.model.provider.clone(),
                 model: self.model.model.clone(),
                 usage: stream_result.usage,
@@ -1826,6 +1833,7 @@ impl Executor {
                             // the ledger would then fail to resolve.
                             let evidence_candidates =
                                 crate::reconciliation::evidence_candidates(&ledger);
+                            let mut judge_spend = crate::AdvisorySpend::new();
                             let outcome = crate::reconciliation::reconcile_completion(
                                 self.runtime.as_ref(),
                                 judge_model,
@@ -1842,8 +1850,12 @@ impl Executor {
                                     contract: completion_contract.as_ref(),
                                 },
                                 &cancellation,
+                                &mut judge_spend,
                             )
                             .await;
+                            for record in &judge_spend {
+                                sink.record_model_request(record).await?;
+                            }
                             tracing::info!(
                                 executor_model = %self.model,
                                 reconciliation_model = %judge_model,
@@ -1875,15 +1887,23 @@ impl Executor {
                             // "nothing was required".
                             let completion_contract = match completion_contract.as_ref() {
                                 Some(_) => completion_contract.clone(),
-                                None => crate::completion_contract::derive_contract(
-                                    self.runtime.as_ref(),
-                                    &self.model,
-                                    judge_timeout,
-                                    &original_task,
-                                    &cancellation,
-                                )
-                                .await
-                                .ok(),
+                                None => {
+                                    let mut spend = crate::AdvisorySpend::new();
+                                    let derived = crate::completion_contract::derive_contract(
+                                        self.runtime.as_ref(),
+                                        &self.model,
+                                        judge_timeout,
+                                        &original_task,
+                                        &cancellation,
+                                        &mut spend,
+                                    )
+                                    .await
+                                    .ok();
+                                    for record in &spend {
+                                        sink.record_model_request(record).await?;
+                                    }
+                                    derived
+                                }
                             };
                             let mut rejected_not_accounted = 0usize;
                             let mut rejected_missing_evidence = 0usize;
@@ -3879,13 +3899,44 @@ impl Executor {
             // gateways don't report streaming usage, and without a fallback
             // compaction would silently never fire. The persisted transcript
             // (sink) is untouched — only what we resend shrinks.
-            let context_tokens = used_tokens.max(estimate_tokens(&messages));
+            let mut context_tokens = used_tokens.max(estimate_tokens(&messages));
             // C5-S3 decision point: over-budget pressure is WHEN we decide,
             // evidence is WHY the budget may grow. An eligible expansion keeps
             // the request prefix (cache-preserving); folding rewrites it — so
             // expand-before-compact whenever the evidence supports it.
+            // The deterministic tier runs on its OWN trigger, not the fold's.
+            // It was wired inside the fold decision, and the fold does not
+            // happen: a real task run peaks around a tenth of the threshold
+            // (see docs/CONTEXT_COST_MEASUREMENT_PLAN.md §0b), so the trimming
+            // never executed. What it reclaims — stale tool results that have
+            // left the working set — is worth reclaiming whether or not the
+            // window is ever threatened.
+            //
+            // It fires on a BATCH of reclaimable bytes rather than every
+            // round, because trimming rewrites bytes the provider has already
+            // cached: one prefix-cache break for a large reclaim, instead of
+            // one per round as results go stale singly.
+            if self.policy.prune_tool_results && has_next_round {
+                let reclaimable = crate::compaction::reclaimable_tool_result_bytes(
+                    &messages,
+                    COMPACT_KEEP_RECENT,
+                );
+                if reclaimable >= PRUNE_BATCH_BYTES {
+                    let before = context_tokens;
+                    messages =
+                        crate::compaction::prune_tool_results(&messages, COMPACT_KEEP_RECENT);
+                    context_tokens = used_tokens.max(estimate_tokens(&messages));
+                    context_diverged = true;
+                    tracing::debug!(
+                        reclaimable_bytes = reclaimable,
+                        tokens_before = before,
+                        tokens_after = context_tokens,
+                        "trimmed stale tool results"
+                    );
+                }
+            }
             let guard_trips = self.tool_context.execution.read_guard.total_trips();
-            let mut context_action = if has_next_round {
+            let context_action = if has_next_round {
                 crate::context_budget::decide_context_action(
                     self.policy.adaptive_context,
                     &self.policy.context_tiers,
@@ -3917,30 +3968,6 @@ impl Executor {
                     crossed_reliable,
                     guard_trips,
                 );
-            }
-            if context_action == crate::context_budget::ContextAction::Compact
-                && self.policy.prune_tool_results
-            {
-                // Cheap tier first: trimming the middle out of tool results
-                // that have left the working set costs no model call and
-                // leaves every message and pairing in place. When it alone
-                // brings the request under budget, the fold — which rewrites
-                // the prefix and pays for a summary — is not needed at all.
-                let pruned = crate::compaction::prune_tool_results(&messages, COMPACT_KEEP_RECENT);
-                let pruned_tokens = estimate_tokens(&pruned);
-                if pruned_tokens < context_tokens {
-                    let reclaimed = context_tokens - pruned_tokens;
-                    messages = pruned;
-                    context_diverged = true;
-                    tracing::debug!(
-                        reclaimed,
-                        budget = context_state.current_budget,
-                        "trimmed stale tool results before folding"
-                    );
-                    if pruned_tokens <= u64::from(context_state.current_budget) {
-                        context_action = crate::context_budget::ContextAction::Keep;
-                    }
-                }
             }
             if context_action == crate::context_budget::ContextAction::Compact {
                 let before = messages.len();
@@ -3982,7 +4009,7 @@ impl Executor {
                 // spent — precisely in the lane a fold is the cost of.
                 if let Some(summarized) = &summarized {
                     sink.record_model_request(&ModelRequestRecord {
-                        id: summarized.request_id.to_string(),
+                        provider_request_id: Some(summarized.request_id.to_string()),
                         provider: self.model.provider.clone(),
                         model: self.model.model.clone(),
                         usage: summarized.usage,

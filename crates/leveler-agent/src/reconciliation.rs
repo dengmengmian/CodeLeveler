@@ -626,6 +626,7 @@ async fn one_call(
     messages: Vec<Message>,
     deadline: std::time::Instant,
     cancellation: &CancellationToken,
+    spend: &mut crate::AdvisorySpend,
 ) -> Result<String, ReconcileOutcome> {
     // One gate, one clock. The first judgment and any format repair spend the
     // same budget, and a request is not started at all once it is gone.
@@ -653,6 +654,7 @@ async fn one_call(
     // format-following judgment, and a thinking-flag model at high effort
     // spends the completion budget on reasoning before any content (HC002-F1).
     request.reasoning_effort = Some(RECONCILE_EFFORT);
+    let started = std::time::Instant::now();
     match tokio::time::timeout(
         remaining,
         runtime.generate(request, cancellation.child_token()),
@@ -673,6 +675,14 @@ async fn one_call(
             format!("reconciliation request failed: {error}"),
         )),
         Ok(Ok(response)) => {
+            // Recorded whatever the reply turns out to say: a judgment that
+            // cannot be parsed, or a repair that fails again, still cost what
+            // the provider billed for it.
+            spend.push(crate::executor::advisory_record(
+                model,
+                &response,
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            ));
             // A judgment cut off mid-object arrives as "no JSON object", which
             // reads like a model that cannot follow a schema. It is usually a
             // budget that ran out, so say which one it was.
@@ -700,6 +710,7 @@ pub(crate) async fn reconcile_completion(
     timeout: std::time::Duration,
     input: ReconcileInput<'_>,
     cancellation: &CancellationToken,
+    spend: &mut crate::AdvisorySpend,
 ) -> ReconcileOutcome {
     let started = std::time::Instant::now();
     // The gate's budget is one absolute deadline from here on: retries inside
@@ -714,6 +725,7 @@ pub(crate) async fn reconcile_completion(
         vec![Message::text(Role::User, prompt.clone())],
         deadline,
         cancellation,
+        spend,
     )
     .await
     {
@@ -752,7 +764,15 @@ pub(crate) async fn reconcile_completion(
             Message::text(Role::User, REPAIR_ASK.to_string()),
         ]
     };
-    let second_text = match one_call(runtime, model, repair_messages, deadline, cancellation).await
+    let second_text = match one_call(
+        runtime,
+        model,
+        repair_messages,
+        deadline,
+        cancellation,
+        spend,
+    )
+    .await
     {
         Ok(text) => text,
         Err(mut refused) => {
@@ -948,6 +968,7 @@ mod tests {
             DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert!(out.allows_completion());
@@ -1016,6 +1037,7 @@ mod tests {
             DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert!(out.allows_completion());
@@ -1045,6 +1067,7 @@ mod tests {
             DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert_eq!(out.verdict, ReconcileVerdict::Unavailable);
@@ -1070,6 +1093,7 @@ mod tests {
             DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert_eq!(out.failure_kind, Some("provider_error"));
@@ -1477,6 +1501,7 @@ mod request_budget {
             Duration::from_millis(180),
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert_eq!(
@@ -1507,6 +1532,7 @@ mod request_budget {
             Duration::from_millis(180),
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert_eq!(outcome.verdict, ReconcileVerdict::Unavailable);
@@ -1567,6 +1593,7 @@ mod request_budget {
             Duration::from_millis(180),
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert!(!outcome.allows_completion(), "prose is not a verdict");
@@ -1617,6 +1644,7 @@ mod request_budget {
             Duration::ZERO,
             input(),
             &CancellationToken::new(),
+            &mut crate::AdvisorySpend::new(),
         )
         .await;
         assert_eq!(outcome.verdict, ReconcileVerdict::Unavailable);
@@ -1752,6 +1780,7 @@ mod probe {
                     contract: saved.contract.as_ref(),
                 },
                 &CancellationToken::new(),
+                &mut crate::AdvisorySpend::new(),
             )
             .await;
             let kind = outcome.failure_kind.unwrap_or("none");
