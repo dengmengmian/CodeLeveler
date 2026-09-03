@@ -531,21 +531,28 @@ fn discharged(
         // `docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md` §7.
         RequirementKind::Behavior => {
             let cited: Vec<&String> = evidence.iter().flat_map(|e| e.refs.iter()).collect();
-            // F7-B: an uncited claim is NOT gated on the run having observed
-            // its own work, though that rule was written and tried. It cannot
-            // live here. `update_goal(complete)` consults this predicate from
-            // inside the agent loop, and on the Direct path the runtime's own
-            // verification plan runs AFTER that claim and never enters this
-            // ledger — so the rule made completion unreachable for every task
-            // that verifies the way the product is designed to verify. Thirteen
-            // engine tests spun until their scripts ran out.
+            // A citation must name an observation of the work; that holds at
+            // both points, because a bad citation is bad whenever it is read.
+            if !cited.is_empty() {
+                return cited.into_iter().any(|id| ledger.witnesses_behavior(id));
+            }
+            // An uncited claim is judged only once the runtime has finished
+            // producing its own evidence. F7-B tried to judge it at the
+            // request point and had to withdraw: the verification plan runs
+            // after that claim, so the refusal demanded proof that did not
+            // exist yet, and thirteen engine tests spun until their scripts
+            // ran out. F7-C made that evidence reach this ledger, so the
+            // question can now be asked at the moment it is answerable.
             //
-            // Moving it to the terminal boundary would mean a second
-            // completion predicate, which is exactly what this architecture
-            // refuses. So uncited semantic discharge remains open, and
-            // `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7 says so rather
-            // than leaving it looking like an oversight.
-            cited.is_empty() || cited.into_iter().any(|id| ledger.witnesses_behavior(id))
+            // Still one predicate and one authority. The flag says which of
+            // the two moments this is, not who decides.
+            if !ledger.runtime_evidence_complete {
+                return true;
+            }
+            // At commit: a behavioural obligation needs something behavioural
+            // behind it. Not "any ref" — an observation of the changed tree,
+            // whoever ran it.
+            ledger.observed_the_changed_tree()
         }
         _ => true,
     }
@@ -810,19 +817,13 @@ mod tests {
         ledger
     }
 
-    /// THE OPEN GAP, pinned so nobody mistakes it for an oversight: a claim
-    /// the judge anchored to nothing still discharges, even when the run
-    /// edited code and then observed none of it.
-    ///
-    /// Gating this was implemented and withdrawn. `update_goal(complete)`
-    /// consults this predicate from inside the agent loop, while on the Direct
-    /// path the runtime's verification plan runs after that claim and never
-    /// enters this ledger — so the gate made completion unreachable for tasks
-    /// that verify the way the product verifies. Putting it at the terminal
-    /// boundary instead would mean a second completion predicate.
-    /// `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7.
+    /// F7-C. While the runtime is still gathering evidence — the agent has
+    /// claimed completion and the verification plan has not run yet — an
+    /// uncited claim is not judged. This is the REQUEST point, and refusing
+    /// here is what made completion unreachable in F7-B: the evidence the
+    /// refusal asks for is produced after this moment, by design.
     #[test]
-    fn an_uncited_claim_still_discharges_even_with_nothing_observed() {
+    fn an_uncited_claim_is_not_judged_while_evidence_is_still_being_gathered() {
         let contract = CompletionContract::new(vec![behaviour_citing(
             Vec::new(),
             EvidenceStrength::Semantic,
@@ -831,7 +832,63 @@ mod tests {
             contract
                 .unsatisfied_material(&edit_without_observation())
                 .is_empty(),
-            "the uncited path is ungated; this is the known open gap"
+            "the request point cannot demand evidence that does not exist yet"
+        );
+    }
+
+    /// F7-C, THE GAP 1 GATE. Once the runtime has finished producing its own
+    /// evidence — the verification plan ran and its observations are on the
+    /// ledger — a behavioural obligation backed by nothing behavioural is not
+    /// discharged. This is the COMMIT point, where the claim is finally
+    /// judged against everything the runtime actually knows.
+    #[test]
+    fn an_uncited_claim_over_unobserved_work_is_refused_once_evidence_is_complete() {
+        let mut ledger = edit_without_observation();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "nothing behavioural was ever observed over the changed tree"
+        );
+    }
+
+    /// The same commit point, with the runtime's own verification on the
+    /// ledger: the claim closes. This is the ordinary Direct shape, and it is
+    /// what F7-C's lifecycle fix exists to make possible.
+    #[test]
+    fn an_uncited_claim_closes_at_commit_when_the_runtime_verified_the_work() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert!(
+            contract.unsatisfied_material(&ledger).is_empty(),
+            "the runtime observed the changed tree; the claim may rest on that"
+        );
+    }
+
+    /// F7-C TEST E. A ref that is not behavioural evidence does not satisfy a
+    /// behavioural obligation — `refs.non_empty()` is not the rule. A mutation
+    /// is the case F7-A already covers; this pins that the commit-point gate
+    /// did not quietly widen into "any ref will do".
+    #[test]
+    fn an_arbitrary_ref_is_not_behavioural_evidence_at_commit() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-edit".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "citing the edit is citing the work, not an observation of it"
         );
     }
 

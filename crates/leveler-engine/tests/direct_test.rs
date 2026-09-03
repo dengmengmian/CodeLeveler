@@ -2614,3 +2614,187 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
         "the capability contract must travel with the trace"
     );
 }
+
+// ── F7-C: the runtime's own verification is evidence ──────────────────────
+//
+// The engine runs the verification plan in `conclude_direct`, after the
+// agent's completion claim and before the terminal contract check. Its
+// results reach the EventLog but never the EvidenceLedger, so the one
+// decision that matters is taken without seeing the runtime's own
+// observation of the changed tree. These pin the lifecycle, not a new rule.
+
+/// F7-C TEST A. A green gate the ENGINE ran over the changed tree is a real
+/// observation of that tree, and the completion contract has to be able to
+/// see it. Today it is announced as an event and never recorded as evidence.
+#[tokio::test]
+async fn engine_verification_reaches_the_evidence_ledger() {
+    let h = harness(patch_resolve_and_proven_ac()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    assert!(
+        ledger
+            .verifications
+            .iter()
+            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
+        "the gate the engine ran over the edited tree must be in the ledger: {:?}",
+        ledger.verifications
+    );
+}
+
+/// F7-C TEST B. A failing gate is equally an observation, and its record has
+/// to say it failed rather than being absent — an absent record reads as "no
+/// check ran", which is a different and softer fact.
+#[tokio::test]
+async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
+    // A red gate buys one repair turn (DIRECT_REPAIR_ATTEMPTS), so the script
+    // has to carry a second pass through the loop.
+    let mut responses = patch_resolve_and_proven_ac();
+    responses.extend(patch_resolve_and_proven_ac());
+    let h = harness(responses).await;
+    let s = spec(&h, gate("nope", "false"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a red gate cannot verify"
+    );
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    assert!(
+        ledger.verifications.iter().any(|v| v.exit_code != 0),
+        "the failure must be on the record, not merely absent: {:?}",
+        ledger.verifications
+    );
+}
+
+/// F7-C TEST C. Recording the verification must not become a second way to
+/// finish. A run whose gate is green but whose goal produced no mutation is
+/// still not Verified: the gate says the tree is healthy, which is not the
+/// same claim as the work being done, and only the contract decides that.
+#[tokio::test]
+async fn a_green_gate_over_no_work_is_not_a_completion_decision() {
+    let h = harness(vec![tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "auth uses JWT sessions"}),
+    )])
+    .await;
+    let mut s = spec(&h, gate("ok", "true"));
+    s.runtime.goal = "explain how auth works".to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a green gate is evidence about the tree, not a completion decision"
+    );
+}
+
+/// F7-C TEST I. A completion attempt may be made more than once. The ledger
+/// must not grow a fresh copy of the same observation each time.
+#[tokio::test]
+async fn recording_the_same_verification_twice_does_not_duplicate_it() {
+    let h = harness(patch_resolve_and_proven_ac()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    let engine_records: Vec<_> = ledger
+        .verifications
+        .iter()
+        .filter(|v| v.tool_call_id.starts_with("engine-verification:"))
+        .collect();
+    let mut ids: Vec<&str> = engine_records
+        .iter()
+        .map(|v| v.tool_call_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        before,
+        "one observation per check per attempt: {engine_records:?}"
+    );
+}
+
+/// F7-C TEST D / TEST J — the GAP 1 gate, on the real Direct completion path.
+///
+/// A behavioural obligation, a run that edits, and no gates for the runtime to
+/// run: nothing anywhere observes the changed tree. The claim is judged at the
+/// commit point, where the runtime has finished producing evidence and has
+/// none, and it must not verify.
+#[tokio::test]
+async fn a_behavioural_obligation_with_nothing_observed_does_not_verify() {
+    let h = harness(patch_resolve_and_proven_ac()).await;
+    // No verification plan: the runtime will not produce an observation, and
+    // the fixture's run does not run one either.
+    let s = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a behavioural claim nothing observed cannot verify"
+    );
+}
+
+/// F7-C TEST J — the same path with the runtime's own gate. The verification
+/// plan runs, its observation lands on the ledger before the one contract
+/// decision, and the run verifies. This is the shape F7-B's withdrawn rule
+/// would have made impossible.
+#[tokio::test]
+async fn the_runtime_s_own_verification_lets_a_behavioural_claim_close() {
+    let h = harness(patch_resolve_and_proven_ac()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "the runtime observed the changed tree before deciding"
+    );
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    assert!(
+        ledger.runtime_evidence_complete,
+        "and the decision knew it was the commit point"
+    );
+}

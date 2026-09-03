@@ -1990,17 +1990,19 @@ impl TaskEngine {
             ));
         }
 
+        let mut attempts = 0;
         let mut report = self
             .verify(
                 log,
+                runner,
                 spec,
                 &[],
                 &outcome.modified_files,
+                attempts,
                 observer,
                 &cancellation,
             )
             .await?;
-        let mut attempts = 0;
         while report.verdict() == Verdict::Failed
             && attempts < DIRECT_REPAIR_ATTEMPTS
             && verification_is_repairable(&report)
@@ -2035,9 +2037,11 @@ impl TaskEngine {
             report = self
                 .verify(
                     log,
+                    runner,
                     spec,
                     &[],
                     &outcome.modified_files,
+                    attempts,
                     observer,
                     &cancellation,
                 )
@@ -2225,9 +2229,11 @@ impl TaskEngine {
     async fn verify(
         &self,
         log: &EventLog<'_>,
+        runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         allowed_paths: &[String],
         modified_files: &[String],
+        attempt: u32,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<VerificationReport, EngineError> {
@@ -2293,7 +2299,89 @@ impl TaskEngine {
             observer,
         )
         .await?;
+        self.record_verification_evidence(log, runner, &plan, &report, attempt, observer)
+            .await?;
         Ok(report)
+    }
+
+    /// Record what the runtime's own verification observed, into the ledger
+    /// the completion contract reads.
+    ///
+    /// The engine runs the verification plan in `conclude_direct`, between the
+    /// agent's completion CLAIM and the terminal contract decision. Those runs
+    /// are real commands over the changed tree — the strongest observation the
+    /// runtime makes on its own account — and they reached the EventLog as
+    /// `VerificationCheck` rows but never the `EvidenceLedger`. So the one
+    /// decision that matters was taken without the runtime's own evidence, and
+    /// a rule asking a behavioural obligation for a witness could not be
+    /// satisfied by the very check the product runs to satisfy it (F7-B §6).
+    ///
+    /// This makes the engine an evidence PRODUCER and nothing more. It records
+    /// facts; `completion_debt()` remains the only thing that decides whether
+    /// they add up to a finished task. A green gate recorded here still cannot
+    /// complete an obligation the contract holds open.
+    ///
+    /// Identity is `engine-verification:<attempt>:<check>`, so a repeated
+    /// completion attempt re-records the same check under the same id instead
+    /// of growing the ledger, and provenance says which run produced it.
+    async fn record_verification_evidence(
+        &self,
+        log: &EventLog<'_>,
+        runner: &TurnRunner<'_>,
+        plan: &VerificationPlan,
+        report: &VerificationReport,
+        attempt: u32,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        if report.checks.is_empty() {
+            return Ok(());
+        }
+        let Ok(Some(mut ledger)) =
+            crate::turn::last_persisted_ledger(runner.stores.events.as_ref(), &runner.session_id)
+                .await
+        else {
+            // No ledger yet means no contract to inform, and inventing one here
+            // would be a second place that creates completion state.
+            return Ok(());
+        };
+        let mut added = false;
+        for check in &report.checks {
+            // Only a check whose command the plan names can be recorded: the
+            // fingerprint is what makes it comparable to a command the agent
+            // ran, and inventing one for a check with no command would put an
+            // unmatchable string into the evidence vocabulary.
+            let Some(command) = plan.commands.iter().find(|c| c.name == check.name) else {
+                continue;
+            };
+            let id = format!("engine-verification:{attempt}:{}", check.name);
+            if ledger.verifications.iter().any(|v| v.tool_call_id == id) {
+                continue;
+            }
+            let fingerprint = leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
+                &command.program,
+                &command.args,
+            );
+            let exit_code = i32::from(check.status != leveler_verifier::CheckStatus::Passed);
+            ledger.record_verify(id, fingerprint, exit_code);
+            added = true;
+        }
+        // The runtime has now produced everything it produces on its own
+        // account for this attempt. The terminal contract check reads this
+        // ledger next, and the flag is what tells the predicate it is being
+        // asked at the commit point rather than at the claim.
+        if !ledger.runtime_evidence_complete {
+            ledger.runtime_evidence_complete = true;
+            added = true;
+        }
+        if added {
+            log.append(
+                None,
+                EngineEvent::EvidenceLedgerUpdated { ledger },
+                observer,
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 

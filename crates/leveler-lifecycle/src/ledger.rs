@@ -62,6 +62,27 @@ pub struct EvidenceLedger {
     /// Serde-default so pre-findings snapshots still replay.
     #[serde(default)]
     pub findings: Vec<FindingRecord>,
+    /// Whether the runtime has finished producing its own evidence for this
+    /// completion attempt.
+    ///
+    /// The completion contract is asked twice on the same ledger, and the two
+    /// moments know different amounts. `update_goal(complete)` asks from
+    /// inside the agent loop — the REQUEST — while the runtime's verification
+    /// plan runs afterwards and records what it saw; the terminal boundary
+    /// then asks again — the COMMIT. One predicate, one authority, two points
+    /// on a ledger that grew in between.
+    ///
+    /// This flag is what lets the predicate tell them apart. Set once the
+    /// verification plan's observations are on the ledger. A rule that needs
+    /// runtime evidence stays silent while this is false, because refusing
+    /// there asks for proof that does not exist yet — the mistake F7-B made
+    /// and had to withdraw.
+    ///
+    /// Serde-default so snapshots written before it existed replay as "still
+    /// gathering", which is the conservative reading: they are judged exactly
+    /// as they were.
+    #[serde(default)]
+    pub runtime_evidence_complete: bool,
     /// Monotonic id source for findings owned by THIS ledger.
     #[serde(default)]
     pub next_finding_seq: u64,
