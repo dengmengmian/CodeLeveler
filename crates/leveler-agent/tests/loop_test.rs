@@ -9908,3 +9908,171 @@ async fn a_behaviour_obligation_citing_the_edit_cannot_complete() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// THE OPEN GAP on the real completion path, pinned so it stays visible: the
+/// run edits, never runs anything, and the judge declares the behavioural
+/// obligation satisfied without anchoring it to any evidence id — and the run
+/// completes.
+///
+/// The judge is not reading nothing here: it gets the recent tool output, the
+/// executor's claims and the modified path list. But none of that is an
+/// observation of the changed code, so the claim stands on prose.
+///
+/// Gating it was implemented and withdrawn: `update_goal(complete)` asks the
+/// contract from inside the agent loop, while the runtime's own verification
+/// plan runs after that claim and never reaches the evidence ledger, so the
+/// gate made completion unreachable for tasks that verify the way the product
+/// verifies. See `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7.
+#[tokio::test]
+async fn an_uncited_behaviour_claim_over_unobserved_work_still_completes() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f7b-unobserved-{}",
+        std::process::id() as u64 * 79 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "records of category A must be absent from every summary".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied",
+                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
+                "contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,
+                   "evidence":"the change filters category A out of the summary",
+                   "evidence_strength":"semantic"}
+                ],
+                "reason":"done"}"#,
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "make records of category A absent from every summary",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "the uncited path is ungated; this pins the gap, it does not bless it: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same run, once a check has actually run over the changed tree: the
+/// uncited claim closes. This is 26 of the 32 behavioural obligations in the
+/// preserved successful cohort, so it has to keep working.
+#[tokio::test]
+async fn an_uncited_behaviour_claim_closes_once_the_work_was_observed() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-f7b-observed-{}",
+        std::process::id() as u64 * 79 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "records of category A must be absent from every summary".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        },
+    ]);
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
+        // A verification-class program, so the run records a real check over
+        // the tree it just changed. `true` would run and prove nothing: F1
+        // decides which programs may be authoritative, and this test must not
+        // route around that.
+        assistant_tool_call(
+            "c2",
+            "run_command",
+            serde_json::json!({"program": "python3", "args": ["-c", "pass"]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied",
+                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
+                "contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,
+                   "evidence":"the change filters category A out of the summary",
+                   "evidence_strength":"semantic"}
+                ],
+                "reason":"done"}"#,
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    // The check has to actually run: under Assisted a command is gated, and a
+    // refused command records no verification, which is the very thing this
+    // test needs the ledger to hold.
+    .with_approver(Arc::new(leveler_execution::AutoApprove))
+    .run(
+        "make records of category A absent from every summary",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let outcome = outcome.expect("the run completes");
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "the run observed its own work; the uncited claim may rest on that: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

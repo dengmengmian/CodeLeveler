@@ -150,22 +150,43 @@ impl EvidenceLedger {
     }
 
     /// Whether `id` names an OBSERVATION this ledger holds: a command that
-    /// ran green over the tree as it now stands.
+    /// ran green over code this run had already changed.
     ///
     /// The distinction a citation needs. `resolves_evidence_ref` answers "does
     /// the runtime know this id at all" — F3's rule, which an invented id
     /// fails. This answers "can this id witness what the code does", which a
     /// file edit fails: a path changing is a fact about the tree, not about
-    /// its behaviour. Stale and failing runs are not witnesses either; they
-    /// describe a tree that no longer exists, or one that did not work.
+    /// its behaviour. A failing run is not a witness either, nor is one that
+    /// ran before anything changed — that says what the code already did, not
+    /// what the work achieved.
+    ///
+    /// F7-B: the test is "after ANY mutation", not "at or after the LAST
+    /// one". The stricter form discarded a check that had genuinely observed
+    /// the work as soon as any later write landed — a harness sanity file was
+    /// enough — and it blocked four obligations of an externally accepted
+    /// run. Whether the newest edit has been re-checked is a different
+    /// question, and [`Self::has_fresh_successful_verify`] is where it is
+    /// asked.
     pub fn witnesses_behavior(&self, id: &str) -> bool {
-        let last_mutation = self.last_mutation_seq();
-        self.verifications.iter().any(|v| {
-            v.tool_call_id == id
-                && v.exit_code == 0
-                && v.after_mutation_seq >= last_mutation
-                && last_mutation > 0
-        })
+        self.verifications
+            .iter()
+            .any(|v| v.tool_call_id == id && v.exit_code == 0 && v.after_mutation_seq > 0)
+    }
+
+    /// Whether this run ever observed the tree it had changed.
+    ///
+    /// The floor under a claim the judge could not anchor to an id. The judge
+    /// is not reading nothing in that case — it is given the recent tool
+    /// output, the executor's claims and the modified path list — but a
+    /// transcript with no observation of changed code leaves the claim
+    /// standing on prose alone.
+    ///
+    /// Same discrimination as [`Self::witnesses_behavior`], asked of the run
+    /// rather than of one id.
+    pub fn observed_the_changed_tree(&self) -> bool {
+        self.verifications
+            .iter()
+            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0)
     }
 
     pub fn has_fresh_successful_verify(&self) -> bool {

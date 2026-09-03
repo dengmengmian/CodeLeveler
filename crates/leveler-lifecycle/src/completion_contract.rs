@@ -531,6 +531,20 @@ fn discharged(
         // `docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md` §7.
         RequirementKind::Behavior => {
             let cited: Vec<&String> = evidence.iter().flat_map(|e| e.refs.iter()).collect();
+            // F7-B: an uncited claim is NOT gated on the run having observed
+            // its own work, though that rule was written and tried. It cannot
+            // live here. `update_goal(complete)` consults this predicate from
+            // inside the agent loop, and on the Direct path the runtime's own
+            // verification plan runs AFTER that claim and never enters this
+            // ledger — so the rule made completion unreachable for every task
+            // that verifies the way the product is designed to verify. Thirteen
+            // engine tests spun until their scripts ran out.
+            //
+            // Moving it to the terminal boundary would mean a second
+            // completion predicate, which is exactly what this architecture
+            // refuses. So uncited semantic discharge remains open, and
+            // `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7 says so rather
+            // than leaving it looking like an oversight.
             cited.is_empty() || cited.into_iter().any(|id| ledger.witnesses_behavior(id))
         }
         _ => true,
@@ -765,6 +779,114 @@ mod tests {
                 .unsatisfied_material(&ledger)
                 .is_empty()
         );
+    }
+
+    // ── F7-B: an uncited claim, and a citation that predates the work ─────
+
+    /// A run that edited and then never ran anything: the judge had only its
+    /// own prose to read.
+    fn edit_without_observation() -> EvidenceLedger {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger
+    }
+
+    /// A run whose only green check ran before anything changed.
+    fn baseline_then_edit() -> EvidenceLedger {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_verify("call-baseline", "check\u{1f}all", 0);
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger
+    }
+
+    /// The shape of a real successful run: work, a green check over it, then a
+    /// later unrelated write (a sanity artifact) that is not what any
+    /// obligation is about.
+    fn work_checked_then_unrelated_touch() -> EvidenceLedger {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger.record_verify("call-check", "check\u{1f}all", 0);
+        ledger.record_mutation("call-sanity", "write_file", vec![".sanity/marker".into()]);
+        ledger
+    }
+
+    /// THE OPEN GAP, pinned so nobody mistakes it for an oversight: a claim
+    /// the judge anchored to nothing still discharges, even when the run
+    /// edited code and then observed none of it.
+    ///
+    /// Gating this was implemented and withdrawn. `update_goal(complete)`
+    /// consults this predicate from inside the agent loop, while on the Direct
+    /// path the runtime's verification plan runs after that claim and never
+    /// enters this ledger — so the gate made completion unreachable for tasks
+    /// that verify the way the product verifies. Putting it at the terminal
+    /// boundary instead would mean a second completion predicate.
+    /// `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7.
+    #[test]
+    fn an_uncited_claim_still_discharges_even_with_nothing_observed() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert!(
+            contract
+                .unsatisfied_material(&edit_without_observation())
+                .is_empty(),
+            "the uncited path is ungated; this is the known open gap"
+        );
+    }
+
+    /// F7-B. A check that passed before anything changed demonstrates that the
+    /// code already satisfied it. Citing it as proof that the work achieved
+    /// something is the substitution this rejects.
+    #[test]
+    fn a_check_that_predates_the_work_proves_nothing_about_it() {
+        let cited = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-baseline".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(
+            cited.unsatisfied_material(&baseline_then_edit()).len(),
+            1,
+            "a baseline-green check is not evidence that the work did anything"
+        );
+    }
+
+    /// F7-B CONTROL. The yield case F7-A got wrong: a check that ran green
+    /// over the changed tree, invalidated only by a later write to something
+    /// no obligation is about. It is still a witness. Four obligations of an
+    /// externally accepted run were blocked by exactly this.
+    #[test]
+    fn a_later_unrelated_write_does_not_destroy_a_witness() {
+        let ledger = work_checked_then_unrelated_touch();
+        let cited = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert!(
+            cited.unsatisfied_material(&ledger).is_empty(),
+            "the check observed the work; a sanity-file write is not about it"
+        );
+
+        let uncited = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert!(
+            uncited.unsatisfied_material(&ledger).is_empty(),
+            "and the run did observe its own changed tree"
+        );
+    }
+
+    /// F7-B CONTROL. The uncited path still closes on the ordinary shape:
+    /// work, then a green check over it. This is 26 of the 32 behavioural
+    /// obligations in the preserved successful cohort.
+    #[test]
+    fn an_uncited_claim_closes_when_the_run_observed_its_own_work() {
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        assert!(contract.unsatisfied_material(&edit_then_check()).is_empty());
     }
 
     /// DURABILITY. A restart re-reads the contract and the ledger from their
@@ -1336,9 +1458,14 @@ mod facet_tests {
         ledger.completion_debt()
     }
 
+    /// A run that changed code and then looked at it — the ordinary shape.
+    /// The check matters to these tests only because a behavioural obligation
+    /// nobody cited needs the run to have observed its own work (F7-B); what
+    /// they are about is the shape of the contract.
     fn edited() -> EvidenceLedger {
         let mut l = EvidenceLedger::default();
         l.record_mutation("c1", "apply_patch", vec!["cmd/main.go".into()]);
+        l.record_verify("v1", "check\u{1f}all", 0);
         l
     }
 
@@ -1568,6 +1695,10 @@ mod mutation_scope_tests {
             "apply_patch",
             vec!["cmd/telemetryd/testdata/boundary_events.txt".into()],
         );
+        // The run looked at what it changed. These tests are about scope
+        // violations; without this the uncited behavioural obligation they
+        // carry as scaffolding would be open for a different reason (F7-B).
+        led.record_verify("v1", "check\u{1f}all", 0);
         led
     }
 
