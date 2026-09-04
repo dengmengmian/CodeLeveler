@@ -13,7 +13,12 @@ OPEN_BETA_REQUIRED=1
 PHASE_B=HOLD
 ```
 
-**Two items block the freeze, and neither is F7.** They are named in §7.
+**One item blocks the freeze, and it is not F7.** It is BR-A in §7.
+
+> **Update.** BR-B is closed — see
+> [`O1_O2_GOVERNANCE_RESOLUTION.md`](O1_O2_GOVERNANCE_RESOLUTION.md). O1 and O2
+> were never frozen as Beta gates; they entered this checklist as undefined
+> labels. `OPEN_REQUIRED` is 1, not 2. BR-A is unchanged.
 
 ---
 
@@ -52,8 +57,8 @@ Recovered from the repository, not inferred from names.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **Completion Truth** | no false Verified; one canonical `completion_debt()`; engine verification is an evidence producer | `F7_FINAL_GROUNDED_VERIFICATION_CLOSURE.md`, `F7_GROUNDED_AUTHORITY_DOGFOOD_ACCEPTANCE.md` | PASS (eng) | 24-run dogfood @7021599, false Verified 0 | current object | **PASS** | closed |
 | **Performance** | no context blow-up, no request amplification, no persistence duplication, no Beta-blocker latency/memory/token regression | `CONTEXT_COST_MEASUREMENT_PLAN.md`, `C2_1_CONTEXT_COST_ATTRIBUTION.md` | PASS | F7 added no model call, no prompt text, no new payload; workspace green | current object | **PASS** | closed (see §4) |
-| **O1** | **not recoverable** | — | unknown | — | — | **DEFINITION_NOT_RECOVERABLE** | see §7 |
-| **O2** | **not recoverable** | — | unknown | — | — | **DEFINITION_NOT_RECOVERABLE** | see §7 |
+| **O1** | **never a frozen gate** | `O1_O2_GOVERNANCE_RESOLUTION.md` | unknown | exhaustive tree + history search | current | **NEVER_ESTABLISHED** | none — BR-B closed |
+| **O2** | **never a frozen gate** | `O1_O2_GOVERNANCE_RESOLUTION.md` | unknown | exhaustive tree + history search | current | **NEVER_ESTABLISHED** | none — BR-B closed |
 | **O4 (O4-B)** | behaviour really happened, proof cannot be bound → CompletedUnverified — i.e. under-crediting real work | `F7_BEHAVIORAL_EVIDENCE_CHARACTERIZATION.md` §7 | OPEN | 11 × Correct+CompletedUnverified in the cohort | current object | **OPEN, measured** | non-blocking limitation (§5) |
 | **D1** viu, small Rust | locate→modify→test on a real repo | `DOGFOOD_D1_D4_FINAL_REVIEW.md` §2 | PASS | reconnect ToolGroup projection gap, NOTE | @`6983d51` | **PASS** | open NOTE → next phase (TUI) |
 | **D2** duf, medium Go | cross-file config, precedence, tests, docs | ibid. §3 | PASS | `--config/--no-config` = spec mismatch, not a defect | @`6983d51` | **PASS** | none |
@@ -228,20 +233,29 @@ BETA_REQUIRED=YES
 Required rather than blocking: nothing is known to be broken, but a gate whose
 own author wrote `PENDING_REAL_DOGFOOD` cannot be closed by reading it.
 
-### BR-B · O1 and O2 have no recoverable definition
+### BR-B · O1 and O2 have no recoverable definition — **CLOSED**
 
-Searched `docs/`, `evals/`, `ROADMAP.md`, `docs/design/`, git log and history.
-`O4-B` is recoverable (§2). **`O1` and `O2` appear nowhere in this repository.**
+Resolved by [`O1_O2_GOVERNANCE_RESOLUTION.md`](O1_O2_GOVERNANCE_RESOLUTION.md).
 
-They were named as Beta gates in the closure plan, so either they are tracked
-outside the repo, or they were superseded and the plan was not updated. Both
-are the owner's to answer; guessing a definition to close a gate against would
-be exactly the accounting this program forbids.
+An exhaustive search of the current tree and the full history found no frozen
+definition, acceptance criterion, evidence contract or closure document for
+either label, and no deleted or renamed gate matrix that once held them. The
+one same-named artifact that does exist — `Production matrix O1–O11` in
+`eval/safety/manifest.yaml` — is an ownership **eval case series** whose cases
+live in an external control plane, explicitly excluded from adoption
+denominators. It is not a superseding gate, and the ownership substance it
+measures is separately covered by the Multi-agent execution gate (FS1–FS16
+PASS, 0 ownership denials).
+
+They entered this checklist as labels in the closure handoff, not from a
+repository decision.
 
 ```
+O1_STATUS=NEVER_ESTABLISHED_AS_FROZEN_GATE
+O2_STATUS=NEVER_ESTABLISHED_AS_FROZEN_GATE
 BETA_BLOCKER=NO
-BETA_REQUIRED=YES   — until the owner either supplies the definitions or
-                      records them as superseded
+BETA_REQUIRED=NO
+BR_B=CLOSED
 ```
 
 ## 8. Beta Risk Ledger
@@ -252,7 +266,7 @@ exists.
 | ID | Title | Category | Source | Sev | Repro | Status | Blocker | Required | Disposition | Post-Beta |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | BR-A | Runtime Version Consistency never dogfooded (A/B daemon replacement) | Runtime | `RUNTIME_VERSION_CONSISTENCY.md` | MAJOR | n/a | PENDING_REAL_DOGFOOD | NO | **YES** | run the macOS A/B replacement dogfood | — |
-| BR-B | O1 / O2 definitions not recoverable | Process | this audit | MAJOR | n/a | OPEN | NO | **YES** | owner supplies or supersedes | — |
+| BR-B | O1 / O2 definitions not recoverable | Process | this audit | MAJOR | n/a | **CLOSED** | NO | NO | never frozen gates; invalid reference removed (`O1_O2_GOVERNANCE_RESOLUTION.md`) | — |
 | BR-1 | Authority yield — correct work ends CompletedUnverified (11/24) | Completion | F7 dogfood | MAJOR | YES | OPEN, measured | NO | NO | ACCEPT_AS_KNOWN_BETA_LIMITATION | proof capability |
 | BR-2 | Reconciliation yield — `NotAccountedFor` (6/13 of CU) | Completion | F7 dogfood | MAJOR | YES | OPEN, measured | NO | NO | ACCEPT_AS_KNOWN_BETA_LIMITATION | judge accounting |
 | BR-3 | Three Windows tests fail (AppContainer semantics, retitle hang) | Platform | `BETA_BLOCKER_RESOLUTION.md` 0b | MAJOR | YES on Windows | OPEN | NO | NO | ship macOS+Linux, hold the Windows artifact — already decided | needs a Windows machine |
@@ -273,7 +287,7 @@ exists.
 ```
 KNOWN_BETA_RISKS_TOTAL=18
 OPEN_BLOCKERS=0
-OPEN_REQUIRED=2          (BR-A, BR-B)
+OPEN_REQUIRED=1          (BR-A)
 ACCEPTED_LIMITATIONS=14
 POST_BETA_ITEMS=7        (per MULTI_AGENT_PRODUCT_CLOSURE, unchanged)
 ```
@@ -305,8 +319,8 @@ browser suite is inside that run and it was green.
 COMPLETION_TRUTH_BETA_CLOSURE=PASS
 PERFORMANCE_CLOSURE=PASS
 
-O1=DEFINITION_NOT_RECOVERABLE
-O2=DEFINITION_NOT_RECOVERABLE
+O1=NEVER_ESTABLISHED_AS_FROZEN_GATE   (BR-B closed)
+O2=NEVER_ESTABLISHED_AS_FROZEN_GATE   (BR-B closed)
 O4=OPEN (measured; non-blocking limitation)
 
 D1=PASS
@@ -321,7 +335,7 @@ AUTHORITY_YIELD_BETA_DISPOSITION=ACCEPT_AS_KNOWN_BETA_LIMITATION
 RECONCILIATION_YIELD_BETA_DISPOSITION=ACCEPT_AS_KNOWN_BETA_LIMITATION
 
 ZERO_KNOWN_BETA_RISK_GATE=HOLD
-  0 undisposed blockers; 2 undisposed required items (BR-A, BR-B)
+  0 undisposed blockers; 1 undisposed required item (BR-A)
 
 OPEN_BETA_BLOCKER=1
 OPEN_BETA_REQUIRED=1
@@ -345,8 +359,8 @@ BR-A   run the macOS A/B runtime-replacement dogfood the gate names:
        verify the RUNNING runtime's BuildIdentity == expected.
        Cheap, bounded, and it is the gate's own stated definition.
 
-BR-B   owner supplies the O1 / O2 definitions, or records them as superseded.
-       A document edit, not engineering.
+BR-B   CLOSED. O1/O2 were never frozen gates; the invalid reference is
+       removed from the required ledger (`O1_O2_GOVERNANCE_RESOLUTION.md`).
 ```
 
 Neither requires touching product code, and neither reopens F7. When both are
