@@ -124,5 +124,13 @@ Outdated  → ShutdownWhenIdle → 等它走 → 起新的 → 重新握手校�
 
 ## 证据状态
 
-确定性测试见 `RUNTIME_VERSION_CONSISTENCY_CLOSURE` 的机器可读门。
-**macOS A/B 真实 dogfood 未跑**，因此闭环状态是 `PENDING_REAL_DOGFOOD`，不是 PASS。
+确定性测试与真实 dogfood 见
+[`RUNTIME_VERSION_CONSISTENCY_CLOSURE.md`](RUNTIME_VERSION_CONSISTENCY_CLOSURE.md)。
+
+**macOS A/B 真实 dogfood 已跑**（两个真实 build，原子 rename 安装，A→B 与 B→A
+双向，以及一次 non-idle 排空证明：A 在收到 `BuildMismatch` 退休指令后带着存活的
+daemon-owned 后台任务又活了约七十秒，排空后才退出）。
+
+```
+RUNTIME_VERSION_CONSISTENCY_CLOSURE=PASS
+```

@@ -5,20 +5,30 @@ gate and known risk has a disposition, and therefore whether Baseline Freeze
 may begin.
 
 ```
-BETA_FINAL_PRODUCT_CLOSURE=HOLD
-READY_FOR_BETA_BASELINE_FREEZE=NO
+BETA_FINAL_PRODUCT_CLOSURE=PASS
+READY_FOR_BETA_BASELINE_FREEZE=YES
 
-OPEN_BETA_BLOCKER=1
-OPEN_BETA_REQUIRED=1
+OPEN_BETA_BLOCKER=0
+OPEN_BETA_REQUIRED=0
 PHASE_B=HOLD
 ```
 
-**One item blocks the freeze, and it is not F7.** It is BR-A in §7.
+**Nothing blocks the freeze.** Both required items closed after this audit was
+first written, and the two updates are kept as updates rather than folded in —
+an audit rewritten to agree with its outcome stops being evidence.
 
-> **Update.** BR-B is closed — see
+> **Update 1.** BR-B closed —
 > [`O1_O2_GOVERNANCE_RESOLUTION.md`](O1_O2_GOVERNANCE_RESOLUTION.md). O1 and O2
 > were never frozen as Beta gates; they entered this checklist as undefined
-> labels. `OPEN_REQUIRED` is 1, not 2. BR-A is unchanged.
+> labels.
+>
+> **Update 2.** BR-A closed —
+> [`RUNTIME_VERSION_CONSISTENCY_CLOSURE.md`](RUNTIME_VERSION_CONSISTENCY_CLOSURE.md)
+> §5a. The non-idle drain was proven on a real macOS A/B replacement: a daemon
+> holding live daemon-owned background work stayed alive ~70 s after
+> `ShutdownWhenIdle(BuildMismatch)` and exited only once it had drained.
+>
+> `OPEN_REQUIRED` is 0.
 
 ---
 
@@ -65,7 +75,7 @@ Recovered from the repository, not inferred from names.
 | **D3** TailAdmin, Next.js | real-UI feature with real verification | ibid. §4 | CONDITIONAL | round ceiling CLOSED by R2; browser gap → Gate 6; temp-file hygiene DEFERRED | @`6983d51` + gate build | **CONDITIONAL PASS** | non-blocking |
 | **D4** memos, full stack | long multi-window autonomous work | ibid. §5–7 | INCOMPLETE→replay | 4 windows, `stop=completed`, disconnect survived | replay @gate build | **PASS** | none |
 | **Browser Final** | 12 structured tools, no shell bypass, boundary tests | `GATE_6_BROWSER_CLOSURE.md` | `NO_PRODUCT_CHANGE` | ~160 structured calls, 0 bypasses; browser suite green in the current workspace run | current object | **PASS** | residual R004-F6 (§6) |
-| **Runtime Version Consistency** | running runtime's `BuildIdentity` == expected `BuildIdentity`, proven by real A/B replacement | `RUNTIME_VERSION_CONSISTENCY.md` (own status line) | `PENDING_REAL_DOGFOOD` | F7 exact-object handoff proves *build* identity, not *replacement* | partial | **PENDING_REAL_DOGFOOD** | **see §7 — required** |
+| **Runtime Version Consistency** | running runtime's `BuildIdentity` == expected `BuildIdentity`, proven by real A/B replacement | `RUNTIME_VERSION_CONSISTENCY.md` | `PENDING_REAL_DOGFOOD` | real macOS A/B, both directions, plus a non-idle drain | current object | **PASS** | closed — BR-A |
 | **Long Goal** | multi-window continuation, interruption/resume, terminal semantics, budget extension | `LONG_TASK_RELIABILITY_FINAL_REVIEW.md` | APPROVED | no BLOCKER, no unresolved MAJOR; workspace gates green | @closeout tree | **PASS** | m-1 DEFERRED (MINOR) |
 | **Spawn / Multi-Agent** | `spawn_agent`, child lifecycle, ownership isolation, `claim_write_scope`, settlement, durable provenance | `MULTI_AGENT_PRODUCT_CLOSURE.md` | `OPEN_BETA_BLOCKER=0`, `OPEN_BETA_REQUIRED=0` | FS1–FS16 PASS, 0 violations | @closure tree | **PASS** | 1 `OPEN_EVIDENCE_NEEDED`, 7 post-Beta |
 
@@ -202,7 +212,7 @@ BROWSER_FINAL_CLOSURE=PASS  (capability), with R004-F6 open as evidence-needed
 
 Two items, neither related to F7.
 
-### BR-A · Runtime Version Consistency has never had its real dogfood
+### BR-A · Runtime Version Consistency had never had its real dogfood — **CLOSED**
 
 `RUNTIME_VERSION_CONSISTENCY.md` closes with its own status line:
 
@@ -227,11 +237,20 @@ That is a different surface and it has never been run.
 
 ```
 BETA_BLOCKER=NO
-BETA_REQUIRED=YES
+BETA_REQUIRED=NO
+BR_A=CLOSED
 ```
 
-Required rather than blocking: nothing is known to be broken, but a gate whose
-own author wrote `PENDING_REAL_DOGFOOD` cannot be closed by reading it.
+**Closed after this audit was written.** The dogfood ran: two real builds, the
+binary replaced by atomic rename so the daemon stayed on its old image, both
+directions, and — the half that mattered — a retirement against a daemon
+holding live daemon-owned background work, which stayed alive about seventy
+seconds and exited only once it had drained.
+[`RUNTIME_VERSION_CONSISTENCY_CLOSURE.md`](RUNTIME_VERSION_CONSISTENCY_CLOSURE.md)
+§5a carries the timestamps.
+
+A gate whose own author wrote `PENDING_REAL_DOGFOOD` could not be closed by
+reading it, and was not.
 
 ### BR-B · O1 and O2 have no recoverable definition — **CLOSED**
 
@@ -265,7 +284,7 @@ exists.
 
 | ID | Title | Category | Source | Sev | Repro | Status | Blocker | Required | Disposition | Post-Beta |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| BR-A | Runtime Version Consistency never dogfooded (A/B daemon replacement) | Runtime | `RUNTIME_VERSION_CONSISTENCY.md` | MAJOR | n/a | PENDING_REAL_DOGFOOD | NO | **YES** | run the macOS A/B replacement dogfood | — |
+| BR-A | Runtime Version Consistency never dogfooded (A/B daemon replacement) | Runtime | `RUNTIME_VERSION_CONSISTENCY.md` | MAJOR | n/a | **CLOSED** | NO | NO | real A/B dogfood + non-idle drain proof (`RUNTIME_VERSION_CONSISTENCY_CLOSURE.md`) | — |
 | BR-B | O1 / O2 definitions not recoverable | Process | this audit | MAJOR | n/a | **CLOSED** | NO | NO | never frozen gates; invalid reference removed (`O1_O2_GOVERNANCE_RESOLUTION.md`) | — |
 | BR-1 | Authority yield — correct work ends CompletedUnverified (11/24) | Completion | F7 dogfood | MAJOR | YES | OPEN, measured | NO | NO | ACCEPT_AS_KNOWN_BETA_LIMITATION | proof capability |
 | BR-2 | Reconciliation yield — `NotAccountedFor` (6/13 of CU) | Completion | F7 dogfood | MAJOR | YES | OPEN, measured | NO | NO | ACCEPT_AS_KNOWN_BETA_LIMITATION | judge accounting |
@@ -287,7 +306,7 @@ exists.
 ```
 KNOWN_BETA_RISKS_TOTAL=18
 OPEN_BLOCKERS=0
-OPEN_REQUIRED=1          (BR-A)
+OPEN_REQUIRED=0
 ACCEPTED_LIMITATIONS=14
 POST_BETA_ITEMS=7        (per MULTI_AGENT_PRODUCT_CLOSURE, unchanged)
 ```
@@ -329,39 +348,51 @@ D3=CONDITIONAL PASS
 D4=PASS
 
 BROWSER_FINAL_CLOSURE=PASS
-RUNTIME_VERSION_CONSISTENCY_CLOSURE=PENDING_REAL_DOGFOOD
+RUNTIME_VERSION_CONSISTENCY_CLOSURE=PASS
 
 AUTHORITY_YIELD_BETA_DISPOSITION=ACCEPT_AS_KNOWN_BETA_LIMITATION
 RECONCILIATION_YIELD_BETA_DISPOSITION=ACCEPT_AS_KNOWN_BETA_LIMITATION
 
-ZERO_KNOWN_BETA_RISK_GATE=HOLD
-  0 undisposed blockers; 1 undisposed required item (BR-A)
+ZERO_KNOWN_BETA_RISK_GATE=PASS
+  0 undisposed blockers; 0 undisposed required items;
+  14 documented, dispositioned, non-blocking limitations
 
-OPEN_BETA_BLOCKER=1
-OPEN_BETA_REQUIRED=1
+OPEN_BETA_BLOCKER=0
+OPEN_BETA_REQUIRED=0
 PHASE_B=HOLD
 
-BETA_FINAL_PRODUCT_CLOSURE=HOLD
-READY_FOR_BETA_BASELINE_FREEZE=NO
+BETA_FINAL_PRODUCT_CLOSURE=PASS
+READY_FOR_BETA_BASELINE_FREEZE=YES
 ```
 
-`HOLD`, not `FAIL`. Nothing is known to be broken: no false Verified
-recurrence, no completion-truth bypass, no unsafe mutation, no data loss, no
-repeatable Beta-scoped correctness blocker, no runtime version mismatch
-observed. Two gates simply have not been closed against their own definitions,
-and closing them by assertion is what this program exists to prevent.
+`PASS`. Nothing is known to be broken: no false Verified recurrence, no
+completion-truth bypass, no unsafe mutation, no data loss, no repeatable
+Beta-scoped correctness blocker, no runtime version mismatch observed. The two
+gates that were open were closed against their own definitions — one by running
+the dogfood it named, one by establishing it was never a gate — rather than by
+assertion, which is what this program exists to prevent.
 
-## 11. What clears the hold
+Fourteen known limitations remain, each documented, dispositioned and
+non-blocking (§8). `ZERO_KNOWN_BETA_RISK_GATE=PASS` means no *undisposed*
+Beta-scoped blocking or required risk, not the absence of known issues.
+
+## 11. How the hold was cleared
 
 ```
-BR-A   run the macOS A/B runtime-replacement dogfood the gate names:
-       install → ShutdownWhenIdle(UpdateReady) → drain → exit → start new →
-       verify the RUNNING runtime's BuildIdentity == expected.
-       Cheap, bounded, and it is the gate's own stated definition.
+BR-A   CLOSED. The macOS A/B runtime-replacement dogfood the gate names was
+       run, including the non-idle drain: a daemon holding live daemon-owned
+       background work did not exit on ShutdownWhenIdle(BuildMismatch), waited
+       ~70 s, drained, then exited; the replacement reported the expected
+       BuildIdentity, confirmed from both directions.
+       → RUNTIME_VERSION_CONSISTENCY_CLOSURE.md §5a
 
 BR-B   CLOSED. O1/O2 were never frozen gates; the invalid reference is
-       removed from the required ledger (`O1_O2_GOVERNANCE_RESOLUTION.md`).
+       removed from the required ledger.
+       → O1_O2_GOVERNANCE_RESOLUTION.md
 ```
 
-Neither requires touching product code, and neither reopens F7. When both are
-closed, `OPEN_BETA_REQUIRED` reaches 0 and this closure can be re-run to `PASS`.
+Neither required touching product code, and neither reopened F7.
+
+`READY_FOR_BETA_BASELINE_FREEZE=YES`. The freeze itself is the next task and is
+not started here: no tag, no release, no Formal Three-Way Eval. `PHASE_B` stays
+`HOLD` until the baseline is frozen.

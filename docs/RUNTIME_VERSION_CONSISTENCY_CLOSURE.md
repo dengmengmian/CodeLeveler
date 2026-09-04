@@ -4,14 +4,14 @@ The file [`RUNTIME_VERSION_CONSISTENCY.md`](RUNTIME_VERSION_CONSISTENCY.md) has
 pointed here since it was written. It did not exist. This is it.
 
 ```
-RUNTIME_VERSION_REAL_DOGFOOD=PARTIAL
-RUNTIME_VERSION_CONSISTENCY_CLOSURE=PENDING_REAL_DOGFOOD
-BR_A=OPEN
+RUNTIME_VERSION_NON_IDLE_DRAIN_PROOF=PASS
+RUNTIME_VERSION_REAL_DOGFOOD=PASS
+RUNTIME_VERSION_CONSISTENCY_CLOSURE=PASS
+BR_A=CLOSED
 ```
 
-**The identity half is proven; the drain half was never put under load.** The
-gate's own status line stays as it was, for the reason given in §5 — not
-because anything failed.
+Both halves are proven. The identity half was closed in the first cycle (§4);
+the drain half — a retirement that waits on live daemon-owned work — is §5a.
 
 ---
 
@@ -146,33 +146,109 @@ is what a real installer does and what leaves the running daemon on its old
 image, behaves correctly. Anyone writing the future Updater's install step
 should know this before discovering it in production.
 
-## 5. Why this is PARTIAL and not PASS
+## 5. The first cycles were idle — recorded, then answered
 
-**The daemon was idle at both retirements.** `runtime idle; retiring` followed
-`runtime retiring once work drains` in the same millisecond, because
-`turns == 0 && background.alive_count() == 0` was already true.
+Both replacements in §4 happened against an **idle** daemon:
+`runtime idle; retiring` followed `runtime retiring once work drains` in the
+same millisecond, because `turns == 0 && background.alive_count() == 0` was
+already true.
 
-So the half of the gate it spends most of its words on — that a background task
-outliving its turn must not be destroyed by a replacement — was never put under
-test. The document is explicit that this is the case that matters:
+So the half of the gate it spends most of its words on had not been tested:
 
 > **只看 turn 是不够的**：那次 `cargo check` 活过它的 turn 半小时，按"无 turn 即闲置"
 > 就会在它头上结束进程，把活扔掉。
 
-**Why the work could not be placed in the daemon.** `leveler run` is headless
-and always embedded: a background task started through it had the *client* as
-its parent process, confirmed by `ps` — the daemon stayed idle. The only path
-that reuses a daemon is `cmd_tui` (`SocketIntent::ProbeDefault`), and a TUI
-needs a terminal: without one it fails `terminal io error: Device not
-configured`, and driving it through a PTY did not get a task submitted.
+`leveler run` could not supply the work — it is headless and always embedded,
+and a background task started through it had the *client* as its parent, so
+the daemon stayed idle. The only daemon-reusing client is `cmd_tui`
+(`SocketIntent::ProbeDefault`), and a TUI needs a terminal.
 
-That is a harness limitation, not a product defect. No product code was changed
-to work around it.
+## 5a. Non-idle drain proof
+
+Answered by driving a real `leveler tui` over a PTY — the same harness shape
+`BROWSER_CAPABILITY_REPORT.md` §T used to prove daemon ownership, and the same
+evidence method: **process ancestry**, not a screen scrape.
 
 ```
-WORK_DRAINED=NOT_EXERCISED
-REASON=no daemon-hosted active work could be created headlessly
+PTY_HARNESS_REUSED=YES   (pattern from BROWSER_CAPABILITY_REPORT.md §T)
+HUMAN_ASSISTED_DOGFOOD=NO
+PRODUCT_RUNTIME_CHANGED=NO
 ```
+
+A goal was submitted through the PTY TUI: start `sleep 240` with
+`background=true`, then run `sleep 90` in the foreground. The daemon's own
+event log records the tool call and its result:
+
+```
+run_command  {"args":["240"],"background":true,"program":"sleep"}
+→ background task started · task_id: bg-1 · status: running
+```
+
+and both processes were **children of the daemon**, which is what
+daemon-owned means:
+
+```
+43657  ppid 43169  sleep 240      ← background task
+43662  ppid 43169  sleep 90       ← the turn's foreground command
+43169  = daemon A
+```
+
+### The sequence, with its timestamps
+
+```
+18:21:41   daemon A starts                              pid 43169
+18:21:57   background task bg-1 alive, owned by A
+18:22:19   B installed by atomic rename
+18:22:20   probe → A logs:
+             runtime retiring once work drains reason=BuildMismatch
+
+18:22:39   A=alive   bg240=alive   fg90=alive
+18:22:49   A=alive   bg240=alive   fg90=alive
+18:22:59   A=alive   bg240=alive   fg90=alive
+18:23:09   A=alive   bg240=alive   fg90=alive
+18:23:19   A=alive   bg240=alive   fg90=alive     ← 59s after retirement began
+18:23:29   A=alive   bg240=alive   fg90=ended     ← turn over, background still alive,
+                                                    A STILL HAS NOT EXITED
+18:23:30   A logs: runtime idle; retiring
+18:23:39   A=gone    bg240=gone    fg90=gone
+18:23:30   B starts                                pid 45519
+```
+
+**A stayed alive for about seventy seconds after being told to retire, for
+exactly as long as it still owed work.** The required ordering holds:
+
+```
+T_background_start (18:21:57)
+  < T_build_mismatch = T_shutdown_when_idle (18:22:20)
+  < T_background_end (≤18:23:30)
+  ≤ T_A_exit (18:23:39)
+  ≈ T_B_start (18:23:30)
+
+PREMATURE_EXIT=NO
+```
+
+### That the running runtime is B, both ways
+
+The replacement daemon (45519) was probed from both sides:
+
+```
+B client → 45519 survives   ⇒ classified Current  ⇒ running identity == B
+A client → 45519 retires    ⇒ classified Outdated ⇒ running identity != A
+```
+
+`lsof` on the socket named 45519, so it is the serving runtime and not a
+bystander.
+
+### One correction, kept rather than tidied away
+
+A third `serve` process (43103) was present on the machine and was **first
+recorded as B by mistake**. It is not: its `--ready-json` names pid 38909,
+from an earlier aborted setup in this lab whose TUI client revived a daemon
+when its own was killed. It never held this run's socket.
+
+That is harness hygiene, not a duplicate runtime produced by the replacement —
+and the distinction was settled by `lsof`, not by assumption. The lab's
+cleanup between runs was at fault and the record says so.
 
 ## 6. Result matrix
 
@@ -184,7 +260,7 @@ UPDATE_READY_OBSERVED            = NOT_IMPLEMENTED_BY_DESIGN
                                     BuildMismatch observed instead)
 SHUTDOWN_WHEN_IDLE_ENTERED       = YES   reason=BuildMismatch
 PREMATURE_EXIT                   = NO
-WORK_DRAINED                     = NOT_EXERCISED   ← §5
+WORK_DRAINED                     = YES   ← §5a
 A_EXITED_AFTER_DRAIN             = YES
 B_STARTED                        = YES   pid 88688
 EXPECTED_BUILD_IDENTITY          = 0.2.0-beta.1 (dd2ed3479d57)
@@ -195,26 +271,37 @@ DUPLICATE_RUNTIME                = NO
 POST_REPLACEMENT_SMOKE           = PASS
 ```
 
-Eleven of twelve. The twelfth is the one the gate cares about most.
-
-## 7. What closes it
-
-A PTY-driven TUI that can submit one task, so the daemon holds a turn and a
-background task when the replacement is triggered. The repository already has
-PTY harness precedent (`F4 PTY contrast smoke 6/6`, `PTY 9/9` in the D4
-replay), so this is reuse rather than new tooling.
-
-The assertion that would then be added:
-
 ```
-start a background task through a daemon-hosted session
-→ let its turn end while the task stays alive
-→ trigger the replacement
-→ A must NOT exit while alive_count() > 0
-→ A exits only after the background task ends
+BACKGROUND_WORK_STARTED                 = YES   task_id bg-1
+BACKGROUND_DAEMON_OWNED                 = YES   ppid == daemon pid
+BACKGROUND_ALIVE_COUNT_BEFORE_REPLACE   = > 0
+BACKGROUND_ALIVE_COUNT_DURING_RETIRE    = > 0
+A_STILL_ALIVE_WHILE_BACKGROUND_ACTIVE   = YES   ~70 s
+BACKGROUND_WORK_FINISHED                = YES
+BACKGROUND_ALIVE_COUNT_AFTER_DRAIN      = 0
+WORK_DRAINED                            = YES
 ```
 
-Until that runs, the gate's own status line stands.
+Twelve of twelve.
+
+## 7. A product fact this proof surfaced
+
+A daemon-owned background task outlives its **turn**, and is reaped at its
+**session's terminal settlement**:
+
+```
+INFO leveler_engine::engine: terminal settlement reaped 1 session-owned
+                             background task(s) session="f9bad960-…"
+```
+
+The first attempt at this proof let the goal finish, so the task was reaped
+before the replacement could be triggered and the daemon was idle again. The
+window the gate protects is therefore *turn ended, session not yet settled* —
+which is exactly the `cargo check` case its own text describes, and which the
+proof above occupies deliberately.
+
+Worth stating because the gate's wording ("活过它的 turn") is true and
+incomplete on its own: the lifetime is bounded by the session, not the turn.
 
 ## 8. Evidence
 
