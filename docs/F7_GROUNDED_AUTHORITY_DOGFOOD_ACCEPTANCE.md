@@ -18,6 +18,11 @@ OPEN_BETA_REQUIRED=1
 PHASE_B=HOLD
 ```
 
+> **Point-in-time.** The Beta flags above are this acceptance's own state. Both
+> reached 0 later, at
+> [`BETA_FINAL_PRODUCT_CLOSURE.md`](BETA_FINAL_PRODUCT_CLOSURE.md). Nothing in
+> this report changed; only what came after it did.
+
 ---
 
 ## 1. Treatment identity

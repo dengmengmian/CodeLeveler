@@ -185,6 +185,14 @@ BR_B=CLOSED
 
 ## 7. Effect on Beta Final Product Closure
 
+> **Point-in-time.** The block below is the state when this review closed BR-B,
+> and BR-A was still open then. BR-A has since closed
+> ([`RUNTIME_VERSION_CONSISTENCY_CLOSURE.md`](RUNTIME_VERSION_CONSISTENCY_CLOSURE.md)
+> §5a), so `OPEN_REQUIRED` is now 0 and
+> [`BETA_FINAL_PRODUCT_CLOSURE.md`](BETA_FINAL_PRODUCT_CLOSURE.md) is `PASS`.
+> The body is left as it was written — an audit rewritten to agree with a later
+> outcome stops being evidence.
+
 ```
 OPEN_BLOCKERS=0
 OPEN_REQUIRED=1        (was 2)
