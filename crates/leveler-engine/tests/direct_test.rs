@@ -2798,3 +2798,284 @@ async fn the_runtime_s_own_verification_lets_a_behavioural_claim_close() {
         "and the decision knew it was the commit point"
     );
 }
+
+/// A runtime that answers the contract derivation and the reconciliation judge
+/// from a fixed script, so a test can state the obligations the run is judged
+/// against instead of taking the autopilot's single generic one. Every other
+/// call falls through to the ordinary FIFO.
+struct ScriptedContractRuntime {
+    inner: MockRuntime,
+    derived: String,
+    reconciled: String,
+}
+
+impl ScriptedContractRuntime {
+    fn new(script: Vec<ModelResponse>, derived: &str, reconciled: &str) -> Self {
+        Self {
+            inner: MockRuntime::new(script),
+            derived: derived.to_string(),
+            reconciled: reconciled.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelRuntime for ScriptedContractRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let says = |marker: &str| {
+            request
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains(marker))
+        };
+        if says(leveler_test_support::DERIVE_MARKER) {
+            return Ok(text_response("derive-scripted", &self.derived));
+        }
+        if says(leveler_test_support::RECONCILE_MARKER) {
+            return Ok(text_response("reconcile-scripted", &self.reconciled));
+        }
+        self.inner.generate(request, cancellation).await
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        self.inner.profile(model).await
+    }
+}
+
+fn text_response(id: &str, body: &str) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::new(id),
+        message: Message::text(Role::Assistant, body),
+        finish_reason: FinishReason::Stop,
+        usage: TokenUsage::default(),
+    }
+}
+
+fn patch_call(id: &str, file: &str, line: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n*** Add File: {file}\n+{line}\n*** End Patch"
+            )
+        }),
+    )
+}
+
+/// A gating check that passes only once `path` exists — so the first run over a
+/// tree without it fails and the run after the repair turn creates it passes.
+fn gate_requires(name: &str, path: &str) -> VerificationPlan {
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec![
+                "/c".into(),
+                format!(
+                    "if exist {} (exit 0) else (exit 1)",
+                    path.replace('/', "\\")
+                ),
+            ],
+        )
+    } else {
+        (
+            "sh".to_string(),
+            vec!["-c".into(), format!("test -e {path}")],
+        )
+    };
+    VerificationPlan {
+        commands: vec![VerificationCommand {
+            name: name.into(),
+            program,
+            args,
+            kind: CheckKind::Test,
+            gating: true,
+            timeout_seconds: 30,
+            scope_policy: Default::default(),
+        }],
+    }
+}
+
+/// Every `ReviewStage` action staged for one session, in order.
+async fn review_stage_actions(db: &Database, session: &leveler_core::SessionId) -> Vec<String> {
+    let store = leveler_storage::EngineStores::from_database(db);
+    let mut out = Vec::new();
+    for row in store.events.load(session).await.unwrap() {
+        if row.event_type == "review_stage"
+            && let Ok(leveler_engine::EngineEvent::ReviewStage { action, .. }) =
+                leveler_engine::EngineEvent::from_payload(&row.payload)
+        {
+            out.push(action);
+        }
+    }
+    out
+}
+
+/// F7-C TERMINAL TRUTH — the Completion Contract decides AFTER the runtime has
+/// finished acting, over a completion claim that was legitimately accepted.
+///
+/// `conclude_direct` -> `last_persisted_ledger` -> `completion_debt()` -> demote
+/// is the contract's single production enforcement point, and it had no
+/// end-to-end test. `a_behavioural_obligation_with_nothing_observed_does_not_verify`
+/// does not reach it: with no gates `conclude_direct` returns at its K19 exit
+/// before the contract is ever consulted.
+///
+/// The shape that does reach it is the one the boundary exists for — the ledger
+/// grows between the two questions. The user's task confines the work to
+/// `src/lib.rs`. The agent obeys, claims completion, and the request-point gate
+/// rightly accepts: at that moment nothing is outside the scope. The engine's
+/// gate then fails, its own repair turn writes `src/other.rs`, and the re-run
+/// goes green. Verification says Verified. The contract, asked at the boundary
+/// on a ledger that now holds a mutation outside the declared scope, says no.
+#[tokio::test]
+async fn a_repair_turn_that_breaks_the_declared_scope_cannot_verify() {
+    let script = vec![
+        patch_call("c1", "src/feature.rs", "pub fn feature() {}"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "wrote the feature"}),
+        ),
+        // The engine's repair turn, after its gate fails: it creates the file
+        // the gate demands — outside the scope the user declared.
+        patch_call("c2", "src/other.rs", "pub fn other() {}"),
+        // Ends the repair turn. Only its rounds, text and modified files are
+        // merged back — the original turn's `Completed` stop reason is what
+        // carries into the conclusion.
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "created the missing file"}),
+        ),
+        understand_met_required_ac(),
+    ];
+    let mut h = harness(script.clone()).await;
+    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
+        script,
+        r#"{"requirements":[{"text":"add the feature, changing only src/feature.rs",
+            "kind":"constraint","proof":"mutation_scope","allowed_paths":["src/feature.rs"]}]}"#,
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"only src/feature.rs was touched","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
+    ));
+    let s = spec(&h, gate_requires("needs-other", "src/other.rs"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    // The repair turn really did write outside the scope, and the gate really
+    // did go green over that tree — so verification alone reads as Verified.
+    assert!(
+        ledger
+            .mutations
+            .iter()
+            .any(|m| m.paths.iter().any(|p| p.contains("other.rs"))),
+        "the repair turn's write must be on the ledger: {:?}",
+        ledger.mutations
+    );
+    assert!(
+        ledger
+            .verifications
+            .iter()
+            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
+        "the re-run gate must be recorded green: {:?}",
+        ledger.verifications
+    );
+    // The obligation was accounted for as satisfied, and the record disagrees.
+    assert!(
+        ledger.completion_debt().is_some(),
+        "a mutation outside the declared scope is still owed"
+    );
+    // Verification itself said Verified — so the contract is what changed the
+    // answer, not a gate that had already failed.
+    assert_eq!(
+        report.verification.as_ref().map(|v| v.verdict()),
+        Some(leveler_verifier::Verdict::Verified),
+        "the verification report must be green for this to be the contract's call"
+    );
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a green gate does not discharge a constraint the record refutes"
+    );
+    // And the refusal came from THIS wire, not from another guard that happens
+    // to demote the same run.
+    assert!(
+        review_stage_actions(&h.db, &session)
+            .await
+            .iter()
+            .any(|a| a == "completion_contract_open"),
+        "the contract's refusal must be staged durably"
+    );
+}
+
+/// F7 GAP 2, CHARACTERIZED ON THE REAL PATH — the defect that is still open.
+///
+/// **This test asserts today's behaviour, which is wrong.** It is here so the
+/// gap is a fact with a name rather than a paragraph in a document, and so that
+/// closing it breaks something loudly. When a behavioural obligation can no
+/// longer be discharged by an observation that has nothing to do with it, this
+/// assertion inverts and the test becomes the green one.
+///
+/// The obligation names a specific behaviour. The runtime's own gate is a real
+/// command: runtime-issued, correctly kinded, exit 0, run after the work landed
+/// — every discrimination F7-A and F7-B added, satisfied. It checks that a file
+/// exists. It exercises nothing the obligation is about.
+///
+/// `observed_the_changed_tree()` cannot tell those apart, because the runtime's
+/// evidence vocabulary holds a fingerprint, an exit code and a mutation
+/// watermark — never what a command was asking of the code. Closing this needs
+/// a witness that a correct run can satisfy and an incorrect one cannot; it
+/// cannot be closed by a rule over the facts the ledger holds today. See
+/// `docs/F7C_BEHAVIORAL_WITNESS_ARCHITECTURE.md`.
+#[tokio::test]
+async fn gap2_an_observation_of_something_else_still_discharges_a_behavioural_claim() {
+    let script = patch_resolve_and_proven_ac();
+    let mut h = harness(script.clone()).await;
+    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
+        script,
+        r#"{"requirements":[{"text":"the summary must omit rows whose amount is zero","kind":"behavior"}]}"#,
+        // Satisfied, anchored to nothing — the normal shape: 26 of the 32
+        // behavioural obligations in the preserved cohort cite no id at all.
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"zero rows are omitted now","evidence_strength":"observed"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
+    ));
+    // A real, green, post-work observation of something entirely unrelated to
+    // the obligation: it checks that a file exists.
+    let s = spec(&h, gate_requires("unrelated", "src/lib.rs"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    assert!(
+        ledger.runtime_evidence_complete,
+        "the contract was asked at the commit point"
+    );
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "GAP 2 as it stands: an unrelated green command grounds the claim"
+    );
+}
