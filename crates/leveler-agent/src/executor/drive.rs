@@ -1912,6 +1912,13 @@ impl Executor {
                             // condition the runtime's own record refutes,
                             // after the judge accounted for them as satisfied.
                             let mut rejected_mechanical_violation = 0usize;
+                            // F7 final floor: a materially behavioural
+                            // obligation the judge accounted for, with no proof
+                            // standard the runtime can settle. Only ever
+                            // non-zero at the terminal boundary — the request
+                            // point does not judge these, which is what keeps
+                            // the floor from making completion unreachable.
+                            let mut rejected_ungrounded_behavior = 0usize;
                             let open_obligations: Vec<String> = match completion_contract.as_ref() {
                                 None => vec![
                                     "the completion contract could not be established, so no \
@@ -1976,6 +1983,9 @@ impl Executor {
                                                     "judge result conflicted with mechanical fact"
                                                 );
                                             }
+                                            leveler_lifecycle::OpenReason::MissingAuthoritativeProof => {
+                                                rejected_ungrounded_behavior += 1
+                                            }
                                             leveler_lifecycle::OpenReason::Blocked => {
                                                 rejected_blocked += 1
                                             }
@@ -1993,6 +2003,9 @@ impl Executor {
                                                 }
                                                 leveler_lifecycle::OpenReason::MechanicalConstraintViolation => {
                                                     "the runtime's own record of this run says this condition does not hold"
+                                                }
+                                                leveler_lifecycle::OpenReason::MissingAuthoritativeProof => {
+                                                    "satisfied by reading only — the runtime has no proof standard for it"
                                                 }
                                                 leveler_lifecycle::OpenReason::Blocked => "blocked",
                                             };
@@ -2028,6 +2041,7 @@ impl Executor {
                                 rejected_blocked,
                                 reconciliation_mechanical_conflict_count =
                                     rejected_mechanical_violation,
+                                rejected_ungrounded_behavior,
                                 omitted = omitted.len(),
                                 "completion contract gate"
                             );

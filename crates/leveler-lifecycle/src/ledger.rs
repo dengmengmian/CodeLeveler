@@ -194,21 +194,20 @@ impl EvidenceLedger {
             .any(|v| v.tool_call_id == id && v.exit_code == 0 && v.after_mutation_seq > 0)
     }
 
-    /// Whether this run ever observed the tree it had changed.
-    ///
-    /// The floor under a claim the judge could not anchor to an id. The judge
-    /// is not reading nothing in that case — it is given the recent tool
-    /// output, the executor's claims and the modified path list — but a
-    /// transcript with no observation of changed code leaves the claim
-    /// standing on prose alone.
-    ///
-    /// Same discrimination as [`Self::witnesses_behavior`], asked of the run
-    /// rather than of one id.
-    pub fn observed_the_changed_tree(&self) -> bool {
-        self.verifications
-            .iter()
-            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0)
-    }
+    // `observed_the_changed_tree()` lived here: "did this run ever see a green
+    // check over code it had changed", and it was the floor under a behavioural
+    // claim the judge could not anchor to an id.
+    //
+    // It is gone because that question cannot carry that weight. It is true of
+    // a run whose only check was `/usr/bin/true`, and true of a run whose green
+    // command exercised a neighbouring behaviour — which is the F7 substitution
+    // arriving through the floor rather than through a citation. Whether the
+    // run observed ANYTHING is not evidence about a PARTICULAR obligation, and
+    // the predicate now asks for a proof standard instead
+    // (`completion_contract::authoritative_proof_holds`).
+    //
+    // Deleted rather than left unused: an authority with no callers is an
+    // invitation to wire the same hole back in.
 
     pub fn has_fresh_successful_verify(&self) -> bool {
         let last_mut = self.last_mutation_seq();
@@ -794,6 +793,9 @@ impl EvidenceLedger {
                         }
                         crate::OpenReason::MechanicalConstraintViolation => {
                             "the runtime's own record says this condition does not hold"
+                        }
+                        crate::OpenReason::MissingAuthoritativeProof => {
+                            "satisfied by reading only — the runtime has no proof standard for it"
                         }
                         crate::OpenReason::Blocked => "blocked",
                     };

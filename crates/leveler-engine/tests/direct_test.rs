@@ -2770,13 +2770,52 @@ async fn a_behavioural_obligation_with_nothing_observed_does_not_verify() {
     );
 }
 
-/// F7-C TEST J — the same path with the runtime's own gate. The verification
-/// plan runs, its observation lands on the ledger before the one contract
-/// decision, and the run verifies. This is the shape F7-B's withdrawn rule
-/// would have made impossible.
+/// F7 FINAL FLOOR — TRUE POSITIVE on the real Direct path.
+///
+/// The floor refuses obligations with no proof standard; it must not refuse
+/// obligations that have one, or it would buy truth by making completion
+/// unreachable. The task names a command that has to pass, derivation carries
+/// it as `CommandSuccess`, the agent runs exactly that command green over the
+/// changed tree, and the run verifies.
+///
+/// This is what grounded means end to end: not that a check was seen, but that
+/// the check the obligation names was seen.
+///
+/// It replaces `the_runtime_s_own_verification_lets_a_behavioural_claim_close`,
+/// whose premise the floor removes — that test asserted a behavioural claim
+/// closing on a `true` gate, which is the GAP 2 shape with a friendlier name.
 #[tokio::test]
-async fn the_runtime_s_own_verification_lets_a_behavioural_claim_close() {
-    let h = harness(patch_resolve_and_proven_ac()).await;
+async fn a_named_command_that_ran_green_still_verifies() {
+    let script = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        // The agent runs the command the task named, so the obligation is
+        // already answered at the request point — the ordinary shape for a
+        // CommandSuccess obligation.
+        tool_call(
+            "v1",
+            "run_command",
+            serde_json::json!({"program": "python3", "args": ["-c", "pass"]}),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the function"}),
+        ),
+        understand_met_required_ac(),
+    ];
+    let mut h = harness(script.clone()).await;
+    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
+        script,
+        r#"{"requirements":[{"text":"the checks must pass","kind":"verification",
+            "proof":"command_success","commands":["python3 -c pass"]}]}"#,
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"the check ran green","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
+    ));
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -2785,17 +2824,22 @@ async fn the_runtime_s_own_verification_lets_a_behavioural_claim_close() {
         .await
         .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "the runtime observed the changed tree before deciding"
-    );
     let ledger = persisted_ledger(&h.db, &session)
         .await
         .expect("a ledger was persisted");
     assert!(
         ledger.runtime_evidence_complete,
-        "and the decision knew it was the commit point"
+        "the contract was asked at the commit point"
+    );
+    assert_eq!(
+        ledger.completion_debt(),
+        None,
+        "the named command ran green over the current tree; nothing is owed"
+    );
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "an obligation whose named command ran green is grounded"
     );
 }
 
@@ -3026,27 +3070,27 @@ async fn a_repair_turn_that_breaks_the_declared_scope_cannot_verify() {
     );
 }
 
-/// F7 GAP 2, CHARACTERIZED ON THE REAL PATH — the defect that is still open.
+/// F7 FINAL FLOOR — GAP 2 CLOSED, on the real completion path.
 ///
-/// **This test asserts today's behaviour, which is wrong.** It is here so the
-/// gap is a fact with a name rather than a paragraph in a document, and so that
-/// closing it breaks something loudly. When a behavioural obligation can no
-/// longer be discharged by an observation that has nothing to do with it, this
-/// assertion inverts and the test becomes the green one.
+/// This test used to assert the defect. It now asserts the fix, and the
+/// scenario is unchanged: that is the point.
 ///
 /// The obligation names a specific behaviour. The runtime's own gate is a real
 /// command: runtime-issued, correctly kinded, exit 0, run after the work landed
 /// — every discrimination F7-A and F7-B added, satisfied. It checks that a file
 /// exists. It exercises nothing the obligation is about.
 ///
-/// `observed_the_changed_tree()` cannot tell those apart, because the runtime's
-/// evidence vocabulary holds a fingerprint, an exit code and a mutation
-/// watermark — never what a command was asking of the code. Closing this needs
-/// a witness that a correct run can satisfy and an incorrect one cannot; it
-/// cannot be closed by a rule over the facts the ledger holds today. See
-/// `docs/F7C_BEHAVIORAL_WITNESS_ARCHITECTURE.md`.
+/// The runtime still cannot tell that command apart from one that would prove
+/// the behaviour; its evidence vocabulary holds a fingerprint, an exit code and
+/// a mutation watermark, never what a command was asking of the code. It no
+/// longer has to. It asks the question it CAN answer — is there a proof
+/// standard here that the record settles — finds none, and declines to call
+/// the task Verified on a reading alone.
+///
+/// The refusal says the runtime cannot confirm the behaviour. It does not say
+/// the behaviour is absent, and the work is still delivered.
 #[tokio::test]
-async fn gap2_an_observation_of_something_else_still_discharges_a_behavioural_claim() {
+async fn gap2_an_observation_of_something_else_no_longer_discharges_a_behavioural_claim() {
     let script = patch_resolve_and_proven_ac();
     let mut h = harness(script.clone()).await;
     h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
@@ -3073,9 +3117,28 @@ async fn gap2_an_observation_of_something_else_still_discharges_a_behavioural_cl
         ledger.runtime_evidence_complete,
         "the contract was asked at the commit point"
     );
+    // The unrelated observation really is on the ledger, green and post-work,
+    // so nothing weaker than the floor is doing the refusing.
+    assert!(
+        ledger
+            .verifications
+            .iter()
+            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
+        "the unrelated gate must be recorded green: {:?}",
+        ledger.verifications
+    );
+    // Fail-closed, and BOUNDED: the run ends, it does not spin looking for
+    // proof that cannot exist. The request point does not judge this
+    // obligation, which is exactly what keeps the floor terminating.
     assert_eq!(
         report.outcome,
-        TaskOutcome::Verified,
-        "GAP 2 as it stands: an unrelated green command grounds the claim"
+        TaskOutcome::CompletedUnverified,
+        "the work is delivered; only the claim of proof is refused"
+    );
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    let debt = ledger.completion_debt().expect("the obligation is owed");
+    assert!(
+        debt.contains("no proof standard"),
+        "the refusal must say what is missing, not that the behaviour is wrong: {debt}"
     );
 }

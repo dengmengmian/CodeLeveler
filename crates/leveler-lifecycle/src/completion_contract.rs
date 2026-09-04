@@ -264,6 +264,18 @@ pub enum OpenReason {
     /// condition the obligation declares does not hold. Distinct from missing
     /// evidence: nothing is missing, the fact is present and it disagrees.
     MechanicalConstraintViolation,
+    /// Claimed satisfied, and there is no proof standard the runtime can
+    /// settle from its own record — so the claim rests on a reading of the
+    /// work and nothing else.
+    ///
+    /// Distinct from [`Self::MissingMechanicalEvidence`], which says a
+    /// demonstrable obligation is waiting for its demonstration. Here nothing
+    /// is waiting: the obligation never had a mechanical standard to meet.
+    ///
+    /// It says the runtime CANNOT CONFIRM the obligation, never that the
+    /// obligation is unmet. Unverified is not falsified, and the difference
+    /// matters to whoever reads the refusal.
+    MissingAuthoritativeProof,
 }
 
 /// The material obligations of one goal, derived once and carried for its
@@ -429,6 +441,13 @@ fn open_reason_for(
             // contradicted by proof that does.
             Some(if mechanically_refuted(policy, ledger) {
                 OpenReason::MechanicalConstraintViolation
+            } else if lacks_authoritative_proof(kind, policy)
+                && behaviour_citation_is_sound(evidence, ledger)
+            {
+                // Nothing is missing and nothing is refuted: there was never a
+                // standard to meet. A citation that cannot witness is a
+                // different failure and keeps its own reason.
+                OpenReason::MissingAuthoritativeProof
             } else {
                 OpenReason::MissingMechanicalEvidence
             })
@@ -449,6 +468,63 @@ fn mechanically_refuted(policy: Option<&EvidencePolicy>, ledger: &EvidenceLedger
         }
         _ => false,
     }
+}
+
+/// Whether the obligation carries a proof standard the runtime can settle from
+/// its own record, and whether the record settles it.
+///
+/// `None` is the answer that matters: there is no such standard here, so the
+/// obligation can be *described* as satisfied but never *shown* to be. That is
+/// a different thing from a standard that exists and is unmet, and the two
+/// must not collapse into one "open" — see [`OpenReason`].
+///
+/// This is the whole of what "authoritative" means in this file: a policy whose
+/// truth the runtime reads off `EvidenceLedger` without interpreting anyone's
+/// prose. `Unresolved` is deliberately not one — it is the derivation saying it
+/// could not determine the standard, which is an absence, not a standard.
+fn authoritative_proof_holds(
+    policy: Option<&EvidencePolicy>,
+    evidence: &[RequirementEvidence],
+    ledger: &EvidenceLedger,
+) -> Option<bool> {
+    match policy {
+        Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
+            let ok = |c: &String| ledger.fresh_successful_command(c);
+            Some(match mode {
+                CommandMode::All => !commands.is_empty() && commands.iter().all(ok),
+                CommandMode::Any => commands.iter().any(ok),
+            })
+        }
+        // Both halves, or neither counts. A binding that resolves to nothing
+        // is a sentence, and a green suite over code that added no test says
+        // nothing about the case that was asked for.
+        Some(EvidencePolicy::TestCoverage) => Some(
+            evidence
+                .iter()
+                .flat_map(|e| e.refs.iter())
+                .any(|id| ledger.resolves_evidence_ref(id))
+                && ledger.has_fresh_successful_verify(),
+        ),
+        Some(EvidencePolicy::MutationScope { allowed_paths }) => Some(
+            !allowed_paths.is_empty() && mutations_outside_scope(allowed_paths, ledger).is_empty(),
+        ),
+        Some(EvidencePolicy::Unresolved) | None => None,
+    }
+}
+
+/// Whether a behavioural obligation carries no standard the runtime can settle
+/// — the condition under which a judge's "satisfied" is the only thing holding
+/// it up.
+fn lacks_authoritative_proof(kind: RequirementKind, policy: Option<&EvidencePolicy>) -> bool {
+    kind == RequirementKind::Behavior && matches!(policy, Some(EvidencePolicy::Unresolved) | None)
+}
+
+/// F7-A's rule on its own: a behavioural citation either names nothing or names
+/// something that observed the work. A file changing is not the behaviour
+/// changing.
+fn behaviour_citation_is_sound(evidence: &[RequirementEvidence], ledger: &EvidenceLedger) -> bool {
+    let cited: Vec<&String> = evidence.iter().flat_map(|e| e.refs.iter()).collect();
+    cited.is_empty() || cited.iter().any(|id| ledger.witnesses_behavior(id))
 }
 
 /// The proof rules, applied identically to an objective and to a condition
@@ -479,30 +555,12 @@ fn discharged(
         // four green checks sat in the ledger while the obligation was refused
         // because the judge had described them in prose. The model may say what
         // evidence means; it does not decide whether the runtime looks.
-        RequirementKind::Verification => match policy {
-            Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
-                let ok = |c: &String| ledger.fresh_successful_command(c);
-                match mode {
-                    CommandMode::All => !commands.is_empty() && commands.iter().all(ok),
-                    CommandMode::Any => commands.iter().any(ok),
-                }
-            }
-            // Both halves, or neither counts. A binding that resolves to
-            // nothing is a sentence, and a green suite over code that added no
-            // test says nothing about the case that was asked for.
-            Some(EvidencePolicy::TestCoverage) => {
-                evidence
-                    .iter()
-                    .flat_map(|e| e.refs.iter())
-                    .any(|id| ledger.resolves_evidence_ref(id))
-                    && ledger.has_fresh_successful_verify()
-            }
-            // No policy is not a licence. Guessing "any green check" here is
-            // precisely how a missing test gets waved through. A scope is not
-            // one either — where the work happened does not demonstrate that
-            // it works — though the check above has already settled that one.
-            Some(EvidencePolicy::MutationScope { .. } | EvidencePolicy::Unresolved) | None => false,
-        },
+        // No policy is not a licence. Guessing "any green check" here is
+        // precisely how a missing test gets waved through, and an obligation
+        // with no standard to meet cannot be met.
+        RequirementKind::Verification => {
+            authoritative_proof_holds(policy, evidence, ledger).unwrap_or(false)
+        }
         // Nothing changed means nothing was delivered, and the judge must still
         // have claimed mechanical backing. What proves a specific deliverable
         // exists is its own question.
@@ -530,29 +588,41 @@ fn discharged(
         // measurement, not by oversight — see
         // `docs/F7_BEHAVIORAL_EVIDENCE_ARCHITECTURE.md` §7.
         RequirementKind::Behavior => {
-            let cited: Vec<&String> = evidence.iter().flat_map(|e| e.refs.iter()).collect();
-            // A citation must name an observation of the work; that holds at
-            // both points, because a bad citation is bad whenever it is read.
-            if !cited.is_empty() {
-                return cited.into_iter().any(|id| ledger.witnesses_behavior(id));
+            // F7-A, unchanged, asked at both points because a bad citation is
+            // bad whenever it is read: a citation must name an observation of
+            // the work, never the edit that did it.
+            if !behaviour_citation_is_sound(evidence, ledger) {
+                return false;
             }
-            // An uncited claim is judged only once the runtime has finished
-            // producing its own evidence. F7-B tried to judge it at the
-            // request point and had to withdraw: the verification plan runs
-            // after that claim, so the refusal demanded proof that did not
-            // exist yet, and thirteen engine tests spun until their scripts
-            // ran out. F7-C made that evidence reach this ledger, so the
-            // question can now be asked at the moment it is answerable.
+            // The REQUEST point. F7-B tried to judge an unproven claim here
+            // and had to withdraw: the verification plan runs after this
+            // moment, so a refusal demanded proof that did not exist yet and
+            // thirteen engine tests spun until their scripts ran out. F7-C
+            // made that evidence reach this ledger, so the question is asked
+            // where it is answerable — and asking nothing here is also what
+            // keeps the floor below from making completion unreachable.
             //
             // Still one predicate and one authority. The flag says which of
             // the two moments this is, not who decides.
             if !ledger.runtime_evidence_complete {
                 return true;
             }
-            // At commit: a behavioural obligation needs something behavioural
-            // behind it. Not "any ref" — an observation of the changed tree,
-            // whoever ran it.
-            ledger.observed_the_changed_tree()
+            // The COMMIT point, and THE F7 FLOOR.
+            //
+            // F7-C asked whether the run had observed its changed tree, and
+            // let any green observation stand for any behaviour. That is the
+            // substitution F7 exists to stop, arriving through the back door:
+            // the observation is real, runtime-issued, correctly kinded, fresh
+            // and successful, and still about a neighbouring behaviour. No
+            // rule over exit codes and mutation watermarks can tell those
+            // apart, and the runtime does not try — deciding whether one
+            // sentence means another is not a fact it holds.
+            //
+            // So it asks the question it CAN answer: is there a proof standard
+            // here that the record settles? A behaviour the judge read as
+            // satisfied, with no such standard, is SemanticSatisfied — worth
+            // reporting, and not authority to call the task Verified.
+            authoritative_proof_holds(policy, evidence, ledger).unwrap_or(false)
         }
         _ => true,
     }
@@ -856,21 +926,140 @@ mod tests {
         );
     }
 
+    /// F7 FINAL FLOOR — THE GAP 2 GATE, at the predicate.
+    ///
     /// The same commit point, with the runtime's own verification on the
-    /// ledger: the claim closes. This is the ordinary Direct shape, and it is
-    /// what F7-C's lifecycle fix exists to make possible.
+    /// ledger. F7-C let this close: something green had been observed over the
+    /// changed tree, so the claim was allowed to rest on it. That is the
+    /// substitution — the observation is real and it is not about this
+    /// obligation, and the runtime cannot tell those apart.
+    ///
+    /// So it no longer decides. A behavioural obligation with no proof
+    /// standard the runtime can settle from its own record is satisfied by
+    /// reading only, and reading alone does not authorize Verified.
     #[test]
-    fn an_uncited_claim_closes_at_commit_when_the_runtime_verified_the_work() {
+    fn an_uncited_claim_does_not_close_at_commit_without_a_proof_standard() {
         let mut ledger = edit_then_check();
         ledger.runtime_evidence_complete = true;
         let contract = CompletionContract::new(vec![behaviour_citing(
             Vec::new(),
             EvidenceStrength::Semantic,
         )]);
-        assert!(
-            contract.unsatisfied_material(&ledger).is_empty(),
-            "the runtime observed the changed tree; the claim may rest on that"
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "a green check that is not about this obligation does not prove it"
         );
+    }
+
+    /// F7 FINAL FLOOR — the "but it is a REAL command" escape hatch, closed.
+    ///
+    /// The citation names a command the runtime itself recorded: correct kind,
+    /// exit 0, run after the work began — every discrimination F7-A and F7-B
+    /// added, satisfied. It is still not proof of THIS obligation, because
+    /// nothing ties that command to it. Real, fresh and successful is not the
+    /// same as adequate.
+    #[test]
+    fn a_real_recorded_witness_without_a_proof_standard_does_not_close_at_commit() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            vec!["call-check".into()],
+            EvidenceStrength::Observed,
+        )]);
+        assert_eq!(
+            contract.unsatisfied_material(&ledger).len(),
+            1,
+            "a recorded command is an observation, not a proof standard"
+        );
+    }
+
+    /// TRUE POSITIVE. The floor is about the absence of a proof standard, not
+    /// about behaviour being unprovable: a behavioural obligation that carries
+    /// one, and whose named command ran green over the current tree, closes at
+    /// the commit point exactly as a verification obligation would.
+    #[test]
+    fn a_behavioural_obligation_with_a_named_command_closes_at_commit() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("call-edit", "apply_patch", vec!["src/a.rs".into()]);
+        ledger.record_verify("call-check", "go test\u{1f}./...", 0);
+        ledger.runtime_evidence_complete = true;
+        let mut r = behaviour_citing(Vec::new(), EvidenceStrength::Semantic);
+        r.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec!["go test\u{1f}./...".into()],
+            mode: CommandMode::All,
+        });
+        assert!(
+            CompletionContract::new(vec![r])
+                .unsatisfied_material(&ledger)
+                .is_empty(),
+            "a proof standard the record answers is what grounding means"
+        );
+    }
+
+    /// SCOPE. The floor applies to behavioural obligations. A kind with no
+    /// mechanical floor of its own is not quietly given one — widening this to
+    /// every requirement would refuse work nobody asked to have proven.
+    #[test]
+    fn the_floor_does_not_reach_other_kinds() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        for kind in [RequirementKind::Constraint, RequirementKind::Other] {
+            let mut r = requirement("r1", kind);
+            r.status = RequirementStatus::Satisfied;
+            r.evidence.push(RequirementEvidence {
+                strength: EvidenceStrength::Semantic,
+                detail: "held throughout".into(),
+                refs: Vec::new(),
+            });
+            assert!(
+                CompletionContract::new(vec![r])
+                    .unsatisfied_material(&ledger)
+                    .is_empty(),
+                "{kind:?} has no behavioural proof obligation to owe"
+            );
+        }
+    }
+
+    /// DURABILITY. A restart re-reads the contract and the ledger from their
+    /// snapshots and asks the same predicate, so an obligation the floor holds
+    /// open stays open. A crash must not launder an ungrounded claim into a
+    /// discharge, and `runtime_evidence_complete` has to survive the round trip
+    /// or the recovered run would be judged at the wrong moment.
+    #[test]
+    fn an_ungrounded_behavioural_claim_is_still_open_after_a_round_trip() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        let back: EvidenceLedger =
+            serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+        let contract_back: CompletionContract =
+            serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
+        assert!(
+            back.runtime_evidence_complete,
+            "the commit-point flag must survive recovery"
+        );
+        assert_eq!(contract_back.unsatisfied_material(&back).len(), 1);
+    }
+
+    /// The open reason names what is actually missing. "No check demonstrates
+    /// it" would be wrong here: nothing is missing, there is no standard to
+    /// meet, and the runtime does not know the behaviour is absent — only that
+    /// it cannot say the behaviour is present.
+    #[test]
+    fn an_ungrounded_behavioural_claim_reports_its_own_reason() {
+        let mut ledger = edit_then_check();
+        ledger.runtime_evidence_complete = true;
+        let contract = CompletionContract::new(vec![behaviour_citing(
+            Vec::new(),
+            EvidenceStrength::Semantic,
+        )]);
+        let open = contract.open_detail(&ledger);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].2, OpenReason::MissingAuthoritativeProof);
     }
 
     /// F7-C TEST E. A ref that is not behavioural evidence does not satisfy a

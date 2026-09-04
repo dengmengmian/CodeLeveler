@@ -30,9 +30,16 @@ pub const DERIVE_MARKER: &str = "list what it OBLIGES the agent to deliver";
 /// It has to be a VALID contract, not an empty one: a missing contract refuses
 /// completion by design, so an empty answer here would block every scripted
 /// goal-mode test for a reason that has nothing to do with what those tests
-/// are about. The single obligation is a `behavior` one, which needs no
-/// mechanical evidence, and [`reconcile_autopilot`] accounts for it by id. A
-/// test that wants real obligations states them with `with_completion_contract`.
+/// are about. [`reconcile_autopilot`] accounts for the single obligation by id.
+/// A test that wants real obligations states them with `with_completion_contract`.
+///
+/// The obligation is kind `other`, and that is load-bearing. It used to be
+/// `behavior`, which needed no mechanical evidence — until the F7 grounded
+/// authority floor made a behavioural obligation with no proof standard refuse
+/// Verified at the commit point. A stand-in whose only job is to be a valid
+/// contract must not carry a proof obligation of its own, or every scripted
+/// test that reaches Verified fails for a reason it is not about. "Complete the
+/// task as the user asked" is a placeholder, not a behaviour anyone named.
 pub fn derive_autopilot(request: &ModelRequest) -> Option<ModelResponse> {
     let is_derivation = request
         .messages
@@ -45,7 +52,7 @@ pub fn derive_autopilot(request: &ModelRequest) -> Option<ModelResponse> {
         request_id: RequestId::new("derive-autopilot"),
         message: Message::text(
             Role::Assistant,
-            r#"{"requirements":[{"text":"complete the task as the user asked","kind":"behavior"}]}"#,
+            r#"{"requirements":[{"text":"complete the task as the user asked","kind":"other"}]}"#,
         ),
         finish_reason: leveler_model::FinishReason::Stop,
         usage: leveler_model::TokenUsage::default(),
