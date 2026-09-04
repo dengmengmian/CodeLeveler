@@ -179,4 +179,10 @@ codegen-units = 1
 strip = true
 
 [profile.dev]
-debug = 1
+# Line tables, not full debuginfo. The workspace links 68 separate integration
+# test binaries against a 503-package graph, so debug info is paid 68 times over
+# and it dominates both link time and `target/debug`, which reached 170 GB /
+# 1.7M files in 48 days. `line-tables-only` keeps what the tests actually need —
+# file and line in every panic and backtrace — and drops the variable-level
+# information only an attached debugger reads.
+debug = "line-tables-only"
