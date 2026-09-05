@@ -2444,6 +2444,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
     .with_pricing(Some(leveler_model::ModelPricing {
         input_usd_per_mtok: 1.0,
         output_usd_per_mtok: 2.0,
+        cached_input_usd_per_mtok: None,
     }))
     .with_step_limits(leveler_agent::StepLimits {
         max_cost_usd_micros: Some(30),

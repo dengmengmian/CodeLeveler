@@ -90,6 +90,12 @@ impl TranscriptSink for TurnSink {
                 model: record.model.clone(),
                 input_tokens: record.usage.input_tokens,
                 output_tokens: record.usage.output_tokens,
+                // Recorded, not inferred: `Some(0)` is a provider that
+                // reported no cache hit, and the `None` this never writes is
+                // reserved for rows from before the column existed.
+                cached_input_tokens: Some(record.usage.cached_input_tokens),
+                cost_usd_micros: record.cost_usd_micros,
+                agent_id: record.agent_id.clone(),
                 finish_reason,
                 error_kind: None,
                 latency_ms: Some(record.latency_ms),

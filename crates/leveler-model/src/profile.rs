@@ -393,13 +393,43 @@ pub struct ModelProfile {
 pub struct ModelPricing {
     pub input_usd_per_mtok: f64,
     pub output_usd_per_mtok: f64,
+    /// Rate for input tokens the provider served from its prefix cache, when
+    /// the provider bills them differently. `None` means the discount is
+    /// unknown, and cached tokens are then charged at the full input rate —
+    /// a harness that invented a discount would understate every bill.
+    #[serde(default)]
+    pub cached_input_usd_per_mtok: Option<f64>,
 }
 
 impl ModelPricing {
-    /// Total cost in micro-USD. USD-per-million-tokens is numerically equal to
-    /// micro-USD per token, so this is a plain weighted sum, rounded.
+    /// Total cost in micro-USD, ignoring any cache discount.
+    ///
+    /// Kept for callers that have no cached-token figure. Where one exists,
+    /// use [`Self::cost_usd_micros_cached`].
     pub fn cost_usd_micros(&self, input_tokens: u64, output_tokens: u64) -> u64 {
-        let micros = input_tokens as f64 * self.input_usd_per_mtok
+        self.cost_usd_micros_cached(input_tokens, 0, output_tokens)
+    }
+
+    /// Total cost in micro-USD with the provider's cache discount applied.
+    ///
+    /// `cached_input_tokens` is a SUBSET of `input_tokens` — that is how every
+    /// provider this harness speaks to reports it — so the uncached remainder
+    /// is the difference and the two are never both charged for the same
+    /// token. When no cached rate is configured the whole prompt is billed at
+    /// the input rate, which is the conservative reading rather than a guess.
+    pub fn cost_usd_micros_cached(
+        &self,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    ) -> u64 {
+        let cached = cached_input_tokens.min(input_tokens);
+        let uncached = input_tokens - cached;
+        let cached_rate = self
+            .cached_input_usd_per_mtok
+            .unwrap_or(self.input_usd_per_mtok);
+        let micros = uncached as f64 * self.input_usd_per_mtok
+            + cached as f64 * cached_rate
             + output_tokens as f64 * self.output_usd_per_mtok;
         micros.round().max(0.0) as u64
     }
@@ -416,11 +446,56 @@ mod tests {
         let pricing = ModelPricing {
             input_usd_per_mtok: 0.27,
             output_usd_per_mtok: 1.10,
+            cached_input_usd_per_mtok: None,
         };
         assert_eq!(pricing.cost_usd_micros(1_000_000, 100_000), 380_000);
         assert_eq!(pricing.cost_usd_micros(0, 0), 0);
         // Sub-micro amounts round to nearest, not truncate to zero.
         assert_eq!(pricing.cost_usd_micros(3, 0), 1);
+    }
+
+    /// A cached prompt token is a discount on a token already counted in
+    /// `input_tokens`, not an extra one: 1M in of which 900k cached, at
+    /// $0.27 uncached and $0.027 cached, is 100k×0.27 + 900k×0.027.
+    #[test]
+    fn cached_input_is_billed_at_the_cached_rate_and_not_double_counted() {
+        let pricing = ModelPricing {
+            input_usd_per_mtok: 0.27,
+            output_usd_per_mtok: 1.10,
+            cached_input_usd_per_mtok: Some(0.027),
+        };
+        assert_eq!(
+            pricing.cost_usd_micros_cached(1_000_000, 900_000, 100_000),
+            27_000 + 24_300 + 110_000
+        );
+    }
+
+    /// No configured cached rate is not a licence to invent a discount: the
+    /// whole prompt bills at the input rate, exactly as before the column
+    /// existed.
+    #[test]
+    fn an_unknown_cached_rate_bills_at_the_full_input_rate() {
+        let pricing = ModelPricing {
+            input_usd_per_mtok: 0.27,
+            output_usd_per_mtok: 1.10,
+            cached_input_usd_per_mtok: None,
+        };
+        assert_eq!(
+            pricing.cost_usd_micros_cached(1_000_000, 900_000, 100_000),
+            pricing.cost_usd_micros(1_000_000, 100_000)
+        );
+    }
+
+    /// A provider that reports more cached tokens than prompt tokens is
+    /// nonsense, and must not produce a negative uncached remainder.
+    #[test]
+    fn cached_above_input_is_clamped_rather_than_underflowing() {
+        let pricing = ModelPricing {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 1.0,
+            cached_input_usd_per_mtok: Some(0.0),
+        };
+        assert_eq!(pricing.cost_usd_micros_cached(100, 500, 0), 0);
     }
 
     /// `pricing` is optional in profile files and defaults to absent — old

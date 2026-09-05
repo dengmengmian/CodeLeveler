@@ -220,6 +220,9 @@ mod usage_tests {
             latency_ms: None,
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
             created_at: leveler_core::now(),
         }
     }

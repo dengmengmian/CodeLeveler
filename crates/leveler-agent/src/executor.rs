@@ -169,6 +169,10 @@ pub enum AgentEvent {
         profile_role: Option<String>,
         capabilities: Vec<String>,
     },
+    /// One model call made by a sub-agent, carrying the child's id so the
+    /// parent can persist it. Boxed because this variant is much larger than
+    /// the rest and `AgentEvent` is cloned on every hop.
+    SubAgentModelRequest { record: Box<ModelRequestRecord> },
     /// A spawned sub-agent acquired an execution slot and/or reported updated
     /// cumulative token usage. Transient: the final result remains authoritative.
     SubAgentProgress {
@@ -692,6 +696,25 @@ pub enum ChildToolEvent {
     },
 }
 
+impl ModelRequestRecord {
+    /// Fill in the estimated cost from the model's pricing, if any.
+    ///
+    /// Cost is priced once, here, against the usage the provider actually
+    /// reported — including how much of the prompt it served from cache. A row
+    /// that carries its own cost can be summed later without re-deriving it
+    /// from a price table that may since have changed.
+    pub fn priced(mut self, pricing: Option<&leveler_model::ModelPricing>) -> Self {
+        self.cost_usd_micros = pricing.map(|p| {
+            p.cost_usd_micros_cached(
+                self.usage.input_tokens,
+                self.usage.cached_input_tokens,
+                self.usage.output_tokens,
+            )
+        });
+        self
+    }
+}
+
 /// A sink that persists the transcript as the loop advances, enabling resume.
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
@@ -726,6 +749,14 @@ pub struct ModelRequestRecord {
     /// call like any other; recording it under its own lane is what lets a
     /// session's cost be attributed to the work versus the overhead.
     pub kind: ModelCallKind,
+    /// The sub-agent that made this call, or `None` for the parent's own. A
+    /// child runs as an owned `'static` future and cannot borrow the parent's
+    /// sink, so its records travel back over the progress channel carrying
+    /// this; without it a reviewer's spend has nowhere to land.
+    pub agent_id: Option<String>,
+    /// Estimated cost in micro-USD, priced where the model has pricing
+    /// configured. `None` means unpriced, never free.
+    pub cost_usd_micros: Option<u64>,
 }
 
 /// Which lane a model call belongs to. The drive loop's rounds are the work;
@@ -765,6 +796,8 @@ pub(crate) fn advisory_record(
         provider: model.provider.clone(),
         model: model.model.clone(),
         usage: response.usage,
+        agent_id: None,
+        cost_usd_micros: None,
         finish_reason: response.finish_reason,
         latency_ms,
         retry_count: 0,
@@ -823,6 +856,17 @@ impl TranscriptSink for SubAgentProgressSink {
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(record.usage.cached_input_tokens);
+        // The counters above drive the live progress line. They are transient:
+        // when the child ends they are gone, which is why a reviewer that
+        // spent half a million tokens left no durable row. Send the record
+        // itself as well, stamped with this child's id, so the parent — which
+        // does hold a persistence sink — can write it down.
+        let _ = self.events.send(AgentEvent::SubAgentModelRequest {
+            record: Box::new(ModelRequestRecord {
+                agent_id: Some(self.id.clone()),
+                ..record.clone()
+            }),
+        });
         let _ = self.events.send(AgentEvent::SubAgentProgress {
             id: self.id.clone(),
             active: true,
@@ -2566,5 +2610,89 @@ mod compaction_tests {
                     && m.text_content().contains("new objective only")),
             "short transcript must still receive host pin: {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod child_accounting_tests {
+    use super::*;
+
+    fn a_record() -> ModelRequestRecord {
+        ModelRequestRecord {
+            provider_request_id: Some("req-1".to_string()),
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            usage: TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cached_input_tokens: 900,
+            },
+            finish_reason: FinishReason::Stop,
+            latency_ms: 10,
+            retry_count: 0,
+            kind: ModelCallKind::Round,
+            agent_id: None,
+            cost_usd_micros: None,
+        }
+    }
+
+    /// A child cannot borrow the parent's persistence sink, so its records
+    /// have to travel as events. The sink used to keep only in-memory counters
+    /// and emit a progress line, which is why a reviewer's half-million tokens
+    /// left no row anywhere.
+    #[tokio::test]
+    async fn a_child_sink_emits_the_record_stamped_with_its_agent_id() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sink = SubAgentProgressSink::new("reviewer-6d8ab312".to_string(), tx);
+
+        sink.record_model_request(&a_record()).await.unwrap();
+
+        let mut durable = None;
+        let mut progress = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::SubAgentModelRequest { record } => durable = Some(record),
+                AgentEvent::SubAgentProgress { .. } => progress = Some(()),
+                _ => {}
+            }
+        }
+        let durable = durable.expect("the child must emit a durable record, not only a counter");
+        assert_eq!(durable.agent_id.as_deref(), Some("reviewer-6d8ab312"));
+        assert_eq!(durable.usage.input_tokens, 1_000);
+        assert_eq!(durable.usage.cached_input_tokens, 900);
+        assert!(progress.is_some(), "the live progress line still goes out");
+    }
+
+    /// Two calls are two records. A sink that only accumulated could not tell
+    /// one expensive call from ten cheap ones.
+    #[tokio::test]
+    async fn every_child_call_produces_its_own_record() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sink = SubAgentProgressSink::new("reviewer-a".to_string(), tx);
+
+        sink.record_model_request(&a_record()).await.unwrap();
+        sink.record_model_request(&a_record()).await.unwrap();
+
+        let mut records = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::SubAgentModelRequest { .. }) {
+                records += 1;
+            }
+        }
+        assert_eq!(records, 2);
+    }
+
+    /// Pricing is applied once, against the usage the provider reported, and
+    /// an unpriced model yields `None` rather than a free call.
+    #[test]
+    fn a_record_is_priced_from_the_usage_it_carries() {
+        let priced = a_record().priced(Some(&leveler_model::ModelPricing {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 2.0,
+            cached_input_usd_per_mtok: Some(0.1),
+        }));
+        // 100 uncached × 1.0 + 900 cached × 0.1 + 100 out × 2.0
+        assert_eq!(priced.cost_usd_micros, Some(100 + 90 + 200));
+        assert_eq!(a_record().priced(None).cost_usd_micros, None);
     }
 }

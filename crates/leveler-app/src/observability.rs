@@ -905,6 +905,9 @@ mod tests {
             latency_ms: Some(7100),
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
             created_at: now(),
         })
         .await

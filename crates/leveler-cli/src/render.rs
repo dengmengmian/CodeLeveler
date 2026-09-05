@@ -14,6 +14,9 @@ fn render_event_text(event: AgentEvent) {
     match event {
         // The CLI renders whole messages, not token deltas.
         AgentEvent::StreamAttemptStarted => {}
+        // A durable accounting row, intercepted by the drive loop. The child's
+        // running totals reach the screen as SubAgentProgress instead.
+        AgentEvent::SubAgentModelRequest { .. } => {}
         AgentEvent::AssistantDelta(_) => {}
         AgentEvent::ReasoningDelta(_) => {}
         AgentEvent::AssistantText(text) => {
@@ -221,6 +224,14 @@ fn render_event_jsonl(event: AgentEvent) {
         AgentEvent::StreamAttemptStarted => {
             serde_json::json!({ "type": "stream_attempt_started" })
         }
+        AgentEvent::SubAgentModelRequest { record } => serde_json::json!({
+            "type": "sub_agent_model_request",
+            "agent_id": record.agent_id,
+            "input_tokens": record.usage.input_tokens,
+            "cached_input_tokens": record.usage.cached_input_tokens,
+            "output_tokens": record.usage.output_tokens,
+            "cost_usd_micros": record.cost_usd_micros,
+        }),
         AgentEvent::AssistantDelta(delta) => {
             serde_json::json!({ "type": "assistant_delta", "delta": delta })
         }

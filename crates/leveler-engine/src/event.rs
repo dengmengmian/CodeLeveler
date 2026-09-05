@@ -1027,6 +1027,18 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 profile_role,
                 capabilities,
             },
+            // Durable-only: the drive loop intercepts this and writes the
+            // row. Nothing downstream renders it, and the child's running
+            // totals already reach the screen as SubAgentProgress. Mapping it
+            // to that keeps the conversion total without inventing an engine
+            // event nobody consumes.
+            A::SubAgentModelRequest { record } => EngineEvent::SubAgentProgress {
+                id: record.agent_id.clone().unwrap_or_default(),
+                active: true,
+                input_tokens: record.usage.input_tokens.min(u32::MAX as u64) as u32,
+                output_tokens: record.usage.output_tokens.min(u32::MAX as u64) as u32,
+                cached_input_tokens: record.usage.cached_input_tokens.min(u32::MAX as u64) as u32,
+            },
             A::SubAgentProgress {
                 id,
                 active,

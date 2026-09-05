@@ -64,6 +64,21 @@ pub struct ModelRequestRecord {
     pub input_tokens: u64,
     /// Completion tokens, clamped on write like [`Self::input_tokens`].
     pub output_tokens: u64,
+    /// Prompt tokens the provider served from its own prefix cache — a SUBSET
+    /// of [`Self::input_tokens`], not an addition to it. `None` means the
+    /// writer did not record it (every row older than migration 0022);
+    /// `Some(0)` means the provider reported no cache hit. The two must not be
+    /// collapsed: one is an absence of measurement, the other a measurement.
+    pub cached_input_tokens: Option<u64>,
+    /// Estimated cost of this call in micro-USD, computed from the usage above
+    /// and the model's configured pricing at the time it ran. `None` when no
+    /// pricing was configured, so a session's cost sums only over rows that
+    /// actually have one.
+    pub cost_usd_micros: Option<u64>,
+    /// The sub-agent that made the call, or `None` for the root session's own
+    /// calls. This is what lets a reviewer's spend be separated from the work
+    /// it was reviewing.
+    pub agent_id: Option<String>,
     /// Provider's stop reason (`stop`, `length`, `tool_calls`, …). `None` when
     /// the call never reached a normal end — see [`Self::error_kind`].
     pub finish_reason: Option<String>,
@@ -107,8 +122,8 @@ impl<'a> ModelRequestRepository<'a> {
             "INSERT INTO model_requests \
              (id, session_id, provider, model, input_tokens, output_tokens, finish_reason, \
               error_kind, latency_ms, retry_count, created_at, kind, \
-              provider_request_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              provider_request_id, cached_input_tokens, cost_usd_micros, agent_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -127,6 +142,17 @@ impl<'a> ModelRequestRepository<'a> {
         .bind(record.created_at.to_rfc3339())
         .bind(record.kind.as_str())
         .bind(&record.provider_request_id)
+        .bind(
+            record
+                .cached_input_tokens
+                .map(|value| value.min(i64::MAX as u64) as i64),
+        )
+        .bind(
+            record
+                .cost_usd_micros
+                .map(|value| value.min(i64::MAX as u64) as i64),
+        )
+        .bind(&record.agent_id)
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -158,10 +184,14 @@ impl<'a> ModelRequestRepository<'a> {
                 String,
                 String,
                 Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
             ),
         >(
             "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, error_kind, \
-                    latency_ms, retry_count, created_at, kind, provider_request_id \
+                    latency_ms, retry_count, created_at, kind, provider_request_id, \
+                    cached_input_tokens, cost_usd_micros, agent_id \
              FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
         )
         .bind(session_id.as_str())
@@ -183,6 +213,9 @@ impl<'a> ModelRequestRepository<'a> {
                     created_at,
                     kind,
                     provider_request_id,
+                    cached_input_tokens,
+                    cost_usd_micros,
+                    agent_id,
                 )| {
                     Ok(ModelRequestRecord {
                         id,
@@ -197,6 +230,9 @@ impl<'a> ModelRequestRepository<'a> {
                         retry_count: retry_count.clamp(0, i64::from(u32::MAX)) as u32,
                         kind: ModelCallKind::from_stored(&kind),
                         provider_request_id,
+                        cached_input_tokens: cached_input_tokens.map(|value| value.max(0) as u64),
+                        cost_usd_micros: cost_usd_micros.map(|value| value.max(0) as u64),
+                        agent_id,
                         created_at: created_at.parse::<Timestamp>().map_err(|error| {
                             StorageError::InvalidData(format!("model request timestamp: {error}"))
                         })?,
@@ -207,9 +243,288 @@ impl<'a> ModelRequestRepository<'a> {
     }
 }
 
+/// What a session's recorded model calls add up to, split by who made them.
+///
+/// Summed from the rows themselves rather than from a running counter, so it
+/// answers the question a running counter cannot: *is the durable record
+/// complete?* A session whose parent spent six million tokens while its
+/// reviewer spent another half million left, before migration 0022, a ledger
+/// saying one number and a database holding a different one with no way to see
+/// the gap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionUsageTotals {
+    /// How many logical calls were summed.
+    pub requests: u64,
+    /// Prompt tokens, cached and uncached together.
+    pub input_tokens: u64,
+    /// Summed over rows that recorded it. Rows that did not are counted in
+    /// [`Self::rows_without_cached_usage`] instead of contributing zero.
+    pub cached_input_tokens: u64,
+    /// Completion tokens.
+    pub output_tokens: u64,
+    /// Summed over rows that carry a cost. Rows without pricing are counted in
+    /// [`Self::rows_without_cost`].
+    pub cost_usd_micros: u64,
+    /// Rows whose cached usage was never recorded — pre-0022 rows. They are
+    /// counted, not treated as zero cache hits.
+    pub rows_without_cached_usage: u64,
+    /// Rows with no cost, because the model had no pricing configured or the
+    /// row predates the column. Not the same as a call that cost nothing.
+    pub rows_without_cost: u64,
+}
+
+impl SessionUsageTotals {
+    fn add(&mut self, record: &ModelRequestRecord) {
+        self.requests += 1;
+        self.input_tokens = self.input_tokens.saturating_add(record.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(record.output_tokens);
+        match record.cached_input_tokens {
+            Some(value) => {
+                self.cached_input_tokens = self.cached_input_tokens.saturating_add(value)
+            }
+            None => self.rows_without_cached_usage += 1,
+        }
+        match record.cost_usd_micros {
+            Some(value) => self.cost_usd_micros = self.cost_usd_micros.saturating_add(value),
+            None => self.rows_without_cost += 1,
+        }
+    }
+
+    /// Whether every row contributed both a cached-usage figure and a cost. A
+    /// caller showing a cost has to be able to say whether it is the whole
+    /// bill or part of one.
+    pub fn is_complete(&self) -> bool {
+        self.rows_without_cached_usage == 0 && self.rows_without_cost == 0
+    }
+}
+
+/// A session's usage, separated into the root's own calls and each sub-agent's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionUsageReconciliation {
+    /// Calls the root session made itself.
+    pub root: SessionUsageTotals,
+    /// Calls made by sub-agents, keyed by agent id, ordered by id.
+    pub by_agent: Vec<(String, SessionUsageTotals)>,
+    /// Root plus every agent. This is the figure to compare against a runtime
+    /// cumulative ledger.
+    pub total: SessionUsageTotals,
+}
+
+impl<'a> ModelRequestRepository<'a> {
+    /// Add up a session's recorded calls, split by the agent that made them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`Self::load_for_session`] fails with.
+    pub async fn reconcile_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionUsageReconciliation, StorageError> {
+        let records = self.load_for_session(session_id).await?;
+        let mut out = SessionUsageReconciliation::default();
+        let mut agents: std::collections::BTreeMap<String, SessionUsageTotals> =
+            std::collections::BTreeMap::new();
+        for record in &records {
+            out.total.add(record);
+            match &record.agent_id {
+                Some(id) => agents.entry(id.clone()).or_default().add(record),
+                None => out.root.add(record),
+            }
+        }
+        out.by_agent = agents.into_iter().collect();
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(id: &str, session: &SessionId) -> ModelRequestRecord {
+        ModelRequestRecord {
+            id: id.to_string(),
+            provider_request_id: None,
+            session_id: session.clone(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            finish_reason: Some("stop".to_string()),
+            error_kind: None,
+            latency_ms: Some(10),
+            retry_count: 0,
+            kind: ModelCallKind::Round,
+            cached_input_tokens: Some(900),
+            cost_usd_micros: Some(1_234),
+            agent_id: None,
+            created_at: leveler_core::now(),
+        }
+    }
+
+    async fn seeded() -> (Database, SessionId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session =
+            SessionRecord::new("/r", "g", "deepseek/deepseek-v4-flash", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id);
+        (db, id)
+    }
+
+    /// T1/T2. What the provider reported is what comes back out — including
+    /// the cached share, which used to be dropped between the usage struct
+    /// and the row.
+    #[tokio::test]
+    async fn a_request_round_trips_its_usage_exactly() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        repo.insert(&record("r-1", &session)).await.unwrap();
+
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].input_tokens, 1_000);
+        assert_eq!(loaded[0].output_tokens, 100);
+        assert_eq!(loaded[0].cached_input_tokens, Some(900));
+        assert_eq!(loaded[0].cost_usd_micros, Some(1_234));
+    }
+
+    /// T3/T4. A sub-agent's call is attributable to the agent that made it.
+    /// Before this, a reviewer's spend reached the screen and nothing else.
+    #[tokio::test]
+    async fn a_child_request_is_attributed_to_its_agent() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        repo.insert(&record("parent-1", &session)).await.unwrap();
+        let mut child = record("reviewer-1", &session);
+        child.agent_id = Some("reviewer-6d8ab312".to_string());
+        repo.insert(&child).await.unwrap();
+
+        let rec = repo.reconcile_session(&session).await.unwrap();
+        assert_eq!(rec.root.requests, 1);
+        assert_eq!(rec.by_agent.len(), 1);
+        assert_eq!(rec.by_agent[0].0, "reviewer-6d8ab312");
+        assert_eq!(rec.by_agent[0].1.requests, 1);
+        assert_eq!(rec.by_agent[0].1.input_tokens, 1_000);
+    }
+
+    /// T5/T9. The total is the root plus every agent, counted once each.
+    #[tokio::test]
+    async fn reconciliation_sums_root_and_children_without_double_counting() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        repo.insert(&record("p-1", &session)).await.unwrap();
+        for (n, agent) in [
+            ("c-1", "reviewer-a"),
+            ("c-2", "reviewer-a"),
+            ("c-3", "explorer-b"),
+        ] {
+            let mut r = record(n, &session);
+            r.agent_id = Some(agent.to_string());
+            repo.insert(&r).await.unwrap();
+        }
+
+        let rec = repo.reconcile_session(&session).await.unwrap();
+        assert_eq!(rec.total.requests, 4, "four rows, counted once each");
+        assert_eq!(rec.total.input_tokens, 4_000);
+        assert_eq!(rec.total.cached_input_tokens, 3_600);
+        assert_eq!(rec.total.cost_usd_micros, 4 * 1_234);
+        assert_eq!(rec.root.requests, 1);
+        let child_requests: u64 = rec.by_agent.iter().map(|(_, t)| t.requests).sum();
+        assert_eq!(rec.root.requests + child_requests, rec.total.requests);
+        assert_eq!(rec.by_agent.len(), 2, "two distinct agents");
+        assert!(rec.total.is_complete());
+    }
+
+    /// A file written by the previous release upgrades in place. The fixture
+    /// is the shape a Phase C formal run left behind: rows with no cached
+    /// usage, no cost and no agent attribution. Upgrading must not ask the
+    /// user to delete `~/.leveler`, and must not invent facts for rows nobody
+    /// measured.
+    #[tokio::test]
+    async fn a_pre_0022_database_upgrades_in_place_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+
+        let session_id = {
+            let db = Database::connect(&path).await.unwrap();
+            let session =
+                SessionRecord::new("/repo", "goal", "deepseek/deepseek-v4-flash", leveler_core::now());
+            SessionRepository::new(&db).create(&session).await.unwrap();
+            let id = SessionId::new(session.id);
+            sqlx::query(
+                "INSERT INTO model_requests \
+                 (id, session_id, provider, model, input_tokens, output_tokens, \
+                  retry_count, created_at, kind) \
+                 VALUES ('legacy-1', ?1, 'deepseek', 'deepseek-v4-flash', 6392866, 67547, \
+                         0, ?2, 'round')",
+            )
+            .bind(id.as_str())
+            .bind(leveler_core::now().to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            id
+        };
+
+        // Reopen the same file: the ordinary "upgrade and start again" path.
+        let db = Database::connect(&path).await.unwrap();
+        let repo = ModelRequestRepository::new(&db);
+        let rows = repo.load_for_session(&session_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "the old row is still readable");
+        assert_eq!(rows[0].input_tokens, 6_392_866);
+        assert_eq!(
+            rows[0].cached_input_tokens, None,
+            "a row from before the column reads as unrecorded, not as a cache miss"
+        );
+        assert_eq!(rows[0].cost_usd_micros, None, "and not as a free call");
+        assert_eq!(rows[0].agent_id, None);
+
+        let rec = repo.reconcile_session(&session_id).await.unwrap();
+        assert_eq!(rec.total.input_tokens, 6_392_866);
+        assert_eq!(rec.total.rows_without_cached_usage, 1);
+        assert_eq!(rec.total.rows_without_cost, 1);
+        assert!(
+            !rec.total.is_complete(),
+            "a total resting on an unrecorded row reports itself incomplete"
+        );
+    }
+
+    /// T6/T7. A row from before the column existed reads as UNRECORDED, not
+    /// as a call that hit no cache and cost nothing. Reconciliation says so
+    /// rather than reporting a clean total it cannot support.
+    #[tokio::test]
+    async fn a_pre_migration_row_is_unknown_usage_not_zero_usage() {
+        let (db, session) = seeded().await;
+        sqlx::query(
+            "INSERT INTO model_requests \
+             (id, session_id, provider, model, input_tokens, output_tokens, created_at) \
+             VALUES ('legacy', ?1, 'p', 'm', 500, 50, ?2)",
+        )
+        .bind(session.as_str())
+        .bind(leveler_core::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let repo = ModelRequestRepository::new(&db);
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded[0].cached_input_tokens, None, "unknown, not zero");
+        assert_eq!(loaded[0].cost_usd_micros, None);
+        assert_eq!(loaded[0].agent_id, None);
+
+        let rec = repo.reconcile_session(&session).await.unwrap();
+        assert_eq!(
+            rec.total.input_tokens, 500,
+            "tokens it did record still count"
+        );
+        assert_eq!(rec.total.cached_input_tokens, 0);
+        assert_eq!(rec.total.rows_without_cached_usage, 1);
+        assert_eq!(rec.total.rows_without_cost, 1);
+        assert!(
+            !rec.total.is_complete(),
+            "a total standing on an unrecorded row must not claim to be whole"
+        );
+    }
+
     use crate::{SessionRecord, SessionRepository};
 
     #[tokio::test]
@@ -231,6 +546,9 @@ mod tests {
             latency_ms: Some(42),
             retry_count: 1,
             kind: ModelCallKind::Round,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
             created_at: leveler_core::now(),
         };
 
@@ -272,6 +590,9 @@ mod tests {
                 latency_ms: Some(1),
                 retry_count: retries,
                 kind,
+                cached_input_tokens: None,
+                cost_usd_micros: None,
+                agent_id: None,
                 created_at: leveler_core::now(),
             })
             .await
@@ -316,6 +637,9 @@ mod tests {
                 latency_ms: Some(1),
                 retry_count: 0,
                 kind: ModelCallKind::Advisory,
+                cached_input_tokens: None,
+                cost_usd_micros: None,
+                agent_id: None,
                 created_at: leveler_core::now(),
             })
             .await

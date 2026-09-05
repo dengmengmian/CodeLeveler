@@ -212,7 +212,8 @@ impl Executor {
                 )
                 .await;
                 for record in &spend {
-                    sink.record_model_request(record).await?;
+                    sink.record_model_request(&record.clone().priced(self.pricing.as_ref()))
+                        .await?;
                 }
                 // Failures used to be one indistinguishable `None`, so a
                 // budget ceiling read the same as a provider outage and the
@@ -526,12 +527,29 @@ impl Executor {
             }};
         }
 
+        // A child runs as an owned `'static` future, so it cannot borrow this
+        // sink; its model-call records ride the progress channel instead and
+        // are written down here, by the one holder of durable storage. They
+        // are not forwarded to the observer: the live progress line already
+        // carries the child's running totals, and this event exists for the
+        // ledger, not the screen.
+        macro_rules! forward_child_event {
+            ($event:expr) => {{
+                let event = $event;
+                if let AgentEvent::SubAgentModelRequest { record } = &event {
+                    sink.record_model_request(record).await?;
+                } else {
+                    observer(event);
+                }
+            }};
+        }
+
         // V2: non-blocking settlement of finished background children — the
         // notice lands in `messages` before the next model round.
         macro_rules! settle_finished_children {
             ($rounds:expr) => {{
                 while let Ok(event) = bg_progress_rx.try_recv() {
-                    observer(event);
+                    forward_child_event!(event);
                 }
                 let mut settled = Vec::new();
                 let mut i = 0;
@@ -597,7 +615,7 @@ impl Executor {
                     }
                     tokio::select! {
                         biased;
-                        Some(event) = bg_progress_rx.recv() => observer(event),
+                        Some(event) = bg_progress_rx.recv() => forward_child_event!(event),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                     }
                 }
@@ -914,16 +932,21 @@ impl Executor {
                 Err(e) => return Err(e),
             };
 
-            sink.record_model_request(&ModelRequestRecord {
-                provider_request_id: Some(stream_result.request_id.clone()),
-                provider: self.model.provider.clone(),
-                model: self.model.model.clone(),
-                usage: stream_result.usage,
-                finish_reason: stream_result.finish_reason,
-                latency_ms: stream_result.latency_ms,
-                retry_count: stream_result.retry_count,
-                kind: crate::ModelCallKind::Round,
-            })
+            sink.record_model_request(
+                &ModelRequestRecord {
+                    provider_request_id: Some(stream_result.request_id.clone()),
+                    provider: self.model.provider.clone(),
+                    model: self.model.model.clone(),
+                    usage: stream_result.usage,
+                    finish_reason: stream_result.finish_reason,
+                    latency_ms: stream_result.latency_ms,
+                    retry_count: stream_result.retry_count,
+                    kind: crate::ModelCallKind::Round,
+                    agent_id: None,
+                    cost_usd_micros: None,
+                }
+                .priced(self.pricing.as_ref()),
+            )
             .await?;
             // Zero-usage gateways must not disable the token budget: fall back
             // to the transcript estimate (same fallback compaction uses), so
@@ -938,10 +961,16 @@ impl Executor {
             };
             model_tokens_spent = model_tokens_spent.saturating_add(round_tokens);
             if let Some(pricing) = self.pricing {
-                cost_spent_micros = cost_spent_micros.saturating_add(pricing.cost_usd_micros(
-                    stream_result.usage.input_tokens,
-                    stream_result.usage.output_tokens,
-                ));
+                // Bill the prompt the way the provider does. Charging every
+                // input token at the uncached rate overstated a session's cost
+                // by roughly 4x at a 90% cache hit rate, which made a cost
+                // budget bind long before the money was actually spent.
+                cost_spent_micros =
+                    cost_spent_micros.saturating_add(pricing.cost_usd_micros_cached(
+                        stream_result.usage.input_tokens,
+                        stream_result.usage.cached_input_tokens,
+                        stream_result.usage.output_tokens,
+                    ));
             }
             // Cost can cross the limit on the response that tips it; stop after
             // this round's tools (if any) rather than allowing another model call.
@@ -1122,7 +1151,7 @@ impl Executor {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => {}
-                        Some(event) = bg_progress_rx.recv() => observer(event),
+                        Some(event) = bg_progress_rx.recv() => forward_child_event!(event),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
                     }
                 }
@@ -1854,7 +1883,10 @@ impl Executor {
                             )
                             .await;
                             for record in &judge_spend {
-                                sink.record_model_request(record).await?;
+                                sink.record_model_request(
+                                    &record.clone().priced(self.pricing.as_ref()),
+                                )
+                                .await?;
                             }
                             tracing::info!(
                                 executor_model = %self.model,
@@ -1900,7 +1932,10 @@ impl Executor {
                                     .await
                                     .ok();
                                     for record in &spend {
-                                        sink.record_model_request(record).await?;
+                                        sink.record_model_request(
+                                            &record.clone().priced(self.pricing.as_ref()),
+                                        )
+                                        .await?;
                                     }
                                     derived
                                 }
@@ -3440,7 +3475,7 @@ impl Executor {
                 while !futs.is_empty() {
                     tokio::select! {
                         biased;
-                        Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
+                        Some(progress_ev) = progress_rx.recv() => forward_child_event!(progress_ev),
                         Some((index, call_id, id, nickname, role, result)) = futs.next() => {
                             self.ownership.release_all(&id);
                             let (content, ok) = fold_child_settlement(
@@ -3472,7 +3507,7 @@ impl Executor {
                     }
                 }
                 while let Ok(progress) = progress_rx.try_recv() {
-                    observer(progress);
+                    forward_child_event!(progress);
                 }
                 drop(futs);
                 // Always flush after sub-agent batch so absorbed spend is durable
@@ -4022,16 +4057,21 @@ impl Executor {
                 // recorded a session that folded reported fewer tokens than it
                 // spent — precisely in the lane a fold is the cost of.
                 if let Some(summarized) = &summarized {
-                    sink.record_model_request(&ModelRequestRecord {
-                        provider_request_id: Some(summarized.request_id.to_string()),
-                        provider: self.model.provider.clone(),
-                        model: self.model.model.clone(),
-                        usage: summarized.usage,
-                        finish_reason: summarized.finish_reason,
-                        latency_ms: summarized.latency_ms,
-                        retry_count: 0,
-                        kind: crate::ModelCallKind::Compaction,
-                    })
+                    sink.record_model_request(
+                        &ModelRequestRecord {
+                            provider_request_id: Some(summarized.request_id.to_string()),
+                            provider: self.model.provider.clone(),
+                            model: self.model.model.clone(),
+                            usage: summarized.usage,
+                            finish_reason: summarized.finish_reason,
+                            latency_ms: summarized.latency_ms,
+                            retry_count: 0,
+                            kind: crate::ModelCallKind::Compaction,
+                            agent_id: None,
+                            cost_usd_micros: None,
+                        }
+                        .priced(self.pricing.as_ref()),
+                    )
                     .await?;
                 }
                 let mut summary = summarized.map(|s| s.text);
