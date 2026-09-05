@@ -1374,7 +1374,7 @@ impl Executor {
                             | "request_user_input"
                             | "ask_user"
                             | REQUEST_PERMISSIONS_TOOL
-                    ),
+                    ) || self.reports_findings_by_contract(&call.name),
                 }) {
                     metrics.plan_first_write_blocked += 1;
                     denied_calls_this_round += 1;

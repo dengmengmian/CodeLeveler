@@ -362,8 +362,15 @@ async fn run_prepared_sub_agent(
             .epoch_duration_at_start
             .saturating_add(parent_wall.run_started.elapsed());
         let residual = parent_max.saturating_sub(elapsed);
+        // Hand the child the residual MINUS what the parent still needs to
+        // finish: fold the result in, reconcile, and write the outcome down.
+        // Handing over the whole remainder let an optional reviewer spend the
+        // last second of a task it had already been told was done — a Phase C
+        // run settled with 115s of a 3600s budget left, behind a reviewer that
+        // returned nothing. A child is a tail, not a claim on the deadline.
+        let for_child = residual.saturating_sub(CHILD_SETTLEMENT_RESERVE);
         let sub_cap = crate::sub_agent::SUB_AGENT_MAX_DURATION;
-        residual_limits.max_duration = Some(sub_cap.min(residual));
+        residual_limits.max_duration = Some(sub_cap.min(for_child));
     }
     let _ = progress.send(AgentEvent::SubAgentProgress {
         id: id.clone(),
@@ -581,6 +588,14 @@ fn cap_activity_preview(s: &str) -> String {
     const MAX: usize = 160;
     leveler_core::truncate_head_bytes(s.trim(), MAX, "…")
 }
+
+/// Wall time held back from a child so the parent can still settle.
+///
+/// Settlement is not free: the parent folds the child's result into its
+/// ledger, may run a reconciliation judge, and writes the outcome. A child
+/// granted the parent's entire remainder leaves none of that, and the run ends
+/// on a deadline rather than on a decision.
+pub(crate) const CHILD_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Parent wall-clock budget context for refreshing a child's residual duration
 /// after it finishes waiting on the concurrency semaphore.

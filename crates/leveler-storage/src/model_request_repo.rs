@@ -446,8 +446,12 @@ mod tests {
 
         let session_id = {
             let db = Database::connect(&path).await.unwrap();
-            let session =
-                SessionRecord::new("/repo", "goal", "deepseek/deepseek-v4-flash", leveler_core::now());
+            let session = SessionRecord::new(
+                "/repo",
+                "goal",
+                "deepseek/deepseek-v4-flash",
+                leveler_core::now(),
+            );
             SessionRepository::new(&db).create(&session).await.unwrap();
             let id = SessionId::new(session.id);
             sqlx::query(

@@ -715,6 +715,27 @@ impl ModelRequestRecord {
     }
 }
 
+/// Whether `tool` is the terminal report of a role that can do nothing else.
+///
+/// The plan gate's own job is to stop multi-step *work* from starting without a
+/// plan — it already lets every read-only navigation tool through, because "plan
+/// is an execution aid, not a license to navigate code". A read-only child is
+/// nothing but navigation and a report: it holds no mutating tool, so there is
+/// no work for a plan to sequence. Holding its one terminal call to that
+/// ceremony spent a Phase C reviewer's entire budget on discovering it needed a
+/// plan to say what it had already found.
+///
+/// Read off the profile, not a role list, and deliberately NOT off
+/// `output_contract.findings` — every profile declares that, so keying on it
+/// would exempt the Worker and the Default agent too, which is the global
+/// bypass this must not be.
+pub(crate) fn role_reports_findings(role: crate::child_profile::AgentRole, tool: &str) -> bool {
+    let profile = crate::sub_agent::ChildProfile::resolve(role);
+    tool == crate::injected_tools::REPORT_FINDING_TOOL
+        && profile.read_only()
+        && profile.output_contract.findings
+}
+
 /// A sink that persists the transcript as the loop advances, enabling resume.
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
@@ -1370,6 +1391,12 @@ impl Executor {
 
     /// Select whether this executor runs to a semantic terminal state or owns
     /// a fixed number of rounds.
+    /// Whether `tool` is this role's declared output. See
+    /// [`role_reports_findings`].
+    fn reports_findings_by_contract(&self, tool: &str) -> bool {
+        role_reports_findings(self.agent_role, tool)
+    }
+
     pub fn with_continuation_policy(mut self, policy: ContinuationPolicy) -> Self {
         self.continuation = policy;
         self
@@ -2694,5 +2721,105 @@ mod child_accounting_tests {
         // 100 uncached × 1.0 + 900 cached × 0.1 + 100 out × 2.0
         assert_eq!(priced.cost_usd_micros, Some(100 + 90 + 200));
         assert_eq!(a_record().priced(None).cost_usd_micros, None);
+    }
+}
+
+#[cfg(test)]
+mod reviewer_policy_tests {
+    use super::*;
+    use crate::child_profile::{AgentRole, ChildProfile};
+    use crate::executor::handlers::CHILD_SETTLEMENT_RESERVE;
+    use crate::injected_tools::REPORT_FINDING_TOOL;
+    use crate::sub_agent::SUB_AGENT_MAX_DURATION;
+    use std::time::Duration;
+
+    fn exempt(role: AgentRole, tool: &str) -> bool {
+        role_reports_findings(role, tool)
+    }
+
+    /// R1. A reviewer's whole output is findings. Holding `report_finding` to
+    /// the executor plan ceremony spent a Phase C reviewer's entire budget on
+    /// discovering it needed a plan to say what it had already found.
+    #[test]
+    fn a_reviewer_may_report_a_finding_without_a_plan() {
+        assert!(exempt(AgentRole::Reviewer, REPORT_FINDING_TOOL));
+        assert!(exempt(AgentRole::Explorer, REPORT_FINDING_TOOL));
+    }
+
+    /// R2/R3. Not a global bypass. The exemption reads the role's output
+    /// contract, so a role that does not deliver findings is unaffected, and
+    /// no other tool is exempted for anyone.
+    #[test]
+    fn the_exemption_is_the_roles_output_contract_not_the_tool_name() {
+        assert!(
+            !exempt(AgentRole::Worker, REPORT_FINDING_TOOL),
+            "a Worker delivers changed files, not findings"
+        );
+        assert!(!exempt(AgentRole::Default, REPORT_FINDING_TOOL));
+        for tool in ["apply_patch", "run_command", "update_goal", "read_file"] {
+            assert!(
+                !exempt(AgentRole::Reviewer, tool),
+                "{tool} is not a reviewer's declared output"
+            );
+        }
+    }
+
+    /// The exemption tracks the profile rather than a hardcoded role list, so
+    /// the two stay in step if a profile's contract changes.
+    #[test]
+    fn every_role_that_declares_findings_is_exempt_and_only_those() {
+        for role in [
+            AgentRole::Default,
+            AgentRole::Explorer,
+            AgentRole::Worker,
+            AgentRole::Reviewer,
+        ] {
+            let profile = ChildProfile::resolve(role);
+            let declares = profile.read_only() && profile.output_contract.findings;
+            assert_eq!(
+                exempt(role, REPORT_FINDING_TOOL),
+                declares,
+                "{role:?} exemption must equal read-only AND declares findings"
+            );
+        }
+    }
+
+    /// R6/R7. A child is a tail, not a claim on the deadline: it gets the
+    /// parent's remainder minus what settlement needs.
+    #[test]
+    fn a_child_never_receives_the_parents_whole_remainder() {
+        let residual = Duration::from_secs(300);
+        let granted = SUB_AGENT_MAX_DURATION.min(residual.saturating_sub(CHILD_SETTLEMENT_RESERVE));
+        assert!(granted < residual, "settlement must keep some of the tail");
+        assert_eq!(granted, Duration::from_secs(240));
+    }
+
+    /// R5. Near the deadline the grant shrinks with the remainder, and once
+    /// the reserve is all that is left the child gets nothing rather than
+    /// eating the parent's ability to finish.
+    #[test]
+    fn a_parent_near_its_deadline_grants_a_child_nothing() {
+        for residual in [
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            Duration::ZERO,
+        ] {
+            let granted =
+                SUB_AGENT_MAX_DURATION.min(residual.saturating_sub(CHILD_SETTLEMENT_RESERVE));
+            assert_eq!(
+                granted,
+                Duration::ZERO,
+                "with {residual:?} left there is nothing to lend"
+            );
+        }
+    }
+
+    /// R4. With plenty of time the profile cap still binds — the reserve is a
+    /// floor on the parent's side, not a new ceiling on the child's.
+    #[test]
+    fn a_parent_with_plenty_of_time_still_caps_the_child_at_its_profile() {
+        let residual = Duration::from_secs(6 * 3600);
+        let granted = SUB_AGENT_MAX_DURATION.min(residual.saturating_sub(CHILD_SETTLEMENT_RESERVE));
+        assert_eq!(granted, SUB_AGENT_MAX_DURATION);
     }
 }
