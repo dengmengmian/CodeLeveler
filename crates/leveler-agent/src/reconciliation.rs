@@ -166,6 +166,9 @@ pub(crate) struct EvidenceCandidate {
     pub detail: String,
     /// Whether this evidence still stands over the current tree.
     pub fresh: bool,
+    /// Whether the ledger holds any recorded change to order this against.
+    /// When it does not, "not fresh" means "unordered", not "superseded".
+    pub ordered: bool,
 }
 
 /// At most this many candidates of each kind reach the judge, newest first —
@@ -177,6 +180,70 @@ const MAX_CANDIDATES_PER_KIND: usize = 8;
 /// Built from the ledger the runtime already keeps: successful verifications
 /// and recorded mutations. Nothing here comes from prose, filenames guessed
 /// from text, or the judge itself.
+/// What the runtime can honestly say about whether a verification is current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Freshness {
+    /// A successful check ran after the last recorded change.
+    Fresh,
+    /// The last successful check predates a recorded change, or nothing
+    /// changed at all and the check is baseline-green.
+    Stale,
+    /// The tree changed but the ledger holds no record to order checks
+    /// against. The runtime cannot tell; it must not pretend to.
+    Unknown,
+}
+
+impl Freshness {
+    /// One-word form for logs and the intercept record, so a batch of runs
+    /// can be checked for what the judge was actually told without reading
+    /// the prompt back.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The workspace-facts line. `Unknown` is spelled out: the judge treats a
+    /// bare `false` against a claim of green tests as a contradiction, and a
+    /// contradiction the runtime cannot actually establish must not be
+    /// handed to it as one.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "true",
+            Self::Stale => "false",
+            Self::Unknown => {
+                "unknown — the tree changed but the runtime holds no record it can \
+                 order checks against; this is not evidence that a claimed test run \
+                 did not happen. Ask for the command to be run, do not call it a \
+                 contradiction."
+            }
+        }
+    }
+}
+
+/// Freshness as it will be stated to the judge.
+///
+/// Three states, because two facts are being read: whether a green check ran
+/// after the last recorded change, and whether the ledger's record of changes
+/// can be trusted to order against at all. When the run lists modified files
+/// but the ledger holds no mutation record — a reset, or edits it never
+/// recorded — the second fact fails and the first cannot be answered.
+pub(crate) fn freshness_for_judge(
+    ledger: &leveler_lifecycle::EvidenceLedger,
+    modified_files: &[String],
+) -> Freshness {
+    if ledger.has_fresh_successful_verify() {
+        Freshness::Fresh
+    } else if !modified_files.is_empty() && ledger.last_mutation_seq() == 0 {
+        Freshness::Unknown
+    } else {
+        Freshness::Stale
+    }
+}
+
 pub(crate) fn evidence_candidates(
     ledger: &leveler_lifecycle::EvidenceLedger,
 ) -> Vec<EvidenceCandidate> {
@@ -200,15 +267,25 @@ pub(crate) fn evidence_candidates(
             kind: "verification",
             detail: v.command_fingerprint.replace('\u{1f}', " "),
             fresh: v.after_mutation_seq >= last_mutation && last_mutation > 0,
+            ordered: last_mutation > 0,
         });
     }
     for m in ledger.mutations.iter().rev().take(MAX_CANDIDATES_PER_KIND) {
+        // A change is superseded only by a LATER change to one of its own
+        // paths. An edit to another file — or a test run that dirties
+        // `node_modules` — leaves it exactly as current as it was; telling
+        // the judge otherwise made it read a landed fix as undone.
+        let re_edited_later = ledger
+            .mutations
+            .iter()
+            .any(|later| later.seq > m.seq && later.paths.iter().any(|p| m.paths.contains(p)));
         out.push(EvidenceCandidate {
             id: String::new(),
             tool_call_id: m.tool_call_id.clone(),
             kind: "change",
             detail: m.paths.join(", "),
-            fresh: m.seq >= last_mutation,
+            fresh: !re_edited_later,
+            ordered: true,
         });
     }
     // Oldest first, so the ids read in the order the work happened.
@@ -252,7 +329,7 @@ pub(crate) struct ReconcileInput<'a> {
     /// Distinct files the run modified.
     pub modified_files: &'a [String],
     /// Whether a verification command succeeded since the last edit.
-    pub fresh_verification: bool,
+    pub fresh_verification: Freshness,
     /// The authoritative evidence of this run, named by the runtime. The judge
     /// cites these ids; it never writes a runtime identifier of its own.
     pub evidence_candidates: &'a [EvidenceCandidate],
@@ -352,6 +429,8 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
                 c.detail,
                 if c.fresh {
                     "still current"
+                } else if !c.ordered {
+                    "recorded with no change on record to order it against"
                 } else {
                     "superseded by a later change"
                 }
@@ -407,7 +486,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
         claim = input.claimed_summary,
         claims = input.recent_claims,
         evidence = input.recent_evidence,
-        fresh = input.fresh_verification,
+        fresh = input.fresh_verification.as_str(),
         candidates = candidates,
         obligations = obligations,
         accounting_rule = accounting_rule,
@@ -945,7 +1024,7 @@ mod tests {
             recent_claims: "",
             recent_evidence: "",
             modified_files: &[],
-            fresh_verification: true,
+            fresh_verification: Freshness::Fresh,
             evidence_candidates: &[],
             contract: None,
         }
@@ -1140,7 +1219,7 @@ mod prompt_render_tests {
             recent_claims: "I removed them",
             recent_evidence: "go test ./... ok",
             modified_files: &["internal/report/summary.go".to_string()],
-            fresh_verification: true,
+            fresh_verification: Freshness::Fresh,
             evidence_candidates: &[],
             contract: Some(&contract),
         });
@@ -1365,6 +1444,60 @@ mod evidence_identity {
 
     /// The candidate list is what the judge is allowed to cite, so it must be
     /// in the prompt — and it must say when there is nothing to cite.
+    /// The run knows files changed (it lists them) but the ledger holds no
+    /// mutation record — a reset, or edits it never recorded. In that state
+    /// the runtime cannot order any verification against the edits. Telling
+    /// the judge "verification run and green since last edit: false" asserts
+    /// a fact it does not have, and the judge then rejects a truthful claim
+    /// as a contradiction. A Phase C run was refused exactly this way with
+    /// its changes real and its tests green.
+    #[test]
+    fn edits_without_mutation_records_are_reported_as_unknown_not_stale() {
+        let mut led = leveler_lifecycle::EvidenceLedger::default();
+        led.record_verify("v1", "go test ./...", 0);
+        let files = ["internal/fingerprint/sources_timestamp.go".to_string()];
+        assert_eq!(freshness_for_judge(&led, &files), Freshness::Unknown);
+
+        let text = instruction(&ReconcileInput {
+            original_goal: "fix it",
+            claimed_summary: "fixed and tested",
+            recent_claims: "",
+            recent_evidence: "",
+            modified_files: &files,
+            fresh_verification: Freshness::Unknown,
+            evidence_candidates: &[],
+            contract: None,
+        });
+        assert!(
+            !text.contains("since last edit: false"),
+            "must not assert stale when it cannot know: {text}"
+        );
+        assert!(
+            text.contains("cannot order") || text.contains("unknown"),
+            "must say the runtime cannot tell: {text}"
+        );
+    }
+
+    /// The label is what a batch detector greps for; it must be one word
+    /// and must not be the prose sentence the judge reads.
+    #[test]
+    fn the_freshness_label_is_one_word_per_state() {
+        assert_eq!(Freshness::Fresh.label(), "fresh");
+        assert_eq!(Freshness::Stale.label(), "stale");
+        assert_eq!(Freshness::Unknown.label(), "unknown");
+        assert!(!Freshness::Unknown.as_str().contains('\n'));
+        assert!(Freshness::Unknown.as_str().len() > Freshness::Unknown.label().len());
+    }
+
+    /// With no edits at all, a green run is baseline-green: not proof of a
+    /// fix, and reported as such — that semantics is kept.
+    #[test]
+    fn no_edits_at_all_is_still_reported_as_not_fresh() {
+        let mut led = leveler_lifecycle::EvidenceLedger::default();
+        led.record_verify("v1", "go test ./...", 0);
+        assert_eq!(freshness_for_judge(&led, &[]), Freshness::Stale);
+    }
+
     #[test]
     fn the_prompt_shows_the_candidates_and_says_when_there_are_none() {
         let led = ledger();
@@ -1376,7 +1509,7 @@ mod evidence_identity {
             recent_claims: "",
             recent_evidence: "",
             modified_files: &[],
-            fresh_verification: true,
+            fresh_verification: Freshness::Fresh,
             evidence_candidates: &candidates,
             contract: Some(&contract),
         });
@@ -1389,7 +1522,7 @@ mod evidence_identity {
             recent_claims: "",
             recent_evidence: "",
             modified_files: &[],
-            fresh_verification: false,
+            fresh_verification: Freshness::Stale,
             evidence_candidates: &[],
             contract: Some(&contract),
         });
@@ -1479,7 +1612,7 @@ mod request_budget {
             recent_claims: "",
             recent_evidence: "",
             modified_files: &[],
-            fresh_verification: true,
+            fresh_verification: Freshness::Fresh,
             evidence_candidates: &[],
             contract: None,
         }
@@ -1675,7 +1808,7 @@ mod probe {
         recent_claims: String,
         recent_evidence: String,
         modified_files: Vec<String>,
-        fresh_verification: bool,
+        fresh_verification: Freshness,
         contract: Option<leveler_lifecycle::CompletionContract>,
         /// The run's ledger, so the replay carries the same runtime-named
         /// evidence candidates the live gate would send.
@@ -1810,5 +1943,52 @@ mod probe {
             sorted.last().copied().unwrap_or(0),
             timeout.as_millis()
         );
+    }
+}
+
+#[cfg(test)]
+mod change_candidate_labels {
+    use super::*;
+    use leveler_lifecycle::EvidenceLedger;
+
+    fn change_candidate<'a>(cands: &'a [EvidenceCandidate], path: &str) -> &'a EvidenceCandidate {
+        cands
+            .iter()
+            .find(|c| c.kind == "change" && c.detail.contains(path))
+            .unwrap_or_else(|| panic!("no change candidate for {path}: {cands:?}"))
+    }
+
+    /// Editing file B afterwards does not undo the edit to file A. A later
+    /// test run that dirties `node_modules` is the common case: the source
+    /// fix must still be offered to the judge as current.
+    #[test]
+    fn an_edit_is_not_superseded_by_a_later_change_to_another_file() {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("c1", "apply_patch", vec!["src/useController.ts".into()]);
+        led.record_mutation("c2", "shell_command", vec!["node_modules".into()]);
+        let cands = evidence_candidates(&led);
+        assert!(change_candidate(&cands, "src/useController.ts").fresh);
+        assert!(change_candidate(&cands, "node_modules").fresh);
+    }
+
+    /// Only a later change to the SAME path supersedes the earlier record.
+    #[test]
+    fn an_edit_is_superseded_only_by_a_later_change_to_the_same_path() {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
+        led.record_mutation("c2", "apply_patch", vec!["src/b.ts".into()]);
+        led.record_mutation(
+            "c3",
+            "apply_patch",
+            vec!["src/a.ts".into(), "src/c.ts".into()],
+        );
+        let cands = evidence_candidates(&led);
+        let first_a = cands
+            .iter()
+            .find(|c| c.kind == "change" && c.tool_call_id == "c1")
+            .unwrap();
+        assert!(!first_a.fresh, "c1's src/a.ts was re-edited by c3");
+        assert!(change_candidate(&cands, "src/b.ts").fresh);
+        assert!(cands.iter().find(|c| c.tool_call_id == "c3").unwrap().fresh);
     }
 }

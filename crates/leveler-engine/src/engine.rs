@@ -93,6 +93,7 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
     TurnProfile::Goal {
         continuation: spec.runtime.continuation,
         limits: spec.runtime.limits,
+        continues_active_goal: false,
     }
 }
 
@@ -1770,6 +1771,9 @@ impl TaskEngine {
                 TurnProfile::Goal {
                     continuation,
                     limits: spec.runtime.limits,
+                    // Same goal, next window. The seeder must carry the
+                    // ledger and plan across; only a NEW goal starts an epoch.
+                    continues_active_goal: true,
                 },
                 TurnInput::Content {
                     prior,
@@ -1829,6 +1833,7 @@ impl TaskEngine {
                 TurnProfile::Goal {
                     continuation: spec.runtime.continuation,
                     limits,
+                    continues_active_goal: false,
                 },
                 TurnInput::Resume(prior),
                 observer,
@@ -3508,6 +3513,10 @@ mod multi_turn_session_tests {
         // A fresh Content turn with terminal progress must not seed (epoch gate).
         progress.enter_terminal();
         assert!(progress.is_terminal_for_inheritance());
-        assert!(!crate::turn::should_seed_task_state(None, Some(&progress)));
+        assert!(!crate::turn::should_seed_task_state(
+            None,
+            Some(&progress),
+            false
+        ));
     }
 }

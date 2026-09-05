@@ -58,6 +58,14 @@ pub struct EvidenceLedger {
     /// to every ledger, so the window judge starved it of progress credit.
     #[serde(default)]
     pub total_mutation_ops: u64,
+    /// Sequence of the most recent mutating call, whether or not it produced
+    /// a `MutationRecord`. `mutations` is keyed on first-touch paths, so a
+    /// refinement edit of a file already in the set used to leave
+    /// [`Self::last_mutation_seq`] where it was — and a test that passed
+    /// before that edit kept reading as current. Freshness has to move on
+    /// every change to the tree, not on every new path in it.
+    #[serde(default)]
+    pub last_mutation_op_seq: u64,
     /// Durable multi-agent findings (self-reported and adopted from children).
     /// Serde-default so pre-findings snapshots still replay.
     #[serde(default)]
@@ -104,12 +112,22 @@ pub struct EvidenceLedger {
 
 impl EvidenceLedger {
     /// One successful mutating tool call happened (new paths or a re-edit).
+    /// Advances the freshness sequence even when no path is new, so a
+    /// verification recorded before this call is no longer current after it.
     pub fn note_mutation_op(&mut self) {
         self.total_mutation_ops = self.total_mutation_ops.saturating_add(1);
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.last_mutation_op_seq = self.next_seq;
     }
 
+    /// The sequence of the latest change to the tree: the later of the last
+    /// first-touch record and the last mutating call of any kind.
     pub fn last_mutation_seq(&self) -> u64 {
-        self.mutations.last().map(|m| m.seq).unwrap_or(0)
+        self.mutations
+            .last()
+            .map(|m| m.seq)
+            .unwrap_or(0)
+            .max(self.last_mutation_op_seq)
     }
 
     pub fn record_mutation(

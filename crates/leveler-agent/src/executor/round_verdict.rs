@@ -67,6 +67,11 @@ pub struct RoundInput {
     /// Every refusal came from a HARNESS POLICY gate (plan gate, budgets,
     /// allowlist) — the harness blocked itself; not agent stagnation.
     pub policy_blocked: bool,
+    /// This round's verification newly covers the latest change: the tree
+    /// was NOT proven green when the round began and IS now. That is the
+    /// evidence the completion gate refuses a close without, so producing it
+    /// is progress even after the plan is complete — never closeout thrash.
+    pub fresh_evidence_gained: bool,
 }
 
 /// Grade one finished round. Order matters: closeout thrash outranks observe
@@ -74,7 +79,7 @@ pub struct RoundInput {
 /// and the plan-repair exemption must be tested before the generic
 /// all-refused rule that would otherwise swallow it.
 pub fn classify(input: &RoundInput) -> RoundVerdict {
-    if input.closing && input.substantive {
+    if input.closing && input.substantive && !input.fresh_evidence_gained {
         RoundVerdict::CloseoutThrash
     } else if input.pure_observe {
         // A fresh grep with new hits is exploration, not thrash; only an
@@ -181,7 +186,30 @@ mod tests {
             had_calls: false,
             all_denied: false,
             policy_blocked: false,
+            fresh_evidence_gained: false,
         }
+    }
+
+    /// The completion gate refuses a close whose last green check predates
+    /// the last edit. The model's only legal move is to re-run the check.
+    /// exp4/f1 did exactly that and was force-stopped for "closeout thrash"
+    /// one round before it could close — two guards giving opposite orders.
+    #[test]
+    fn a_verification_that_newly_covers_the_latest_edit_is_not_closeout_thrash() {
+        let i = RoundInput {
+            closing: true,
+            substantive: true,
+            fresh_evidence_gained: true,
+            ..input()
+        };
+        assert_eq!(classify(&i), RoundVerdict::Progress);
+        // Re-running a check the tree was ALREADY proven green by is still
+        // thrash: nothing new is learned.
+        let redundant = RoundInput {
+            fresh_evidence_gained: false,
+            ..i
+        };
+        assert_eq!(classify(&redundant), RoundVerdict::CloseoutThrash);
     }
 
     #[test]

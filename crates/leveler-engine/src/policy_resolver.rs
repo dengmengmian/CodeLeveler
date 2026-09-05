@@ -402,6 +402,7 @@ mod tests {
         TurnProfile::Goal {
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
+            continues_active_goal: false,
         }
     }
 

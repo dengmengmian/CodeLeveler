@@ -309,6 +309,13 @@ impl TurnRunner<'_> {
         // The executor block OWNS the emitter (observer closure + recorders); when it
         // ends, every sender is dropped and the pump drains to close.
         let is_goal_profile = matches!(profile, TurnProfile::Goal { .. });
+        let continues_active_goal = matches!(
+            profile,
+            TurnProfile::Goal {
+                continues_active_goal: true,
+                ..
+            }
+        );
         // P3: the raw request text feeds task-class gate grading in the
         // factory. Resume turns carry no new request, so they stay
         // unclassified and keep the default (fully gated) assembly.
@@ -404,7 +411,7 @@ impl TurnRunner<'_> {
             let seed_state = match &input {
                 TurnInput::Resume(_) => true,
                 TurnInput::Content { .. } | TurnInput::Goal { .. } => {
-                    should_seed_task_state(plan.as_ref(), progress.as_ref())
+                    should_seed_task_state(plan.as_ref(), progress.as_ref(), continues_active_goal)
                 }
             };
             if seed_state {
@@ -446,10 +453,9 @@ impl TurnRunner<'_> {
                     children_spawned_total: prior.children_spawned_total,
                     ..Default::default()
                 });
-                if let Some(ledger) =
-                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
-                    && let Some(carried) = ledger.carry_forward_findings()
-                {
+                if let Some(carried) = seeded_ledger_for_repair(
+                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?,
+                ) {
                     executor = executor.with_seeded_ledger(carried);
                 }
             } else if let Some(ledger) =
@@ -722,13 +728,38 @@ fn content_text(content: &[leveler_model::ContentPart]) -> String {
 
 /// Whether a fresh Content/Goal turn should inherit Plan/Ledger/Progress.
 ///
+/// The ledger a verification-repair window starts from.
+///
+/// A repair continues the same goal: it exists because the tree was edited
+/// and a check failed. The edits and that failed check ARE its starting
+/// facts. Carrying only open findings (as a genuinely new goal does) left the
+/// repair window with `last_mutation == 0` over a changed tree, unable to
+/// order anything it did against what came before. Progress is still not
+/// inherited here — that is MA-WA1's one-fact-per-epoch rule and is decided
+/// separately — only the evidence.
+pub(crate) fn seeded_ledger_for_repair(
+    persisted: Option<leveler_lifecycle::EvidenceLedger>,
+) -> Option<leveler_lifecycle::EvidenceLedger> {
+    persisted
+}
+
 /// Resume always seeds (caller uses `TurnInput::Resume`). For Content/Goal we
 /// seed only when the prior task is still open — never Closing/Terminal or a
 /// fully completed plan (that would be a finished epoch).
+///
+/// A continuation of the active goal seeds unconditionally. `closing` and a
+/// fully completed plan both describe the previous WINDOW; neither says the
+/// GOAL is done, and the runtime only issues a continuation because it is
+/// not. Whether the carried evidence is still valid is then the workspace
+/// revision's question, never the epoch's.
 pub(crate) fn should_seed_task_state(
     plan: Option<&leveler_agent::PlanState>,
     progress: Option<&leveler_lifecycle::ProgressLedger>,
+    continues_active_goal: bool,
 ) -> bool {
+    if continues_active_goal {
+        return true;
+    }
     if let Some(p) = progress
         && p.is_terminal_for_inheritance()
     {
@@ -1096,12 +1127,16 @@ mod seed_gate_tests {
     fn fresh_content_does_not_seed_closing_progress() {
         let mut progress = ProgressLedger::default();
         progress.enter_closing();
-        assert!(!should_seed_task_state(None, Some(&progress)));
+        assert!(!should_seed_task_state(None, Some(&progress), false));
     }
 
     #[test]
     fn fresh_content_does_not_seed_fully_completed_plan() {
-        assert!(!should_seed_task_state(Some(&completed_plan()), None));
+        assert!(!should_seed_task_state(
+            Some(&completed_plan()),
+            None,
+            false
+        ));
     }
 
     #[test]
@@ -1111,11 +1146,49 @@ mod seed_gate_tests {
             closing: false,
             ..Default::default()
         };
-        assert!(should_seed_task_state(None, Some(&progress)));
+        assert!(should_seed_task_state(None, Some(&progress), false));
+    }
+
+    /// A refused close is the opposite of a finished epoch: the goal is
+    /// explicitly still open, and the runtime itself is continuing it. The
+    /// `closing` flag only records that a close was ATTEMPTED. Treating it as
+    /// terminal dropped every mutation and verification a Phase C run had —
+    /// the next window then told its own judge no test had run since the last
+    /// edit, and refused a truthful claim as a contradiction.
+    #[test]
+    fn a_goal_continuation_seeds_even_after_a_refused_close() {
+        let mut progress = ProgressLedger::default();
+        progress.enter_closing();
+        assert!(should_seed_task_state(None, Some(&progress), true));
+    }
+
+    /// Plan steps all done is not the goal done. On a continuation of the
+    /// same goal the evidence must carry regardless of plan state.
+    #[test]
+    fn a_goal_continuation_seeds_even_when_the_plan_is_fully_completed() {
+        assert!(should_seed_task_state(Some(&completed_plan()), None, true));
+    }
+
+    /// A repair turn exists BECAUSE the tree was edited and a check failed.
+    /// Its ledger used to keep only open findings — the edits and the failed
+    /// verification that motivated the repair were dropped, so the repair
+    /// window began with `last_mutation == 0` over a changed tree and could
+    /// not order anything it did against what came before. Same goal, next
+    /// window: the evidence carries, and the workspace revision decides what
+    /// is still current.
+    #[test]
+    fn a_repair_turn_carries_the_edits_and_the_failed_check_it_is_repairing() {
+        let mut led = leveler_lifecycle::EvidenceLedger::default();
+        led.record_mutation("m1", "apply_patch", vec!["a.rs".into()]);
+        led.record_verify("v1", "cargo\u{1f}test", 1);
+        let seeded = seeded_ledger_for_repair(Some(led)).expect("evidence carries");
+        assert_eq!(seeded.mutations.len(), 1, "the edit is still on record");
+        assert_eq!(seeded.verifications.len(), 1, "so is the failed check");
+        assert!(seeded.last_mutation_seq() > 0);
     }
 
     #[test]
     fn empty_prior_state_seeds_harmlessly() {
-        assert!(should_seed_task_state(None, None));
+        assert!(should_seed_task_state(None, None, false));
     }
 }

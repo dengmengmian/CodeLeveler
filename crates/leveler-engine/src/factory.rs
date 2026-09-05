@@ -25,6 +25,14 @@ pub enum TurnProfile {
     Goal {
         continuation: ContinuationPolicy,
         limits: StepLimits,
+        /// This turn continues the goal already active in the session — the
+        /// runtime issued it after a refused close — rather than opening a
+        /// new one. Nothing else distinguishes the two: both run as
+        /// `TurnKind::User` with `TurnInput::Content`, and the prior
+        /// `closing` flag reads the same either way. Without an explicit
+        /// identity the seeder took "a close was attempted" for "the epoch
+        /// is finished" and dropped every mutation and verification.
+        continues_active_goal: bool,
     },
     /// Conversational turn: same execution controls, goal mode off.
     Chat {
@@ -231,6 +239,7 @@ mod tests {
             TurnProfile::Goal {
                 continuation: ContinuationPolicy::UntilTerminal,
                 limits: StepLimits::default(),
+                continues_active_goal: false,
             },
             TurnProfile::Chat {
                 continuation: ContinuationPolicy::UntilTerminal,
@@ -258,6 +267,7 @@ mod tests {
         let goal = TurnProfile::Goal {
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
+            continues_active_goal: false,
         };
         let chat = TurnProfile::Chat {
             continuation: ContinuationPolicy::UntilTerminal,

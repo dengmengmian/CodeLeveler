@@ -34,7 +34,7 @@ use super::{
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, is_observe_result_tool, is_pure_observe_call, is_search_tool,
-    is_verification_program, observe_class, push_unique_path,
+    is_verification_program, observe_class, push_unique_path, unproven_verification_note,
 };
 use crate::compaction::{
     COMPACT_KEEP_RECENT, PRUNE_BATCH_BYTES, compact_messages, estimate_tokens,
@@ -161,6 +161,11 @@ impl Executor {
             .clone()
             .with_objective_version(objective.version);
         progress.phase = TurnPhase::Active;
+        // `closing` records that a close was attempted in a previous window.
+        // A drive that is starting is not closing, whatever the window before
+        // it did; a seeded continuation must not begin inside the closeout it
+        // was issued to get out of.
+        progress.closing = false;
         let structured_plan_required =
             self.policy.require_explicit_plan && task_needs_structured_plan(&original_task);
         // Soft plan nudge only: after this many explore rounds without a plan,
@@ -1349,6 +1354,10 @@ impl Executor {
             // penalized), so this never fires on them.
             let mut verify_passed_this_round = false;
             let mut novel_observe_this_round = false;
+            // Whether the tree was already proven green when this round began;
+            // compared against the ledger at verdict time to tell "produced the
+            // evidence the gate asked for" from "re-ran a check for nothing".
+            let fresh_at_round_start = ledger.has_fresh_successful_verify();
             // R007 F1: whether THIS round actually repeated an observation
             // (identical result re-obtained, or a repeat refused by the loop
             // guard). The thrash verdict keys off this per-round fact — never
@@ -1863,6 +1872,15 @@ impl Executor {
                             let evidence_candidates =
                                 crate::reconciliation::evidence_candidates(&ledger);
                             let mut judge_spend = crate::AdvisorySpend::new();
+                            // Bound once so the judge and the refusal record
+                            // state the same fact about verification freshness.
+                            // The judge rules on the TASK's tree, not this
+                            // window's: a continuation window that only
+                            // re-ran tests must not present "nothing changed"
+                            // over an epoch that landed the fix.
+                            let judge_paths = epoch_modified_paths(&progress, &modified_files);
+                            let freshness =
+                                crate::reconciliation::freshness_for_judge(&ledger, &judge_paths);
                             let outcome = crate::reconciliation::reconcile_completion(
                                 self.runtime.as_ref(),
                                 judge_model,
@@ -1873,8 +1891,8 @@ impl Executor {
                                     claimed_summary: claimed,
                                     recent_claims: &recent_claims,
                                     recent_evidence: &recent_evidence,
-                                    modified_files: &modified_files,
-                                    fresh_verification: ledger.has_fresh_successful_verify(),
+                                    modified_files: &judge_paths,
+                                    fresh_verification: freshness,
                                     evidence_candidates: &evidence_candidates,
                                     contract: completion_contract.as_ref(),
                                 },
@@ -2112,6 +2130,15 @@ impl Executor {
                                         outcome.contradictions.join("; ")
                                     ));
                                 }
+                                // Record what the judge was told about
+                                // freshness alongside its verdict: a refusal
+                                // issued on an `unknown` fact is a different
+                                // event from one issued on `stale`, and only
+                                // the record can say which.
+                                let detail = format!(
+                                    "{detail} [workspace_facts.freshness={}]",
+                                    freshness.label()
+                                );
                                 ledger
                                     .record_intercept("completion_reconciliation", detail.clone());
                                 observer(AgentEvent::GoalIntercepted {
@@ -2668,7 +2695,7 @@ impl Executor {
                     workspace_snapshot,
                     plan,
                     newly_modified,
-                    call_mutated,
+                    call_files,
                     executed_commands,
                     call,
                 ) = match self
@@ -2744,7 +2771,7 @@ impl Executor {
                             workspace_snapshot,
                             plan,
                             newly,
-                            !call_files.is_empty(),
+                            call_files,
                             executed_commands,
                             admitted.into_call(),
                         )
@@ -2759,12 +2786,17 @@ impl Executor {
                             None,
                             None,
                             Vec::new(),
-                            false,
+                            Vec::new(),
                             Vec::new(),
                             call,
                         )
                     }
                 };
+                // The call's own report of what it touched. Kept as paths, not
+                // collapsed to a bool: a re-edit of a file already in the set
+                // has an empty first-touch delta and would otherwise be
+                // invisible to the ledger.
+                let call_mutated = !call_files.is_empty();
                 if let Some(snapshot) = workspace_snapshot {
                     observer(AgentEvent::WorkspaceSnapshot {
                         call_id: call.id.as_str().to_string(),
@@ -2884,6 +2916,20 @@ impl Executor {
                         ledger.record_verify(call.id.as_str(), fp.clone(), 0);
                         recorded.push(fp);
                     }
+                    // A verification program that ran in a shape whose exit
+                    // proves nothing is real to the model and invisible to the
+                    // ledger. Say so on the result, where the model is looking,
+                    // instead of at the next refused close.
+                    if let Some(note) = unproven_verification_note(
+                        &call.name,
+                        &call.arguments,
+                        &executed_commands,
+                        is_error,
+                    ) {
+                        ledger.record_intercept("unproven_verification", note.clone());
+                        content.push_str("\n\n");
+                        content.push_str(&note);
+                    }
                     if !recorded.is_empty() {
                         verification_ran = true;
                         // A verification-class command that PASSED is real progress.
@@ -2911,11 +2957,21 @@ impl Executor {
                         }
                         verification_ran = false;
                     }
+                    // Record what THIS call touched. `newly_modified` is the
+                    // first-touch delta and is empty on a re-edit; `call_files`
+                    // is the call's own report. Together they name every path
+                    // this change reached, so scope and impact see re-edits.
+                    let mut touched = newly_modified;
+                    for path in &call_files {
+                        if !touched.iter().any(|p| p == path) {
+                            touched.push(path.clone());
+                        }
+                    }
                     note_tool_side_effects(
                         &mut ledger,
                         call.id.as_str(),
                         call.name.as_str(),
-                        newly_modified,
+                        touched,
                         &plan_state,
                         observer,
                     );
@@ -3687,6 +3743,9 @@ impl Executor {
                     // escalates on its own bounded track (R006 R6-P1).
                     policy_blocked: !call_snapshot.is_empty()
                         && policy_blocked_calls_this_round == call_snapshot.len(),
+                    fresh_evidence_gained: verification_ran
+                        && !fresh_at_round_start
+                        && ledger.has_fresh_successful_verify(),
                 })
             };
             if verdict == RoundVerdict::CloseoutThrash {

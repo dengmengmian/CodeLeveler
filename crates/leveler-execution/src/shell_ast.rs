@@ -393,6 +393,58 @@ pub fn literal_command_words(script: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// The program names a shell script would run, in source order, whatever
+/// shape they sit in — pipeline members, `;` chains, env-prefixed commands,
+/// the body of a nested `sh -c`. This is the model's view of "what I ran",
+/// as opposed to [`proven_executed_commands`], which is the ledger's view of
+/// what a zero exit proves. The gap between the two is exactly what a
+/// runtime note has to explain.
+///
+/// `None` when the script does not parse.
+pub fn literal_program_names(script: &str) -> Option<Vec<String>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(script, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let src = script.as_bytes();
+    let mut names = Vec::new();
+    collect_program_names(&root, src, &mut names);
+    Some(names)
+}
+
+/// Source-order walk behind [`literal_program_names`].
+fn collect_program_names(node: &Node, src: &[u8], out: &mut Vec<String>) {
+    if node.kind() == "command" {
+        let program = node
+            .child_by_field_name("name")
+            .and_then(|n| resolve_command_name(&n, src));
+        if let Some(program) = program {
+            let args = literal_arguments(node, src);
+            if is_shell_wrapper_program(&program)
+                && let Some(pos) = args
+                    .iter()
+                    .position(|a| a.as_deref().is_some_and(is_shell_c_flag))
+                && let Some(Some(body)) = args.get(pos + 1)
+                && let Some(mut inner) = literal_program_names(body)
+            {
+                out.append(&mut inner);
+                return;
+            }
+            out.push(program);
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_program_names(&child, src, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the *internal* contract of [`classify_bash_script`]: which inputs
@@ -527,5 +579,25 @@ mod tests {
         );
         // A nested body that doesn't parse defers for the whole script.
         assert_eq!(classify_bash_script("bash -c ')((('"), None);
+    }
+}
+
+#[cfg(test)]
+mod program_name_tests {
+    use super::literal_program_names;
+
+    #[test]
+    fn every_program_in_a_pipeline_chain_or_env_prefix_is_named() {
+        let names = literal_program_names(
+            "TEST_ENV=web node_modules/.bin/jest --ci nested 2>&1 | tail -6; echo done",
+        )
+        .unwrap();
+        assert_eq!(names, vec!["node_modules/.bin/jest", "tail", "echo"]);
+    }
+
+    #[test]
+    fn a_nested_shell_body_is_looked_into() {
+        let names = literal_program_names("sh -c 'pytest -q; echo done'").unwrap();
+        assert_eq!(names, vec!["pytest", "echo"]);
     }
 }
