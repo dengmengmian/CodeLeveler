@@ -23,7 +23,7 @@ MODEL_REQUESTS_TREATMENT_VS_CONTROL=−45%     118 vs 213 mean, n=3 per arm
 INPUT_TOKENS_TREATMENT_VS_CONTROL=−58%
 ESTIMATED_COST_TREATMENT_VS_CONTROL=−49%
 
-HUNDRED_ROUND_WINDOW_CHAIN=OPEN              not fixed here; decision needed
+HUNDRED_ROUND_WINDOW_CHAIN=OPEN              1i tried, A/B'd (§6 exp7), withdrawn — §3d
 CONTRACT_OBLIGATION_FROM_EXPLANATORY_PROSE=OPEN  §6, exp6/f2; not this closure
 
 TREATMENT_RUNS=12   GOOD=12   BREAKER_KILLS=0   CLEAN_COMPLETED_ENDINGS=5
@@ -185,12 +185,42 @@ Whether the extra rounds buy anything: of the four breaker-killed runs across
 both batches, two were GOOD when killed (exp2/f2, exp3/c1) and two were not
 (exp2/c1, exp2/f1). A lottery, not an investment.
 
-Not fixed because it is a behaviour decision, not a defect repair: the
-progress rule should probably count only *plan steps newly completed* and
-*verification newly green* after a ceiling hit, and not new files — but the
-choice of rule changes what a long, legitimately hard task is allowed to do,
-and this programme has already been burned once by a limit changed on a
-guess. Recorded as the next decision, with the numbers above.
+This was held back as a behaviour decision, not a defect repair. The
+decision was taken with the numbers above in hand, the rule was built,
+tested and A/B'd — and **withdrawn**, because the A/B showed it does not
+bound the failure it was aimed at. What was tried, and why it is not in the
+tree, is recorded here so the next attempt starts from the evidence.
+
+**The rule tried (1i).** A window that ended `TurnLimitReached` earns
+another one only if the *goal* moved — a plan step newly completed, or a
+verification newly green — and not merely because the tree grew. Pure
+function, four unit tests, the R011-F1 end-to-end test split into
+"refinement that advances the plan finishes" and "refinement that only
+rewrites the tree stops after two". The patch is kept outside the tree.
+
+**What exp7 showed (§6).** The control arm never hit a ceiling; the one
+treatment run that did, exp7/f1, ran three 100-round windows with **zero**
+close attempts and was killed by the breaker at 310 — the exact shape of
+exp2/f1. The rule was live and every window *qualified*: window 2 marked
+"trace root cause" and "confirm failing paths" completed, window 3 turned a
+check green — the agent's own `zz-scratch.test.tsx`. In 300 rounds it wrote
+no source change at all. Both of the rule's signals are satisfiable by pure
+investigation: a plan step is the model's own claim, and a green check
+counts whether it covers the fix or a probe.
+
+The rule also bounds nothing the breaker did not already bound: with the
+no-progress cap at 2, the worst case is still initial window + two
+no-progress windows = 300 rounds. Replayed against exp2/f1 it would have
+stopped at the breaker line, not before it.
+
+**What the evidence points at instead.** The two runs of this shape share
+one fact no other run has: *no `update_goal` call in 300 rounds*. A rule
+keyed on that — a ceiling window that made no close attempt earns at most
+one more — would have ended both at 200 rounds and touched none of the
+twelve runs that closed. A second candidate is to require the "newly green"
+check to cover a *source* mutation, not a scratch test. Neither is built;
+both are decisions, and this one has now been made once on a rule that
+looked right and was not.
 
 ## 4. Tests
 
@@ -205,6 +235,7 @@ guess. Recorded as the next decision, with the numbers above.
 | 1h | a check that newly covers the latest edit is progress while closing; a redundant one is still thrash | `a_verification_that_newly_covers_the_latest_edit_is_not_closeout_thrash` |
 | 1g | a piped / env-prefixed / `;`-chained verification run is named on the result; a recorded run, a non-verification pipeline and a failed run get no note | `a_piped_test_run_is_named_as_unrecorded_evidence`, `a_recorded_run_and_a_non_verification_pipeline_get_no_note`, `run_command_with_a_shell_wrapper_is_covered_too` |
 | 1g | every program in a pipeline, chain, env prefix or nested `sh -c` is named | `every_program_in_a_pipeline_chain_or_env_prefix_is_named`, `a_nested_shell_body_is_looked_into` (`leveler-execution`) |
+| 1i | withdrawn (§3d); its six tests left the tree with it | — |
 
 Every test was written red first and turned green by the change it names.
 
@@ -310,7 +341,28 @@ spent its last rounds grepping for `zod` and was force-stopped. That is a
 contract-derivation question (`completion_contract.rs`), outside this
 closure; recorded here so it is not rediscovered.
 
-### Across the three treatment batches
+### exp7 — 1i A/B: control d125402 (1a–1h), treatment adds the post-ceiling rule
+
+Three and three, in parallel, same task, tree, oracle and breaker.
+
+| run | arm | requests | close attempts | windows | GOOD |
+| --- | --- | ---: | ---: | --- | --- |
+| c1 | control | 79 | 1 | Completed:77 | PASS |
+| c2 | control | 58 | 2 | Completed:57 | PASS |
+| c3 | control | 58 | 1 | Completed:56 | PASS |
+| f1 | treatment | **310 (breaker)** | **0** | 100 · 100 · 100 · … | **FAIL** |
+| f2 | treatment | 61 | 2 | Completed:59 | PASS |
+| f3 | treatment | 63 | 2 | Completed:60 | PASS |
+
+Control 195 requests, 9.4M input tokens; treatment 434 and 22.4M, of which
+f1 alone is 310 and 16.7M. The five runs that never hit a ceiling are
+indistinguishable across arms, as they must be — the rule only reads after
+a `TurnLimitReached` window. The one run that did hit it is the run the rule
+was built for, and the rule let it through three times (§3d). At n=3 this
+is one observation; it is also the only observation the rule could have
+been judged on, and it went the wrong way. Withdrawn.
+
+### Across the treatment batches
 
 | batch | binary | requests (3 runs) | ended `Completed` | GOOD |
 | --- | --- | ---: | ---: | --- |
