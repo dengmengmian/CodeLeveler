@@ -530,9 +530,36 @@ GOAL_CONTINUATION_KEEPS_EVIDENCE=YES
 CHEAP_IMPROVEMENT_CONFIRMED=YES   on this task, this n
 CODELEVELER_IS_CHEAPER_THAN_ATOMCODE=NOT_CLAIMED
 
-NEXT_DECISION=HUNDRED_ROUND_WINDOW_CHAIN_PROGRESS_RULE
-NEXT_FINDING=CONTRACT_OBLIGATION_FROM_EXPLANATORY_PROSE
-NEW_FORMAL_TREATMENT_FROZEN=NO
+NEXT_FINDING=CONTRACT_EVIDENCE_STANDARD_REFUSES_GREEN_TREES   (C2 post-closure, exp6/f2, exp9/f2, m40)
+NEW_FORMAL_TREATMENT_FROZEN=YES   c04407b01e28, see §8
+LOCAL_INSTALL=c04407b01e28   ~/.cargo/bin/leveler, rm+cp+codesign
+```
+
+## 8. Post-closure three-way cohort
+
+The Phase C protocol re-run unchanged against the 1a–1k binary
+(`leveler 0.2.0-beta.1 (c04407b01e28)`, clean `--locked` build, registered
+as `dogfood/bin/codeleveler/c04407b01e28`). Evidence and the full table:
+`dogfood/eval/phase-c/post-closure-20260906-133550/COMPARISON.md`.
+
+| task | CodeLeveler | DSH | AtomCode |
+| --- | --- | --- | --- |
+| C1 | PASS · 125 req · 24 min | PASS | INVALID_INFRA (CodingPlan login expired, HTTP 403) |
+| C2 | PASS · 110 req · 29 min | PASS | INVALID_INFRA |
+| C3 | PASS · 203 req · 51 min | PASS | INVALID_INFRA |
+
+Mechanical oracle only — the blind human half of Phase C was not run, and
+could not be blind here. CodeLeveler 3/3 as in the formal cohort, with 438
+requests and 6205 s across the three tasks against 464 and 7741 s; the
+closure reviewers on C1 and C3 are on the books (13 and 10 rows) where the
+formal cohort's left none. C2's ending — three refusals of a green tree at
+`freshness=fresh` on the contract's evidence standard — is the open item
+above, seen once more. DSH went 2/3 → 3/3 on the same binary, which is what
+n = 1 per cell looks like. AtomCode's arm is re-runnable into the same
+cohort (`--only atomcode`) once its login is renewed.
+
+The local binary was replaced with this build after the cohort.
+
 ```
 
 Nothing here changed a limit, a prompt, or a model setting. Every fix
