@@ -473,6 +473,10 @@ impl EventBridge {
                     .events
                     .send(RuntimeEvent::CommandProgress { label, elapsed_ms });
             }
+            // Supervisor control state. Durable for recovery, not for display:
+            // the window count and the guards behind it are how the runtime
+            // decides, and the user already sees the decision.
+            EngineEvent::WindowStateUpdated { .. } => {}
             EngineEvent::ProgressUpdated { ledger } => {
                 let phase = match ledger.phase {
                     leveler_lifecycle::TurnPhase::Active => "active",

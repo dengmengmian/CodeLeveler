@@ -3476,3 +3476,138 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
          an estimate rather than blend into the audited total"
     );
 }
+
+/// A second `TaskEngine` over the same database and workspace: what a restart
+/// after a crash actually has — the durable log, and nothing else.
+fn restarted_engine(h: &Harness, responses: Vec<ModelResponse>) -> TaskEngine {
+    let workspace = Workspace::new(h.dir.path()).unwrap();
+    let tool_context = ToolContext::with_environment(
+        workspace,
+        PermissionProfile::Assisted,
+        Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )),
+    );
+    TaskEngine {
+        stores: leveler_storage::EngineStores::from_database(&h.db),
+        // The same runtime identity coming back: ownership is reclaimed, which
+        // is what a restart of this machine's daemon actually looks like.
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        factory: ExecutorFactory {
+            runtime: Arc::new(MockRuntime::new(responses)),
+            registry: Arc::new(default_registry()),
+            tool_context,
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            work_profile: leveler_agent::WorkProfile::Balanced,
+            memory_index: String::new(),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            grants_state_dir: None,
+            steering: None,
+            allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
+            completion_judge_model: None,
+            completion_judge_timeout: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+        supervisor: None,
+    }
+}
+
+/// The window-admission control state as the durable log holds it.
+async fn persisted_window_state(
+    h: &Harness,
+    session: &leveler_core::SessionId,
+) -> serde_json::Value {
+    let rows = leveler_storage::EventRepository::new(&h.db)
+        .load(session)
+        .await
+        .unwrap();
+    rows.iter()
+        .rev()
+        .find_map(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.payload).ok()?;
+            (value.get("type")?.as_str()? == "window_state_updated")
+                .then(|| value.get("payload")?.get("state").cloned())?
+        })
+        .expect("a run that opened a window records the state that admitted it")
+}
+
+/// RCP-C. The guards that decide whether another window opens survive the
+/// process that was counting them.
+///
+/// They lived in local variables inside the supervision loop, so a runtime
+/// that died mid-goal and came back handed the resumed run a clean slate: full
+/// extension quota, no-progress counter at zero, segment baseline forgotten.
+/// The guards were not merely stale after a crash — they were gone, and
+/// nothing in the recovered state said so.
+#[tokio::test]
+async fn window_admission_guards_survive_a_restart() {
+    // Two windows of two rounds over a four-round total, none of which touches
+    // a file: the convergence guard advances and the total runs out.
+    let h = harness(vec![
+        tool_call("r1", "list_files", serde_json::json!({"path": "."})),
+        tool_call("r2", "list_files", serde_json::json!({"path": "."})),
+        tool_call("r3", "list_files", serde_json::json!({"path": "."})),
+        tool_call("r4", "list_files", serde_json::json!({"path": "."})),
+        text("unused"),
+    ])
+    .await;
+    let s = spec_budgeted(&h, "investigate the layout", 2, 4);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        report.windows >= 2,
+        "the fixture must actually open a second window: {report:?}"
+    );
+    let before = persisted_window_state(&h, &session).await;
+    assert_eq!(
+        before["window_index"].as_u64(),
+        Some(u64::from(report.windows)),
+        "the log's window count must be the one the report carries: {before}"
+    );
+    assert!(
+        before["windows_without_progress"].as_u64().unwrap_or(0) > 0,
+        "windows that touched nothing must have advanced the convergence \
+         guard, or this proves nothing: {before}"
+    );
+
+    // The process dies here. A new one comes back to the same database with
+    // no memory of any of it.
+    let resumed = restarted_engine(
+        &h,
+        vec![
+            tool_call("r5", "list_files", serde_json::json!({"path": "."})),
+            tool_call("r6", "list_files", serde_json::json!({"path": "."})),
+            tool_call("r7", "list_files", serde_json::json!({"path": "."})),
+            text("unused"),
+        ],
+    );
+    resumed
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let after = persisted_window_state(&h, &session).await;
+    assert!(
+        after["windows_without_progress"].as_u64().unwrap_or(0)
+            >= before["windows_without_progress"].as_u64().unwrap_or(0),
+        "the restarted run must continue counting from what it was left, not \
+         from zero: before={before}, after={after}"
+    );
+    assert!(
+        after["window_index"].as_u64().unwrap_or(0) > before["window_index"].as_u64().unwrap_or(0),
+        "and it must know which window it is on: before={before}, after={after}"
+    );
+}

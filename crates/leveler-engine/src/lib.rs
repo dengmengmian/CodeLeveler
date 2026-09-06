@@ -19,6 +19,7 @@ mod recorders;
 mod recovery;
 mod session_context;
 mod turn;
+pub mod window;
 
 pub use engine::{
     CodingTaskSpec, RuntimeTaskSpec, TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window,

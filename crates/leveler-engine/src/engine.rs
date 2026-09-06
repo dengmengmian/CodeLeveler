@@ -244,11 +244,47 @@ pub(crate) fn round_extension_earned(
         && after.close_attempts > before.close_attempts
 }
 
-pub(crate) fn advance_no_progress_windows(current: u32, made_progress: bool) -> u32 {
-    if made_progress {
-        0
-    } else {
-        current.saturating_add(1)
+/// Write the supervisor's control state to the log, segment baseline folded
+/// in. The segment lives in a `SegmentMarks` while the loop runs and on the
+/// state when it is at rest — one fact, two shapes, joined here so nothing
+/// else has to know both.
+async fn persist_window_state(
+    log: &EventLog<'_>,
+    state: &crate::window::WindowState,
+    segment: &SegmentMarks,
+    observer: &mut (dyn FnMut(EngineEvent) + Send),
+) -> Result<(), EngineError> {
+    let mut state = *state;
+    state.segment_source_changes = segment.source_changes;
+    state.segment_close_attempts = segment.close_attempts;
+    log.append(None, EngineEvent::WindowStateUpdated { state }, observer)
+        .await
+}
+
+/// The supervisor's control state as the log last recorded it, or a clean
+/// slate when the session has none.
+pub(crate) async fn last_persisted_window_state(
+    events: &dyn leveler_storage::EventStore,
+    session_id: &SessionId,
+) -> crate::window::WindowState {
+    match events
+        .load_last_by_type(session_id, "window_state_updated", None)
+        .await
+    {
+        Ok(Some(row)) => match EngineEvent::from_payload(&row.payload) {
+            Ok(EngineEvent::WindowStateUpdated { state }) => state,
+            // An unreadable row must not be read as "no guards were ever
+            // spent" — but there is nothing better to offer, so say so.
+            _ => {
+                tracing::warn!("window state row could not be read; guards restart clean");
+                crate::window::WindowState::default()
+            }
+        },
+        Ok(None) => crate::window::WindowState::default(),
+        Err(error) => {
+            tracing::warn!(%error, "window state could not be loaded; guards restart clean");
+            crate::window::WindowState::default()
+        }
     }
 }
 
@@ -1549,6 +1585,10 @@ impl TaskEngine {
                 runner,
                 spec,
                 recorded.outcome,
+                // Continuing an interrupted invocation: the guards it had already
+                // spent are the guards it still has.
+                last_persisted_window_state(runner.stores.events.as_ref(), &runner.session_id)
+                    .await,
                 observer,
                 cancellation.clone(),
             )
@@ -1602,6 +1642,11 @@ impl TaskEngine {
                 runner,
                 spec,
                 recorded.outcome,
+                // A fresh invocation of the goal is a fresh mandate: the user asked
+                // again, so the convergence guards and the extension quota start
+                // clean. What carries across invocations is the goal record's window
+                // count and the progress ledger's spend, which have their own homes.
+                crate::window::WindowState::default(),
                 observer,
                 cancellation.clone(),
             )
@@ -1678,42 +1723,70 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         mut outcome: leveler_agent::AgentOutcome,
+        // The control state this invocation continues from. A fresh run starts
+        // clean; a resume hands in what the log last recorded, so a crash
+        // inside a goal cannot give the recovered run a full quota of
+        // extensions and a no-progress counter back at zero.
+        mut state: crate::window::WindowState,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<(leveler_agent::AgentOutcome, u32), EngineError> {
         let policy = self.supervisor_policy();
-        let mut extensions = 0u32;
         let mut limits = spec.runtime.limits;
         // Engine-paced round budget: the task total the windows below spend,
         // grown only by `round_extension_earned`. Caller-pinned budgets
         // (`round_budget: None`) never change.
+        // The task total this invocation is spending. Derived, not stored: it
+        // is the configured base grown by the round extensions the state
+        // already records, so a resume does not start growing it again from
+        // the base it was originally given.
         let mut round_budget = spec.runtime.continuation;
-        let mut round_extensions = 0u32;
-        let mut segment = match crate::turn::last_persisted_ledger(
-            runner.stores.events.as_ref(),
-            &runner.session_id,
-        )
-        .await
+        if let (Some(budget), Some(base)) = (spec.runtime.round_budget, round_budget.round_limit())
+            && state.round_extensions > 0
         {
-            Ok(Some(ledger)) => segment_marks(&ledger),
-            _ => SegmentMarks::default(),
+            round_budget = ContinuationPolicy::bounded(
+                base.saturating_add(budget.extension.saturating_mul(state.round_extensions)),
+            );
+        }
+        // The segment baseline a round extension is judged against. A resumed
+        // invocation keeps the one it was using; only a first window reads the
+        // ledger for it.
+        let mut segment = if state.window_index > 0 {
+            SegmentMarks {
+                source_changes: state.segment_source_changes,
+                close_attempts: state.segment_close_attempts,
+            }
+        } else {
+            match crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            {
+                Ok(Some(ledger)) => segment_marks(&ledger),
+                _ => SegmentMarks::default(),
+            }
         };
-        // Goal-invocation-scoped, in-memory (not persisted): how many windows in
-        // a row have produced no effective work. Bounds multi-window
-        // continuation so a stuck goal converges without a durable window ledger.
-        let mut windows_without_progress = 0u32;
-        // Windows this invocation opened, the initial drive included. The
-        // durable goal ledger's only source for `windows_run`.
-        let mut windows_run = 1u32;
-        let mut progress_mark = outcome.modified_files.len();
+        // The initial drive is this invocation's first window.
+        state.open_window();
+        let mut progress_mark = outcome.modified_files.len().max(state.progress_files_mark);
         // R011-F1: the file-set mark alone starved refinement windows (fixing
         // files already written read as no progress and killed the goal). The
         // persisted evidence ledger carries two more window-grained signals:
         // total mutation OPERATIONS (re-edits included) and whether a green
         // verification now covers the latest mutations. Loaded per window —
         // windows are rare, so the full-log scan is affordable here.
-        let (mut ops_mark, mut fresh_verify_mark) =
+        let (ops_seen, fresh_seen) =
             evidence_progress_marks(runner.stores.events.as_ref(), &runner.session_id).await;
+        // A resumed invocation keeps the baselines it had; a fresh one reads
+        // them off the ledger. Taking the larger of the two can only
+        // under-credit progress, never invent it.
+        let mut ops_mark = ops_seen.max(state.progress_ops_mark);
+        let mut fresh_verify_mark = fresh_seen || state.progress_fresh_verify_mark;
+        // Publish the opening state before any window can be admitted on it:
+        // a crash between here and the first boundary must still find a record
+        // saying this invocation had begun.
+        persist_window_state(log, &state, &segment, observer).await?;
 
         for _ in 0..MAX_SUPERVISED_TURNS {
             if cancellation.is_cancelled() {
@@ -1725,9 +1798,9 @@ impl TaskEngine {
                 progress: &outcome.progress,
                 budget_exhaustion: outcome.budget_exhaustion.as_ref(),
                 modified_files: &outcome.modified_files,
-                extensions_granted: extensions,
+                extensions_granted: state.budget_extensions,
                 round_budget,
-                windows_without_progress,
+                windows_without_progress: state.windows_without_progress,
                 engine_paced: spec.runtime.round_budget.is_some(),
             });
             // The task total ran out. A segment that landed a source change
@@ -1754,15 +1827,15 @@ impl TaskEngine {
                     Ok(Some(ledger)) => segment_marks(&ledger),
                     _ => segment,
                 };
-                if round_extension_earned(segment, now, round_extensions, budget) {
-                    round_extensions = round_extensions.saturating_add(1);
+                if round_extension_earned(segment, now, state.round_extensions, budget) {
+                    state.round_extensions = state.round_extensions.saturating_add(1);
                     round_budget =
                         ContinuationPolicy::bounded(total.saturating_add(budget.extension));
                     segment = now;
                     observer(EngineEvent::AdvisoryStarted {
                         kind: format!(
                             "round_budget_extension:{}/{}:+{}",
-                            round_extensions, budget.max_extensions, budget.extension
+                            state.round_extensions, budget.max_extensions, budget.extension
                         ),
                     });
                     decision = crate::Continuation::DriveGoalAgain;
@@ -1802,12 +1875,12 @@ impl TaskEngine {
                     .await?
                 }
                 crate::Continuation::ExtendBudget(exhaustion) => {
-                    extensions = extensions.saturating_add(1);
+                    state.budget_extensions = state.budget_extensions.saturating_add(1);
                     limits = crate::continuation::extended_limits(limits, &exhaustion);
                     observer(EngineEvent::AdvisoryStarted {
                         kind: format!(
                             "budget_extension:{}/{}:{}",
-                            extensions,
+                            state.budget_extensions,
                             crate::MAX_EXTENSIONS,
                             exhaustion.dimension.as_str()
                         ),
@@ -1823,7 +1896,7 @@ impl TaskEngine {
                 }
             };
             merge_continued_outcome(&mut outcome, continued);
-            windows_run = windows_run.saturating_add(1);
+            state.open_window();
             // Effective work this window, from three independent signals:
             //   1. the modified-file set grew (first-touch writes),
             //   2. mutation OPERATIONS advanced — refinement of files already
@@ -1840,10 +1913,16 @@ impl TaskEngine {
             progress_mark = outcome.modified_files.len();
             ops_mark = ops_mark.max(ops_now);
             fresh_verify_mark = fresh_now;
-            windows_without_progress =
-                advance_no_progress_windows(windows_without_progress, made_progress);
+            state.note_window_progress(made_progress);
+            state.progress_files_mark = progress_mark;
+            state.progress_ops_mark = ops_mark;
+            state.progress_fresh_verify_mark = fresh_verify_mark;
+            // Durable at every window boundary, not only at the end: the
+            // boundary is exactly where a killed process leaves the guards
+            // that decide whether the next window may open.
+            persist_window_state(log, &state, &segment, observer).await?;
         }
-        Ok((outcome, windows_run))
+        Ok((outcome, state.window_index))
     }
 
     /// Mechanism for [`crate::Continuation::DriveGoalAgain`]: restate the
@@ -2925,7 +3004,7 @@ mod continue_cap_tests {
     }
 
     // M-2 — the multi-window loop is hard-bounded. These drive the SAME policy
-    // (`after_turn`) and the SAME counter rule (`advance_no_progress_windows`)
+    // (`after_turn`) and the SAME counter rule (`WindowState::note_window_progress`)
     // that `supervise()` uses, in the same order, so the termination guarantee is
     // exercised deterministically without a live model.
     fn goal_ended(
@@ -2955,19 +3034,19 @@ mod continue_cap_tests {
             closing: false,
             ..Default::default()
         };
-        let mut wwp = 0u32;
+        let mut guard = crate::window::WindowState::default();
         let mut windows_opened = 0u32;
         let mut stopped = false;
         // Every window hits the ceiling and grows no files (no material progress).
         for _ in 0..MAX_SUPERVISED_TURNS {
-            match policy.after_turn(&goal_ended(&progress, wwp)) {
+            match policy.after_turn(&goal_ended(&progress, guard.windows_without_progress)) {
                 crate::Continuation::Stop => {
                     stopped = true;
                     break;
                 }
                 _ => {
                     windows_opened += 1;
-                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ false);
+                    guard.note_window_progress(/*made_progress*/ false);
                 }
             }
         }
@@ -2990,16 +3069,16 @@ mod continue_cap_tests {
             closing: false,
             ..Default::default()
         };
-        let mut wwp = 0u32;
+        let mut guard = crate::window::WindowState::default();
         let mut windows_opened = 0u32;
         // Every window makes progress (counter resets), so the no-progress cap
         // never fires — only the absolute MAX_SUPERVISED_TURNS bounds the loop.
         for _ in 0..MAX_SUPERVISED_TURNS {
-            match policy.after_turn(&goal_ended(&progress, wwp)) {
+            match policy.after_turn(&goal_ended(&progress, guard.windows_without_progress)) {
                 crate::Continuation::Stop => break,
                 _ => {
                     windows_opened += 1;
-                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ true);
+                    guard.note_window_progress(/*made_progress*/ true);
                 }
             }
         }
@@ -3038,7 +3117,7 @@ mod continue_cap_tests {
     fn settlement_debt_windows_consume_the_pinned_total_and_terminate() {
         // Deterministic simulation of the supervise loop for the accident
         // shape: SAME policy decision (`after_turn`), SAME counter rule
-        // (`advance_no_progress_windows`), SAME engine clamp
+        // (`WindowState::note_window_progress`), SAME engine clamp
         // (`continuation_for_next_window`) — a goal whose every window ceilings
         // with unconsumed settlement debt spends the 280 total exactly, never
         // more, across clamped windows (100-round local ceiling per window).
@@ -3048,7 +3127,7 @@ mod continue_cap_tests {
         const LOCAL_WINDOW: u32 = 100;
         let policy = crate::DefaultSupervisorPolicy::default();
         let mut spent = LOCAL_WINDOW; // window 1 hit the local ceiling
-        let mut wwp = 0u32;
+        let mut guard = crate::window::WindowState::default();
         let mut windows_opened = 0u32;
         for _ in 0..MAX_SUPERVISED_TURNS {
             let progress = ProgressLedger {
@@ -3058,7 +3137,7 @@ mod continue_cap_tests {
                 unconsumed_child_settlements: 1,
                 ..Default::default()
             };
-            let mut ended = goal_ended(&progress, wwp);
+            let mut ended = goal_ended(&progress, guard.windows_without_progress);
             ended.round_budget = ContinuationPolicy::bounded(TOTAL);
             match policy.after_turn(&ended) {
                 crate::Continuation::Stop => break,
@@ -3075,7 +3154,7 @@ mod continue_cap_tests {
                     windows_opened += 1;
                     spent += window;
                     // Integration windows move the workspace in this shape.
-                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ true);
+                    guard.note_window_progress(/*made_progress*/ true);
                 }
                 other => panic!("unexpected continuation {other:?}"),
             }

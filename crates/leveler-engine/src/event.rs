@@ -320,6 +320,12 @@ pub enum EngineEvent {
     ProgressUpdated {
         ledger: leveler_lifecycle::ProgressLedger,
     },
+    /// The supervisor's window-admission control state, as it stands after the
+    /// window that just ended. Durable so a crash inside a goal invocation
+    /// cannot hand the resumed run a clean slate of guards.
+    WindowStateUpdated {
+        state: crate::window::WindowState,
+    },
     /// Exact messages the next request will use. Unlike the raw transcript,
     /// this includes compaction and transient continuation nudges.
     ContextSnapshot {
@@ -590,6 +596,7 @@ impl EngineEvent {
             | EngineEvent::AcceptanceEvidence { .. }
             | EngineEvent::PhaseChanged { .. }
             | EngineEvent::ProgressUpdated { .. }
+            | EngineEvent::WindowStateUpdated { .. }
             | EngineEvent::ContextReady { .. }
             | EngineEvent::NodeStarted { .. }
             | EngineEvent::NodeFinished { .. }
@@ -760,6 +767,9 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            // Local control state. It says nothing a remote peer needs and
+            // deny-by-default is the right answer for it.
+            | EngineEvent::WindowStateUpdated { .. }
             | EngineEvent::GoalCheckpointCreated { .. }
             | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
