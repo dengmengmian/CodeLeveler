@@ -3290,3 +3290,59 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
         "the reviewer's {reviewer_rows} round(s) must be in the session's cumulative rounds: before={before} after={after}"
     );
 }
+
+/// THE safety half of the authority-yield change. A behavioural obligation the
+/// contract gave no proof standard is not a reason to send the agent back to
+/// work — but it is still debt, and debt still withholds the verified claim.
+///
+/// post-closure C2 is the run this pins: judge satisfied, tree green, the only
+/// open obligation one the runtime admits it has no standard for. The claim is
+/// now accepted; the task must still end CompletedUnverified.
+#[tokio::test]
+async fn a_behaviour_with_no_proof_standard_is_accepted_but_never_verified() {
+    let script = vec![
+        patch_call("c1", "src/feature.rs", "pub fn feature() {}"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "the nested field now submits a defined value"}),
+        ),
+        understand_met_required_ac(),
+    ];
+    let mut h = harness(script.clone()).await;
+    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
+        script,
+        // A bug report: how the thing must behave. No command named, no
+        // coverage asked for — so the derivation gives it no proof standard.
+        r#"{"requirements":[{"text":"a nested field under a null parent submits a defined value","kind":"behavior"}]}"#,
+        // The judge reads it as satisfied and cites the check that ran.
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"the suite is green"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"the suite is green over the change","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
+    ));
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("a ledger was persisted");
+    assert!(
+        ledger.runtime_evidence_complete,
+        "the contract was asked at the commit point"
+    );
+    let debt = ledger
+        .completion_debt()
+        .expect("an obligation with no proof standard is still owed");
+    assert!(
+        debt.contains("no proof standard"),
+        "the debt must name why it can never be discharged: {debt}"
+    );
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::CompletedUnverified,
+        "a behaviour read as satisfied with no standard behind it is not Verified"
+    );
+}

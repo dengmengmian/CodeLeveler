@@ -115,6 +115,7 @@ impl EvidenceLedger {
     /// Advances the freshness sequence even when no path is new, so a
     /// verification recorded before this call is no longer current after it.
     pub fn note_mutation_op(&mut self) {
+        self.note_tree_moved();
         self.total_mutation_ops = self.total_mutation_ops.saturating_add(1);
         self.next_seq = self.next_seq.saturating_add(1);
         self.last_mutation_op_seq = self.next_seq;
@@ -136,6 +137,7 @@ impl EvidenceLedger {
         tool: impl Into<String>,
         paths: Vec<String>,
     ) {
+        self.note_tree_moved();
         self.next_seq = self.next_seq.saturating_add(1);
         self.mutations.push(MutationRecord {
             seq: self.next_seq,
@@ -143,6 +145,15 @@ impl EvidenceLedger {
             tool: tool.into(),
             paths,
         });
+    }
+
+    /// The tree just changed, so the verification plan's observations no
+    /// longer describe it: the next completion claim is a REQUEST again, not a
+    /// COMMIT. Only ever setting this flag left every claim after the first
+    /// verification cycle judged at the commit standard, which for an
+    /// obligation with no proof standard can never be met.
+    fn note_tree_moved(&mut self) {
+        self.runtime_evidence_complete = false;
     }
 
     pub fn record_verify(
@@ -1057,5 +1068,50 @@ mod terminal_truth_matrix {
         );
         l.record_verify("v1", "go\u{1f}test", 0);
         assert_eq!(l.completion_debt(), None);
+    }
+}
+
+#[cfg(test)]
+mod request_point_tests {
+    use super::*;
+
+    /// `runtime_evidence_complete` says the verification plan's observations
+    /// are on the ledger FOR THIS TREE. It was only ever set, never cleared,
+    /// so after the first verification cycle every later in-loop completion
+    /// claim was judged at the commit standard — post-closure C2 edited more
+    /// files in a second window and was refused three times for an obligation
+    /// that, at the request point, had nothing to prove yet.
+    #[test]
+    fn a_mutation_after_the_verification_plan_reopens_the_request_point() {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
+        l.runtime_evidence_complete = true;
+        l.record_mutation("c2", "apply_patch", vec!["src/b.ts".into()]);
+        assert!(
+            !l.runtime_evidence_complete,
+            "the plan has not observed the tree this mutation just made"
+        );
+    }
+
+    /// A re-edit of a path already on record is the same fact (R011-F1): the
+    /// tree moved, so the plan's observations no longer describe it.
+    #[test]
+    fn a_re_edit_also_reopens_the_request_point() {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
+        l.runtime_evidence_complete = true;
+        l.note_mutation_op();
+        assert!(!l.runtime_evidence_complete);
+    }
+
+    /// A verification does not reopen it: observing the tree is what the flag
+    /// is about, and the engine sets it once the plan has run.
+    #[test]
+    fn recording_a_check_does_not_reopen_the_request_point() {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
+        l.runtime_evidence_complete = true;
+        l.record_verify("v1", "jest", 0);
+        assert!(l.runtime_evidence_complete);
     }
 }

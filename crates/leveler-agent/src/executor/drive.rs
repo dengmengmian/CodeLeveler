@@ -1990,12 +1990,26 @@ impl Executor {
                             // point does not judge these, which is what keeps
                             // the floor from making completion unreachable.
                             let mut rejected_ungrounded_behavior = 0usize;
-                            let open_obligations: Vec<String> = match completion_contract.as_ref() {
-                                None => vec![
-                                    "the completion contract could not be established, so no \
-                                     obligation could be checked"
-                                        .to_string(),
-                                ],
+                            type OpenObligation = (String, String, leveler_lifecycle::OpenReason);
+                            let (open_obligations, open_reasons): (
+                                Vec<String>,
+                                Vec<OpenObligation>,
+                            ) = match completion_contract.as_ref() {
+                                None => (
+                                    vec![
+                                        "the completion contract could not be established, so no \
+                                         obligation could be checked"
+                                            .to_string(),
+                                    ],
+                                    // Not knowing what is owed is not the same
+                                    // as knowing nothing is owed: refuse.
+                                    vec![(
+                                        "(contract)".to_string(),
+                                        "the completion contract could not be established"
+                                            .to_string(),
+                                        leveler_lifecycle::OpenReason::NotAccountedFor,
+                                    )],
+                                ),
                                 Some(contract) => {
                                     let mut accounted = contract.clone();
                                     let apply =
@@ -2063,7 +2077,8 @@ impl Executor {
                                         }
                                     }
                                     let listed: Vec<String> = open
-                                        .into_iter()
+                                        .iter()
+                                        .cloned()
                                         .map(|(id, text, why)| {
                                             let why = match why {
                                                 leveler_lifecycle::OpenReason::NotAccountedFor => {
@@ -2090,7 +2105,7 @@ impl Executor {
                                     observer(AgentEvent::EvidenceLedgerUpdated {
                                         ledger: ledger.clone(),
                                     });
-                                    listed
+                                    (listed, open)
                                 }
                             };
                             // A requirement the contract never captured is the
@@ -2116,10 +2131,11 @@ impl Executor {
                                 omitted = omitted.len(),
                                 "completion contract gate"
                             );
-                            if !outcome.allows_completion()
-                                || !open_obligations.is_empty()
-                                || !omitted.is_empty()
-                            {
+                            if completion_claim_refused(
+                                outcome.allows_completion(),
+                                &open_reasons,
+                                &omitted,
+                            ) {
                                 let mut detail = format!("verdict={:?}", outcome.verdict);
                                 if !open_obligations.is_empty() {
                                     detail.push_str(&format!(
@@ -4576,6 +4592,27 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
     Some(cmd.map_or_else(|| call.name.clone(), str::to_string))
 }
 
+/// Whether a completion claim must be refused, given what the judge said and
+/// what the contract still owes.
+///
+/// The refusal is an instruction to the agent: finish these and claim again.
+/// An obligation the runtime admits it has no standard for is not something
+/// the agent can finish — see
+/// [`leveler_lifecycle::OpenReason::dischargeable_by_more_work`]. It stays on
+/// the ledger and still withholds the verified claim at the terminal
+/// boundary; it is not a reason to send the agent back to work.
+pub(crate) fn completion_claim_refused(
+    judge_allows_completion: bool,
+    open: &[(String, String, leveler_lifecycle::OpenReason)],
+    omitted: &[String],
+) -> bool {
+    !judge_allows_completion
+        || open
+            .iter()
+            .any(|(_, _, why)| why.dischargeable_by_more_work())
+        || !omitted.is_empty()
+}
+
 /// Epoch + this-drive distinct modified paths (source of truth for residual).
 fn epoch_modified_paths(
     progress: &leveler_lifecycle::ProgressLedger,
@@ -4817,5 +4854,66 @@ mod residual_budget_tests {
             None,
             "re-edit of counted path must be allowed at residual 0 new"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_claim_tests {
+    use super::completion_claim_refused;
+    use leveler_lifecycle::OpenReason;
+
+    fn open(why: OpenReason) -> (String, String, OpenReason) {
+        (
+            "R1".into(),
+            "a nested field submits a defined value".into(),
+            why,
+        )
+    }
+
+    /// post-closure C2: the judge said satisfied, the tree passes the frozen
+    /// oracle, and the only open obligation is one the runtime has no proof
+    /// standard for. Refusing here told the agent to go run the check green —
+    /// it already had, three times — and the turn ended in a forced closeout.
+    #[test]
+    fn an_obligation_with_no_proof_standard_does_not_refuse_the_claim() {
+        assert!(!completion_claim_refused(
+            true,
+            &[open(OpenReason::MissingAuthoritativeProof)],
+            &[],
+        ));
+    }
+
+    /// Everything the agent CAN act on still refuses, alone or beside it.
+    #[test]
+    fn an_actionable_obligation_still_refuses_the_claim() {
+        for why in [
+            OpenReason::NotAccountedFor,
+            OpenReason::MissingMechanicalEvidence,
+            OpenReason::MechanicalConstraintViolation,
+            OpenReason::Blocked,
+        ] {
+            assert!(completion_claim_refused(true, &[open(why)], &[]), "{why:?}");
+            assert!(
+                completion_claim_refused(
+                    true,
+                    &[open(OpenReason::MissingAuthoritativeProof), open(why)],
+                    &[],
+                ),
+                "mixed with an impossible one, the actionable one still governs: {why:?}"
+            );
+        }
+    }
+
+    /// The other two refusal grounds are untouched: a judge that did not allow
+    /// completion, and a requirement the contract never captured.
+    #[test]
+    fn a_refusing_judge_or_an_omitted_requirement_still_refuses() {
+        assert!(completion_claim_refused(false, &[], &[]));
+        assert!(completion_claim_refused(
+            true,
+            &[open(OpenReason::MissingAuthoritativeProof)],
+            &["re-run the failing checks".to_string()],
+        ));
+        assert!(!completion_claim_refused(true, &[], &[]));
     }
 }

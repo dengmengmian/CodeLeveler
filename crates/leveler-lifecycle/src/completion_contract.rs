@@ -423,6 +423,25 @@ impl CompletionContract {
     }
 }
 
+impl OpenReason {
+    /// Whether the agent doing more work could discharge this.
+    ///
+    /// [`Self::MissingAuthoritativeProof`] cannot be: it says there was never
+    /// a standard to meet, so no check, however green, can settle it. Refusing
+    /// a completion claim on it asks for proof that does not exist and cannot
+    /// be produced — post-closure C2 answered that demand with three more
+    /// green jest runs, was refused three times for the same reason, and ended
+    /// in a forced closeout over a tree that passes the frozen oracle.
+    ///
+    /// The debt itself is NOT waived: `completion_debt()` still reports it and
+    /// the terminal boundary still refuses to call the task verified. This
+    /// separates withholding the claim (right) from demanding work that cannot
+    /// change the answer (wrong).
+    pub fn dischargeable_by_more_work(self) -> bool {
+        !matches!(self, OpenReason::MissingAuthoritativeProof)
+    }
+}
+
 /// Why one obligation — objective or condition — is still open.
 fn open_reason_for(
     kind: RequirementKind,
@@ -2120,5 +2139,95 @@ mod mutation_scope_tests {
             round.open_detail(&run07_mutations())[0].2,
             OpenReason::MechanicalConstraintViolation
         );
+    }
+}
+
+#[cfg(test)]
+mod authority_yield_tests {
+    use super::*;
+    use crate::EvidenceLedger;
+
+    fn behaviour_satisfied_with_no_standard() -> CompletionContract {
+        CompletionContract::new(vec![CompletionRequirement {
+            id: "R1".into(),
+            text: "a nested field under a null parent submits a defined value".into(),
+            kind: RequirementKind::Behavior,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: None,
+            evidence: vec![RequirementEvidence {
+                strength: EvidenceStrength::Semantic,
+                detail: "the suite passes".into(),
+                refs: vec!["v-jest".into()],
+            }],
+            acceptance_facets: Vec::new(),
+        }])
+    }
+
+    /// The C2 ledger: an edit, a green check that covers it, the verification
+    /// plan已 run. The obligation is open because it never had a standard —
+    /// and no further green check can change that.
+    fn c2_shaped_ledger() -> EvidenceLedger {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation(
+            "c-edit",
+            "apply_patch",
+            vec!["src/logic/createFormControl.ts".into()],
+        );
+        l.record_verify("v-jest", "jest", 0);
+        l.runtime_evidence_complete = true;
+        l
+    }
+
+    #[test]
+    fn an_obligation_with_no_proof_standard_cannot_be_discharged_by_more_work() {
+        let contract = behaviour_satisfied_with_no_standard();
+        let ledger = c2_shaped_ledger();
+        let open = contract.open_obligations(&ledger);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].1, OpenReason::MissingAuthoritativeProof);
+        assert!(
+            !open[0].1.dischargeable_by_more_work(),
+            "there is no standard to meet; asking for one more check is an impossible demand"
+        );
+        // Another green check over the same tree changes nothing.
+        let mut more = ledger.clone();
+        more.record_verify("v-jest-again", "jest --coverage", 0);
+        let open = more_open(&contract, &more);
+        assert_eq!(open, vec![OpenReason::MissingAuthoritativeProof]);
+    }
+
+    fn more_open(c: &CompletionContract, l: &EvidenceLedger) -> Vec<OpenReason> {
+        c.open_obligations(l)
+            .into_iter()
+            .map(|(_, why)| why)
+            .collect()
+    }
+
+    /// The safety half, pinned: not demanding work is not the same as waiving
+    /// the debt. The ledger still owes, so the terminal boundary still refuses
+    /// to call this verified.
+    #[test]
+    fn an_impossible_obligation_still_withholds_the_verified_claim() {
+        let mut ledger = c2_shaped_ledger();
+        ledger.completion_contract = Some(behaviour_satisfied_with_no_standard());
+        let debt = ledger
+            .completion_debt()
+            .expect("an obligation with no proof standard is still debt");
+        assert!(debt.contains("no proof standard"), "{debt}");
+    }
+
+    /// Every other reason names something the agent can act on, and must keep
+    /// refusing the claim.
+    #[test]
+    fn every_other_open_reason_is_actionable() {
+        for why in [
+            OpenReason::NotAccountedFor,
+            OpenReason::MissingMechanicalEvidence,
+            OpenReason::MechanicalConstraintViolation,
+            OpenReason::Blocked,
+        ] {
+            assert!(why.dischargeable_by_more_work(), "{why:?}");
+        }
     }
 }
