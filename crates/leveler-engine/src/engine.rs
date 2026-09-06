@@ -470,6 +470,14 @@ pub struct TaskReport {
     /// The executor's concrete reason for a non-success stop, when available.
     pub stop_detail: Option<String>,
     pub rounds: u32,
+    /// Work windows this invocation opened for the goal, the first drive
+    /// included. At least 1 for any run that started.
+    ///
+    /// The supervisor's continuation loop is the only thing that knows this,
+    /// and until it was reported the durable `goals.windows_run` had no writer
+    /// at all — the column read zero for a goal that had just spent two full
+    /// windows on the problem.
+    pub windows: u32,
     /// Legacy review findings (unused; kept for report shape stability).
     pub review: Option<Vec<String>>,
 }
@@ -494,6 +502,9 @@ impl TaskReport {
             stop_reason,
             stop_detail: None,
             rounds,
+            // One window unless the supervisor says otherwise: a report is
+            // built from a drive that ran.
+            windows: 1,
             review: None,
         }
     }
@@ -1532,7 +1543,7 @@ impl TaskEngine {
                 cancellation.clone(),
             )
             .await?;
-        let outcome = self
+        let (outcome, windows) = self
             .supervise(
                 log,
                 runner,
@@ -1542,8 +1553,12 @@ impl TaskEngine {
                 cancellation.clone(),
             )
             .await?;
-        self.conclude_direct(log, runner, spec, outcome, observer, cancellation)
-            .await
+        // Stamped once, here: `conclude_direct` reaches a report through
+        // several paths and none of them can see the supervisor's loop.
+        let report = self
+            .conclude_direct(log, runner, spec, outcome, observer, cancellation)
+            .await?;
+        Ok(TaskReport { windows, ..report })
     }
 
     /// The direct strategy: one goal turn, then verify + bounded repair.
@@ -1581,7 +1596,7 @@ impl TaskEngine {
             .await?;
         // Epoch spend lives on ProgressLedger inside the drive (seeded across
         // continue/resume). Do not re-accumulate here — that would double-count.
-        let outcome = self
+        let (outcome, windows) = self
             .supervise(
                 log,
                 runner,
@@ -1591,8 +1606,12 @@ impl TaskEngine {
                 cancellation.clone(),
             )
             .await?;
-        self.conclude_direct(log, runner, spec, outcome, observer, cancellation)
-            .await
+        // Stamped once, here: `conclude_direct` reaches a report through
+        // several paths and none of them can see the supervisor's loop.
+        let report = self
+            .conclude_direct(log, runner, spec, outcome, observer, cancellation)
+            .await?;
+        Ok(TaskReport { windows, ..report })
     }
 
     /// Load session messages (prefer snapshot), bound length for Goal injection.
@@ -1661,7 +1680,7 @@ impl TaskEngine {
         mut outcome: leveler_agent::AgentOutcome,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
-    ) -> Result<leveler_agent::AgentOutcome, EngineError> {
+    ) -> Result<(leveler_agent::AgentOutcome, u32), EngineError> {
         let policy = self.supervisor_policy();
         let mut extensions = 0u32;
         let mut limits = spec.runtime.limits;
@@ -1683,6 +1702,9 @@ impl TaskEngine {
         // a row have produced no effective work. Bounds multi-window
         // continuation so a stuck goal converges without a durable window ledger.
         let mut windows_without_progress = 0u32;
+        // Windows this invocation opened, the initial drive included. The
+        // durable goal ledger's only source for `windows_run`.
+        let mut windows_run = 1u32;
         let mut progress_mark = outcome.modified_files.len();
         // R011-F1: the file-set mark alone starved refinement windows (fixing
         // files already written read as no progress and killed the goal). The
@@ -1801,6 +1823,7 @@ impl TaskEngine {
                 }
             };
             merge_continued_outcome(&mut outcome, continued);
+            windows_run = windows_run.saturating_add(1);
             // Effective work this window, from three independent signals:
             //   1. the modified-file set grew (first-touch writes),
             //   2. mutation OPERATIONS advanced — refinement of files already
@@ -1820,7 +1843,7 @@ impl TaskEngine {
             windows_without_progress =
                 advance_no_progress_windows(windows_without_progress, made_progress);
         }
-        Ok(outcome)
+        Ok((outcome, windows_run))
     }
 
     /// Mechanism for [`crate::Continuation::DriveGoalAgain`]: restate the
@@ -3168,6 +3191,7 @@ mod continue_cap_tests {
             stop_reason: leveler_agent::StopReason::Incomplete,
             stop_detail: None,
             rounds: 1,
+            windows: 1,
             review: None,
         };
         let (status, _) = terminal_status_for(&report);
@@ -3181,6 +3205,7 @@ mod continue_cap_tests {
             verification: None,
             stop_detail: None,
             rounds: 1,
+            windows: 1,
             review: None,
         };
         let (status, _) = terminal_status_for(&clean);

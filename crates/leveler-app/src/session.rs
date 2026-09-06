@@ -624,11 +624,15 @@ impl Application {
         // that work was owed.
         let goal_record = self.open_goal_record(session_id, goal).await;
         let result = engine.run(session_id, &spec, observer, cancellation).await;
-        // The goal stops owing work when its driving run reaches a terminal
-        // state, including an error: a run that failed is finished, not owed.
-        // Only a process that never got here leaves the goal `running`, which
-        // is exactly the signal P2 reports.
-        self.settle_goal_record(goal_record).await;
+        // The engine already decided what this run means; this reads its
+        // answer rather than inferring one from "the call returned". A goal
+        // whose run stopped at its round budget still owes work, and the whole
+        // reason the goal ledger exists is so that fact survives the process.
+        self.record_goal_windows(goal_record.as_ref(), &result)
+            .await;
+        if goal_owes_no_more_work(&result) {
+            self.settle_goal_record(goal_record).await;
+        }
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -650,11 +654,51 @@ impl Application {
         let task = leveler_storage::TaskStore::ensure_for_session(&db, session_id, now)
             .await
             .ok()?;
+        // An objective this task still owes IS this objective: continuing it is
+        // what resuming means. Opening a second record for the same intent
+        // splits one goal across two — the windows spent on it land half in
+        // each, and the record the earlier invocation left owed stays owed
+        // forever because nothing will ever settle it again.
+        if let Ok(existing) = leveler_storage::GoalStore::for_task(&db, &task).await
+            && let Some(owed) = existing.into_iter().find(|goal| {
+                goal.state == leveler_storage::GoalState::Running && goal.objective == objective
+            })
+        {
+            return Some(owed.id);
+        }
         match leveler_storage::GoalStore::open(&db, &task, objective, now).await {
             Ok(id) => Some(id),
             Err(error) => {
                 tracing::warn!(%error, "could not record goal identity; the goal still runs");
                 None
+            }
+        }
+    }
+
+    /// Record the work windows this invocation spent on the goal.
+    ///
+    /// Best-effort, like every other line of goal bookkeeping: a window that
+    /// cannot be written down must not fail the run that ran it. The store
+    /// counts calls, so a resumed goal accumulates across processes — which is
+    /// the only way a count of windows can outlive the windows.
+    async fn record_goal_windows(
+        &self,
+        goal: Option<&leveler_core::GoalId>,
+        result: &Result<leveler_engine::TaskReport, leveler_engine::EngineError>,
+    ) {
+        let Some(goal) = goal else { return };
+        // A run that never produced a report still opened one window. Saying
+        // "no windows" about a goal that just spent real model calls would be
+        // a worse lie than an approximate count.
+        let windows = result.as_ref().map(|r| r.windows).unwrap_or(1);
+        let Ok(db) = self.open_database().await else {
+            tracing::warn!("could not record goal windows: database unavailable");
+            return;
+        };
+        for _ in 0..windows {
+            if let Err(error) = leveler_storage::GoalStore::note_window(&db, goal).await {
+                tracing::warn!(%error, "could not record a goal work window");
+                break;
             }
         }
     }
@@ -908,6 +952,7 @@ mod tests {
             stop_reason,
             stop_detail: None,
             rounds: 1,
+            windows: 1,
             review: None,
         }
     }
@@ -1196,5 +1241,91 @@ mod tests {
         let out =
             report_to_result(report(TaskOutcome::Verified, StopReason::Answered, &[])).unwrap();
         assert_eq!(out.stop_reason, StopReason::Answered);
+    }
+}
+
+/// Does this run's terminal truth mean the goal owes no further work?
+///
+/// The engine produces a structured verdict for every run and uses it itself —
+/// to decide whether to reap the task, and which kind of checkpoint to cut.
+/// The durable goal record has to read the same verdict. It used to be settled
+/// unconditionally the moment `engine.run` returned, which made "the function
+/// came back" the settlement authority and quietly closed the books on the one
+/// case the record exists for: a goal stopped at a resource boundary with work
+/// still owed.
+///
+/// Deliberately NOT "anything but Verified stays open". A run that genuinely
+/// failed is finished — the goal owes nothing more automatically, and how it
+/// went lives on the session row. Only a run that was *cut short* still owes.
+pub(crate) fn goal_owes_no_more_work(
+    result: &Result<leveler_engine::TaskReport, leveler_engine::EngineError>,
+) -> bool {
+    use leveler_lifecycle::TaskOutcome;
+    match result {
+        Ok(report) => match report.outcome {
+            // Reached an end, however it went.
+            TaskOutcome::Verified | TaskOutcome::CompletedUnverified | TaskOutcome::Failed => true,
+            // Stopped at an explicit resource boundary: incomplete and
+            // resumable, which is precisely "still owed".
+            TaskOutcome::BudgetLimited => false,
+            // Cut short. No Ok report carries this today; if one ever does,
+            // "still owed" is the honest reading of it.
+            TaskOutcome::Interrupted => false,
+        },
+        // Cancelled mid-flight. The work was stopped, not finished.
+        Err(leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled)) => false,
+        // The engine could not reach a verdict at all. A goal with no verdict
+        // is not a settled goal: leaving it owed is what keeps it discoverable
+        // instead of silently dropped.
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod goal_settlement_tests {
+    use super::goal_owes_no_more_work;
+    use leveler_engine::{EngineError, TaskReport};
+    use leveler_lifecycle::TaskOutcome;
+
+    fn report(outcome: TaskOutcome) -> Result<TaskReport, EngineError> {
+        Ok(TaskReport {
+            outcome,
+            final_text: String::new(),
+            modified_files: Vec::new(),
+            verification: None,
+            stop_reason: leveler_agent::StopReason::Completed,
+            stop_detail: None,
+            rounds: 1,
+            windows: 1,
+            review: None,
+        })
+    }
+
+    #[test]
+    fn a_finished_run_settles_however_it_went() {
+        assert!(goal_owes_no_more_work(&report(TaskOutcome::Verified)));
+        assert!(goal_owes_no_more_work(&report(
+            TaskOutcome::CompletedUnverified
+        )));
+        assert!(
+            goal_owes_no_more_work(&report(TaskOutcome::Failed)),
+            "a run that failed is finished; the verdict lives on the session row"
+        );
+    }
+
+    #[test]
+    fn a_run_cut_short_leaves_the_goal_owed() {
+        assert!(!goal_owes_no_more_work(&report(TaskOutcome::BudgetLimited)));
+        assert!(!goal_owes_no_more_work(&report(TaskOutcome::Interrupted)));
+        assert!(!goal_owes_no_more_work(&Err(EngineError::Agent(
+            leveler_agent::AgentError::Cancelled
+        ))));
+    }
+
+    #[test]
+    fn no_verdict_is_not_a_settlement() {
+        assert!(!goal_owes_no_more_work(&Err(EngineError::Config(
+            "nothing ran".to_string()
+        ))));
     }
 }
