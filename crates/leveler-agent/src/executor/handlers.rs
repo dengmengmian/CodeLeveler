@@ -201,15 +201,15 @@ impl Executor {
         id: String,
         brief: String,
         files: Vec<String>,
+        // How much of the task's wall budget is already spent when the review
+        // starts. The review is a tail of the task, not a fresh task: it gets
+        // the residual minus the settlement reserve, like any other child.
+        parent_elapsed: std::time::Duration,
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> DelegatedChildResult {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let parent_wall = ParentWallBudget {
-            cap: self.step_limits.max_duration,
-            epoch_duration_at_start: std::time::Duration::ZERO,
-            run_started: std::time::Instant::now(),
-        };
+        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
         // R013r: an unbounded reviewer burned the full 100-round turn ceiling
         // reading a repo it was only asked to judge. The bound now lives on
         // the role's capability profile; a reviewer that has not concluded by
@@ -242,6 +242,7 @@ impl Executor {
         DelegatedChildResult {
             ok: result.result.status.completed(),
             result: result.result,
+            progress: result.progress,
             modified_files: result.modified_files,
             findings: result.findings,
         }
@@ -565,6 +566,9 @@ pub struct DelegatedChildResult {
     pub ok: bool,
     /// What the child established, and how its run ended.
     pub result: ChildResult,
+    /// The child's own spend (rounds, tokens, cost, commands, paths), for the
+    /// caller to fold into whatever ledger it answers to.
+    pub progress: ProgressLedger,
     /// Files the child touched (a reviewer is read-only, so normally empty).
     pub modified_files: Vec<String>,
     /// Typed findings the child reported (partial ones survive an abnormal
@@ -604,4 +608,38 @@ pub(crate) struct ParentWallBudget {
     pub cap: Option<std::time::Duration>,
     pub epoch_duration_at_start: std::time::Duration,
     pub run_started: std::time::Instant,
+}
+
+/// The wall budget a harness-launched reviewer runs under: the task's cap,
+/// with the task's elapsed time already counted, so the child is granted the
+/// residual (minus the settlement reserve) and never a fresh full cap.
+pub(crate) fn reviewer_wall_budget(
+    limits: &StepLimits,
+    parent_elapsed: std::time::Duration,
+) -> ParentWallBudget {
+    ParentWallBudget {
+        cap: limits.max_duration,
+        epoch_duration_at_start: parent_elapsed,
+        run_started: std::time::Instant::now(),
+    }
+}
+
+#[cfg(test)]
+mod reviewer_wall_budget_tests {
+    use super::reviewer_wall_budget;
+    use crate::StepLimits;
+    use std::time::Duration;
+
+    /// exp9/c3: a reviewer launched 79 rounds into a run started its clock at
+    /// zero and saw the whole cap as its own.
+    #[test]
+    fn the_reviewer_starts_its_clock_where_the_task_left_it() {
+        let limits = StepLimits {
+            max_duration: Some(Duration::from_secs(3600)),
+            ..StepLimits::default()
+        };
+        let wall = reviewer_wall_budget(&limits, Duration::from_secs(3000));
+        assert_eq!(wall.cap, Some(Duration::from_secs(3600)));
+        assert_eq!(wall.epoch_duration_at_start, Duration::from_secs(3000));
+    }
 }

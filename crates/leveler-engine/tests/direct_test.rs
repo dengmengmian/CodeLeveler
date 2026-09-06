@@ -3203,3 +3203,90 @@ async fn an_engine_paced_budget_spans_windows_and_stops_at_the_total() {
         "two windows of two rounds spend exactly the total"
     );
 }
+
+/// The harness-launched closure reviewer is a model consumer like any child:
+/// every call it makes is a `model_requests` row under its own agent id, and
+/// its rounds land in the session's persisted progress. Before this, six
+/// reviews across the C2 batches ran for minutes each and left no row and no
+/// round behind — invisible to the bill and to the task budget.
+#[tokio::test]
+async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+    ];
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let reviewer = seen
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::SubAgentStarted { id, role, .. } if role == "reviewer" => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a security-shaped change launches a reviewer");
+
+    // Accounting: the reviewer's calls are rows under its id.
+    let rows = leveler_storage::ModelRequestRepository::new(&h.db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    let reviewer_rows = rows
+        .iter()
+        .filter(|r| r.agent_id.as_deref() == Some(reviewer.as_str()))
+        .count();
+    let root_rows = rows.iter().filter(|r| r.agent_id.is_none()).count();
+    assert!(
+        reviewer_rows >= 1,
+        "the reviewer made model calls and none is on the books: {rows:?}"
+    );
+    assert!(root_rows >= 1, "the root's own rows are still its own");
+
+    // Budget: the session's persisted progress absorbed the reviewer's rounds.
+    let started_at = seen
+        .iter()
+        .position(|e| matches!(e, EngineEvent::SubAgentStarted { .. }))
+        .unwrap();
+    let before = seen[..started_at]
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_rounds),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(0);
+    let after = seen[started_at..]
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_rounds),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(before);
+    assert!(
+        after >= before + reviewer_rows as u32,
+        "the reviewer's {reviewer_rows} round(s) must be in the session's cumulative rounds: before={before} after={after}"
+    );
+}

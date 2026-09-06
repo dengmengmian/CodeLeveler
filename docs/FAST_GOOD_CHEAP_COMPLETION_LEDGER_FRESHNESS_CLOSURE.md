@@ -16,6 +16,7 @@ CHANGE_SUPERSEDED_ONLY_BY_SAME_PATH=YES      (1e)
 JUDGE_SEES_THE_EPOCHS_FILES=YES              (1f)
 FRESH_VERIFICATION_IS_NEVER_CLOSEOUT_THRASH=YES (1h)
 UNRECORDED_VERIFICATION_IS_NAMED_ON_THE_RESULT=YES (1g)
+CLOSURE_REVIEWER_ACCOUNTED_AND_BUDGETED=YES (1k)
 
 LEDGER_STATE_LOSS_ON_CONTINUATION=0 across 12 runs on the 1c binary; 1 of 1 refused-close continuation dropped on the binary before it
 GOOD_NON_REGRESSION=PASS                     3/3 vs 3/3
@@ -245,6 +246,32 @@ Read against the 24 C2 runs so far: none of the 14 that closed is touched
 (max 169 < 200); the two 300-round investigations stop at 200 with an
 `Incomplete` instead of a breaker kill.
 
+### 3f. The closure reviewer was off the books — fixed here (1k)
+
+The harness-launched closure review (`closure_review_stage` →
+`TurnRunner::run_review` → `run_reviewer_child`) is a second entry into a
+child agent, beside the model's own `delegate`. WP1 wired attribution and
+WP2 the settlement reserve on the delegation path only. On this path:
+
+- the reviewer's model calls came back as `SubAgentModelRequest` events,
+  drained after it finished into an observer that maps them to a progress
+  line — **zero rows** in `model_requests` for every one of the six closure
+  reviews that launched across the C2 batches (exp9/c3's ran 9.5 minutes);
+- its rounds, tokens and cost were folded into nothing: the engine builds a
+  fresh executor with no parent ledger, so the session's cumulative counters
+  — and with them the task round budget and the runtime's own bill — never
+  saw it;
+- its wall clock started at zero against the task's whole cap, not the
+  residual minus the settlement reserve the delegation path grants.
+
+Now `run_review` writes every reviewer record through the same
+`storage_model_request` the root turn uses (its `agent_id` is already
+stamped), folds the child's `ProgressLedger` into the persisted session
+progress with the existing `absorb_child_spend`, and hands the reviewer the
+task's elapsed time so `reviewer_wall_budget` grants the residual. Six
+launched reviews, five `finished_incomplete`: that ratio is now at least
+visible in the rows, and is a separate question.
+
 ## 4. Tests
 
 | | | |
@@ -264,13 +291,14 @@ Read against the 24 C2 runs so far: none of the 14 that closed is touched
 | 1j | the 80% note fires once, names both numbers, and never for tiny budgets | `the_note_fires_once_at_eighty_percent_and_names_both_numbers`, `tiny_budgets_get_no_note` |
 | 1j | end to end: the total spans windows and is where an investigating goal stops | `an_engine_paced_budget_spans_windows_and_stops_at_the_total` |
 | 1j | wiring: `--max-rounds` maps to default / unbounded / a base; a budget on the spec pins the continuation (the exp8 null result) | `the_flag_maps_to_default_unbounded_or_a_base`, `a_budget_pins_the_continuation_to_its_base`, `run_parses_max_rounds` |
+| 1k | a harness-launched review's calls are rows under its agent id and its rounds are in the session's progress; its clock starts where the task's left off | `a_harness_launched_review_is_accounted_and_folded_into_the_session`, `the_reviewer_starts_its_clock_where_the_task_left_it` |
 
 Every test was written red first and turned green by the change it names.
 
 ```
 FMT=PASS
 CLIPPY=PASS   (workspace, all-targets, all-features, -D warnings)
-FULL_PRODUCT_TEST_GATE=3742 passed, 150 result lines, 1 failure
+FULL_PRODUCT_TEST_GATE=3744 passed, 135 result lines, 1 failure
   the failure is `client_command_schema_is_current`: the committed
   `schemas/client_command.schema.json` lacks the `shutdown_when_idle` /
   `RestartReason` types added in f5a63b2. Pre-existing, outside this change,

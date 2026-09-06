@@ -75,44 +75,51 @@ impl TranscriptSink for TurnSink {
         &mut self,
         record: &leveler_agent::ModelRequestRecord,
     ) -> Result<(), AgentError> {
-        let finish_reason = serde_json::to_value(record.finish_reason)
-            .ok()
-            .and_then(|value| value.as_str().map(ToOwned::to_owned));
         self.model_requests
-            .insert(&leveler_storage::ModelRequestRecord {
-                // The engine owns the row's identity; the provider's id rides
-                // along as a diagnostic. Two calls that report the same id are
-                // two rows, not a persistence failure that ends the turn.
-                id: leveler_core::EventId::generate().into_inner(),
-                provider_request_id: record.provider_request_id.clone(),
-                session_id: self.session_id.clone(),
-                provider: record.provider.clone(),
-                model: record.model.clone(),
-                input_tokens: record.usage.input_tokens,
-                output_tokens: record.usage.output_tokens,
-                // Recorded, not inferred: `Some(0)` is a provider that
-                // reported no cache hit, and the `None` this never writes is
-                // reserved for rows from before the column existed.
-                cached_input_tokens: Some(record.usage.cached_input_tokens),
-                cost_usd_micros: record.cost_usd_micros,
-                agent_id: record.agent_id.clone(),
-                finish_reason,
-                error_kind: None,
-                latency_ms: Some(record.latency_ms),
-                retry_count: record.retry_count,
-                kind: match record.kind {
-                    leveler_agent::ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
-                    leveler_agent::ModelCallKind::Compaction => {
-                        leveler_storage::ModelCallKind::Compaction
-                    }
-                    leveler_agent::ModelCallKind::Advisory => {
-                        leveler_storage::ModelCallKind::Advisory
-                    }
-                },
-                created_at: leveler_core::now(),
-            })
+            .insert(&storage_model_request(record, &self.session_id))
             .await
             .map_err(|error| AgentError::Persistence(error.to_string()))
+    }
+}
+
+/// The durable row for one model call, whoever made it: the root turn, a
+/// delegated child, or the harness-launched closure reviewer. The record
+/// already carries the caller's `agent_id`; the engine owns the row's
+/// identity and the session it belongs to.
+pub(crate) fn storage_model_request(
+    record: &leveler_agent::ModelRequestRecord,
+    session_id: &SessionId,
+) -> leveler_storage::ModelRequestRecord {
+    let finish_reason = serde_json::to_value(record.finish_reason)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    leveler_storage::ModelRequestRecord {
+        // The engine owns the row's identity; the provider's id rides
+        // along as a diagnostic. Two calls that report the same id are
+        // two rows, not a persistence failure that ends the turn.
+        id: leveler_core::EventId::generate().into_inner(),
+        provider_request_id: record.provider_request_id.clone(),
+        session_id: session_id.clone(),
+        provider: record.provider.clone(),
+        model: record.model.clone(),
+        input_tokens: record.usage.input_tokens,
+        output_tokens: record.usage.output_tokens,
+        // Recorded, not inferred: `Some(0)` is a provider that
+        // reported no cache hit, and the `None` this never writes is
+        // reserved for rows from before the column existed.
+        cached_input_tokens: Some(record.usage.cached_input_tokens),
+        cost_usd_micros: record.cost_usd_micros,
+        agent_id: record.agent_id.clone(),
+        finish_reason,
+        error_kind: None,
+        latency_ms: Some(record.latency_ms),
+        retry_count: record.retry_count,
+        kind: match record.kind {
+            leveler_agent::ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
+            leveler_agent::ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
+            leveler_agent::ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
+        },
+        created_at: leveler_core::now(),
     }
 }
 
@@ -920,6 +927,8 @@ impl TurnRunner<'_> {
         profile: TurnProfile,
         brief: String,
         files: Vec<String>,
+        // The task's wall time already spent: the review is its tail.
+        parent_elapsed: std::time::Duration,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<bool, EngineError> {
@@ -954,12 +963,48 @@ impl TurnRunner<'_> {
                 observer,
             )
             .await?;
+        // The reviewer's model calls arrive as progress events; the engine's
+        // own sink is the only thing that can make them rows. Collect here,
+        // write below — the child drains its channel after it finishes.
+        let mut child_records: Vec<leveler_agent::ModelRequestRecord> = Vec::new();
         let result = {
-            let mut forward = |event: leveler_agent::AgentEvent| observer(EngineEvent::from(event));
+            let mut forward = |event: leveler_agent::AgentEvent| {
+                if let leveler_agent::AgentEvent::SubAgentModelRequest { record } = &event {
+                    child_records.push((**record).clone());
+                }
+                observer(EngineEvent::from(event))
+            };
             executor
-                .run_reviewer_child(id.clone(), brief, files, &mut forward, cancellation)
+                .run_reviewer_child(
+                    id.clone(),
+                    brief,
+                    files,
+                    parent_elapsed,
+                    &mut forward,
+                    cancellation,
+                )
                 .await
         };
+        for record in &child_records {
+            self.stores
+                .model_requests
+                .insert(&storage_model_request(record, &self.session_id))
+                .await?;
+        }
+        // The review's spend is the session's spend: fold rounds, tokens,
+        // cost and commands into the persisted progress so budgets, resume
+        // and the runtime's own counters see it.
+        let mut progress = last_persisted_progress(self.stores.events.as_ref(), &self.session_id)
+            .await?
+            .unwrap_or_default();
+        progress.absorb_child_spend(&result.progress);
+        self.log
+            .append(
+                None,
+                EngineEvent::ProgressUpdated { ledger: progress },
+                observer,
+            )
+            .await?;
         // Unified findings: adopt first so the finish summary can name the
         // parent-side ids the TUI projects as a finding count.
         let mut summary = result.result.for_parent("reviewer");

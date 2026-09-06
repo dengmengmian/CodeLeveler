@@ -2063,6 +2063,7 @@ impl TaskEngine {
                 goal_profile(spec),
                 review_brief(&spec.runtime.goal, &outcome.modified_files, diff.as_deref()),
                 outcome.modified_files.clone(),
+                std::time::Duration::from_millis(outcome.progress.cumulative_duration_ms),
                 observer,
                 cancellation.clone(),
             )
