@@ -164,6 +164,10 @@ pub struct Application {
     work_profile: WorkProfile,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
+    /// Engine-paced task budget for headless goal runs (`leveler run`). `None`
+    /// keeps a goal until-terminal; the CLI sets it from `--max-rounds` or the
+    /// default. Eval and the interactive UI never set it.
+    task_round_budget: Option<leveler_engine::TaskRoundBudget>,
     environment: Arc<leveler_core::EnvSnapshot>,
     /// Process-lived background task registry, shared (cloned) into every
     /// engine/turn so `background=true` servers survive between messages. A
@@ -355,6 +359,7 @@ impl Application {
             readonly_roots,
             work_profile: WorkProfile::Balanced,
             collaboration: CollaborationMode::Chat,
+            task_round_budget: None,
             environment,
             background_tasks,
             browser,
@@ -384,6 +389,18 @@ impl Application {
     pub fn with_collaboration(mut self, mode: CollaborationMode) -> Self {
         self.collaboration = mode;
         self
+    }
+
+    /// Engine-paced task budget for headless goal runs, from the CLI's
+    /// `--max-rounds`: absent means the default (200 / +100 / twice), `0`
+    /// means unbounded, `n` means a base of `n` rounds.
+    pub fn with_task_round_budget(mut self, max_rounds: Option<u32>) -> Self {
+        self.task_round_budget = task_round_budget_from_flag(max_rounds);
+        self
+    }
+
+    pub fn task_round_budget(&self) -> Option<leveler_engine::TaskRoundBudget> {
+        self.task_round_budget
     }
 
     pub fn work_profile(&self) -> WorkProfile {
@@ -1071,5 +1088,63 @@ mod completion_judge_timeout_tests {
                 if m.contains("completion_judge_timeout_seconds")),
             "the error names the setting: {err}"
         );
+    }
+}
+
+/// `--max-rounds` → task budget: absent = default, `0` = unbounded, `n` = base n.
+pub fn task_round_budget_from_flag(
+    max_rounds: Option<u32>,
+) -> Option<leveler_engine::TaskRoundBudget> {
+    match max_rounds {
+        None => Some(leveler_engine::DEFAULT_TASK_ROUND_BUDGET),
+        Some(0) => None,
+        Some(base) => Some(leveler_engine::TaskRoundBudget {
+            base,
+            ..leveler_engine::DEFAULT_TASK_ROUND_BUDGET
+        }),
+    }
+}
+
+/// The continuation a goal runs under for a given task budget: pinned to the
+/// budget's base when the engine paces it, until-terminal otherwise.
+pub fn goal_continuation_for(
+    budget: Option<leveler_engine::TaskRoundBudget>,
+) -> leveler_agent::ContinuationPolicy {
+    match budget {
+        Some(b) => leveler_agent::ContinuationPolicy::bounded(b.base),
+        None => leveler_agent::ContinuationPolicy::UntilTerminal,
+    }
+}
+
+#[cfg(test)]
+mod task_round_budget_tests {
+    use super::{goal_continuation_for, task_round_budget_from_flag};
+    use leveler_engine::DEFAULT_TASK_ROUND_BUDGET;
+
+    #[test]
+    fn the_flag_maps_to_default_unbounded_or_a_base() {
+        assert_eq!(
+            task_round_budget_from_flag(None),
+            Some(DEFAULT_TASK_ROUND_BUDGET)
+        );
+        assert_eq!(task_round_budget_from_flag(Some(0)), None);
+        let custom = task_round_budget_from_flag(Some(40)).unwrap();
+        assert_eq!(custom.base, 40);
+        assert_eq!(custom.extension, DEFAULT_TASK_ROUND_BUDGET.extension);
+        assert_eq!(
+            custom.max_extensions,
+            DEFAULT_TASK_ROUND_BUDGET.max_extensions
+        );
+    }
+
+    /// The bug exp8 ran with: a budget on the spec and an until-terminal
+    /// continuation pinned over it is a budget that never binds.
+    #[test]
+    fn a_budget_pins_the_continuation_to_its_base() {
+        assert_eq!(
+            goal_continuation_for(Some(DEFAULT_TASK_ROUND_BUDGET)).round_limit(),
+            Some(DEFAULT_TASK_ROUND_BUDGET.base)
+        );
+        assert_eq!(goal_continuation_for(None).round_limit(), None);
     }
 }

@@ -708,6 +708,7 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
@@ -1418,6 +1419,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir2.path().to_path_buf(),
@@ -1846,6 +1848,20 @@ fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
     s
 }
 
+/// An engine-paced task budget (`leveler run`): `base` rounds in total,
+/// spent across windows of `rounds_per_window`, extendable only by
+/// finishing work.
+fn spec_budgeted(h: &Harness, goal: &str, rounds_per_window: u32, base: u32) -> TaskSpec {
+    let mut s = spec_windowed(h, goal, rounds_per_window);
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(base);
+    s.runtime.round_budget = Some(leveler_engine::TaskRoundBudget {
+        base,
+        extension: 2,
+        max_extensions: 1,
+    });
+    s
+}
+
 fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
     tool_call(
         id,
@@ -2157,6 +2173,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir.path().to_path_buf(),
@@ -3140,5 +3157,49 @@ async fn gap2_an_observation_of_something_else_no_longer_discharges_a_behavioura
     assert!(
         debt.contains("no proof standard"),
         "the refusal must say what is missing, not that the behaviour is wrong: {debt}"
+    );
+}
+
+/// The engine-paced budget is a task total, not a window: a per-turn ceiling
+/// inside it opens the next window (no child settlement needed), and the
+/// total itself is where a goal that only investigated stops — with what it
+/// has, before the close-out it never earned.
+#[tokio::test]
+async fn an_engine_paced_budget_spans_windows_and_stops_at_the_total() {
+    let h = harness(vec![
+        // Window 1 (2 rounds): create a file, then read → ceiling.
+        patch_add("b1", "src/feature.rs", "pub fn feature() {}"),
+        read_call_named("b2", "src/feature.rs"),
+        // Window 2: only reads → ceiling, and the 4-round total is spent.
+        read_call_named("b3", "src/feature.rs"),
+        read_call_named("b4", "src/feature.rs"),
+        // Never reached: no source change + close attempt in the segment, so
+        // no extension; the total is the end.
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        text("unused"),
+        text("unused"),
+    ])
+    .await;
+    let s = spec_budgeted(&h, "add the feature", 2, 4);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::TurnLimitReached,
+        "the task total is the bound; got {:?} ({:?})",
+        report.stop_reason,
+        report.outcome,
+    );
+    assert_eq!(
+        report.rounds, 4,
+        "two windows of two rounds spend exactly the total"
     );
 }

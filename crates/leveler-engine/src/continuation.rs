@@ -50,7 +50,30 @@ pub struct TurnEnded<'a> {
     /// hitting the round ceiling without moving the workspace is stopped instead
     /// of burning every supervised window.
     pub windows_without_progress: u32,
+    /// The pinned round budget is the ENGINE's (a `TaskRoundBudget` on the spec),
+    /// not the caller's: windows continue at the per-turn ceiling while the
+    /// total has rounds left, the same way an unbounded goal does.
+    pub engine_paced: bool,
 }
+
+/// An engine-paced task budget in model rounds: what `leveler run` spends
+/// across supervised windows before it stops, and what it takes to earn more.
+/// Extensions are granted only for a segment that moved the goal — a source
+/// change landed AND a close was attempted — never for investigation alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRoundBudget {
+    pub base: u32,
+    pub extension: u32,
+    pub max_extensions: u32,
+}
+
+/// 200 / +100 / twice. From the C2 batches: every run that closed did so
+/// within 169 rounds; both runs that never closed were still going at 300.
+pub const DEFAULT_TASK_ROUND_BUDGET: TaskRoundBudget = TaskRoundBudget {
+    base: 200,
+    extension: 100,
+    max_extensions: 2,
+};
 
 /// Decides whether a finished turn gets a successor.
 pub trait SupervisorPolicy: Send + Sync {
@@ -75,6 +98,18 @@ impl SupervisorPolicy for DefaultSupervisorPolicy {
         // window; the engine clamps that window to the remaining budget, so
         // the total is consumed, never topped up.
         if let Some(total) = ended.round_budget.round_limit() {
+            // Engine-paced (`leveler run`): the total is the engine's own bound
+            // and a per-turn ceiling inside it is a window boundary, exactly
+            // as for an unbounded goal. The no-progress cap and a human
+            // boundary still stop it.
+            if ended.engine_paced
+                && ended.stop_reason == StopReason::TurnLimitReached
+                && ended.progress.cumulative_rounds < total
+                && !ended.progress.human_boundary_seen()
+                && ended.windows_without_progress < MAX_NO_PROGRESS_WINDOWS
+            {
+                return Continuation::DriveGoalAgain;
+            }
             if ended.stop_reason == StopReason::TurnLimitReached
                 && ended.progress.unconsumed_child_settlements > 0
                 && ended.progress.cumulative_rounds < total
@@ -174,7 +209,46 @@ mod tests {
             extensions_granted: 0,
             round_budget: ContinuationPolicy::UntilTerminal,
             windows_without_progress: 0,
+            engine_paced: false,
         }
+    }
+
+    /// `leveler run` owns its budget: a window that hit the per-turn ceiling
+    /// with rounds left in the task total gets the next window, exactly as an
+    /// unbounded goal would — no child settlement required.
+    #[test]
+    fn an_engine_paced_budget_continues_at_the_window_ceiling_while_rounds_remain() {
+        let mut progress = active();
+        progress.cumulative_rounds = 100;
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        assert_eq!(policy.after_turn(&e), Continuation::DriveGoalAgain);
+        // The total is the bound: at it, no window opens.
+        let mut spent = active();
+        spent.cumulative_rounds = 200;
+        let mut at_total = ended(StopReason::TurnLimitReached, &spent, &[], None);
+        at_total.round_budget = ContinuationPolicy::bounded(200);
+        at_total.engine_paced = true;
+        assert_eq!(policy.after_turn(&at_total), Continuation::Stop);
+        // The no-progress cap still binds.
+        let mut stuck = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        stuck.round_budget = ContinuationPolicy::bounded(200);
+        stuck.engine_paced = true;
+        stuck.windows_without_progress = MAX_NO_PROGRESS_WINDOWS;
+        assert_eq!(policy.after_turn(&stuck), Continuation::Stop);
+    }
+
+    /// A caller-pinned budget (eval harness) is unchanged: never add turns.
+    #[test]
+    fn a_caller_paced_budget_still_never_adds_turns_at_the_ceiling() {
+        let mut progress = active();
+        progress.cumulative_rounds = 100;
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
     }
 
     fn active() -> ProgressLedger {

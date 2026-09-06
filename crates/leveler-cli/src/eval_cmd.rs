@@ -881,6 +881,7 @@ async fn run_bare_case(
             kind: leveler_engine::ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
             limits: leveler_agent::StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: app.layout.repo_root.clone(),
@@ -1786,6 +1787,7 @@ mod ablation_tests {
                 kind: leveler_engine::ExecutionKind::Direct,
                 continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
                 limits: leveler_agent::StepLimits::default(),
+                round_budget: None,
             },
             coding: leveler_engine::CodingTaskSpec {
                 repository: std::path::PathBuf::from("/repo"),

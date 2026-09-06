@@ -35,10 +35,12 @@ pub(crate) async fn cmd_run(
     sandbox: bool,
     work_profile: leveler_lifecycle::WorkProfile,
     collaboration: leveler_lifecycle::CollaborationMode,
+    max_rounds: Option<u32>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let app = Application::assemble(layout)?
         .with_work_profile(work_profile)
-        .with_collaboration(collaboration);
+        .with_collaboration(collaboration)
+        .with_task_round_budget(max_rounds);
     let model_ref = resolve_model(&app, model)?;
     let execution_mode = map_mode(mode);
 

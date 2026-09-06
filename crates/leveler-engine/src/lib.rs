@@ -35,8 +35,8 @@ pub use checkpoint::{
     project_goal_checkpoint, resume_prior_from_checkpoint,
 };
 pub use continuation::{
-    Continuation, DefaultSupervisorPolicy, MAX_EXTENSIONS, NoContinuation, SupervisorPolicy,
-    TurnEnded,
+    Continuation, DEFAULT_TASK_ROUND_BUDGET, DefaultSupervisorPolicy, MAX_EXTENSIONS,
+    NoContinuation, SupervisorPolicy, TaskRoundBudget, TurnEnded,
 };
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};

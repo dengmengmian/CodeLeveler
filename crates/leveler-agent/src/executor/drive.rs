@@ -179,6 +179,7 @@ impl Executor {
         // lifecycle facts, so they stay out of the ProgressLedger schema.
         let mut engagement_tool_rounds = 0u32;
         let mut engagement_advisories_sent = 0u32;
+        let mut budget_note_sent = false;
         let mut engagement_material_progress = false;
         let mut plan_state = self.seeded_plan.clone();
         let mut structured_plan_started = !plan_state.is_empty();
@@ -888,6 +889,23 @@ impl Executor {
                 sink.append(std::slice::from_ref(&note)).await?;
                 messages.push(note);
                 engagement_advisories_sent = engagement_advisories_sent.saturating_add(1);
+            }
+
+            // A pinned task budget is the model's to spend: at 80% it is told
+            // where it stands, once. `epoch_rounds_at_start + round_limit` is
+            // the task total the engine clamped this window to.
+            if self.depth == 0
+                && let Some(remaining) = self.continuation.round_limit()
+                && let Some(note) = round_verdict::budget_note(
+                    epoch_rounds_at_start.saturating_add(round),
+                    epoch_rounds_at_start.saturating_add(remaining),
+                    budget_note_sent,
+                )
+            {
+                let note = Message::text(Role::User, note);
+                sink.append(std::slice::from_ref(&note)).await?;
+                messages.push(note);
+                budget_note_sent = true;
             }
 
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());

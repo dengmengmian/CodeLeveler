@@ -114,6 +114,26 @@ pub fn classify(input: &RoundInput) -> RoundVerdict {
 /// deliberately advisory-only so a false positive costs a message, never a run.
 pub const ENGAGEMENT_ADVISORY_AFTER_ROUNDS: u32 = 45;
 
+/// Once a pinned task budget is 80% spent, the model is told so, once. The
+/// budget is the model's to spend and it cannot see it otherwise; every
+/// harness that converges on a budget shows it. Tiny budgets (tests, evals
+/// with a handful of rounds) get no note — there is nothing to pace.
+pub const BUDGET_NOTE_MIN_TOTAL: u32 = 20;
+
+pub fn budget_note(used: u32, total: u32, already_sent: bool) -> Option<String> {
+    if already_sent
+        || total < BUDGET_NOTE_MIN_TOTAL
+        || used.saturating_mul(5) < total.saturating_mul(4)
+    {
+        return None;
+    }
+    Some(format!(
+        "Budget: {used} of {total} rounds for this task are used. Converge now: land \
+         the change, run the check that proves it, and call update_goal. If the \
+         goal cannot be reached in what remains, say so with update_goal(blocked)."
+    ))
+}
+
 /// At most this many advisories per drive; the second lands at twice the
 /// threshold, mirroring the policy-blocked track's escalate-then-stop shape.
 pub const ENGAGEMENT_ADVISORY_MAX: u32 = 2;
@@ -428,5 +448,25 @@ mod tests {
                 "signal {signal} must clear the streak on its own"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_note_tests {
+    use super::budget_note;
+
+    #[test]
+    fn the_note_fires_once_at_eighty_percent_and_names_both_numbers() {
+        assert!(budget_note(159, 200, false).is_none());
+        let note = budget_note(160, 200, false).expect("80% is the line");
+        assert!(note.contains("160") && note.contains("200"), "{note}");
+        assert!(budget_note(161, 200, true).is_none(), "said once");
+        assert!(budget_note(199, 200, true).is_none());
+    }
+
+    #[test]
+    fn tiny_budgets_get_no_note() {
+        assert!(budget_note(4, 4, false).is_none());
+        assert!(budget_note(16, 19, false).is_none());
     }
 }

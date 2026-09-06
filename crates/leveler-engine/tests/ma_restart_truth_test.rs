@@ -214,6 +214,7 @@ fn gated_spec(dir: &Path) -> TaskSpec {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir.to_path_buf(),

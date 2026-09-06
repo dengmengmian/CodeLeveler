@@ -434,8 +434,9 @@ impl Application {
             runtime: leveler_engine::RuntimeTaskSpec {
                 goal,
                 kind: ExecutionKind::Direct,
-                continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+                continuation: crate::goal_continuation_for(self.task_round_budget),
                 limits: self.top_level_limits(),
+                round_budget: self.task_round_budget,
             },
             coding: leveler_engine::CodingTaskSpec {
                 repository: self.layout.repo_root.clone(),
@@ -479,7 +480,9 @@ impl Application {
             // the canonical stream one-way.
             &mut |event| forward_engine_event(event, observer),
             cancellation,
-            leveler_agent::ContinuationPolicy::UntilTerminal,
+            // Headless goals run on the engine-paced task budget when one is
+            // set; pinning UntilTerminal over it was the exp8 null result.
+            crate::goal_continuation_for(self.task_round_budget),
             unattended_limits(self.top_level_limits()),
         )
         .await

@@ -282,6 +282,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             pr_base,
             sandbox,
             work_mode,
+            max_rounds,
             collaboration,
             parallel,
         } => {
@@ -319,6 +320,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     sandbox,
                     work_profile,
                     collab,
+                    max_rounds,
                 )
                 .await
             }

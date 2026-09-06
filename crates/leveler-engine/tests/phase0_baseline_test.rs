@@ -432,6 +432,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
@@ -510,6 +511,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),

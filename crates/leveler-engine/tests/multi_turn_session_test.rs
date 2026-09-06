@@ -183,6 +183,7 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::bounded(6),
             limits: StepLimits::default(),
+            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),

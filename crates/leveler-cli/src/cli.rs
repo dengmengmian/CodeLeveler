@@ -227,6 +227,11 @@ pub enum Command {
         /// Work profile: economy | balanced | delivery (default balanced).
         #[arg(long, default_value = "balanced")]
         work_mode: String,
+        /// Task round budget for this run: default 200 (extendable +100 up to
+        /// twice when a segment lands a source change and tries to close);
+        /// `0` runs until the goal is resolved with no round budget.
+        #[arg(long, value_name = "N")]
+        max_rounds: Option<u32>,
         /// Collaboration axis: chat | plan | goal.
         /// Default **chat** (ordinary turns). Use `goal` for
         /// delivery runs that must call update_goal to finish.
@@ -845,6 +850,20 @@ mod tests {
                 assert_eq!(work_mode, "delivery");
             }
             other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_max_rounds() {
+        let cli = Cli::parse_from(["leveler", "run", "fix it", "--max-rounds", "40"]);
+        match cli.command {
+            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, Some(40)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let cli = Cli::parse_from(["leveler", "run", "fix it"]);
+        match cli.command {
+            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, None),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

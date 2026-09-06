@@ -23,7 +23,7 @@ MODEL_REQUESTS_TREATMENT_VS_CONTROL=−45%     118 vs 213 mean, n=3 per arm
 INPUT_TOKENS_TREATMENT_VS_CONTROL=−58%
 ESTIMATED_COST_TREATMENT_VS_CONTROL=−49%
 
-HUNDRED_ROUND_WINDOW_CHAIN=OPEN              1i tried, A/B'd (§6 exp7), withdrawn — §3d
+HUNDRED_ROUND_WINDOW_CHAIN=BOUNDED           1i withdrawn (§3d); 1j task budget 200/+100/×2 built (§3e), A/B in §6 exp8
 CONTRACT_OBLIGATION_FROM_EXPLANATORY_PROSE=OPEN  §6, exp6/f2; not this closure
 
 TREATMENT_RUNS=12   GOOD=12   BREAKER_KILLS=0   CLEAN_COMPLETED_ENDINGS=5
@@ -214,13 +214,36 @@ no-progress windows = 300 rounds. Replayed against exp2/f1 it would have
 stopped at the breaker line, not before it.
 
 **What the evidence points at instead.** The two runs of this shape share
-one fact no other run has: *no `update_goal` call in 300 rounds*. A rule
-keyed on that — a ceiling window that made no close attempt earns at most
-one more — would have ended both at 200 rounds and touched none of the
-twelve runs that closed. A second candidate is to require the "newly green"
-check to cover a *source* mutation, not a scratch test. Neither is built;
-both are decisions, and this one has now been made once on a rule that
-looked right and was not.
+one fact no other run has: *no `update_goal` call in 300 rounds*. And the
+industry answer to an agent that does not stop is not a cleverer progress
+rule; it is a task-level budget the agent can see, with a bounded way to earn
+more.
+
+### 3e. An engine-paced task budget — **built here (1j)**, A/B in §6 exp8
+
+`leveler run` now carries a `TaskRoundBudget` of **200 rounds, +100, at most
+twice**. The numbers come from the batches: every run that closed did so
+within 169 rounds; both runs that never closed were still going at 300.
+
+- **The total is the engine's, not the caller's.** `Bounded` used to mean
+  "the caller owns pacing; never add turns" (the eval harness). With a
+  `round_budget` on the spec the same pinned total is engine-paced: a
+  per-turn ceiling inside it is a window boundary, as for an unbounded goal,
+  and the total is where a goal stops — `Incomplete`, with its work and
+  ledger intact. Caller-pinned budgets (`round_budget: None`) are unchanged.
+- **An extension is earned, never granted for trying.** When the total runs
+  out, the segment since the last grant must show a **source change**
+  (a mutation to a path that is not a test, a probe, or `node_modules`)
+  **and a close attempt** (a refused `update_goal` or reconciliation
+  intercept — an accepted one ends the task). Both, or it stops. exp2/f1 and
+  exp7/f1 had neither; every run that closed had both.
+- **The budget is visible.** At 80% the model is told once: rounds used of
+  total, converge now, `update_goal(blocked)` if it cannot. Every
+  continuation window's restatement names rounds used so far.
+
+Read against the 24 C2 runs so far: none of the 14 that closed is touched
+(max 169 < 200); the two 300-round investigations stop at 200 with an
+`Incomplete` instead of a breaker kill.
 
 ## 4. Tests
 
@@ -236,13 +259,18 @@ looked right and was not.
 | 1g | a piped / env-prefixed / `;`-chained verification run is named on the result; a recorded run, a non-verification pipeline and a failed run get no note | `a_piped_test_run_is_named_as_unrecorded_evidence`, `a_recorded_run_and_a_non_verification_pipeline_get_no_note`, `run_command_with_a_shell_wrapper_is_covered_too` |
 | 1g | every program in a pipeline, chain, env prefix or nested `sh -c` is named | `every_program_in_a_pipeline_chain_or_env_prefix_is_named`, `a_nested_shell_body_is_looked_into` (`leveler-execution`) |
 | 1i | withdrawn (§3d); its six tests left the tree with it | — |
+| 1j | an engine-paced total continues at the window ceiling while rounds remain, stops at the total, honours the no-progress cap; a caller-pinned one never adds turns | `an_engine_paced_budget_continues_at_the_window_ceiling_while_rounds_remain`, `a_caller_paced_budget_still_never_adds_turns_at_the_ceiling` |
+| 1j | an extension needs a source change and a close attempt in the segment, and is capped; source paths exclude tests, probes and `node_modules` | `investigation_alone_earns_no_extension`, `a_segment_that_landed_a_change_and_tried_to_close_earns_one`, `the_extension_count_is_capped`, `source_paths_exclude_tests_probes_and_dependencies` |
+| 1j | the 80% note fires once, names both numbers, and never for tiny budgets | `the_note_fires_once_at_eighty_percent_and_names_both_numbers`, `tiny_budgets_get_no_note` |
+| 1j | end to end: the total spans windows and is where an investigating goal stops | `an_engine_paced_budget_spans_windows_and_stops_at_the_total` |
+| 1j | wiring: `--max-rounds` maps to default / unbounded / a base; a budget on the spec pins the continuation (the exp8 null result) | `the_flag_maps_to_default_unbounded_or_a_base`, `a_budget_pins_the_continuation_to_its_base`, `run_parses_max_rounds` |
 
 Every test was written red first and turned green by the change it names.
 
 ```
 FMT=PASS
 CLIPPY=PASS   (workspace, all-targets, all-features, -D warnings)
-FULL_PRODUCT_TEST_GATE=3729 passed, 135 result lines, 1 failure
+FULL_PRODUCT_TEST_GATE=3742 passed, 150 result lines, 1 failure
   the failure is `client_command_schema_is_current`: the committed
   `schemas/client_command.schema.json` lacks the `shutdown_when_idle` /
   `RestartReason` types added in f5a63b2. Pre-existing, outside this change,
@@ -361,6 +389,95 @@ a `TurnLimitReached` window. The one run that did hit it is the run the rule
 was built for, and the rule let it through three times (§3d). At n=3 this
 is one observation; it is also the only observation the rule could have
 been judged on, and it went the wrong way. Withdrawn.
+
+### exp8 — 1j, first A/B: **a null result, by a wiring bug**
+
+Three control (d125402) and three treatment, in parallel.
+
+| run | arm | requests | windows | GOOD |
+| --- | --- | ---: | --- | --- |
+| c1 | control | 49 | Completed:47 | PASS |
+| c2 | control | 70 | Completed:68 | PASS |
+| c3 | control | 112 | 100 · Completed:10 | PASS |
+| f1 | treatment | 94 | Completed:92 (closeout gate failed: the agent's symlinked `node_modules`) | PASS |
+| f2 | treatment | 68 | Completed:66 | PASS |
+| f3 | treatment | 72 | Completed:70 | PASS |
+
+Indistinguishable arms — and they should have been, for the wrong reason.
+The budget was on the spec, but the headless `run_in_session` path pinned
+`UntilTerminal` over the spec's continuation, so `round_limit()` was `None`
+and neither the total, the extension, nor the 80% note could ever engage.
+The treatment binary behaved exactly like control. Found by asking why no
+run had printed a budget line; fixed by making the headless goal path derive
+its continuation from the task budget (`goal_continuation_for`), with a
+regression test pinning that a budget on the spec yields a pinned
+continuation. The eval path and the interactive UI keep `UntilTerminal`
+and no budget. `leveler run --max-rounds N` sets the base (`0` = unbounded).
+
+### exp9 — 1j, wired: A/B plus a bound check
+
+Before the batch, a three-round sanity run on an empty repository:
+`--max-rounds 3` stopped at round 3 — *"Reached the 3-round limit before
+finishing. Resume with: leveler resume …"*. The budget binds.
+
+**m40** — treatment with `--max-rounds 40` on C2, so the total is reached on
+a real model:
+
+- stopped at exactly round 40, `BudgetExhausted`, with the files changed and
+  a resume id in the stop message; the tree passed the oracle;
+- the 80% note was injected at round 32 (in `session_messages`; the CLI does
+  not echo injected messages);
+- the segment had a source change *and* a refused close, so it had **earned**
+  the extension — and did not get it. The pinned window limit exits as
+  `BudgetExhausted` with no budget dimension, and the extension gate was keyed
+  on `TurnLimitReached` alone. `round_budget_spent` now names both endings
+  as "the rounds are spent" and neither tokens/cost/time exhaustion nor any
+  other stop; **m40b** re-runs the same check on the corrected binary.
+
+**m40b** — corrected binary, `--max-rounds 40`: stopped at 40 again, and
+this time the rule is what stopped it. The segment had source changes
+(`useController.ts`, a new `getNullAncestorValue.ts`) but **no close
+attempt** in 40 rounds, so no extension: the tree was cut mid-edit, with a
+resume id, and fails the oracle. That is the trade the budget makes, shown
+on a real run: finishing earns more rounds, editing alone does not. With
+the default base of 200 no run in this programme would have been cut —
+every close came by 169.
+
+**A/B** — three control (d125402) and three treatment (budget wired), in
+parallel:
+
+| run | arm | requests | close attempts / refused | windows | GOOD |
+| --- | --- | ---: | --- | --- | --- |
+| c1 | control | 68 | 1 / 0 | Completed:66 | PASS |
+| c2 | control | 73 | 2 / 1 | Completed:70 | PASS |
+| c3 | control | 82 | 2 / 2 | CloseoutForced:79 | PASS |
+| f1 | treatment | 81 | 2 / 1 | Completed:78 | PASS |
+| f2 | treatment | **26** | 1 / 1 (contract obligation, `freshness=fresh`) | CloseoutForced:24 | PASS |
+| f3 | treatment | 87 | 1 / 0 | Completed:85 | PASS |
+
+Control 223 requests / 12.0M input tokens, treatment 194 / 10.4M. No run
+came within 100 rounds of the total, so the arms are equivalent by
+construction: the budget is a bound on the tail, and this batch, like exp8,
+drew no tail. The evidence that the bound binds, and how, is the three
+`--max-rounds` runs above; the evidence that it costs nothing when it does
+not bind is these six plus exp8's six.
+
+**m70** — `--max-rounds 70`: stopped at 70, `BudgetExhausted`, tree GOOD
+(the agent's last note: full suite green, "final review of the diff") —
+and **no close attempt in 70 rounds**, so no extension. Three field runs at
+the total, and the extension path was earned only in the one that hit the
+gate bug (m40); the other two had a source change and never claimed. That
+is the rule as decided — finishing earns rounds, editing does not — shown
+twice at its sharpest: a green tree cut because the model had not yet said
+so. At the default base of 200 no observed run is near that edge (latest
+close: 169). If that edge ever bites, the candidate relaxation is recorded
+here and not built: accept a *fresh green check covering a source change*
+in place of the close attempt.
+
+The extension mechanism itself is covered by unit tests
+(`a_segment_that_landed_a_change_and_tried_to_close_earns_one`,
+`the_total_is_spent_by_either_rounds_stop_but_not_by_other_budgets`); it has
+not yet been observed granting in the field.
 
 ### Across the treatment batches
 
