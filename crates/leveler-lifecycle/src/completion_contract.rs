@@ -2231,3 +2231,190 @@ mod authority_yield_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod behavioural_proof_policy_tests {
+    use super::*;
+    use crate::EvidenceLedger;
+
+    /// The commit point: the run has edited, checked green, and the
+    /// verification plan has reported. This is where the F7 floor applies.
+    fn committed(paths: &[&str]) -> EvidenceLedger {
+        let mut l = EvidenceLedger::default();
+        for (i, p) in paths.iter().enumerate() {
+            l.record_mutation(
+                format!("call-edit-{i}"),
+                "apply_patch",
+                vec![(*p).to_string()],
+            );
+        }
+        l.record_verify("call-check", "pnpm\u{1f}test", 0);
+        l.runtime_evidence_complete = true;
+        l
+    }
+
+    fn satisfied(kind: RequirementKind, text: &str, refs: Vec<String>) -> CompletionRequirement {
+        CompletionRequirement {
+            id: "R1".into(),
+            text: text.into(),
+            kind,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: None,
+            evidence: vec![RequirementEvidence {
+                strength: EvidenceStrength::Mechanical,
+                detail: "the suite is green".into(),
+                refs,
+            }],
+            acceptance_facets: Vec::new(),
+        }
+    }
+
+    fn open_reasons(r: CompletionRequirement, l: &EvidenceLedger) -> Vec<OpenReason> {
+        CompletionContract::new(vec![r])
+            .open_obligations(l)
+            .into_iter()
+            .map(|(_, why)| why)
+            .collect()
+    }
+
+    /// B1. "Make the architecture cleaner" is material and unprovable. A green
+    /// suite says nothing about it, and the judge reading it as satisfied is
+    /// not authority. It stays open at the commit point, for the reason that
+    /// says so.
+    #[test]
+    fn generic_behaviour_is_never_authoritatively_discharged() {
+        for text in [
+            "make the architecture cleaner",
+            "improve maintainability",
+            "use an idiomatic implementation",
+        ] {
+            let r = satisfied(RequirementKind::Behavior, text, vec!["call-check".into()]);
+            assert_eq!(
+                open_reasons(r, &committed(&["src/a.rs"])),
+                vec![OpenReason::MissingAuthoritativeProof],
+                "{text}"
+            );
+        }
+    }
+
+    /// B3. A real, runtime-issued, fresh, green check that is about something
+    /// else is still not proof of THIS behaviour. The citation resolves — that
+    /// is what makes this the interesting case — and the obligation stays open
+    /// because no standard says the check covers it.
+    #[test]
+    fn an_unrelated_green_check_does_not_discharge_a_behaviour() {
+        let r = satisfied(
+            RequirementKind::Behavior,
+            "a nested field under a null parent submits a defined value",
+            vec!["call-check".into()],
+        );
+        let ledger = committed(&["src/logic/createFormControl.ts"]);
+        assert!(
+            ledger.witnesses_behavior("call-check"),
+            "the citation resolves to a real green check — the point of this case"
+        );
+        assert_eq!(
+            open_reasons(r, &ledger),
+            vec![OpenReason::MissingAuthoritativeProof]
+        );
+    }
+
+    /// B4. The agent may write a test and run it green. That test is the same
+    /// agent's account of what its own work must satisfy, and it cannot
+    /// authorize the discharge of the obligation the agent wants closed.
+    #[test]
+    fn an_agent_written_test_does_not_authorize_its_own_discharge() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation(
+            "call-edit",
+            "apply_patch",
+            vec!["src/useController.ts".into()],
+        );
+        // The agent writes its own check and runs it green.
+        ledger.record_mutation(
+            "call-write-test",
+            "apply_patch",
+            vec!["src/__tests__/mine.test.ts".into()],
+        );
+        ledger.record_verify("call-mine", "jest\u{1f}mine", 0);
+        ledger.runtime_evidence_complete = true;
+        let r = satisfied(
+            RequirementKind::Behavior,
+            "the field submits a defined value",
+            vec!["call-mine".into()],
+        );
+        assert_eq!(
+            open_reasons(r, &ledger),
+            vec![OpenReason::MissingAuthoritativeProof],
+            "a test the agent authored and ran is evidence, not authority"
+        );
+    }
+
+    /// B10, adversarial. The implementation is wrong and an unrelated suite is
+    /// green. Nothing about this may reach a discharged obligation — the debt
+    /// is what the terminal boundary reads to refuse the verified claim.
+    #[test]
+    fn a_wrong_implementation_behind_a_green_suite_is_still_debt() {
+        let mut ledger = committed(&["src/wrong.ts"]);
+        ledger.completion_contract = Some(CompletionContract::new(vec![satisfied(
+            RequirementKind::Behavior,
+            "the field submits a defined value",
+            vec!["call-check".into()],
+        )]));
+        let debt = ledger
+            .completion_debt()
+            .expect("a behaviour with no standard is debt however green the suite");
+        assert!(debt.contains("no proof standard"), "{debt}");
+    }
+
+    /// TRUE POSITIVE, restated at the boundary this package is about: when the
+    /// USER's own words name the check, the behaviour obligation carries a
+    /// standard and the record settles it. Authority comes from the task, not
+    /// from the runtime deciding a sentence is testable.
+    #[test]
+    fn a_user_named_check_grounds_a_behaviour_obligation() {
+        let mut r = satisfied(
+            RequirementKind::Behavior,
+            "the field submits a defined value, and `pnpm test` must pass",
+            Vec::new(),
+        );
+        r.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec!["pnpm\u{1f}test".into()],
+            mode: CommandMode::All,
+        });
+        assert!(open_reasons(r, &committed(&["src/a.rs"])).is_empty());
+    }
+
+    /// §22, and the line this package went looking for and did not move. The
+    /// two failures the gate must not confuse:
+    ///
+    /// A VERIFICATION obligation whose standard the derivation could not
+    /// determine is still an obligation to DEMONSTRATE something. The agent
+    /// has moves — write the check, run it, or say plainly it cannot be done —
+    /// so it stays actionable and the claim stays refused. Reclassifying it
+    /// would let "I added a test" close an obligation with no test behind it.
+    ///
+    /// A BEHAVIOUR obligation with no standard has no such move, and is the
+    /// one the gate must stop demanding work for.
+    #[test]
+    fn an_unproven_verification_stays_actionable_but_an_unprovable_behaviour_does_not() {
+        let mut unproven = satisfied(
+            RequirementKind::Verification,
+            "covered by a test",
+            Vec::new(),
+        );
+        unproven.evidence_policy = Some(EvidencePolicy::Unresolved);
+        let reasons = open_reasons(unproven, &committed(&["src/a.rs"]));
+        assert_eq!(reasons, vec![OpenReason::MissingMechanicalEvidence]);
+        assert!(
+            reasons[0].dischargeable_by_more_work(),
+            "writing the check, or reporting blocked, are real moves"
+        );
+
+        let unprovable = satisfied(RequirementKind::Behavior, "make it cleaner", Vec::new());
+        let reasons = open_reasons(unprovable, &committed(&["src/a.rs"]));
+        assert_eq!(reasons, vec![OpenReason::MissingAuthoritativeProof]);
+        assert!(!reasons[0].dischargeable_by_more_work());
+    }
+}

@@ -6,6 +6,10 @@ checks on the ledger — and three refused completion claims ending in a forced
 closeout.
 
 ```
+REQUEST_COMMIT_PHASE_SEMANTICS_CLOSURE=PASS
+COMPLETION_BEHAVIOR_PROOF_BINDING=OPEN — answered in
+  docs/FAST_GOOD_CHEAP_BEHAVIORAL_PROOF_POLICY_CLOSURE.md
+
 COMPLETION_AUTHORITY_ROOT_CAUSE=THE_REQUEST_POINT_WAS_NEVER_REOPENED
 
 PROOF_PRODUCTION=PASS
@@ -125,7 +129,7 @@ different things.
 ```
 FMT=PASS
 CLIPPY=PASS
-FULL_PRODUCT_TEST_GATE=3754 passed, 135 result lines, 1 failure
+FULL_PRODUCT_TEST_GATE=3760 passed, 158 result lines, 1 failure
   the failure is the pre-existing stale `client_command.schema.json` from
   f5a63b2; unrelated to this change and untouched.
 ```
