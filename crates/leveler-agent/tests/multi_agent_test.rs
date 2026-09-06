@@ -6724,3 +6724,117 @@ mod mcp_ownership_boundary {
         );
     }
 }
+
+/// A sink that keeps every finalized record, parent's and children's alike.
+struct SpendSink(std::sync::Arc<std::sync::Mutex<Vec<leveler_agent::ModelRequestRecord>>>);
+
+#[async_trait::async_trait]
+impl leveler_agent::TranscriptSink for SpendSink {
+    async fn append(
+        &mut self,
+        _messages: &[leveler_model::Message],
+    ) -> Result<(), leveler_agent::AgentError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), leveler_agent::AgentError> {
+        self.0.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
+
+/// RCP-A. A delegated child's tokens reach the parent's budget exactly once.
+///
+/// They used to arrive twice by two paths that did not agree: the child's
+/// records travelled up to become `model_requests` rows, and the child's own
+/// summed ledger was separately absorbed into the parent's epoch. Whichever
+/// number a budget then read, it was not the bill — and the paths disagreed by
+/// construction, because a child's rows include the folds and advisory calls
+/// its ledger never counted.
+#[tokio::test]
+async fn a_delegated_child_is_charged_to_the_parent_once() {
+    let dir = tmp("child-spend-once", 91);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let mut child_round = read_call("child-spend-read");
+    child_round.usage = TokenUsage {
+        input_tokens: 700,
+        output_tokens: 30,
+        cached_input_tokens: 300,
+    };
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            {
+                let mut spawn_round = assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "inspect providers", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                );
+                spawn_round.usage = TokenUsage {
+                    input_tokens: 500,
+                    output_tokens: 25,
+                    cached_input_tokens: 200,
+                };
+                spawn_round
+            },
+            child_round,
+            assistant_text_with_usage(
+                "provider report",
+                TokenUsage {
+                    input_tokens: 1_200,
+                    output_tokens: 80,
+                    cached_input_tokens: 600,
+                },
+            ),
+            assistant_text_with_usage(
+                "parent done",
+                TokenUsage {
+                    input_tokens: 400,
+                    output_tokens: 20,
+                    cached_input_tokens: 100,
+                },
+            ),
+        ],
+        Duration::from_millis(0),
+    ));
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .run(
+        "delegate provider inspection",
+        &mut |_| {},
+        &mut SpendSink(recorded.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let rows = recorded.lock().unwrap().clone();
+    let child_rows: Vec<_> = rows.iter().filter(|r| r.agent_id.is_some()).collect();
+    assert!(
+        !child_rows.is_empty(),
+        "the child must actually have spent something: {rows:?}"
+    );
+    let total: u64 = rows.iter().map(|r| r.usage.total()).sum();
+    assert_eq!(
+        outcome.progress.cumulative_model_tokens, total,
+        "parent epoch spend must be the sum of every record once — parent's and \
+         child's alike. rows={rows:?}"
+    );
+    assert_eq!(
+        outcome.progress.cumulative_estimated_model_tokens, 0,
+        "every call here reported its usage"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

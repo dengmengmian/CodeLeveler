@@ -3650,10 +3650,9 @@ mod multi_turn_session_tests {
     fn cumulative_rounds_do_not_reset_on_continue_merge() {
         // Mirrors continue_active_goal: epoch totals grow, not reset.
         let mut progress = leveler_lifecycle::ProgressLedger::default();
-        progress.accumulate_drive(5, 1000);
-        progress.accumulate_drive(3, 500);
+        progress.accumulate_drive_rounds(5);
+        progress.accumulate_drive_rounds(3);
         assert_eq!(progress.cumulative_rounds, 8);
-        assert_eq!(progress.cumulative_model_tokens, 1500);
         // A fresh Content turn with terminal progress must not seed (epoch gate).
         progress.enter_terminal();
         assert!(progress.is_terminal_for_inheritance());

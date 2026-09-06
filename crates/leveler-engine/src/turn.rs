@@ -985,19 +985,25 @@ impl TurnRunner<'_> {
                 )
                 .await
         };
+        // The review's spend is the session's spend: the reviewer's own rounds
+        // and commands fold in from its ledger, and its TOKENS AND COST fold in
+        // from the very records being written down here — the same authority
+        // the bill reconciles against, never a second summary of it.
+        let mut progress = last_persisted_progress(self.stores.events.as_ref(), &self.session_id)
+            .await?
+            .unwrap_or_default();
         for record in &child_records {
             self.stores
                 .model_requests
                 .insert(&storage_model_request(record, &self.session_id))
                 .await?;
+            progress.absorb_request_spend(
+                record.usage.total(),
+                0,
+                record.cost_usd_micros.unwrap_or(0),
+            );
         }
-        // The review's spend is the session's spend: fold rounds, tokens,
-        // cost and commands into the persisted progress so budgets, resume
-        // and the runtime's own counters see it.
-        let mut progress = last_persisted_progress(self.stores.events.as_ref(), &self.session_id)
-            .await?
-            .unwrap_or_default();
-        progress.absorb_child_spend(&result.progress);
+        progress.absorb_child_work(&result.progress);
         self.log
             .append(
                 None,

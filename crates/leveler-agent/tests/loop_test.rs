@@ -10077,3 +10077,164 @@ async fn an_uncited_behaviour_claim_closes_once_the_work_was_observed() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A sink that keeps every finalized record, so a test can compare what
+/// admission believed it had spent against what was actually written down.
+struct SpendSink(Arc<Mutex<Vec<leveler_agent::ModelRequestRecord>>>);
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for SpendSink {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), AgentError> {
+        self.0.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
+
+/// RCP-A. The figure a token cap trips on is the sum of the records, not a
+/// number computed beside them.
+///
+/// The loop used to add up `stream_result.usage` on its own account while
+/// separately handing the same usage to the sink. Two derivations of one fact
+/// is one derivation too many: they agreed for the main loop and nowhere else.
+#[tokio::test]
+async fn token_admission_spends_exactly_what_the_records_say() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-admission-tokens-{}",
+        std::process::id() as u64 * 37 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(UsageRuntime {
+        responses: Mutex::new(VecDeque::from(vec![
+            assistant_tool_call("c1", "list_files", serde_json::json!({"path": "."})),
+            assistant_tool_call("c2", "list_files", serde_json::json!({"path": "."})),
+            assistant_text("must not be requested"),
+        ])),
+        requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        usage: TokenUsage {
+            input_tokens: 60,
+            cached_input_tokens: 20,
+            output_tokens: 40,
+        },
+    });
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_model_tokens: Some(150),
+        ..Default::default()
+    })
+    .run(
+        "inspect within budget",
+        &mut |_| {},
+        &mut SpendSink(recorded.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let rows = recorded.lock().unwrap().clone();
+    let recorded_tokens: u64 = rows.iter().map(|r| r.usage.total()).sum();
+    let exhaustion = outcome
+        .budget_exhaustion
+        .expect("the cap must trip on a spend, not on nothing");
+    assert_eq!(
+        exhaustion.spent, recorded_tokens,
+        "admission spent must BE the recorded total; rows={rows:?}"
+    );
+    assert_eq!(
+        outcome.progress.cumulative_model_tokens, recorded_tokens,
+        "and so must the ledger the next window inherits"
+    );
+    assert_eq!(
+        outcome.progress.cumulative_estimated_model_tokens, 0,
+        "every call here reported its usage; nothing was estimated"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RCP-A. A window that resumes or repairs inherits the spend it already made
+/// and adds this drive's records to it — it does not restart from zero, and it
+/// does not re-count what the previous window already paid for.
+#[tokio::test]
+async fn resumed_spend_continues_from_the_seeded_epoch_without_recounting() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-admission-resume-{}",
+        std::process::id() as u64 * 41 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(UsageRuntime {
+        responses: Mutex::new(VecDeque::from(vec![
+            assistant_tool_call("c1", "list_files", serde_json::json!({"path": "."})),
+            assistant_text("done"),
+        ])),
+        requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        usage: TokenUsage {
+            input_tokens: 30,
+            cached_input_tokens: 10,
+            output_tokens: 20,
+        },
+    });
+    // What earlier windows of this epoch already spent, as the ledger records
+    // it: 900 tokens of which 100 were never reported by any provider.
+    let seeded = leveler_lifecycle::ProgressLedger {
+        cumulative_model_tokens: 900,
+        cumulative_estimated_model_tokens: 100,
+        cumulative_cost_usd_micros: 4_000,
+        ..Default::default()
+    };
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_pricing(Some(leveler_model::ModelPricing {
+        input_usd_per_mtok: 1.0,
+        output_usd_per_mtok: 2.0,
+        cached_input_usd_per_mtok: None,
+    }))
+    .with_seeded_progress(seeded)
+    .run(
+        "carry on",
+        &mut |_| {},
+        &mut SpendSink(recorded.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let rows = recorded.lock().unwrap().clone();
+    let this_window: u64 = rows.iter().map(|r| r.usage.total()).sum();
+    let this_cost: u64 = rows.iter().filter_map(|r| r.cost_usd_micros).sum();
+    assert!(this_window > 0, "this window must actually spend something");
+    assert_eq!(
+        outcome.progress.cumulative_model_tokens,
+        900 + this_window,
+        "resume adds to the epoch; it neither resets it nor re-counts it"
+    );
+    assert_eq!(
+        outcome.progress.cumulative_estimated_model_tokens, 100,
+        "the seeded unreported share survives and does not grow on its own"
+    );
+    assert_eq!(
+        outcome.progress.cumulative_cost_usd_micros,
+        4_000 + this_cost,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

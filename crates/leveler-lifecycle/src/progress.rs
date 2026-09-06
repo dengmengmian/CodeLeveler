@@ -72,8 +72,24 @@ pub struct ProgressLedger {
     #[serde(default)]
     pub cumulative_rounds: u32,
     /// Model tokens spent across continues/resumes of this task epoch.
+    ///
+    /// This is the number a token budget admits on. It is the durable
+    /// `model_requests` total for this session PLUS
+    /// [`Self::cumulative_estimated_model_tokens`] — subtract that and what
+    /// remains must equal the ledger exactly.
     #[serde(default)]
     pub cumulative_model_tokens: u64,
+    /// The share of [`Self::cumulative_model_tokens`] that no provider
+    /// reported.
+    ///
+    /// A gateway that returns zero usage must not silently switch the token
+    /// budget off, so the loop bills a transcript estimate instead. That
+    /// estimate is an admission input, not an accounting fact, and it has no
+    /// durable row behind it. Carried separately so the two can never be
+    /// confused for one another: the ledger stays reconcilable, and a caller
+    /// that needs the audited figure subtracts this.
+    #[serde(default)]
+    pub cumulative_estimated_model_tokens: u64,
     /// `run_command` / `shell_command` executions across the epoch.
     #[serde(default)]
     pub cumulative_commands: u32,
@@ -164,17 +180,25 @@ impl ProgressLedger {
         self.phase = TurnPhase::Terminal;
     }
 
-    /// Fold one finished drive's spend into the epoch totals.
-    pub fn accumulate_drive(&mut self, rounds: u32, model_tokens: u64) {
+    /// Fold one finished drive's rounds into the epoch totals.
+    ///
+    /// Rounds only. Spend has exactly one way in — [`Self::absorb_request_spend`],
+    /// fed by the finalized records — and a second writer for tokens is how the
+    /// runtime came to hold a number the bill could not account for.
+    pub fn accumulate_drive_rounds(&mut self, rounds: u32) {
         self.cumulative_rounds = self.cumulative_rounds.saturating_add(rounds);
-        self.cumulative_model_tokens = self.cumulative_model_tokens.saturating_add(model_tokens);
     }
 
     /// Absolute epoch spend snapshot (used when a drive ends or is mid-flight).
+    ///
+    /// `estimated_model_tokens` is the unreported share of `model_tokens` —
+    /// see [`Self::cumulative_estimated_model_tokens`].
+    #[allow(clippy::too_many_arguments)]
     pub fn set_epoch_spend(
         &mut self,
         rounds: u32,
         model_tokens: u64,
+        estimated_model_tokens: u64,
         commands: u32,
         cost_usd_micros: u64,
         duration_ms: u64,
@@ -182,6 +206,7 @@ impl ProgressLedger {
     ) {
         self.cumulative_rounds = rounds;
         self.cumulative_model_tokens = model_tokens;
+        self.cumulative_estimated_model_tokens = estimated_model_tokens;
         self.cumulative_commands = commands;
         self.cumulative_cost_usd_micros = cost_usd_micros;
         self.cumulative_duration_ms = duration_ms;
@@ -206,25 +231,51 @@ impl ProgressLedger {
         self.cumulative_modified_files = self.cumulative_modified_paths.len() as u32;
     }
 
-    /// Fold another ledger's spend into this epoch (sub-agent → parent rollup).
+    /// Fold another ledger's non-spend work into this epoch (sub-agent →
+    /// parent rollup): rounds, commands and touched files.
     ///
     /// Does **not** add child wall-clock duration: parent duration is wall time
-    /// of the parent drive (children may run concurrently). Commands / tokens /
-    /// cost / files still roll up.
-    pub fn absorb_child_spend(&mut self, child: &ProgressLedger) {
+    /// of the parent drive (children may run concurrently).
+    ///
+    /// Deliberately does **not** add the child's tokens or cost either. A
+    /// child's model calls reach the parent as records — the same records that
+    /// become its `model_requests` rows — and are folded there. Adding the
+    /// child's own summed totals here as well would bill every delegated token
+    /// twice, and the two paths do not even agree: the child's ledger counts
+    /// its rounds, while its rows also carry the folds and advisory calls it
+    /// made. Spend has one path in, and it is the record.
+    pub fn absorb_child_work(&mut self, child: &ProgressLedger) {
         self.cumulative_rounds = self
             .cumulative_rounds
             .saturating_add(child.cumulative_rounds);
-        self.cumulative_model_tokens = self
-            .cumulative_model_tokens
-            .saturating_add(child.cumulative_model_tokens);
         self.cumulative_commands = self
             .cumulative_commands
             .saturating_add(child.cumulative_commands);
+        self.merge_modified_paths(child.cumulative_modified_paths.iter().cloned());
+    }
+
+    /// Fold one model call's spend into the epoch.
+    ///
+    /// The single entry point for tokens and cost: whoever made the call — the
+    /// root loop, a delegated child, the closure reviewer, a bounded advisory
+    /// — its spend arrives here, once, from the same finalized record that
+    /// becomes its durable row.
+    pub fn absorb_request_spend(
+        &mut self,
+        reported_tokens: u64,
+        estimated_tokens: u64,
+        cost_usd_micros: u64,
+    ) {
+        self.cumulative_model_tokens = self
+            .cumulative_model_tokens
+            .saturating_add(reported_tokens)
+            .saturating_add(estimated_tokens);
+        self.cumulative_estimated_model_tokens = self
+            .cumulative_estimated_model_tokens
+            .saturating_add(estimated_tokens);
         self.cumulative_cost_usd_micros = self
             .cumulative_cost_usd_micros
-            .saturating_add(child.cumulative_cost_usd_micros);
-        self.merge_modified_paths(child.cumulative_modified_paths.iter().cloned());
+            .saturating_add(cost_usd_micros);
     }
 
     /// Fresh epoch after /clear, /compact, or checkpoint restore — no inheritance.
@@ -441,12 +492,10 @@ mod tests {
         assert!(!led.is_terminal_for_inheritance());
         led.enter_closing();
         assert!(led.is_terminal_for_inheritance());
-        led.accumulate_drive(5, 1200);
+        led.accumulate_drive_rounds(5);
         assert_eq!(led.cumulative_rounds, 5);
-        assert_eq!(led.cumulative_model_tokens, 1200);
-        led.accumulate_drive(3, 800);
+        led.accumulate_drive_rounds(3);
         assert_eq!(led.cumulative_rounds, 8);
-        assert_eq!(led.cumulative_model_tokens, 2000);
         led.enter_terminal();
         assert!(led.is_terminal_for_inheritance());
         assert_eq!(led.phase, TurnPhase::Terminal);
@@ -455,7 +504,7 @@ mod tests {
     #[test]
     fn epoch_spend_and_context_reset() {
         let mut led = ProgressLedger::default();
-        led.set_epoch_spend(4, 900, 7, 12_000, 5_000, 3);
+        led.set_epoch_spend(4, 900, 0, 7, 12_000, 5_000, 3);
         assert_eq!(led.cumulative_commands, 7);
         assert_eq!(led.cumulative_cost_usd_micros, 12_000);
         assert_eq!(led.cumulative_duration_ms, 5_000);
@@ -474,16 +523,36 @@ mod tests {
         assert_eq!(parent.cumulative_modified_paths, vec!["a.rs", "b.rs"]);
 
         let mut child = ProgressLedger::default();
-        child.set_epoch_spend(2, 100, 3, 50, 10, 0);
+        child.set_epoch_spend(2, 100, 0, 3, 50, 10, 0);
         child.merge_modified_paths(["b.rs", "c.rs"]);
-        parent.absorb_child_spend(&child);
+        parent.absorb_child_work(&child);
         assert_eq!(parent.cumulative_commands, 3);
-        assert_eq!(parent.cumulative_model_tokens, 100);
-        assert_eq!(parent.cumulative_cost_usd_micros, 50);
+        assert_eq!(parent.cumulative_rounds, 2);
+        // Spend does NOT ride the child's ledger: its records carry it, and
+        // folding both would bill every delegated token twice.
+        assert_eq!(parent.cumulative_model_tokens, 0);
+        assert_eq!(parent.cumulative_cost_usd_micros, 0);
         // Wall duration is parent-only; child duration must not inflate it.
         assert_eq!(parent.cumulative_duration_ms, 0);
         assert_eq!(parent.cumulative_modified_files, 3);
         assert!(parent.cumulative_modified_paths.contains(&"c.rs".into()));
+    }
+
+    /// Spend arrives one record at a time, and the unreported share stays
+    /// separable from the share a durable row can vouch for.
+    #[test]
+    fn request_spend_keeps_the_estimated_share_separable() {
+        let mut led = ProgressLedger::default();
+        led.absorb_request_spend(1_000, 0, 40);
+        led.absorb_request_spend(0, 250, 0);
+        assert_eq!(led.cumulative_model_tokens, 1_250, "admission sees both");
+        assert_eq!(led.cumulative_estimated_model_tokens, 250);
+        assert_eq!(
+            led.cumulative_model_tokens - led.cumulative_estimated_model_tokens,
+            1_000,
+            "what remains is exactly what the ledger can vouch for"
+        );
+        assert_eq!(led.cumulative_cost_usd_micros, 40);
     }
 
     #[test]

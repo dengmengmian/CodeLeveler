@@ -24,6 +24,7 @@ mod prompt;
 mod reconciliation;
 pub use reconciliation::DEFAULT_RECONCILE_TIMEOUT;
 mod sub_agent;
+pub mod usage;
 
 pub use budget::{
     BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, budget_extension_allowed,

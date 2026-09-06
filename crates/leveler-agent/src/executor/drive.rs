@@ -166,6 +166,43 @@ impl Executor {
         // it did; a seeded continuation must not begin inside the closeout it
         // was issued to get out of.
         progress.closing = false;
+        // Spend admission reads ONE authority: the finalized model-request
+        // records, folded here as they are handed to the sink that makes them
+        // `model_requests` rows. Whatever this drive spends is
+        // `<what the epoch already spent> + <this drive's projection>` —
+        // nothing re-derives a token count or re-applies a price table.
+        let mut usage = crate::usage::RuntimeUsageProjection::default();
+        let epoch_tokens_at_start = progress.cumulative_model_tokens;
+        let epoch_estimated_at_start = progress.cumulative_estimated_model_tokens;
+        let epoch_cost_at_start = progress.cumulative_cost_usd_micros;
+        let mut model_tokens_spent = epoch_tokens_at_start;
+        let mut estimated_tokens_spent = epoch_estimated_at_start;
+        let mut cost_spent_micros = epoch_cost_at_start;
+        // The one way a model call becomes spend. Every provider call this
+        // drive is responsible for — its own rounds, the folds it triggers,
+        // the bounded advisory calls it makes, and every call its children
+        // make — arrives here as an already-priced record, is projected into
+        // the runtime's admission totals, and is then written down. One event,
+        // two consumers; the guard and the bill cannot drift apart because
+        // there is nothing left to drift.
+        //
+        // `$estimate` stands in for a provider that reported no usage at all:
+        // an admission input with no durable row behind it, tracked apart so
+        // the reconciliation stays exact.
+        macro_rules! record_request {
+            ($record:expr) => {{ record_request!($record, None) }};
+            ($record:expr, $estimate:expr) => {{
+                let record = $record;
+                usage.record(&record, $estimate);
+                model_tokens_spent =
+                    epoch_tokens_at_start.saturating_add(usage.admission_model_tokens());
+                estimated_tokens_spent =
+                    epoch_estimated_at_start.saturating_add(usage.estimated_model_tokens);
+                cost_spent_micros =
+                    epoch_cost_at_start.saturating_add(usage.admission_cost_usd_micros());
+                sink.record_model_request(&record).await?;
+            }};
+        }
         let structured_plan_required =
             self.policy.require_explicit_plan && task_needs_structured_plan(&original_task);
         // Soft plan nudge only: after this many explore rounds without a plan,
@@ -218,8 +255,7 @@ impl Executor {
                 )
                 .await;
                 for record in &spend {
-                    sink.record_model_request(&record.clone().priced(self.pricing.as_ref()))
-                        .await?;
+                    record_request!(record.clone().priced(self.pricing.as_ref()));
                 }
                 // Failures used to be one indistinguishable `None`, so a
                 // budget ceiling read the same as a provider outage and the
@@ -494,11 +530,8 @@ impl Executor {
         }
         let cancellation = turn_cancellation;
         let mut commands_run = progress.cumulative_commands;
-        let mut model_tokens_spent = progress.cumulative_model_tokens;
-        let mut cost_spent_micros = progress.cumulative_cost_usd_micros;
         // Human reason + structured dimension when a step limit trips mid-round.
         let mut budget_exceeded: Option<(String, crate::budget::BudgetExhaustion)> = None;
-        let epoch_tokens_at_start = progress.cumulative_model_tokens;
         let epoch_rounds_at_start = progress.cumulative_rounds;
 
         if self.step_limits.max_cost_usd_micros.is_some() && self.pricing.is_none() {
@@ -523,6 +556,7 @@ impl Executor {
                     run_started,
                     $rounds,
                     model_tokens_spent,
+                    estimated_tokens_spent,
                     commands_run,
                     cost_spent_micros,
                     &modified_files,
@@ -543,7 +577,8 @@ impl Executor {
             ($event:expr) => {{
                 let event = $event;
                 if let AgentEvent::SubAgentModelRequest { record } = &event {
-                    sink.record_model_request(record).await?;
+                    // Already priced by the child against its own model.
+                    record_request!((**record).clone());
                 } else {
                     observer(event);
                 }
@@ -578,8 +613,6 @@ impl Executor {
                     let (content, _ok) = fold_child_settlement(
                         &mut progress,
                         &mut commands_run,
-                        &mut model_tokens_spent,
-                        &mut cost_spent_micros,
                         &mut modified_files,
                         &mut ledger,
                         observer,
@@ -955,8 +988,25 @@ impl Executor {
                 Err(e) => return Err(e),
             };
 
-            sink.record_model_request(
-                &ModelRequestRecord {
+            // Zero-usage gateways must not disable the token budget: fall back
+            // to the transcript estimate (same fallback compaction uses), so
+            // `max_model_tokens` still binds. Estimated spend is per-round
+            // request + response, mirroring what the provider actually bills.
+            let round_estimate = if stream_result.usage.total() > 0 {
+                None
+            } else {
+                Some(estimate_tokens(&messages).saturating_add(estimate_tokens(
+                    std::slice::from_ref(&stream_result.message),
+                )))
+            };
+            // Priced once, here, against the usage the provider reported —
+            // cached share included, because charging every input token at the
+            // uncached rate overstated a session's cost by roughly 4x at a 90%
+            // hit rate and made a cost budget bind long before the money was
+            // actually spent. The same priced record is what admission folds
+            // and what the ledger stores.
+            record_request!(
+                ModelRequestRecord {
                     provider_request_id: Some(stream_result.request_id.clone()),
                     provider: self.model.provider.clone(),
                     model: self.model.model.clone(),
@@ -969,32 +1019,8 @@ impl Executor {
                     cost_usd_micros: None,
                 }
                 .priced(self.pricing.as_ref()),
-            )
-            .await?;
-            // Zero-usage gateways must not disable the token budget: fall back
-            // to the transcript estimate (same fallback compaction uses), so
-            // `max_model_tokens` still binds. Estimated spend is per-round
-            // request + response, mirroring what the provider actually bills.
-            let round_tokens = if stream_result.usage.total() > 0 {
-                stream_result.usage.total()
-            } else {
-                estimate_tokens(&messages).saturating_add(estimate_tokens(std::slice::from_ref(
-                    &stream_result.message,
-                )))
-            };
-            model_tokens_spent = model_tokens_spent.saturating_add(round_tokens);
-            if let Some(pricing) = self.pricing {
-                // Bill the prompt the way the provider does. Charging every
-                // input token at the uncached rate overstated a session's cost
-                // by roughly 4x at a 90% cache hit rate, which made a cost
-                // budget bind long before the money was actually spent.
-                cost_spent_micros =
-                    cost_spent_micros.saturating_add(pricing.cost_usd_micros_cached(
-                        stream_result.usage.input_tokens,
-                        stream_result.usage.cached_input_tokens,
-                        stream_result.usage.output_tokens,
-                    ));
-            }
+                round_estimate
+            );
             // Cost can cross the limit on the response that tips it; stop after
             // this round's tools (if any) rather than allowing another model call.
             if let Some(max) = self.step_limits.max_cost_usd_micros
@@ -1698,17 +1724,11 @@ impl Executor {
                             .map(|c| format!("{} ({})", c.nickname, c.id))
                             .collect();
                         // Review 必改②: this drain runs MID tool batch — pin the
-                        // parent's same-batch spend first, or the settlement
+                        // parent's same-batch commands first, or the settlement
                         // fold overwrites local counters with a lagging ledger
-                        // (the exact under-count pin_parent_batch_spend exists
+                        // (the exact under-count pin_parent_batch_work exists
                         // to prevent on the foreground path).
-                        pin_parent_batch_spend(
-                            &mut progress,
-                            commands_run,
-                            model_tokens_spent,
-                            cost_spent_micros,
-                            &modified_files,
-                        );
+                        pin_parent_batch_work(&mut progress, commands_run, &modified_files);
                         drain_background_children!(round);
                         let feedback = format!(
                             "Cannot complete: delegated sub-agent(s) {} were still \
@@ -1919,10 +1939,7 @@ impl Executor {
                             )
                             .await;
                             for record in &judge_spend {
-                                sink.record_model_request(
-                                    &record.clone().priced(self.pricing.as_ref()),
-                                )
-                                .await?;
+                                record_request!(record.clone().priced(self.pricing.as_ref()));
                             }
                             tracing::info!(
                                 executor_model = %self.model,
@@ -1968,10 +1985,9 @@ impl Executor {
                                     .await
                                     .ok();
                                     for record in &spend {
-                                        sink.record_model_request(
-                                            &record.clone().priced(self.pricing.as_ref()),
-                                        )
-                                        .await?;
+                                        record_request!(
+                                            record.clone().priced(self.pricing.as_ref())
+                                        );
                                     }
                                     derived
                                 }
@@ -3148,16 +3164,10 @@ impl Executor {
                 let mut futs = FuturesUnordered::new();
                 // Parent may have run shells/edits in this same tool batch
                 // before children. Pin that spend on the ledger now — otherwise
-                // absorb_child_spend + `commands_run = progress.cumulative_*`
+                // absorb_child_work + `commands_run = progress.cumulative_*`
                 // overwrites local counters with a lagging ledger (mixed batch
                 // under-counts parent commands).
-                pin_parent_batch_spend(
-                    &mut progress,
-                    commands_run,
-                    model_tokens_spent,
-                    cost_spent_micros,
-                    &modified_files,
-                );
+                pin_parent_batch_work(&mut progress, commands_run, &modified_files);
                 // Pass 1: reject invalid spawns. Pass 2: split residual only
                 // across *accepted* children (rejected slots must not dilute
                 // the share — and must not let accepted children oversell).
@@ -3571,8 +3581,6 @@ impl Executor {
                             let (content, ok) = fold_child_settlement(
                                 &mut progress,
                                 &mut commands_run,
-                                &mut model_tokens_spent,
-                                &mut cost_spent_micros,
                                 &mut modified_files,
                                 &mut ledger,
                                 observer,
@@ -4150,8 +4158,8 @@ impl Executor {
                 // recorded a session that folded reported fewer tokens than it
                 // spent — precisely in the lane a fold is the cost of.
                 if let Some(summarized) = &summarized {
-                    sink.record_model_request(
-                        &ModelRequestRecord {
+                    record_request!(
+                        ModelRequestRecord {
                             provider_request_id: Some(summarized.request_id.to_string()),
                             provider: self.model.provider.clone(),
                             model: self.model.model.clone(),
@@ -4163,9 +4171,8 @@ impl Executor {
                             agent_id: None,
                             cost_usd_micros: None,
                         }
-                        .priced(self.pricing.as_ref()),
-                    )
-                    .await?;
+                        .priced(self.pricing.as_ref())
+                    );
                 }
                 let mut summary = summarized.map(|s| s.text);
                 // Long-goal P3: before old context is folded away, the host
@@ -4283,8 +4290,6 @@ impl Executor {
 fn fold_child_settlement(
     progress: &mut leveler_lifecycle::ProgressLedger,
     commands_run: &mut u32,
-    model_tokens_spent: &mut u64,
-    cost_spent_micros: &mut u64,
     modified_files: &mut Vec<String>,
     ledger: &mut EvidenceLedger,
     observer: &mut (dyn FnMut(AgentEvent) + Send),
@@ -4293,8 +4298,10 @@ fn fold_child_settlement(
     role: AgentRole,
     result: &super::handlers::SubAgentRunResult,
 ) -> (String, bool) {
-    // Roll sub-agent spend into the parent task epoch.
-    progress.absorb_child_spend(&result.progress);
+    // Roll the sub-agent's work into the parent task epoch. Its SPEND does not
+    // travel this way: every model call it made already reached the parent as a
+    // record and was folded into the usage projection when it arrived.
+    progress.absorb_child_work(&result.progress);
     // Settlement × continuation seam: every settled result starts as debt the
     // parent has not acted on. The round loop resets the counter when a round
     // with the notice model-visible performs a successful non-observe action,
@@ -4302,8 +4309,6 @@ fn fold_child_settlement(
     // continuation layer must give the parent a bounded window to integrate.
     progress.unconsumed_child_settlements = progress.unconsumed_child_settlements.saturating_add(1);
     *commands_run = progress.cumulative_commands;
-    *model_tokens_spent = progress.cumulative_model_tokens;
-    *cost_spent_micros = progress.cumulative_cost_usd_micros;
     for path in &result.modified_files {
         if !modified_files.iter().any(|p| p == path) {
             modified_files.push(path.clone());
@@ -4459,23 +4464,21 @@ fn join_settlement(
     }
 }
 
-/// Pin parent-local batch spend onto the ledger before child absorb.
+/// Pin parent-local batch work onto the ledger before child absorb.
 ///
-/// Local `commands_run` / tokens / cost advance when parent tools run in the
-/// same assistant batch as `spawn_agent`; the ledger may still lag until the
-/// next `sync_epoch_progress`. Without this pin, `absorb_child_spend` +
-/// reassignment from `progress.cumulative_*` drops the parent's same-batch spend.
-fn pin_parent_batch_spend(
+/// Local `commands_run` advances when parent tools run in the same assistant
+/// batch as `spawn_agent`; the ledger may still lag until the next
+/// `sync_epoch_progress`. Without this pin, `absorb_child_work` + reassignment
+/// from `progress.cumulative_*` drops the parent's same-batch commands.
+///
+/// Tokens and cost need no pin: they are an absolute projection of the records
+/// seen so far, not a running local the ledger can overwrite.
+fn pin_parent_batch_work(
     progress: &mut leveler_lifecycle::ProgressLedger,
     commands_run: u32,
-    model_tokens_spent: u64,
-    cost_spent_micros: u64,
     modified_files: &[String],
 ) {
     progress.cumulative_commands = progress.cumulative_commands.max(commands_run);
-    progress.cumulative_model_tokens = progress.cumulative_model_tokens.max(model_tokens_spent);
-    progress.cumulative_cost_usd_micros =
-        progress.cumulative_cost_usd_micros.max(cost_spent_micros);
     progress.merge_modified_paths(modified_files.iter().cloned());
 }
 
@@ -4682,6 +4685,7 @@ fn sync_epoch_progress(
     run_started: std::time::Instant,
     round: u32,
     model_tokens_spent: u64,
+    estimated_tokens_spent: u64,
     commands_run: u32,
     cost_spent_micros: u64,
     modified_files: &[String],
@@ -4696,6 +4700,7 @@ fn sync_epoch_progress(
     progress.set_epoch_spend(
         epoch_rounds_at_start.saturating_add(round),
         model_tokens_spent,
+        estimated_tokens_spent,
         commands_run,
         cost_spent_micros,
         duration_ms,
@@ -4798,20 +4803,20 @@ mod residual_budget_tests {
     }
 
     #[test]
-    fn pin_parent_batch_spend_keeps_local_commands_before_absorb() {
+    fn pin_parent_batch_work_keeps_local_commands_before_absorb() {
         use leveler_lifecycle::ProgressLedger;
         // Ledger lags (0); local batch already spent 1 command.
         let mut progress = ProgressLedger {
             cumulative_commands: 0,
             ..Default::default()
         };
-        pin_parent_batch_spend(&mut progress, 1, 0, 0, &[]);
+        pin_parent_batch_work(&mut progress, 1, &[]);
         assert_eq!(progress.cumulative_commands, 1);
         let child = ProgressLedger {
             cumulative_commands: 1,
             ..Default::default()
         };
-        progress.absorb_child_spend(&child);
+        progress.absorb_child_work(&child);
         assert_eq!(
             progress.cumulative_commands, 2,
             "parent same-batch + child must both count"

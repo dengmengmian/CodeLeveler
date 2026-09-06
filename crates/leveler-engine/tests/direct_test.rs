@@ -80,6 +80,13 @@ impl ModelRuntime for MockRuntime {
                 "context_window": 128000, "reliable_context": 64000,
                 "max_output_tokens": 4096, "max_tool_schema_bytes": 65536,
                 "max_parallel_tool_calls": 4
+            },
+            // Priced, so a run exercises the cost half of spend accounting
+            // rather than leaving every row unpriced and every cost zero.
+            "pricing": {
+                "input_usd_per_mtok": 1.0,
+                "output_usd_per_mtok": 4.0,
+                "cached_input_usd_per_mtok": 0.1
             }
         }))
         .unwrap())
@@ -3344,5 +3351,128 @@ async fn a_behaviour_with_no_proof_standard_is_accepted_but_never_verified() {
         report.outcome,
         TaskOutcome::CompletedUnverified,
         "a behaviour read as satisfied with no standard behind it is not Verified"
+    );
+}
+
+/// Stamp provider-reported usage onto a scripted response.
+fn with_usage(mut response: ModelResponse, input: u64, cached: u64, output: u64) -> ModelResponse {
+    response.usage = TokenUsage {
+        input_tokens: input,
+        cached_input_tokens: cached,
+        output_tokens: output,
+    };
+    response
+}
+
+/// RCP-A. The number a budget guard admits on and the number the bill
+/// reconciles to must be the same number.
+///
+/// `model_requests` is the durable factual authority for what a session spent.
+/// The runtime used to compute its own spend beside it — from the same
+/// provider usage, but only for the main loop's own rounds — so a session's
+/// advisory calls, its folds and its reviewer were on the books and invisible
+/// to admission, while a child's tokens arrived twice by two paths that did
+/// not agree. Two authorities that disagree is not an accounting nicety: it is
+/// a cost cap that binds at the wrong time, in whichever direction the drift
+/// happens to run.
+///
+/// This pins the projection to the ledger field by field over a run that
+/// spends in every lane it has: root rounds with reported usage, a
+/// contract-derivation advisory the mock answers with none, and a
+/// harness-launched reviewer.
+#[tokio::test]
+async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
+    let mut responses = vec![
+        // Deliberately unstamped: a gateway that reports no usage at all.
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        with_usage(
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+            ),
+            5_000,
+            4_500,
+            80,
+        ),
+    ];
+    responses.push(with_usage(
+        text("reviewed src/auth.rs: no blocking defect found"),
+        900,
+        0,
+        40,
+    ));
+    responses.push(with_usage(
+        text("reviewed src/auth.rs: no blocking defect found"),
+        950,
+        0,
+        30,
+    ));
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let durable = leveler_storage::ModelRequestRepository::new(&h.db)
+        .reconcile_session(&session)
+        .await
+        .unwrap();
+    let ledger = seen
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .next_back()
+        .expect("a run that spent anything publishes its ledger");
+
+    assert!(
+        !durable.by_agent.is_empty(),
+        "the run must spend in a child lane too, or this proves nothing: {durable:?}"
+    );
+    assert!(
+        durable.total.requests > durable.root.requests,
+        "root and child rows must both be present: {durable:?}"
+    );
+    assert_eq!(
+        ledger.cumulative_model_tokens - ledger.cumulative_estimated_model_tokens,
+        durable.total.input_tokens + durable.total.output_tokens,
+        "the audited share of runtime token admission must BE the durable \
+         ledger's own total (durable={:?}, runtime={}, estimated={})",
+        durable.total,
+        ledger.cumulative_model_tokens,
+        ledger.cumulative_estimated_model_tokens,
+    );
+    assert_eq!(
+        ledger.cumulative_cost_usd_micros, durable.total.cost_usd_micros,
+        "runtime cost admission must be the durable ledger's own total \
+         (durable={:?}, runtime={})",
+        durable.total, ledger.cumulative_cost_usd_micros,
+    );
+    assert_eq!(
+        durable.total.rows_without_cost, 0,
+        "a priced model leaves no unpriced row: {:?}",
+        durable.total
+    );
+    assert!(
+        ledger.cumulative_estimated_model_tokens > 0,
+        "the first round reports no usage at all; the estimate standing in for \
+         it is what keeps a token budget binding, and it must stay visible as \
+         an estimate rather than blend into the audited total"
     );
 }
