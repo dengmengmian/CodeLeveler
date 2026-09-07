@@ -10,6 +10,103 @@ investigation is how these runs reach their fix, and that cutting it early
 truncates correct work. The question is why the same investigation costs so
 many model ↔ tool round trips.
 
+## Verdict, after a clean A/B
+
+The batching lever was implemented, measured twice, and **rejected**. The
+second measurement — contemporaneous, interleaved, latency-matched — refuted
+the first. What follows records both, because the difference between them is
+the more useful lesson.
+
+```
+L1_BATCHING_CONFIRMATION = REJECTED
+L1_BATCHING_AS_PRIMARY_FAST_LEVER = REJECTED
+```
+
+### The confirmation cohort
+
+14 runs, alternating arms within the same hours (`C T T C` / `T C C T` /
+`C T C T T C`), one machine, serial, same model and gateway, frozen engineering
+timeouts (C1/C2 3600s, C3 5400s; the formal 3600s contract untouched).
+
+```
+LATENCY_PARITY = YES     control median 4.7s (4.2–5.5) · treatment 4.9s (3.7–5.7)
+```
+
+The arms sat in one latency regime. That is what the earlier attempt could not
+say, and it is what makes this result readable.
+
+| | control (n=7) | treatment (n=7) |
+|---|---|---|
+| GOOD | 6/7 | 5/7 |
+| multi-tool turn ratio | **16.4%** (6.5–30.8) | **21.2%** (12.2–28.6) |
+| tools per tool-using turn | 1.19 (1.07–1.39) | 1.22 (1.13–1.36) |
+| main-task requests | **91** (39–200) | **119** (36–151) |
+| input tokens | 5.67M | 7.03M |
+| cost | **$0.82** | **$1.01** |
+| wall | **1857s** | **2314s** |
+| timeouts | 0/7 | 1/7 |
+
+Paired by task, only C3 moved in the hypothesised direction:
+
+| task | multi% C→T | requests C→T | cost C→T |
+|---|---|---|---|
+| C1 | 28.3 → 26.6 | 57 → 78 | $0.47 → $0.62 |
+| C2 | 18.7 → 17.9 | 79 → 144 | $0.69 → $1.20 |
+| C3 | 12.7 → 16.1 | 165 → 98 | $1.86 → $0.99 |
+
+Requests, cost and wall all moved the **wrong** way at the median. The ~40%
+round reduction reported from the first attempt does not reproduce.
+
+### Why the first reading was wrong
+
+**The control's own batching varies more than the treatment changes it.**
+Untreated runs range from 6.5% to 30.8% multi-tool turns. The treatment shifts
+the median by about five points into a distribution that already spans
+twenty-four. At n=7 per arm the effect is smaller than the noise it sits in.
+
+The original diagnosis anchored on post-closure C3 at 1.6% multi-tool and
+called single-tool turns a stable 73–98% property. It is not stable. That run
+was at the far tail of a wide natural distribution, and building a lever on it
+measured the tail, not the property.
+
+### What the diagnosis still gets right
+
+Unchanged by any of this, because it is arithmetic inside single runs:
+
+- Cost is round-trip count × accumulated context. formal C3 carried 445 KB of
+  tool results and spent 10.2M input tokens — the transcript is re-sent about
+  ninety times.
+- Assistant prose is 0.6–5.1% of the transcript. Reasoning volume is not the
+  amplifier.
+- 50–88% of wall is model latency at a per-round-trip cost that does not depend
+  on how much work the round carries.
+- Long silent investigation is how correct runs reach their fix (RCP-D2), so
+  stopping earlier is not available.
+
+The cost structure is real. **Telling the model to batch is not a lever on it.**
+
+### What this rules out, and what is left
+
+Three levers have now been measured and none survived:
+
+```
+quiet-round early closeout      REFUTED    (truncates correct runs)
+delegation reconsideration      WEAKENED   (adoption 0/2 after reoffer)
+independent-inspection batching REJECTED   (effect < control variance)
+```
+
+All three tried to change what the model *chooses* to do. The remaining
+directions change what a choice *costs*:
+
+1. **Shell ergonomics.** C3 routes 68–70% of its shell calls at text search,
+   file discovery and source inspection — and `shell_command` is not
+   parallel-safe, so that work cannot batch even in principle. This is a
+   capability gap, not an instruction gap.
+2. **Tool-result and context growth.** The secondary amplifier, untouched.
+
+Neither has been attempted. Both are mechanical rather than persuasive, which
+on this evidence is the distinction that matters.
+
 ## The finding
 
 | run | correct | turns | 1-tool turns | multi | median tools/turn | tool calls |
