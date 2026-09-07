@@ -9,6 +9,7 @@
 //! are owned by the orchestration and verification layers.
 #![forbid(unsafe_code)]
 
+pub mod admission;
 mod authorization;
 mod budget;
 mod child_profile;

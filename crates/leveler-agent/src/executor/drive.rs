@@ -732,117 +732,118 @@ impl Executor {
             // at the round's end — is invisible until the next model call and
             // must survive this round's consumption reset.
             let visible_settlement_debt = progress.unconsumed_child_settlements;
-            if let Some(max) = self.step_limits.max_model_tokens
-                && model_tokens_spent >= max
-            {
-                let reason = format!(
-                    "Stopped: the {max}-token model budget was exhausted after {round} round(s)."
-                );
-                observer(AgentEvent::Finished(reason.clone()));
-                flush_epoch!(round);
-
-                drain_background_children!(round);
-                return Ok(AgentOutcome::drive_budget_exhausted(
-                    reason,
+            // The one place that decides whether another main-task model call
+            // happens. These six predicates ran inline here, each with its own
+            // early return, and every path that wanted another round reached
+            // them only by falling back to the top of the loop. Same
+            // predicates, same order, same verdicts — named, and now with one
+            // input a later policy can be handed.
+            let verdict =
+                crate::admission::admit_next_round(&crate::admission::RoundAdmissionInput {
                     round,
-                    modified_files,
-                    crate::budget::BudgetExhaustion::new(
-                        crate::budget::BudgetDimension::ModelTokens,
-                        model_tokens_spent,
-                        max,
-                    ),
-                    &metrics,
-                    &progress,
-                    &objective,
-                ));
-            }
-            if let Some(max) = self.step_limits.max_cost_usd_micros
-                && cost_spent_micros >= max
-            {
-                let reason = format!(
-                    "Stopped: the {max}-micro-USD model cost budget was exhausted after {round} round(s)."
-                );
-                observer(AgentEvent::Finished(reason.clone()));
-                flush_epoch!(round);
-
-                drain_background_children!(round);
-                return Ok(AgentOutcome::drive_budget_exhausted(
-                    reason,
-                    round,
-                    modified_files,
-                    crate::budget::BudgetExhaustion::new(
-                        crate::budget::BudgetDimension::Cost,
-                        cost_spent_micros,
-                        max,
-                    ),
-                    &metrics,
-                    &progress,
-                    &objective,
-                ));
-            }
-            if round >= round_ceiling {
-                // Unconditional circuit breaker: even a busy loop that evades
-                // every progress watchdog terminates here.
-                let reason = format!(
-                    "Stopped: reached the {round_ceiling}-round ceiling for a single turn."
-                );
-                observer(AgentEvent::Finished(reason.clone()));
-                flush_epoch!(round);
-                drain_background_children!(round);
-                return Ok(AgentOutcome::drive_result(
-                    reason,
-                    round,
-                    modified_files,
-                    StopReason::TurnLimitReached,
-                    Some("round ceiling reached".to_string()),
-                    &metrics,
-                    &progress,
-                    &objective,
-                ));
-            }
-            if self
-                .continuation
-                .round_limit()
-                .is_some_and(|max| round >= max)
-            {
-                break;
-            }
-            round = round.saturating_add(1);
-            let has_next_round = self.continuation.allows_round_after(round);
-            if cancellation.is_cancelled() && !deadline_expired.load(Ordering::Acquire) {
-                // Flush epoch spend before Cancelled so resume/event-log keep
-                // command/file/token totals (including any absorbed children).
-                flush_epoch!(round);
-                drain_background_children!(round);
-                return Err(AgentError::Cancelled);
-            }
-            if let Some(max) = self.step_limits.max_duration {
-                let elapsed = epoch_duration_at_start.saturating_add(run_started.elapsed());
-                // Some(0) = hard exhausted residual; elapsed > max for positive caps.
-                if max.is_zero() || elapsed > max {
-                    let reason = format!(
-                        "Stopped: the {}s duration budget was exhausted after {} round(s).",
-                        max.as_secs_f64(),
-                        round.saturating_sub(1)
-                    );
+                    round_ceiling,
+                    window_round_limit: self.continuation.round_limit(),
+                    model_tokens_spent,
+                    max_model_tokens: self.step_limits.max_model_tokens,
+                    cost_spent_micros,
+                    max_cost_usd_micros: self.step_limits.max_cost_usd_micros,
+                    elapsed: epoch_duration_at_start.saturating_add(run_started.elapsed()),
+                    max_duration: self.step_limits.max_duration,
+                    cancelled: cancellation.is_cancelled(),
+                    deadline_expired: deadline_expired.load(Ordering::Acquire),
+                });
+            // Applied in two phases because the round counter advances between
+            // them, and what a stop reports depends on which side of that it
+            // falls: a spent budget names the rounds that COMPLETED, while the
+            // cancel and deadline paths flush the round they were about to
+            // start. One decision, the loop's own bookkeeping.
+            match &verdict {
+                crate::admission::RoundAdmission::StopBudget(exhaustion)
+                    if !matches!(
+                        exhaustion.dimension,
+                        crate::budget::BudgetDimension::Duration
+                    ) =>
+                {
+                    let reason = match exhaustion.dimension {
+                        crate::budget::BudgetDimension::Cost => format!(
+                            "Stopped: the {}-micro-USD model cost budget was exhausted after {round} round(s).",
+                            exhaustion.cap
+                        ),
+                        _ => format!(
+                            "Stopped: the {}-token model budget was exhausted after {round} round(s).",
+                            exhaustion.cap
+                        ),
+                    };
                     observer(AgentEvent::Finished(reason.clone()));
                     flush_epoch!(round);
-
                     drain_background_children!(round);
                     return Ok(AgentOutcome::drive_budget_exhausted(
                         reason,
-                        round - 1,
+                        round,
                         modified_files,
-                        crate::budget::BudgetExhaustion::new(
-                            crate::budget::BudgetDimension::Duration,
-                            elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-                            max.as_millis().min(u128::from(u64::MAX)) as u64,
-                        ),
+                        exhaustion.clone(),
                         &metrics,
                         &progress,
                         &objective,
                     ));
                 }
+                crate::admission::RoundAdmission::StopRoundCeiling { ceiling } => {
+                    // Unconditional circuit breaker: even a busy loop that
+                    // evades every progress watchdog terminates here.
+                    let reason =
+                        format!("Stopped: reached the {ceiling}-round ceiling for a single turn.");
+                    observer(AgentEvent::Finished(reason.clone()));
+                    flush_epoch!(round);
+                    drain_background_children!(round);
+                    return Ok(AgentOutcome::drive_result(
+                        reason,
+                        round,
+                        modified_files,
+                        StopReason::TurnLimitReached,
+                        Some("round ceiling reached".to_string()),
+                        &metrics,
+                        &progress,
+                        &objective,
+                    ));
+                }
+                crate::admission::RoundAdmission::StopWindowLimit => break,
+                _ => {}
+            }
+            round = round.saturating_add(1);
+            let has_next_round = self.continuation.allows_round_after(round);
+            match verdict {
+                crate::admission::RoundAdmission::Cancelled => {
+                    // Flush epoch spend before Cancelled so resume/event-log keep
+                    // command/file/token totals (including any absorbed children).
+                    flush_epoch!(round);
+                    drain_background_children!(round);
+                    return Err(AgentError::Cancelled);
+                }
+                // Only the duration dimension can reach here: the token and
+                // cost caps returned in the phase above. Matched explicitly so
+                // a dimension added later cannot inherit this message.
+                crate::admission::RoundAdmission::StopBudget(exhaustion)
+                    if exhaustion.dimension == crate::budget::BudgetDimension::Duration =>
+                {
+                    let reason = format!(
+                        "Stopped: the {}s duration budget was exhausted after {} round(s).",
+                        std::time::Duration::from_millis(exhaustion.cap).as_secs_f64(),
+                        round.saturating_sub(1)
+                    );
+                    observer(AgentEvent::Finished(reason.clone()));
+                    flush_epoch!(round);
+                    drain_background_children!(round);
+                    return Ok(AgentOutcome::drive_budget_exhausted(
+                        reason,
+                        round - 1,
+                        modified_files,
+                        exhaustion,
+                        &metrics,
+                        &progress,
+                        &objective,
+                    ));
+                }
+                _ => {}
             }
 
             // Nested AGENTS.md rules for directories touched so far. Appended at

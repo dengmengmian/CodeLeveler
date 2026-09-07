@@ -29,6 +29,10 @@ pub enum Continuation {
     DriveGoalAgain,
     /// Grant one bounded budget extension and resume the transcript.
     ExtendBudget(BudgetExhaustion),
+    /// The task total is spent, but the segment that spent it was finishing
+    /// rather than investigating. Grow the total by one slice and open another
+    /// window. The engine applies the growth; this decides that it is earned.
+    ExtendRoundBudget,
 }
 
 /// Everything a policy may look at. Deliberately a plain snapshot of facts the
@@ -54,6 +58,16 @@ pub struct TurnEnded<'a> {
     /// not the caller's: windows continue at the per-turn ceiling while the
     /// total has rounds left, the same way an unbounded goal does.
     pub engine_paced: bool,
+    /// Did the budget segment that just ran move the goal — a source change
+    /// landed AND a close was attempted — since its baseline? The engine
+    /// gathers it (it owns the evidence ledger); whether it earns anything is
+    /// this policy's call.
+    pub segment_advanced: bool,
+    /// Round-budget extensions already granted against the task total.
+    pub round_extensions_granted: u32,
+    /// The engine-paced budget, when one is pinned. `None` means the caller
+    /// owns pacing and no extension is ever earned.
+    pub task_round_budget: Option<TaskRoundBudget>,
 }
 
 /// An engine-paced task budget in model rounds: what `leveler run` spends
@@ -121,6 +135,25 @@ impl SupervisorPolicy for DefaultSupervisorPolicy {
                 && ended.windows_without_progress < MAX_NO_PROGRESS_WINDOWS
             {
                 return Continuation::DriveGoalAgain;
+            }
+            // The task total ran out. A segment that landed a source change
+            // AND tried to close is finishing, not investigating: it earns one
+            // more slice, up to the cap. Anything else stops here with what it
+            // has. This used to sit in the engine, rewriting a `Stop` this
+            // policy had already returned — a second decider for the one
+            // question this trait exists to answer.
+            if let Some(budget) = ended.task_round_budget
+                && ended.segment_advanced
+                && ended.round_extensions_granted < budget.max_extensions
+                && crate::engine::round_budget_spent(
+                    ended.stop_reason,
+                    ended.budget_exhaustion.is_some(),
+                    ended.progress.cumulative_rounds,
+                    total,
+                )
+                && !ended.progress.human_boundary_seen()
+            {
+                return Continuation::ExtendRoundBudget;
             }
             return Continuation::Stop;
         }
@@ -209,8 +242,105 @@ mod tests {
             extensions_granted: 0,
             round_budget: ContinuationPolicy::UntilTerminal,
             windows_without_progress: 0,
+            segment_advanced: false,
+            round_extensions_granted: 0,
+            task_round_budget: None,
             engine_paced: false,
         }
+    }
+
+    /// RCP-D1 conformance. Every window-level path that can spend another main
+    /// model call, and the decision it must produce — the same decisions the
+    /// engine produced when the round-extension case was decided AFTER this
+    /// policy had already answered, by rewriting its `Stop`.
+    ///
+    /// This is a golden table, not an assertion about one case: if a later
+    /// change moves any of these verdicts, it is a policy change and has to be
+    /// argued as one.
+    #[test]
+    fn window_admission_decisions_are_unchanged_by_the_move() {
+        let policy = DefaultSupervisorPolicy::default();
+        let budget = TaskRoundBudget {
+            base: 200,
+            extension: 20,
+            max_extensions: 1,
+        };
+
+        // 1. Next window: engine-paced, ceiling hit, total not spent.
+        let mut progress = active();
+        progress.cumulative_rounds = 100;
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        assert_eq!(policy.after_turn(&e), Continuation::DriveGoalAgain);
+
+        // 2. Total spent, segment moved the goal: one more slice is earned.
+        let mut spent = active();
+        spent.cumulative_rounds = 200;
+        let mut e = ended(StopReason::TurnLimitReached, &spent, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        e.task_round_budget = Some(budget);
+        e.segment_advanced = true;
+        assert_eq!(policy.after_turn(&e), Continuation::ExtendRoundBudget);
+
+        // 3. Same, but the segment only investigated: nothing is earned.
+        e.segment_advanced = false;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+
+        // 4. Segment moved, but the extension quota is already spent.
+        e.segment_advanced = true;
+        e.round_extensions_granted = budget.max_extensions;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+
+        // 5. Segment moved, quota available — but the user drew a boundary.
+        // A refused permission is not re-asked by buying more rounds.
+        let mut denied = active();
+        denied.cumulative_rounds = 200;
+        denied.denied_network = true;
+        let mut e = ended(StopReason::TurnLimitReached, &denied, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        e.task_round_budget = Some(budget);
+        e.segment_advanced = true;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+
+        // 6. Total spent and the segment moved, but the stop was a TOKEN
+        // budget, not the rounds. Buying rounds does not answer that.
+        let exhaustion = BudgetExhaustion::new(BudgetDimension::ModelTokens, 10, 10);
+        let mut e = ended(StopReason::BudgetExhausted, &spent, &[], Some(&exhaustion));
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        e.task_round_budget = Some(budget);
+        e.segment_advanced = true;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+
+        // 7. No pinned budget at all: an extension is never earned, whatever
+        // the segment did.
+        let mut e = ended(StopReason::TurnLimitReached, &spent, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(200);
+        e.engine_paced = true;
+        e.segment_advanced = true;
+        assert_eq!(
+            policy.after_turn(&e),
+            Continuation::Stop,
+            "a caller-pinned budget owns its own pacing"
+        );
+
+        // 8. Unpinned goal, budget exhausted with real progress: the resource
+        // extension path, untouched by this move.
+        let files = vec!["src/lib.rs".to_string()];
+        let idle = active();
+        let e = ended(
+            StopReason::BudgetExhausted,
+            &idle,
+            &files,
+            Some(&exhaustion),
+        );
+        assert_eq!(
+            policy.after_turn(&e),
+            Continuation::ExtendBudget(exhaustion.clone())
+        );
     }
 
     /// `leveler run` owns its budget: a window that hit the per-turn ceiling

@@ -232,18 +232,6 @@ pub(crate) fn round_budget_spent(
         }
 }
 
-/// Does the segment that just spent the task total earn an extension?
-pub(crate) fn round_extension_earned(
-    before: SegmentMarks,
-    after: SegmentMarks,
-    granted: u32,
-    budget: crate::continuation::TaskRoundBudget,
-) -> bool {
-    granted < budget.max_extensions
-        && after.source_changes > before.source_changes
-        && after.close_attempts > before.close_attempts
-}
-
 /// Write the supervisor's control state to the log, segment baseline folded
 /// in. The segment lives in a `SegmentMarks` while the loop runs and on the
 /// state when it is at rest — one fact, two shapes, joined here so nothing
@@ -1734,7 +1722,8 @@ impl TaskEngine {
         let policy = self.supervisor_policy();
         let mut limits = spec.runtime.limits;
         // Engine-paced round budget: the task total the windows below spend,
-        // grown only by `round_extension_earned`. Caller-pinned budgets
+        // grown only when the supervisor policy says a segment earned it.
+        // Caller-pinned budgets
         // (`round_budget: None`) never change.
         // The task total this invocation is spending. Derived, not stored: it
         // is the configured base grown by the round extensions the state
@@ -1792,7 +1781,19 @@ impl TaskEngine {
             if cancellation.is_cancelled() {
                 break;
             }
-            let mut decision = policy.after_turn(&crate::TurnEnded {
+            // The segment as it stands now, read before the decision rather
+            // than after it: whether the total was moved is an input to the
+            // question, not a second answer to it.
+            let segment_now = match crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            {
+                Ok(Some(ledger)) => segment_marks(&ledger),
+                _ => segment,
+            };
+            let decision = policy.after_turn(&crate::TurnEnded {
                 stop_reason: outcome.stop_reason,
                 stop_detail: outcome.stop_detail.as_deref(),
                 progress: &outcome.progress,
@@ -1802,46 +1803,11 @@ impl TaskEngine {
                 round_budget,
                 windows_without_progress: state.windows_without_progress,
                 engine_paced: spec.runtime.round_budget.is_some(),
+                segment_advanced: segment_now.source_changes > segment.source_changes
+                    && segment_now.close_attempts > segment.close_attempts,
+                round_extensions_granted: state.round_extensions,
+                task_round_budget: spec.runtime.round_budget,
             });
-            // The task total ran out. A segment that landed a source change
-            // AND tried to close is finishing, not investigating: it earns
-            // one more slice, up to the cap. Anything else stops here with
-            // what it has.
-            if let (crate::Continuation::Stop, Some(budget), Some(total)) = (
-                &decision,
-                spec.runtime.round_budget,
-                round_budget.round_limit(),
-            ) && round_budget_spent(
-                outcome.stop_reason,
-                outcome.budget_exhaustion.is_some(),
-                outcome.progress.cumulative_rounds,
-                total,
-            ) && !outcome.progress.human_boundary_seen()
-            {
-                let now = match crate::turn::last_persisted_ledger(
-                    runner.stores.events.as_ref(),
-                    &runner.session_id,
-                )
-                .await
-                {
-                    Ok(Some(ledger)) => segment_marks(&ledger),
-                    _ => segment,
-                };
-                if round_extension_earned(segment, now, state.round_extensions, budget) {
-                    state.round_extensions = state.round_extensions.saturating_add(1);
-                    round_budget =
-                        ContinuationPolicy::bounded(total.saturating_add(budget.extension));
-                    segment = now;
-                    observer(EngineEvent::AdvisoryStarted {
-                        kind: format!(
-                            "round_budget_extension:{}/{}:+{}",
-                            state.round_extensions, budget.max_extensions, budget.extension
-                        ),
-                    });
-                    decision = crate::Continuation::DriveGoalAgain;
-                }
-            }
-
             let continued = match decision {
                 crate::Continuation::Stop => {
                     // Name why a quiet goal was not nudged again, so the stop
@@ -1851,6 +1817,43 @@ impl TaskEngine {
                             Some("continue suppressed: no-progress cap".to_string());
                     }
                     break;
+                }
+                crate::Continuation::ExtendRoundBudget => {
+                    // Mechanical application of a decision already made: grow
+                    // the total by one slice, re-baseline the segment, then
+                    // open the window exactly as `DriveGoalAgain` does.
+                    let Some(budget) = spec.runtime.round_budget else {
+                        break;
+                    };
+                    let Some(total) = round_budget.round_limit() else {
+                        break;
+                    };
+                    state.round_extensions = state.round_extensions.saturating_add(1);
+                    round_budget =
+                        ContinuationPolicy::bounded(total.saturating_add(budget.extension));
+                    segment = segment_now;
+                    observer(EngineEvent::AdvisoryStarted {
+                        kind: format!(
+                            "round_budget_extension:{}/{}:+{}",
+                            state.round_extensions, budget.max_extensions, budget.extension
+                        ),
+                    });
+                    let Some(continuation) = continuation_for_next_window(
+                        round_budget,
+                        outcome.progress.cumulative_rounds,
+                    ) else {
+                        break;
+                    };
+                    self.drive_goal_again(
+                        log,
+                        runner,
+                        spec,
+                        continuation,
+                        &outcome,
+                        observer,
+                        &cancellation,
+                    )
+                    .await?
                 }
                 crate::Continuation::DriveGoalAgain => {
                     // Engine bound, not policy: a pinned round budget is a task
@@ -3020,6 +3023,9 @@ mod continue_cap_tests {
             extensions_granted: 0,
             round_budget: leveler_agent::ContinuationPolicy::UntilTerminal,
             windows_without_progress,
+            segment_advanced: false,
+            round_extensions_granted: 0,
+            task_round_budget: None,
             engine_paced: false,
         }
     }
@@ -3770,8 +3776,7 @@ mod multi_turn_session_tests {
 
 #[cfg(test)]
 mod round_budget_tests {
-    use super::{SegmentMarks, is_source_change_path, round_budget_spent, round_extension_earned};
-    use crate::continuation::TaskRoundBudget;
+    use super::{SegmentMarks, is_source_change_path, round_budget_spent};
     use leveler_agent::StopReason;
 
     /// exp9/m40: `--max-rounds 40` stopped at 40 as `BudgetExhausted` (the
@@ -3808,12 +3813,6 @@ mod round_budget_tests {
         assert!(!round_budget_spent(StopReason::Stalled, false, 40, 40));
     }
 
-    const B: TaskRoundBudget = TaskRoundBudget {
-        base: 200,
-        extension: 100,
-        max_extensions: 2,
-    };
-
     fn marks(source_changes: usize, close_attempts: usize) -> SegmentMarks {
         SegmentMarks {
             source_changes,
@@ -3823,25 +3822,31 @@ mod round_budget_tests {
 
     /// exp2/f1 and exp7/f1: 300 rounds, probe tests only, never tried to
     /// close. Neither buys another hundred.
+    ///
+    /// "Did the segment move?" is the fact the engine now hands the supervisor
+    /// as `TurnEnded::segment_advanced`; the cap and the rest of the decision
+    /// live in the policy (see `window_admission_decisions_are_unchanged_by_the_move`).
+    /// What this pins is the fact itself, computed from the two baselines.
     #[test]
-    fn investigation_alone_earns_no_extension() {
-        assert!(!round_extension_earned(marks(0, 0), marks(0, 0), 0, B));
+    fn investigation_alone_is_not_a_segment_that_advanced() {
+        assert!(!segment_advanced(marks(0, 0), marks(0, 0)));
         // A source change without a close attempt is not enough either: the
         // extension is for finishing, not for continuing to edit.
-        assert!(!round_extension_earned(marks(0, 0), marks(2, 0), 0, B));
+        assert!(!segment_advanced(marks(0, 0), marks(2, 0)));
         // A close attempt over an unchanged tree is a claim, not work.
-        assert!(!round_extension_earned(marks(1, 0), marks(1, 1), 0, B));
+        assert!(!segment_advanced(marks(1, 0), marks(1, 1)));
     }
 
     #[test]
-    fn a_segment_that_landed_a_change_and_tried_to_close_earns_one() {
-        assert!(round_extension_earned(marks(0, 0), marks(1, 1), 0, B));
-        assert!(round_extension_earned(marks(3, 2), marks(4, 3), 1, B));
+    fn a_segment_that_landed_a_change_and_tried_to_close_advanced() {
+        assert!(segment_advanced(marks(0, 0), marks(1, 1)));
+        assert!(segment_advanced(marks(3, 2), marks(4, 3)));
     }
 
-    #[test]
-    fn the_extension_count_is_capped() {
-        assert!(!round_extension_earned(marks(0, 0), marks(1, 1), 2, B));
+    /// The same expression the supervise loop builds, named once so the test
+    /// and the loop cannot drift.
+    fn segment_advanced(before: SegmentMarks, after: SegmentMarks) -> bool {
+        after.source_changes > before.source_changes && after.close_attempts > before.close_attempts
     }
 
     #[test]
