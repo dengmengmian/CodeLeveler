@@ -263,11 +263,6 @@ impl TurnContext {
              structured file tools. Prefer `shell_command` for git/shell one-liners; use \
              `list_files` for directories and `read_file` only for files. Do not answer a \
              task-like message with only a greeting.\n\
-             - When you already know several independent inspection targets — files to read, \
-             patterns to search, directories to list — issue those calls together in one \
-             tool-call turn rather than one per turn. This applies only to reads and searches \
-             whose arguments you already have: anything that needs a previous result to \
-             construct, and anything that writes, belongs in its own turn.\n\
              - Git mutate (`git pull`/`fetch`/`commit`/`rebase`/…): under assisted/request-approval, \
              workspace `.git` is write-protected. Call `request_permissions` with \
              `filesystem=unrestricted` (and `network=true` when contacting a remote) first, \
@@ -477,57 +472,6 @@ mod tests {
         assert!(prompt.contains("use `.` for cwd itself"), "{prompt}");
         assert!(prompt.contains("workspace-relative paths"), "{prompt}");
         assert!(prompt.contains("never construct `~/Users/...`"), "{prompt}");
-    }
-
-    /// Nine measured runs issued a median of ONE tool call per model turn
-    /// (73–98% single-call turns), while the executor has always run
-    /// independent read/search tools concurrently and the wire flag has always
-    /// permitted several calls in one response. The capability was there; the
-    /// prompt never said so, and every extra turn re-sends the whole
-    /// transcript — which is where 50–88% of a long run's wall time goes.
-    ///
-    /// The rule has to keep its condition: batching a call that needs the
-    /// previous result, or a write, is a different and unsafe thing. The tool
-    /// layer already refuses to parallelise those, so the prompt must not
-    /// invite them either.
-    #[test]
-    fn operating_rules_offer_batched_inspection_but_only_for_independent_reads() {
-        let prompt = PromptBuilder::new()
-            .turn_context(TurnContext {
-                model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
-                mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
-                project_rules: Vec::new(),
-                user_language: None,
-            })
-            .build();
-
-        assert!(
-            prompt.contains("independent inspection targets"),
-            "the batching affordance must be stated: {prompt}"
-        );
-        assert!(
-            prompt.contains("one tool-call turn"),
-            "and it must name the unit it is about: {prompt}"
-        );
-        assert!(
-            prompt.contains("anything that writes, belongs in its own turn"),
-            "a write must never be invited into a batch: {prompt}"
-        );
-        assert!(
-            prompt.contains("needs a previous result"),
-            "a dependent call must never be invited into a batch: {prompt}"
-        );
-        // Not an unverifiable exhortation. "Be faster" cannot be checked by
-        // anything and would licence skipping work to look quick.
-        for banned in ["be faster", "use fewer turns", "as quickly as possible"] {
-            assert!(
-                !prompt.to_lowercase().contains(banned),
-                "prompt must not carry unverifiable speed instructions: {banned}"
-            );
-        }
     }
 
     #[test]
