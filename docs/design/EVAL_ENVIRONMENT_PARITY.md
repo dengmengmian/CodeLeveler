@@ -153,6 +153,28 @@ ENVIRONMENT_PARITY = FULL        both arms in one regime, gap < within-regime sp
                    = CONFOUNDED  arms in different regimes
 ```
 
+## The health probe, and what it cannot tell you
+
+Eight small requests through the same gateway and model, 09-07 evening:
+
+```
+1.56  1.61  1.80  1.85  2.00  2.14  2.78  2.97   (median ~1.93s)
+```
+
+The gateway is healthy — no outage, no rate limiting, no auth problem. That is
+all this establishes.
+
+It does **not** say the eval-size regime recovered. The probe sends 88 input
+tokens; the runs it is standing in for send 17k–145k. Latency at those sizes is
+a different quantity, and measuring it properly costs about what the thing being
+measured costs.
+
+Which points at the better answer. **Interleaving removes the need to measure
+the regime at all.** If control and treatment alternate within the same hours,
+drift hits both arms and cancels; if they are blocked by day, no amount of
+latency bookkeeping repairs the comparison afterwards. The fix for this class of
+problem is the ordering, not a better probe.
+
 ## Pre-flight before any expensive cohort
 
 Check, and hold if any fails: binary identity (never `-dirty`), model, gateway,
