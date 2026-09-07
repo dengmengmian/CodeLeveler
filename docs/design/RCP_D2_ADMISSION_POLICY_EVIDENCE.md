@@ -1,106 +1,151 @@
-# RCP-D2 — what the logs actually say about continuation
+# RCP-D2 — the quiet-interval hypothesis, calibrated and refuted
 
-Measured, not argued. Every number below is read off durable event logs with
-`dogfood/eval/phase-c/round_delta_report.py`, which reconstructs per-round
-control-plane deltas — mutations, verification outcomes, refused closes — and
-nothing else. No model output, no semantics.
+Measured, not argued. Every number is read off durable event logs with
+`dogfood/eval/phase-c/round_delta_report.py`, `quiet_envelope.py` and
+`policy_replay.py`, which reconstruct per-round control-plane deltas and
+nothing else: no model output, no semantics.
 
-## The question
+**Result: the hypothesis is refuted with sufficient data, not blocked for lack
+of it.** An earlier draft of this document said the evidence was insufficient.
+That was wrong, and it was wrong for an instructive reason — see "What the
+first pass got wrong".
 
-D2 may change whether the next main-task model call happens. To do that safely
-it needs a mechanical predicate that separates *a loop that is getting
-somewhere* from *a loop that is not*, using facts the runtime already has.
+## The hypothesis
 
-## What a "control-plane delta" is
+A round has a **control-plane delta** when at least one of these advanced: the
+modified-file set or mutation-operation count, a verification outcome, or a
+refused close. A round without one is not a round where the model learned
+nothing; it is a round where **the runtime observed nothing it could act on**.
 
-A round has one when at least one of these advanced:
+C3 spent 129 consecutive rounds that way — 104 shell commands, 23 reads, zero
+mutations, zero verifications, zero refused closes, 9.38M tokens, 83% of the
+session's cost. The existing guards never fired: `no_progress_streak` peaked at
+0 and `stagnation_streak` at 2, because both reset on a novel read and 115 of
+those 132 shell commands were distinct.
 
-- the modified-file set grew, or mutation operations increased
-- a verification ran green
-- a close attempt was refused (the runtime told the model it is not done)
+The hypothesis that follows is obvious, and wrong: *a long control-plane
+silence means the loop is not converging, so the runtime should stop paying
+for it.*
 
-A round without one is not a round where the model learned nothing. It is a
-round where **the runtime observed nothing it could act on**. That distinction
-is the whole difficulty.
+## What the first pass got wrong
 
-## Post-closure cohort, CodeLeveler arm
+It used `Verified` as the definition of a successful run. No run in the cohort
+reached `Verified`, so it concluded there was no success-side data to calibrate
+against.
 
-| | C1 | C2 | C3 |
-|---|---|---|---|
-| terminal state | CompletedUnverified | Unknown | CompletedUnverified |
-| rounds | 110 | 77 | 190 |
-| rounds with a control-plane delta | 30 | — | 23 |
-| rounds without one | 80 | — | **167** |
-| longest unbroken quiet run | 26 | 37 | **129** |
-| total cost | $0.94 | $0.70 | $2.02 |
-| cost inside quiet rounds | — | — | **$1.68 (83%)** |
+`Verified` means the runtime holds authoritative proof. It is not the same
+question as *was the changeset correct*. The frozen cohorts already answer that
+question with a mechanical oracle and a blind human review, and the answer had
+been sitting in `mechanical-summary.json` and `human-decisions.json` the whole
+time.
 
-C3's quiet run is rounds 26 → 154, unbroken. Inside it: 104 `shell_command`,
-23 `read_file`, 2 `update_plan`. Zero mutations. Zero verifications. Zero
-refused closes. 9.38M tokens.
+## The successful cohort
 
-## Why the existing guards never fired
+Seven CodeLeveler runs, all mechanically correct. The formal three were also
+ACCEPTed under blind review (`blind_mapping.json`: C1-C, C2-B, C3-A are all
+codeleveler); the post-closure three carry mechanical pass only.
 
-`no_progress_streak` peaked at **0** and `stagnation_streak` at **2** across all
-three runs. Both are reset by a novel read or search, and the model was reading
-novel things: 115 of those 132 shell commands were distinct. By the drive
-loop's definition of progress, nothing was wrong for 129 rounds.
-
-The guards are not broken. They answer a different question — "is the model
-repeating itself?" — and the answer was honestly no. Nobody was asking "has the
-runtime learned anything in a hundred rounds?"
-
-That is the gap, and it is now measured rather than inferred.
-
-## Why D2 does not ship a threshold
-
-To turn that gap into a stopping rule, the rule needs a bound. Calibrating one
-requires knowing how long a *successful* run legitimately goes quiet.
-
-**No run in this cohort reached `Verified`.** C1 and C3 are
-`CompletedUnverified`; C2's terminal state is `Unknown`. The observed quiet-run
-envelope — 26, 37, 129 — is entirely drawn from runs that did not succeed. A
-threshold picked from it would be calibrated against failure alone, with
-nothing to say whether it also cuts the investigation a successful run needs.
-
-That is exactly the arbitrary no-progress limit RCP-D2 is instructed not to
-introduce, and dressing it in this evidence would not make it less arbitrary.
+| run | terminal state | mechanical | human | main rounds | Q0 max quiet | Q1 quiet that recovered | Q3 quiet before last mutation | last mutation |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| formal C1 | — | PASS | ACCEPT | 100 | 33 | 33 | 33 | 94 |
+| formal C2 | — | PASS | ACCEPT | 185 | 41 | 41 | 41 | 171 |
+| formal C3 | — | PASS | ACCEPT | 159 | 87 | 87 | 87 | 148 |
+| post-closure C1 | CompletedUnverified | PASS | — | 123 | 26 | 26 | 26 | 100 |
+| post-closure C2 | Unknown | PASS | — | 78 | 37 | 37 | 37 | 77 |
+| post-closure C3 | CompletedUnverified | PASS | — | 200 | **129** | **129** | **129** | **183** |
+| pre-D C3 @47c2d7d | CompletedUnverified | PASS | — | 145 | 26 | 26 | 26 | 123 |
 
 ```
+SUCCESS_QUIET_MAX                        = 129
+SUCCESS_RECOVERABLE_QUIET_MAX            = 129
+SUCCESS_POST_CLOSEOUT_RECOVERABLE_QUIET  = 129
+```
+
+Every one of those longest streaks **recovered**. In post-closure C3 the last
+real change landed at round 183, after the 129-round silence that ended at 154.
+The run the earlier draft held up as the waste case is a mechanically correct
+run whose fix arrived on the far side of the silence.
+
+Failure-side samples (`prune-ab`, 100 rounds each) show quiet streaks of 50 and
+74 — squarely inside the success envelope.
+
+```
+QUIET_ENVELOPE_SEPARATION = NONE
+```
+
+## Replay — the hard gate
+
+`policy_replay.py` sweeps the rule *N consecutive quiet rounds → EnterCloseout*
+over the successful cohort and asks, for each N, whether it fires before that
+run's last real progress.
+
+| N | fires on | truncates a successful run |
+|---:|---:|---:|
+| 20 | 6 | 6 |
+| 30 | 5 | 5 |
+| 40 | 3 | 3 |
+| 50 | 2 | 2 |
+| 80 | 2 | 2 |
+| 100 | 1 | 1 |
+| 120 | 1 | 1 |
+| 130 | 0 | 0 |
+| 150 | 0 | 0 |
+
+Conditioning on "only after a close has been refused" changes which runs are
+hit, not the shape: 20→4/4, 40→1/1, 120→1/1, 130→0/0.
+
+**There is no N that fires and is safe.** Below 130 every firing is a
+truncation; at 130 and above the rule is inert inside a 200-round budget.
+
+```
+CANDIDATE_POLICY_TRUNCATES_SUCCESSFUL_RECOVERY = YES  (every candidate)
+D2_EVIDENCE_GATE = FAIL
 RCP_D2_POLICY_CHANGE = NOT_PROVEN
-POLICY_EVIDENCE_INSUFFICIENT = calibration data, not signal
 ```
 
-The signal is real. The bound is not yet earned.
+The candidate proposed in the previous draft — half the round budget,
+conditioned on a refused close — fires on post-closure C3 at round 125 and
+would have cut it 58 rounds before its fix. It is withdrawn.
 
-## The one candidate, stated so it can be judged
+## What this actually establishes
 
-If the user wants a first rule, this is the least arbitrary one available,
-because its only constant is a fraction of a budget the product already chose:
+Both halves of the naive reading are wrong:
 
-> When half the task's total round budget has been spent with **zero**
-> control-plane delta, and a close has already been refused, the next admission
-> returns `EnterCloseout` rather than `ContinueCurrentWindow`.
+```
+EXPLORATION_NOVELTY        != CONTROL_PLANE_PROGRESS   (true, and known)
+CONTROL_PLANE_QUIET        != NOT_CONVERGING           (this is the new part)
+```
 
-Properties worth noting:
+Long silent investigation is not a pathology in this runtime on these tasks; it
+is how correct runs reach their fix. The runtime's blindness during that
+stretch is real, and RCP-A/B/C were right to make what it *can* see durable and
+single-authority. But that blindness is blindness to investigation, not a
+signal of failure, and it cannot carry a stopping rule.
 
-- It introduces no round count of its own; it scales with `DEFAULT_TASK_ROUND_BUDGET`.
-- Against this cohort it fires **only on C3**, at roughly round 126 — cutting
-  about 28 of 190 rounds (~15%). C1 (26) and C2 (37) are far below it.
-- `EnterCloseout` is not a verdict. The terminal state is still decided by
-  `completion_debt()` and the reconciliation gate, so the rule cannot turn
-  anything into `Verified`, and cannot turn a real completion into a failure —
-  it can only stop the runtime paying for rounds it cannot see.
+## Where FAST has to come from instead
 
-What it needs before shipping: at least one `Verified` run to bound the quiet
-envelope from the success side. Until then it is a proposal with a measurement
-behind it, not a policy.
+Not from stopping earlier on the signals the runtime already has — that is what
+was just refuted. The remaining directions, in the order the evidence supports:
 
-## What would make this decidable
+1. **Make investigation cheaper rather than shorter.** post-closure C3 spent
+   9.38M tokens on 129 rounds of reading. Prompt-cache hit rate is already
+   ~98% on input; the cost is the sheer number of round trips over a growing
+   transcript. Batching, or letting one round carry more of the search, attacks
+   the same waste without touching convergence.
+2. **Give the runtime a signal it does not have.** Every rule tested here reads
+   facts the runtime already holds. A materially better admission decision
+   needs a fact that does not exist yet — and inventing one is a new subsystem,
+   which this program has consistently refused for good reasons. It would need
+   its own justification, not a footnote here.
+3. **Leave the ceiling where it is.** The 200-round budget already bounds the
+   worst case, and post-closure C3 shows the boundary being used productively.
 
-1. A cohort with at least one `Verified` CodeLeveler run, so the quiet envelope
-   has a success side.
-2. Or a task whose reference fix is known to be reachable in few rounds, run to
-   `Verified`, to establish the floor directly.
+## Reproducing this
 
-Either one turns the fraction above from a guess into a bound.
+```
+python3 round_delta_report.py <sessions.db>          # per-round deltas
+python3 quiet_envelope.py     <sessions.db> [label]  # Q0–Q3 for one run
+python3 policy_replay.py      <label>=<db> [...]     # the hard gate sweep
+```
+
+All three live in `dogfood/eval/phase-c/` and read only durable logs.
