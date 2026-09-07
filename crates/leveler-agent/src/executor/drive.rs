@@ -393,6 +393,10 @@ impl Executor {
                 kept: progress.delegation_kept_recorded,
                 delegated: progress.delegation_delegated_recorded,
                 reconsidered: progress.delegation_reconsidered,
+                // Seeded rounds mean a prior window already ran this
+                // objective. Read off the ledger, so a restart cannot turn a
+                // continuation back into a first window.
+                continuation_window: progress.cumulative_rounds > 0,
             },
             self.policy.delegation_timing,
         );
@@ -3696,7 +3700,7 @@ impl Executor {
                         });
                     }
                     DelegationRoundAction::Offer {
-                        trigger: "reconsideration",
+                        trigger: trigger @ ("reconsideration" | "window_boundary"),
                         steps,
                     } => {
                         // The one event-driven re-ask: the plan materially
@@ -3706,7 +3710,11 @@ impl Executor {
                         progress.delegation_reconsidered = true;
                         observer(AgentEvent::DelegationStage {
                             action: "reoffered".to_string(),
-                            detail: "plan_progress".to_string(),
+                            detail: if trigger == "window_boundary" {
+                                "window_boundary".to_string()
+                            } else {
+                                "plan_progress".to_string()
+                            },
                         });
                         observer(AgentEvent::ProgressUpdated {
                             ledger: progress.clone(),

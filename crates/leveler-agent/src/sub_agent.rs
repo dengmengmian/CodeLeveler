@@ -268,6 +268,14 @@ pub(crate) struct DelegationPrior {
     pub delegated: bool,
     /// The one event-driven reconsideration already happened in a prior window.
     pub reconsidered: bool,
+    /// This drive continues an objective that already consumed a whole window.
+    ///
+    /// The keep-vs-delegate question is asked at plan registration, which is
+    /// the moment of least information: nothing there says whether the
+    /// objective will take twenty rounds or two hundred. A window boundary is
+    /// the first durable fact that says the work outlasted its first window —
+    /// and it costs nothing to observe, unlike any threshold over progress.
+    pub continuation_window: bool,
 }
 
 /// Keep-vs-delegate decision point (MA-WA1).
@@ -305,6 +313,10 @@ pub(crate) struct DelegationDecisionPoint {
     delegated_recorded: bool,
     /// The one event-driven reconsideration was raised (ever, this epoch).
     reconsidered: bool,
+    /// This drive continues an objective past its first window.
+    continuation_window: bool,
+    /// The window-boundary re-open has not been spent yet in this drive.
+    window_reoffer_pending: bool,
     /// The initial offer enumerated plan steps (trigger=plan). A fallback
     /// offer without steps leaves this false; a plan landing later is then a
     /// material change (unknown decomposition → concrete).
@@ -363,6 +375,8 @@ impl DelegationDecisionPoint {
             kept_recorded: prior.kept,
             delegated_recorded: prior.delegated,
             reconsidered: prior.reconsidered,
+            continuation_window: prior.continuation_window,
+            window_reoffer_pending: prior.continuation_window,
             offer_had_steps: false,
             offered_in_window: false,
             baseline_completed: None,
@@ -462,6 +476,35 @@ impl DelegationDecisionPoint {
         // has started writing instead of before. Nothing else moves: same
         // wording, same trigger labels, same per-step form, same one-shot
         // latches, same KEEP semantics, same reconsideration rules.
+        // The objective outlasted a whole window. That is the first durable
+        // fact saying the work is larger than the plan implied, and it is the
+        // one the original decision could not have used — it did not exist yet.
+        //
+        // Deliberately NOT anchored to a plan update: the runs this exists for
+        // barely touch their plan (post-closure C3 registered four in 190
+        // rounds), so the existing plan-change reconsideration never fires for
+        // exactly the shape of run that needs it most. And deliberately not
+        // anchored to a count of quiet rounds: control-plane quiet was measured
+        // and rejected as a convergence signal, and reusing it here would be
+        // the same rejected inference wearing a different hat.
+        //
+        // It rides the next normal parent turn — no extra model call — and the
+        // model still chooses. The runtime re-opens the question; it does not
+        // answer it.
+        if self.window_reoffer_pending
+            && self.continuation_window
+            && self.offered
+            && kept_at_round_start
+            && !self.delegated_recorded
+            && !self.reconsidered
+        {
+            self.window_reoffer_pending = false;
+            self.reconsidered = true;
+            actions.push(DelegationRoundAction::Offer {
+                trigger: "window_boundary",
+                steps: self.latest_plan_steps.clone(),
+            });
+        }
         let timing_allows_initial_offer =
             matches!(self.timing, DelegationTiming::PlanRegistration) || self.edit_seen;
         if !self.offered && !self.delegated_recorded && timing_allows_initial_offer {
@@ -1252,6 +1295,7 @@ mod decision_point_tests {
                     offered: true,
                     kept: false,
                     delegated: false,
+                    continuation_window: false,
                     reconsidered: false,
                 },
             ),
@@ -1261,6 +1305,154 @@ mod decision_point_tests {
             dp.note_worker_admitted(&["a".into()]);
             assert!(dp.end_round().is_empty());
         }
+    }
+
+    fn kept_in_a_continuation_window() -> DelegationDecisionPoint {
+        DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                continuation_window: true,
+                reconsidered: false,
+            },
+        )
+    }
+
+    /// The measured gap this exists for. Seven correct runs delegated exactly
+    /// zero times: the keep-vs-delegate question is asked at plan registration
+    /// — the moment of least information — and the only re-ask is anchored to a
+    /// plan that materially changes. post-closure C3 registered four plans in
+    /// 190 rounds, so for exactly the shape of run that spends the most, the
+    /// question was never reopened.
+    ///
+    /// A window boundary is a durable fact the original decision could not have
+    /// used, because it did not exist yet.
+    #[test]
+    fn a_continuation_window_reopens_the_kept_decision_once() {
+        let mut dp = kept_in_a_continuation_window();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer {
+                trigger: "window_boundary",
+                steps: Vec::new(),
+            }],
+            "the objective outlasted a window; the question comes back"
+        );
+        // Once. Not once per round, and not once per window.
+        assert!(dp.end_round().is_empty());
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// It must NOT need a plan update to fire — that is precisely the
+    /// dependency that made the existing re-ask unreachable on long runs.
+    #[test]
+    fn the_window_reoffer_does_not_wait_for_a_plan() {
+        let mut dp = kept_in_a_continuation_window();
+        let actions = dp.end_round();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DelegationRoundAction::Offer {
+                    trigger: "window_boundary",
+                    ..
+                }]
+            ),
+            "no plan was registered and the offer still came: {actions:?}"
+        );
+    }
+
+    /// A first window is not a continuation. Nothing reopens before the
+    /// objective has actually outlasted one.
+    #[test]
+    fn a_first_window_does_not_reopen_anything() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                continuation_window: false,
+                reconsidered: false,
+            },
+        );
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// Resume must not replay it. The fact is durable on the ledger, so a
+    /// restarted continuation window inherits `reconsidered` and stays quiet.
+    #[test]
+    fn a_restart_does_not_repeat_the_window_reoffer() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                continuation_window: true,
+                reconsidered: true,
+            },
+        );
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// An objective already being investigated by a child has nothing to
+    /// reconsider: asking again would invite a second delegation of the same
+    /// work.
+    #[test]
+    fn an_active_delegation_suppresses_the_window_reoffer() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: true,
+                continuation_window: true,
+                reconsidered: false,
+            },
+        );
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// Never offered at all (a child, or delegation disabled): a continuation
+    /// window does not manufacture a first offer out of nothing.
+    #[test]
+    fn the_window_reoffer_presupposes_an_earlier_offer() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: false,
+                kept: false,
+                delegated: false,
+                continuation_window: true,
+                reconsidered: false,
+            },
+        );
+        // Whatever this produces, it is not the window re-offer.
+        assert!(!dp.end_round().iter().any(|a| matches!(
+            a,
+            DelegationRoundAction::Offer {
+                trigger: "window_boundary",
+                ..
+            }
+        )));
+    }
+
+    /// A child never sees any of this, continuation window or not.
+    #[test]
+    fn an_ineligible_run_never_reopens() {
+        let mut dp = DelegationDecisionPoint::new(
+            false,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                continuation_window: true,
+                reconsidered: false,
+            },
+        );
+        assert!(dp.end_round().is_empty());
     }
 
     #[test]
@@ -1273,6 +1465,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: false,
                 delegated: false,
+                continuation_window: false,
                 reconsidered: false,
             },
         );
@@ -1318,6 +1511,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: true,
                 delegated: false,
+                continuation_window: false,
                 reconsidered: false,
             },
         );
@@ -1339,6 +1533,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: false,
                 delegated: true,
+                continuation_window: false,
                 reconsidered: false,
             },
         );
@@ -1447,6 +1642,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: true,
                 delegated: false,
+                continuation_window: false,
                 reconsidered: true,
             },
         );
@@ -1462,6 +1658,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: true,
                 delegated: false,
+                continuation_window: false,
                 reconsidered: false,
             },
         );
