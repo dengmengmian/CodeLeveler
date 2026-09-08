@@ -19,8 +19,8 @@ pub mod background;
 pub mod checkpoint;
 pub mod command;
 pub mod hooks;
-pub mod permission_grants;
 pub mod permission_rules;
+pub mod policy;
 pub mod risk;
 mod shell_ast;
 pub use shell_ast::{literal_command_words, literal_program_names, proven_executed_commands};
@@ -44,19 +44,19 @@ pub use background::{
 };
 pub use checkpoint::Checkpoint;
 pub use command::{
-    CommandRunner, OutputChunk, OutputStream, ProcessError, ProcessOutput, ProcessRequest,
-    VerifyNetworkPolicy, credential_env_names, first_absolute_arg_outside_roots,
-    first_home_path_outside_roots, is_credential_env_name, looks_like_absolute_path_arg,
-    process_request_for_verify_check, seal_read_denials, shell_invocation,
+    CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessError, ProcessIdentity,
+    ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,
+    is_credential_env_name, looks_like_absolute_path_arg, process_request_for_verify_check,
+    seal_read_denials, shell_invocation,
 };
 pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
-pub use permission_grants::{
-    GrantFile, grants_path, load_grants, remember_project_grant, signatures_from_file,
-};
 pub use permission_rules::{
     MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
     RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
     clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
+};
+pub use policy::{
+    AuthorizationEvidence, PendingApproval, PolicyDenial, PolicyResolution, ResolvedExecutionPolicy,
 };
 pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile, WriteScope};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
@@ -67,7 +67,7 @@ pub use trust::{
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
     WindowsSandboxError, assert_background_intent_spawn_allowed, assert_intent_spawn_allowed,
-    assert_windows_spawn_allowed, doctor_sandbox_line, probe_sandbox_capabilities,
-    process_tree_backend_available, validate_acl_root,
+    doctor_sandbox_line, probe_sandbox_capabilities, process_tree_backend_available,
+    validate_acl_root,
 };
-pub use workspace::{PathAccess, Workspace, WorkspaceError, is_sensitive_file_name};
+pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};

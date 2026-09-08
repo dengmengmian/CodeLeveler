@@ -61,7 +61,7 @@ impl Tool for ReplaceTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        cancellation: CancellationToken,
+        _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
@@ -71,7 +71,11 @@ impl Tool for ReplaceTool {
         if let Some(denied) = context.policy.write_path_denied(&input.path) {
             return Ok(ToolOutput::error(denied));
         }
-        let resolved = match context.execution.workspace.resolve(&input.path) {
+        let resolved = match context
+            .execution
+            .workspace
+            .resolve_for_write(&input.path, &context.write_scope())
+        {
             Ok(p) => p,
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
@@ -175,7 +179,6 @@ impl Tool for ReplaceTool {
             .file_state
             .record(&input.path, new_content.as_bytes());
         // Auto-format the edited file (best-effort; re-fingerprints internally).
-        super::format::format_after_edit(&context, &input.path, &resolved, &cancellation).await;
 
         // Report the write: the executor folds `modified_files` into the turn's
         // change set, and the engine gates verification on it. Without this an
@@ -314,7 +317,11 @@ pub(crate) async fn commit_replace(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context
+        .execution
+        .workspace
+        .revalidate_write_path(resolved, &context.write_scope())
+    {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }
@@ -461,7 +468,11 @@ pub(crate) async fn commit_create_with_permissions(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context
+        .execution
+        .workspace
+        .revalidate_write_path(resolved, &context.write_scope())
+    {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }
@@ -556,7 +567,11 @@ pub(crate) async fn commit_remove(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context
+        .execution
+        .workspace
+        .revalidate_write_path(resolved, &context.write_scope())
+    {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }

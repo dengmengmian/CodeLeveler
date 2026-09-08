@@ -107,8 +107,8 @@ fn format_rule(rule: &PermissionRule) -> String {
     if let Some(prefix) = &rule.match_.command_prefix {
         parts.push(format!("command_prefix={prefix:?}"));
     }
-    if let Some(glob) = &rule.match_.path_glob {
-        parts.push(format!("path_glob={glob:?}"));
+    if let Some(glob) = &rule.match_.write_path_glob {
+        parts.push(format!("write_path_glob={glob:?}"));
     }
     if parts.is_empty() {
         parts.push("(empty match)".into());

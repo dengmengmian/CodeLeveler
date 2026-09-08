@@ -760,7 +760,7 @@ mod tests {
             VerifyNetworkPolicy::ForceDeny,
         );
         assert!(accept.deny_network);
-        assert!(accept.write_root.is_some());
+        assert!(accept.write_scope.confines());
 
         let repo = process_request_for_verify_check(
             "cargo",
@@ -769,7 +769,7 @@ mod tests {
             VerifyNetworkPolicy::InheritSession,
         );
         assert!(!repo.deny_network);
-        assert!(repo.write_root.is_some());
+        assert!(repo.write_scope.confines());
     }
 
     #[tokio::test]

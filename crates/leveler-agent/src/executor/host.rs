@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::ApprovalId;
 use leveler_execution::{
-    ApprovalDecision, ApprovalRequest, CommandView, Requirement, ReviewVerdict, RiskLevel,
-    command_is_destructive,
+    ApprovalDecision, ApprovalRequest, AuthorizationEvidence, CommandView, PendingApproval,
+    PolicyDenial, PolicyResolution, Requirement, ResolvedExecutionPolicy, ReviewVerdict, RiskLevel,
+    WriteScope, command_is_destructive,
 };
 use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
@@ -37,9 +38,12 @@ use crate::authorization::{
 /// approval, and the side-effect barrier all ran for exactly this call.
 pub(crate) struct AdmittedCall {
     pub(crate) call: ToolCall,
-    /// The effective execution context, including any post-approval elevation
-    /// (host-escape openers). Private: only the host dereferences it.
+    /// The execution context, frozen to `resolved` (PR 5): the tool reads its
+    /// write scope and network policy from here, never from the live profile.
+    /// Private: only the host dereferences it.
     ctx: ToolContext,
+    /// The immutable policy this call executes under.
+    resolved: ResolvedExecutionPolicy,
 }
 
 impl AdmittedCall {
@@ -47,6 +51,26 @@ impl AdmittedCall {
     pub(crate) fn into_call(self) -> ToolCall {
         self.call
     }
+
+    /// The policy this call was admitted under. Immutable: a profile switch
+    /// or a grant made after admission reaches the next call, not this one.
+    pub(crate) fn resolved(&self) -> &ResolvedExecutionPolicy {
+        &self.resolved
+    }
+
+    /// The context the tool executes with — already frozen to `resolved`.
+    pub(crate) fn execution_context(&self) -> &ToolContext {
+        &self.ctx
+    }
+}
+
+/// What asking the reviewer / human produced for a [`PendingApproval`].
+pub(crate) enum AskOutcome {
+    Allowed(AuthorizationEvidence),
+    DeniedByUser,
+    /// Nobody was asked: a headless approver refused, or the reviewer did.
+    DeniedUnattended(String),
+    Cancelled,
 }
 
 /// A call whose admission ALREADY happened and is on the durable record — a
@@ -165,12 +189,19 @@ impl Executor {
             return Err(AdmitError::Refused { call, reason });
         }
         let mut pending_always: Option<PendingStandingGrant> = None;
-        if let Err(reason) = self
-            .authorize_with_cancellation(&call, session_approved, &mut pending_always, cancellation)
+        let mut resolved = match self
+            .authorize_with_cancellation(
+                &call,
+                &ctx,
+                session_approved,
+                &mut pending_always,
+                cancellation,
+            )
             .await
         {
-            return Err(AdmitError::Refused { call, reason });
-        }
+            Ok(resolved) => resolved,
+            Err(reason) => return Err(AdmitError::Refused { call, reason }),
+        };
         // Side-effect barrier, second wait: authorization may have produced
         // ApprovalRequested/Resolved — the decision must be durable before
         // the tool it authorized can produce a side effect (else a crash
@@ -211,25 +242,77 @@ impl Executor {
             return Err(AdmitError::Fatal(AgentError::StaleOwnership(reason)));
         }
         // Host openers (`open`/`xdg-open`) only work outside seatbelt;
-        // elevate after approval (the user already OK'd this call).
-        let mut ctx = ctx;
+        // elevate after approval (the user already OK'd this call). This is
+        // the one post-approval widening, and it lands in the frozen policy —
+        // not in a flag a tool could read back.
         if call_needs_host_escape(&call) {
-            ctx.policy.grant_unrestricted_fs();
+            resolved.write = WriteScope::Unrestricted;
         }
-        Ok(AdmittedCall { call, ctx })
+        let ctx = ctx.with_resolved_policy(resolved.clone());
+        Ok(AdmittedCall {
+            call,
+            ctx,
+            resolved,
+        })
     }
 
-    /// Decide whether a tool call may proceed. Returns `Ok(())` to allow, or
-    /// `Err(reason)` to reject (fed back to the model as a tool error).
-    ///
-    /// Order: Pre hooks → permission rules → profile policy → grants/approver.
+    /// Decide whether a tool call may proceed: resolve the policy, then ask
+    /// if resolution says so. `Ok` carries the immutable policy the call runs
+    /// under; `Err(reason)` is fed back to the model as a tool error.
     pub(crate) async fn authorize_with_cancellation(
         &self,
         call: &ToolCall,
+        ctx: &ToolContext,
         session_approved: &mut HashSet<String>,
         pending_always: &mut Option<PendingStandingGrant>,
         cancellation: &CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<ResolvedExecutionPolicy, String> {
+        let pending = match self.resolve_policy(call, ctx, cancellation).await {
+            PolicyResolution::Allow(resolved) => return Ok(resolved),
+            PolicyResolution::Deny(PolicyDenial { reason }) => return Err(reason),
+            PolicyResolution::Ask(pending) => pending,
+        };
+        match self
+            .ask(
+                &pending,
+                Some(session_approved),
+                Some(pending_always),
+                cancellation,
+            )
+            .await
+        {
+            AskOutcome::Allowed(evidence) => Ok(pending.allowed(evidence)),
+            AskOutcome::DeniedByUser => Err("denied by user".to_string()),
+            AskOutcome::DeniedUnattended(reason) if call.name == "remember" => {
+                let _ = reason;
+                Err(self.park_unattended_denial(call))
+            }
+            AskOutcome::DeniedUnattended(reason) => Err(reason),
+            AskOutcome::Cancelled => Err("cancelled".to_string()),
+        }
+    }
+
+    /// Pure resolution (PR 5): pre hooks → permission rules → profile policy.
+    /// Produces Allow / Ask / Deny and asks nobody. The write scope and
+    /// network policy come from `ctx` — the inputs the loop assembled (live
+    /// profile, turn grants, this call's escalation) — and are frozen here.
+    pub(crate) async fn resolve_policy(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+        cancellation: &CancellationToken,
+    ) -> PolicyResolution {
+        let write = ctx.write_scope();
+        let network_allowed = !ctx.policy.network_denied();
+        let deny = |reason: String| PolicyResolution::Deny(PolicyDenial { reason });
+        let allow = |authorization: AuthorizationEvidence| {
+            PolicyResolution::Allow(ResolvedExecutionPolicy {
+                write: write.clone(),
+                network_allowed,
+                authorization,
+            })
+        };
+
         let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
         match self
             .hook_runner
@@ -237,7 +320,7 @@ impl Executor {
             .await
         {
             leveler_execution::PreHookResult::Allow => {}
-            leveler_execution::PreHookResult::Deny(reason) => return Err(reason),
+            leveler_execution::PreHookResult::Deny(reason) => return deny(reason),
         }
 
         let risk = self
@@ -264,7 +347,7 @@ impl Executor {
             _ => risk,
         };
 
-        // Paths the call touches, for `path_glob` rules, the approval prompt,
+        // Paths the call touches, for `write_path_glob` rules, the approval prompt,
         // and deriving `ApproveAlways` path rules.
         let mut scoped_paths: Vec<String> = Vec::new();
         crate::authorization::collect_scoped_paths_from_call(call, &mut scoped_paths);
@@ -281,27 +364,20 @@ impl Executor {
             .evaluate(&call.name, command_line.as_deref(), &rule_paths);
         match rule_decision {
             leveler_execution::RuleDecision::Deny => {
-                return Err("forbidden by permission rule".to_string());
+                return deny("forbidden by permission rule".to_string());
             }
-            leveler_execution::RuleDecision::Allow => return Ok(()),
+            leveler_execution::RuleDecision::Allow => return allow(AuthorizationEvidence::Rule),
             leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
         }
 
-        let requirement = self.approval_policy.evaluate(
-            self.tool_context.policy.mode(),
-            &call.name,
-            risk,
-            command_view,
-        );
-
-        match requirement {
-            Requirement::Auto => Ok(()),
-            Requirement::Forbidden => Err("forbidden by policy".to_string()),
+        let profile = ctx.policy.mode();
+        match self
+            .approval_policy
+            .evaluate(profile, &call.name, risk, command_view)
+        {
+            Requirement::Auto => allow(AuthorizationEvidence::Policy { profile }),
+            Requirement::Forbidden => deny("forbidden by policy".to_string()),
             Requirement::NeedApproval => {
-                let signature = approval_signature(&call.name, program.as_deref(), &args);
-                if session_approved.contains(&signature) {
-                    return Ok(());
-                }
                 // Only say something the tool name and command do not already
                 // say. "<tool> requested by the model" is filler, and filler in
                 // a decision prompt trains people to stop reading it.
@@ -310,67 +386,111 @@ impl Executor {
                 } else {
                     String::new()
                 };
-                let request = ApprovalRequest {
-                    id: ApprovalId::generate(),
-                    turn_id: None,
-                    call_id: call.id.to_string(),
-                    agent_id: self.agent_id.clone(),
-                    action_fingerprint: action_fingerprint(call),
-                    tool: call.name.clone(),
-                    risk,
-                    description,
-                    command: command_line.clone(),
-                    paths: rule_paths,
-                };
-                let review = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return Err("cancelled".to_string()),
-                    verdict = self.auto_reviewer.review(&request) => verdict,
-                };
-                match review {
-                    ReviewVerdict::Allow => return Ok(()),
-                    ReviewVerdict::Deny(reason) => return Err(reason),
-                    ReviewVerdict::NeedUser => {}
-                }
-                let decision = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return Err("cancelled".to_string()),
-                    decision = self.approver.decide(&request) => decision,
-                };
-                match decision {
-                    ApprovalDecision::ApproveOnce => Ok(()),
-                    ApprovalDecision::ApproveSession => {
-                        // Strictly session-scoped: durable standing permission
-                        // is ApproveAlways writing a permission rule.
-                        session_approved.insert(signature);
-                        Ok(())
-                    }
-                    ApprovalDecision::ApproveAlways => {
-                        // Do NOT write the standing permission here. The
-                        // decision is only queued for persistence at this
-                        // point; writing a durable rule now means a crash can
-                        // leave a permanent grant in place while the event log
-                        // still shows the approval unresolved. `admit` writes
-                        // it after the barrier confirms the resolution landed.
-                        *pending_always = Some(PendingStandingGrant {
-                            tool: call.name.clone(),
-                            command_line: command_line.clone(),
-                            paths: scoped_paths.clone(),
-                        });
-                        // Session grant too: the current action proceeds even
-                        // when no durable rule could be persisted.
-                        session_approved.insert(signature);
-                        Ok(())
-                    }
-                    ApprovalDecision::Deny if !self.approver.has_human() => {
-                        // Nobody was asked, so nobody refused. Reporting this as
-                        // a user decision teaches the model that this user
-                        // rejects memories they never saw.
-                        Err(self.park_unattended_denial(call))
-                    }
-                    ApprovalDecision::Deny => Err("denied by user".to_string()),
-                }
+                PolicyResolution::Ask(Box::new(PendingApproval {
+                    request: ApprovalRequest {
+                        id: ApprovalId::generate(),
+                        turn_id: None,
+                        call_id: call.id.to_string(),
+                        agent_id: self.agent_id.clone(),
+                        action_fingerprint: action_fingerprint(call),
+                        tool: call.name.clone(),
+                        risk,
+                        description,
+                        command: command_line.clone(),
+                        paths: rule_paths,
+                    },
+                    signature: approval_signature(&call.name, program.as_deref(), &args),
+                    write,
+                    network_allowed,
+                    command_line,
+                    scoped_paths,
+                }))
             }
+        }
+    }
+
+    /// The one place a decision is put to the reviewer and then the human
+    /// (PR 5). Tool calls and `request_permissions` both come through here,
+    /// so `--auto-approve`, session grants and the human-vs-headless
+    /// distinction mean the same thing for both.
+    ///
+    /// A session grant or an "always" grant only skips the prompt; the policy
+    /// the call runs under is whatever `pending` already carries.
+    pub(crate) async fn ask(
+        &self,
+        pending: &PendingApproval,
+        session_approved: Option<&mut HashSet<String>>,
+        pending_always: Option<&mut Option<PendingStandingGrant>>,
+        cancellation: &CancellationToken,
+    ) -> AskOutcome {
+        let mut session_approved = session_approved;
+        if session_approved
+            .as_ref()
+            .is_some_and(|set| set.contains(&pending.signature))
+        {
+            return AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
+                signature: pending.signature.clone(),
+            });
+        }
+        let review = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return AskOutcome::Cancelled,
+            verdict = self.auto_reviewer.review(&pending.request) => verdict,
+        };
+        match review {
+            ReviewVerdict::Allow => return AskOutcome::Allowed(AuthorizationEvidence::Reviewer),
+            ReviewVerdict::Deny(reason) => return AskOutcome::DeniedUnattended(reason),
+            ReviewVerdict::NeedUser => {}
+        }
+        let decision = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return AskOutcome::Cancelled,
+            decision = self.approver.decide(&pending.request) => decision,
+        };
+        match decision {
+            ApprovalDecision::ApproveOnce => {
+                AskOutcome::Allowed(AuthorizationEvidence::ApprovedOnce)
+            }
+            ApprovalDecision::ApproveSession => {
+                // Strictly session-scoped: durable standing permission
+                // is ApproveAlways writing a permission rule.
+                if let Some(set) = &mut session_approved {
+                    set.insert(pending.signature.clone());
+                }
+                AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
+                    signature: pending.signature.clone(),
+                })
+            }
+            ApprovalDecision::ApproveAlways => {
+                // Do NOT write the standing permission here. The decision is
+                // only queued for persistence at this point; writing a durable
+                // rule now means a crash can leave a permanent grant in place
+                // while the event log still shows the approval unresolved.
+                // `admit` writes it after the barrier confirms the resolution
+                // landed.
+                if let Some(slot) = pending_always {
+                    *slot = Some(PendingStandingGrant {
+                        tool: pending.request.tool.clone(),
+                        command_line: pending.command_line.clone(),
+                        paths: pending.scoped_paths.clone(),
+                    });
+                }
+                // Session grant too: the current action proceeds even when no
+                // durable rule could be persisted.
+                if let Some(set) = &mut session_approved {
+                    set.insert(pending.signature.clone());
+                }
+                AskOutcome::Allowed(AuthorizationEvidence::ApprovedAlways)
+            }
+            // Nobody was asked, so nobody refused. Reporting this as a user
+            // decision teaches the model that this user rejects things they
+            // never saw.
+            ApprovalDecision::Deny if !self.approver.has_human() => AskOutcome::DeniedUnattended(
+                "no approver was available in this non-interactive run (nobody declined it); \
+                 re-run with --permission full-access to allow it"
+                    .to_string(),
+            ),
+            ApprovalDecision::Deny => AskOutcome::DeniedByUser,
         }
     }
 
@@ -381,14 +501,17 @@ impl Executor {
         session_approved: &mut HashSet<String>,
     ) -> Result<(), String> {
         let mut pending = None;
+        let ctx = self.tool_context.clone();
         let result = self
             .authorize_with_cancellation(
                 call,
+                &ctx,
                 session_approved,
                 &mut pending,
                 &CancellationToken::new(),
             )
-            .await;
+            .await
+            .map(|_| ());
         // The inline tests assert on the durable rule file, so apply what a
         // real run would apply after its barrier.
         if let Some(grant) = pending {
@@ -535,12 +658,22 @@ impl Executor {
         cancellation: &CancellationToken,
     ) -> (String, bool, serde_json::Value) {
         let call = &admitted.call;
+        // The tool runs under the policy admission froze — the one place the
+        // decision and the execution are tied together (PR 5).
+        let resolved = admitted.resolved();
+        tracing::debug!(
+            tool = %call.name,
+            write_scope = ?resolved.write,
+            network_allowed = resolved.network_allowed,
+            authorization = ?resolved.authorization,
+            "executing admitted call"
+        );
         let outcome = match self
             .registry
             .execute(
                 &call.name,
                 call.arguments.clone(),
-                admitted.ctx.clone(),
+                admitted.execution_context().clone(),
                 cancellation.child_token(),
             )
             .await
@@ -1101,7 +1234,7 @@ mod authorize_tests {
     async fn approve_session_stays_in_session_and_writes_no_grants_file() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
-        let executor = executor_for(dir.path(), approver.clone()).with_grants_state_dir(dir.path());
+        let executor = executor_for(dir.path(), approver.clone());
         let mut session = HashSet::new();
 
         executor
@@ -1232,7 +1365,7 @@ mod authorize_tests {
     }
 
     #[tokio::test]
-    async fn path_glob_deny_rule_matches_call_paths() {
+    async fn write_path_glob_deny_rule_matches_call_paths() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let deny_src = leveler_execution::PermissionRule {
@@ -1240,7 +1373,7 @@ mod authorize_tests {
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
                 command_exact: None,
-                path_glob: Some("src/**".into()),
+                write_path_glob: Some("src/**".into()),
             },
             effect: leveler_execution::RuleEffect::Deny,
         };
@@ -1396,6 +1529,166 @@ mod authorize_tests {
         assert!(
             !summary.contains("requested by the model"),
             "description is filler: {summary}"
+        );
+    }
+
+    // ---- PR 5: authorization is decided in one place and frozen per call ----
+
+    /// Resolution is pure: hooks → rules → profile policy decide Allow / Ask
+    /// / Deny without touching the approver. Asking is a separate step.
+    #[tokio::test]
+    async fn policy_resolution_is_decided_before_anyone_is_asked() {
+        use leveler_execution::{AuthorizationEvidence, PolicyResolution, WriteScope};
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let exec = executor_for(dir.path(), approver.clone());
+        let ctx = exec.tool_context.clone();
+        let root = ctx.execution.workspace.root().to_path_buf();
+
+        match exec
+            .resolve_policy(&grep_call(), &ctx, &CancellationToken::new())
+            .await
+        {
+            PolicyResolution::Allow(resolved) => {
+                assert!(
+                    matches!(resolved.authorization, AuthorizationEvidence::Policy { .. }),
+                    "{:?}",
+                    resolved.authorization
+                );
+                assert_eq!(resolved.write, WriteScope::Workspace { root: root.clone() });
+                assert!(resolved.network_allowed);
+            }
+            other => panic!("grep under assisted must resolve to Allow: {other:?}"),
+        }
+        assert!(matches!(
+            exec.resolve_policy(&rm_rf_call(), &ctx, &CancellationToken::new())
+                .await,
+            PolicyResolution::Ask(_)
+        ));
+        assert_eq!(approver.asks(), 0, "resolution must not ask anyone");
+    }
+
+    /// The admitted call carries its policy. A profile switch after admission
+    /// reaches the NEXT call, never this one — and the context the tool
+    /// executes with is that frozen policy, not the live cell.
+    #[tokio::test]
+    async fn an_admitted_call_carries_a_frozen_policy() {
+        use leveler_execution::WriteScope;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_sharing(dir.path(), &profile, approver);
+        let ctx = exec.tool_context.clone();
+        let root = ctx.execution.workspace.root().to_path_buf();
+        let admitted = exec
+            .admit(
+                grep_call(),
+                ctx,
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .expect("grep is admitted under assisted");
+        let confined = WriteScope::Workspace { root: root.clone() };
+        assert_eq!(admitted.resolved().write, confined);
+
+        profile.set(PermissionProfile::FullAccess);
+        assert_eq!(
+            admitted.resolved().write,
+            confined,
+            "a switch after admission must not widen an admitted call"
+        );
+        assert_eq!(
+            admitted.execution_context().write_scope(),
+            confined,
+            "the tool executes under the frozen policy, not the live profile"
+        );
+    }
+
+    /// "Don't ask again" skips the prompt. It never widens the write scope.
+    #[tokio::test]
+    async fn approve_session_skips_the_prompt_but_does_not_widen_the_write_scope() {
+        use leveler_execution::{AuthorizationEvidence, WriteScope};
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
+        let exec = executor_for(dir.path(), approver.clone());
+        let ctx = exec.tool_context.clone();
+        let root = ctx.execution.workspace.root().to_path_buf();
+        let mut session = HashSet::new();
+        let first = exec
+            .admit(
+                rm_rf_call(),
+                ctx.clone(),
+                false,
+                &mut session,
+                &CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .expect("first admitted after approval");
+        let second = exec
+            .admit(
+                rm_rf_call(),
+                ctx,
+                false,
+                &mut session,
+                &CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .expect("second admitted on the session grant");
+        assert_eq!(approver.asks(), 1, "the second call must not re-prompt");
+        for admitted in [&first, &second] {
+            assert_eq!(
+                admitted.resolved().write,
+                WriteScope::Workspace { root: root.clone() },
+                "a session grant skips approval; it does not lift write confinement"
+            );
+        }
+        assert!(matches!(
+            second.resolved().authorization,
+            AuthorizationEvidence::SessionGrant { .. }
+        ));
+    }
+
+    /// `request_permissions` goes through the host's ask path. An allowing
+    /// auto-reviewer settles it without reaching the human approver — the
+    /// direct-to-approver bypass the migration plan pointed at.
+    #[tokio::test]
+    async fn request_permissions_is_settled_by_the_same_ask_path_as_tool_calls() {
+        struct AllowAll;
+        #[async_trait::async_trait]
+        impl leveler_execution::AutoReviewer for AllowAll {
+            async fn review(&self, _request: &ApprovalRequest) -> ReviewVerdict {
+                ReviewVerdict::Allow
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let exec =
+            executor_for(dir.path(), approver.clone()).with_auto_reviewer(Arc::new(AllowAll));
+        let call = ToolCall {
+            id: ToolCallId::new("p"),
+            name: "request_permissions".to_string(),
+            arguments: serde_json::json!({"action": "fetch deps", "network": true}),
+        };
+        let outcome = exec
+            .handle_request_permissions(&call, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::injected_tools::PermissionRequestOutcome::Granted { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            approver.asks(),
+            0,
+            "the reviewer settled it; the human was never asked"
         );
     }
 }

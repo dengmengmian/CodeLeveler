@@ -118,10 +118,10 @@ impl Tool for GitDiffTool {
         if input.staged {
             args.push("--staged");
         }
-        // Validate the path stays in the workspace before passing it to git.
+        // Refuse credential paths before handing the path to git.
         let path_owned;
         if let Some(p) = &input.path {
-            context.execution.workspace.resolve(p)?;
+            context.execution.workspace.resolve_for_read(p)?;
             args.push("--");
             path_owned = p.clone();
             args.push(&path_owned);

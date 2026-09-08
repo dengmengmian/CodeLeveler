@@ -527,8 +527,8 @@ fn plan_for_intent(
         FilesystemIntent::ReadOnly { read_roots } => {
             let mut reads = read_roots.clone();
             if reads.is_empty() {
-                if let Some(w) = &request.write_root {
-                    reads.push(w.clone());
+                if let Some(w) = request.write_scope.root() {
+                    reads.push(w.to_path_buf());
                 }
                 reads.push(request.cwd.clone());
             }
@@ -549,18 +549,17 @@ fn plan_for_intent(
                 env_overrides: temp_env_overrides(&sandbox_temp),
             })
         }
-        FilesystemIntent::WorkspaceWrite {
-            write_root,
-            extra_read_roots,
-        } => {
+        FilesystemIntent::WorkspaceWrite { write_root } => {
             let sandbox_temp = private_sandbox_temp("ww", write_root, temp_root)?;
             let mut writes = vec![write_root.clone(), sandbox_temp.clone()];
             let cache = temp_root.join("leveler-tool-cache");
             let _ = std::fs::create_dir_all(&cache);
             writes.push(cache);
 
-            let mut reads = extra_read_roots.clone();
-            reads.extend(writes.iter().cloned());
+            // Known limitation: reads are allowlisted to the write roots; a
+            // Windows "read anything" backend is pending (see
+            // `ProcessRequest::filesystem_intent`).
+            let reads = writes.clone();
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
                 write_roots: dedup_paths(writes),
@@ -590,7 +589,7 @@ fn profile_name_for(request: &ProcessRequest) -> String {
     let mut h = DefaultHasher::new();
     PROFILE_PREFIX.hash(&mut h);
     request.cwd.hash(&mut h);
-    if let Some(w) = &request.write_root {
+    if let Some(w) = request.write_scope.root() {
         w.hash(&mut h);
     }
     format!("{PROFILE_PREFIX}.{:x}", h.finish())
@@ -807,7 +806,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let intent = FilesystemIntent::WorkspaceWrite {
             write_root: dir.path().to_path_buf(),
-            extra_read_roots: vec![],
         };
         let req = ProcessRequest::new("cmd", vec![], dir.path().to_path_buf());
         let plan = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
@@ -960,9 +958,6 @@ mod tests {
         #[tokio::test]
         async fn readonly_can_read_workspace_but_not_write() {
             let pair = temp_pair();
-            let intent = FilesystemIntent::ReadOnly {
-                read_roots: vec![pair.ws.clone()],
-            };
             let mut req = ProcessRequest::new(
                 "cmd",
                 vec![
@@ -971,7 +966,7 @@ mod tests {
                 ],
                 pair.ws.clone(),
             );
-            req.filesystem_intent = Some(intent.clone());
+            req.write_scope = crate::WriteScope::None;
             req.timeout = Duration::from_secs(30);
             let out = canary_runner()
                 .run(req, CancellationToken::new())
@@ -992,7 +987,7 @@ mod tests {
                 vec!["/C".into(), format!("echo pwned> {}", out_path.display())],
                 pair.ws.clone(),
             );
-            wreq.filesystem_intent = Some(intent);
+            wreq.write_scope = crate::WriteScope::None;
             wreq.timeout = Duration::from_secs(30);
             let wout = canary_runner()
                 .run(wreq, CancellationToken::new())
@@ -1041,7 +1036,7 @@ mod tests {
                 ],
                 pair.ws.clone(),
             );
-            req.filesystem_intent = Some(intent);
+            req.write_scope = crate::WriteScope::None;
             req.timeout = Duration::from_secs(30);
             let out = canary_runner()
                 .run(req, CancellationToken::new())
@@ -1060,7 +1055,6 @@ mod tests {
             let pair = temp_pair();
             let intent = FilesystemIntent::WorkspaceWrite {
                 write_root: pair.ws.clone(),
-                extra_read_roots: vec![],
             };
             let req_probe = ProcessRequest::new("cmd", vec![], pair.ws.clone());
             let plan = plan_for_intent(&intent, &req_probe, &std::env::temp_dir()).unwrap();
@@ -1083,8 +1077,9 @@ mod tests {
                 vec!["/C".into(), format!("echo hello> {}", target.display())],
                 pair.ws.clone(),
             );
-            req.filesystem_intent = Some(intent.clone());
-            req.write_root = Some(pair.ws.clone());
+            req.write_scope = crate::WriteScope::Workspace {
+                root: pair.ws.clone(),
+            };
             req.timeout = Duration::from_secs(30);
             let out = canary_runner()
                 .run(req, CancellationToken::new())
@@ -1117,8 +1112,9 @@ mod tests {
                 ],
                 pair.ws.clone(),
             );
-            treq.filesystem_intent = Some(intent.clone());
-            treq.write_root = Some(pair.ws.clone());
+            treq.write_scope = crate::WriteScope::Workspace {
+                root: pair.ws.clone(),
+            };
             treq.timeout = Duration::from_secs(30);
             let expected_profile = profile_name_for(&treq).to_ascii_lowercase();
             let tout = canary_runner()
@@ -1176,8 +1172,9 @@ mod tests {
                 vec!["/C".into(), format!("echo bad> {}", evil.display())],
                 pair.ws.clone(),
             );
-            sreq.filesystem_intent = Some(intent);
-            sreq.write_root = Some(pair.ws.clone());
+            sreq.write_scope = crate::WriteScope::Workspace {
+                root: pair.ws.clone(),
+            };
             sreq.timeout = Duration::from_secs(30);
             let _ = canary_runner()
                 .run(sreq, CancellationToken::new())
@@ -1197,15 +1194,12 @@ mod tests {
         #[tokio::test]
         async fn deny_network_true_is_accepted_for_appcontainer() {
             let pair = temp_pair();
-            let intent = FilesystemIntent::ReadOnly {
-                read_roots: vec![pair.ws.clone()],
-            };
             let mut req = ProcessRequest::new(
                 "cmd",
                 vec!["/C".into(), "echo net-ok".into()],
                 pair.ws.clone(),
             );
-            req.filesystem_intent = Some(intent);
+            req.write_scope = crate::WriteScope::None;
             req.deny_network = true;
             req.timeout = Duration::from_secs(30);
             let out = canary_runner()

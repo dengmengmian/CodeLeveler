@@ -613,18 +613,9 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.repeated_read_guard = Some(false);
             (true, false)
         }
-        "prune_tool_results" => {
-            o.prune_tool_results = Some(true);
-            (false, true)
-        }
-        "keep_reasoning" => {
-            o.keep_reasoning = Some(true);
-            (false, true)
-        }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
-             repeated_read_guard, progress_guards, \
-             prune_tool_results, keep_reasoning"
+             repeated_read_guard, progress_guards"
         ),
     };
     Ok((o, before, after))

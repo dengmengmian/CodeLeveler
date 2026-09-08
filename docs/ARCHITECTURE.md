@@ -259,12 +259,38 @@ Platform controls (capability-detected, never over-claimed):
 boundary — including FUTURE User Shell (`!command`), Capability, and Extension
 tools. User-initiated work does **not** skip host safety.
 
+**One spawn path.** `CommandRunner::spawn(&ProcessRequest) -> ManagedProcess`
+is the only place a model-driven command is confined, environment-scrubbed,
+and process-grouped. Foreground `run`, the background task registry, and the
+verifier all go through it; the registry keeps only a `ManagedProcess` (and its
+`ProcessIdentity` for tree kill after the reaper takes the handle) and never
+spawns or `taskkill`s on its own. The single exception is the Windows
+AppContainer launcher for confined commands, which yields no process handle
+and is therefore foreground-only (the registry refuses it). Host lifecycle
+hooks are not model commands and run through their own spawn.
+
 Distinguish:
 
 - **Model authorization** (what the model is allowed to *request*)
 - **Host authorization** (what the host actually permits)
 
 The model never elevates its own privileges.
+
+**Reads need no authorization.** Structured file tools (`read_file`, `grep`,
+`list_files`, `find_files`, …) resolve any path — inside or outside the
+workspace — through `Workspace::resolve_for_read`, which canonicalizes and
+applies the credential-name denylist (`.env*`, private keys, `.ssh`/`.aws`,
+`.git` internals) but performs no scope check and raises no approval. Reading
+another checkout no longer needs a readonly root. The one write boundary is
+`WriteScope` (`None` / `Workspace { root }` / `Unrestricted`), applied by
+`Workspace::resolve_for_write` for structured edits and by the OS sandbox for
+commands. Network stays an independent capability precisely because "read
+anything + network" is an exfiltration path; it is not implied by any write
+scope. `ProcessRequest` carries only `write_scope` and `deny_network`; the
+host-side absolute-path read preflights are gone. **Windows caveat:** the
+AppContainer backend still allowlists reads to its write roots, so "read
+anything" does not yet hold there — the Restricted Token + ACL + Job
+write-confinement backend has to be built and verified on a Windows host.
 
 ---
 
@@ -848,7 +874,7 @@ Do not schedule Capability ahead of User Shell without new evidence.
 | --- | --- | --- |
 | Global | `~/.leveler/config.toml` | Default model, providers, MCP |
 | Bundle | `configs/providers/`, `configs/models/` | Checked-in provider/model profiles |
-| Project | `<repo>/.leveler/config.yaml` | Model override, permission profile, verify, ignore, readonly roots, limits |
+| Project | `<repo>/.leveler/config.yaml` | Model override, permission profile, verify, ignore, limits |
 | Permissions | `~/.leveler/permissions.yaml`, project file | Durable allow/ask/deny |
 | Hooks | `~/.leveler/hooks.yaml`, project file | Pre/post tool external commands |
 

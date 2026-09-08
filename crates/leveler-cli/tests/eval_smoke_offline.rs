@@ -98,8 +98,8 @@ fn text(t: &str) -> ModelResponse {
 #[tokio::test]
 async fn smoke_case_runs_offline_end_to_end() {
     // 1. Load the real committed case — its format must stay parseable.
-    let case_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/smoke/rust-mul.yaml");
+    let case_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../evals/cases/smoke/rust-mul.yaml");
     let case = leveler_eval::EvaluationCase::load(&case_path).expect("smoke case must parse");
     assert_eq!(case.id, "rust-mul");
 

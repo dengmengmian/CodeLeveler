@@ -94,7 +94,7 @@ impl Tool for FindFilesTool {
             return Ok(ToolOutput::error("`pattern` must not be empty"));
         }
         let base_label = input.path.as_deref().unwrap_or(".");
-        let base = context.execution.workspace.resolve_read(base_label)?;
+        let base = context.execution.workspace.resolve_for_read(base_label)?;
         if !base.is_dir() {
             return Ok(ToolOutput::error(crate::recoverable::path_not_directory(
                 base_label,

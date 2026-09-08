@@ -23,11 +23,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
 
-    /// Extra directory the agent may **read** (not write). Repeatable.
-    /// Also: env `LEVELER_READONLY_ROOTS` and `.leveler/config.yaml` `readonly_roots`.
-    #[arg(long = "readonly-root", global = true, value_name = "DIR")]
-    pub readonly_root: Vec<PathBuf>,
-
     /// Increase log verbosity (-v, -vv).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -77,8 +72,8 @@ pub enum Command {
         #[arg(long)]
         auto_approve: bool,
         /// Deny network access to run_command processes.
-        #[arg(long)]
-        sandbox: bool,
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
         /// Override the per-repository Unix socket path.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
@@ -122,8 +117,8 @@ pub enum Command {
         #[arg(long)]
         auto_approve: bool,
         /// Deny network access to run_command processes (in-process runtime only).
-        #[arg(long)]
-        sandbox: bool,
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
     },
 
     /// Manage project-scoped durable memory (approved conclusions / preferences).
@@ -221,9 +216,9 @@ pub enum Command {
         /// Base branch for the pull request.
         #[arg(long)]
         pr_base: Option<String>,
-        /// Deny network access to run_command processes (macOS OS sandbox).
-        #[arg(long)]
-        sandbox: bool,
+        /// Deny network access to run_command processes (OS sandbox).
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
         /// Work profile: economy | balanced | delivery (default balanced).
         #[arg(long, default_value = "balanced")]
         work_mode: String,
@@ -1185,7 +1180,7 @@ mod tests {
             "deepseek/v4",
             "--permission",
             "full-access",
-            "--sandbox",
+            "--deny-network",
             "--socket",
             "/tmp/leveler.sock",
         ]);
@@ -1194,7 +1189,7 @@ mod tests {
                 model,
                 mode,
                 auto_approve,
-                sandbox,
+                deny_network,
                 socket,
                 tcp,
                 ready_json,
@@ -1202,12 +1197,25 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert!(matches!(mode, RunMode::FullAccess));
                 assert!(!auto_approve);
-                assert!(sandbox);
+                assert!(deny_network);
                 assert_eq!(socket, Some(PathBuf::from("/tmp/leveler.sock")));
                 assert!(tcp.is_none(), "no --tcp given → Unix-only daemon");
                 assert!(ready_json.is_none());
             }
             other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    /// PR 6: the flag says what it does. The old spelling keeps working for
+    /// scripts that still pass it.
+    #[test]
+    fn deny_network_flag_and_its_legacy_sandbox_alias_both_parse() {
+        for flag in ["--deny-network", "--sandbox"] {
+            let cli = parse(&["leveler", "run", "do it", flag]);
+            match cli.command {
+                Some(Command::Run { deny_network, .. }) => assert!(deny_network, "{flag}"),
+                other => panic!("expected Run, got {other:?}"),
+            }
         }
     }
 

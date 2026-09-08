@@ -46,9 +46,10 @@ impl Tool for ReadFileTool {
     fn description(&self) -> &'static str {
         "Read a UTF-8 text *file* under the workspace root (prefer paths relative \
          to that root, e.g. `src/lib.rs`). Paths that are directories must use \
-         `list_files` instead — `read_file` does not list directories. Absolute \
-         paths outside the workspace are rejected unless under a configured \
-         readonly root (`--readonly-root`). Returns content with 1-based line \
+         `list_files` instead — `read_file` does not list directories. Any \
+         absolute path is readable (reads are not confined to the workspace; \
+         credential files such as `.env` and private keys are refused). \
+         Returns content with 1-based line \
          numbers. `start_line`/`end_line` return only that inclusive range; \
          omitting both returns the whole file."
     }
@@ -78,7 +79,7 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.execution.workspace.resolve_read(&input.path)?;
+        let path = context.execution.workspace.resolve_for_read(&input.path)?;
 
         let meta = match tokio::fs::metadata(&path).await {
             Ok(m) => m,

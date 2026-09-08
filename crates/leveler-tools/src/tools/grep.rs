@@ -60,9 +60,9 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search files under the workspace root (relative path, or absolute under \
-         the workspace / a `--readonly-root`) for a pattern. Returns matching \
-         lines as `path:line:text`. Uses ripgrep when available."
+        "Search files under a path (relative to the workspace root, or any \
+         absolute path — reads are not confined to the workspace) for a pattern. \
+         Returns matching lines as `path:line:text`. Uses ripgrep when available."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -85,7 +85,7 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
-        let search_root = context.execution.workspace.resolve_read(&rel)?;
+        let search_root = context.execution.workspace.resolve_for_read(&rel)?;
         let max = input.max_results.unwrap_or(DEFAULT_MAX);
 
         // Try ripgrep first.

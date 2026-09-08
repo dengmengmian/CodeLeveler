@@ -36,25 +36,22 @@ pub enum FilesystemIntent {
         read_roots: Vec<PathBuf>,
     },
     /// Low-integrity / write-restricted (future backend).
-    WorkspaceWrite {
-        write_root: PathBuf,
-        #[serde(default)]
-        extra_read_roots: Vec<PathBuf>,
-    },
+    WorkspaceWrite { write_root: PathBuf },
 }
 
 impl FilesystemIntent {
-    /// Conservative mapping from legacy `write_root` + full_access flags.
-    ///
-    /// Missing write_root with full_access → Unrestricted.
-    /// write_root present → WorkspaceWrite (restricted).
-    pub fn from_legacy(write_root: Option<&Path>, full_access: bool) -> Self {
-        if full_access || write_root.is_none() {
-            return Self::Unrestricted;
-        }
-        Self::WorkspaceWrite {
-            write_root: write_root.unwrap().to_path_buf(),
-            extra_read_roots: Vec::new(),
+    /// The Windows contract for one [`WriteScope`](crate::WriteScope). `None`
+    /// anchors its read-only allowlist on `cwd` (the workspace the command
+    /// runs in).
+    pub fn from_write_scope(scope: &crate::WriteScope, cwd: &Path) -> Self {
+        match scope {
+            crate::WriteScope::Unrestricted => Self::Unrestricted,
+            crate::WriteScope::Workspace { root } => Self::WorkspaceWrite {
+                write_root: root.clone(),
+            },
+            crate::WriteScope::None => Self::ReadOnly {
+                read_roots: vec![cwd.to_path_buf()],
+            },
         }
     }
 
@@ -265,27 +262,9 @@ pub fn assert_background_intent_spawn_allowed(
     deny_network: bool,
 ) -> Result<(), WindowsSandboxError> {
     assert_intent_spawn_allowed(intent, deny_network)?;
-    #[cfg(windows)]
-    {
-        confined_background_refusal(intent, /* no confining background runner yet */ false)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
-
-/// Whether a restricted process request may proceed on this host.
-///
-/// **WS0 hard rule:** on Windows, any request with `write_root=Some` must not
-/// plain-spawn. Until a real backend ships, return [`WindowsSandboxError`].
-pub fn assert_windows_spawn_allowed(
-    write_root: Option<&Path>,
-    deny_network: bool,
-    full_access: bool,
-) -> Result<(), WindowsSandboxError> {
-    let intent = FilesystemIntent::from_legacy(write_root, full_access);
-    assert_intent_spawn_allowed(&intent, deny_network)
+    // Off Windows the argv wrappers (seatbelt / bwrap) ARE the confining
+    // background runner; on Windows there is none yet.
+    confined_background_refusal(intent, cfg!(not(windows)))
 }
 
 /// Intent-aware gate (WS2). Unrestricted always allowed; restricted intents
@@ -387,17 +366,25 @@ mod tests {
 
     #[test]
     fn full_access_always_allowed() {
-        assert!(assert_windows_spawn_allowed(Some(Path::new("C:\\ws")), true, true).is_ok());
+        let intent = FilesystemIntent::from_write_scope(
+            &crate::WriteScope::Unrestricted,
+            Path::new("C:\\ws"),
+        );
+        assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_restricted_write_allowed_when_appcontainer_linked() {
-        let intent = FilesystemIntent::from_legacy(Some(Path::new("C:\\ws")), false);
+        let intent = FilesystemIntent::from_write_scope(
+            &crate::WriteScope::Workspace {
+                root: PathBuf::from("C:\\ws"),
+            },
+            Path::new("C:\\ws"),
+        );
         assert!(matches!(intent, FilesystemIntent::WorkspaceWrite { .. }));
         // WS3-B linked: WorkspaceWrite is allowed (deny_network still ok).
         assert!(assert_intent_spawn_allowed(&intent, false).is_ok());
-        assert!(assert_windows_spawn_allowed(Some(Path::new("C:\\ws")), false, false).is_ok());
     }
 
     #[cfg(windows)]
@@ -412,7 +399,13 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn non_windows_allows_restricted_for_seatbelt_path() {
-        assert!(assert_windows_spawn_allowed(Some(Path::new("/tmp/ws")), true, false).is_ok());
+        let intent = FilesystemIntent::from_write_scope(
+            &crate::WriteScope::Workspace {
+                root: PathBuf::from("/tmp/ws"),
+            },
+            Path::new("/tmp/ws"),
+        );
+        assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
     }
 
     #[test]
@@ -424,14 +417,28 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_intent_legacy_defaults_conservative() {
-        assert!(FilesystemIntent::from_legacy(None, false).is_unrestricted());
-        assert!(FilesystemIntent::from_legacy(Some(Path::new("/ws")), true).is_unrestricted());
-        match FilesystemIntent::from_legacy(Some(Path::new("/ws")), false) {
-            FilesystemIntent::WorkspaceWrite { write_root, .. } => {
+    fn filesystem_intent_derives_from_write_scope() {
+        use crate::WriteScope;
+        let cwd = Path::new("/ws");
+        assert!(
+            FilesystemIntent::from_write_scope(&WriteScope::Unrestricted, cwd).is_unrestricted()
+        );
+        match FilesystemIntent::from_write_scope(
+            &WriteScope::Workspace {
+                root: PathBuf::from("/ws"),
+            },
+            cwd,
+        ) {
+            FilesystemIntent::WorkspaceWrite { write_root } => {
                 assert_eq!(write_root, PathBuf::from("/ws"));
             }
             other => panic!("expected WorkspaceWrite, got {other:?}"),
+        }
+        match FilesystemIntent::from_write_scope(&WriteScope::None, cwd) {
+            FilesystemIntent::ReadOnly { read_roots } => {
+                assert_eq!(read_roots, vec![cwd.to_path_buf()])
+            }
+            other => panic!("expected ReadOnly, got {other:?}"),
         }
     }
 
@@ -488,21 +495,17 @@ mod tests {
     }
 
     #[test]
-    fn process_request_carries_filesystem_intent_field() {
+    fn process_request_derives_its_intent_from_its_scope() {
         use crate::command::ProcessRequest;
-        let mut req = ProcessRequest::new("echo", vec!["hi".into()], PathBuf::from("."));
-        assert!(req.filesystem_intent.is_none());
-        req.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-            write_root: PathBuf::from("/ws"),
-            extra_read_roots: Vec::new(),
-        });
+        let mut req = ProcessRequest::new("echo", vec!["hi".into()], PathBuf::from("/ws"));
+        assert!(req.filesystem_intent().is_unrestricted());
+        req.write_scope = crate::WriteScope::Workspace {
+            root: PathBuf::from("/ws"),
+        };
         assert!(matches!(
-            req.filesystem_intent,
-            Some(FilesystemIntent::WorkspaceWrite { .. })
+            req.filesystem_intent(),
+            FilesystemIntent::WorkspaceWrite { .. }
         ));
-        // Legacy mapping still used when intent is None.
-        let legacy = FilesystemIntent::from_legacy(Some(Path::new("/ws")), false);
-        assert!(matches!(legacy, FilesystemIntent::WorkspaceWrite { .. }));
     }
 }
 
@@ -519,7 +522,6 @@ mod background_gate_tests {
     fn a_confined_background_intent_is_refused_when_no_confining_runner_exists() {
         let ws = FilesystemIntent::WorkspaceWrite {
             write_root: PathBuf::from("C:\\ws"),
-            extra_read_roots: vec![],
         };
         let err = confined_background_refusal(&ws, false).expect_err("must refuse");
         let text = err.to_string();
@@ -545,7 +547,6 @@ mod background_gate_tests {
     fn a_confined_background_intent_passes_once_a_confining_runner_exists() {
         let ws = FilesystemIntent::WorkspaceWrite {
             write_root: PathBuf::from("C:\\ws"),
-            extra_read_roots: vec![],
         };
         assert!(confined_background_refusal(&ws, true).is_ok());
     }
@@ -557,7 +558,6 @@ mod background_gate_tests {
     fn background_gate_is_permissive_off_windows_and_closed_on_windows() {
         let ws = FilesystemIntent::WorkspaceWrite {
             write_root: PathBuf::from("/ws"),
-            extra_read_roots: vec![],
         };
         let result = assert_background_intent_spawn_allowed(&ws, false);
         #[cfg(not(windows))]

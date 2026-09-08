@@ -6,7 +6,9 @@
 //! Unix process groups (`killpg`) and Windows Job Objects via `process-wrap`
 //! (WS1; no in-crate `unsafe`).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use crate::WriteScope;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -59,24 +61,12 @@ pub struct ProcessRequest {
     pub timeout: Duration,
     /// Deny network access for this process (macOS seatbelt; no-op elsewhere).
     pub deny_network: bool,
-    /// Confine filesystem *writes* to this root (plus the standard temp dirs).
-    /// `Some(workspace_root)` in workspace-write mode blocks a stray `rm -rf` or
-    /// an edit outside the repo at the OS level; `None` applies no write
-    /// confinement (full-access / legacy).
-    pub write_root: Option<PathBuf>,
-    /// Pre-claim child semantics: run the process, but make the WORKSPACE
-    /// read-only at the OS boundary (scratch and toolchain caches stay
-    /// writable so builds still work). A child that owns no write scope can
-    /// therefore observe the repository — the thing it must do before it can
-    /// know what to claim — while every workspace mutation fails in the
-    /// kernel, whatever program attempts it. This replaces guessing which
-    /// commands are "read-only": the boundary is the effect, not the intent.
-    pub read_only_workspace: bool,
-    /// Extra project trees for host-side absolute-arg preflight (e.g.
-    /// `--readonly-root`). OS sandbox reads are unrestricted;
-    /// writes still use [`Self::write_root`] + toolchain caches.
-    /// **Windows has no OS FS sandbox yet** — preflight is primary.
-    pub extra_read_roots: Vec<PathBuf>,
+    /// The one write boundary this process runs under. The OS wrappers
+    /// (seatbelt / bwrap / AppContainer) enforce it: `Workspace` confines
+    /// writes to that root plus temp/toolchain caches, `None` mounts the
+    /// workspace read-only (scratch and caches stay writable so builds run),
+    /// `Unrestricted` applies no write fence. Reads are never confined.
+    pub write_scope: WriteScope,
     /// Per-stream cap on captured output. The process keeps running (its pipes
     /// are drained to EOF) but only the first and last halves of this many
     /// bytes are kept in memory; the middle is dropped and counted.
@@ -88,10 +78,6 @@ pub struct ProcessRequest {
     /// Credential-like variables intentionally granted to this trusted child.
     /// Tool/model-controlled requests must leave this empty.
     pub allow_env: Vec<String>,
-    /// Host-trusted filesystem intent (WS2). When set, overrides the legacy
-    /// write_root → restricted mapping for Windows capability gates. Models
-    /// never choose this; only host policy may populate it.
-    pub filesystem_intent: Option<crate::windows_sandbox::FilesystemIntent>,
 }
 
 /// Default per-stream output cap (1 MiB).
@@ -105,68 +91,33 @@ impl ProcessRequest {
             cwd,
             timeout: Duration::from_secs(600),
             deny_network: false,
-            write_root: None,
-            read_only_workspace: false,
-            extra_read_roots: Vec::new(),
+            write_scope: WriteScope::Unrestricted,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             deny_env: Vec::new(),
             allow_env: Vec::new(),
-            filesystem_intent: None,
         }
     }
 }
 
 impl ProcessRequest {
-    /// Set the legacy confinement triple (`write_root`, `read_only_workspace`,
-    /// `filesystem_intent`) from one [`WriteScope`]. Every call site used to
-    /// assemble the three by hand; this is the only place that knows how they
-    /// relate. `extra_read_roots` must already be set — the Windows intent
-    /// carries it.
+    /// The Windows backend contract for this request, derived from the write
+    /// scope. Never model-chosen: the scope comes from host policy.
     ///
-    /// `cwd` is the workspace anchor for `None`: the OS wrappers need a root
-    /// to mount read-only even when nothing under it may be written.
-    pub fn apply_write_scope(&mut self, scope: &crate::WriteScope) {
-        use crate::WriteScope;
-        use crate::windows_sandbox::FilesystemIntent;
-        match scope {
-            WriteScope::Unrestricted => {
-                self.write_root = None;
-                self.read_only_workspace = false;
-                self.filesystem_intent = Some(FilesystemIntent::Unrestricted);
-            }
-            WriteScope::Workspace { root } => {
-                self.write_root = Some(root.clone());
-                self.read_only_workspace = false;
-                self.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-                    write_root: root.clone(),
-                    extra_read_roots: self.extra_read_roots.clone(),
-                });
-            }
-            WriteScope::None => {
-                let root = self.cwd.clone();
-                self.write_root = Some(root.clone());
-                self.read_only_workspace = true;
-                let mut read_roots = vec![root];
-                read_roots.extend(self.extra_read_roots.iter().cloned());
-                self.filesystem_intent = Some(FilesystemIntent::ReadOnly { read_roots });
-            }
-        }
+    /// Known limitation: AppContainer allowlists *reads* to its write roots,
+    /// so on Windows "read anything" does not hold yet — the Restricted
+    /// Token + ACL write-confinement backend the migration plan calls for
+    /// must be built and verified on a Windows host.
+    pub fn filesystem_intent(&self) -> crate::windows_sandbox::FilesystemIntent {
+        crate::windows_sandbox::FilesystemIntent::from_write_scope(&self.write_scope, &self.cwd)
     }
+}
 
-    /// The scope the OS wrappers will actually enforce for this request.
-    ///
-    /// Derived from `write_root` first because that is what every wrapper
-    /// anchors on: `read_only_workspace` without a `write_root` is ignored by
-    /// all of them, so it reads back as `Unrestricted` here — the truth, not
-    /// the flag. (Legacy gap; PR 3 closes it.)
-    pub fn write_scope(&self) -> crate::WriteScope {
-        use crate::WriteScope;
-        match &self.write_root {
-            None => WriteScope::Unrestricted,
-            Some(_) if self.read_only_workspace => WriteScope::None,
-            Some(root) => WriteScope::Workspace { root: root.clone() },
-        }
-    }
+/// The directory a confined request's private scratch and tool caches are
+/// keyed on: the write root when there is one, else the cwd (a `None` scope
+/// still needs caches to build against).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn sandbox_anchor(request: &ProcessRequest) -> &Path {
+    request.write_scope.root().unwrap_or(&request.cwd)
 }
 
 /// Whether a confined command should expose the host's existing dependency
@@ -201,7 +152,7 @@ pub enum VerifyNetworkPolicy {
 
 /// Build a sandbox-confined ProcessRequest for verification or acceptance.
 ///
-/// Never HostTrusted: always sets `write_root` + `FilesystemIntent::WorkspaceWrite`
+/// Never HostTrusted: always runs under `WriteScope::Workspace`
 /// on `workspace_root`. Built-in credential env scrubbing still applies
 /// (`deny_env` left empty for additional names). Models never choose the intent.
 pub fn process_request_for_verify_check(
@@ -210,23 +161,19 @@ pub fn process_request_for_verify_check(
     workspace_root: PathBuf,
     network: VerifyNetworkPolicy,
 ) -> ProcessRequest {
-    let write_root = workspace_root.clone();
-    let mut req = ProcessRequest::new(program, args, workspace_root);
-    req.write_root = Some(write_root.clone());
-    req.filesystem_intent = Some(crate::windows_sandbox::FilesystemIntent::WorkspaceWrite {
-        write_root,
-        extra_read_roots: Vec::new(),
-    });
+    let mut req = ProcessRequest::new(program, args, workspace_root.clone());
+    req.write_scope = WriteScope::Workspace {
+        root: workspace_root,
+    };
     req.deny_network = matches!(network, VerifyNetworkPolicy::ForceDeny);
     req
 }
 
 /// Wrap a command in an OS sandbox. Independent tightenings:
 /// - `deny_network`: block network access.
-/// - `write_root`: confine filesystem *writes* to the workspace (+ temp/toolchain
-///   caches). Reads stay broad. Host-side absolute-argument
-///   preflight on `run_command` still blocks model-supplied absolute paths
-///   outside the workspace for non-full-access modes.
+/// - `scope`: confine filesystem *writes* to the workspace (+ temp/toolchain
+///   caches), or mount the workspace read-only for a `None` scope. Reads are
+///   never confined.
 ///
 /// macOS uses `sandbox-exec` with a closed-by-default seatbelt profile; writable
 /// roots are `-D` params. Linux uses bubblewrap with full ro-bind of `/` and
@@ -294,100 +241,38 @@ pub(crate) fn sandbox_command(
     program: &str,
     args: &[String],
     deny_network: bool,
-    write_root: Option<&Path>,
-    extra_read_roots: &[PathBuf],
+    scope: &WriteScope,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
-) -> (String, Vec<String>) {
-    sandbox_command_read_only(
-        program,
-        args,
-        deny_network,
-        write_root,
-        extra_read_roots,
-        scratch_root,
-        cache_write_roots,
-        false,
-    )
-}
-
-/// [`sandbox_command`] with the pre-claim read-only-workspace switch: when
-/// `read_only_workspace` is set the workspace root is NOT a writable root, so
-/// the process runs and reads normally while every workspace mutation fails
-/// in the kernel. Scratch and toolchain caches stay writable.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sandbox_command_read_only(
-    program: &str,
-    args: &[String],
-    deny_network: bool,
-    write_root: Option<&Path>,
-    extra_read_roots: &[PathBuf],
-    scratch_root: Option<&Path>,
-    cache_write_roots: &[PathBuf],
-    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
     let denials = configured_read_denials();
-    sandbox_command_with_read_denials_ro(
+    sandbox_command_with_read_denials(
         program,
         args,
         deny_network,
-        write_root,
-        extra_read_roots,
+        scope,
         scratch_root,
         cache_write_roots,
         &denials,
-        read_only_workspace,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Test-facing entry: the production callers all go through
-/// [`sandbox_command_read_only`], which carries the pre-claim switch.
-#[cfg(test)]
-// Every caller is a test, and on Windows every one of those tests is gated out:
-// read denials are a seatbelt rule with no Windows equivalent (confinement
-// there is AppContainer, not an argv wrapper).
-#[cfg_attr(windows, allow(dead_code))]
+/// [`sandbox_command`] with the read denials made explicit (tests seal their
+/// own; production reads the process-wide set).
 pub(crate) fn sandbox_command_with_read_denials(
     program: &str,
     args: &[String],
     deny_network: bool,
-    write_root: Option<&Path>,
-    extra_read_roots: &[PathBuf],
+    scope: &WriteScope,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
     read_denied_roots: &[PathBuf],
-) -> (String, Vec<String>) {
-    sandbox_command_with_read_denials_ro(
-        program,
-        args,
-        deny_network,
-        write_root,
-        extra_read_roots,
-        scratch_root,
-        cache_write_roots,
-        read_denied_roots,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sandbox_command_with_read_denials_ro(
-    program: &str,
-    args: &[String],
-    deny_network: bool,
-    write_root: Option<&Path>,
-    extra_read_roots: &[PathBuf],
-    scratch_root: Option<&Path>,
-    cache_write_roots: &[PathBuf],
-    read_denied_roots: &[PathBuf],
-    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
     // Defense in depth. Without confinement to apply this would normally run
     // the command bare — but once a harness has sealed host roots, "no
     // confinement" must not mean "no denials". An approval bug upstream should
     // cost us the write boundary, not the answer key.
-    if !deny_network && write_root.is_none() && read_denied_roots.is_empty() {
+    if !deny_network && !scope.confines() && read_denied_roots.is_empty() {
         return (program.to_string(), args.to_vec());
     }
     #[cfg(target_os = "macos")]
@@ -396,25 +281,21 @@ pub(crate) fn sandbox_command_with_read_denials_ro(
             program,
             args,
             deny_network,
-            write_root,
+            scope,
             read_denied_roots,
-            extra_read_roots,
             scratch_root,
             cache_write_roots,
-            read_only_workspace,
         )
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = extra_read_roots;
         linux_sandbox_command(
             program,
             args,
             deny_network,
-            write_root,
+            scope,
             scratch_root,
             cache_write_roots,
-            read_only_workspace,
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -422,13 +303,7 @@ pub(crate) fn sandbox_command_with_read_denials_ro(
         // Windows confines through AppContainer (see `windows_sandbox`), not
         // through an argv wrapper, so every confinement input is consumed
         // there and none of them shape the command line here.
-        let _ = (
-            write_root,
-            extra_read_roots,
-            scratch_root,
-            cache_write_roots,
-            read_only_workspace,
-        );
+        let _ = (scope, scratch_root, cache_write_roots);
         (program.to_string(), args.to_vec())
     }
 }
@@ -445,14 +320,12 @@ fn macos_sandbox_command(
     program: &str,
     args: &[String],
     deny_network: bool,
-    write_root: Option<&Path>,
+    scope: &WriteScope,
     read_denied_roots: &[PathBuf],
-    extra_read_roots: &[PathBuf],
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
-    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
-    let Some(root) = write_root else {
+    if !scope.confines() {
         // No write confinement (full-access dropping only the network): keep the
         // long-standing open profile so that path is unchanged.
         let mut profile = String::from("(version 1)(allow default)(deny network*)");
@@ -469,24 +342,24 @@ fn macos_sandbox_command(
         wrapped.push(program.to_string());
         wrapped.extend_from_slice(args);
         return ("/usr/bin/sandbox-exec".to_string(), wrapped);
-    };
+    }
 
     // Workspace-write mode allows broad reads (git needs ~/.gitconfig; tools
     // need system libs), writes confined to workspace + temp + toolchain caches.
-    // Host-side absolute-arg preflight on run_command still blocks model-supplied
-    // absolute paths outside the workspace for non-full-access modes.
-    // `extra_read_roots` is reserved for future write/read carve-outs; write
-    // roots already include toolchain trees.
-    let _ = extra_read_roots;
-    // Pre-claim: the workspace is NOT writable; scratch and toolchain caches
-    // still are, so a build/test can run while every repository mutation
-    // fails in the kernel regardless of which program attempts it.
-    let write_roots = if read_only_workspace {
-        writable_roots_without_workspace(scratch_root, cache_write_roots)
-    } else {
-        writable_roots(root, scratch_root, cache_write_roots)
+    // Pre-claim (`None`): the workspace is NOT writable; scratch and
+    // toolchain caches still are, so a build/test can run while every
+    // repository mutation fails in the kernel regardless of which program
+    // attempts it.
+    let (write_roots, protected) = match scope {
+        WriteScope::Workspace { root } => (
+            writable_roots(root, scratch_root, cache_write_roots),
+            git_write_protected_paths(root),
+        ),
+        _ => (
+            writable_roots_without_workspace(scratch_root, cache_write_roots),
+            Vec::new(),
+        ),
     };
-    let protected = git_write_protected_paths(root);
     let mut policy = String::from(SEATBELT_BASE);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
     policy.push_str("(allow file-read*)\n");
@@ -675,113 +548,6 @@ pub fn looks_like_absolute_path_arg(arg: &str) -> bool {
     false
 }
 
-/// First absolute path argument outside `allowed_roots` (canonicalized when
-/// possible). Used by `run_command` for a preflight before spawn.
-///
-/// Platform reality (R004 F3):
-/// - **macOS**: seatbelt confines writes + network; production reads are broad
-///   (`(allow file-read*)`) — kernel read denial is armed only by `leveler
-///   eval`. Unix read-preflight is [`first_home_path_outside_roots`].
-/// - **Linux**: bwrap ro-binds `/` (full read); same Unix preflight applies.
-/// - **Windows**: Job tree kill (WS1) + AppContainer RO/WW (WS3) when intent
-///   is set — this any-absolute-arg preflight is the primary defense against
-///   `type`/`Get-Content`/`cat` of foreign trees.
-pub fn first_absolute_arg_outside_roots<'a>(
-    args: &'a [String],
-    allowed_roots: &[PathBuf],
-) -> Option<&'a str> {
-    let roots: Vec<PathBuf> = allowed_roots
-        .iter()
-        .filter_map(|r| r.canonicalize().ok().or_else(|| Some(r.clone())))
-        .collect();
-    for arg in args {
-        if !looks_like_absolute_path_arg(arg) {
-            continue;
-        }
-        let path = Path::new(arg.as_str());
-        let probe = path
-            .canonicalize()
-            .unwrap_or_else(|_| lexical_abs_normalize(path));
-        if !roots.iter().any(|r| path_is_under(&probe, r)) {
-            return Some(arg.as_str());
-        }
-    }
-    None
-}
-
-/// First argument that resolves into the user's HOME tree but outside
-/// `allowed_roots` (canonicalized; symlinks into home count). This is the
-/// Unix read-preflight scope for R004 F3: system paths and temp stay readable
-/// (toolchains, /etc, /tmp), while foreign user trees — other repos, control
-/// files, dotfiles — are refused at the tool boundary before spawn.
-pub fn first_home_path_outside_roots<'a>(
-    args: impl IntoIterator<Item = &'a str>,
-    allowed_roots: &[PathBuf],
-    home: &Path,
-) -> Option<String> {
-    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let roots: Vec<PathBuf> = allowed_roots
-        .iter()
-        .filter_map(|r| r.canonicalize().ok().or_else(|| Some(r.clone())))
-        .collect();
-    for arg in args {
-        if !looks_like_absolute_path_arg(arg) {
-            continue;
-        }
-        let path = Path::new(arg);
-        let probe = path
-            .canonicalize()
-            .unwrap_or_else(|_| lexical_abs_normalize(path));
-        if path_is_under(&probe, &home) && !roots.iter().any(|r| path_is_under(&probe, r)) {
-            return Some(arg.to_string());
-        }
-    }
-    None
-}
-
-/// Path containment that is case-insensitive on Windows (drive letters / short
-/// names) and prefix-safe (requires a boundary after the root).
-fn path_is_under(path: &Path, root: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        let p = normalize_windows_path_key(path);
-        let r = normalize_windows_path_key(root);
-        p == r || p.starts_with(&(r.clone() + "\\")) || p.starts_with(&(r + "/"))
-    }
-    #[cfg(not(windows))]
-    {
-        path.starts_with(root)
-    }
-}
-
-#[cfg(windows)]
-fn normalize_windows_path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .replace('/', "\\")
-        .to_ascii_lowercase()
-}
-
-fn lexical_abs_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::Prefix(prefix) => {
-                out.push(prefix.as_os_str());
-            }
-            Component::RootDir => {
-                out.push(comp.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(s) => out.push(s),
-        }
-    }
-    out
-}
-
 /// Build the Linux `bwrap` (bubblewrap) invocation:
 /// bind-mount the whole filesystem read-only, then re-`--bind` each writable
 /// root read-write, with `--dev`/`--proc` for a minimal working environment and
@@ -794,12 +560,11 @@ fn linux_sandbox_command(
     program: &str,
     args: &[String],
     deny_network: bool,
-    write_root: Option<&Path>,
+    scope: &WriteScope,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
-    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
-    let Some(root) = write_root else {
+    if !scope.confines() {
         // No write confinement (full-access): only optionally drop the network,
         // via a fresh network namespace.
         if deny_network {
@@ -813,16 +578,20 @@ fn linux_sandbox_command(
             return ("unshare".to_string(), wrapped);
         }
         return (program.to_string(), args.to_vec());
+    }
+    // Pre-claim (`None`): bwrap binds `/` read-only and then re-binds each
+    // writable root rw — omitting the workspace leaves it read-only while
+    // scratch and toolchain caches stay usable.
+    let (roots, protected) = match scope {
+        WriteScope::Workspace { root } => (
+            writable_roots(root, scratch_root, cache_write_roots),
+            git_write_protected_paths(root),
+        ),
+        _ => (
+            writable_roots_without_workspace(scratch_root, cache_write_roots),
+            Vec::new(),
+        ),
     };
-    // Pre-claim: bwrap binds `/` read-only and then re-binds each writable
-    // root rw — omitting the workspace leaves it read-only while scratch and
-    // toolchain caches stay usable.
-    let roots = if read_only_workspace {
-        writable_roots_without_workspace(scratch_root, cache_write_roots)
-    } else {
-        writable_roots(root, scratch_root, cache_write_roots)
-    };
-    let protected = git_write_protected_paths(root);
     (
         "bwrap".to_string(),
         bwrap_args(program, args, deny_network, &roots, &protected),
@@ -968,6 +737,11 @@ impl CommandRunner {
         Self { environment }
     }
 
+    /// The immutable environment snapshot every child is built from.
+    pub fn environment(&self) -> &std::sync::Arc<leveler_core::EnvSnapshot> {
+        &self.environment
+    }
+
     /// Spawn the process and collect its output, honoring timeout and
     /// cancellation. stdout and stderr are drained concurrently so a chatty
     /// process cannot deadlock on a full pipe.
@@ -999,28 +773,79 @@ impl CommandRunner {
         cancellation: CancellationToken,
         chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
     ) -> Result<ProcessOutput, ProcessError> {
-        // WS0/WS2: host-trusted intent (or legacy write_root mapping). On
+        // WS0/WS2: the Windows contract, derived from the write scope. On
         // Windows, restricted intents fail closed when FS backends are missing.
-        let intent = request.filesystem_intent.clone().unwrap_or_else(|| {
-            crate::windows_sandbox::FilesystemIntent::from_legacy(
-                request.write_root.as_deref(),
-                /* full_access */ request.write_root.is_none(),
-            )
-        });
+        let intent = request.filesystem_intent();
         if let Err(err) =
             crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
         {
             return Err(ProcessError::SandboxPolicy(err.to_string()));
         }
+        // Confined Windows commands run through the AppContainer launcher,
+        // which hands back synchronous readers rather than a process handle —
+        // the one path that does not go through `spawn` (foreground only;
+        // the background registry refuses it, PR 0).
+        #[cfg(windows)]
+        if !intent.is_unrestricted() {
+            let (program, args) = sandbox_command(
+                &request.program,
+                &request.args,
+                request.deny_network,
+                &request.write_scope,
+                None,
+                &[],
+            );
+            return run_windows_appcontainer(
+                request,
+                intent,
+                &program,
+                &args,
+                cancellation,
+                self.environment.clone(),
+                chunks,
+            )
+            .await;
+        }
+        #[cfg(not(windows))]
+        let _ = intent;
+
+        let process = self.spawn(&request).await?;
+        drive_to_completion(process, &request, cancellation, chunks).await
+    }
+
+    /// The one spawn path (PR 4). Every command — foreground, background,
+    /// verification — is confined, environment-scrubbed and process-grouped
+    /// here, and comes back as a [`ManagedProcess`] the caller waits on or
+    /// terminates as a tree. Windows: Unrestricted only (Job Object); a
+    /// confined Windows request is refused because the AppContainer launcher
+    /// cannot yield a process handle (see [`Self::run`] for its foreground use).
+    pub async fn spawn(&self, request: &ProcessRequest) -> Result<ManagedProcess, ProcessError> {
+        let intent = request.filesystem_intent();
+        if let Err(err) =
+            crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
+        {
+            return Err(ProcessError::SandboxPolicy(err.to_string()));
+        }
+        #[cfg(windows)]
+        if !intent.is_unrestricted() {
+            return Err(ProcessError::SandboxPolicy(
+                "confined Windows commands run only through the foreground AppContainer \
+                 launcher; no confining spawn is available for them"
+                    .into(),
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = intent;
+
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let sandbox_paths = request
-            .write_root
-            .as_ref()
-            .map(|workspace| {
+            .write_scope
+            .confines()
+            .then(|| {
                 prepare_sandbox_paths(
                     &self.environment,
-                    workspace,
-                    should_read_host_caches(&request),
+                    sandbox_anchor(request),
+                    should_read_host_caches(request),
                 )
             })
             .transpose()
@@ -1040,65 +865,317 @@ impl CommandRunner {
             .unwrap_or(&[]);
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let sandbox_cache_write_roots: &[PathBuf] = &[];
-        let (program, args) = sandbox_command_read_only(
+        let (program, args) = sandbox_command(
             &request.program,
             &request.args,
             request.deny_network,
-            request.write_root.as_deref(),
-            &request.extra_read_roots,
+            &request.write_scope,
             sandbox_scratch_root,
             sandbox_cache_write_roots,
-            request.read_only_workspace,
         );
 
-        #[cfg(windows)]
-        {
-            return run_windows_dispatch(
-                request,
-                intent,
-                &program,
-                &args,
-                cancellation,
-                self.environment.clone(),
-                chunks,
-            )
-            .await;
+        let mut cmd = Command::new(&program);
+        apply_common_command_env(&mut cmd, request, &args, &self.environment);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(paths) = sandbox_paths.as_ref() {
+            apply_sandbox_environment(&mut cmd, paths);
         }
 
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            let _ = intent;
-            run_unix_process_group(
-                request,
-                &program,
-                &args,
-                cancellation,
-                &self.environment,
-                chunks,
+            // Own process group so the whole subtree (child and grandchildren)
+            // can be terminated on timeout, cancel, or registry drop.
+            cmd.process_group(0);
+            set_parent_death_signal(&mut cmd);
+            let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
+                program: request.program.clone(),
+                source,
+            })?;
+            let pid = child.id().ok_or_else(|| ProcessError::Io {
+                program: request.program.clone(),
+                source: std::io::Error::other("child has no pid"),
+            })?;
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            Ok(ManagedProcess {
+                child,
+                identity: ProcessIdentity { pgid: pid as i32 },
+                stdout,
+                stderr,
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                sandbox_paths.as_ref(),
-            )
-            .await
+                sandbox_paths,
+            })
+        }
+        #[cfg(windows)]
+        {
+            // Job Object via process-wrap (WS1): start_kill terminates the whole
+            // job. Job setup failure is typed — never a plain spawn without one.
+            use process_wrap::tokio::*;
+            let mut wrap = TokioCommandWrap::from(cmd);
+            wrap.wrap(JobObject);
+            wrap.wrap(KillOnDrop);
+            let mut child = wrap
+                .spawn()
+                .map_err(|source| map_windows_job_spawn_error(&request.program, source))?;
+            let pid = child.id().ok_or_else(|| ProcessError::Io {
+                program: request.program.clone(),
+                source: std::io::Error::other("child has no pid"),
+            })?;
+            let stdout = child.stdout().take();
+            let stderr = child.stderr().take();
+            Ok(ManagedProcess {
+                child,
+                identity: ProcessIdentity { pid },
+                stdout,
+                stderr,
+            })
         }
     }
 }
 
-/// Windows: Unrestricted → Job Object only; restricted intents → AppContainer FS.
+/// Identity needed to signal a process tree after the handle is gone (the
+/// background registry's reaper takes the [`ManagedProcess`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessIdentity {
+    /// Unix process group id (every spawn uses `process_group(0)`).
+    #[cfg(unix)]
+    pgid: i32,
+    /// Windows process id for `taskkill /T` tree kill.
+    #[cfg(not(unix))]
+    pid: u32,
+}
+
+impl ProcessIdentity {
+    #[cfg(unix)]
+    pub fn pgid(&self) -> i32 {
+        self.pgid
+    }
+
+    #[cfg(not(unix))]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Immediate tree kill (drop path / hard kill).
+    ///
+    /// Unix: `killpg(SIGKILL)` on the group. Windows: `taskkill /T /F` by pid
+    /// — best-effort; the Job Object on the handle is the stronger kill.
+    pub fn kill_tree(self) {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    /// Graceful then hard: SIGTERM the group, then SIGKILL as a backstop.
+    pub async fn terminate_tree(self) {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let group = Pid::from_raw(self.pgid);
+            let _ = killpg(group, Signal::SIGTERM);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            self.kill_tree();
+        }
+    }
+}
+
+/// One spawned, policy-confined process from [`CommandRunner::spawn`].
+///
+/// Owns the handle, the output pipes (until taken), and — on macOS/Linux —
+/// the private scratch/cache lease the confined command runs against, so the
+/// lease lives exactly as long as the process unless the caller takes it.
+pub struct ManagedProcess {
+    #[cfg(unix)]
+    child: tokio::process::Child,
+    #[cfg(windows)]
+    child: Box<dyn process_wrap::tokio::TokioChildWrapper>,
+    identity: ProcessIdentity,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    sandbox_paths: Option<SandboxPaths>,
+}
+
+impl ManagedProcess {
+    pub fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.stderr.take()
+    }
+
+    /// Wait for the direct child to exit.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            self.child.wait().await
+        }
+        #[cfg(windows)]
+        {
+            Box::into_pin(self.child.wait()).await
+        }
+    }
+
+    /// Kill the direct child (Windows: the whole job) without waiting.
+    pub fn start_kill(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    /// Terminate the child and everything it spawned. Returns once the
+    /// signals are sent; pair with [`Self::wait`] to reap.
+    pub async fn terminate_tree(&mut self) {
+        self.identity.terminate_tree().await;
+        self.start_kill();
+    }
+
+    /// Wait after a kill, but never forever: a child that will not reap must
+    /// not hold the tool future, the turn, and the TUI. On deadline, kill
+    /// once more and fabricate a signalled exit so callers can unwind.
+    pub(crate) async fn wait_deadline(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match tokio::time::timeout(POST_KILL_WAIT, self.wait()).await {
+            Ok(status) => status,
+            Err(_elapsed) => {
+                self.start_kill();
+                match tokio::time::timeout(Duration::from_millis(500), self.wait()).await {
+                    Ok(status) => status,
+                    Err(_elapsed) => Ok(synthetic_killed_status()),
+                }
+            }
+        }
+    }
+
+    /// SIGKILL anything still in the group after the child exited — detached
+    /// grandchildren (`cmd &`) — so a run leaves nothing behind.
+    pub(crate) fn reap_group(&self) {
+        #[cfg(unix)]
+        reap_process_group(Some(self.identity.pgid as u32));
+    }
+
+    /// Hand the scratch/cache lease to a longer-lived owner (the background
+    /// registry keeps it until the log pumps drain).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn take_sandbox_scratch(&mut self) -> Option<SandboxScratch> {
+        self.sandbox_paths.take().map(SandboxPaths::into_scratch)
+    }
+}
+
+/// `ExitStatus::from_raw(9)` is SIGKILL on Unix; used only when wait truly
+/// will not return so the rest of the stack can still complete.
+#[cfg(unix)]
+fn synthetic_killed_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(9)
+}
 #[cfg(windows)]
-/// `chunks` is the live-output sender that `run_observed` (the user shell's
-/// `!command` view) passes down.
+fn synthetic_killed_status() -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(1)
+}
+
+/// Run a spawned process to completion: drain both pipes concurrently (capped),
+/// honor timeout and cancellation by terminating the whole tree, and never
+/// block forever on a post-kill wait.
+async fn drive_to_completion(
+    mut process: ManagedProcess,
+    request: &ProcessRequest,
+    cancellation: CancellationToken,
+    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
+) -> Result<ProcessOutput, ProcessError> {
+    let mut stdout_pipe = process.take_stdout();
+    let mut stderr_pipe = process.take_stderr();
+    let cap = request.max_output_bytes;
+    // A shared deadline that unblocks the pipe readers once the child has
+    // exited (see below), so a detached grandchild holding the write end can't
+    // wedge us on an EOF that never comes.
+    let drain = CancellationToken::new();
+    let stdout_task = {
+        let drain = drain.clone();
+        let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
+        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
+    };
+    let stderr_task = {
+        let drain = drain.clone();
+        let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
+        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
+    };
+
+    let mut timed_out = false;
+    let status = tokio::select! {
+        status = process.wait() => status,
+        _ = tokio::time::sleep(request.timeout) => {
+            timed_out = true;
+            process.terminate_tree().await;
+            process.wait_deadline().await
+        }
+        _ = cancellation.cancelled() => {
+            process.terminate_tree().await;
+            let _ = process.wait_deadline().await;
+            return Err(ProcessError::Cancelled);
+        }
+    };
+
+    let status = status.map_err(|source| ProcessError::Io {
+        program: request.program.clone(),
+        source,
+    })?;
+
+    // The child has exited. Its own output is already in the pipe buffers; only
+    // a detached grandchild can still hold the write end open. Give the readers
+    // a brief grace to drain, then cut them loose.
+    {
+        let drain = drain.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PIPE_DRAIN_GRACE).await;
+            drain.cancel();
+        });
+    }
+    let (stdout, stdout_dropped) = stdout_task.await.unwrap_or_default();
+    let (stderr, stderr_dropped) = stderr_task.await.unwrap_or_default();
+    let dropped_bytes = stdout_dropped + stderr_dropped;
+    process.reap_group();
+
+    Ok(ProcessOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        timed_out,
+        truncated: dropped_bytes > 0,
+        dropped_bytes,
+    })
+}
+
+/// Windows confined path: the AppContainer launcher. `chunks` is the live-output
+/// sender that `run_observed` (the user shell's `!command` view) passes down.
 ///
 /// The Job Object path reads its pipes exactly like Unix does, so it streams.
-/// The AppContainer path cannot: `rappct` hands back synchronous readers, and
-/// giving it a live view means restructuring that launcher rather than threading
-/// one argument. It therefore emits the whole output **once, at the end**.
-///
-/// Emitting it matters more than it looks. A consumer of this channel — the
-/// `!command` view — builds what the user reads from chunks alone, so a
-/// confined command that sent none would print nothing at all, not merely
-/// "nothing yet". The difference between a late view and no view is the
-/// difference between a slow feature and a broken one.
-async fn run_windows_dispatch(
+/// This path cannot: `rappct` hands back synchronous readers, and giving it a
+/// live view means restructuring that launcher rather than threading one
+/// argument. It therefore emits the whole output **once, at the end** — a
+/// consumer of this channel builds what the user reads from chunks alone, so
+/// a confined command that sent none would print nothing at all.
+#[cfg(windows)]
+async fn run_windows_appcontainer(
     request: ProcessRequest,
     intent: crate::windows_sandbox::FilesystemIntent,
     program: &str,
@@ -1107,37 +1184,29 @@ async fn run_windows_dispatch(
     environment: std::sync::Arc<leveler_core::EnvSnapshot>,
     chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
 ) -> Result<ProcessOutput, ProcessError> {
-    use crate::windows_sandbox::FilesystemIntent;
-    match intent {
-        FilesystemIntent::Unrestricted => {
-            run_with_windows_job(request, program, args, cancellation, &environment, chunks).await
-        }
-        FilesystemIntent::ReadOnly { .. } | FilesystemIntent::WorkspaceWrite { .. } => {
-            let result = crate::windows_appcontainer::run_appcontainer(
-                request,
-                intent,
-                program,
-                args,
-                cancellation,
-                environment,
-            )
-            .await;
-            if let (Some(tx), Ok(output)) = (chunks.as_ref(), result.as_ref()) {
-                for (stream, text) in [
-                    (OutputStream::Stdout, &output.stdout),
-                    (OutputStream::Stderr, &output.stderr),
-                ] {
-                    if !text.is_empty() {
-                        let _ = tx.send(OutputChunk {
-                            stream,
-                            text: text.clone(),
-                        });
-                    }
-                }
+    let result = crate::windows_appcontainer::run_appcontainer(
+        request,
+        intent,
+        program,
+        args,
+        cancellation,
+        environment,
+    )
+    .await;
+    if let (Some(tx), Ok(output)) = (chunks.as_ref(), result.as_ref()) {
+        for (stream, text) in [
+            (OutputStream::Stdout, &output.stdout),
+            (OutputStream::Stderr, &output.stderr),
+        ] {
+            if !text.is_empty() {
+                let _ = tx.send(OutputChunk {
+                    stream,
+                    text: text.clone(),
+                });
             }
-            result
         }
     }
+    result
 }
 
 /// Linux: deliver SIGTERM to the child when this (parent) process dies — the
@@ -1165,100 +1234,6 @@ pub(crate) fn set_parent_death_signal(cmd: &mut Command) {
 pub(crate) fn set_parent_death_signal(_cmd: &mut Command) {}
 
 /// Unix path: process group + killpg for whole tree.
-#[cfg(not(windows))]
-async fn run_unix_process_group(
-    request: ProcessRequest,
-    program: &str,
-    args: &[String],
-    cancellation: CancellationToken,
-    environment: &leveler_core::EnvSnapshot,
-    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))] sandbox_paths: Option<&SandboxPaths>,
-) -> Result<ProcessOutput, ProcessError> {
-    let mut cmd = Command::new(program);
-    apply_common_command_env(&mut cmd, &request, args, environment);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(paths) = sandbox_paths {
-        apply_sandbox_environment(&mut cmd, paths);
-    }
-    // Put the child in its own process group so we can terminate the whole
-    // subtree (the child and any grandchildren) on timeout or cancellation.
-    cmd.process_group(0);
-    set_parent_death_signal(&mut cmd);
-
-    let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
-        program: request.program.clone(),
-        source,
-    })?;
-
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let cap = request.max_output_bytes;
-    // A shared deadline that unblocks the pipe readers once the child has
-    // exited (see below), so a detached grandchild holding the write end can't
-    // wedge us on an EOF that never comes.
-    let drain = CancellationToken::new();
-    let stdout_task = {
-        let drain = drain.clone();
-        let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
-    };
-    let stderr_task = {
-        let drain = drain.clone();
-        let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
-    };
-
-    let child_pid = child.id();
-    let mut timed_out = false;
-    let status = tokio::select! {
-        status = child.wait() => status,
-        _ = tokio::time::sleep(request.timeout) => {
-            timed_out = true;
-            terminate_unix_tree(child_pid, &mut child).await;
-            // Never block forever on a post-kill wait (unkillable / stuck
-            // sandbox-exec children previously trapped cancel and the TUI).
-            wait_child_deadline(&mut child).await
-        }
-        _ = cancellation.cancelled() => {
-            terminate_unix_tree(child_pid, &mut child).await;
-            let _ = wait_child_deadline(&mut child).await;
-            return Err(ProcessError::Cancelled);
-        }
-    };
-
-    let status = status.map_err(|source| ProcessError::Io {
-        program: request.program.clone(),
-        source,
-    })?;
-
-    // The child has exited. Its own output is already in the pipe buffers; only
-    // a detached grandchild can still hold the write end open. Give the readers
-    // a brief grace to drain, then cut them loose.
-    {
-        let drain = drain.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(PIPE_DRAIN_GRACE).await;
-            drain.cancel();
-        });
-    }
-    let (stdout, stdout_dropped) = stdout_task.await.unwrap_or_default();
-    let (stderr, stderr_dropped) = stderr_task.await.unwrap_or_default();
-    let dropped_bytes = stdout_dropped + stderr_dropped;
-    // Reap any process still in the group so a foreground `cmd &` doesn't leave
-    // an orphan running (no-op once the group is empty).
-    reap_process_group(child_pid);
-
-    Ok(ProcessOutput {
-        exit_code: status.code(),
-        stdout,
-        stderr,
-        timed_out,
-        truncated: dropped_bytes > 0,
-        dropped_bytes,
-    })
-}
-
 /// How long the pipe readers keep draining after the child exits before giving
 /// up on a write end still held open by a detached grandchild. The child's own
 /// output is already buffered, so this only needs to cover reading it out.
@@ -1274,114 +1249,6 @@ fn reap_process_group(child_pid: Option<u32>) {
         use nix::unistd::Pid;
         let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
     }
-}
-
-/// Windows path: Job Object via process-wrap (WS1). start_kill terminates the
-/// whole job (grandchildren included). Job setup failure is typed — never plain
-/// spawn without a job.
-#[cfg(windows)]
-async fn run_with_windows_job(
-    request: ProcessRequest,
-    program: &str,
-    args: &[String],
-    cancellation: CancellationToken,
-    environment: &leveler_core::EnvSnapshot,
-    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
-) -> Result<ProcessOutput, ProcessError> {
-    use process_wrap::tokio::*;
-
-    let mut cmd = Command::new(program);
-    apply_common_command_env(&mut cmd, &request, args, environment);
-
-    let mut wrap = TokioCommandWrap::from(cmd);
-    wrap.wrap(JobObject);
-    wrap.wrap(KillOnDrop);
-
-    let mut child = wrap
-        .spawn()
-        .map_err(|source| map_windows_job_spawn_error(&request.program, source))?;
-
-    let mut stdout_pipe = child.stdout().take();
-    let mut stderr_pipe = child.stderr().take();
-    let cap = request.max_output_bytes;
-    let drain = CancellationToken::new();
-    let stdout_task = {
-        let drain = drain.clone();
-        let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
-    };
-    let stderr_task = {
-        let drain = drain.clone();
-        let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
-    };
-
-    // Bound post-kill wait so a stuck job cannot trap the agent turn (same
-    // failure mode as Unix child.wait hanging after killpg).
-    let wait_deadline = async |child: &mut Box<dyn TokioChildWrapper>| match tokio::time::timeout(
-        POST_KILL_WAIT,
-        Box::into_pin(child.wait()),
-    )
-    .await
-    {
-        Ok(status) => status,
-        Err(_elapsed) => {
-            let _ = child.start_kill();
-            match tokio::time::timeout(Duration::from_millis(500), Box::into_pin(child.wait()))
-                .await
-            {
-                Ok(status) => status,
-                Err(_elapsed) => {
-                    use std::os::windows::process::ExitStatusExt;
-                    Ok(std::process::ExitStatus::from_raw(1))
-                }
-            }
-        }
-    };
-
-    let mut timed_out = false;
-    let status = tokio::select! {
-        status = Box::into_pin(child.wait()) => status,
-        _ = tokio::time::sleep(request.timeout) => {
-            timed_out = true;
-            // JobObjectChild::start_kill terminates the entire job tree.
-            let _ = child.start_kill();
-            wait_deadline(&mut child).await
-        }
-        _ = cancellation.cancelled() => {
-            let _ = child.start_kill();
-            let _ = wait_deadline(&mut child).await;
-            return Err(ProcessError::Cancelled);
-        }
-    };
-
-    let status = status.map_err(|source| ProcessError::Io {
-        program: request.program.clone(),
-        source,
-    })?;
-
-    // Same drain bound as the Unix path: once the child exits, don't wait on a
-    // pipe write end a detached job member might still hold. KillOnDrop reaps
-    // the job when `child` drops at function exit.
-    {
-        let drain = drain.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(PIPE_DRAIN_GRACE).await;
-            drain.cancel();
-        });
-    }
-    let (stdout, stdout_dropped) = stdout_task.await.unwrap_or_default();
-    let (stderr, stderr_dropped) = stderr_task.await.unwrap_or_default();
-    let dropped_bytes = stdout_dropped + stderr_dropped;
-
-    Ok(ProcessOutput {
-        exit_code: status.code(),
-        stdout,
-        stderr,
-        timed_out,
-        truncated: dropped_bytes > 0,
-        dropped_bytes,
-    })
 }
 
 /// Map process-wrap / Job Object spawn failures to typed errors.
@@ -1443,58 +1310,10 @@ fn apply_common_command_env(
     cmd.env("CLICOLOR_FORCE", "0");
 }
 
-/// Terminate the child and its whole process group (Unix).
-#[cfg(unix)]
-async fn terminate_unix_tree(child_pid: Option<u32>, child: &mut tokio::process::Child) {
-    if let Some(pid) = child_pid {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        // SIGTERM the group, then SIGKILL as a backstop.
-        let group = Pid::from_raw(pid as i32);
-        let _ = killpg(group, Signal::SIGTERM);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    child.start_kill().ok();
-}
-
 /// Upper bound for waiting after kill/timeout. Without this, a child that
 /// never reaps (rare sandbox / zombie edge cases) holds the tool future, which
 /// holds the whole turn, which holds the TUI in Busy with no escape.
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
-
-/// Wait for the child to exit, or give up after [`POST_KILL_WAIT`].
-///
-/// On deadline, attempt one more kill and return a synthetic signal-exit status
-/// so callers can finish (timeout → timed_out; cancel → Cancelled) instead of
-/// hanging the agent loop.
-#[cfg(not(windows))]
-async fn wait_child_deadline(
-    child: &mut tokio::process::Child,
-) -> Result<std::process::ExitStatus, std::io::Error> {
-    match tokio::time::timeout(POST_KILL_WAIT, child.wait()).await {
-        Ok(status) => status,
-        Err(_elapsed) => {
-            child.start_kill().ok();
-            match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
-                Ok(status) => status,
-                Err(_elapsed) => {
-                    // Fabricate a signalled exit so the tool path unwinds.
-                    // Unix: status 9 ≈ SIGKILL. Prefer `from_raw` when available.
-                    synthetic_killed_status()
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn synthetic_killed_status() -> Result<std::process::ExitStatus, std::io::Error> {
-    // `ExitStatus::from_raw(9)` is SIGKILL on Unix; used only when wait truly
-    // will not return so the rest of the stack can still complete.
-    use std::os::unix::process::ExitStatusExt;
-    Ok(std::process::ExitStatus::from_raw(9))
-}
 
 /// Drain a pipe to EOF while keeping at most `cap` bytes in memory: the first
 /// half is kept verbatim, the last half is a ring over the tail, and the
@@ -1585,12 +1404,8 @@ mod tests {
             root.clone(),
             VerifyNetworkPolicy::ForceDeny,
         );
-        assert_eq!(accept.write_root.as_deref(), Some(root.as_path()));
+        assert_eq!(accept.write_scope.root(), Some(root.as_path()));
         assert!(accept.deny_network, "model acceptance forces deny_network");
-        assert!(matches!(
-            accept.filesystem_intent,
-            Some(crate::windows_sandbox::FilesystemIntent::WorkspaceWrite { .. })
-        ));
 
         let repo = process_request_for_verify_check(
             "cargo",
@@ -1598,15 +1413,11 @@ mod tests {
             root.clone(),
             VerifyNetworkPolicy::InheritSession,
         );
-        assert_eq!(repo.write_root.as_deref(), Some(root.as_path()));
+        assert_eq!(repo.write_scope.root(), Some(root.as_path()));
         assert!(
             !repo.deny_network,
             "repo verify inherits session network (not force deny)"
         );
-        assert!(matches!(
-            repo.filesystem_intent,
-            Some(crate::windows_sandbox::FilesystemIntent::WorkspaceWrite { .. })
-        ));
     }
 
     #[tokio::test]
@@ -1908,8 +1719,9 @@ mod tests {
             "touch",
             &["x".into()],
             true,
-            Some(root),
-            &[],
+            &WriteScope::Workspace {
+                root: (root).to_path_buf(),
+            },
             Some(scratch.path()),
             &[],
         );
@@ -1963,8 +1775,7 @@ mod tests {
             "cat",
             &["x".into()],
             false,
-            None,
-            &[],
+            &WriteScope::Unrestricted,
             None,
             &[],
             std::slice::from_ref(&secret),
@@ -2325,7 +2136,9 @@ mod tests {
             ],
             workspace.clone(),
         );
-        request.write_root = Some(workspace.clone());
+        request.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
         let output = runner
             .run(request, CancellationToken::new())
             .await
@@ -2844,7 +2657,9 @@ mod tests {
             ],
             workspace.clone(),
         );
-        private_tmp.write_root = Some(workspace.clone());
+        private_tmp.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
         let output = runner
             .run(private_tmp, CancellationToken::new())
             .await
@@ -2869,7 +2684,9 @@ mod tests {
             ],
             workspace.clone(),
         );
-        shared_tmp.write_root = Some(workspace.clone());
+        shared_tmp.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
         let output = runner
             .run(shared_tmp, CancellationToken::new())
             .await
@@ -2885,7 +2702,9 @@ mod tests {
                 vec!["check".into(), "--offline".into(), "--quiet".into()],
                 workspace.clone(),
             );
-            request.write_root = Some(workspace.clone());
+            request.write_scope = WriteScope::Workspace {
+                root: workspace.clone(),
+            };
             let output = runner
                 .run(request, CancellationToken::new())
                 .await
@@ -2920,7 +2739,7 @@ mod tests {
                 vec!["build".into(), "./...".into()],
                 go_workspace.clone(),
             );
-            request.write_root = Some(go_workspace);
+            request.write_scope = WriteScope::Workspace { root: go_workspace };
             let output = runner
                 .run(request, CancellationToken::new())
                 .await
@@ -2945,7 +2764,9 @@ mod tests {
                 vec!["run".into(), "build".into(), "--silent".into()],
                 npm_workspace.clone(),
             );
-            request.write_root = Some(npm_workspace.clone());
+            request.write_scope = WriteScope::Workspace {
+                root: npm_workspace.clone(),
+            };
             let output = runner
                 .run(request, CancellationToken::new())
                 .await
@@ -3067,7 +2888,9 @@ mod tests {
             vec!["check".into(), "--offline".into(), "--quiet".into()],
             workspace.clone(),
         );
-        request.write_root = Some(workspace.clone());
+        request.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
         request.deny_network = true;
         let output = runner
             .run(request, CancellationToken::new())
@@ -3097,7 +2920,9 @@ mod tests {
             ],
             workspace.clone(),
         );
-        write_host_cache.write_root = Some(workspace.clone());
+        write_host_cache.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
         write_host_cache.deny_network = true;
         let output = runner
             .run(write_host_cache, CancellationToken::new())
@@ -3124,20 +2949,6 @@ mod tests {
     }
 
     #[test]
-    fn absolute_arg_outside_roots_is_detected() {
-        // Absolute-path spelling differs by platform.
-        #[cfg(not(windows))]
-        let (allowed, outside) = (PathBuf::from("/tmp"), "/etc/hosts");
-        #[cfg(windows)]
-        let (allowed, outside) = (PathBuf::from(r"C:\ws"), r"C:\Windows\System32\etc\hosts");
-        let allowed = vec![allowed];
-        assert!(
-            first_absolute_arg_outside_roots(&["hello".into(), outside.into()], &allowed).is_some()
-        );
-        assert!(first_absolute_arg_outside_roots(&["-n".into(), "hi".into()], &allowed).is_none());
-    }
-
-    #[test]
     fn windows_style_absolute_args_are_recognized_on_all_hosts() {
         // Cross-compile docs / model transcripts often use Windows paths even
         // when the agent runs on Unix; detect them so preflight stays useful.
@@ -3148,30 +2959,31 @@ mod tests {
         assert!(!looks_like_absolute_path_arg("-LiteralPath"));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_path_under_is_case_insensitive() {
-        let root = PathBuf::from(r"C:\Users\Me\proj");
-        let child = PathBuf::from(r"c:\users\me\proj\src\main.rs");
-        assert!(path_is_under(&child, &root));
-        assert!(!path_is_under(
-            Path::new(r"C:\Users\Me\other\secret.txt"),
-            &root
-        ));
-    }
-
     #[test]
     fn sandbox_passthrough_when_unconfined() {
         // No network deny, no write confinement → run the command as-is.
-        let (p, a) = sandbox_command("cargo", &["test".into()], false, None, &[], None, &[]);
+        let (p, a) = sandbox_command(
+            "cargo",
+            &["test".into()],
+            false,
+            &WriteScope::Unrestricted,
+            None,
+            &[],
+        );
         assert_eq!(p, "cargo");
         assert_eq!(a, vec!["test".to_string()]);
     }
 
     #[test]
     fn sandbox_wraps_when_denying_network() {
-        let (program, args) =
-            sandbox_command("cargo", &["build".into()], true, None, &[], None, &[]);
+        let (program, args) = sandbox_command(
+            "cargo",
+            &["build".into()],
+            true,
+            &WriteScope::Unrestricted,
+            None,
+            &[],
+        );
         #[cfg(target_os = "macos")]
         {
             assert_eq!(program, "/usr/bin/sandbox-exec");
@@ -3219,8 +3031,9 @@ mod tests {
             "cat",
             &["/Users/someone/project/evals/case.yaml".into()],
             true,
-            Some(root),
-            &[],
+            &WriteScope::Workspace {
+                root: (root).to_path_buf(),
+            },
             Some(scratch.path()),
             &[],
             std::slice::from_ref(&secret),
@@ -3266,8 +3079,9 @@ mod tests {
             "go",
             &["build".into()],
             true,
-            Some(&workspace),
-            &[],
+            &WriteScope::Workspace {
+                root: workspace.clone(),
+            },
             Some(scratch.path()),
             std::slice::from_ref(&cache),
             std::slice::from_ref(&sealed.to_path_buf()),
@@ -3321,8 +3135,9 @@ mod tests {
             "go",
             &["build".into(), "./...".into()],
             true,
-            Some(&workspace),
-            &[],
+            &WriteScope::Workspace {
+                root: workspace.clone(),
+            },
             Some(scratch.path()),
             &cache_roots,
             std::slice::from_ref(&sealed),
@@ -3351,8 +3166,9 @@ mod tests {
             "cat",
             &[key.display().to_string()],
             true,
-            Some(&workspace),
-            &[],
+            &WriteScope::Workspace {
+                root: workspace.clone(),
+            },
             Some(scratch.path()),
             &cache_roots,
             std::slice::from_ref(&sealed),
@@ -3383,8 +3199,9 @@ mod tests {
             "cat",
             &["x".into()],
             true,
-            Some(root),
-            &[],
+            &WriteScope::Workspace {
+                root: (root).to_path_buf(),
+            },
             Some(scratch.path()),
             &[],
         );
@@ -3392,8 +3209,9 @@ mod tests {
             "cat",
             &["x".into()],
             true,
-            Some(root),
-            &[],
+            &WriteScope::Workspace {
+                root: (root).to_path_buf(),
+            },
             Some(scratch.path()),
             &[],
             &[],
@@ -3463,8 +3281,9 @@ mod tests {
                 "/bin/sh",
                 &["-c".to_string(), cmd.to_string()],
                 true,
-                Some(workspace.as_path()),
-                &[],
+                &WriteScope::Workspace {
+                    root: (workspace.as_path()).to_path_buf(),
+                },
                 Some(scratch.as_path()),
                 &[],
                 &denied,
@@ -3569,8 +3388,7 @@ mod tests {
             "cat",
             &["x".into()],
             false,
-            None,
-            &[],
+            &WriteScope::Unrestricted,
             None,
             &[],
             &[],
@@ -3583,8 +3401,7 @@ mod tests {
             "cat",
             &["x".into()],
             false,
-            None,
-            &[],
+            &WriteScope::Unrestricted,
             None,
             &[],
             std::slice::from_ref(&secret),
@@ -3616,8 +3433,9 @@ mod tests {
             "touch",
             &["x".into()],
             true,
-            Some(root),
-            &[],
+            &WriteScope::Workspace {
+                root: (root).to_path_buf(),
+            },
             Some(scratch.path()),
             &cache_roots,
         );
@@ -3674,8 +3492,7 @@ mod tests {
 
         let read_only = |program: &str, args: Vec<String>| {
             let mut req = ProcessRequest::new(program, args, ws.clone());
-            req.write_root = Some(ws.clone());
-            req.read_only_workspace = true;
+            req.write_scope = WriteScope::None;
             req
         };
 
@@ -3771,7 +3588,7 @@ mod tests {
             vec!["-c".into(), "echo hi > ok.txt".into()],
             ws.clone(),
         );
-        inside.write_root = Some(ws.clone());
+        inside.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner.run(inside, CancellationToken::new()).await.unwrap();
         assert!(
             out.success(),
@@ -3787,7 +3604,7 @@ mod tests {
             vec!["-c".into(), format!("echo x > {}", escape.display())],
             ws.clone(),
         );
-        out_req.write_root = Some(ws.clone());
+        out_req.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner.run(out_req, CancellationToken::new()).await.unwrap();
         assert!(
             !out.success(),
@@ -3801,7 +3618,7 @@ mod tests {
         std::fs::write(&secret, "classified\n").unwrap();
         let mut read_req =
             ProcessRequest::new("cat", vec![secret.display().to_string()], ws.clone());
-        read_req.write_root = Some(ws.clone());
+        read_req.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner
             .run(read_req, CancellationToken::new())
             .await
@@ -3832,7 +3649,7 @@ mod tests {
             ],
             ws.clone(),
         );
-        git_write.write_root = Some(ws.clone());
+        git_write.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner
             .run(git_write, CancellationToken::new())
             .await
@@ -3847,7 +3664,7 @@ mod tests {
             vec!["-c".into(), "echo fine > normal.txt".into()],
             ws.clone(),
         );
-        ok_write.write_root = Some(ws.clone());
+        ok_write.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner
             .run(ok_write, CancellationToken::new())
             .await
@@ -3888,7 +3705,7 @@ mod tests {
             vec!["-c".into(), "echo lock > .git/index.lock".into()],
             ws.clone(),
         );
-        confined.write_root = Some(ws.clone());
+        confined.write_scope = WriteScope::Workspace { root: ws.clone() };
         let out = runner
             .run(confined, CancellationToken::new())
             .await
@@ -3942,7 +3759,7 @@ mod tests {
             vec!["-c".into(), "echo hi > ok.txt".into()],
             ws.clone(),
         );
-        inside.write_root = Some(ws.clone());
+        inside.write_scope = WriteScope::Workspace { root: ws.clone() };
         let output = runner.run(inside, CancellationToken::new()).await.unwrap();
         assert!(
             output.success(),
@@ -3956,7 +3773,7 @@ mod tests {
             vec!["-c".into(), format!("echo x > {}", escape.display())],
             ws.clone(),
         );
-        outside.write_root = Some(ws.clone());
+        outside.write_scope = WriteScope::Workspace { root: ws.clone() };
         let output = runner.run(outside, CancellationToken::new()).await.unwrap();
         assert!(
             !output.success(),
@@ -4325,92 +4142,123 @@ mod streaming_tests {
 }
 
 #[cfg(test)]
-mod write_scope_adapter_tests {
+mod write_scope_tests {
     use super::*;
-    use crate::WriteScope;
     use crate::windows_sandbox::FilesystemIntent;
 
     fn req() -> ProcessRequest {
         ProcessRequest::new("echo", vec![], PathBuf::from("/ws"))
     }
 
-    /// PR 1. One setter replaces the hand-assembled triple every call site
-    /// used to write out: `write_root` + `read_only_workspace` +
-    /// `filesystem_intent`. It must produce exactly what those sites produce
-    /// today, so the OS wrappers see no difference.
+    /// PR 3. The request carries the boundary itself; nothing else.
     #[test]
-    fn applying_workspace_scope_sets_the_legacy_triple() {
+    fn a_fresh_request_is_unrestricted() {
+        assert_eq!(req().write_scope, WriteScope::Unrestricted);
+    }
+
+    /// The Windows contract is derived, never chosen: a `None` scope anchors
+    /// its read-only intent on the cwd, a `Workspace` scope names its root.
+    #[test]
+    fn filesystem_intent_derives_from_the_write_scope() {
         let mut r = req();
-        r.extra_read_roots = vec![PathBuf::from("/other")];
-        r.apply_write_scope(&WriteScope::Workspace {
+        assert_eq!(r.filesystem_intent(), FilesystemIntent::Unrestricted);
+
+        r.write_scope = WriteScope::Workspace {
             root: PathBuf::from("/ws"),
-        });
-        assert_eq!(r.write_root.as_deref(), Some(Path::new("/ws")));
-        assert!(!r.read_only_workspace);
+        };
         assert_eq!(
-            r.filesystem_intent,
-            Some(FilesystemIntent::WorkspaceWrite {
+            r.filesystem_intent(),
+            FilesystemIntent::WorkspaceWrite {
                 write_root: PathBuf::from("/ws"),
-                extra_read_roots: vec![PathBuf::from("/other")],
-            })
+            }
         );
-    }
 
-    /// `None` is the pre-claim child: workspace mounted read-only, and the
-    /// Windows gate sees a ReadOnly intent whose roots are workspace + extras
-    /// (the exact list `run_command` builds by hand today).
-    #[test]
-    fn applying_none_scope_makes_the_workspace_read_only() {
-        let mut r = req();
-        r.extra_read_roots = vec![PathBuf::from("/other")];
-        r.apply_write_scope(&WriteScope::None);
-        // Legacy shape: the OS wrapper still needs the workspace as its
-        // anchor even though nothing under it may be written.
-        assert_eq!(r.write_root.as_deref(), Some(Path::new("/ws")));
-        assert!(r.read_only_workspace);
+        r.write_scope = WriteScope::None;
         assert_eq!(
-            r.filesystem_intent,
-            Some(FilesystemIntent::ReadOnly {
-                read_roots: vec![PathBuf::from("/ws"), PathBuf::from("/other")],
-            })
+            r.filesystem_intent(),
+            FilesystemIntent::ReadOnly {
+                read_roots: vec![PathBuf::from("/ws")],
+            }
+        );
+    }
+}
+
+/// PR 4: one spawn path for every command.
+#[cfg(all(test, unix))]
+mod managed_runner_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn ws() -> tempfile::TempDir {
+        tempfile::tempdir().expect("workspace")
+    }
+
+    #[tokio::test]
+    async fn spawn_wait_and_read_stdout() {
+        let dir = ws();
+        let req = ProcessRequest::new("echo", vec!["managed-ok".into()], dir.path().to_path_buf());
+        let mut proc = CommandRunner::new().spawn(&req).await.expect("spawn");
+        let mut out = String::new();
+        proc.take_stdout()
+            .expect("stdout pipe")
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        let status = proc.wait().await.expect("wait");
+        assert!(status.success(), "{status:?}");
+        assert_eq!(out.trim(), "managed-ok");
+    }
+
+    /// The acceptance the plan names: after `terminate_tree` returns, the
+    /// child AND its grandchildren are gone — not just the direct child.
+    #[tokio::test]
+    async fn terminate_tree_leaves_no_grandchild_behind() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+        let dir = ws();
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30 & sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        let mut proc = CommandRunner::new().spawn(&req).await.expect("spawn");
+        let group = Pid::from_raw(proc.identity().pgid());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            killpg(group, None).is_ok(),
+            "group must be alive before terminate"
+        );
+
+        proc.terminate_tree().await;
+        let _ = proc.wait().await;
+        // The whole group must be gone: signal 0 to an empty group is ESRCH.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            killpg(group, None).is_err(),
+            "process group still has members after terminate_tree"
         );
     }
 
-    #[test]
-    fn applying_unrestricted_scope_clears_confinement() {
-        let mut r = req();
-        r.apply_write_scope(&WriteScope::Unrestricted);
-        assert_eq!(r.write_root, None);
-        assert!(!r.read_only_workspace);
-        assert_eq!(r.filesystem_intent, Some(FilesystemIntent::Unrestricted));
-    }
-
-    /// Reading the scope back from a request round-trips through the setter.
-    #[test]
-    fn write_scope_round_trips() {
-        for scope in [
-            WriteScope::Unrestricted,
-            WriteScope::Workspace {
-                root: PathBuf::from("/ws"),
-            },
-            WriteScope::None,
-        ] {
-            let mut r = req();
-            r.apply_write_scope(&scope);
-            assert_eq!(r.write_scope(), scope);
-        }
-    }
-
-    /// Legacy quirk, preserved on purpose in PR 1: `read_only_workspace`
-    /// without a `write_root` is IGNORED by every OS wrapper (they anchor on
-    /// `write_root`), so a zero-authority child under 完全访问 runs
-    /// unconfined today. The adapter reports what actually happens, not what
-    /// the flag says. Closing the gap is PR 3's job.
-    #[test]
-    fn read_only_flag_without_a_write_root_reads_back_as_unrestricted() {
-        let mut r = req();
-        r.write_root = None;
-        r.read_only_workspace = true;
-        assert_eq!(r.write_scope(), WriteScope::Unrestricted);
+    /// `ProcessIdentity` is enough to kill the tree after the registry's
+    /// reaper has taken the process — the path the background registry uses.
+    #[tokio::test]
+    async fn identity_kill_tree_works_without_the_process_handle() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+        let dir = ws();
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30 & sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        let mut proc = CommandRunner::new().spawn(&req).await.expect("spawn");
+        let identity = proc.identity();
+        let group = Pid::from_raw(identity.pgid());
+        let waiter = tokio::spawn(async move { proc.wait().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        identity.terminate_tree().await;
+        let _ = waiter.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(killpg(group, None).is_err(), "group survived identity kill");
     }
 }

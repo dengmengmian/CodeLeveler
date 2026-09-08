@@ -47,7 +47,7 @@ is newer than any of them and its trust model is still being reviewed; a tier
 that promised anything would be promising it about code whose own gate document
 says do not ship this yet.
 
-**Global flags** (`--repo`, `--config-dir`, `--readonly-root`, `--verbose`)
+**Global flags** (`--repo`, `--config-dir`, `--verbose`)
 apply to every subcommand and should be frozen with the same promise as tier 1.
 
 ## 2. Configuration files

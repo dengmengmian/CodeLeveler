@@ -1171,7 +1171,6 @@ mod m1_tests {
 @@ -461,3 +461,6 @@
  permission_rules_path: Some(path),
  hook_runner,
- grants_state_dir: Some(dir),
 +// Project config wins over global when set; both default true.
 +allow_delegation: self.project_config().agents.delegation
 +    && self.config.agents_delegation,

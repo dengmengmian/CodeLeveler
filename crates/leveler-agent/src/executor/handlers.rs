@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_core::{ApprovalId, ClarificationId};
-use leveler_execution::{ApprovalDecision, ApprovalRequest, RiskLevel};
+use leveler_execution::{ApprovalRequest, RiskLevel};
 use leveler_model::ToolCall;
 
 use leveler_lifecycle::ProgressLedger;
@@ -180,33 +180,33 @@ impl Executor {
             command: None,
             paths: Vec::new(),
         };
-        let decision = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-            decision = self.approver.decide(&request) => decision,
+        // Through the host's one ask path (PR 5): the reviewer, the human, and
+        // the human-vs-headless distinction mean the same here as for a tool
+        // call. The grant's lifetime is still the caller's business.
+        let pending = leveler_execution::PendingApproval {
+            signature: action_fingerprint(call),
+            write: self.tool_context.write_scope(),
+            network_allowed: !self.tool_context.policy.network_denied(),
+            command_line: None,
+            scoped_paths: Vec::new(),
+            request,
         };
-        let granted = matches!(
-            decision,
-            ApprovalDecision::ApproveOnce
-                | ApprovalDecision::ApproveSession
-                | ApprovalDecision::ApproveAlways
-        );
-        if granted {
-            return Ok(PermissionRequestOutcome::Granted {
+        match self.ask(&pending, None, None, cancellation).await {
+            super::host::AskOutcome::Allowed(_) => Ok(PermissionRequestOutcome::Granted {
                 message: permission_grant_message(true, grants),
                 grants,
-            });
-        }
-        if self.approver.has_human() {
-            Ok(PermissionRequestOutcome::DeniedByUser {
+            }),
+            super::host::AskOutcome::DeniedByUser => Ok(PermissionRequestOutcome::DeniedByUser {
                 requested: grants,
                 message: permission_denied_by_user_message(),
-            })
-        } else {
-            Ok(PermissionRequestOutcome::DeniedUnattended {
-                requested: grants,
-                message: permission_denied_unattended_message(),
-            })
+            }),
+            super::host::AskOutcome::DeniedUnattended(_) => {
+                Ok(PermissionRequestOutcome::DeniedUnattended {
+                    requested: grants,
+                    message: permission_denied_unattended_message(),
+                })
+            }
+            super::host::AskOutcome::Cancelled => Err(AgentError::Cancelled),
         }
     }
 

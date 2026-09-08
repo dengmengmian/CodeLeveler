@@ -46,13 +46,6 @@ ignore:
   - "*.log"
   - "tmp/**"
 
-# Other checkouts the agent may *read* (not write). Absolute paths or paths
-# relative to this repo root. Same as CLI `--readonly-root` / env
-# LEVELER_READONLY_ROOTS (':' on Unix, ';' on Windows).
-# readonly_roots:
-#   - ../adjacent-project
-#   - /Users/you/src/other-project
-
 # Multi-agent: advertise spawn_agent (default true). Set false to hide the tool.
 # independent_review: off (default) | required. Explicit only — the runtime
 # never infers a review from file names or diff size. Legacy `auto` reads as

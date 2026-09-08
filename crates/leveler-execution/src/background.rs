@@ -6,17 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::command::{ProcessRequest, sandbox_command};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::command::{
-    SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths, should_read_host_caches,
-};
+use crate::command::{CommandRunner, ManagedProcess, ProcessIdentity, ProcessRequest};
 use crate::snapshot::SnapshotId;
-use crate::windows_sandbox::{FilesystemIntent, assert_background_intent_spawn_allowed};
+use crate::windows_sandbox::assert_background_intent_spawn_allowed;
 
 /// Pre-spawn workspace snapshot used for wait-end mutation accounting (PR-3b).
 #[derive(Debug, Clone)]
@@ -64,18 +59,6 @@ pub struct BackgroundTaskSnapshot {
     pub duration_ms: u64,
 }
 
-/// Identity needed to signal a process after the registry no longer holds `Child`
-/// (the wait reaper `take()`s it).
-#[derive(Debug, Clone, Copy)]
-struct ProcessIdentity {
-    /// Unix process group id (set when spawned with `process_group(0)`).
-    #[cfg(unix)]
-    pgid: i32,
-    /// Windows / non-Unix process id for taskkill-style tree kill.
-    #[cfg(not(unix))]
-    pid: u32,
-}
-
 /// Tracks live process identities for kill-on-drop of the registry handle.
 ///
 /// Strong refs live only on [`BackgroundTaskRegistry`] (and its `Clone`s).
@@ -105,7 +88,7 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if let Ok(map) = self.live.get_mut() {
             for identity in map.values() {
-                signal_process_tree(*identity);
+                identity.kill_tree();
             }
         }
     }
@@ -125,7 +108,7 @@ struct TaskInner {
     log: String,
     started: Instant,
     finished: Option<Instant>,
-    child: Option<Child>,
+    child: Option<ManagedProcess>,
     identity: Option<ProcessIdentity>,
     done: Arc<Notify>,
     process_done: bool,
@@ -146,9 +129,10 @@ struct TaskInner {
 #[derive(Clone)]
 pub struct BackgroundTaskRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    /// The one spawn path, shared with foreground execution (PR 4).
+    runner: CommandRunner,
     /// Dropped when the last registry handle is dropped (session end).
     kill_on_drop: Arc<KillOnDrop>,
-    environment: Arc<leveler_core::EnvSnapshot>,
 }
 
 impl Default for BackgroundTaskRegistry {
@@ -172,7 +156,7 @@ impl BackgroundTaskRegistry {
         Self {
             inner: Arc::new(Mutex::new(RegistryState::default())),
             kill_on_drop: Arc::new(KillOnDrop::default()),
-            environment,
+            runner: CommandRunner::with_environment(environment),
         }
     }
 
@@ -204,12 +188,7 @@ impl BackgroundTaskRegistry {
         st.next += 1;
         let id = format!("bg-{}", st.next);
 
-        let intent = request.filesystem_intent.clone().unwrap_or_else(|| {
-            FilesystemIntent::from_legacy(
-                request.write_root.as_deref(),
-                /* full_access */ request.write_root.is_none(),
-            )
-        });
+        let intent = request.filesystem_intent();
         // PR 0: this registry has no confining runner on Windows — the spawn
         // below is a plain one — so a restricted intent must be refused here,
         // never run unconfined.
@@ -217,88 +196,18 @@ impl BackgroundTaskRegistry {
             return Err(err.to_string());
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let sandbox_paths = request
-            .write_root
-            .as_ref()
-            .map(|workspace| {
-                prepare_sandbox_paths(
-                    &self.environment,
-                    workspace,
-                    should_read_host_caches(&request),
-                )
-            })
-            .transpose()
-            .map_err(|err| format!("create private sandbox scratch directory: {err}"))?;
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_paths: Option<tempfile::TempDir> = None;
-
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_scratch_root: Option<&std::path::Path> = None;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let sandbox_cache_write_roots = sandbox_paths
-            .as_ref()
-            .map(SandboxPaths::cache_write_roots)
-            .unwrap_or(&[]);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_cache_write_roots: &[std::path::PathBuf] = &[];
-
-        let (program, args) = sandbox_command(
-            &request.program,
-            &request.args,
-            request.deny_network,
-            request.write_root.as_deref(),
-            &request.extra_read_roots,
-            sandbox_scratch_root,
-            sandbox_cache_write_roots,
-        );
-
-        let mut cmd = Command::new(&program);
-        cmd.args(&args)
-            .current_dir(&request.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null());
-        // Own process group so kill can signal the whole tree via pgid even
-        // after the wait reaper has taken `Child`.
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-            crate::command::set_parent_death_signal(&mut cmd);
-        }
-        cmd.env_clear();
-        for (name, value) in self.environment.vars_os() {
-            let name_text = name.to_string_lossy();
-            let denied = crate::is_credential_env_name(&name_text)
-                || request.deny_env.iter().any(|v| v == &name_text);
-            if !denied || request.allow_env.iter().any(|v| v == &name_text) {
-                cmd.env(name, value);
-            }
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(paths) = sandbox_paths.as_ref() {
-            apply_sandbox_environment(&mut cmd, paths);
-        }
-
-        let mut child = cmd
-            .spawn()
+        let mut process = self
+            .runner
+            .spawn(&request)
+            .await
             .map_err(|e| format!("spawn background {}: {e}", request.program))?;
-
-        let pid = child
-            .id()
-            .ok_or_else(|| format!("spawn background {}: child has no pid", request.program))?;
-        let identity = ProcessIdentity {
-            #[cfg(unix)]
-            pgid: pid as i32,
-            #[cfg(not(unix))]
-            pid,
-        };
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let identity = process.identity();
+        let stdout = process.take_stdout();
+        let stderr = process.take_stderr();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_scratch = process.take_sandbox_scratch();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_scratch: Option<tempfile::TempDir> = None;
         let log_pumps_remaining = u8::from(stdout.is_some()) + u8::from(stderr.is_some());
         let done = Arc::new(Notify::new());
         let reg = self.inner.clone();
@@ -321,22 +230,13 @@ impl BackgroundTaskRegistry {
                 log: String::new(),
                 started: Instant::now(),
                 finished: None,
-                child: Some(child),
+                child: Some(process),
                 identity: Some(identity),
                 done: done.clone(),
                 process_done: false,
                 log_pumps_remaining,
                 mutation_baseline,
-                sandbox_scratch: {
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
-                    {
-                        sandbox_paths.map(SandboxPaths::into_scratch)
-                    }
-                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                    {
-                        sandbox_paths
-                    }
-                },
+                sandbox_scratch,
             },
         );
         drop(st);
@@ -525,7 +425,7 @@ impl BackgroundTaskRegistry {
             // Running → Killing; prefer pid/pgid so kill works after reaper take().
             task.status = BackgroundTaskStatus::Killing;
             if let Some(child) = task.child.as_mut() {
-                let _ = child.start_kill();
+                child.start_kill();
             }
             identity
         };
@@ -533,7 +433,7 @@ impl BackgroundTaskRegistry {
         if let Some(identity) = identity {
             // SIGTERM then SIGKILL so stubborn children still die after
             // the reaper has taken `Child`.
-            signal_process_tree_graceful(identity).await;
+            identity.terminate_tree().await;
         }
 
         let st = self.inner.lock().await;
@@ -568,56 +468,6 @@ fn prune_terminal_tasks(state: &mut RegistryState) {
     terminal.sort_unstable();
     for (_, id) in terminal.into_iter().take(remove_count) {
         state.tasks.remove(&id);
-    }
-}
-
-/// Immediate tree kill (drop path / hard kill).
-///
-/// Unix: `killpg(SIGKILL)` on the recorded process group (spawn used
-/// `process_group(0)`). Windows: `taskkill /T /F` by pid — best-effort tree
-/// kill; not equivalent to foreground Job Object / `process-wrap` (follow-up
-/// if Windows background parity is required).
-fn signal_process_tree(identity: ProcessIdentity) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        let group = Pid::from_raw(identity.pgid);
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &identity.pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = identity;
-    }
-}
-
-/// Graceful then hard kill (async kill path).
-async fn signal_process_tree_graceful(identity: ProcessIdentity) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        let group = Pid::from_raw(identity.pgid);
-        let _ = killpg(group, Signal::SIGTERM);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        // taskkill /T /F terminates the tree immediately (see signal_process_tree).
-        signal_process_tree(identity);
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = identity;
     }
 }
 
@@ -704,10 +554,11 @@ fn snapshot(task: &TaskInner) -> BackgroundTaskSnapshot {
 mod tests {
     use super::*;
     use crate::command::ProcessRequest;
-    use crate::windows_sandbox::FilesystemIntent;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::command::prepare_sandbox_paths;
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn unix_host_registry() -> BackgroundTaskRegistry {
+    pub(super) fn unix_host_registry() -> BackgroundTaskRegistry {
         BackgroundTaskRegistry::with_environment(Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
             std::env::current_dir().unwrap_or_default(),
@@ -1231,11 +1082,9 @@ mod tests {
         let mut req =
             ProcessRequest::new("echo", vec!["sandboxed-bg".into()], ws.path().to_path_buf());
         req.deny_network = true;
-        req.write_root = Some(ws.path().to_path_buf());
-        req.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-            write_root: ws.path().to_path_buf(),
-            extra_read_roots: vec![],
-        });
+        req.write_scope = crate::WriteScope::Workspace {
+            root: ws.path().to_path_buf(),
+        };
         let id = reg.spawn(req, None).await.expect("spawn confined");
         let snap = reg
             .wait(
@@ -1285,11 +1134,7 @@ mod tests {
             vec!["-c".into(), "echo hi > ok.txt".into()],
             ws.clone(),
         );
-        inside.write_root = Some(ws.clone());
-        inside.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-            write_root: ws.clone(),
-            extra_read_roots: vec![],
-        });
+        inside.write_scope = crate::WriteScope::Workspace { root: ws.clone() };
         let id = reg.spawn(inside, None).await.expect("spawn inside");
         let snap = reg
             .wait(
@@ -1314,11 +1159,7 @@ mod tests {
             vec!["-c".into(), format!("echo x > {}", escape.display())],
             ws.clone(),
         );
-        outside.write_root = Some(ws.clone());
-        outside.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-            write_root: ws.clone(),
-            extra_read_roots: vec![],
-        });
+        outside.write_scope = crate::WriteScope::Workspace { root: ws.clone() };
         let id = reg.spawn(outside, None).await.expect("spawn outside");
         let snap = reg
             .wait(
@@ -1339,7 +1180,7 @@ mod tests {
 
         // Cache contents are writable, but the trusted leaf itself must not be
         // unlinked and replaced by a background child.
-        let prepared = prepare_sandbox_paths(&reg.environment, &ws, false).unwrap();
+        let prepared = prepare_sandbox_paths(reg.runner.environment(), &ws, false).unwrap();
         let registry_root = prepared.tool_cache_path().join("cargo/registry");
         drop(prepared);
         let sentinel_dir = base.join("cache-escape");
@@ -1356,11 +1197,7 @@ mod tests {
             ],
             ws.clone(),
         );
-        poison.write_root = Some(ws.clone());
-        poison.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
-            write_root: ws.clone(),
-            extra_read_roots: vec![],
-        });
+        poison.write_scope = crate::WriteScope::Workspace { root: ws.clone() };
         let id = reg.spawn(poison, None).await.expect("spawn cache poison");
         let snap = reg
             .wait(
@@ -1430,5 +1267,147 @@ mod tests {
         use nix::unistd::Pid;
         // signal 0 = existence check
         kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+}
+
+/// PR 4: the background registry spawns through the same `CommandRunner`
+/// as the foreground, so one policy yields one result in both.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod unified_runner_tests {
+    use super::*;
+    use crate::WriteScope;
+    use crate::command::ProcessRequest;
+
+    #[cfg(target_os = "linux")]
+    fn bwrap_available() -> bool {
+        std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    fn bwrap_available() -> bool {
+        true
+    }
+
+    fn confined_request(ws: &std::path::Path, script: String) -> ProcessRequest {
+        let mut req = ProcessRequest::new("sh", vec!["-c".into(), script], ws.to_path_buf());
+        req.write_scope = WriteScope::Workspace {
+            root: ws.to_path_buf(),
+        };
+        req
+    }
+
+    /// Same policy, foreground and background: an outside write is blocked
+    /// the same way on both paths, and the workspace write succeeds on both.
+    #[tokio::test]
+    async fn foreground_and_background_enforce_the_same_write_scope() {
+        if !bwrap_available() {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"));
+        let base = home.join(format!(".leveler-unified-{}", std::process::id()));
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let reg = super::tests::unix_host_registry();
+        let runner = reg.runner.clone();
+
+        for (label, escape) in [
+            ("fg", base.join("fg-escape.txt")),
+            ("bg", base.join("bg-escape.txt")),
+        ] {
+            let _ = std::fs::remove_file(&escape);
+            let inside = confined_request(&ws, format!("echo hi > {label}-ok.txt"));
+            let outside = confined_request(&ws, format!("echo x > {}", escape.display()));
+            let (inside_code, outside_code) = if label == "fg" {
+                let a = runner.run(inside, CancellationToken::new()).await.unwrap();
+                let b = runner.run(outside, CancellationToken::new()).await.unwrap();
+                (a.exit_code, b.exit_code)
+            } else {
+                let a = reg.spawn(inside, None).await.unwrap();
+                let a = reg
+                    .wait(&a, Some(Duration::from_secs(10)), &CancellationToken::new())
+                    .await
+                    .unwrap();
+                let b = reg.spawn(outside, None).await.unwrap();
+                let b = reg
+                    .wait(&b, Some(Duration::from_secs(10)), &CancellationToken::new())
+                    .await
+                    .unwrap();
+                (a.exit_code, b.exit_code)
+            };
+            assert_eq!(
+                inside_code,
+                Some(0),
+                "{label}: workspace write must succeed"
+            );
+            assert_ne!(
+                outside_code,
+                Some(0),
+                "{label}: outside write must be blocked"
+            );
+            assert!(ws.join(format!("{label}-ok.txt")).exists(), "{label}");
+            assert!(!escape.exists(), "{label}: escape file must not exist");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Network deny/allow, measured against a real local listener, through
+    /// both paths.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn network_policy_is_enforced_the_same_way_fg_and_bg() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let reg = super::tests::unix_host_registry();
+        let runner = reg.runner.clone();
+        let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+
+        for deny in [true, false] {
+            let mut fg = ProcessRequest::new(
+                "bash",
+                vec!["-c".into(), connect.clone()],
+                dir.path().to_path_buf(),
+            );
+            fg.deny_network = deny;
+            let bg = fg.clone();
+            let fg_out = runner.run(fg, CancellationToken::new()).await.unwrap();
+            let id = reg.spawn(bg, None).await.unwrap();
+            let bg_out = reg
+                .wait(
+                    &id,
+                    Some(Duration::from_secs(10)),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            if deny {
+                assert_ne!(
+                    fg_out.exit_code,
+                    Some(0),
+                    "fg: connect must fail under deny_network"
+                );
+                assert_ne!(
+                    bg_out.exit_code,
+                    Some(0),
+                    "bg: connect must fail under deny_network"
+                );
+            } else {
+                assert_eq!(
+                    fg_out.exit_code,
+                    Some(0),
+                    "fg: connect must succeed: {fg_out:?}"
+                );
+                assert_eq!(
+                    bg_out.exit_code,
+                    Some(0),
+                    "bg: connect must succeed: {bg_out:?}"
+                );
+            }
+        }
+        drop(listener);
     }
 }

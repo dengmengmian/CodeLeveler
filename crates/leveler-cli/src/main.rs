@@ -127,14 +127,6 @@ fn resolve_layout(repo: Option<PathBuf>, config_dir: Option<PathBuf>) -> anyhow:
     Ok(Layout::resolve(repo_root, config_dir))
 }
 
-/// Register CLI `--readonly-root` values for every subsequent `Application::assemble`.
-fn merge_cli_readonly_roots(roots: &[PathBuf]) {
-    if roots.is_empty() {
-        return;
-    }
-    leveler_app::set_process_readonly_roots(roots.to_vec());
-}
-
 /// Tell the user when this repository ships `.leveler/hooks.yaml` or
 /// `.leveler/permissions.yaml` that is being ignored for lack of trust.
 ///
@@ -160,9 +152,6 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
 
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     let config_overridden = args.config_dir.is_some();
-    // Merge CLI readonly roots into the env the composition root already reads
-    // (`Application::default_readonly_roots`), so every assemble path inherits them.
-    merge_cli_readonly_roots(&args.readonly_root);
     let layout = resolve_layout(args.repo, args.config_dir)?;
     warn_untrusted_project_config(&layout);
 
@@ -209,7 +198,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             model,
             mode,
             auto_approve,
-            sandbox,
+            deny_network,
             socket,
             tcp,
             ready_json,
@@ -219,7 +208,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 model,
                 mode,
                 auto_approve,
-                sandbox,
+                deny_network,
                 socket,
                 tcp,
                 ready_json,
@@ -233,7 +222,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             model,
             mode,
             auto_approve,
-            sandbox,
+            deny_network,
         } => {
             cmd_web(
                 layout,
@@ -243,7 +232,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 model,
                 mode,
                 auto_approve,
-                sandbox,
+                deny_network,
             )
             .await
         }
@@ -280,7 +269,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             push,
             pr,
             pr_base,
-            sandbox,
+            deny_network,
             work_mode,
             max_rounds,
             collaboration,
@@ -317,7 +306,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     auto_approve,
                     output,
                     ship,
-                    sandbox,
+                    deny_network,
                     work_profile,
                     collab,
                     max_rounds,

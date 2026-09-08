@@ -36,7 +36,7 @@ fn permissions_list_and_clear_cover_the_state_dir_file() {
             tool: Some("run_command".into()),
             command_prefix: Some("git push".into()),
             command_exact: None,
-            path_glob: None,
+            write_path_glob: None,
         },
         effect: RuleEffect::Allow,
     };
@@ -107,7 +107,7 @@ fn permissions_list_shows_project_rule_then_clear_removes_it() {
             tool: Some("run_command".into()),
             command_prefix: Some("git push".into()),
             command_exact: None,
-            path_glob: None,
+            write_path_glob: None,
         },
         effect: RuleEffect::Allow,
     };

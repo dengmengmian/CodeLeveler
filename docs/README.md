@@ -38,7 +38,7 @@
 
 1. **Global** `~/.leveler/config.toml` — default model and API providers.
 2. **Bundle** `configs/{providers,models}/*.yaml` — optional checked-in profiles.
-3. **Project** `.leveler/config.yaml` — per-repo verify commands, mode, ignore, readonly roots.
+3. **Project** `.leveler/config.yaml` — per-repo verify commands, mode, ignore.
 4. **Permissions / hooks** — under `~/.leveler/` and/or `.leveler/`.
 
 Permission profile wire values: `request_approval` | `assisted` | `full_access`

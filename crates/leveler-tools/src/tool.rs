@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{FileStateTracker, RepeatedReadGuard};
 use leveler_execution::{
-    Checkpoint, CommandRunner, PermissionProfile, ProcessError, RiskLevel, SharedPermissionProfile,
-    Workspace, WorkspaceError, WriteScope,
+    Checkpoint, CommandRunner, PermissionProfile, ProcessError, ResolvedExecutionPolicy, RiskLevel,
+    SharedPermissionProfile, Workspace, WorkspaceError, WriteScope,
 };
 
 /// Shared, cheaply-cloneable context handed to every tool invocation,
@@ -86,17 +86,21 @@ pub struct ToolPolicy {
     /// loosened only through [`Self::grant_network`], so the elevation surface
     /// stays auditable in one place.
     deny_network: bool,
-    /// Turn-scoped grant from `request_permissions`: drop write_root
+    /// Turn-scoped grant from `request_permissions`: drop write
     /// confinement for `run_command` / `shell_command`. PRIVATE: granted only
     /// through [`Self::grant_unrestricted_fs`].
     turn_unrestricted_fs: bool,
+    /// The policy an ADMITTED call executes under (PR 5). Set once by the
+    /// ToolHost at admission; while present, [`Self::write_scope`] and
+    /// [`Self::network_denied`] answer from it and never from the live
+    /// profile or the turn flags above — those are inputs to resolution,
+    /// not something a running tool may re-read.
+    resolved: Option<ResolvedExecutionPolicy>,
     /// Extra env var names scrubbed from `run_command` children (the
     /// configured providers' `api_key_env` names).
     pub deny_env: Arc<Vec<String>>,
     /// Run the language formatter (gofmt/rustfmt/…) after each edit. Off by
     /// default so unit tests exercise edit logic in isolation; the real agent
-    /// path turns it on.
-    pub auto_format: bool,
     /// Max files a single `apply_patch` may touch (0 = unlimited).
     pub max_files_per_step: usize,
     /// Paths a command may modify. `None` means unrestricted.
@@ -136,7 +140,16 @@ impl ToolPolicy {
 
     /// Whether `run_command` children run with network access denied.
     pub fn network_denied(&self) -> bool {
+        if let Some(resolved) = &self.resolved {
+            return !resolved.network_allowed;
+        }
         self.deny_network
+    }
+
+    /// The frozen per-call policy, when this context belongs to an admitted
+    /// call.
+    pub fn resolved_policy(&self) -> Option<&ResolvedExecutionPolicy> {
+        self.resolved.as_ref()
     }
 
     /// Whether this scope holds an unrestricted-filesystem grant.
@@ -152,6 +165,9 @@ impl ToolPolicy {
     /// same, it is just one answer now. Reads the live profile cell, so a
     /// mid-turn switch lands on the next call.
     pub fn write_scope(&self, workspace_root: &std::path::Path) -> WriteScope {
+        if let Some(resolved) = &self.resolved {
+            return resolved.write.clone();
+        }
         if self.turn_unrestricted_fs {
             return WriteScope::Unrestricted;
         }
@@ -268,8 +284,8 @@ impl ToolContext {
                 read_only: false,
                 deny_network: false,
                 turn_unrestricted_fs: false,
+                resolved: None,
                 deny_env: Arc::new(Vec::new()),
-                auto_format: false,
                 max_files_per_step: 0,
                 command_write_allowlist: None,
                 command_modified_files_remaining: None,
@@ -301,6 +317,13 @@ impl ToolContext {
     /// broadcast and nothing to restart.
     pub fn with_permission_profile(mut self, profile: SharedPermissionProfile) -> Self {
         self.policy.permission_profile = profile;
+        self
+    }
+
+    /// Freeze this context to one admitted call's policy (PR 5). The ToolHost
+    /// is the only caller; a tool never widens its own policy.
+    pub fn with_resolved_policy(mut self, resolved: ResolvedExecutionPolicy) -> Self {
+        self.policy.resolved = Some(resolved);
         self
     }
 
@@ -356,12 +379,6 @@ impl ToolContext {
     /// Enable network sandboxing for `run_command` processes.
     pub fn with_sandbox(mut self, deny_network: bool) -> Self {
         self.policy.deny_network = deny_network;
-        self
-    }
-
-    /// Enable post-edit auto-formatting (real agent path; off in unit tests).
-    pub fn with_auto_format(mut self, on: bool) -> Self {
-        self.policy.auto_format = on;
         self
     }
 

@@ -32,9 +32,11 @@ pub struct RuleMatch {
     /// allowed, so an appended payload (`cmd; rm -rf /`) never rides the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_exact: Option<String>,
-    /// Glob matched against any path involved (simple `*` / `**` / `?`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_glob: Option<String>,
+    /// Glob over the paths the call WRITES (simple `*` / `**` / `?`). An
+    /// `allow` rule must cover every written path; `ask` / `deny` fire on any.
+    /// Reads are never gated by rules.
+    #[serde(default, alias = "path_glob", skip_serializing_if = "Option::is_none")]
+    pub write_path_glob: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +95,7 @@ impl PermissionRuleSet {
         let mut saw_ask = false;
         let mut matched = false;
         for rule in &self.rules {
-            if !rule_matches(&rule.match_, tool, command_line, paths) {
+            if !rule_matches(&rule.match_, tool, command_line, paths, rule.effect) {
                 continue;
             }
             matched = true;
@@ -116,7 +118,13 @@ impl PermissionRuleSet {
     }
 }
 
-fn rule_matches(m: &RuleMatch, tool: &str, command_line: Option<&str>, paths: &[PathBuf]) -> bool {
+fn rule_matches(
+    m: &RuleMatch,
+    tool: &str,
+    command_line: Option<&str>,
+    paths: &[PathBuf],
+    effect: RuleEffect,
+) -> bool {
     let mut any_constraint = false;
     if let Some(t) = &m.tool {
         any_constraint = true;
@@ -142,12 +150,18 @@ fn rule_matches(m: &RuleMatch, tool: &str, command_line: Option<&str>, paths: &[
             return false;
         }
     }
-    if let Some(glob) = &m.path_glob {
+    if let Some(glob) = &m.write_path_glob {
         any_constraint = true;
         if paths.is_empty() {
             return false;
         }
-        if !paths.iter().any(|p| path_matches_glob(p, glob)) {
+        // A standing allow covers a multi-file write only when it covers
+        // EVERY path; a restriction bites as soon as ANY path is inside it.
+        let covered = match effect {
+            RuleEffect::Allow => paths.iter().all(|p| path_matches_glob(p, glob)),
+            RuleEffect::Ask | RuleEffect::Deny => paths.iter().any(|p| path_matches_glob(p, glob)),
+        };
+        if !covered {
             return false;
         }
     }
@@ -304,7 +318,7 @@ pub fn project_rules_path(repo_root: &Path) -> PathBuf {
 pub fn always_rules_for(
     tool: &str,
     command: Option<&str>,
-    _paths: &[String],
+    paths: &[String],
 ) -> Vec<PermissionRule> {
     if is_memory_write_tool(tool) {
         return Vec::new();
@@ -315,13 +329,21 @@ pub fn always_rules_for(
     };
     match tool {
         "run_command" | "shell_command" => command_rule(tool, command, allow),
-        // Plan edits many files: one Always covers the whole edit tool.
-        "apply_patch" | "replace" => vec![allow(RuleMatch {
-            tool: Some(tool.to_string()),
-            command_prefix: None,
-            command_exact: None,
-            path_glob: None,
-        })],
+        // An edit tool's "always" covers exactly the paths the user saw —
+        // never the whole tool, which would let a later plan step rewrite
+        // anything without asking. No paths → nothing durable.
+        "apply_patch" | "replace" => paths
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                allow(RuleMatch {
+                    tool: Some(tool.to_string()),
+                    command_prefix: None,
+                    command_exact: None,
+                    write_path_glob: Some(p.trim().to_string()),
+                })
+            })
+            .collect(),
         // MCP proxy tools (`mcp__<server>__<tool>`) prompt on every confined
         // profile and carry no command line to scope by, so the only standing
         // grant that can be expressed is the exact tool. Without this the
@@ -331,7 +353,7 @@ pub fn always_rules_for(
             tool: Some(tool.to_string()),
             command_prefix: None,
             command_exact: None,
-            path_glob: None,
+            write_path_glob: None,
         })],
         _ => Vec::new(),
     }
@@ -352,7 +374,7 @@ fn command_rule(
             tool: Some(tool.to_string()),
             command_prefix: Some(prefix),
             command_exact: None,
-            path_glob: None,
+            write_path_glob: None,
         })];
     }
     let Some(exact) = command.map(str::trim).filter(|c| !c.is_empty()) else {
@@ -362,7 +384,7 @@ fn command_rule(
         tool: Some(tool.to_string()),
         command_prefix: None,
         command_exact: Some(exact.to_string()),
-        path_glob: None,
+        write_path_glob: None,
     })]
 }
 
@@ -453,7 +475,7 @@ mod tests {
                 tool: Some(tool.into()),
                 command_prefix: Some(line.into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         }])
@@ -468,7 +490,7 @@ mod tests {
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         }]);
@@ -490,7 +512,7 @@ mod tests {
                     tool: Some("run_command".into()),
                     command_prefix: Some("cargo".into()),
                     command_exact: None,
-                    path_glob: None,
+                    write_path_glob: None,
                 },
                 effect: RuleEffect::Allow,
             },
@@ -499,7 +521,7 @@ mod tests {
                     tool: Some("run_command".into()),
                     command_prefix: Some("cargo clean".into()),
                     command_exact: None,
-                    path_glob: None,
+                    write_path_glob: None,
                 },
                 effect: RuleEffect::Deny,
             },
@@ -521,7 +543,7 @@ mod tests {
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
                 command_exact: None,
-                path_glob: Some("src/**".into()),
+                write_path_glob: Some("src/**".into()),
             },
             effect: RuleEffect::Ask,
         }]);
@@ -655,29 +677,6 @@ rules:
     }
 
     #[test]
-    fn always_rules_apply_patch_is_tool_level_for_all_paths() {
-        let paths = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
-        let rules = always_rules_for("apply_patch", None, &paths);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].match_.tool.as_deref(), Some("apply_patch"));
-        assert!(rules[0].match_.path_glob.is_none());
-        let set = PermissionRuleSet::from_rules(rules);
-        // Later plan steps on other files must not re-prompt.
-        assert_eq!(
-            set.evaluate(
-                "apply_patch",
-                None,
-                &[std::path::PathBuf::from("crates/other/src/x.rs")]
-            ),
-            RuleDecision::Allow
-        );
-        let rules = always_rules_for("replace", None, &[]);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].match_.tool.as_deref(), Some("replace"));
-        assert!(always_rules_for("web_search", Some("x"), &[]).is_empty());
-    }
-
-    #[test]
     fn append_project_rule_creates_file_and_dir_then_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         let rule = PermissionRule {
@@ -685,7 +684,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -706,7 +705,7 @@ rules:
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
                 command_exact: None,
-                path_glob: Some("src/lib.rs".into()),
+                write_path_glob: Some("src/lib.rs".into()),
             },
             effect: RuleEffect::Allow,
         };
@@ -726,7 +725,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -754,7 +753,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("curl".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -784,7 +783,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -822,7 +821,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("git push".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -844,7 +843,7 @@ rules:
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
                 command_exact: None,
-                path_glob: None,
+                write_path_glob: None,
             },
             effect: RuleEffect::Allow,
         };
@@ -964,5 +963,119 @@ mod mcp_always_tests {
     fn memory_writes_still_derive_no_durable_rule() {
         assert!(always_rules_for("remember", None, &[]).is_empty());
         assert!(always_rules_for("forget", None, &[]).is_empty());
+    }
+}
+
+/// PR 6: rules scope WRITES by path, and a standing allow never covers more
+/// than the paths the user saw.
+#[cfg(test)]
+mod write_path_tests {
+    use super::*;
+
+    fn rule(effect: RuleEffect, glob: &str) -> PermissionRule {
+        PermissionRule {
+            match_: RuleMatch {
+                tool: Some("apply_patch".into()),
+                command_prefix: None,
+                command_exact: None,
+                write_path_glob: Some(glob.into()),
+            },
+            effect,
+        }
+    }
+
+    /// A multi-file write is allowed by a rule only when EVERY path it
+    /// touches matches; one path outside the glob means the whole call asks.
+    #[test]
+    fn an_allow_rule_must_cover_every_written_path() {
+        let set = PermissionRuleSet::from_rules(vec![rule(RuleEffect::Allow, "src/**")]);
+        assert_eq!(
+            set.evaluate(
+                "apply_patch",
+                None,
+                &[PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")]
+            ),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate(
+                "apply_patch",
+                None,
+                &[PathBuf::from("src/a.rs"), PathBuf::from("README.md")]
+            ),
+            RuleDecision::NoMatch,
+            "one path outside the allow glob must not ride the rule"
+        );
+    }
+
+    /// A deny fires as soon as ANY written path is inside it.
+    #[test]
+    fn a_deny_rule_fires_on_any_written_path() {
+        let set = PermissionRuleSet::from_rules(vec![rule(RuleEffect::Deny, "secrets/**")]);
+        assert_eq!(
+            set.evaluate(
+                "apply_patch",
+                None,
+                &[PathBuf::from("src/a.rs"), PathBuf::from("secrets/key")]
+            ),
+            RuleDecision::Deny
+        );
+    }
+
+    /// The old spelling still loads from a user's permissions.yaml.
+    #[test]
+    fn the_legacy_path_glob_key_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.yaml");
+        std::fs::write(
+            &path,
+            "rules:\n  - match: { tool: apply_patch, write_path_glob: \"src/**\" }\n    effect: allow\n",
+        )
+        .unwrap();
+        let set = load_rules_file(&path).unwrap();
+        assert_eq!(
+            set.rules()[0].match_.write_path_glob.as_deref(),
+            Some("src/**")
+        );
+    }
+
+    /// "Always" on an edit tool grants the paths the user approved, never
+    /// the whole tool: a later edit elsewhere asks again.
+    #[test]
+    fn always_on_an_edit_tool_is_path_scoped_never_tool_wide() {
+        let paths = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        let rules = always_rules_for("apply_patch", None, &paths);
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        for rule in &rules {
+            assert_eq!(rule.match_.tool.as_deref(), Some("apply_patch"));
+            assert!(rule.match_.write_path_glob.is_some(), "{rule:?}");
+        }
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("apply_patch", None, &[PathBuf::from("src/lib.rs")]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate(
+                "apply_patch",
+                None,
+                &[PathBuf::from("crates/other/src/x.rs")]
+            ),
+            RuleDecision::NoMatch,
+            "a standing grant must not cover files the user never approved"
+        );
+        assert_eq!(
+            set.evaluate(
+                "apply_patch",
+                None,
+                &[PathBuf::from("src/lib.rs"), PathBuf::from("src/new.rs")]
+            ),
+            RuleDecision::NoMatch,
+            "adding an unapproved file to an approved one must ask"
+        );
+        assert!(
+            always_rules_for("replace", None, &[]).is_empty(),
+            "no paths → nothing durable; the grant stays session-only"
+        );
     }
 }

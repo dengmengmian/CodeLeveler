@@ -9,7 +9,6 @@ mod expand_tools;
 mod find_files;
 mod find_references;
 mod find_symbol;
-mod format;
 mod git;
 mod grep;
 mod list_files;

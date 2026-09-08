@@ -26,7 +26,7 @@
 2. **包配置** `configs/providers/*.yaml`、`configs/models/*.yaml`<br>
    可提交进仓库的兼容档案；详见 `configs/example.yaml`。
 3. **项目** `<repo>/.leveler/config.yaml`<br>
-   本仓库的 model / mode / verify / ignore / readonly_roots / limits。
+   本仓库的 model / mode / verify / ignore / limits。
 4. **权限 / hooks**<br>
    用户级 `~/.leveler/` 与项目级 `.leveler/` 均可。
 
@@ -49,7 +49,7 @@
 
 - 只要写了 `verify` 里任一命令，就**整段替换**语言自动发现计划。
 - `format` 失败**不阻塞**完成；`build` / `test` **阻塞**完成。
-- `readonly_roots`：可多读相邻仓库，**不能**写入那些路径。
+- 读取不需要授权：任意路径可读（`.env`、私钥等凭据文件除外），写入只限工作区。
 
 ## 权限规则要点
 

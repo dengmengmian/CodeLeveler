@@ -2445,8 +2445,8 @@ expect: { program: cargo, args: [test] }
         // id silently corrupts checkpoints and cross-suite dedup.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases");
         let all = EvaluationCase::load_dir(&root).expect("recursive eval suite");
-        let scenarios =
-            EvaluationCase::load_dir(&root.join("scenarios")).expect("evals/cases/scenarios must parse");
+        let scenarios = EvaluationCase::load_dir(&root.join("scenarios"))
+            .expect("evals/cases/scenarios must parse");
         assert!(
             !scenarios.is_empty(),
             "evals/cases/scenarios must contain at least one case"

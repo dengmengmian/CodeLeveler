@@ -245,7 +245,7 @@ impl Tool for ApplyPatchTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        cancellation: CancellationToken,
+        _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
@@ -280,14 +280,16 @@ impl Tool for ApplyPatchTool {
         let mut ops = Vec::new();
         let mut summary = Vec::new();
         let mut modified = Vec::new();
+        let scope = context.write_scope();
 
         for change in changes {
             match change {
                 FileChange::Add { path, content } => {
-                    let resolved = match context.execution.workspace.resolve(&path) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                    };
+                    let resolved =
+                        match context.execution.workspace.resolve_for_write(&path, &scope) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                        };
                     match tokio::fs::symlink_metadata(&resolved).await {
                         Ok(_) => {
                             return Ok(ToolOutput::error(format!(
@@ -305,10 +307,11 @@ impl Tool for ApplyPatchTool {
                     modified.push(path);
                 }
                 FileChange::Delete { path } => {
-                    let resolved = match context.execution.workspace.resolve(&path) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                    };
+                    let resolved =
+                        match context.execution.workspace.resolve_for_write(&path, &scope) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                        };
                     let expected = match tokio::fs::read_to_string(&resolved).await {
                         Ok(content) => content,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -335,10 +338,11 @@ impl Tool for ApplyPatchTool {
                     move_to,
                     chunks,
                 } => {
-                    let resolved = match context.execution.workspace.resolve(&path) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                    };
+                    let resolved =
+                        match context.execution.workspace.resolve_for_write(&path, &scope) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                        };
                     let existing = match tokio::fs::read_to_string(&resolved).await {
                         Ok(s) => s,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -380,7 +384,11 @@ impl Tool for ApplyPatchTool {
 
                     match move_to {
                         Some(dest) => {
-                            let dest_resolved = match context.execution.workspace.resolve(&dest) {
+                            let dest_resolved = match context
+                                .execution
+                                .workspace
+                                .resolve_for_write(&dest, &scope)
+                            {
                                 Ok(p) => p,
                                 Err(e) => return Ok(ToolOutput::error(e.to_string())),
                             };
@@ -495,13 +503,11 @@ impl Tool for ApplyPatchTool {
         // like an outside change to its next patch. A path we can no longer read
         // was deleted here; forget it so a recreated file starts clean.
         for rel in &modified {
-            match context.execution.workspace.resolve(rel) {
+            match context.execution.workspace.resolve_for_read(rel) {
                 Ok(resolved) => match tokio::fs::read(&resolved).await {
                     Ok(bytes) => {
                         context.execution.file_state.record(rel, &bytes);
                         // Auto-format the edited file (best-effort; re-fingerprints).
-                        super::format::format_after_edit(&context, rel, &resolved, &cancellation)
-                            .await;
                     }
                     Err(_) => context.execution.file_state.forget(rel),
                 },
@@ -1183,7 +1189,6 @@ mod tests {
             leveler_execution::PermissionProfile::Assisted,
             &[("main.go", "package main\n\nfunc main() {\n}\n")],
         );
-        let context = context.with_auto_format(true);
 
         // The patch writes deliberately misformatted Go; gofmt normalizes it.
         let first = "*** Begin Patch\n*** Update File: main.go\n func main() {\n+\tx   :=   1\n+\t_ = x\n }\n*** End Patch";

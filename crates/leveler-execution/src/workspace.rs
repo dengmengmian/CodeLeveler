@@ -1,19 +1,20 @@
 //! Workspace path resolution and scope validation (spec §21).
 //!
-//! Every file/patch tool must route paths through [`Workspace::resolve`] /
-//! [`Workspace::resolve_read`] so a model can never write outside the primary
-//! repository, escape via `..`, or reach sensitive files (`.env`, keys, `.git`
-//! internals, `~/.ssh`, ...). Optional **readonly roots** allow cross-repo
-//! reads (e.g. comparing a sibling checkout) without opening the write surface.
+//! Reads need no authorization: [`Workspace::resolve_for_read`] canonicalizes
+//! any path and applies only the credential-name denylist (`.env`, keys,
+//! `.git` internals, `~/.ssh`, ...). Writes are bounded by exactly one
+//! [`WriteScope`]: [`Workspace::resolve_for_write`] refuses anything outside
+//! it, including `..` escapes and symlinks that point out of it.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Whether a path is resolved for reading only or for mutation.
+use crate::WriteScope;
+
+/// Whether a path is resolved for reading only or for mutation. Internal:
+/// decides which denials apply (trust-gated config is read-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathAccess {
-    /// Primary workspace + optional readonly roots.
+enum PathAccess {
     Read,
-    /// Primary workspace only (writes, cwd for commands, patches).
     Write,
 }
 
@@ -30,39 +31,24 @@ pub enum WorkspaceError {
 }
 
 impl WorkspaceError {
-    fn outside(path: &Path, primary: &Path, access: PathAccess, readonly: &[PathBuf]) -> Self {
-        let path = path.display().to_string();
-        let root = primary.display().to_string();
-        let message = match access {
-            PathAccess::Write => format!(
-                "path `{path}` is outside the workspace root `{root}`. \
-                 Use a path relative to that root (e.g. `src/lib.rs`), or start \
-                 leveler inside the target repository. Cross-repo absolute paths \
-                 are blocked for writes by design. To *read* another checkout, \
-                 pass `--readonly-root <dir>` (or `readonly_roots` in \
-                 `.leveler/config.yaml`)."
-            ),
-            PathAccess::Read if readonly.is_empty() => format!(
-                "path `{path}` is outside the workspace root `{root}`. \
-                 Use a path relative to that root, or start leveler inside the \
-                 target repository. To read another repo without leaving this \
-                 workspace, pass `--readonly-root <dir>` (repeatable) or set \
-                 `readonly_roots` in `.leveler/config.yaml`."
-            ),
-            PathAccess::Read => {
-                let extras: Vec<_> = readonly
-                    .iter()
-                    .map(|p| format!("`{}`", p.display()))
-                    .collect();
-                format!(
-                    "path `{path}` is outside the workspace root `{root}` and \
-                     outside readonly roots ({}). Use a path under the primary \
-                     root or an absolute path under a configured readonly root.",
-                    extras.join(", ")
-                )
-            }
-        };
-        WorkspaceError::OutsideWorkspace(message)
+    fn outside(path: &Path, root: &Path) -> Self {
+        WorkspaceError::OutsideWorkspace(format!(
+            "path `{}` is outside the workspace root `{}`. Use a path relative \
+             to that root (e.g. `src/lib.rs`), or start leveler inside the target \
+             repository. Writes outside the write scope are blocked by design; \
+             reading any path is allowed.",
+            path.display(),
+            root.display()
+        ))
+    }
+
+    fn no_write_scope(path: &Path) -> Self {
+        WorkspaceError::OutsideWorkspace(format!(
+            "path `{}` cannot be written: no write scope is currently owned. \
+             Read the relevant code, then use claim_write_scope(paths) before \
+             modifying files.",
+            path.display()
+        ))
     }
 }
 
@@ -75,7 +61,6 @@ pub struct Workspace {
     #[cfg(windows)]
     root_dir: std::sync::Arc<cap_std::fs::Dir>,
     /// Extra trees allowed for [`PathAccess::Read`] only (canonicalized).
-    readonly_roots: Vec<PathBuf>,
     /// Whether this root's filesystem treats `Foo.rs` and `foo.rs` as ONE
     /// file. Probed once when the workspace opens (see
     /// [`detect_case_insensitive`]) because it is a property of the volume,
@@ -176,7 +161,6 @@ impl Workspace {
             root_fd: std::sync::Arc::new(root_fd),
             #[cfg(windows)]
             root_dir: std::sync::Arc::new(root_dir),
-            readonly_roots: Vec::new(),
             case_insensitive,
         })
     }
@@ -188,26 +172,6 @@ impl Workspace {
         self.case_insensitive
     }
 
-    /// Add directories that may be **read** via absolute paths (or paths under
-    /// those roots). Writes still require the primary root. Missing paths are
-    /// skipped with no error so config can list optional checkouts.
-    pub fn with_readonly_roots(
-        mut self,
-        roots: impl IntoIterator<Item = impl AsRef<Path>>,
-    ) -> Self {
-        for root in roots {
-            let root = root.as_ref();
-            if let Ok(canonical) = root.canonicalize()
-                && canonical != self.root
-                && !self.readonly_roots.iter().any(|r| r == &canonical)
-            {
-                self.readonly_roots.push(canonical);
-            }
-        }
-        self
-    }
-
-    /// The canonical primary workspace root (writable).
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -226,28 +190,60 @@ impl Workspace {
         self.root_dir.clone()
     }
 
-    /// Extra read-only roots (canonicalized).
-    pub fn readonly_roots(&self) -> &[PathBuf] {
-        &self.readonly_roots
+    /// Resolve for **read**: any path, inside or outside the workspace.
+    ///
+    /// Relative paths anchor on the workspace root. The result is canonical
+    /// when the path exists. Only the credential-name denylist applies —
+    /// there is no scope check and nothing here raises an approval.
+    pub fn resolve_for_read(&self, input: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        let normalized = self.normalize(input);
+        self.check_sensitive(&normalized, input, PathAccess::Read)?;
+        if let Ok(real) = std::fs::canonicalize(&normalized) {
+            self.check_sensitive(&real, input, PathAccess::Read)?;
+            return Ok(real);
+        }
+        Ok(normalized)
     }
 
-    /// Resolve for **write** access: primary root only.
+    /// Resolve for **write** under `scope`.
     ///
-    /// Prefer this for patches, replaces, and command `cwd`.
-    pub fn resolve(&self, input: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
-        self.resolve_with(input, PathAccess::Write)
+    /// - [`WriteScope::None`]: every write is refused.
+    /// - [`WriteScope::Workspace`]: the canonical location must sit under the
+    ///   scope root — a `..` escape or a symlink pointing out is refused.
+    /// - [`WriteScope::Unrestricted`]: any location.
+    ///
+    /// Credential names and the trust-gated project config are refused under
+    /// every scope: a tool that could rewrite `.leveler/hooks.yaml` would be
+    /// choosing its own hooks.
+    pub fn resolve_for_write(
+        &self,
+        input: impl AsRef<Path>,
+        scope: &WriteScope,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        let bound = match scope {
+            WriteScope::None => return Err(WorkspaceError::no_write_scope(input)),
+            WriteScope::Workspace { root } => Some(root.as_path()),
+            WriteScope::Unrestricted => None,
+        };
+        self.resolve_bounded(input, bound, PathAccess::Write)
     }
 
     /// Revalidate a previously resolved write path immediately before mutation.
     ///
     /// Resolution is intentionally repeated at the commit boundary: an
     /// ancestor may have been replaced by a symlink while a tool was preparing
-    /// its output.  The returned path must still identify the same location.
+    /// its output. The returned path must still identify the same location.
     /// This closes ordinary symlink swaps; a hostile process that can race the
     /// final syscall still requires descriptor-relative OS APIs for a complete
     /// guarantee.
-    pub fn revalidate_write_path(&self, resolved: &Path) -> Result<(), WorkspaceError> {
-        let checked = self.resolve_with(resolved, PathAccess::Write)?;
+    pub fn revalidate_write_path(
+        &self,
+        resolved: &Path,
+        scope: &WriteScope,
+    ) -> Result<(), WorkspaceError> {
+        let checked = self.resolve_for_write(resolved, scope)?;
         if checked != resolved {
             return Err(WorkspaceError::OutsideWorkspace(format!(
                 "path `{}` changed identity before write",
@@ -257,85 +253,72 @@ impl Workspace {
         Ok(())
     }
 
-    /// Resolve for **read** access: primary root or any readonly root.
-    pub fn resolve_read(&self, input: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
-        self.resolve_with(input, PathAccess::Read)
-    }
-
-    /// Resolve `input` under the allowed roots for `access`.
-    pub fn resolve_with(
+    /// Resolve a command's working directory.
+    ///
+    /// Not a write, but a confined scope (`Workspace` or `None`) keeps the
+    /// cwd inside the workspace root — the OS sandbox anchors on it — while
+    /// `Unrestricted` may start anywhere.
+    pub fn resolve_command_cwd(
         &self,
         input: impl AsRef<Path>,
-        access: PathAccess,
+        scope: &WriteScope,
     ) -> Result<PathBuf, WorkspaceError> {
-        let input = input.as_ref();
+        let bound = scope.confines().then_some(self.root.as_path());
+        self.resolve_bounded(input.as_ref(), bound, PathAccess::Read)
+    }
+
+    fn normalize(&self, input: &Path) -> PathBuf {
         let joined = if input.is_absolute() {
             input.to_path_buf()
         } else {
-            // Relative paths always anchor on the primary root (writable tree).
+            // Relative paths always anchor on the primary root.
             self.root.join(input)
         };
-        let normalized = lexical_normalize(&joined);
+        lexical_normalize(&joined)
+    }
+
+    /// Resolve `input`, refusing any canonical location outside `bound` when
+    /// one is given.
+    fn resolve_bounded(
+        &self,
+        input: &Path,
+        bound: Option<&Path>,
+        access: PathAccess,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let normalized = self.normalize(input);
         // On macOS, `/var/...` and `/private/var/...` differ lexically but are
         // the same tree after canonicalize — probe with the real ancestor too.
         let ancestor = canonicalize_existing_ancestor(&normalized);
 
-        let in_scope = self.containing_root(&normalized, access).is_some()
-            || ancestor
-                .as_ref()
-                .is_some_and(|a| self.containing_root(a, access).is_some());
-        if !in_scope {
-            return Err(WorkspaceError::outside(
-                input,
-                &self.root,
-                access,
-                &self.readonly_roots,
-            ));
+        if let Some(bound) = bound {
+            let in_scope = normalized.starts_with(bound)
+                || ancestor.as_ref().is_some_and(|a| a.starts_with(bound));
+            if !in_scope {
+                return Err(WorkspaceError::outside(input, bound));
+            }
         }
 
         self.check_sensitive(&normalized, input, access)?;
 
         // Full path exists: return canonical form and re-check scope (symlink escape).
         if let Ok(real) = std::fs::canonicalize(&normalized) {
-            if self.containing_root(&real, access).is_none() {
-                return Err(WorkspaceError::outside(
-                    input,
-                    &self.root,
-                    access,
-                    &self.readonly_roots,
-                ));
+            if let Some(bound) = bound
+                && !real.starts_with(bound)
+            {
+                return Err(WorkspaceError::outside(input, bound));
             }
             self.check_sensitive(&real, input, access)?;
             return Ok(real);
         }
 
         // Path not created yet: ensure the existing ancestor stays in scope.
-        if let Some(real_anc) = ancestor
-            && self.containing_root(&real_anc, access).is_none()
+        if let (Some(bound), Some(real_anc)) = (bound, ancestor)
+            && !real_anc.starts_with(bound)
         {
-            return Err(WorkspaceError::outside(
-                input,
-                &self.root,
-                access,
-                &self.readonly_roots,
-            ));
+            return Err(WorkspaceError::outside(input, bound));
         }
 
         Ok(normalized)
-    }
-
-    fn containing_root(&self, normalized: &Path, access: PathAccess) -> Option<&Path> {
-        if normalized.starts_with(&self.root) {
-            return Some(&self.root);
-        }
-        if access == PathAccess::Read {
-            for extra in &self.readonly_roots {
-                if normalized.starts_with(extra) {
-                    return Some(extra);
-                }
-            }
-        }
-        None
     }
 
     fn check_sensitive(
@@ -446,6 +429,12 @@ fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn ws_scope(ws: &Workspace) -> WriteScope {
+        WriteScope::Workspace {
+            root: ws.root().to_path_buf(),
+        }
+    }
+
     fn workspace() -> (Workspace, PathBuf) {
         let dir = std::env::temp_dir().join(format!("leveler-ws-{}", ordinal()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -463,7 +452,7 @@ mod tests {
     #[test]
     fn resolves_relative_inside_workspace() {
         let (ws, dir) = workspace();
-        let p = ws.resolve("src/main.rs").unwrap();
+        let p = ws.resolve_for_write("src/main.rs", &ws_scope(&ws)).unwrap();
         assert!(p.starts_with(ws.root()));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -471,14 +460,19 @@ mod tests {
     #[test]
     fn allows_new_nonexistent_file() {
         let (ws, dir) = workspace();
-        assert!(ws.resolve("src/new_module.rs").is_ok());
+        assert!(
+            ws.resolve_for_write("src/new_module.rs", &ws_scope(&ws))
+                .is_ok()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn rejects_parent_traversal() {
         let (ws, dir) = workspace();
-        let err = ws.resolve("../../etc/passwd").unwrap_err();
+        let err = ws
+            .resolve_for_write("../../etc/passwd", &ws_scope(&ws))
+            .unwrap_err();
         assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)));
         let msg = err.to_string();
         assert!(
@@ -492,14 +486,12 @@ mod tests {
     #[test]
     fn rejects_absolute_outside() {
         let (ws, dir) = workspace();
-        let err = ws.resolve("/etc/hosts").unwrap_err();
+        let err = ws
+            .resolve_for_write("/etc/hosts", &ws_scope(&ws))
+            .unwrap_err();
         assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)));
         let msg = err.to_string();
         assert!(msg.contains("outside the workspace root"), "{msg}");
-        assert!(
-            msg.contains("--readonly-root") || msg.contains("readonly_roots"),
-            "should mention how to allow cross-repo reads: {msg}"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -507,19 +499,21 @@ mod tests {
     fn denies_env_and_keys_and_git() {
         let (ws, dir) = workspace();
         assert!(matches!(
-            ws.resolve(".env").unwrap_err(),
+            ws.resolve_for_write(".env", &ws_scope(&ws)).unwrap_err(),
             WorkspaceError::Denied(_)
         ));
         assert!(matches!(
-            ws.resolve(".env.local").unwrap_err(),
+            ws.resolve_for_write(".env.local", &ws_scope(&ws))
+                .unwrap_err(),
             WorkspaceError::Denied(_)
         ));
         assert!(matches!(
-            ws.resolve("id.pem").unwrap_err(),
+            ws.resolve_for_write("id.pem", &ws_scope(&ws)).unwrap_err(),
             WorkspaceError::Denied(_)
         ));
         assert!(matches!(
-            ws.resolve(".git/config").unwrap_err(),
+            ws.resolve_for_write(".git/config", &ws_scope(&ws))
+                .unwrap_err(),
             WorkspaceError::Denied(_)
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -539,13 +533,19 @@ mod tests {
             "config/credentials.json",
         ] {
             assert!(
-                matches!(ws.resolve(name), Err(WorkspaceError::Denied(_))),
+                matches!(
+                    ws.resolve_for_write(name, &ws_scope(&ws)),
+                    Err(WorkspaceError::Denied(_))
+                ),
                 "{name} must be denied"
             );
         }
         // Public halves and ordinary files stay readable.
         for name in ["id_rsa.pub", "src/main.rs", "package.json"] {
-            assert!(ws.resolve(name).is_ok(), "{name} must stay allowed");
+            assert!(
+                ws.resolve_for_write(name, &ws_scope(&ws)).is_ok(),
+                "{name} must stay allowed"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -561,10 +561,16 @@ mod tests {
         let (ws, dir) = workspace();
         for name in [".leveler/hooks.yaml", ".leveler/permissions.yaml"] {
             assert!(
-                matches!(ws.resolve(name), Err(WorkspaceError::Denied(_))),
+                matches!(
+                    ws.resolve_for_write(name, &ws_scope(&ws)),
+                    Err(WorkspaceError::Denied(_))
+                ),
                 "{name} must not be writable"
             );
-            assert!(ws.resolve_read(name).is_ok(), "{name} must stay readable");
+            assert!(
+                ws.resolve_for_read(name).is_ok(),
+                "{name} must stay readable"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -580,42 +586,32 @@ mod tests {
             "ci/hooks.yaml",
             "config/permissions.yaml",
         ] {
-            assert!(ws.resolve(name).is_ok(), "{name} must stay writable");
+            assert!(
+                ws.resolve_for_write(name, &ws_scope(&ws)).is_ok(),
+                "{name} must stay writable"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A sibling checkout is readable with no readonly root at all, and the
+    /// workspace scope still refuses to write it.
     #[test]
-    fn readonly_root_allows_read_but_not_write() {
+    fn another_checkout_is_readable_but_not_writable_under_workspace_scope() {
         let (ws, primary) = workspace();
         let other = std::env::temp_dir().join(format!("leveler-ws-ro-{}", ordinal()));
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("AGENTS.md"), "rules").unwrap();
 
-        let ws = ws.with_readonly_roots([&other]);
         let abs = other.join("AGENTS.md");
-        let read = ws.resolve_read(&abs).expect("read via readonly root");
+        let read = ws.resolve_for_read(&abs).expect("reads are not scoped");
         assert_eq!(read, abs.canonicalize().unwrap_or(abs.clone()));
 
-        let write_err = ws.resolve(&abs).unwrap_err();
+        let write_err = ws.resolve_for_write(&abs, &ws_scope(&ws)).unwrap_err();
         assert!(matches!(write_err, WorkspaceError::OutsideWorkspace(_)));
-        assert!(
-            write_err.to_string().contains("blocked for writes")
-                || write_err.to_string().contains("outside the workspace root"),
-            "{}",
-            write_err
-        );
 
         std::fs::remove_dir_all(&primary).ok();
         std::fs::remove_dir_all(&other).ok();
-    }
-
-    #[test]
-    fn resolve_read_without_readonly_roots_still_rejects_outside() {
-        let (ws, dir) = workspace();
-        let err = ws.resolve_read("/etc/hosts").unwrap_err();
-        assert!(err.to_string().contains("--readonly-root"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
@@ -624,14 +620,14 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (ws, dir) = workspace();
-        let resolved = ws.resolve("src/new.rs").unwrap();
+        let resolved = ws.resolve_for_write("src/new.rs", &ws_scope(&ws)).unwrap();
         let outside = std::env::temp_dir().join(format!("leveler-ws-race-{}", ordinal()));
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::remove_dir_all(dir.join("src")).unwrap();
         symlink(&outside, dir.join("src")).unwrap();
 
         assert!(matches!(
-            ws.revalidate_write_path(&resolved),
+            ws.revalidate_write_path(&resolved, &ws_scope(&ws)),
             Err(WorkspaceError::OutsideWorkspace(_))
         ));
         assert!(!outside.join("new.rs").exists());
@@ -681,5 +677,236 @@ mod tests {
             assert!(ws.path_case_insensitive());
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// PR 2: reads need no authorization; writes are bounded by one `WriteScope`.
+#[cfg(test)]
+mod scope_split_tests {
+    use super::*;
+    use crate::WriteScope;
+
+    fn workspace() -> (Workspace, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("leveler-ws2-{}", ordinal()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        (Workspace::new(&dir).unwrap(), dir)
+    }
+
+    fn ordinal() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(1000);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn outside_dir() -> PathBuf {
+        let other = std::env::temp_dir().join(format!("leveler-ws2-out-{}", ordinal()));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("notes.md"), "elsewhere").unwrap();
+        other
+    }
+
+    fn workspace_scope(ws: &Workspace) -> WriteScope {
+        WriteScope::Workspace {
+            root: ws.root().to_path_buf(),
+        }
+    }
+
+    // ---- reads ----
+
+    /// Any path is readable without a readonly root or approval.
+    #[test]
+    fn a_read_outside_the_workspace_resolves_without_any_gate() {
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        let abs = other.join("notes.md");
+        let read = ws
+            .resolve_for_read(&abs)
+            .expect("outside read is not gated");
+        assert_eq!(read, abs.canonicalize().unwrap());
+        assert!(ws.resolve_for_read("/etc/hosts").is_ok() || !Path::new("/etc/hosts").exists());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn a_relative_read_anchors_on_the_workspace_root() {
+        let (ws, dir) = workspace();
+        let p = ws.resolve_for_read("src/main.rs").unwrap();
+        assert!(p.starts_with(ws.root()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Scope is gone from reads; the credential denylist is not. Whether
+    /// `.env` / private keys become readable is a product decision the
+    /// migration plan leaves to documentation, so this pins today's answer.
+    #[test]
+    fn sensitive_names_stay_denied_on_read_everywhere() {
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        std::fs::write(other.join(".env"), "SECRET=1").unwrap();
+        for p in [
+            ws.root().join(".env"),
+            other.join(".env"),
+            other.join("id_rsa"),
+            PathBuf::from("/tmp/anything/.ssh/config"),
+        ] {
+            assert!(
+                matches!(ws.resolve_for_read(&p), Err(WorkspaceError::Denied(_))),
+                "{} must stay denied",
+                p.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// The trust-gated config files stay readable — the agent may show the
+    /// user what the repository ships; it may not rewrite it.
+    #[test]
+    fn trust_gated_config_is_readable_but_not_writable_under_any_scope() {
+        let (ws, dir) = workspace();
+        for name in [".leveler/hooks.yaml", ".leveler/permissions.yaml"] {
+            assert!(ws.resolve_for_read(name).is_ok(), "{name} readable");
+            for scope in [workspace_scope(&ws), WriteScope::Unrestricted] {
+                assert!(
+                    matches!(
+                        ws.resolve_for_write(name, &scope),
+                        Err(WorkspaceError::Denied(_))
+                    ),
+                    "{name} must not be writable under {scope:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- writes ----
+
+    #[test]
+    fn workspace_scope_allows_writes_inside_and_refuses_outside() {
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        let scope = workspace_scope(&ws);
+        assert!(ws.resolve_for_write("src/new.rs", &scope).is_ok());
+        let err = ws
+            .resolve_for_write(other.join("notes.md"), &scope)
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)), "{err}");
+        assert!(
+            !err.to_string().contains("--readonly-root"),
+            "readonly roots are a read concept and reads are no longer gated: {err}"
+        );
+        assert!(matches!(
+            ws.resolve_for_write("../../etc/passwd", &scope),
+            Err(WorkspaceError::OutsideWorkspace(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// `None` is the pre-claim child: nothing is writable, not even inside.
+    #[test]
+    fn none_scope_refuses_every_write() {
+        let (ws, dir) = workspace();
+        let err = ws
+            .resolve_for_write("src/main.rs", &WriteScope::None)
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)), "{err}");
+        assert!(
+            err.to_string().contains("claim_write_scope")
+                || err.to_string().contains("no write scope"),
+            "must tell the child how to obtain a scope: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unrestricted_scope_allows_writes_outside_the_workspace() {
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        let p = ws
+            .resolve_for_write(other.join("notes.md"), &WriteScope::Unrestricted)
+            .expect("unrestricted may write anywhere");
+        assert_eq!(p, other.join("notes.md").canonicalize().unwrap());
+        // ...but not credentials.
+        assert!(matches!(
+            ws.resolve_for_write(other.join(".env"), &WriteScope::Unrestricted),
+            Err(WorkspaceError::Denied(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// A symlink inside the workspace that points outside must not become a
+    /// write path under the workspace scope — canonical location decides.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_pointing_outside_is_not_writable_under_workspace_scope() {
+        use std::os::unix::fs::symlink;
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        symlink(&other, dir.join("linked")).unwrap();
+        let scope = workspace_scope(&ws);
+        assert!(matches!(
+            ws.resolve_for_write("linked/notes.md", &scope),
+            Err(WorkspaceError::OutsideWorkspace(_))
+        ));
+        assert!(matches!(
+            ws.resolve_for_write("linked/new.md", &scope),
+            Err(WorkspaceError::OutsideWorkspace(_))
+        ));
+        // Reading through it is fine.
+        assert!(ws.resolve_for_read("linked/notes.md").is_ok());
+        std::fs::remove_file(dir.join("linked")).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// Revalidation carries the scope too: an ancestor swapped to an outside
+    /// symlink between resolve and write is caught under the workspace scope.
+    #[cfg(unix)]
+    #[test]
+    fn revalidation_under_workspace_scope_catches_an_ancestor_swap() {
+        use std::os::unix::fs::symlink;
+        let (ws, dir) = workspace();
+        let scope = workspace_scope(&ws);
+        let resolved = ws.resolve_for_write("src/new.rs", &scope).unwrap();
+        let outside = outside_dir();
+        std::fs::remove_dir_all(dir.join("src")).unwrap();
+        symlink(&outside, dir.join("src")).unwrap();
+        assert!(matches!(
+            ws.revalidate_write_path(&resolved, &scope),
+            Err(WorkspaceError::OutsideWorkspace(_))
+        ));
+        std::fs::remove_file(dir.join("src")).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    // ---- command cwd ----
+
+    /// A command's cwd is not a write, but a confined scope still keeps it
+    /// inside the workspace (today's behavior); unrestricted may cd anywhere.
+    #[test]
+    fn command_cwd_follows_confinement_not_writability() {
+        let (ws, dir) = workspace();
+        let other = outside_dir();
+        for scope in [workspace_scope(&ws), WriteScope::None] {
+            assert!(ws.resolve_command_cwd("src", &scope).is_ok(), "{scope:?}");
+            assert!(
+                matches!(
+                    ws.resolve_command_cwd(&other, &scope),
+                    Err(WorkspaceError::OutsideWorkspace(_))
+                ),
+                "{scope:?}"
+            );
+        }
+        assert!(
+            ws.resolve_command_cwd(&other, &WriteScope::Unrestricted)
+                .is_ok()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

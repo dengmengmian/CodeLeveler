@@ -26,5 +26,5 @@ rules:
     effect: deny
   - match: { tool: apply_patch }
     effect: allow
-  - match: { tool: apply_patch, path_glob: "secrets/**" }
+  - match: { tool: apply_patch, write_path_glob: "secrets/**" }
     effect: deny
