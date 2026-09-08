@@ -65,10 +65,7 @@ pub use checkpoint::{
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
 };
 pub use contract::TaskContract;
-pub use findings::{
-    ChildResultProjection, ContributionSource, FindingError, FindingKind, FindingRecord,
-    FindingState, transition_allowed,
-};
+pub use findings::{ChildResultProjection, FindingKind, FindingRecord};
 pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};

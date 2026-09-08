@@ -1468,15 +1468,10 @@
       "type": "string"
     },
     "ChildContribution": {
-      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\nCounts are about the PARENT's judgement, not the child's output volume. `findings_total` is not a success metric; `findings_accepted` and `findings_verified` are what say the work mattered.",
+      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\n`findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it.",
       "type": "object",
       "required": [
-        "findings_accepted",
-        "findings_acknowledged",
-        "findings_open_blocking",
-        "findings_rejected",
         "findings_total",
-        "findings_verified",
         "role"
       ],
       "properties": {
@@ -1486,32 +1481,7 @@
             "type": "string"
           }
         },
-        "findings_accepted": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_acknowledged": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_open_blocking": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_rejected": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
         "findings_total": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_verified": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -1530,13 +1500,6 @@
         },
         "role": {
           "type": "string"
-        },
-        "source": {
-          "description": "Which mechanism produced it: `executor_child`, `independent_reviewer` or `self_reported`. `None` on events written before it was stamped.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       }
     },
@@ -1940,17 +1903,11 @@
       "description": "One finding, as the inspector shows it.\n\nA projection of `leveler_lifecycle::FindingRecord`, not the record itself: this crate is the stable wire, and the ledger must stay free to change.",
       "type": "object",
       "required": [
-        "blocking",
         "id",
         "kind",
-        "state",
         "summary"
       ],
       "properties": {
-        "blocking": {
-          "description": "Still gates a verified closure.",
-          "type": "boolean"
-        },
         "file": {
           "type": [
             "string",
@@ -1963,17 +1920,6 @@
         },
         "kind": {
           "description": "`relevant_file`, `risk`, `correctness`, …",
-          "type": "string"
-        },
-        "resolution_reason": {
-          "description": "Why the parent declined it. Present only on a rejection, where it is required — a rejection without a reason is not a judgement.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "state": {
-          "description": "`created` | `acknowledged` | `accepted` | `rejected` | `addressed` | `verified`.",
           "type": "string"
         },
         "summary": {
@@ -2016,22 +1962,6 @@
         "display_summary": {
           "description": "The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback.",
           "type": "string"
-        },
-        "findings_blocking": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_open": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
         },
         "findings_total": {
           "description": "`None` = UNKNOWN (ledger unreadable) — never render as 0.",

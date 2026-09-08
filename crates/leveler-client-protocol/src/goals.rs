@@ -84,10 +84,6 @@ pub struct UiGoalRecap {
     /// `None` = UNKNOWN (ledger unreadable) — never render as 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_total: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub findings_open: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub findings_blocking: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_limitations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

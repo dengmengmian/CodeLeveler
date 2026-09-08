@@ -5310,8 +5310,6 @@ fn goal_recap(id: &str, ordinal: Option<u64>) -> leveler_client_protocol::UiGoal
         verification: "unmeasured".to_string(),
         verification_detail: None,
         findings_total: None,
-        findings_open: None,
-        findings_blocking: None,
         known_limitations: Vec::new(),
         unresolved_work: Vec::new(),
     }

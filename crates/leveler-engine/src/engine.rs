@@ -1588,44 +1588,6 @@ impl TaskEngine {
         let _ = self
             .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
             .await?;
-        // Blocking-finding closure truth is a lifecycle fact: a reviewer's
-        // open blocking finding is recorded durably at the boundary, after
-        // the review stage so a finding adopted moments ago is seen. Addressed
-        // findings are host-promoted first when fresh post-mutation
-        // verification exists.
-        if let Ok(Some(mut ledger)) =
-            crate::turn::last_persisted_ledger(runner.stores.events.as_ref(), &runner.session_id)
-                .await
-            && !ledger.findings.is_empty()
-        {
-            if ledger.promote_addressed_findings(ledger.has_fresh_successful_verify()) > 0 {
-                log.append(
-                    None,
-                    EngineEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    },
-                    observer,
-                )
-                .await?;
-            }
-            let open: Vec<String> = ledger
-                .open_blocking_findings()
-                .iter()
-                .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
-                .collect();
-            if !open.is_empty() {
-                log.append(
-                    None,
-                    EngineEvent::ReviewStage {
-                        required: true,
-                        action: "blocking_finding_open".to_string(),
-                        detail: open.join("; "),
-                    },
-                    observer,
-                )
-                .await?;
-            }
-        }
         let base = report_from_agent_outcome(outcome, TaskOutcome::Completed);
         Ok(TaskReport {
             verification: Some(report),

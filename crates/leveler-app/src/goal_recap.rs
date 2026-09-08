@@ -35,15 +35,10 @@ pub(crate) fn project_goal_recap_parts(
         CheckpointVerification::Failed { detail } => ("failed", Some(detail.clone())),
         CheckpointVerification::Unmeasured => ("unmeasured", None),
     };
-    let (findings_total, findings_open, findings_blocking) = match &payload.findings {
-        CheckpointFindings::Known {
-            total,
-            open,
-            open_blocking,
-            ..
-        } => (Some(*total), Some(*open), Some(*open_blocking)),
+    let findings_total = match &payload.findings {
+        CheckpointFindings::Known { total, .. } => Some(*total),
         // UNKNOWN is None on the wire — a client must never render it as 0.
-        CheckpointFindings::Unknown => (None, None, None),
+        CheckpointFindings::Unknown => None,
     };
     UiGoalRecap {
         checkpoint_id: checkpoint_id.to_string(),
@@ -66,8 +61,6 @@ pub(crate) fn project_goal_recap_parts(
         verification: verification.to_string(),
         verification_detail,
         findings_total,
-        findings_open,
-        findings_blocking,
         known_limitations: payload.known_limitations.clone(),
         unresolved_work: payload.unresolved_work.clone(),
     }

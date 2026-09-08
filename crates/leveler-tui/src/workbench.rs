@@ -397,22 +397,20 @@ fn team_panel_height(state: &AppState) -> u16 {
     // The turn clock stops when the turn ends, so the linger window alone
     // cannot expire the terminal row afterwards — and it shouldn't: once the
     // turn settles, 任务已完成 is the single completion owner (§16) and the
-    // collaboration surface yields immediately. Open blocking findings keep
-    // it on screen: the user still owes those a decision.
-    if !state.is_busy() && state.team.open_blocking() == 0 {
+    // collaboration surface yields immediately.
+    if !state.is_busy() {
         return 0;
     }
     if state.collaboration_collapsed || state.team.surface_is_terminal(state.elapsed_secs) {
         return 1;
     }
-    // Roster shape: optional blocking banner + Main row + up to 4 child rows
-    // + an overflow row. Capped so the runtime surface stays a caption on
-    // the task, never most of the viewport.
+    // Roster shape: Main row + up to 4 child rows + an overflow row. Capped
+    // so the runtime surface stays a caption on the task, never most of the
+    // viewport.
     let children = state.team.children.len();
     let shown = children.min(4);
     let overflow = usize::from(children > shown);
-    let banner = usize::from(state.team.open_blocking() > 0);
-    (banner + 1 + shown + overflow).min(7) as u16
+    (1 + shown + overflow).min(7) as u16
 }
 
 fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -429,7 +427,6 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
     const MEMBER_INDENT: &str = "  ";
-    let blocking = state.team.open_blocking() > 0;
     let terminal = state.team.surface_is_terminal(state.elapsed_secs);
     if area.height == 1 || terminal {
         // Compact / terminal: one truthful row, nothing else.
@@ -443,7 +440,7 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             .children
             .iter()
             .any(|c| c.status == crate::multi_agent::ChildStatus::Failed);
-        let color = if blocking || bad {
+        let color = if bad {
             theme.status.error
         } else if terminal {
             theme.status.success
@@ -465,17 +462,6 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     // child); the existing structured activity label is its source, with a
     // truthful "正在工作" fallback rather than invented detail.
     let mut lines: Vec<Line> = Vec::new();
-    if blocking {
-        lines.push(Line::from(Span::styled(
-            truncate(
-                crate::multi_agent::team_panel_title(&state.team, t),
-                area.width as usize,
-            ),
-            Style::default()
-                .fg(theme.status.error)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
     let rows = crate::multi_agent::roster_rows(
         &state.team,
         state.activity.as_deref(),
@@ -1278,39 +1264,6 @@ mod tests {
             empty.trim().len() > 50,
             "an empty team must not blank the workbench: {empty}"
         );
-    }
-
-    #[test]
-    fn a_blocking_finding_is_named_in_the_panel_title() {
-        let mut team = team_with(&[("w1", "worker", "implement"), ("r1", "reviewer", "review")]);
-        let mut c = leveler_client_protocol::ChildContribution {
-            role: "reviewer".into(),
-            profile_id: Some("reviewer".into()),
-            profile_role: Some("reviewer".into()),
-            capabilities: vec!["code_review".into()],
-            source: Some("independent_reviewer".into()),
-            findings_total: 2,
-            findings_acknowledged: 2,
-            findings_accepted: 1,
-            findings_verified: 0,
-            findings_rejected: 0,
-            findings_open_blocking: 1,
-        };
-        c.findings_open_blocking = 1;
-        team.apply_update(crate::multi_agent::ChildUpdate {
-            id: "r1".into(),
-            nickname: "reviewer".into(),
-            role: "reviewer".into(),
-            done: true,
-            ok: true,
-            detail: "done".into(),
-            profile_id: None,
-            capabilities: Vec::new(),
-            contribution: Some(c),
-            started_elapsed_secs: 0,
-        });
-        let screen = render_with_team(team);
-        assert!(screen.contains("1 blocking"), "{screen}");
     }
 
     fn buffer_has_bg(buf: &ratatui::buffer::Buffer, want: ratatui::style::Color) -> bool {

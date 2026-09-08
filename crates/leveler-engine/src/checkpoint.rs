@@ -19,7 +19,7 @@ use std::path::Path;
 use leveler_core::SessionId;
 use leveler_lifecycle::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
-    CheckpointWorkspace, EvidenceLedger, FindingState, GoalCheckpoint,
+    CheckpointWorkspace, EvidenceLedger, GoalCheckpoint,
 };
 use leveler_storage::{
     EngineStores, EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore,
@@ -334,16 +334,14 @@ async fn last_plan(
 }
 
 fn findings_from(ledger: &EvidenceLedger) -> CheckpointFindings {
-    let open: Vec<&leveler_lifecycle::FindingRecord> = ledger
-        .findings
-        .iter()
-        .filter(|f| !matches!(f.state, FindingState::Rejected | FindingState::Verified))
-        .collect();
     CheckpointFindings::Known {
         total: ledger.findings.len() as u32,
-        open: open.len() as u32,
-        open_blocking: ledger.findings.iter().filter(|f| f.open_blocking()).count() as u32,
-        refs: open.iter().take(MAX_REFS).map(|f| f.id.clone()).collect(),
+        refs: ledger
+            .findings
+            .iter()
+            .take(MAX_REFS)
+            .map(|f| f.id.clone())
+            .collect(),
     }
 }
 
@@ -470,7 +468,7 @@ mod tests {
             .unwrap();
     }
 
-    fn finding(id: &str, state: FindingState, blocking: bool) -> FindingRecord {
+    fn finding(id: &str) -> FindingRecord {
         FindingRecord {
             id: id.to_string(),
             source_child: "c1".to_string(),
@@ -479,9 +477,6 @@ mod tests {
             summary: format!("finding {id}"),
             file: None,
             symbol: None,
-            blocking,
-            state,
-            resolution_reason: None,
         }
     }
 
@@ -529,19 +524,15 @@ mod tests {
         assert_eq!(projected.event_cursor, 3);
     }
 
-    /// Truth case D: an open blocking finding stays open and blocking in the
-    /// projection; rejected/verified findings are not "open".
+    /// Truth case D: every recorded finding is counted and referenced. There
+    /// is no "open" or "blocking" subset any more — a finding is information.
     #[tokio::test]
     async fn findings_truth_is_preserved() {
         let events = MemoryEventStore::new();
         let messages = MemoryMessageStore::new();
         let session = SessionId::new("s1");
         let ledger = EvidenceLedger {
-            findings: vec![
-                finding("f-1", FindingState::Acknowledged, true),
-                finding("f-2", FindingState::Rejected, true),
-                finding("f-3", FindingState::Verified, false),
-            ],
+            findings: vec![finding("f-1"), finding("f-2"), finding("f-3")],
             ..Default::default()
         };
         append(
@@ -555,16 +546,12 @@ mod tests {
             .await
             .unwrap();
         match projected.payload.findings {
-            CheckpointFindings::Known {
-                total,
-                open,
-                open_blocking,
-                refs,
-            } => {
+            CheckpointFindings::Known { total, refs } => {
                 assert_eq!(total, 3);
-                assert_eq!(open, 1, "rejected/verified are settled");
-                assert_eq!(open_blocking, 1);
-                assert_eq!(refs, vec!["f-1".to_string()]);
+                assert_eq!(
+                    refs,
+                    vec!["f-1".to_string(), "f-2".to_string(), "f-3".to_string()]
+                );
             }
             other => panic!("expected known findings, got {other:?}"),
         }

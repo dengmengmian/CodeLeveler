@@ -58,9 +58,6 @@ fn project_finding(f: &FindingRecord) -> UiFinding {
         summary: f.summary.clone(),
         file: f.file.clone(),
         symbol: f.symbol.clone(),
-        state: f.state.label().to_string(),
-        resolution_reason: f.resolution_reason.clone(),
-        blocking: f.blocking,
     }
 }
 
@@ -118,24 +115,17 @@ pub async fn child_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_lifecycle::{FindingKind, FindingState};
+    use leveler_lifecycle::{FindingKind, FindingRecord};
 
-    fn rec(id: &str, child: &str, state: FindingState, blocking: bool) -> FindingRecord {
+    fn rec(id: &str, child: &str) -> FindingRecord {
         FindingRecord {
             id: id.into(),
             source_child: child.into(),
             role: "reviewer".into(),
             kind: FindingKind::Correctness,
-            summary: format!("finding {id}"),
+            summary: format!("summary {id}"),
             file: Some("src/auth.rs".into()),
             symbol: None,
-            blocking,
-            state,
-            resolution_reason: if matches!(state, FindingState::Rejected) {
-                Some("covered by the existing guard".into())
-            } else {
-                None
-            },
         }
     }
 
@@ -148,87 +138,40 @@ mod tests {
 
     #[test]
     fn a_child_sees_only_its_own_findings() {
-        let l = ledger(vec![
-            rec("f-1", "a1", FindingState::Accepted, false),
-            rec("f-2", "a2", FindingState::Accepted, false),
-        ]);
-        let got = project_child_contribution(Some(&l), "a1", "explorer", None, Vec::new());
-        assert_eq!(got.findings.len(), 1);
-        assert_eq!(got.findings[0].id, "f-1");
-    }
-
-    #[test]
-    fn no_ledger_is_unmeasured_not_clean() {
-        let got = project_child_contribution(None, "a1", "reviewer", None, Vec::new());
-        assert!(!got.measured);
-        assert!(
-            !got.reviewed_clean(),
-            "an unanswerable question must not read as a clean review"
-        );
-    }
-
-    #[test]
-    fn a_measured_child_with_no_findings_is_a_clean_review() {
-        let l = ledger(vec![rec("f-1", "other", FindingState::Accepted, false)]);
-        let got = project_child_contribution(Some(&l), "r1", "reviewer", None, Vec::new());
+        let l = ledger(vec![rec("f-1", "a1"), rec("f-2", "a2"), rec("f-3", "a1")]);
+        let got = project_child_contribution(Some(&l), "a1", "reviewer", None, Vec::new());
         assert!(got.measured);
-        assert!(got.reviewed_clean());
+        assert_eq!(got.findings.len(), 2);
+        assert_eq!(got.findings[0].id, "f-1");
+        assert_eq!(got.findings[0].summary, "summary f-1");
+        assert_eq!(got.findings[0].file.as_deref(), Some("src/auth.rs"));
     }
 
+    /// "No ledger" and "found nothing" are different answers and must not
+    /// render alike: the first is unmeasured, the second is a clean review.
     #[test]
-    fn lifecycle_states_are_counted_by_what_the_parent_did() {
-        let l = ledger(vec![
-            rec("f-1", "r1", FindingState::Verified, false),
-            rec("f-2", "r1", FindingState::Accepted, false),
-            rec("f-3", "r1", FindingState::Rejected, false),
-            rec("f-4", "r1", FindingState::Acknowledged, false),
-        ]);
-        let got = project_child_contribution(Some(&l), "r1", "reviewer", None, Vec::new());
-        assert_eq!(got.accepted(), 2, "verified counts as accepted");
-        assert_eq!(got.verified(), 1);
-        assert_eq!(got.rejected(), 1);
-        assert_eq!(got.unjudged(), 1, "acknowledged but never judged");
-    }
+    fn an_absent_ledger_is_unmeasured_not_empty() {
+        let none = project_child_contribution(None, "a1", "reviewer", None, Vec::new());
+        assert!(!none.measured);
+        assert!(none.findings.is_empty());
 
-    #[test]
-    fn a_rejection_carries_its_reason() {
-        let l = ledger(vec![rec("f-1", "r1", FindingState::Rejected, false)]);
-        let got = project_child_contribution(Some(&l), "r1", "reviewer", None, Vec::new());
-        assert_eq!(
-            got.findings[0].resolution_reason.as_deref(),
-            Some("covered by the existing guard"),
-            "a rejection without a reason is not a judgement"
-        );
-    }
-
-    #[test]
-    fn the_capability_contract_travels_with_the_detail() {
-        let l = ledger(Vec::new());
-        let got = project_child_contribution(
-            Some(&l),
-            "r1",
+        let empty = project_child_contribution(
+            Some(&ledger(Vec::new())),
+            "a1",
             "reviewer",
-            Some("reviewer".into()),
-            vec!["code_review".into()],
+            None,
+            Vec::new(),
         );
-        assert_eq!(got.profile_id.as_deref(), Some("reviewer"));
-        assert_eq!(got.capabilities, vec!["code_review"]);
+        assert!(empty.measured);
+        assert!(empty.reviewed_clean());
     }
 
     #[test]
-    fn the_findings_list_is_bounded() {
-        let many: Vec<_> = (0..CONTRIBUTION_FINDINGS_MAX + 50)
-            .map(|i| rec(&format!("f-{i}"), "r1", FindingState::Accepted, false))
+    fn the_returned_list_is_bounded() {
+        let many: Vec<FindingRecord> = (0..(CONTRIBUTION_FINDINGS_MAX + 10))
+            .map(|i| rec(&format!("f-{i}"), "a1"))
             .collect();
-        let got =
-            project_child_contribution(Some(&ledger(many)), "r1", "reviewer", None, Vec::new());
+        let got = project_child_contribution(Some(&ledger(many)), "a1", "reviewer", None, Vec::new());
         assert_eq!(got.findings.len(), CONTRIBUTION_FINDINGS_MAX);
-    }
-
-    #[test]
-    fn blocking_is_preserved_so_the_inspector_can_mark_it() {
-        let l = ledger(vec![rec("f-1", "r1", FindingState::Acknowledged, true)]);
-        let got = project_child_contribution(Some(&l), "r1", "reviewer", None, Vec::new());
-        assert!(got.findings[0].blocking);
     }
 }

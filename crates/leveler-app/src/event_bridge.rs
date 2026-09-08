@@ -100,13 +100,7 @@ fn project_contribution(c: &leveler_lifecycle::ChildResultProjection) -> ChildCo
         profile_id: c.profile_id.clone(),
         profile_role: c.profile_role.clone(),
         capabilities: c.capabilities.clone(),
-        source: c.source.as_ref().map(|s| s.label().to_string()),
         findings_total: c.findings_total,
-        findings_acknowledged: c.findings_acknowledged,
-        findings_accepted: c.findings_accepted,
-        findings_verified: c.findings_verified,
-        findings_rejected: c.findings_rejected,
-        findings_open_blocking: c.findings_open_blocking,
     }
 }
 

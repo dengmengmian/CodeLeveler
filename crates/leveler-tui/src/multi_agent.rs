@@ -37,35 +37,10 @@ pub enum Contribution {
     /// zero findings from a child that was cut off certifies nothing — it only
     /// says the review never got there.
     Incomplete { reported: u32 },
-    /// It reported, and this is what became of it.
-    Reported {
-        total: u32,
-        accepted: u32,
-        verified: u32,
-        rejected: u32,
-        open_blocking: u32,
-    },
-}
-
-impl Contribution {
-    /// Did the parent act on anything? A rejection counts — it looked and
-    /// decided. A finding nobody judged does not.
-    pub fn engaged(&self) -> bool {
-        matches!(
-            self,
-            Contribution::Reported {
-                accepted, rejected, ..
-            } if *accepted > 0 || *rejected > 0
-        )
-    }
-
-    /// Findings that still gate a verified closure.
-    pub fn open_blocking(&self) -> u32 {
-        match self {
-            Contribution::Reported { open_blocking, .. } => *open_blocking,
-            _ => 0,
-        }
-    }
+    /// It reported this many findings. What the parent made of them is in
+    /// the transcript, in the parent's own words — the runtime no longer
+    /// tracks a per-finding verdict, so neither does this.
+    Reported { total: u32 },
 }
 
 /// One child, as the user should understand it.
@@ -161,16 +136,6 @@ impl TaskTeamView {
             .filter(|c| matches!(c.status, ChildStatus::Running | ChildStatus::Waiting))
     }
 
-    /// Findings across the team that still gate a verified closure. Surfaced
-    /// at task level because a block discovered at the end is a block the user
-    /// should have seen coming.
-    pub fn open_blocking(&self) -> u32 {
-        self.children
-            .iter()
-            .map(|c| c.contribution.open_blocking())
-            .sum()
-    }
-
     /// Apply one `SubAgentUpdated`. Upserts by id so a child transitions in
     /// place rather than appearing twice.
     /// Re-derive the terminal stamp after any child-state change.
@@ -200,7 +165,7 @@ impl TaskTeamView {
         if self.children.is_empty() {
             return false;
         }
-        if self.active().next().is_some() || self.open_blocking() > 0 {
+        if self.active().next().is_some() {
             return true;
         }
         match self.settled_at_elapsed {
@@ -330,10 +295,6 @@ fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
     }
     Contribution::Reported {
         total: c.findings_total,
-        accepted: c.findings_accepted,
-        verified: c.findings_verified,
-        rejected: c.findings_rejected,
-        open_blocking: c.findings_open_blocking,
     }
 }
 
@@ -426,19 +387,13 @@ mod tests {
         assert!(row.contains("未完成"), "{row}");
     }
 
-    fn contribution(total: u32, accepted: u32, verified: u32, rejected: u32) -> ChildContribution {
+    fn contribution(total: u32) -> ChildContribution {
         ChildContribution {
             role: "reviewer".into(),
             profile_id: Some("reviewer".into()),
             profile_role: Some("reviewer".into()),
             capabilities: vec!["code_review".into()],
-            source: Some("independent_reviewer".into()),
             findings_total: total,
-            findings_acknowledged: total,
-            findings_accepted: accepted,
-            findings_verified: verified,
-            findings_rejected: rejected,
-            findings_open_blocking: 0,
         }
     }
 
@@ -501,7 +456,7 @@ mod tests {
     fn a_child_transitions_in_place_rather_than_appearing_twice() {
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
-        finished(&mut team, "a1", true, Some(contribution(2, 1, 1, 0)));
+        finished(&mut team, "a1", true, Some(contribution(2)));
         assert_eq!(team.children.len(), 1);
         assert_eq!(team.children[0].status, ChildStatus::Completed);
     }
@@ -515,7 +470,7 @@ mod tests {
             "explorer",
             "analyzing repository structure",
         );
-        finished(&mut team, "a1", true, Some(contribution(1, 1, 0, 0)));
+        finished(&mut team, "a1", true, Some(contribution(1)));
         assert_eq!(
             team.children[0].purpose, "analyzing repository structure",
             "the finish summary is not the purpose"
@@ -523,30 +478,21 @@ mod tests {
     }
 
     #[test]
-    fn explorer_contribution_reports_what_the_parent_accepted() {
+    fn a_reporting_child_carries_its_finding_count() {
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
-        finished(&mut team, "a1", true, Some(contribution(7, 5, 3, 1)));
-        match &team.children[0].contribution {
-            Contribution::Reported {
-                total,
-                accepted,
-                verified,
-                rejected,
-                ..
-            } => {
-                assert_eq!((*total, *accepted, *verified, *rejected), (7, 5, 3, 1));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        assert!(team.children[0].contribution.engaged());
+        finished(&mut team, "a1", true, Some(contribution(7)));
+        assert_eq!(
+            team.children[0].contribution,
+            Contribution::Reported { total: 7 }
+        );
     }
 
     #[test]
     fn a_reviewer_that_found_nothing_is_a_result_not_an_empty_state() {
         let mut team = TaskTeamView::default();
         started(&mut team, "r1", "reviewer", "review the diff");
-        finished(&mut team, "r1", true, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "r1", true, Some(contribution(0)));
         assert_eq!(team.children[0].contribution, Contribution::NothingToFlag);
         assert!(!team.children[0].contribution_unknown());
     }
@@ -569,30 +515,8 @@ mod tests {
     fn a_failed_child_is_failed_even_with_a_projection() {
         let mut team = TaskTeamView::default();
         started(&mut team, "w1", "worker", "implement");
-        finished(&mut team, "w1", false, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "w1", false, Some(contribution(0)));
         assert_eq!(team.children[0].status, ChildStatus::Failed);
-    }
-
-    #[test]
-    fn findings_nobody_judged_are_not_engagement() {
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "r1", true, Some(contribution(3, 0, 0, 0)));
-        assert!(
-            !team.children[0].contribution.engaged(),
-            "reported but unjudged is noise, not contribution"
-        );
-    }
-
-    #[test]
-    fn a_rejection_counts_as_engagement() {
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "r1", true, Some(contribution(2, 0, 0, 2)));
-        assert!(
-            team.children[0].contribution.engaged(),
-            "the parent read it and decided"
-        );
     }
 
     #[test]
@@ -615,16 +539,6 @@ mod tests {
             started_elapsed_secs: 0,
         });
         assert!(!team2.children[0].is_read_only());
-    }
-
-    #[test]
-    fn open_blocking_findings_surface_at_team_level() {
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        let mut c = contribution(2, 1, 0, 0);
-        c.findings_open_blocking = 1;
-        finished(&mut team, "r1", true, Some(c));
-        assert_eq!(team.open_blocking(), 1);
     }
 
     #[test]
@@ -651,7 +565,7 @@ mod tests {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "r1", "reviewer", "review the diff");
-        finished(&mut team, "r1", true, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "r1", true, Some(contribution(0)));
         let line = contribution_line(&team.children[0], t).expect("a result line");
         assert!(line.contains("nothing to flag"), "{line}");
         assert!(!line.contains('0'), "zero must not be the headline: {line}");
@@ -673,21 +587,10 @@ mod tests {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
-        finished(&mut team, "a1", true, Some(contribution(7, 5, 3, 0)));
+        finished(&mut team, "a1", true, Some(contribution(7)));
         let line = contribution_line(&team.children[0], t).expect("a result line");
         assert!(line.contains("5 accepted"), "{line}");
         assert!(line.contains("3 verified"), "{line}");
-    }
-
-    #[test]
-    fn unjudged_findings_are_not_dressed_up_as_contribution() {
-        let t = crate::i18n::Locale::En.text();
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "r1", true, Some(contribution(3, 0, 0, 0)));
-        let line = contribution_line(&team.children[0], t).expect("a result line");
-        assert!(line.contains("none judged"), "{line}");
-        assert!(!line.contains("accepted"), "{line}");
     }
 
     #[test]
@@ -725,16 +628,13 @@ mod tests {
 
     use leveler_client_protocol::{UiChildContribution, UiFinding};
 
-    fn finding(id: &str, state: &str, blocking: bool, reason: Option<&str>) -> UiFinding {
+    fn finding(id: &str) -> UiFinding {
         UiFinding {
             id: id.into(),
             kind: "correctness".into(),
             summary: format!("summary {id}"),
             file: Some("src/auth.rs".into()),
             symbol: None,
-            state: state.into(),
-            resolution_reason: reason.map(|r| r.into()),
-            blocking,
         }
     }
 
@@ -768,8 +668,8 @@ mod tests {
         team.apply_detail(detail(
             true,
             vec![
-                finding("f-1", "accepted", false, None),
-                finding("f-2", "verified", false, None),
+                finding("f-1"),
+                finding("f-2"),
             ],
         ));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
@@ -806,33 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_finding_carries_the_reason_it_was_declined() {
-        let t = crate::i18n::Locale::En.text();
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        team.apply_detail(detail(
-            true,
-            vec![finding(
-                "f-1",
-                "rejected",
-                false,
-                Some("covered by the existing guard"),
-            )],
-        ));
-        let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("covered by the existing guard"), "{joined}");
-        assert!(
-            joined.contains("0 accepted · 0 verified · 1 rejected"),
-            "{joined}"
-        );
-    }
-
-    #[test]
     fn an_unmeasured_detail_says_so_rather_than_listing_nothing() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
@@ -846,45 +719,6 @@ mod tests {
             .join("\n");
         assert!(joined.contains("not measured"), "{joined}");
         assert!(!joined.contains("nothing to flag"), "{joined}");
-    }
-
-    #[test]
-    fn an_open_blocking_finding_is_marked_but_a_resolved_one_is_not() {
-        let t = crate::i18n::Locale::En.text();
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        team.apply_detail(detail(
-            true,
-            vec![
-                finding("f-1", "acknowledged", true, None),
-                finding("f-2", "verified", true, None),
-            ],
-        ));
-        let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let marked: Vec<_> = rows.iter().filter(|r| r.blocking).collect();
-        assert_eq!(marked.len(), 1, "only the still-open one gates closure");
-        assert!(marked[0].text.contains("[acknowledged]"), "{:?}", marked[0]);
-    }
-
-    #[test]
-    fn unjudged_findings_are_called_out_separately() {
-        let t = crate::i18n::Locale::En.text();
-        let mut team = TaskTeamView::default();
-        started(&mut team, "r1", "reviewer", "review");
-        team.apply_detail(detail(
-            true,
-            vec![
-                finding("f-1", "acknowledged", false, None),
-                finding("f-2", "accepted", false, None),
-            ],
-        ));
-        let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("1 not judged"), "{joined}");
     }
 
     #[test]
@@ -955,7 +789,7 @@ mod tests {
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
         started(&mut team, "w1", "worker", "implement");
-        finished(&mut team, "a1", true, Some(contribution(7, 5, 3, 0)));
+        finished(&mut team, "a1", true, Some(contribution(7)));
         let lines = team_lines(&team, t);
         assert_eq!(lines[0].glyph, "✓");
         assert!(lines[0].detail.contains("5 accepted"), "{:?}", lines[0]);
@@ -967,7 +801,7 @@ mod tests {
         let mut team = TaskTeamView::default();
         started(&mut team, "w1", "worker", "implement");
         started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "r1", true, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "r1", true, Some(contribution(0)));
         let lines = team_lines(&team, t);
         let reviewer = lines
             .iter()
@@ -993,22 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn the_title_leads_with_a_block_when_one_exists() {
-        let t = crate::i18n::Locale::En.text();
-        let mut team = TaskTeamView::default();
-        started(&mut team, "w1", "worker", "implement");
-        started(&mut team, "r1", "reviewer", "review");
-        let mut c = contribution(2, 1, 0, 0);
-        c.findings_open_blocking = 1;
-        finished(&mut team, "r1", true, Some(c));
-        finished(&mut team, "w1", true, Some(contribution(0, 0, 0, 0)));
-        assert!(
-            team_panel_title(&team, t).contains("1 blocking"),
-            "a block found at the end is a block the user should have seen coming"
-        );
-    }
-
-    #[test]
     fn the_title_never_leads_with_a_head_count() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
@@ -1027,8 +845,8 @@ mod tests {
         let mut team = TaskTeamView::default();
         started(&mut team, "w1", "worker", "implement");
         started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "w1", true, Some(contribution(0, 0, 0, 0)));
-        finished(&mut team, "r1", false, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "w1", true, Some(contribution(0)));
+        finished(&mut team, "r1", false, Some(contribution(0)));
         let title = team_panel_title(&team, t);
         assert!(
             !title.contains("done"),
@@ -1045,7 +863,7 @@ mod tests {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "r1", "reviewer", "review the diff");
-        finished(&mut team, "r1", false, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "r1", false, Some(contribution(0)));
         assert_ne!(
             team.children[0].contribution,
             Contribution::NothingToFlag,
@@ -1063,7 +881,7 @@ mod tests {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "r1", "reviewer", "review");
-        finished(&mut team, "r1", true, Some(contribution(0, 0, 0, 0)));
+        finished(&mut team, "r1", true, Some(contribution(0)));
         let line = contribution_line(&team.children[0], t).unwrap_or_default();
         assert!(line.contains("nothing to flag"), "{line}");
     }
@@ -1073,7 +891,7 @@ mod tests {
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
         started(&mut team, "w1", "worker", "implement");
-        finished(&mut team, "a1", true, Some(contribution(1, 1, 0, 0)));
+        finished(&mut team, "a1", true, Some(contribution(1)));
         let active: Vec<_> = team.active().map(|c| c.id.clone()).collect();
         assert_eq!(active, vec!["w1"]);
     }
@@ -1093,29 +911,10 @@ pub fn contribution_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> Opti
             t.child_contribution_incomplete
                 .replace("{n}", &reported.to_string()),
         ),
-        Contribution::Reported {
-            total,
-            accepted,
-            verified,
-            rejected,
-            ..
-        } => {
-            // Lead with what the parent did, not with volume. A finding nobody
-            // judged is the one number that does not belong in front.
-            let judged = accepted + rejected;
-            if judged == 0 {
-                return Some(
-                    t.child_contribution_unjudged
-                        .replace("{n}", &total.to_string()),
-                );
-            }
-            Some(
-                t.child_contribution_reported
-                    .replace("{n}", &total.to_string())
-                    .replace("{accepted}", &accepted.to_string())
-                    .replace("{verified}", &verified.to_string()),
-            )
-        }
+        Contribution::Reported { total } => Some(
+            t.child_contribution_reported
+                .replace("{n}", &total.to_string()),
+        ),
     }
 }
 
@@ -1147,26 +946,10 @@ pub fn contribution_line_for_block(
             t.child_contribution_incomplete
                 .replace("{n}", &reported.to_string()),
         ),
-        Contribution::Reported {
-            total,
-            accepted,
-            verified,
-            rejected,
-            ..
-        } => {
-            if accepted + rejected == 0 {
-                return Some(
-                    t.child_contribution_unjudged
-                        .replace("{n}", &total.to_string()),
-                );
-            }
-            Some(
-                t.child_contribution_reported
-                    .replace("{n}", &total.to_string())
-                    .replace("{accepted}", &accepted.to_string())
-                    .replace("{verified}", &verified.to_string()),
-            )
-        }
+        Contribution::Reported { total } => Some(
+            t.child_contribution_reported
+                .replace("{n}", &total.to_string()),
+        ),
     }
 }
 
@@ -1174,8 +957,6 @@ pub fn contribution_line_for_block(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorRow {
     pub text: String,
-    /// Findings that still gate closure are marked so the eye finds them.
-    pub blocking: bool,
 }
 
 /// Inspector body for one child.
@@ -1189,7 +970,6 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
 
     rows.push(InspectorRow {
         text: format!("{}: {}", t.inspector_purpose, running_line(view, t)),
-        blocking: false,
     });
     if let Some(profile) = detail.profile_id.as_deref() {
         let access = if view.is_read_only() {
@@ -1199,7 +979,6 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
         };
         rows.push(InspectorRow {
             text: format!("{}: {profile} · {access}", t.inspector_profile),
-            blocking: false,
         });
     }
 
@@ -1208,7 +987,6 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
         // which would read as "found nothing".
         rows.push(InspectorRow {
             text: t.child_contribution_unmeasured.to_string(),
-            blocking: false,
         });
         return Some(rows);
     }
@@ -1217,7 +995,6 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
         // A clean review is a result. It gets a sentence, not blank space.
         rows.push(InspectorRow {
             text: t.child_contribution_clean.to_string(),
-            blocking: false,
         });
         return Some(rows);
     }
@@ -1233,33 +1010,15 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
             text.push_str(" — ");
         }
         text.push_str(&f.summary);
-        text.push_str(&format!(" [{}]", f.state));
-        // A rejection is a judgement, and a judgement without its reason is
-        // indistinguishable from being ignored.
-        if let Some(reason) = f.resolution_reason.as_deref() {
-            text.push_str(&format!(" · {reason}"));
-        }
-        rows.push(InspectorRow {
-            text,
-            blocking: f.blocking && f.state != "verified" && f.state != "rejected",
-        });
+        text.push_str(&format!(" [{}]", f.kind));
+        rows.push(InspectorRow { text });
     }
 
     rows.push(InspectorRow {
         text: t
             .inspector_summary
-            .replace("{accepted}", &detail.accepted().to_string())
-            .replace("{verified}", &detail.verified().to_string())
-            .replace("{rejected}", &detail.rejected().to_string()),
-        blocking: false,
+            .replace("{n}", &detail.findings.len().to_string()),
     });
-    let unjudged = detail.unjudged();
-    if unjudged > 0 {
-        rows.push(InspectorRow {
-            text: t.inspector_unjudged.replace("{n}", &unjudged.to_string()),
-            blocking: false,
-        });
-    }
     Some(rows)
 }
 
@@ -1466,10 +1225,6 @@ pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine>
 /// them there are — "3 agents" is the count the product deliberately does not
 /// lead with.
 pub fn team_panel_title(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
-    let blocking = team.open_blocking();
-    if blocking > 0 {
-        return t.team_panel_blocking.replace("{n}", &blocking.to_string());
-    }
     if team.active().next().is_some() {
         return t.team_panel_working.to_string();
     }

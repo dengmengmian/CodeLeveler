@@ -157,8 +157,6 @@ pub(crate) struct RuntimePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
     pub serial_tools: bool,
-    /// `report_finding(blocking=true)` is honoured. Only the Reviewer.
-    pub may_report_blocking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,10 +197,6 @@ impl ChildProfile {
     /// Spawn admission requires a non-empty exclusive `files` scope.
     pub fn requires_scope(&self) -> bool {
         self.workspace_policy.requires_explicit_scope
-    }
-
-    pub fn may_report_blocking(&self) -> bool {
-        self.runtime_policy.may_report_blocking
     }
 
     pub fn max_rounds(&self) -> Option<u32> {
@@ -267,7 +261,6 @@ impl ChildProfile {
             runtime_policy: RuntimePolicy {
                 max_rounds: None,
                 serial_tools: false,
-                may_report_blocking: false,
             },
             budget_policy: BudgetPolicy {
                 inherits_residual: true,
@@ -301,7 +294,6 @@ impl ChildProfile {
             runtime_policy: RuntimePolicy {
                 max_rounds: None,
                 serial_tools: false,
-                may_report_blocking: false,
             },
             budget_policy: BudgetPolicy {
                 inherits_residual: true,
@@ -335,7 +327,6 @@ impl ChildProfile {
             runtime_policy: RuntimePolicy {
                 max_rounds: Some(20),
                 serial_tools: false,
-                may_report_blocking: true,
             },
             budget_policy: BudgetPolicy {
                 inherits_residual: true,
@@ -373,7 +364,6 @@ impl ChildProfile {
             runtime_policy: RuntimePolicy {
                 max_rounds: None,
                 serial_tools: true,
-                may_report_blocking: false,
             },
             budget_policy: BudgetPolicy {
                 inherits_residual: true,
@@ -464,9 +454,6 @@ impl ChildProfile {
         }
         if self.role == AgentRole::Worker && !self.workspace_policy.requires_explicit_scope {
             return Err("worker profile must require an explicit file scope".into());
-        }
-        if self.role == AgentRole::Reviewer && !self.runtime_policy.may_report_blocking {
-            return Err("reviewer profile must be allowed to raise blocking findings".into());
         }
         if read_only && self.workspace_policy.requires_explicit_scope {
             return Err(format!(
@@ -593,7 +580,6 @@ mod tests {
         assert_eq!(p.role, AgentRole::Default);
         assert!(!p.read_only());
         assert!(!p.requires_scope());
-        assert!(!p.may_report_blocking());
         assert_eq!(p.max_rounds(), None);
         assert!(!p.serial_tools());
         assert_eq!(p.tool_policy.access, ToolAccess::Inherit);
@@ -610,7 +596,6 @@ mod tests {
         assert_eq!(p.id, "explorer");
         assert!(p.read_only());
         assert!(!p.requires_scope());
-        assert!(!p.may_report_blocking());
         assert_eq!(p.tool_policy.access, ToolAccess::ReadSearch);
         assert!(p.output_contract.findings);
         assert!(!p.output_contract.changed_files);
@@ -622,7 +607,6 @@ mod tests {
         let p = ChildProfile::reviewer();
         assert_eq!(p.id, "reviewer");
         assert!(p.read_only());
-        assert!(p.may_report_blocking());
         assert_eq!(p.max_rounds(), Some(20));
         assert_eq!(p.tool_policy.access, ToolAccess::ReadTest);
         assert!(p.output_contract.findings);
@@ -638,7 +622,6 @@ mod tests {
         assert!(!p.read_only());
         assert!(p.requires_scope());
         assert!(p.serial_tools());
-        assert!(!p.may_report_blocking());
         assert_eq!(p.tool_policy.access, ToolAccess::WriteScoped);
         assert_eq!(p.workspace_policy.mode, WorkspaceMode::ControlledMutation);
         assert!(p.output_contract.changed_files);
@@ -818,16 +801,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_the_reviewer_may_raise_blocking_findings() {
-        for role in [AgentRole::Default, AgentRole::Explorer, AgentRole::Worker] {
-            assert!(
-                !ChildProfile::resolve(role).may_report_blocking(),
-                "{role:?}"
-            );
-        }
-        assert!(ChildProfile::resolve(AgentRole::Reviewer).may_report_blocking());
-    }
 
     #[test]
     fn apply_to_registry_strips_writes_from_read_only_profiles() {

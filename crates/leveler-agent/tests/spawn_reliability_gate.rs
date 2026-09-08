@@ -584,10 +584,6 @@ async fn a_settled_child_reports_a_contribution_projection() {
         "explorer capabilities must appear on the projection: {:?}",
         projection.capabilities
     );
-    assert!(
-        !projection.contributed(),
-        "this child reported nothing, and the projection must say so rather than flatter it"
-    );
 }
 
 // ── MA-RT-4: spawn persistence (durable-before-execute) ──────────────────────

@@ -1700,7 +1700,7 @@ impl Executor {
                  Never expand into a whole-repository survey and never re-run builds or test \
                  suites — the change is judged from the code. Report EACH defect with one \
                  report_finding call the moment you confirm it (kind=correctness/risk, naming \
-                 the file), setting blocking=true only for a defect that must be fixed before \
+                 the file), reserving `correctness` for a defect that must be fixed before \
                  the change can ship. Your round budget is small and fixed: once every part of \
                  the change is judged, end immediately with a short final verdict — the \
                  defects found, or an explicit statement that nothing is blocking. Do not \

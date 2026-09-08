@@ -1285,8 +1285,6 @@ fn sample_recap(unknown_truth: bool) -> leveler_client_protocol::UiGoalRecap {
         .to_string(),
         verification_detail: (!unknown_truth).then(|| "cargo test: 2707 passed".to_string()),
         findings_total: if unknown_truth { None } else { Some(3) },
-        findings_open: if unknown_truth { None } else { Some(1) },
-        findings_blocking: if unknown_truth { None } else { Some(1) },
         known_limitations: vec!["delayed popup 未覆盖".to_string()],
         unresolved_work: Vec::new(),
     }

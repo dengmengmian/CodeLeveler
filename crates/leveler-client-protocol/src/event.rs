@@ -37,9 +37,9 @@ pub enum NotificationLevel {
 /// itself: this crate is the stable wire, so an internal refactor of the
 /// ledger must not change what clients parse.
 ///
-/// Counts are about the PARENT's judgement, not the child's output volume.
-/// `findings_total` is not a success metric; `findings_accepted` and
-/// `findings_verified` are what say the work mattered.
+/// `findings_total` is a count, not a score: it says how much this child
+/// reported, never whether any of it mattered. What the parent did about it
+/// is in the transcript, where the parent said it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChildContribution {
@@ -50,25 +50,10 @@ pub struct ChildContribution {
     pub profile_role: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// Which mechanism produced it: `executor_child`, `independent_reviewer`
-    /// or `self_reported`. `None` on events written before it was stamped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
     pub findings_total: u32,
-    pub findings_acknowledged: u32,
-    pub findings_accepted: u32,
-    pub findings_verified: u32,
-    pub findings_rejected: u32,
-    pub findings_open_blocking: u32,
 }
 
 impl ChildContribution {
-    /// Did the parent act on anything this child reported? A rejection counts
-    /// — the parent looked and decided. A finding nobody judged does not.
-    pub fn engaged(&self) -> bool {
-        self.findings_accepted > 0 || self.findings_rejected > 0
-    }
-
     /// The child ran and reported nothing. A real answer, not an empty state.
     pub fn reported_nothing(&self) -> bool {
         self.findings_total == 0

@@ -290,7 +290,6 @@ impl TurnRunner<'_> {
             self.settle_ghost_children(
                 open_ghosts,
                 "was lost when its previous runtime window ended before it reported",
-                "its runtime window ended before it reported",
                 &turn_id,
                 observer,
             )
@@ -434,14 +433,6 @@ impl TurnRunner<'_> {
                 if !settled_notices.is_empty() {
                     executor = executor.with_restart_settled_children(settled_notices);
                 }
-            } else if let Some(ledger) =
-                last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
-                && let Some(carried) = ledger.carry_forward_findings()
-            {
-                // Fresh epoch: drop mutation/verify evidence (N2) but keep
-                // unsettled review debt so an open blocking finding cannot
-                // vanish between windows.
-                executor = executor.with_seeded_ledger(carried);
             }
             let expanded_budget = self.expanded_context_budget.clone();
             let mut forward = |event: leveler_agent::AgentEvent| {
@@ -640,7 +631,6 @@ impl TurnRunner<'_> {
                     .settle_ghost_children(
                         open,
                         &format!("did not report before the turn ended ({how})"),
-                        &format!("the turn ended ({how}) before it reported"),
                         &turn_id,
                         observer,
                     )
@@ -774,77 +764,36 @@ impl TurnRunner<'_> {
     /// NOT resumed. Mirrors `fold_child_settlement`'s truth rules for a child
     /// that never reported:
     ///
-    /// - a lost Worker is original-goal debt: an open blocking finding is
-    ///   recorded (once — an existing open one is not duplicated), so neither
-    ///   completion gate can pass it off as done;
     /// - findings the child ALREADY durably reported stay adopted, and its
     ///   terminal carries a projection over them (C9: the synthetic finish
     ///   must not contradict durable evidence);
-    /// - debt is persisted BEFORE the terminal: if only one of the two
-    ///   commits, an open child with recorded debt re-reconciles on the next
-    ///   turn, while a terminal without debt would reopen the false-Verified
-    ///   window;
+    /// - the terminal says `ok: false` — the mechanical fact that this child
+    ///   started and never reported. It used to also write a host-authored
+    ///   BLOCKING finding so a completion could be refused over it; a lost
+    ///   child is a fact to report, not a gate to hold;
     /// - the terminal is attributed to the turn the child STARTED in.
     ///
     /// `desc` finishes the sentence "[sub-agent {nickname}] …" on the terminal
-    /// event; `debt_cause` finishes "did not complete scoped work (…)" on the
-    /// Worker debt finding.
+    /// event.
     async fn settle_ghost_children(
         &self,
         open: Vec<crate::log::UnfinishedChild>,
         desc: &str,
-        debt_cause: &str,
         current_turn: &TurnId,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         if open.is_empty() {
             return Ok(());
         }
-        let mut ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
+        let ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
             .await?
             .unwrap_or_default();
-        let mut ledger_dirty = false;
-        for child in &open {
-            let has_open_debt = ledger
-                .findings
-                .iter()
-                .any(|f| f.source_child == child.id && f.open_blocking());
-            if child.role == "worker" && !has_open_debt {
-                ledger.record_parent_finding(
-                    &child.id,
-                    &child.role,
-                    leveler_lifecycle::FindingKind::Observation,
-                    format!(
-                        "Worker {} did not complete scoped work ({debt_cause}). Finish it \
-                         yourself, then reject this finding with a reason, or spawn the \
-                         worker again.",
-                        child.nickname
-                    ),
-                    true,
-                );
-                ledger_dirty = true;
-            }
-        }
-        if ledger_dirty {
-            self.log
-                .append(
-                    Some(current_turn),
-                    EngineEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    },
-                    observer,
-                )
-                .await?;
-        }
         for child in open {
             let projection = leveler_lifecycle::ChildResultProjection::from_findings(
                 &child.id,
                 &child.role,
                 &ledger.findings,
-            )
-            .with_source(leveler_lifecycle::ContributionSource::ExecutorChild {
-                child_id: child.id.clone(),
-            });
+            );
             let preserved = projection.findings_total;
             let summary = if preserved > 0 {
                 format!(
@@ -988,13 +937,13 @@ impl TurnRunner<'_> {
                 summary.insert_str(
                     pos + 1,
                     &format!(
-                        "Structured findings adopted: {} — judge each with resolve_finding.\n",
+                        "Structured findings adopted: {}.\n",
                         adopted.join(", ")
                     ),
                 );
             } else {
                 summary.push_str(&format!(
-                    "\nStructured findings adopted: {} — judge each with resolve_finding.",
+                    "\nStructured findings adopted: {}.",
                     adopted.join(", ")
                 ));
             }
@@ -1032,12 +981,7 @@ impl TurnRunner<'_> {
                                 .map(|l| l.findings.as_slice())
                                 .unwrap_or(&[]),
                         )
-                        .with_profile(profile_id_trace, profile_role_trace, capabilities_trace)
-                        .with_source(
-                            leveler_lifecycle::ContributionSource::IndependentReviewer {
-                                review_id: id.clone(),
-                            },
-                        ),
+                        .with_profile(profile_id_trace, profile_role_trace, capabilities_trace),
                     ),
                 },
                 observer,

@@ -33,20 +33,13 @@ export type CheckpointId = string;
 /** The state of one verification check. */
 export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
 
-/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. Counts are about the PARENT's judgement, not the child's output volume. `findings_total` is not a success metric; `findings_accepted` and `findings_verified` are what say the work mattered. */
+/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. */
 export interface ChildContribution {
   capabilities?: string[];
-  findings_accepted: number;
-  findings_acknowledged: number;
-  findings_open_blocking: number;
-  findings_rejected: number;
   findings_total: number;
-  findings_verified: number;
   profile_id?: string | null;
   profile_role?: string | null;
   role: string;
-  /** Which mechanism produced it: `executor_child`, `independent_reviewer` or `self_reported`. `None` on events written before it was stamped. */
-  source?: string | null;
 }
 
 /** Identifies a pending clarification (ask-user) request. */
@@ -190,17 +183,11 @@ export interface UiEventRelation {
 
 /** One finding, as the inspector shows it. A projection of `leveler_lifecycle::FindingRecord`, not the record itself: this crate is the stable wire, and the ledger must stay free to change. */
 export interface UiFinding {
-  /** Still gates a verified closure. */
-  blocking: boolean;
   file?: string | null;
   /** Parent-ledger id (`f-1`). Stable enough for a user to refer to. */
   id: string;
   /** `relevant_file`, `risk`, `correctness`, … */
   kind: string;
-  /** Why the parent declined it. Present only on a rejection, where it is required — a rejection without a reason is not a judgement. */
-  resolution_reason?: string | null;
-  /** `created` | `acknowledged` | `accepted` | `rejected` | `addressed` | `verified`. */
-  state: string;
   summary: string;
   symbol?: string | null;
 }
@@ -214,8 +201,6 @@ export interface UiGoalRecap {
   created_at: string;
   /** The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback. */
   display_summary: string;
-  findings_blocking?: number | null;
-  findings_open?: number | null;
   /** `None` = UNKNOWN (ledger unreadable) — never render as 0. */
   findings_total?: number | null;
   goal_id: string;

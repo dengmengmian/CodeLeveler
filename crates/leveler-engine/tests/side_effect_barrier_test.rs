@@ -159,7 +159,6 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         permission_rules: leveler_execution::PermissionRuleSet::default(),
         permission_rules_path: None,
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-        grants_state_dir: None,
         steering: None,
         allow_delegation: true,
         independent_review: leveler_engine::IndependentReviewPolicy::Off,

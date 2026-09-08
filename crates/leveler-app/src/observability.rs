@@ -360,18 +360,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
                     }
                     fields.push((
                         "Findings".into(),
-                        format!(
-                            "{} reported · {} accepted · {} rejected · {} verified{}",
-                            c.findings_total,
-                            c.findings_accepted,
-                            c.findings_rejected,
-                            c.findings_verified,
-                            if c.findings_open_blocking > 0 {
-                                format!(" · {} open blocking", c.findings_open_blocking)
-                            } else {
-                                String::new()
-                            }
-                        ),
+                        format!("{} reported", c.findings_total),
                     ));
                 }
                 fields
@@ -872,11 +861,6 @@ mod tests {
                     child_id: "ag1".into(),
                     role: "reviewer".into(),
                     findings_total: 3,
-                    findings_acknowledged: 3,
-                    findings_accepted: 2,
-                    findings_verified: 1,
-                    findings_rejected: 1,
-                    findings_open_blocking: 0,
                     ..Default::default()
                 }),
             },
@@ -929,7 +913,7 @@ mod tests {
             .map(|f| f.value.clone());
         assert_eq!(
             findings_field.as_deref(),
-            Some("3 reported · 2 accepted · 1 rejected · 1 verified"),
+            Some("3 reported"),
             "the child's contribution must be readable from the trace: {:?}",
             loaded.window
         );

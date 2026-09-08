@@ -507,22 +507,6 @@
           "description": "The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback.",
           "type": "string"
         },
-        "findings_blocking": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "findings_open": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
         "findings_total": {
           "description": "`None` = UNKNOWN (ledger unreadable) — never render as 0.",
           "type": [

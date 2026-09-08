@@ -1857,11 +1857,13 @@ async fn persisted_ledger(
     out
 }
 
-/// A reviewer's blocking correctness finding refuses a Verified closure and
-/// survives durably: adopted into the persisted ledger at Acknowledged, with
-/// the refusal staged as a review_stage row — never a silent downgrade.
+/// A reviewer's correctness finding is adopted durably and attributed — and
+/// the model's declared completion stands beside it. The finding used to
+/// carry a `blocking` flag that refused the closure until the parent walked it
+/// through a resolution lifecycle; a reviewer's sentence of English was never
+/// a mechanical fact the runtime could hold a task on.
 #[tokio::test]
-async fn a_blocking_reviewer_finding_is_recorded_at_closure() {
+async fn a_reviewer_finding_is_adopted_without_gating_the_closure() {
     let responses = vec![
         tool_call(
             "c1",
@@ -1908,10 +1910,10 @@ async fn a_blocking_reviewer_finding_is_recorded_at_closure() {
 
     let stages = review_stage_rows(&h.db, &session).await;
     assert!(
-        stages
+        !stages
             .iter()
-            .any(|(required, action, _)| *required && action == "blocking_finding_open"),
-        "the refusal must be staged durably: {stages:?}"
+            .any(|(_, action, _)| action == "blocking_finding_open"),
+        "no stage may refuse a closure over a finding: {stages:?}"
     );
 
     let ledger = persisted_ledger(&h.db, &session)
@@ -1919,17 +1921,15 @@ async fn a_blocking_reviewer_finding_is_recorded_at_closure() {
         .expect("adoption must persist a ledger snapshot");
     assert_eq!(ledger.findings.len(), 1);
     let f = &ledger.findings[0];
-    assert_eq!(f.state, leveler_lifecycle::FindingState::Acknowledged);
     assert_eq!(f.role, "reviewer");
     assert!(f.source_child.starts_with("reviewer-"));
-    assert!(f.blocking);
     assert_eq!(f.summary, "login() accepts any password");
 }
 
-/// A reviewer finding that is NOT blocking is knowledge, not a gate: it is
-/// adopted durably but the verified closure stands.
+/// An observation from a reviewer is knowledge: adopted durably, and the
+/// closure stands.
 #[tokio::test]
-async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
+async fn a_reviewer_observation_does_not_refuse_the_closure() {
     let responses = vec![
         tool_call(
             "c1",
@@ -1971,13 +1971,13 @@ async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
         .await
         .expect("the finding must still be adopted durably");
     assert_eq!(ledger.findings.len(), 1);
-    assert!(!ledger.findings[0].blocking);
+    assert_eq!(ledger.findings[0].summary, "consider rate limiting later");
 }
 
 /// EventLog replay: reloading the last EvidenceLedgerUpdated after a
-/// reviewer adoption returns the same single Acknowledged finding. Resume of
-/// a CompletedUnverified session is refused by the engine (start a new
-/// task); the durable contract is the snapshot, not a second drive.
+/// reviewer adoption returns the same single finding. Resume of a completed
+/// session is refused by the engine (start a new task); the durable contract
+/// is the snapshot, not a second drive.
 #[tokio::test]
 async fn persisted_findings_reload_without_duplication() {
     let responses = vec![
@@ -2019,10 +2019,6 @@ async fn persisted_findings_reload_without_duplication() {
     let second = persisted_ledger(&h.db, &session).await.unwrap();
     assert_eq!(first.findings.len(), 1);
     assert_eq!(first, second, "reload must be identical, not duplicated");
-    assert_eq!(
-        first.findings[0].state,
-        leveler_lifecycle::FindingState::Acknowledged
-    );
 }
 
 // ── Phase 1: contribution trace closure on the independent-review path ──
@@ -2093,19 +2089,11 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
         contribution.findings_total, 1,
         "the adopted finding must be counted: {contribution:?}"
     );
-    assert_eq!(
-        contribution.findings_acknowledged, 1,
-        "adoption lands at Acknowledged, so the parent received it"
-    );
-    assert_eq!(contribution.findings_accepted, 0, "nobody judged it yet");
-    assert_eq!(contribution.findings_open_blocking, 1);
     assert_eq!(contribution.role, "reviewer");
     assert_eq!(
-        contribution.source,
-        Some(leveler_lifecycle::ContributionSource::IndependentReviewer {
-            review_id: contribution.child_id.clone(),
-        }),
-        "the trace must name which mechanism produced the finding"
+        contribution.profile_id.as_deref(),
+        Some("reviewer"),
+        "the trace must name the capability contract that produced it"
     );
 }
 

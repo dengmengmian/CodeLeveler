@@ -3199,9 +3199,6 @@ fn finding_call(id: &str, args: serde_json::Value) -> ContentPart {
     tool_call_part(id, "report_finding", args)
 }
 
-fn resolve_call(id: &str, args: serde_json::Value) -> ContentPart {
-    tool_call_part(id, "resolve_finding", args)
-}
 
 /// The last ledger snapshot the PARENT emitted (adoption is a parent-side,
 /// durable act — receipt must be observable, not implied).
@@ -3216,11 +3213,10 @@ fn last_ledger(events: &[AgentEvent]) -> leveler_lifecycle::EvidenceLedger {
         .expect("adoption must persist a ledger snapshot")
 }
 
-/// 50.A/D: an explorer's typed finding reaches the parent ledger at
-/// Acknowledged, attributed to the child, and the parent-facing tool result
-/// names the adopted id so the model can judge it.
+/// 50.A/D: an explorer's typed finding reaches the parent ledger attributed to
+/// the child, and the parent-facing tool result names the adopted id.
 #[tokio::test]
-async fn an_explorer_finding_is_adopted_by_the_parent_at_acknowledged() {
+async fn an_explorer_finding_is_adopted_by_the_parent() {
     let dir = tmp("finding-adopt", 94);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -3278,13 +3274,11 @@ async fn an_explorer_finding_is_adopted_by_the_parent_at_acknowledged() {
     let ledger = last_ledger(&events);
     assert_eq!(ledger.findings.len(), 1, "one adopted finding");
     let f = &ledger.findings[0];
-    assert_eq!(f.state, leveler_lifecycle::FindingState::Acknowledged);
     // 970e5db: child ids are session-unique UUIDs, not run ordinals.
     assert!(!f.source_child.is_empty() && f.source_child != "agent-1");
     assert_eq!(f.role, "explorer");
     assert_eq!(f.summary, "config loader lives here");
     assert_eq!(f.file.as_deref(), Some("src/config.rs"));
-    assert!(!f.blocking);
 
     let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
     assert!(!is_error);
@@ -3292,68 +3286,6 @@ async fn an_explorer_finding_is_adopted_by_the_parent_at_acknowledged() {
         content.contains(&f.id),
         "the parent-facing result must name the adopted finding id: {content}"
     );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Only the reviewer role may raise blocking findings; an explorer's
-/// blocking=true is recorded, but non-blocking.
-#[tokio::test]
-async fn a_non_reviewer_blocking_flag_is_not_honored() {
-    let dir = tmp("finding-blocking", 95);
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"task": "investigate", "role": "explorer"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![finding_call(
-                    "f1",
-                    serde_json::json!({
-                        "kind": "risk",
-                        "summary": "this feels risky",
-                        "blocking": true
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("Done."),
-            assistant_text("Parent wrap-up."),
-        ],
-        Duration::from_millis(0),
-    ));
-
-    let mut events = Vec::new();
-    Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .run(
-        "delegate",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let ledger = last_ledger(&events);
-    assert_eq!(ledger.findings.len(), 1);
-    assert!(
-        !ledger.findings[0].blocking,
-        "an explorer cannot gate closure with a blocking finding"
-    );
-    assert!(ledger.open_blocking_findings().is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3419,161 +3351,48 @@ async fn a_stopped_child_still_delivers_its_partial_findings() {
         ledger.findings[0].summary,
         "handler registered in router.rs"
     );
-    assert_eq!(
-        ledger.findings[0].state,
-        leveler_lifecycle::FindingState::Acknowledged
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The parent's judgment runs through the audited lifecycle: accept works,
-/// rejecting without a reason is refused, rejecting with one lands and is
-/// durable.
+/// Authority boundary: a finding is information, so an unjudged one — even a
+/// correctness finding from a reviewer-shaped child — cannot refuse the
+/// model's own `update_goal(complete)`. This used to be a hard gate: an open
+/// `blocking` finding made completion impossible until the parent walked it
+/// through a six-state lifecycle.
 #[tokio::test]
-async fn the_parent_resolves_findings_through_the_audited_lifecycle() {
-    let dir = tmp("finding-resolve", 97);
+async fn an_unjudged_finding_does_not_refuse_completion() {
+    let dir = tmp("finding-no-gate", 97);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"task": "investigate", "role": "explorer"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![finding_call(
-                    "f1",
-                    serde_json::json!({"kind": "risk", "summary": "duplicated lock"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("Done."),
-            assistant_with(
-                vec![
-                    resolve_call(
-                        "r1",
-                        serde_json::json!({"id": "f-1", "resolution": "accepted"}),
-                    ),
-                    resolve_call(
-                        "r2",
-                        serde_json::json!({"id": "f-1", "resolution": "rejected"}),
-                    ),
-                    resolve_call(
-                        "r3",
-                        serde_json::json!({
-                            "id": "f-1",
-                            "resolution": "rejected",
-                            "reason": "duplicate of known issue"
-                        }),
-                    ),
-                ],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("Parent wrap-up."),
-        ],
-        Duration::from_millis(0),
-    ));
-
-    let mut events = Vec::new();
-    Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .run(
-        "delegate",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let ok_results: Vec<(String, bool)> = events
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::ToolResult {
-                id, name, is_error, ..
-            } if name == "resolve_finding" => Some((id.clone(), *is_error)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ok_results.len(), 3);
-    assert!(!ok_results[0].1, "accept must succeed");
-    assert!(ok_results[1].1, "reject without a reason must be refused");
-    assert!(!ok_results[2].1, "reject with a reason must succeed");
-
-    let ledger = last_ledger(&events);
-    let f = ledger.finding("f-1").expect("finding survives");
-    assert_eq!(f.state, leveler_lifecycle::FindingState::Rejected);
-    assert_eq!(
-        f.resolution_reason.as_deref(),
-        Some("duplicate of known issue")
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Completion truth: an open blocking finding refuses update_goal(complete);
-/// an explicitly rejected one no longer blocks.
-#[tokio::test]
-async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
-    let dir = tmp("finding-gate", 98);
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // Seed the parent with a reviewer-raised blocking finding, as a resumed
-    // turn would after a harness review.
+    // A seeded ledger carrying an unjudged correctness finding, exactly as a
+    // resumed session that already adopted one would have.
     let mut seeded = leveler_lifecycle::EvidenceLedger::default();
-    let reviewer_rec = {
-        let mut child = leveler_lifecycle::EvidenceLedger::default();
-        let id = child.record_finding(
-            leveler_lifecycle::FindingKind::Correctness,
-            "unlocked shared counter",
-            Some("src/state.rs".into()),
-            None,
-            true,
-        );
-        child.finding(&id).unwrap().clone()
-    };
-    seeded.adopt_finding("reviewer-1", "reviewer", &reviewer_rec);
+    seeded.adopt_finding(
+        "reviewer-1",
+        "reviewer",
+        &leveler_lifecycle::FindingRecord {
+            id: "f-1".into(),
+            source_child: String::new(),
+            role: String::new(),
+            kind: leveler_lifecycle::FindingKind::Correctness,
+            summary: "login() accepts any password".into(),
+            file: Some("src/auth.rs".into()),
+            symbol: None,
+        },
+    );
 
     let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![tool_call_part(
-                    "g1",
-                    "update_goal",
-                    serde_json::json!({"status": "complete", "summary": "done"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![
-                    resolve_call(
-                        "r1",
-                        serde_json::json!({
-                            "id": "f-1",
-                            "resolution": "rejected",
-                            "reason": "code path unreachable in this build"
-                        }),
-                    ),
-                    tool_call_part(
-                        "g2",
-                        "update_goal",
-                        serde_json::json!({"status": "complete", "summary": "done"}),
-                    ),
-                ],
-                FinishReason::ToolCalls,
-            ),
-        ],
+        vec![assistant_with(
+            vec![tool_call_part(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "done"}),
+            )],
+            FinishReason::ToolCalls,
+        )],
         Duration::from_millis(0),
     ));
 
@@ -3583,12 +3402,12 @@ async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
         registry,
         tool_context,
         ModelRef::new("mock", "m"),
-        10,
+        6,
     )
     .with_goal_mode(true)
     .with_seeded_ledger(seeded)
     .run(
-        "finish the task",
+        "finish the work",
         &mut |e| events.push(e),
         &mut NoopSink,
         CancellationToken::new(),
@@ -3596,36 +3415,26 @@ async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
     .await
     .unwrap();
 
-    let goal_results: Vec<bool> = events
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::ToolResult { name, is_error, .. } if name == "update_goal" => {
-                Some(*is_error)
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(goal_results.len(), 2);
-    assert!(
-        goal_results[0],
-        "completion with an open blocking finding must be refused"
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "an unjudged finding is information, not a gate: {outcome:?}"
     );
-    assert!(!goal_results[1], "completion after rejection must pass");
     assert!(
-        events.iter().any(|e| matches!(
+        !events.iter().any(|e| matches!(
             e,
             AgentEvent::GoalIntercepted { kind, .. } if kind == "blocking_finding"
         )),
-        "the interception must be observable"
+        "no interception may name a finding: {events:?}"
     );
-    assert_eq!(outcome.stop_reason, StopReason::Completed);
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A Worker that dies before finishing is original-goal debt: the host
-/// records a blocking finding so the parent cannot silently Verified.
+/// A Worker that dies before finishing is reported as a failed child — the
+/// mechanical fact — and nothing more. The host used to also write a BLOCKING
+/// finding into the parent ledger so completion could be refused over it.
 #[tokio::test]
-async fn an_incomplete_worker_raises_a_blocking_finding() {
+async fn an_incomplete_worker_is_reported_without_a_ledger_gate() {
     let dir = tmp("worker-incomplete-block", 99);
     std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
@@ -3633,8 +3442,7 @@ async fn an_incomplete_worker_raises_a_blocking_finding() {
     let registry = Arc::new(default_registry());
 
     // Only the parent's spawn is scripted: the child's first model call
-    // errors, which is INCOMPLETE_NO_RESULT — and must become a blocking
-    // parent finding.
+    // errors, which is INCOMPLETE_NO_RESULT.
     let runtime = Arc::new(SleepyRuntime::new(
         vec![assistant_with(
             vec![spawn_call(
@@ -3666,15 +3474,20 @@ async fn an_incomplete_worker_raises_a_blocking_finding() {
     )
     .await;
 
-    let ledger = last_ledger(&events);
-    let open = ledger.open_blocking_findings();
-    assert_eq!(open.len(), 1, "an incomplete worker must block: {open:?}");
-    assert_eq!(open[0].role, "worker");
-    assert!(!open[0].source_child.is_empty() && open[0].source_child != "agent-1");
+    let finished = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentFinished { ok, .. } => Some(*ok),
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some(false),
+        "the child that never reported must settle as not-ok: {events:?}"
+    );
     assert!(
-        open[0].summary.contains("did not complete"),
-        "the finding must name the incomplete work: {}",
-        open[0].summary
+        events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::EvidenceLedgerUpdated { .. })),
+        "a lost worker writes no finding: the terminal is the fact"
     );
 
     let started = events.iter().find_map(|e| match e {
@@ -3758,55 +3571,10 @@ async fn structured_findings_without_prose_are_still_a_result() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Explorer incomplete is knowledge loss, not a closure gate.
+/// Replay: a finding adopted in one drive is still exactly one finding when a
+/// fresh executor is seeded from that ledger snapshot.
 #[tokio::test]
-async fn an_incomplete_explorer_does_not_raise_a_blocking_finding() {
-    let dir = tmp("explorer-incomplete-noblock", 100);
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![assistant_with(
-            vec![spawn_call(
-                "s1",
-                serde_json::json!({"task": "investigate", "role": "explorer"}),
-            )],
-            FinishReason::ToolCalls,
-        )],
-        Duration::from_millis(0),
-    ));
-
-    let mut events = Vec::new();
-    let _ = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .run(
-        "delegate",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await;
-
-    assert!(
-        events
-            .iter()
-            .all(|e| !matches!(e, AgentEvent::EvidenceLedgerUpdated { .. }))
-            || last_ledger(&events).open_blocking_findings().is_empty(),
-        "an incomplete explorer must not invent a blocking finding"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Replay: a finding accepted in one drive is still Accepted — and still
-/// exactly one — when a fresh executor is seeded from that ledger snapshot.
-#[tokio::test]
-async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
+async fn adopted_findings_survive_a_seeded_replay_without_duplication() {
     let dir = tmp("finding-replay", 101);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -3829,13 +3597,6 @@ async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
                 FinishReason::ToolCalls,
             ),
             assistant_text("Done."),
-            assistant_with(
-                vec![resolve_call(
-                    "r1",
-                    serde_json::json!({"id": "f-1", "resolution": "accepted"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
             assistant_text("Parent wrap-up."),
         ],
         Duration::from_millis(0),
@@ -3860,10 +3621,7 @@ async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
 
     let snapshot = last_ledger(&events);
     assert_eq!(snapshot.findings.len(), 1);
-    assert_eq!(
-        snapshot.finding("f-1").unwrap().state,
-        leveler_lifecycle::FindingState::Accepted
-    );
+    assert_eq!(snapshot.finding("f-1").unwrap().summary, "duplicated lock");
 
     // "Crash": a fresh executor seeded from the persisted snapshot.
     let runtime2 = Arc::new(SleepyRuntime::new(
@@ -3888,9 +3646,8 @@ async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
     .await
     .unwrap();
 
-    // The seeded ledger is the in-memory starting point; a quiet resume
-    // emits no new snapshot. The contract is: we did not create a second
-    // finding, and the snapshot we would persist is still Accepted.
+    // The seeded ledger is the in-memory starting point; a quiet resume emits
+    // no new snapshot. The contract is: we did not create a second finding.
     let after = events2
         .iter()
         .rev()
@@ -3900,10 +3657,6 @@ async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
         })
         .unwrap_or(snapshot);
     assert_eq!(after.findings.len(), 1, "replay must not duplicate");
-    assert_eq!(
-        after.finding("f-1").unwrap().state,
-        leveler_lifecycle::FindingState::Accepted
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

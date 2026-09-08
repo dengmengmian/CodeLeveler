@@ -211,25 +211,10 @@ fn goal_recap_lines(
         _ => t.goal_recap_unmeasured.to_string(),
     };
     section(t.goal_recap_verification, &verification, out);
-    let findings = match (
-        recap.findings_total,
-        recap.findings_open,
-        recap.findings_blocking,
-    ) {
-        (Some(total), open, blocking) => {
-            let mut text = format!("{total}");
-            if let Some(open) = open {
-                text.push_str(&format!(" · {open} {}", t.goal_recap_unresolved));
-            }
-            if let Some(blocking) = blocking
-                && blocking > 0
-            {
-                text.push_str(&format!(" · {blocking} {}", t.goal_recap_open_blocking));
-            }
-            text
-        }
+    let findings = match recap.findings_total {
+        Some(total) => format!("{total}"),
         // UNKNOWN is a statement, not a zero.
-        (None, _, _) => t.goal_recap_findings_unknown.to_string(),
+        None => t.goal_recap_findings_unknown.to_string(),
     };
     section(t.goal_recap_findings, &findings, out);
     if !recap.known_limitations.is_empty() {
@@ -1402,13 +1387,7 @@ mod tests {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
-        a.contribution = crate::multi_agent::Contribution::Reported {
-            total: 3,
-            accepted: 2,
-            verified: 1,
-            rejected: 0,
-            open_blocking: 0,
-        };
+        a.contribution = crate::multi_agent::Contribution::Reported { total: 3 };
         let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
         let text: String = lines
             .iter()

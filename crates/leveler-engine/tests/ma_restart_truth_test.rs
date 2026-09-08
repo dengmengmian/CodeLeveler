@@ -307,13 +307,15 @@ async fn control_the_same_script_reaches_verified_without_a_ghost() {
     assert_eq!(report.outcome, TaskOutcome::Completed);
 }
 
-/// MA_RT_GHOST_WORKER_INCOMPLETE + MA_RT_GHOST_WORKER_BLOCKING_DEBT +
-/// MA_RT_GHOST_PREVENTS_VERIFIED + MA_RT_GHOST_FINISH_TURN_ATTRIBUTION —
-/// a durably started Worker whose activation died must be reconciled into an
-/// incomplete terminal plus open blocking debt, and the parent must not reach
-/// Verified past it.
+/// MA_RT_GHOST_WORKER_INCOMPLETE + MA_RT_GHOST_FINISH_TURN_ATTRIBUTION — a
+/// durably started Worker whose activation died must be reconciled into an
+/// incomplete terminal, attributed to the turn it started in.
+///
+/// It used to also leave an open BLOCKING finding that refused the parent's
+/// completion. Whether a lost child's work still matters is the model's
+/// reading of its own goal; the runtime states the fact and stops there.
 #[tokio::test]
-async fn a_ghost_worker_from_a_dead_window_denies_verified_and_leaves_debt() {
+async fn a_ghost_worker_from_a_dead_window_settles_as_an_incomplete_terminal() {
     let dir = workspace_dir();
     let db = Database::connect_in_memory().await.unwrap();
     let mut script = vec![patch_call(), complete_call("g1")];
@@ -335,10 +337,10 @@ async fn a_ghost_worker_from_a_dead_window_denies_verified_and_leaves_debt() {
         .await
         .unwrap();
 
-    assert_ne!(
+    assert_eq!(
         report.outcome,
         TaskOutcome::Completed,
-        "a lost Worker is unresolved original-goal debt; Verified past it is a false claim"
+        "the model declared the goal complete and nothing mechanical contradicts it"
     );
 
     let events = event_rows(&db, &session).await;
@@ -356,7 +358,7 @@ async fn a_ghost_worker_from_a_dead_window_denies_verified_and_leaves_debt() {
     };
     assert!(!ok, "a child that never reported cannot be recorded as ok");
 
-    let refused = events.iter().any(|(_, e)| {
+    let refused_over_a_finding = events.iter().any(|(_, e)| {
         matches!(
             e,
             EngineEvent::ToolCallFinished {
@@ -368,64 +370,11 @@ async fn a_ghost_worker_from_a_dead_window_denies_verified_and_leaves_debt() {
         )
     });
     assert!(
-        refused,
-        "the completion attempt must be durably refused over the blocking debt"
-    );
-
-    let ledger = last_ledger(&events).expect("reconciliation must persist the debt ledger");
-    let debt: Vec<_> = ledger
-        .findings
-        .iter()
-        .filter(|f| f.source_child == "agent-1" && f.open_blocking())
-        .collect();
-    assert_eq!(
-        debt.len(),
-        1,
-        "exactly one open blocking finding must represent the lost Worker's unfinished scope"
+        !refused_over_a_finding,
+        "a lost child is a fact to report, never a gate on the model's own close"
     );
 }
 
-/// Truth must converge, not dead-end: the parent settles the ghost debt with
-/// resolve_finding (it finished the work itself) and Verified is legitimate
-/// again.
-#[tokio::test]
-async fn resolving_the_ghost_debt_restores_verified() {
-    let dir = workspace_dir();
-    let db = Database::connect_in_memory().await.unwrap();
-    let engine = engine_on(
-        &db,
-        dir.path(),
-        vec![
-            patch_call(),
-            tool_call(
-                "r1",
-                "resolve_finding",
-                serde_json::json!({
-                    "id": "f-1",
-                    "resolution": "rejected",
-                    "reason": "the worker was lost in a restart; I completed the parser work myself"
-                }),
-            ),
-            complete_call("g1"),
-            understand_met_required_ac(),
-        ],
-    );
-    let spec = gated_spec(dir.path());
-    let session = engine.create_task(&spec).await.unwrap();
-    seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
-
-    let report = engine
-        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Completed,
-        "settled debt must not keep blocking: the gate is truth, not punishment"
-    );
-}
-
-// ── MA-RT-3: settlement / restart truth ──────────────────────────────────────
 
 async fn append_event(db: &Database, session: &SessionId, turn: Option<&TurnId>, e: EngineEvent) {
     EventLog::new(db, session.clone())
@@ -531,15 +480,6 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
         "first terminal fact wins: reconciliation must not write a second, contradictory \
          terminal for a finished child"
     );
-    if let Some(ledger) = last_ledger(&events) {
-        assert!(
-            !ledger
-                .findings
-                .iter()
-                .any(|f| f.source_child == "agent-1" && f.open_blocking()),
-            "a finished child is not debt"
-        );
-    }
 
     let messages = transcript(
         &leveler_storage::MessageRepository::new(&db)
@@ -645,9 +585,6 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
         summary: "parser drops trailing comments".into(),
         file: None,
         symbol: None,
-        blocking: false,
-        state: leveler_lifecycle::FindingState::Acknowledged,
-        resolution_reason: None,
     });
     append_event(
         &db,
@@ -699,15 +636,6 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
         1,
         "the adopted finding must survive exactly once — neither erased nor duplicated"
     );
-    assert_eq!(
-        ledger
-            .findings
-            .iter()
-            .filter(|f| f.source_child == "agent-1" && f.open_blocking())
-            .count(),
-        1,
-        "the lost Worker's debt joins the preserved finding"
-    );
 
     // Reconcile again (second window): nothing changes.
     let engine2 = engine_on(&db, dir.path(), padded(Vec::new()));
@@ -731,10 +659,10 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
         ledger
             .findings
             .iter()
-            .filter(|f| f.source_child == "agent-1" && f.open_blocking())
+            .filter(|f| f.source_child == "agent-1")
             .count(),
         1,
-        "reconciliation is idempotent: one debt finding per lost Worker"
+        "reconciliation is idempotent: the preserved finding is not re-adopted"
     );
 }
 
@@ -789,10 +717,10 @@ async fn ghost_reconciliation_survives_a_real_database_reopen() {
         ledger
             .findings
             .iter()
-            .filter(|f| f.source_child == "agent-1" && f.open_blocking())
+            .filter(|f| f.source_child == "agent-1")
             .count(),
         1,
-        "the durable record alone must be enough to reconstruct the Worker debt"
+        "the durable record alone must carry what the child reported"
     );
 }
 

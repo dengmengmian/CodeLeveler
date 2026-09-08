@@ -95,7 +95,7 @@ pub enum CheckpointVerification {
     Unmeasured,
 }
 
-/// Findings state at the checkpoint boundary.
+/// Findings recorded at the checkpoint boundary.
 ///
 /// `Unknown` is the default on purpose: "the ledger was unavailable" must
 /// never decay into "zero findings".
@@ -105,12 +105,8 @@ pub enum CheckpointFindings {
     /// The ledger was read; these counts are real (zero included).
     Known {
         total: u32,
-        /// Neither rejected nor verified — still owed a judgment or a fix.
-        open: u32,
-        /// Still blocking a verified closure.
-        open_blocking: u32,
         /// Finding ids (`f-{n}`), references into the authoritative ledger.
-        /// Bounded; counts above stay authoritative when truncated.
+        /// Bounded; `total` stays authoritative when truncated.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         refs: Vec<String>,
     },
@@ -278,17 +274,10 @@ impl GoalCheckpoint {
         if let Some(plan) = &self.plan {
             parts.push(format!("计划 {}/{}", plan.completed, plan.total));
         }
-        if let CheckpointFindings::Known {
-            open,
-            open_blocking,
-            ..
-        } = &self.findings
+        if let CheckpointFindings::Known { total, .. } = &self.findings
+            && *total > 0
         {
-            if *open_blocking > 0 {
-                parts.push(format!("{open_blocking} 个阻塞发现未解决"));
-            } else if *open > 0 {
-                parts.push(format!("{open} 个发现未解决"));
-            }
+            parts.push(format!("{total} 项发现"));
         }
         match &self.verification {
             CheckpointVerification::Passed { .. } => parts.push("验证已通过".to_string()),
@@ -335,13 +324,8 @@ impl GoalCheckpoint {
             }
         }
         match &self.findings {
-            CheckpointFindings::Known {
-                total,
-                open,
-                open_blocking,
-                refs,
-            } => {
-                let mut body = format!("{total} total, {open} open, {open_blocking} blocking");
+            CheckpointFindings::Known { total, refs } => {
+                let mut body = format!("{total} total");
                 if !refs.is_empty() {
                     body.push_str(&format!(" ({})", refs.join(", ")));
                 }
@@ -354,12 +338,9 @@ impl GoalCheckpoint {
         for child in &self.children {
             let status = match (&child.completed, &child.contribution) {
                 (true, Some(c)) if c.findings_total == 0 => "completed, no findings".to_string(),
-                (true, Some(c)) => format!(
-                    "completed, {} findings ({} blocking)",
-                    c.findings_total, c.findings_open_blocking
-                ),
+                (true, Some(c)) => format!("completed, {} findings", c.findings_total),
                 (true, None) => "completed, contribution not measured".to_string(),
-                (false, _) => "INCOMPLETE — produced no accepted result".to_string(),
+                (false, _) => "INCOMPLETE — produced no result".to_string(),
             };
             push_section(&mut out, &format!("Child {}", child.nickname), &status);
         }
@@ -468,8 +449,6 @@ mod tests {
             },
             findings: CheckpointFindings::Known {
                 total: 3,
-                open: 1,
-                open_blocking: 1,
                 refs: vec!["f-1".into(), "f-2".into(), "f-3".into()],
             },
             next_action: Some("inspect the API boundary".into()),
@@ -529,15 +508,13 @@ mod tests {
             }),
             findings: CheckpointFindings::Known {
                 total: 2,
-                open: 2,
-                open_blocking: 0,
                 refs: vec![],
             },
             ..Default::default()
         };
         let line = cp.fallback_display_summary();
         assert!(line.contains("计划 3/5"), "got: {line}");
-        assert!(line.contains("2 个发现未解决"), "got: {line}");
+        assert!(line.contains("2 项发现"), "got: {line}");
         assert!(
             !line.contains("验证"),
             "unmeasured verification must not appear as any verdict: {line}"

@@ -233,9 +233,6 @@ pub(crate) fn resolve_run_in_background(arguments: &serde_json::Value) -> bool {
 /// The tool a CHILD calls to report one typed finding as it is confirmed.
 pub(crate) const REPORT_FINDING_TOOL: &str = "report_finding";
 
-/// The tool the PARENT calls to judge an adopted finding.
-pub(crate) const RESOLVE_FINDING_TOOL: &str = "resolve_finding";
-
 pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: REPORT_FINDING_TOOL.to_string(),
@@ -262,42 +259,9 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
                     "description": "One specific, evidence-backed sentence."
                 },
                 "file": { "type": "string", "description": "The file it concerns, if any." },
-                "symbol": { "type": "string", "description": "The symbol it concerns, if any." },
-                "blocking": {
-                    "type": "boolean",
-                    "description": "Reviewer only: this defect must be resolved before the change can be considered verified."
-                }
+                "symbol": { "type": "string", "description": "The symbol it concerns, if any." }
             },
             "required": ["kind", "summary"]
-        }),
-    }
-}
-
-pub(crate) fn resolve_finding_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: RESOLVE_FINDING_TOOL.to_string(),
-        description: "Judge one finding a sub-agent reported (ids look like \
-            `f-3`). accepted = relevant, act on it; rejected = will not act, \
-            requires `reason`; addressed = you made the fix for an accepted \
-            finding (it is auto-verified once fresh verification passes). A \
-            blocking finding must reach rejected or verified before the goal \
-            can complete."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "The finding id, e.g. f-3." },
-                "resolution": {
-                    "type": "string",
-                    "enum": ["accepted", "rejected", "addressed"],
-                    "description": "Your judgment."
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Required for rejected: why this finding will not be acted on."
-                }
-            },
-            "required": ["id", "resolution"]
         }),
     }
 }
@@ -306,7 +270,7 @@ pub(crate) fn resolve_finding_tool_definition() -> ToolDefinition {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TurnPermissionGrants {
     pub network: bool,
-    /// Drop OS write_root confinement for run_command/shell_command this turn.
+    /// Drop OS write confinement for run_command/shell_command this turn.
     pub unrestricted_fs: bool,
 }
 
@@ -565,7 +529,7 @@ fn permission_granted_message(grants: TurnPermissionGrants) -> String {
         parts.push("网络访问");
     }
     if grants.unrestricted_fs {
-        parts.push("本轮无限制写(命令不再套工作区 write_root)");
+        parts.push("本轮无限制写(命令不再套工作区写沙箱)");
     }
     if parts.is_empty() {
         "已获授权。".to_string()
@@ -675,7 +639,7 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
                 "filesystem": {
                     "type": "string",
                     "enum": ["workspace", "unrestricted"],
-                    "description": "workspace = keep write sandbox (default); unrestricted = no write_root for commands this turn."
+                    "description": "workspace = keep write sandbox (default); unrestricted = no write confinement for commands this turn."
                 },
                 "full_access": {
                     "type": "boolean",
