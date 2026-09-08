@@ -4851,9 +4851,13 @@ async fn goal_intercept_emits_ledger_events() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// TaskContract body is injected on the user-turn path, not the system prefix.
+/// The runtime no longer re-compiles the user's goal into a "## Task contract"
+/// block and injects it back. The user's own words reach the model once, as
+/// the user wrote them: a parser that split prose on `Request:` / `Constraints:`
+/// headers and re-emitted them was the runtime restating semantics it does not
+/// own — and it guessed acceptance commands out of the result.
 #[tokio::test]
-async fn task_contract_is_injected_on_user_turn_not_system() {
+async fn the_goal_text_is_not_reinterpreted_into_a_contract_block() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-contract-inject-{}",
         std::process::id() as u64 * 31 + 51
@@ -4862,7 +4866,6 @@ async fn task_contract_is_injected_on_user_turn_not_system() {
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("ok")]));
-    // Chat path is enough: injection is in drive(), not goal-only.
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
@@ -4881,15 +4884,15 @@ async fn task_contract_is_injected_on_user_turn_not_system() {
         .unwrap();
     let reqs = runtime.recorded_requests();
     assert!(!reqs.is_empty());
-    let system = reqs[0]
+    let all: String = reqs[0]
         .messages
         .iter()
-        .find(|m| m.role == Role::System)
         .map(|m| m.text_content())
-        .unwrap_or_default();
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !system.contains("do not change public API"),
-        "contract body must not enter system prefix: {system}"
+        !all.contains("## Task contract"),
+        "no re-compiled contract block may be injected: {all}"
     );
     let user_joined: String = reqs[0]
         .messages
@@ -4899,8 +4902,8 @@ async fn task_contract_is_injected_on_user_turn_not_system() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        user_joined.contains("Task contract") && user_joined.contains("do not change public API"),
-        "contract injection missing from user path: {user_joined}"
+        user_joined.contains("do not change public API"),
+        "the user's own text still reaches the model verbatim: {user_joined}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -6708,11 +6711,13 @@ impl ModelRuntime for CheckpointProbeRuntime {
     }
 }
 
-/// Six read rounds followed by an answer. The only thing the model sees that
-/// the durable transcript does not hold is the drive-start task contract, so
-/// exactly one `ContextSnapshot` is owed — after round one. The five rounds
-/// that merely appended durable messages are reconstructible from the
-/// transcript and must not each persist a copy of the whole context.
+/// Six read rounds followed by an answer. Every round only appends durable
+/// messages, so the whole run is reconstructible from the transcript and NOT
+/// ONE `ContextSnapshot` is owed. (Until the free-text task contract was
+/// deleted, its drive-start injection made round one diverge.) A snapshot is
+/// the expensive copy of the entire context; it is written when the model
+/// sees something the transcript lacks — a fold, a transient nudge — and
+/// never merely because a round happened.
 #[tokio::test]
 async fn only_a_diverged_context_is_snapshotted() {
     let dir = std::env::temp_dir().join(format!(
@@ -6773,17 +6778,9 @@ async fn only_a_diverged_context_is_snapshotted() {
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     let rounds_with_snapshot: Vec<usize> = snapshots.iter().map(|(r, _)| *r).collect();
-    assert_eq!(
-        rounds_with_snapshot,
-        vec![1],
-        "the task contract diverges the context once at drive start; got {snapshots:#?}"
-    );
     assert!(
-        snapshots[0]
-            .1
-            .iter()
-            .any(|m| m.contains("## Task contract")),
-        "the snapshot must carry what the transcript lacks: {snapshots:#?}"
+        rounds_with_snapshot.is_empty(),
+        "a run that only appended durable messages owes no snapshot; got {snapshots:#?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

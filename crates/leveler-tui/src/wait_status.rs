@@ -456,7 +456,7 @@ mod tests {
                 nickname: "Worker".into(),
                 role: "执行 Agent".into(),
                 profile_id: Some("worker".into()),
-                capabilities: Vec::new(),
+                read_only: false,
                 purpose: "check".into(),
                 status: ChildStatus::Running,
                 contribution: crate::multi_agent::Contribution::Pending,

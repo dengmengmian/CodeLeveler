@@ -44,8 +44,9 @@ pub struct UiChildContribution {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    /// Whether this child held a physically read-only toolset.
+    #[serde(default)]
+    pub read_only: bool,
     /// Findings this child produced, in ledger order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<UiFinding>,

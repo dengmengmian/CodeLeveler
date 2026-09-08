@@ -311,7 +311,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             role,
             task,
             profile_id,
-            capabilities,
+            read_only,
             ..
         } => (
             ObservationClass::Agent,
@@ -326,9 +326,10 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
                 if let Some(pid) = profile_id {
                     fields.push(("Profile".into(), pid.clone()));
                 }
-                if !capabilities.is_empty() {
-                    fields.push(("Capabilities".into(), capabilities.join(", ")));
-                }
+                fields.push((
+                    "Access".into(),
+                    if *read_only { "read-only" } else { "can write" }.into(),
+                ));
                 fields
             },
         ),
@@ -355,13 +356,16 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
                     if let Some(pid) = &c.profile_id {
                         fields.push(("Profile".into(), pid.clone()));
                     }
-                    if !c.capabilities.is_empty() {
-                        fields.push(("Capabilities".into(), c.capabilities.join(", ")));
-                    }
                     fields.push((
-                        "Findings".into(),
-                        format!("{} reported", c.findings_total),
+                        "Access".into(),
+                        if c.read_only {
+                            "read-only"
+                        } else {
+                            "can write"
+                        }
+                        .into(),
                     ));
+                    fields.push(("Findings".into(), format!("{} reported", c.findings_total)));
                 }
                 fields
             },
@@ -845,7 +849,7 @@ mod tests {
                 task: "review patch".into(),
                 profile_id: Some("reviewer".into()),
                 profile_role: Some("reviewer".into()),
-                capabilities: vec!["code_review".into(), "verification".into()],
+                read_only: true,
             },
         )
         .await;
@@ -1102,7 +1106,7 @@ mod tests {
             task: task.into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
         }
     }
 

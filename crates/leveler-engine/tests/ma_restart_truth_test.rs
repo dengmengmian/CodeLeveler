@@ -247,7 +247,7 @@ async fn seed_ghost_child(
             task: "fix the parser module".to_string(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
         },
         &mut |_| {},
     )
@@ -375,7 +375,6 @@ async fn a_ghost_worker_from_a_dead_window_settles_as_an_incomplete_terminal() {
     );
 }
 
-
 async fn append_event(db: &Database, session: &SessionId, turn: Option<&TurnId>, e: EngineEvent) {
     EventLog::new(db, session.clone())
         .append(turn, e, &mut |_| {})
@@ -435,7 +434,7 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
             task: "map the parser".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
         },
     )
     .await;

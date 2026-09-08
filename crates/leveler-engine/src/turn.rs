@@ -333,17 +333,10 @@ impl TurnRunner<'_> {
             TurnInput::Resume(_) => None,
         };
         let exec = async {
-            let restored = {
-                let value = self
-                    .expanded_context_budget
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                (value > 0).then_some(value)
-            };
             let mut executor: Executor = self
                 .factory
                 .build(profile, task_text.as_deref())
                 .await?
-                .with_restored_context_budget(restored)
                 .with_approver(Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
                     events: events.clone(),
@@ -434,11 +427,7 @@ impl TurnRunner<'_> {
                     executor = executor.with_restart_settled_children(settled_notices);
                 }
             }
-            let expanded_budget = self.expanded_context_budget.clone();
             let mut forward = |event: leveler_agent::AgentEvent| {
-                if let leveler_agent::AgentEvent::ContextExpanded { to, .. } = &event {
-                    expanded_budget.fetch_max(*to, std::sync::atomic::Ordering::Relaxed);
-                }
                 events.emit(EngineEvent::from(event));
             };
             let result = match input {
@@ -846,13 +835,9 @@ impl TurnRunner<'_> {
                 token: self.token.clone(),
             }));
         let id = format!("reviewer-{}", leveler_core::RequestId::generate());
-        let (profile_id, profile_role, capabilities) =
-            leveler_agent::child_profile_trace("reviewer");
-        let (profile_id_trace, profile_role_trace, capabilities_trace) = (
-            profile_id.clone(),
-            profile_role.clone(),
-            capabilities.clone(),
-        );
+        let (profile_id, profile_role, read_only) = leveler_agent::child_profile_trace("reviewer");
+        let (profile_id_trace, profile_role_trace, read_only_trace) =
+            (profile_id.clone(), profile_role.clone(), read_only);
         self.log
             .append(
                 None,
@@ -863,7 +848,7 @@ impl TurnRunner<'_> {
                     task: brief.clone(),
                     profile_id: Some(profile_id),
                     profile_role: Some(profile_role),
-                    capabilities,
+                    read_only,
                 },
                 observer,
             )
@@ -936,10 +921,7 @@ impl TurnRunner<'_> {
             if let Some(pos) = summary.find('\n') {
                 summary.insert_str(
                     pos + 1,
-                    &format!(
-                        "Structured findings adopted: {}.\n",
-                        adopted.join(", ")
-                    ),
+                    &format!("Structured findings adopted: {}.\n", adopted.join(", ")),
                 );
             } else {
                 summary.push_str(&format!(
@@ -981,7 +963,11 @@ impl TurnRunner<'_> {
                                 .map(|l| l.findings.as_slice())
                                 .unwrap_or(&[]),
                         )
-                        .with_profile(profile_id_trace, profile_role_trace, capabilities_trace),
+                        .with_profile(
+                            profile_id_trace,
+                            profile_role_trace,
+                            read_only_trace,
+                        ),
                     ),
                 },
                 observer,

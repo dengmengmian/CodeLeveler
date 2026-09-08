@@ -577,12 +577,8 @@ async fn a_settled_child_reports_a_contribution_projection() {
     assert_eq!(projection.profile_id.as_deref(), Some("explorer"));
     assert_eq!(projection.profile_role.as_deref(), Some("explorer"));
     assert!(
-        projection
-            .capabilities
-            .iter()
-            .any(|c| c == "repository_analysis"),
-        "explorer capabilities must appear on the projection: {:?}",
-        projection.capabilities
+        projection.read_only,
+        "an explorer's write bound must appear on the projection"
     );
 }
 

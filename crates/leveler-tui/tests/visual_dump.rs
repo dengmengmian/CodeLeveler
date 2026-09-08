@@ -94,7 +94,7 @@ fn agents_screen_lists_spawned_sub_agents_in_direct_mode() {
             detail: "investigating the parser".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );
@@ -201,7 +201,7 @@ fn visual_inspect() {
             detail: "resolver.go 定义了 4 个 provider adapter".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );

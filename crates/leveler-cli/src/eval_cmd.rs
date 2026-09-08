@@ -299,7 +299,11 @@ pub(crate) async fn cmd_eval(
                 "daily",
                 // Synthetic recovery scenarios join the daily gate; the heavy
                 // real-repo scenarios stay in `release`.
-                &["evals/cases/core", "evals/cases/hard", "evals/cases/scenarios/debugging"],
+                &[
+                    "evals/cases/core",
+                    "evals/cases/hard",
+                    "evals/cases/scenarios/debugging",
+                ],
                 repetitions,
                 json_out,
             )
@@ -316,7 +320,12 @@ pub(crate) async fn cmd_eval(
                 &config_dir,
                 &model_ref,
                 "release",
-                &["evals/cases/smoke", "evals/cases/core", "evals/cases/hard", "evals/cases/scenarios"],
+                &[
+                    "evals/cases/smoke",
+                    "evals/cases/core",
+                    "evals/cases/hard",
+                    "evals/cases/scenarios",
+                ],
                 repetitions,
                 json_out,
             )
@@ -604,13 +613,6 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.repeated_read_guard = Some(false);
             (true, false)
         }
-        // C5-S3: control = static budget (production default OFF); ablated =
-        // the adaptive candidate ON. Note the direction: this knob measures a
-        // CANDIDATE, so "ablated" is the arm with the mechanism enabled.
-        "adaptive_context" => {
-            o.adaptive_context = Some(true);
-            (false, true)
-        }
         "prune_tool_results" => {
             o.prune_tool_results = Some(true);
             (false, true)
@@ -622,7 +624,7 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
              repeated_read_guard, progress_guards, \
-             adaptive_context, prune_tool_results, keep_reasoning"
+             prune_tool_results, keep_reasoning"
         ),
     };
     Ok((o, before, after))
@@ -877,7 +879,6 @@ async fn run_bare_case(
             kind: leveler_engine::ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
             limits: leveler_agent::StepLimits::default(),
-            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: app.layout.repo_root.clone(),
@@ -1709,7 +1710,6 @@ mod ablation_tests {
                 kind: leveler_engine::ExecutionKind::Direct,
                 continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
                 limits: leveler_agent::StepLimits::default(),
-                round_budget: None,
             },
             coding: leveler_engine::CodingTaskSpec {
                 repository: std::path::PathBuf::from("/repo"),

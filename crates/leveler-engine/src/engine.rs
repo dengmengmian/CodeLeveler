@@ -1046,7 +1046,7 @@ impl TaskEngine {
                 log,
                 Some(&self.context_summarizer(cancellation)),
                 objective,
-                u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                u64::from(crate::CHAT_CONTEXT_BUDGET),
             )
             .await?;
         if context.compacted {
@@ -1064,7 +1064,7 @@ impl TaskEngine {
         session_id: &SessionId,
         strict: Option<&str>,
     ) -> Result<crate::RawTranscript, EngineError> {
-        let threshold = u64::from(crate::ContextPolicy::chat_default().initial_budget);
+        let threshold = u64::from(crate::CHAT_CONTEXT_BUDGET);
         let snapshot_ordinal = EventLog::new(self.stores.events.as_ref(), session_id.clone())
             .latest_context_snapshot(None)
             .await?
@@ -1091,7 +1091,7 @@ impl TaskEngine {
         cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
-        let threshold = u64::from(crate::ContextPolicy::chat_default().initial_budget);
+        let threshold = u64::from(crate::CHAT_CONTEXT_BUDGET);
         if leveler_agent::estimate_tokens(&raw.messages) <= threshold {
             return Ok(None);
         }
@@ -1171,9 +1171,7 @@ impl TaskEngine {
         raw: &[leveler_model::Message],
         cancellation: &CancellationToken,
     ) -> Option<String> {
-        if leveler_agent::estimate_tokens(raw)
-            <= u64::from(crate::ContextPolicy::chat_default().initial_budget)
-        {
+        if leveler_agent::estimate_tokens(raw) <= u64::from(crate::CHAT_CONTEXT_BUDGET) {
             return None;
         }
         leveler_agent::summarize_with_model(
@@ -1425,12 +1423,7 @@ impl TaskEngine {
             return Ok(prior);
         }
         let context = raw
-            .assemble(
-                log,
-                None,
-                Some(goal),
-                u64::from(crate::ContextPolicy::chat_default().initial_budget),
-            )
+            .assemble(log, None, Some(goal), u64::from(crate::CHAT_CONTEXT_BUDGET))
             .await?;
         Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
     }

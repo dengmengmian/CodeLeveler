@@ -19,7 +19,7 @@
 //!   redefines it. `runtime` must not reference `workflow`.
 //!
 //! The remaining modules (plan, progress, readiness, ledger, impact, axes,
-//! contract, objective) are Coding/product vocabulary and conceptually sit on
+//! objective) are Coding/product vocabulary and conceptually sit on
 //! the workflow side; they keep their top-level paths until a consumer needs
 //! the split to be physical.
 //!
@@ -48,7 +48,6 @@
 
 mod axes;
 mod checkpoint;
-mod contract;
 mod findings;
 mod impact;
 mod ledger;
@@ -64,7 +63,6 @@ pub use checkpoint::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
 };
-pub use contract::TaskContract;
 pub use findings::{ChildResultProjection, FindingKind, FindingRecord};
 pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord};

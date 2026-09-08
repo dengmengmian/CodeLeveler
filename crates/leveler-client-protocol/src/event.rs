@@ -48,8 +48,11 @@ pub struct ChildContribution {
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    /// Whether this child held a physically read-only toolset. It used to be
+    /// a list of semantic capability labels; what a client needs is the
+    /// structural bound.
+    #[serde(default)]
+    pub read_only: bool,
     pub findings_total: u32,
 }
 
@@ -235,8 +238,9 @@ pub enum RuntimeEvent {
         profile_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_role: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        capabilities: Vec<String>,
+        /// Whether this child holds a physically read-only toolset.
+        #[serde(default)]
+        read_only: bool,
         /// What the parent did with what this child found, once it finished.
         ///
         /// `None` means NOT MEASURED — the runtime produced no projection —

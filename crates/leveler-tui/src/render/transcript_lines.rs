@@ -510,7 +510,10 @@ fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a
         leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION => {
             t.turn_no_automatic_verification
         }
-        // Executor machine tokens + long defaults → short product copy.
+        // Executor machine tokens + long defaults → short product copy. The
+        // "observe thrash" and "continue suppressed" tokens are replay-only:
+        // the semantic watchdogs that wrote them are deleted, and a session
+        // recorded before that must still render as what it said.
         s if s.contains("observe thrash") && s.contains("plan complete") => t.turn_plan_thrash,
         s if s.contains("observe thrash")
             || s.starts_with("no-progress streak")

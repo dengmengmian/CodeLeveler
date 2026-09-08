@@ -3199,7 +3199,6 @@ fn finding_call(id: &str, args: serde_json::Value) -> ContentPart {
     tool_call_part(id, "report_finding", args)
 }
 
-
 /// The last ledger snapshot the PARENT emitted (adoption is a parent-side,
 /// durable act — receipt must be observable, not implied).
 fn last_ledger(events: &[AgentEvent]) -> leveler_lifecycle::EvidenceLedger {

@@ -101,8 +101,9 @@ pub struct ChildResultProjection {
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    /// Whether the child held a physically read-only toolset.
+    #[serde(default)]
+    pub read_only: bool,
     /// Findings in the parent ledger attributed to this child.
     pub findings_total: u32,
 }
@@ -118,7 +119,7 @@ impl ChildResultProjection {
             role: role.to_string(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             findings_total: findings
                 .iter()
                 .filter(|f| f.source_child == child_id)
@@ -132,11 +133,11 @@ impl ChildResultProjection {
         mut self,
         profile_id: impl Into<String>,
         profile_role: impl Into<String>,
-        capabilities: Vec<String>,
+        read_only: bool,
     ) -> Self {
         self.profile_id = Some(profile_id.into());
         self.profile_role = Some(profile_role.into());
-        self.capabilities = capabilities;
+        self.read_only = read_only;
         self
     }
 }
@@ -212,7 +213,7 @@ mod tests {
     #[test]
     fn a_projection_roundtrips_through_json() {
         let p = ChildResultProjection::from_findings("a1", "reviewer", &[rec("f-1", "a1")])
-            .with_profile("reviewer", "reviewer", vec!["code_review".into()]);
+            .with_profile("reviewer", "reviewer", true);
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(
             serde_json::from_str::<ChildResultProjection>(&json).unwrap(),
@@ -224,12 +225,14 @@ mod tests {
     /// must read as "not recorded", never as a validation failure.
     #[test]
     fn a_legacy_projection_without_profile_fields_still_deserializes() {
-        let p: ChildResultProjection = serde_json::from_str(
-            r#"{"child_id":"a1","role":"explorer","findings_total":2}"#,
-        )
-        .unwrap();
+        let p: ChildResultProjection =
+            serde_json::from_str(r#"{"child_id":"a1","role":"explorer","findings_total":2}"#)
+                .unwrap();
         assert_eq!(p.findings_total, 2);
         assert_eq!(p.profile_id, None);
-        assert!(p.capabilities.is_empty());
+        assert!(
+            !p.read_only,
+            "absent means not recorded, and false is the floor"
+        );
     }
 }

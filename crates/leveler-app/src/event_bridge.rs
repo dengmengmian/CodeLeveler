@@ -99,7 +99,7 @@ fn project_contribution(c: &leveler_lifecycle::ChildResultProjection) -> ChildCo
         role: c.role.clone(),
         profile_id: c.profile_id.clone(),
         profile_role: c.profile_role.clone(),
-        capabilities: c.capabilities.clone(),
+        read_only: c.read_only,
         findings_total: c.findings_total,
     }
 }
@@ -509,7 +509,7 @@ impl EventBridge {
                 task,
                 profile_id,
                 profile_role,
-                capabilities,
+                read_only,
             } => {
                 // The capability contract travels with the child so the UI can
                 // state what it was allowed to do rather than implying it.
@@ -523,7 +523,7 @@ impl EventBridge {
                     detail: task,
                     profile_id,
                     profile_role,
-                    capabilities,
+                    read_only,
                     contribution: None,
                 });
             }
@@ -571,10 +571,7 @@ impl EventBridge {
                     detail: summary,
                     profile_id: projected.as_ref().and_then(|c| c.profile_id.clone()),
                     profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
-                    capabilities: projected
-                        .as_ref()
-                        .map(|c| c.capabilities.clone())
-                        .unwrap_or_default(),
+                    read_only: projected.as_ref().is_some_and(|c| c.read_only),
                     contribution: projected,
                 });
             }
@@ -1489,7 +1486,7 @@ mod projection_equivalence {
             summary: "done".into(),
             contribution: Some(
                 leveler_lifecycle::ChildResultProjection::from_findings("a1", "explorer", &[])
-                    .with_profile("explorer", "explorer", vec!["read_file".into()]),
+                    .with_profile("explorer", "explorer", true),
             ),
         });
         let ev = rx.try_recv().expect("one event");
@@ -1540,16 +1537,16 @@ mod projection_equivalence {
             task: "review the diff".into(),
             profile_id: Some("reviewer".into()),
             profile_role: Some("reviewer".into()),
-            capabilities: vec!["code_review".into(), "verification".into()],
+            read_only: true,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated {
                 profile_id,
-                capabilities,
+                read_only,
                 ..
             } => {
                 assert_eq!(profile_id.as_deref(), Some("reviewer"));
-                assert_eq!(capabilities, vec!["code_review", "verification"]);
+                assert!(read_only, "a reviewer's write bound must cross the wire");
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1565,7 +1562,7 @@ mod projection_equivalence {
                 task: "look".into(),
                 profile_id: None,
                 profile_role: None,
-                capabilities: Vec::new(),
+                read_only: false,
             },
             EngineEvent::SubAgentProgress {
                 id: "a1".into(),

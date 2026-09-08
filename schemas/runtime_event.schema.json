@@ -906,12 +906,6 @@
         "type"
       ],
       "properties": {
-        "capabilities": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "contribution": {
           "description": "What the parent did with what this child found, once it finished.\n\n`None` means NOT MEASURED — the runtime produced no projection — and must never be rendered as a zero. A child that reported nothing arrives as `Some` with zero counts, which is a different fact and reads differently to the user.",
           "anyOf": [
@@ -953,6 +947,11 @@
             "string",
             "null"
           ]
+        },
+        "read_only": {
+          "description": "Whether this child holds a physically read-only toolset.",
+          "default": false,
+          "type": "boolean"
         },
         "role": {
           "type": "string"
@@ -1475,12 +1474,6 @@
         "role"
       ],
       "properties": {
-        "capabilities": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "findings_total": {
           "type": "integer",
           "format": "uint32",
@@ -1497,6 +1490,11 @@
             "string",
             "null"
           ]
+        },
+        "read_only": {
+          "description": "Whether this child held a physically read-only toolset. It used to be a list of semantic capability labels; what a client needs is the structural bound.",
+          "default": false,
+          "type": "boolean"
         },
         "role": {
           "type": "string"
@@ -1724,12 +1722,6 @@
         "role"
       ],
       "properties": {
-        "capabilities": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "child_id": {
           "type": "string"
         },
@@ -1749,6 +1741,11 @@
             "string",
             "null"
           ]
+        },
+        "read_only": {
+          "description": "Whether this child held a physically read-only toolset.",
+          "default": false,
+          "type": "boolean"
         },
         "role": {
           "type": "string"

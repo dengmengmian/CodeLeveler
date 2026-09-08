@@ -51,7 +51,8 @@ pub struct ChildAgentView {
     pub role: String,
     /// Built-in capability contract. `None` means the runtime recorded none.
     pub profile_id: Option<String>,
-    pub capabilities: Vec<String>,
+    /// Whether this child holds a physically read-only toolset.
+    pub read_only: bool,
     /// What it was asked to do. Leads the running line: a user watching a
     /// spinner needs the reason, not the state.
     pub purpose: String,
@@ -73,19 +74,20 @@ pub struct ChildAgentView {
 }
 
 impl ChildAgentView {
-    /// True when this child can only be described by its capabilities, not by
-    /// what it produced — the honest state for a failed or unmeasured child.
+    /// True when this child can only be described by its bounds, not by what
+    /// it produced — the honest state for a failed or unmeasured child.
     pub fn contribution_unknown(&self) -> bool {
         matches!(self.contribution, Contribution::NotMeasured)
     }
 
     /// Read-only children can be stated as such rather than implied.
+    ///
+    /// This used to scan a list of semantic capability labels for
+    /// "write"/"edit"/"apply_patch" — none of which a label ever was, so every
+    /// profiled child, Workers included, read as read-only. The runtime now
+    /// sends the bound it enforces.
     pub fn is_read_only(&self) -> bool {
-        !self.capabilities.is_empty()
-            && !self
-                .capabilities
-                .iter()
-                .any(|c| matches!(c.as_str(), "write" | "edit" | "apply_patch" | "mutation"))
+        self.read_only
     }
 }
 
@@ -107,7 +109,7 @@ pub struct ChildUpdate {
     /// The task while running; a short result summary once done.
     pub detail: String,
     pub profile_id: Option<String>,
-    pub capabilities: Vec<String>,
+    pub read_only: bool,
     /// `None` means the runtime produced no projection — not measured.
     pub contribution: Option<ChildContribution>,
     pub started_elapsed_secs: u64,
@@ -188,7 +190,7 @@ impl TaskTeamView {
             ok,
             detail,
             profile_id,
-            capabilities,
+            read_only,
             contribution,
             started_elapsed_secs,
         } = update;
@@ -215,9 +217,7 @@ impl TaskTeamView {
             if profile_id.is_some() {
                 existing.profile_id = profile_id;
             }
-            if !capabilities.is_empty() {
-                existing.capabilities = capabilities;
-            }
+            existing.read_only = read_only;
             self.restamp_settlement(started_elapsed_secs);
             return;
         }
@@ -226,7 +226,7 @@ impl TaskTeamView {
             nickname,
             role,
             profile_id,
-            capabilities,
+            read_only,
             purpose: detail,
             status,
             contribution,
@@ -314,7 +314,7 @@ mod tests {
                     "审查 Agent".into()
                 },
                 profile_id: None,
-                capabilities: Vec::new(),
+                read_only: false,
                 purpose: "look around".into(),
                 status: *st,
                 contribution: Contribution::Pending,
@@ -392,7 +392,7 @@ mod tests {
             role: "reviewer".into(),
             profile_id: Some("reviewer".into()),
             profile_role: Some("reviewer".into()),
-            capabilities: vec!["code_review".into()],
+            read_only: true,
             findings_total: total,
         }
     }
@@ -406,7 +406,7 @@ mod tests {
             ok: false,
             detail: purpose.into(),
             profile_id: Some(role.into()),
-            capabilities: vec!["read_file".into()],
+            read_only: true,
             contribution: None,
             started_elapsed_secs: 0,
         });
@@ -421,7 +421,7 @@ mod tests {
             ok,
             detail: "summary".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: c,
             started_elapsed_secs: 0,
         });
@@ -534,7 +534,7 @@ mod tests {
             ok: false,
             detail: "implement".into(),
             profile_id: Some("worker".into()),
-            capabilities: vec!["read_file".into(), "apply_patch".into()],
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
         });
@@ -553,7 +553,7 @@ mod tests {
             ok: true,
             detail: "done".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
         });
@@ -643,7 +643,7 @@ mod tests {
             child_id: "r1".into(),
             role: "reviewer".into(),
             profile_id: Some("reviewer".into()),
-            capabilities: vec!["code_review".into()],
+            read_only: true,
             findings,
             measured,
         }
@@ -665,13 +665,7 @@ mod tests {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "r1", "explorer", "repository analysis");
-        team.apply_detail(detail(
-            true,
-            vec![
-                finding("f-1"),
-                finding("f-2"),
-            ],
-        ));
+        team.apply_detail(detail(true, vec![finding("f-1"), finding("f-2")]));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
         let joined = rows
             .iter()

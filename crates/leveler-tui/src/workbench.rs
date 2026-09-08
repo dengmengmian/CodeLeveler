@@ -1214,7 +1214,7 @@ mod tests {
                 ok: false,
                 detail: (*purpose).into(),
                 profile_id: Some((*role).into()),
-                capabilities: vec!["read_file".into()],
+                read_only: true,
                 contribution: None,
                 started_elapsed_secs: 0,
             });
@@ -1687,7 +1687,7 @@ mod tests {
                     "审查 Agent".into()
                 },
                 profile_id: None,
-                capabilities: Vec::new(),
+                read_only: false,
                 purpose: "check deps".into(),
                 status: *st,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -1785,7 +1785,7 @@ mod tests {
             ok: false,
             detail: "审计生命周期与身份".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
         });
@@ -1830,7 +1830,7 @@ mod tests {
             ok: true,
             detail: "done".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 4,
         });
@@ -1842,7 +1842,7 @@ mod tests {
             ok: false,
             detail: "died".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 5,
         });
@@ -1856,7 +1856,7 @@ mod tests {
             ok: false,
             detail: "audit c".into(),
             profile_id: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
             started_elapsed_secs: 6,
         });
@@ -1891,7 +1891,7 @@ mod tests {
                 ok,
                 detail: "done".into(),
                 profile_id: None,
-                capabilities: Vec::new(),
+                read_only: false,
                 contribution: None,
                 started_elapsed_secs: 3,
             });

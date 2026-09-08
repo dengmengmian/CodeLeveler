@@ -131,15 +131,6 @@ pub enum AgentEvent {
     /// The in-memory transcript was auto-compacted to fit the context window,
     /// shrinking from `from` to `to` messages.
     Compacted { from: usize, to: usize },
-    /// C5-S3: the fold threshold climbed one tier on authoritative evidence.
-    /// Persisted (via the engine event log) so a resumed task replays to the
-    /// same budget instead of shrinking back to the initial tier.
-    ContextExpanded {
-        from: u32,
-        to: u32,
-        reason: &'static str,
-        crossed_reliable: bool,
-    },
     /// The model updated its structured plan via the `update_plan` tool. The
     /// full step list replaces any previous plan (not a delta).
     PlanUpdated { steps: Vec<PlanStep> },
@@ -164,9 +155,12 @@ pub enum AgentEvent {
         task: String,
         /// Built-in capability contract. Absent on events written before
         /// Child Profile existed (`None` means "not recorded", not "no profile").
+        /// It used to be followed by a list of semantic capability labels;
+        /// what consumers needed was the structural fact below.
         profile_id: Option<String>,
         profile_role: Option<String>,
-        capabilities: Vec<String>,
+        /// Whether this child holds a physically read-only toolset.
+        read_only: bool,
     },
     /// One model call made by a sub-agent, carrying the child's id so the
     /// parent can persist it. Boxed because this variant is much larger than
@@ -916,20 +910,7 @@ pub struct TurnPolicy {
     /// The usable context window in tokens (0 = disabled). When the last
     /// request's reported token count exceeds this, the in-memory transcript is
     /// compacted before the next round so a long task never overflows.
-    /// C5-S3 note: this stays the INITIAL fold threshold (the resolver's
-    /// compatibility mirror). The live threshold is `ContextBudgetState` in
-    /// the drive loop; adaptive expansion never mutates this field.
     pub context_budget: u32,
-    /// C5-S3: allow the fold threshold to climb the tier ladder on evidence.
-    pub adaptive_context: bool,
-    /// The resolver's budget ladder (sorted, deduped, clamped). Empty when
-    /// adaptive context is off.
-    pub context_tiers: Vec<u32>,
-    /// The model's quality boundary: plain evidence never expands past it.
-    pub reliable_context: u32,
-    /// Budget the engine recovered from prior `ContextExpanded` events, so a
-    /// resumed task does not silently shrink back to the initial tier.
-    pub restored_context_budget: Option<u32>,
     /// Keep the reasoning a streamed round produced on the assistant message,
     /// so a provider with the pass-back contract receives the chain it asked
     /// for instead of an empty string.
@@ -984,10 +965,6 @@ impl Default for TurnPolicy {
             require_explicit_plan: false,
             reasoning_effort: None,
             context_budget: 0,
-            adaptive_context: false,
-            context_tiers: Vec::new(),
-            reliable_context: 0,
-            restored_context_budget: None,
             keep_reasoning: false,
             prune_tool_results: false,
             context_trace: false,
@@ -1455,10 +1432,6 @@ impl Executor {
                 // Sub-agents keep the static behavior in S3 v1: a child's
                 // transcript is short-lived and expansion evidence is a
                 // top-level task concern.
-                adaptive_context: false,
-                context_tiers: Vec::new(),
-                reliable_context: self.policy.reliable_context,
-                restored_context_budget: None,
                 keep_reasoning: self.policy.keep_reasoning,
                 prune_tool_results: self.policy.prune_tool_results,
                 context_trace: self.policy.context_trace,
@@ -1551,29 +1524,6 @@ impl Executor {
     /// window. Ignored when zero.
     pub fn with_context_budget(mut self, context_budget: u32) -> Self {
         self.policy.context_budget = context_budget;
-        self
-    }
-
-    /// C5-S3: enable adaptive expansion with the resolver's tier ladder and
-    /// the model's quality boundary. Off (the default) reproduces the static
-    /// S2 behavior exactly.
-    pub fn with_context_expansion(
-        mut self,
-        adaptive: bool,
-        tiers: Vec<u32>,
-        reliable_context: u32,
-    ) -> Self {
-        self.policy.adaptive_context = adaptive;
-        self.policy.context_tiers = tiers;
-        self.policy.reliable_context = reliable_context;
-        self
-    }
-
-    /// C5-S3: one-shot strong-evidence grant for a repair turn.
-    /// C5-S3: budget recovered from prior `ContextExpanded` events, so a
-    /// resumed or follow-on turn does not shrink back to the initial tier.
-    pub fn with_restored_context_budget(mut self, restored: Option<u32>) -> Self {
-        self.policy.restored_context_budget = restored;
         self
     }
 

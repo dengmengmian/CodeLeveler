@@ -35,10 +35,11 @@ export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
 
 /** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. */
 export interface ChildContribution {
-  capabilities?: string[];
   findings_total: number;
   profile_id?: string | null;
   profile_role?: string | null;
+  /** Whether this child held a physically read-only toolset. It used to be a list of semantic capability labels; what a client needs is the structural bound. */
+  read_only?: boolean;
   role: string;
 }
 
@@ -128,13 +129,14 @@ export interface UiCheckpoint {
 
 /** Everything the inspector shows for one child. */
 export interface UiChildContribution {
-  capabilities?: string[];
   child_id: string;
   /** Findings this child produced, in ledger order. */
   findings?: UiFinding[];
   /** Whether a ledger snapshot was found at all. `false` means the question could not be answered — no ledger, or the child predates finding adoption. It does NOT mean the child found nothing, and the inspector must not render it that way. */
   measured: boolean;
   profile_id?: string | null;
+  /** Whether this child held a physically read-only toolset. */
+  read_only?: boolean;
   role: string;
 }
 
@@ -621,7 +623,7 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; capabilities?: string[]; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; profile_id?: string | null; profile_role?: string | null; role: string }
+  | { type: 'sub_agent_updated'; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string }
   /** Live execution state and cumulative model usage for one spawned agent. */
   | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
   /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */

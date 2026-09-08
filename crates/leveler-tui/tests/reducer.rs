@@ -1898,7 +1898,7 @@ fn turn_end_finalizes_in_flight_blocks() {
             detail: "investigating".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );
@@ -2005,7 +2005,7 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             detail: detail.into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         })
     };
@@ -2033,7 +2033,7 @@ fn sub_agent_finish_before_start_still_renders() {
             detail: "already done".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );
@@ -2061,7 +2061,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             detail: "investigate module A".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );
@@ -2083,7 +2083,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             detail: "found 12 crates".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
             contribution: None,
         }),
     );

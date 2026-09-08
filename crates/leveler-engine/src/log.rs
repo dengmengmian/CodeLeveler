@@ -581,7 +581,7 @@ mod tests {
             task: "look around".into(),
             profile_id: None,
             profile_role: None,
-            capabilities: Vec::new(),
+            read_only: false,
         }
     }
 
@@ -976,7 +976,7 @@ mod tests {
                     task: "explore the repository".into(),
                     profile_id: None,
                     profile_role: None,
-                    capabilities: Vec::new(),
+                    read_only: false,
                 },
                 &mut sink,
             )
@@ -1022,7 +1022,7 @@ mod tests {
                 task: "t".into(),
                 profile_id: None,
                 profile_role: None,
-                capabilities: Vec::new(),
+                read_only: false,
             },
             &mut sink,
         )

@@ -22,14 +22,14 @@ pub fn project_child_contribution(
     child_id: &str,
     role: &str,
     profile_id: Option<String>,
-    capabilities: Vec<String>,
+    read_only: bool,
 ) -> UiChildContribution {
     let Some(ledger) = ledger else {
         return UiChildContribution {
             child_id: child_id.to_string(),
             role: role.to_string(),
             profile_id,
-            capabilities,
+            read_only,
             findings: Vec::new(),
             measured: false,
         };
@@ -45,7 +45,7 @@ pub fn project_child_contribution(
         child_id: child_id.to_string(),
         role: role.to_string(),
         profile_id,
-        capabilities,
+        read_only,
         findings,
         measured: true,
     }
@@ -80,18 +80,18 @@ pub async fn last_ledger(
     out
 }
 
-/// Role, profile and capabilities for one child, from its spawn event.
+/// Role, profile and write bound for one child, from its spawn event.
 ///
 /// These are the child's own facts, not ledger facts. Reading them from the
 /// event rather than inferring from the id keeps the inspector honest about a
-/// child whose profile was never recorded: empty means "not recorded".
+/// child whose profile was never recorded: `None` means "not recorded".
 pub async fn child_identity(
     events: &dyn leveler_storage::EventStore,
     session_id: &SessionId,
     child_id: &str,
-) -> (String, Option<String>, Vec<String>) {
+) -> (String, Option<String>, bool) {
     let Ok(rows) = events.load(session_id).await else {
-        return (String::new(), None, Vec::new());
+        return (String::new(), None, false);
     };
     for row in rows {
         if row.event_type != "sub_agent_started" {
@@ -101,15 +101,15 @@ pub async fn child_identity(
             id,
             role,
             profile_id,
-            capabilities,
+            read_only,
             ..
         }) = leveler_engine::EngineEvent::from_payload(&row.payload)
             && id == child_id
         {
-            return (role, profile_id, capabilities);
+            return (role, profile_id, read_only);
         }
     }
-    (String::new(), None, Vec::new())
+    (String::new(), None, false)
 }
 
 #[cfg(test)]
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn a_child_sees_only_its_own_findings() {
         let l = ledger(vec![rec("f-1", "a1"), rec("f-2", "a2"), rec("f-3", "a1")]);
-        let got = project_child_contribution(Some(&l), "a1", "reviewer", None, Vec::new());
+        let got = project_child_contribution(Some(&l), "a1", "reviewer", None, true);
         assert!(got.measured);
         assert_eq!(got.findings.len(), 2);
         assert_eq!(got.findings[0].id, "f-1");
@@ -151,17 +151,12 @@ mod tests {
     /// render alike: the first is unmeasured, the second is a clean review.
     #[test]
     fn an_absent_ledger_is_unmeasured_not_empty() {
-        let none = project_child_contribution(None, "a1", "reviewer", None, Vec::new());
+        let none = project_child_contribution(None, "a1", "reviewer", None, true);
         assert!(!none.measured);
         assert!(none.findings.is_empty());
 
-        let empty = project_child_contribution(
-            Some(&ledger(Vec::new())),
-            "a1",
-            "reviewer",
-            None,
-            Vec::new(),
-        );
+        let empty =
+            project_child_contribution(Some(&ledger(Vec::new())), "a1", "reviewer", None, true);
         assert!(empty.measured);
         assert!(empty.reviewed_clean());
     }
@@ -171,7 +166,7 @@ mod tests {
         let many: Vec<FindingRecord> = (0..(CONTRIBUTION_FINDINGS_MAX + 10))
             .map(|i| rec(&format!("f-{i}"), "a1"))
             .collect();
-        let got = project_child_contribution(Some(&ledger(many)), "a1", "reviewer", None, Vec::new());
+        let got = project_child_contribution(Some(&ledger(many)), "a1", "reviewer", None, true);
         assert_eq!(got.findings.len(), CONTRIBUTION_FINDINGS_MAX);
     }
 }

@@ -332,7 +332,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             detail,
             profile_id,
             profile_role: _,
-            capabilities,
+            read_only,
             contribution,
         } => {
             let started = state.elapsed_secs;
@@ -344,7 +344,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ok,
                 detail: detail.clone(),
                 profile_id,
-                capabilities,
+                read_only,
                 contribution: contribution.clone(),
                 started_elapsed_secs: started,
             });

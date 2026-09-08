@@ -139,7 +139,7 @@ async fn run_spawn(dir: &std::path::Path, script: Vec<ModelResponse>) -> Vec<Age
     events
 }
 
-fn started_profile(events: &[AgentEvent]) -> (String, Option<String>, Option<String>, Vec<String>) {
+fn started_profile(events: &[AgentEvent]) -> (String, Option<String>, Option<String>, bool) {
     events
         .iter()
         .find_map(|e| match e {
@@ -147,13 +147,13 @@ fn started_profile(events: &[AgentEvent]) -> (String, Option<String>, Option<Str
                 role,
                 profile_id,
                 profile_role,
-                capabilities,
+                read_only,
                 ..
             } => Some((
                 role.clone(),
                 profile_id.clone(),
                 profile_role.clone(),
-                capabilities.clone(),
+                *read_only,
             )),
             _ => None,
         })
@@ -193,11 +193,11 @@ async fn spawn_with_explorer_profile_records_the_contract() {
         ],
     )
     .await;
-    let (role, profile_id, profile_role, caps) = started_profile(&events);
+    let (role, profile_id, profile_role, read_only) = started_profile(&events);
     assert_eq!(role, "explorer");
     assert_eq!(profile_id.as_deref(), Some("explorer"));
     assert_eq!(profile_role.as_deref(), Some("explorer"));
-    assert!(caps.iter().any(|c| c == "repository_analysis"));
+    assert!(read_only, "an explorer holds no mutating tool");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -224,10 +224,10 @@ async fn spawn_with_worker_profile_requires_files_and_records_the_contract() {
         ],
     )
     .await;
-    let (role, profile_id, _, caps) = started_profile(&events);
+    let (role, profile_id, _, read_only) = started_profile(&events);
     assert_eq!(role, "worker");
     assert_eq!(profile_id.as_deref(), Some("worker"));
-    assert!(caps.iter().any(|c| c == "implementation"));
+    assert!(!read_only, "a worker writes");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -426,6 +426,9 @@ async fn contribution_projection_carries_the_profile() {
     let p = contribution.expect("settled child must carry a projection");
     assert_eq!(p.profile_id.as_deref(), Some("explorer"));
     assert_eq!(p.profile_role.as_deref(), Some("explorer"));
-    assert!(p.capabilities.iter().any(|c| c == "repository_analysis"));
+    assert!(
+        p.read_only,
+        "the projection carries the child's write bound"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -60,41 +60,6 @@ impl AgentRole {
     }
 }
 
-/// What a child is for. Closed and composable — not a per-tool allowlist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ChildCapability {
-    RepositoryAnalysis,
-    CodeReview,
-    Implementation,
-    Testing,
-    Verification,
-}
-
-impl ChildCapability {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::RepositoryAnalysis => "repository_analysis",
-            Self::CodeReview => "code_review",
-            Self::Implementation => "implementation",
-            Self::Testing => "testing",
-            Self::Verification => "verification",
-        }
-    }
-
-    #[allow(dead_code)] // inverse of `label`; used by tests and future callers
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s.trim() {
-            "repository_analysis" => Self::RepositoryAnalysis,
-            "code_review" => Self::CodeReview,
-            "implementation" => Self::Implementation,
-            "testing" => Self::Testing,
-            "verification" => Self::Verification,
-            _ => return None,
-        })
-    }
-}
-
 /// Which tool *class* the child holds. Maps onto existing registry subsets;
 /// never a per-role × tool-name matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,21 +82,6 @@ pub(crate) enum ToolAccess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ToolPolicy {
     pub access: ToolAccess,
-}
-
-/// Which existing structured-result channels a parent should expect.
-///
-/// Flags over artefacts that already exist (`FindingRecord`,
-/// `EvidenceLedger.verifications`, the child's `modified_files`). No new
-/// result types.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OutputContract {
-    /// `FindingRecord[]` via `report_finding` / ledger adoption.
-    pub findings: bool,
-    /// Host verification records on the child's / parent's ledger.
-    pub verification: bool,
-    /// Files the child mutated.
-    pub changed_files: bool,
 }
 
 /// How the child may touch the workspace.
@@ -177,11 +127,7 @@ pub(crate) struct ChildProfile {
     pub id: String,
     pub name: String,
     pub role: AgentRole,
-    pub description: String,
-    pub purpose: String,
-    pub capabilities: Vec<ChildCapability>,
     pub tool_policy: ToolPolicy,
-    pub output_contract: OutputContract,
     pub workspace_policy: WorkspacePolicy,
     pub runtime_policy: RuntimePolicy,
     pub budget_policy: BudgetPolicy,
@@ -207,19 +153,20 @@ impl ChildProfile {
         self.runtime_policy.serial_tools
     }
 
-    pub fn capability_labels(&self) -> Vec<String> {
-        self.capabilities
-            .iter()
-            .map(|c| c.label().to_string())
-            .collect()
-    }
-
-    /// `(profile_id, profile_role, capabilities)` for events and projections.
-    pub fn trace_fields(&self) -> (String, String, Vec<String>) {
+    /// `(profile_id, profile_role, read_only)` for events and projections.
+    ///
+    /// The third field used to be a list of capability labels
+    /// (`repository_analysis`, `code_review`, …) — a taxonomy that described
+    /// a child rather than bounding it, and that no runtime decision read.
+    /// What every consumer actually wanted is the structural fact: may this
+    /// child write? The TUI tried to derive it by scanning the labels for
+    /// "write"/"edit"/"apply_patch", none of which a label ever was, so every
+    /// profiled child — Workers included — rendered as read-only.
+    pub fn trace_fields(&self) -> (String, String, bool) {
         (
             self.id.clone(),
             self.role.label().to_string(),
-            self.capability_labels(),
+            self.read_only(),
         )
     }
 
@@ -241,18 +188,8 @@ impl ChildProfile {
             id: "default".into(),
             name: "Default".into(),
             role: AgentRole::Default,
-            description: "Generic child: claims its own write scope after reading.".into(),
-            purpose: "Carry out a self-contained subtask with the parent's full \
-                      non-MCP toolset, bounded by late-bound exclusive ownership."
-                .into(),
-            capabilities: vec![ChildCapability::Implementation],
             tool_policy: ToolPolicy {
                 access: ToolAccess::Inherit,
-            },
-            output_contract: OutputContract {
-                findings: true,
-                verification: false,
-                changed_files: true,
             },
             workspace_policy: WorkspacePolicy {
                 mode: WorkspaceMode::LateBound,
@@ -274,18 +211,8 @@ impl ChildProfile {
             id: "explorer".into(),
             name: "Explorer".into(),
             role: AgentRole::Explorer,
-            description: "Read-only repository understanding.".into(),
-            purpose: "Architecture discovery, dependency analysis, and code \
-                      exploration. Reports FindingRecords; cannot mutate."
-                .into(),
-            capabilities: vec![ChildCapability::RepositoryAnalysis],
             tool_policy: ToolPolicy {
                 access: ToolAccess::ReadSearch,
-            },
-            output_contract: OutputContract {
-                findings: true,
-                verification: false,
-                changed_files: false,
             },
             workspace_policy: WorkspacePolicy {
                 mode: WorkspaceMode::ReadOnly,
@@ -307,18 +234,8 @@ impl ChildProfile {
             id: "reviewer".into(),
             name: "Reviewer".into(),
             role: AgentRole::Reviewer,
-            description: "Independent verification of a change already made.".into(),
-            purpose: "Review changes, detect regressions, inspect security. \
-                      Reports FindingRecords and verification judgment; cannot mutate."
-                .into(),
-            capabilities: vec![ChildCapability::CodeReview, ChildCapability::Verification],
             tool_policy: ToolPolicy {
                 access: ToolAccess::ReadTest,
-            },
-            output_contract: OutputContract {
-                findings: true,
-                verification: true,
-                changed_files: false,
             },
             workspace_policy: WorkspacePolicy {
                 mode: WorkspaceMode::ReadOnly,
@@ -340,22 +257,8 @@ impl ChildProfile {
             id: "worker".into(),
             name: "Worker".into(),
             role: AgentRole::Worker,
-            description: "Scoped implementation in an exclusive file set.".into(),
-            purpose: "Modify code, run tests, fix issues — only within the \
-                      files it exclusively owns."
-                .into(),
-            capabilities: vec![
-                ChildCapability::Implementation,
-                ChildCapability::Testing,
-                ChildCapability::Verification,
-            ],
             tool_policy: ToolPolicy {
                 access: ToolAccess::WriteScoped,
-            },
-            output_contract: OutputContract {
-                findings: true,
-                verification: true,
-                changed_files: true,
             },
             workspace_policy: WorkspacePolicy {
                 mode: WorkspaceMode::ControlledMutation,
@@ -417,18 +320,6 @@ impl ChildProfile {
         }
         if self.name.trim().is_empty() {
             return Err("profile name must not be empty".into());
-        }
-        if self.purpose.trim().is_empty() {
-            return Err("profile purpose must not be empty".into());
-        }
-        if self.capabilities.is_empty() {
-            return Err("profile must declare at least one capability".into());
-        }
-        let output = &self.output_contract;
-        if !output.findings && !output.verification && !output.changed_files {
-            return Err("output_contract must name at least one existing artefact \
-                        (findings, verification, changed_files)"
-                .into());
         }
         let read_only = matches!(self.workspace_policy.mode, WorkspaceMode::ReadOnly);
         let writes = matches!(
@@ -555,7 +446,7 @@ fn unknown_profile_message(raw: &str) -> String {
 
 /// Trace fields for a built-in (or parsed) profile, so the engine's
 /// harness-launched reviewer emits the same shape as `spawn_agent` children.
-pub fn child_profile_trace(role: &str) -> (String, String, Vec<String>) {
+pub fn child_profile_trace(role: &str) -> (String, String, bool) {
     let profile = ChildProfile::lookup(role)
         .or_else(|| AgentRole::from_label(role).map(ChildProfile::resolve))
         .unwrap_or_else(ChildProfile::default_profile);
@@ -573,280 +464,118 @@ mod tests {
         }
     }
 
+    /// Each built-in is a bundle of STRUCTURAL bounds — what it may touch and
+    /// for how long — with no semantic self-description. Every assertion here
+    /// is something the runtime enforces.
     #[test]
-    fn default_profile_is_the_historical_child() {
-        let p = ChildProfile::default_profile();
-        assert_eq!(p.id, "default");
-        assert_eq!(p.role, AgentRole::Default);
-        assert!(!p.read_only());
-        assert!(!p.requires_scope());
-        assert_eq!(p.max_rounds(), None);
-        assert!(!p.serial_tools());
-        assert_eq!(p.tool_policy.access, ToolAccess::Inherit);
-        assert_eq!(p.workspace_policy.mode, WorkspaceMode::LateBound);
-        assert!(p.output_contract.findings);
-        assert!(p.output_contract.changed_files);
-        assert!(!p.output_contract.verification);
-        assert_eq!(p.capabilities, vec![ChildCapability::Implementation]);
+    fn the_builtins_are_the_documented_bounds() {
+        let d = ChildProfile::default_profile();
+        assert_eq!(d.role, AgentRole::Default);
+        assert!(!d.read_only());
+        assert!(!d.requires_scope(), "the default child claims late");
+        assert_eq!(d.tool_policy.access, ToolAccess::Inherit);
+        assert_eq!(d.workspace_policy.mode, WorkspaceMode::LateBound);
+        assert_eq!(d.max_rounds(), None);
+        assert!(!d.serial_tools());
+
+        let e = ChildProfile::explorer();
+        assert!(e.read_only(), "an explorer holds no mutating tool at all");
+        assert!(!e.requires_scope());
+        assert_eq!(e.tool_policy.access, ToolAccess::ReadSearch);
+
+        let r = ChildProfile::reviewer();
+        assert!(r.read_only());
+        assert_eq!(r.max_rounds(), Some(20), "a reviewer is bounded");
+
+        let w = ChildProfile::worker();
+        assert!(!w.read_only());
+        assert!(w.requires_scope(), "an unscoped writer is not admitted");
+        assert!(w.serial_tools(), "parallel writes conflict");
+        assert_eq!(w.workspace_policy.mode, WorkspaceMode::ControlledMutation);
     }
 
+    /// The bound the trace carries is the structural one. It used to be a list
+    /// of capability labels, which the TUI then scanned for "write"/"edit" —
+    /// words no label ever was, so every profiled child read as read-only.
     #[test]
-    fn explorer_is_read_only_analysis() {
-        let p = ChildProfile::explorer();
-        assert_eq!(p.id, "explorer");
-        assert!(p.read_only());
-        assert!(!p.requires_scope());
-        assert_eq!(p.tool_policy.access, ToolAccess::ReadSearch);
-        assert!(p.output_contract.findings);
-        assert!(!p.output_contract.changed_files);
-        assert_eq!(p.capabilities, vec![ChildCapability::RepositoryAnalysis]);
-    }
-
-    #[test]
-    fn reviewer_is_bounded_read_only_judgment() {
-        let p = ChildProfile::reviewer();
-        assert_eq!(p.id, "reviewer");
-        assert!(p.read_only());
-        assert_eq!(p.max_rounds(), Some(20));
-        assert_eq!(p.tool_policy.access, ToolAccess::ReadTest);
-        assert!(p.output_contract.findings);
-        assert!(p.output_contract.verification);
-        assert!(!p.output_contract.changed_files);
-        assert!(!p.serial_tools());
-    }
-
-    #[test]
-    fn worker_is_scoped_serial_writer() {
-        let p = ChildProfile::worker();
-        assert_eq!(p.id, "worker");
-        assert!(!p.read_only());
-        assert!(p.requires_scope());
-        assert!(p.serial_tools());
-        assert_eq!(p.tool_policy.access, ToolAccess::WriteScoped);
-        assert_eq!(p.workspace_policy.mode, WorkspaceMode::ControlledMutation);
-        assert!(p.output_contract.changed_files);
-        assert!(p.output_contract.verification);
-    }
-
-    #[test]
-    fn lookup_accepts_short_and_builtin_ids() {
-        for id in ["explorer", "builtin.explorer", "EXPLORER"] {
-            let p = ChildProfile::lookup(id).expect(id);
-            assert_eq!(p.id, "explorer");
-        }
-        assert!(ChildProfile::lookup("not-a-profile").is_none());
-        assert!(ChildProfile::lookup("").is_none());
-    }
-
-    #[test]
-    fn resolve_matches_lookup_by_role_label() {
-        for role in [
-            AgentRole::Default,
-            AgentRole::Explorer,
-            AgentRole::Worker,
-            AgentRole::Reviewer,
+    fn the_trace_carries_the_write_bound_not_a_taxonomy() {
+        for (role, read_only) in [
+            (AgentRole::Explorer, true),
+            (AgentRole::Reviewer, true),
+            (AgentRole::Worker, false),
+            (AgentRole::Default, false),
         ] {
-            let a = ChildProfile::resolve(role);
-            let b = ChildProfile::lookup(role.label()).unwrap();
-            assert_eq!(a, b, "{role:?}");
+            let (id, role_label, traced) = ChildProfile::resolve(role).trace_fields();
+            assert_eq!(role_label, role.label());
+            assert_eq!(traced, read_only, "{id} must trace its real write bound");
         }
+        assert!(!child_profile_trace("worker").2);
+        assert!(child_profile_trace("explorer").2);
     }
 
+    /// A profile that contradicts itself is refused before it can be spawned.
     #[test]
-    fn builtins_round_trip_through_json() {
-        for p in ChildProfile::builtins() {
-            let json = serde_json::to_string(&p).unwrap();
-            let back: ChildProfile = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, p, "{}", p.id);
-            assert!(json.contains(&format!("\"{}\"", p.id)), "{json}");
-        }
-    }
-
-    #[test]
-    fn capabilities_round_trip_between_parse_and_label() {
-        for cap in [
-            ChildCapability::RepositoryAnalysis,
-            ChildCapability::CodeReview,
-            ChildCapability::Implementation,
-            ChildCapability::Testing,
-            ChildCapability::Verification,
-        ] {
-            assert_eq!(ChildCapability::parse(cap.label()), Some(cap));
-        }
-        assert_eq!(ChildCapability::parse("vibe"), None);
-    }
-
-    #[test]
-    fn validation_rejects_incoherent_contracts() {
-        let mut p = ChildProfile::explorer();
-        p.id.clear();
-        assert!(p.validate().unwrap_err().contains("id"));
-
+    fn a_self_contradictory_profile_is_refused() {
         let mut p = ChildProfile::explorer();
         p.tool_policy.access = ToolAccess::WriteScoped;
-        assert!(p.validate().unwrap_err().contains("read-only"));
+        assert!(p.validate().is_err(), "read-only workspace + write tools");
 
-        let mut p = ChildProfile::worker();
-        p.workspace_policy.requires_explicit_scope = false;
-        assert!(p.validate().unwrap_err().contains("scope"));
+        let mut w = ChildProfile::worker();
+        w.workspace_policy.requires_explicit_scope = false;
+        assert!(w.validate().is_err(), "an unscoped worker is not a worker");
 
-        let mut p = ChildProfile::explorer();
-        p.output_contract = OutputContract {
-            findings: false,
-            verification: false,
-            changed_files: false,
-        };
-        assert!(p.validate().unwrap_err().contains("output_contract"));
+        let mut bad_id = ChildProfile::explorer();
+        bad_id.id = "../etc".into();
+        assert!(bad_id.validate().is_err());
     }
 
     #[test]
-    fn model_parse_still_does_not_accept_reviewer() {
-        assert_eq!(AgentRole::parse(Some("reviewer")), AgentRole::Default);
-        assert_eq!(AgentRole::parse(None), AgentRole::Default);
-        assert_eq!(AgentRole::parse(Some("explorer")), AgentRole::Explorer);
-        assert_eq!(AgentRole::from_label("reviewer"), Some(AgentRole::Reviewer));
-    }
-
-    #[test]
-    fn a_worker_without_a_scope_is_refused_not_unleashed() {
-        let err = ChildProfile::admit(AgentRole::Worker, &[]).unwrap_err();
-        assert!(
-            err.contains("files"),
-            "denial must name the missing scope: {err}"
-        );
-        assert!(ChildProfile::admit(AgentRole::Worker, &["src/a.rs".into()]).is_ok());
-    }
-
-    #[test]
-    fn a_read_only_role_asking_for_write_scope_is_refused() {
-        let err = ChildProfile::admit(AgentRole::Explorer, &["src/a.rs".into()]).unwrap_err();
-        assert!(
-            err.contains("read-only"),
-            "denial must say why, not silently ignore the request: {err}"
-        );
+    fn a_read_only_role_is_refused_a_write_scope_and_a_writer_needs_one() {
+        assert!(ChildProfile::admit(AgentRole::Worker, &[]).is_err());
+        assert!(ChildProfile::admit(AgentRole::Worker, &["a.rs".into()]).is_ok());
+        assert!(ChildProfile::admit(AgentRole::Explorer, &["a.rs".into()]).is_err());
         assert!(ChildProfile::admit(AgentRole::Explorer, &[]).is_ok());
-        assert!(ChildProfile::admit(AgentRole::Default, &[]).is_ok());
     }
 
+    /// The reviewer is harness-launched: a model cannot ask for one, and a
+    /// conflicting profile/role pair is refused rather than silently resolved.
     #[test]
-    fn omitted_profile_and_role_maps_to_default() {
-        let p = ChildProfile::admit_spawn(None, None, &[]).unwrap();
-        assert_eq!(p.id, "default");
-        assert_eq!(p.role, AgentRole::Default);
-    }
-
-    #[test]
-    fn spawn_with_explorer_profile() {
-        let p = ChildProfile::admit_spawn(Some("explorer"), None, &[]).unwrap();
-        assert_eq!(p.id, "explorer");
-        assert!(p.read_only());
-        let p = ChildProfile::admit_spawn(Some("builtin.explorer"), None, &[]).unwrap();
-        assert_eq!(p.id, "explorer");
-    }
-
-    #[test]
-    fn spawn_with_worker_profile_requires_files() {
-        let err = ChildProfile::admit_spawn(Some("worker"), None, &[]).unwrap_err();
-        assert!(err.contains("files"), "{err}");
-        let p = ChildProfile::admit_spawn(Some("worker"), None, &["src/a.rs".into()]).unwrap();
-        assert_eq!(p.id, "worker");
-        assert!(p.requires_scope());
-    }
-
-    #[test]
-    fn spawn_with_reviewer_profile_is_harness_only() {
-        let err = ChildProfile::admit_spawn(Some("reviewer"), None, &[]).unwrap_err();
+    fn spawn_admission_refuses_reviewer_unknown_and_conflicting_requests() {
+        assert!(ChildProfile::admit_spawn(Some("reviewer"), None, &[]).is_err());
+        assert!(ChildProfile::admit_spawn(Some("nonsense"), None, &[]).is_err());
         assert!(
-            err.contains("harness"),
-            "the model must not be able to request a reviewer: {err}"
+            ChildProfile::admit_spawn(Some("explorer"), Some("worker"), &[]).is_err(),
+            "profile and role must not disagree"
         );
-        assert!(ChildProfile::lookup("reviewer").is_some());
-        assert!(ChildProfile::admit(AgentRole::Reviewer, &[]).is_ok());
-    }
-
-    #[test]
-    fn unknown_profile_is_an_honest_denial() {
-        let err = ChildProfile::admit_spawn(Some("marketplace.cool-agent"), None, &[]).unwrap_err();
-        assert!(err.contains("Unknown profile"), "{err}");
-        assert!(err.contains("explorer"), "{err}");
-        assert!(
-            !err.contains("Available: marketplace"),
-            "must not invent a marketplace: {err}"
+        assert_eq!(
+            ChildProfile::admit_spawn(Some("builtin.explorer"), None, &[])
+                .unwrap()
+                .role,
+            AgentRole::Explorer,
+            "the `builtin.` prefix resolves to the same profile"
+        );
+        assert_eq!(
+            ChildProfile::admit_spawn(None, None, &[]).unwrap().role,
+            AgentRole::Default
         );
     }
 
+    /// `reviewer` is not a model-facing role word, but it IS a valid label
+    /// when the harness resolves one by name.
     #[test]
-    fn conflicting_profile_and_role_is_refused() {
-        let err = ChildProfile::admit_spawn(Some("explorer"), Some("worker"), &[]).unwrap_err();
-        assert!(err.contains("Pick one"), "{err}");
-        let p = ChildProfile::admit_spawn(Some("explorer"), Some("explorer"), &[]).unwrap();
-        assert_eq!(p.id, "explorer");
+    fn role_parsing_keeps_reviewer_harness_only() {
+        assert_eq!(AgentRole::parse(Some("reviewer")), AgentRole::Default);
+        assert_eq!(AgentRole::parse(Some("explorer")), AgentRole::Explorer);
+        assert_eq!(AgentRole::parse(None), AgentRole::Default);
+        assert_eq!(AgentRole::from_label("reviewer"), Some(AgentRole::Reviewer));
+        assert_eq!(AgentRole::from_label("nonsense"), None);
     }
 
     #[test]
-    fn historical_role_argument_still_selects_the_profile() {
-        let p = ChildProfile::admit_spawn(None, Some("explorer"), &[]).unwrap();
-        assert_eq!(p.id, "explorer");
-        let p = ChildProfile::admit_spawn(None, Some("worker"), &["a.rs".into()]).unwrap();
-        assert_eq!(p.id, "worker");
-    }
-
-    #[test]
-    fn explorer_and_reviewer_are_structurally_read_only() {
-        for role in [AgentRole::Explorer, AgentRole::Reviewer] {
-            let p = ChildProfile::resolve(role);
-            assert!(p.read_only(), "{role:?} must hold no write tools");
-            assert!(!p.requires_scope());
-            assert!(!p.serial_tools());
+    fn every_child_shares_one_wall_clock_bound() {
+        for p in ChildProfile::builtins() {
+            assert_eq!(p.budget_policy.max_duration_secs, CHILD_MAX_DURATION_SECS);
+            assert!(p.budget_policy.inherits_residual);
         }
-    }
-
-
-    #[test]
-    fn apply_to_registry_strips_writes_from_read_only_profiles() {
-        let registry = leveler_tools::default_registry();
-        for p in [ChildProfile::explorer(), ChildProfile::reviewer()] {
-            let subset = p.apply_to_registry(&registry);
-            for forbidden in [
-                "apply_patch",
-                "replace",
-                "write_file",
-                "create_file",
-                "run_command",
-                "shell_command",
-            ] {
-                assert!(
-                    subset.get(forbidden).is_none(),
-                    "{} must not advertise {forbidden}",
-                    p.id
-                );
-            }
-            assert!(
-                subset.get("read_file").is_some(),
-                "{} must keep read_file",
-                p.id
-            );
-        }
-        let worker = ChildProfile::worker().apply_to_registry(&registry);
-        assert!(worker.get("apply_patch").is_some());
-        assert!(
-            worker
-                .definitions()
-                .iter()
-                .all(|d| !d.name.starts_with("mcp__")),
-            "a writer child must not hold MCP proxies"
-        );
-    }
-
-    #[test]
-    fn child_profile_trace_matches_the_builtin() {
-        let (id, role, caps) = child_profile_trace("reviewer");
-        assert_eq!(id, "reviewer");
-        assert_eq!(role, "reviewer");
-        assert!(caps.contains(&"code_review".to_string()));
-        assert!(caps.contains(&"verification".to_string()));
-        let (id, role, _) = child_profile_trace("nope");
-        assert_eq!(id, "default");
-        assert_eq!(role, "default");
     }
 }

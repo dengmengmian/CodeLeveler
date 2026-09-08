@@ -1255,7 +1255,7 @@ mod tests {
                     detail: task.into(),
                     profile_id: None,
                     profile_role: None,
-                    capabilities: Vec::new(),
+                    read_only: false,
                     contribution: None,
                 }),
             );
@@ -1312,7 +1312,7 @@ mod tests {
                 detail: "Inspect provider architecture".into(),
                 profile_id: None,
                 profile_role: None,
-                capabilities: Vec::new(),
+                read_only: false,
                 contribution: None,
             }),
         );

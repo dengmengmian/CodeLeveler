@@ -6,8 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
-    ChangeImpact, DepthUseMetrics, EvidenceLedger, FindingKind, GateConfig,
-    ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check, is_build_relevant,
+    ChangeImpact, DepthUseMetrics, EvidenceLedger, FindingKind, GateConfig, ObjectiveAnchor,
+    PlanState, ProgressCaps, TurnPhase, check, is_build_relevant,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
@@ -39,8 +39,8 @@ use crate::compaction::{
 };
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
-    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
-    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, ask_user_tool_definition,
+    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
+    advertise_escalation, apply_turn_grants, ask_user_tool_definition,
     claim_write_scope_tool_definition, escalation_action, escalation_missing_axis_message,
     is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
     permission_already_denied_message, report_finding_tool_definition,
@@ -230,17 +230,6 @@ impl Executor {
         // that only appended durable messages is reconstructible from the
         // transcript alone.
         let mut context_diverged = false;
-        // Task contract → user turn (never system prefix) so prefix cache stays stable.
-        let task_contract = TaskContract::parse(&original_task);
-        let contract_injection = task_contract.user_injection();
-        if !contract_injection.trim().is_empty()
-            && !messages
-                .iter()
-                .any(|m| m.role == Role::User && m.text_content().contains("## Task contract"))
-        {
-            messages.push(Message::text(Role::User, contract_injection));
-            context_diverged = true;
-        }
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
         // keywords are not required — ordinary implementation goals must still
         // evaluate bounded Worker work.
@@ -569,16 +558,6 @@ impl Executor {
                 ));
             }};
         }
-
-        // C5-S3: the live fold threshold. Policy stays immutable; this state
-        // climbs the tier ladder on evidence and is durably reconstructed by
-        // the engine from ContextExpanded events (restored_context_budget).
-        let mut context_state = crate::context_budget::ContextBudgetState::new(
-            self.policy
-                .restored_context_budget
-                .unwrap_or(self.policy.context_budget)
-                .max(self.policy.context_budget),
-        );
 
         loop {
             // Mid-turn user input goes in at the top of the round, before the
@@ -1115,8 +1094,8 @@ impl Executor {
                     && progress.human_boundary_seen()
                 {
                     // User said no, model went quiet without resolving the
-                    // goal. That is blocked, not a stall the supervisor
-                    // should DriveGoalAgain.
+                    // goal. That is blocked, not a stall — and it is reported
+                    // as such, since nothing re-drives a turn on its own.
                     progress.enter_terminal();
                     observer(AgentEvent::ProgressUpdated {
                         ledger: progress.clone(),
@@ -1394,13 +1373,7 @@ impl Executor {
                             .get("override_incomplete_todos")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        if let Err(fail) = check(
-                            &plan_state,
-                            &ledger,
-                            Some(&task_contract),
-                            &gate,
-                            explicit_todo_override,
-                        ) {
+                        if let Err(fail) = check(&plan_state, &gate, explicit_todo_override) {
                             ledger.record_intercept("update_goal", fail.to_string());
                             ledger.plan = plan_state.clone();
                             observer(AgentEvent::GoalIntercepted {
@@ -2578,7 +2551,7 @@ impl Executor {
                     observer(AgentEvent::ProgressUpdated {
                         ledger: progress.clone(),
                     });
-                    let (profile_id, profile_role, capabilities) = profile.trace_fields();
+                    let (profile_id, profile_role, read_only) = profile.trace_fields();
                     observer(AgentEvent::SubAgentStarted {
                         id: id.clone(),
                         nickname: nickname.clone(),
@@ -2586,7 +2559,7 @@ impl Executor {
                         task: started_task,
                         profile_id: Some(profile_id),
                         profile_role: Some(profile_role),
-                        capabilities,
+                        read_only,
                     });
                     accepted.push((
                         index,
@@ -2969,47 +2942,18 @@ impl Executor {
                     );
                 }
             }
-            let guard_trips = self.tool_context.execution.read_guard.total_trips();
-            let context_action = if has_next_round {
-                crate::context_budget::decide_context_action(
-                    self.policy.adaptive_context,
-                    &self.policy.context_tiers,
-                    self.policy.reliable_context,
-                    &context_state,
-                    context_tokens,
-                    guard_trips,
-                )
-            } else {
-                crate::context_budget::ContextAction::Keep
-            };
-            if let crate::context_budget::ContextAction::Expand {
-                from,
-                to,
-                reason,
-                crossed_reliable,
-            } = context_action
-            {
-                observer(AgentEvent::ContextExpanded {
-                    from,
-                    to,
-                    reason: reason.as_str(),
-                    crossed_reliable,
-                });
-                crate::context_budget::apply_expansion(
-                    &mut context_state,
-                    to,
-                    reason,
-                    crossed_reliable,
-                    guard_trips,
-                );
-            }
-            if context_action == crate::context_budget::ContextAction::Compact {
+            // Fold when the last request's estimate crossed the budget. One
+            // threshold, one action: the runtime does not read the model's
+            // re-reads as evidence that it "deserves" a bigger window.
+            let over_budget = self.policy.context_budget > 0
+                && context_tokens > u64::from(self.policy.context_budget);
+            if has_next_round && over_budget {
                 let before = messages.len();
                 // Cap the retained working set at half the live budget so a
                 // huge recent tool output can't keep the fold over the window;
                 // the other half leaves room for the head, summary, and next
                 // response. (current_budget > 0 is guaranteed by the decision.)
-                let keep_recent_tokens = context_state.current_budget as u64 / 2;
+                let keep_recent_tokens = u64::from(self.policy.context_budget) / 2;
                 // Name this extra round trip so the UI shows "compacting…" instead
                 // of a bare "waiting for model" during the summary call.
                 observer(AgentEvent::AdvisoryStarted {
@@ -3024,7 +2968,7 @@ impl Executor {
                             leveler_execution::LifecycleEvent::PreCompact,
                             &format!(
                                 r#"{{"context_tokens":{context_tokens},"budget":{}}}"#,
-                                context_state.current_budget
+                                self.policy.context_budget
                             ),
                             &cancellation,
                         )
@@ -3106,9 +3050,6 @@ impl Executor {
                         from: before,
                         to: messages.len(),
                     });
-                }
-                if fold_permitted {
-                    crate::context_budget::apply_compaction(&mut context_state, guard_trips);
                 }
             }
 
@@ -3233,10 +3174,10 @@ fn fold_child_settlement(
     // settlement rather than read later, so a replay of the terminal event
     // alone can answer "did the parent act on what this child found".
     let profile = ChildProfile::resolve(role);
-    let (profile_id, profile_role, capabilities) = profile.trace_fields();
+    let (profile_id, profile_role, read_only) = profile.trace_fields();
     let contribution =
         leveler_lifecycle::ChildResultProjection::from_findings(id, role.label(), &ledger.findings)
-            .with_profile(profile_id, profile_role, capabilities);
+            .with_profile(profile_id, profile_role, read_only);
     observer(AgentEvent::SubAgentFinished {
         id: id.to_string(),
         nickname: nickname.to_string(),

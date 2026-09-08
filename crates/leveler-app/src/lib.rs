@@ -499,7 +499,7 @@ impl Application {
         let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
             .with_policy_limits(max_files, read_guard)
             .with_sandbox(sandbox)
-            .with_auto_format(true)
+            .with_auto_format(self.project_config().auto_format)
             .with_deny_env(provider_secret_env_names(&self.config.providers))
             .with_artifact_store(artifact_store)
             .with_memory_root(self.layout.memory_dir())

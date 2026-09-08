@@ -149,11 +149,6 @@ impl ExecutorFactory {
         .with_max_output_tokens(resolved.max_output_tokens)
         .with_pricing(model_profile.pricing)
         .with_context_budget(resolved.context_budget)
-        .with_context_expansion(
-            resolved.context.expansion == crate::policy_resolver::ExpansionPolicy::Adaptive,
-            crate::policy_resolver::expansion_tiers(&model_profile),
-            model_profile.limits.reliable_context,
-        )
         .with_reasoning_effort(resolved.reasoning_effort)
         .with_context_trace(resolved.context_trace)
         .with_tool_result_pruning(resolved.prune_tool_results)

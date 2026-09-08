@@ -1231,7 +1231,7 @@ impl InProcessRuntimeClient {
                             &log,
                             None,
                             Some(question.as_str()),
-                            u64::from(leveler_engine::ContextPolicy::chat_default().initial_budget),
+                            u64::from(leveler_engine::CHAT_CONTEXT_BUDGET),
                         )
                         .await
                         .map_err(|e| e.to_string())?;

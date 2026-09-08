@@ -16,8 +16,7 @@ mod authorization;
 mod budget;
 mod child_profile;
 mod compaction;
-pub mod context_budget;
-mod executor;
+pub mod executor;
 mod injected_tools;
 pub mod named_agent;
 mod nudges;
@@ -44,8 +43,8 @@ pub use executor::{
 };
 pub use leveler_lifecycle::{
     CollaborationMode, DepthUseMetrics, EvidenceLedger, GateConfig, ObjectiveAnchor,
-    ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TaskContract,
-    TurnPhase, WorkProfile, check,
+    ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TurnPhase,
+    WorkProfile, check,
 };
 pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

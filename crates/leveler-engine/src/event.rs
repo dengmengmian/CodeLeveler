@@ -224,9 +224,9 @@ pub enum EngineEvent {
         from: usize,
         to: usize,
     },
-    /// C5-S3: the context fold threshold climbed one tier on authoritative
-    /// evidence. Durable so a resumed task replays to the same budget instead
-    /// of silently shrinking back to its initial tier.
+    /// Replay-only: the deleted adaptive-context ladder recorded a climb of
+    /// the fold threshold here. Old logs carry these rows; nothing writes one
+    /// any more, and the fold threshold no longer moves during a task.
     ContextExpanded {
         from: u32,
         to: u32,
@@ -358,8 +358,11 @@ pub enum EngineEvent {
         profile_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_role: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        capabilities: Vec<String>,
+        /// Whether this child holds a physically read-only toolset. Absent on
+        /// events written before the write bound replaced the capability
+        /// taxonomy; `false` is then the floor, never a claim.
+        #[serde(default)]
+        read_only: bool,
     },
     /// TRANSIENT: live execution state and cumulative usage for one sub-agent.
     SubAgentProgress {
@@ -988,17 +991,6 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 cached_input_tokens,
             },
             A::Compacted { from, to } => EngineEvent::Compacted { from, to },
-            A::ContextExpanded {
-                from,
-                to,
-                reason,
-                crossed_reliable,
-            } => EngineEvent::ContextExpanded {
-                from,
-                to,
-                reason: reason.to_string(),
-                crossed_reliable,
-            },
             A::AdvisoryStarted { kind } => EngineEvent::AdvisoryStarted {
                 kind: kind.as_key().to_string(),
             },
@@ -1040,7 +1032,7 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 task,
                 profile_id,
                 profile_role,
-                capabilities,
+                read_only,
             } => EngineEvent::SubAgentStarted {
                 id,
                 nickname,
@@ -1048,7 +1040,7 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 task,
                 profile_id,
                 profile_role,
-                capabilities,
+                read_only,
             },
             // Durable-only: the drive loop intercepts this and writes the
             // row. Nothing downstream renders it, and the child's running

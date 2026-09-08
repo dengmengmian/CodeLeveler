@@ -1,15 +1,18 @@
 //! Pure readiness checks for `update_goal(complete)`.
 //!
-//! No I/O, no shell, no Verifier, no model. Every refusal here is a mechanical
-//! fact the runtime can state from its own record: the model's own plan still
-//! lists open steps, or a command the USER explicitly named as acceptance has
-//! not run green. Whether the work satisfies the user's intent is the model's
-//! judgement and the user's acceptance — never decided here.
+//! No I/O, no shell, no Verifier, no model. The one refusal here is a
+//! mechanical fact the runtime can state from its own record: the model's own
+//! plan still lists open steps. Whether the work satisfies the user's intent
+//! is the model's judgement and the user's acceptance — never decided here.
+//!
+//! The user's mechanical acceptance is the project's own `verify:` commands
+//! (`.leveler/config.yaml`), run by the Verifier and reported as
+//! `VerificationStatus`. This gate used to ALSO enforce acceptance commands
+//! guessed out of the goal prose by a `TaskContract` parser; a sentence the
+//! user wrote is not a command they asked for.
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::TaskContract;
-use crate::ledger::EvidenceLedger;
 use crate::plan::PlanState;
 
 /// Why `update_goal(complete)` was refused by the mechanical readiness gate.
@@ -24,8 +27,6 @@ pub enum ReadinessFailure {
         in_progress: usize,
         override_allowed: bool,
     },
-    #[error("acceptance commands unmet: {commands:?}")]
-    AcceptanceCommandsUnmet { commands: Vec<String> },
 }
 
 /// Gate knobs for update_goal(complete).
@@ -47,19 +48,13 @@ impl Default for GateConfig {
     }
 }
 
-/// Mechanical readiness check against the model's own plan and the user's
-/// explicit acceptance commands.
+/// Mechanical readiness check against the model's own plan.
 ///
 /// `explicit_todo_override` must be true (from structured `update_goal` args or
 /// a user-approved path) to clear incomplete ModelExplicit todos when
 /// [`GateConfig::todo_override_allowed`] is set. A bare second attempt is not enough.
-///
-/// Acceptance commands are checked whenever the user wrote them: they are the
-/// one place the user states, mechanically, what "done" must include.
 pub fn check(
     plan: &PlanState,
-    ledger: &EvidenceLedger,
-    contract: Option<&TaskContract>,
     cfg: &GateConfig,
     explicit_todo_override: bool,
 ) -> Result<(), ReadinessFailure> {
@@ -80,32 +75,7 @@ pub fn check(
         }
     }
 
-    if let Some(contract) = contract {
-        let mut unmet = Vec::new();
-        for cmd in &contract.acceptance_commands {
-            let fp = normalize_acceptance(cmd);
-            let ok = ledger.verifications.iter().any(|v| {
-                v.exit_code == 0
-                    && (v.command_fingerprint == fp || v.command_fingerprint.contains(cmd.trim()))
-            });
-            if !ok {
-                unmet.push(cmd.clone());
-            }
-        }
-        if !unmet.is_empty() {
-            return Err(ReadinessFailure::AcceptanceCommandsUnmet { commands: unmet });
-        }
-    }
-
     Ok(())
-}
-
-fn normalize_acceptance(cmd: &str) -> String {
-    let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
-    if parts.is_empty() {
-        return String::new();
-    }
-    EvidenceLedger::normalize_command_fingerprint(&parts[0], &parts[1..])
 }
 
 #[cfg(test)]
@@ -113,110 +83,56 @@ mod tests {
     use super::*;
     use crate::plan::{PlanOrigin, PlanStep};
 
-    #[test]
-    fn todo_override_requires_explicit_flag_not_attempt_count() {
-        let plan = PlanState {
+    fn one_pending() -> PlanState {
+        PlanState {
             steps: vec![PlanStep {
                 step: "a".into(),
                 status: "pending".into(),
                 id: None,
                 origin: PlanOrigin::ModelExplicit,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn todo_override_requires_explicit_flag_not_attempt_count() {
         let cfg = GateConfig {
             todo_override_allowed: true,
             ..GateConfig::default()
         };
-        let led = EvidenceLedger::default();
         // Bare second (or nth) complete without the flag still refuses.
-        assert!(check(&plan, &led, None, &cfg, false).is_err());
-        assert!(check(&plan, &led, None, &cfg, false).is_err());
-        assert!(check(&plan, &led, None, &cfg, true).is_ok());
+        assert!(check(&one_pending(), &cfg, false).is_err());
+        assert!(check(&one_pending(), &cfg, false).is_err());
+        assert!(check(&one_pending(), &cfg, true).is_ok());
     }
 
     #[test]
     fn todo_override_disallowed_never_passes() {
-        let plan = PlanState {
-            steps: vec![PlanStep {
-                step: "a".into(),
-                status: "pending".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            }],
-        };
         let cfg = GateConfig {
             todo_override_allowed: false,
             ..GateConfig::default()
         };
-        let led = EvidenceLedger::default();
-        assert!(check(&plan, &led, None, &cfg, true).is_err());
+        assert!(check(&one_pending(), &cfg, true).is_err());
     }
 
-    /// Case 1 of the authority boundary: "fix bug" with no mutation and no
+    /// The authority boundary: "fix the login bug" with no mutation and no
     /// verification is still the model's call. The runtime has no keyword
-    /// classifier and no proof standard to refuse it with.
+    /// classifier, no proof standard, and — since the free-text contract was
+    /// deleted — no acceptance command guessed out of the prose to refuse it
+    /// with. What the user wrote as `verify:` is enforced by the Verifier and
+    /// reported beside the outcome, not here.
     #[test]
-    fn no_mutation_and_no_verification_is_not_refused() {
-        let cfg = GateConfig::default();
-        assert!(
-            check(
-                &PlanState::default(),
-                &EvidenceLedger::default(),
-                Some(&TaskContract::parse("fix the login bug")),
-                &cfg,
-                false,
-            )
-            .is_ok()
-        );
+    fn an_empty_plan_is_never_refused() {
+        assert!(check(&PlanState::default(), &GateConfig::default(), false).is_ok());
     }
 
-    /// A build-relevant mutation with no fresh verification is reported by
-    /// the terminal verification status, never refused at the claim.
+    /// The gate can be switched off entirely; then even open todos pass.
     #[test]
-    fn stale_verification_after_mutation_is_not_refused() {
-        let cfg = GateConfig::default();
-        let mut led = EvidenceLedger::default();
-        led.record_mutation("c1", "apply_patch", vec!["src/lib.rs".into()]);
-        led.record_verify("v1", "cargo\u{1f}test", 0);
-        led.record_mutation("c2", "replace", vec!["src/lib.rs".into()]);
-        assert!(check(&PlanState::default(), &led, None, &cfg, false).is_ok());
-    }
-
-    /// Case 4: a command the user explicitly wrote as acceptance is a
-    /// mechanical fact the runtime owns, and it is checked unconditionally.
-    #[test]
-    fn acceptance_commands_must_appear_in_ledger() {
-        let cfg = GateConfig::default();
-        let mut led = EvidenceLedger::default();
-        led.record_mutation("c1", "apply_patch", vec![]);
-        led.record_verify("v1", "cargo\u{1f}test", 0);
-        let contract = TaskContract {
-            acceptance_commands: vec!["cargo clippy".into()],
-            ..Default::default()
+    fn a_disabled_todo_gate_refuses_nothing() {
+        let cfg = GateConfig {
+            goal_todo_gate: false,
+            ..GateConfig::default()
         };
-        assert!(matches!(
-            check(&PlanState::default(), &led, Some(&contract), &cfg, false),
-            Err(ReadinessFailure::AcceptanceCommandsUnmet { .. })
-        ));
-        led.record_verify("v2", "cargo\u{1f}clippy", 0);
-        assert!(check(&PlanState::default(), &led, Some(&contract), &cfg, false).is_ok());
-    }
-
-    /// Case 5: natural-language "make sure this is tested" is not an
-    /// acceptance command and produces no mechanical requirement.
-    #[test]
-    fn prose_about_testing_is_not_an_acceptance_command() {
-        let contract = TaskContract::parse("确保这个行为被充分测试。");
-        assert!(contract.acceptance_commands.is_empty());
-        assert!(
-            check(
-                &PlanState::default(),
-                &EvidenceLedger::default(),
-                Some(&contract),
-                &GateConfig::default(),
-                false,
-            )
-            .is_ok()
-        );
+        assert!(check(&one_pending(), &cfg, false).is_ok());
     }
 }
