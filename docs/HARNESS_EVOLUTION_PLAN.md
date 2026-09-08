@@ -716,7 +716,7 @@ The DeepSeek Harness comparison does **not** authorize these changes:
 - **Do not make the Agent Loop arbitrarily replaceable as a prerequisite for extension work.**
 - **Do not redo Browser Capability V1.**
 - **Do not build a SubAgent Provider ecosystem before spawn utility is empirically positive.**
-- **Do not create a parallel benchmark runner; keep using existing eval/dogfood infrastructure.**
+- **Do not create a parallel benchmark runner; keep using existing evals/dogfood infrastructure.**
 
 ---
 

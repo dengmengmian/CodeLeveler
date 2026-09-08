@@ -4,7 +4,7 @@
 但 6 个候选 probe 预算内机制零触发 —— `C5-E2 SHAPE INCONCLUSIVE`，未冻结。
 副产物是一个对 C5 全局重要的实测结论：见 §The Real Finding。**
 
-## Case（`evals/context/c5-e2-history-dependent.yaml`）
+## Case（`evals/cases/context/c5-e2-history-dependent.yaml`）
 
 fixture `telemetryd-e2`（`gen_e2_fixture.py`，seed 20260810）：1500 文件（scale 家族 filler，
 其自带 window 缺陷已治愈）+ **96 个真实 adapter**（~12KB/个，1.1MB relevant），四维种子

@@ -48,7 +48,7 @@ Existing Real Usage Batch #1 cases. No synthetic tasks.
 | R009 | `go-task/task` | Concurrency + independent review |
 | R010 | TailAdmin (frontend long task) | Long task + browser |
 
-Pointers live in `eval/suites/multi_agent/multi_agent_value/cases/`. Task
+Pointers live in `evals/suites/multi_agent/multi_agent_value/cases/`. Task
 statements and hidden verifiers stay in the dogfood-control repo. This tree
 does not vendor them.
 
@@ -132,7 +132,7 @@ leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode single
 leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode multi
 ```
 
-Reports: `eval/reports/multi_agent/MA-VALUE-001/<mode>/{batch.json,report.md,eval_result.json}`.
+Reports: `evals/reports/multi_agent/MA-VALUE-001/<mode>/{batch.json,report.md,eval_result.json}`.
 
 A full 36-run execution needs the dogfood-control checkouts, a published
 binary, and budget. It is out of scope for this phase.

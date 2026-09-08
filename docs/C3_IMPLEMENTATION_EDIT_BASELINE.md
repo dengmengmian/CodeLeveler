@@ -76,14 +76,14 @@ C2 已 CLOSED（24/24、FalseCompletion 0）。C3 的问题不是"能不能找�
 **逐 case 修完立即过闸，VALID 才进下一个。** 最终：
 
 ```
-evals/edit 8/8 VALID, exit 0
-C2 evals/navigation 复验仍 8/8 VALID（尺子未被破坏）
+evals/cases/edit 8/8 VALID, exit 0
+C2 evals/cases/navigation 复验仍 8/8 VALID（尺子未被破坏）
 gate regressions 7/7 · loader 58/58
 ```
 
 Answer-key containment：references 位于密封的仓库根 subpath 内，与 navigation 同一结构；
 密封 deny 机制有既有 red-team regression（`declared_read_denials_survive_every_escape_...`）。
-24 个 run 无一读取 `evals/edit/reference/`。
+24 个 run 无一读取 `evals/cases/edit/reference/`。
 
 ## Benchmark Freeze / Model Config / Experimental Design
 

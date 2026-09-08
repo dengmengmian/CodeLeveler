@@ -26,7 +26,7 @@ spending a model run.
 | # | Gate | Check | State |
 | --- | --- | --- | --- |
 | G1 | Reviewer contribution is observable | `sub_agent_finished.contribution` is `Some` on the `independent_review` path | ✅ Phase 1 — verified end to end, 5/5 real runs, `contribution_unmeasured = 0` |
-| G2 | Unmeasured ≠ zero | observer reports `contribution_unmeasured` separately from `zero_findings` | ✅ `eval/lib/reviewer.py` |
+| G2 | Unmeasured ≠ zero | observer reports `contribution_unmeasured` separately from `zero_findings` | ✅ `evals/lib/reviewer.py` |
 | G3 | Independent `expect` reaches the run record | `verifier.ran` is true for every scored run | ✅ `load_expect_verdicts` |
 | G4 | Control arm has headroom | measured control pass rate 50–70 % per case, n ≥ 3 | ❌ **blocking** — see [MA-VALUE-REVIEWER-TASKS](MA-VALUE-REVIEWER-TASKS.md) |
 
@@ -190,9 +190,9 @@ leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL --mod
 leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL --mode reviewer
 
 # Real runs (expensive)
-python3 eval/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL \
+python3 evals/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL \
   --mode self --runs 3 --execute --binary target/release/leveler
-python3 eval/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL \
+python3 evals/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-FORMAL \
   --mode reviewer --runs 3 --execute --binary target/release/leveler
 ```
 

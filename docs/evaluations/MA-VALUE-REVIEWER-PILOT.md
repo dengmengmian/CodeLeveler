@@ -52,13 +52,13 @@ verifier. Not audit. Not CRUD.
 
 | ID | Pressure | Source |
 | --- | --- | --- |
-| `icg-2-bug-fix` | Hidden defect | `evals/icg/` |
-| `rust-race-counter` | Concurrency | `evals/hard/` |
-| `ts-concurrency-limit` | Async limit | `evals/core/` |
-| `ts-redact-secrets` | Secrets | `evals/core/` |
-| `icg-3-cross-module` | API / cross-module | `evals/icg/` |
+| `icg-2-bug-fix` | Hidden defect | `evals/cases/icg/` |
+| `rust-race-counter` | Concurrency | `evals/cases/hard/` |
+| `ts-concurrency-limit` | Async limit | `evals/cases/core/` |
+| `ts-redact-secrets` | Secrets | `evals/cases/core/` |
+| `icg-3-cross-module` | API / cross-module | `evals/cases/icg/` |
 
-Pointers live in `eval/suites/multi_agent/reviewer_value/cases/`.
+Pointers live in `evals/suites/multi_agent/reviewer_value/cases/`.
 
 ### Scale (pilot)
 
@@ -101,7 +101,7 @@ The scorer, not the model, must prove:
 3. Accepted / verified / rejected are distinguishable.
 4. Independent `expect` is the quality score.
 
-Those four are locked by `eval/tests/test_reviewer.py`.
+Those four are locked by `evals/tests/test_reviewer.py`.
 
 ## Decision criteria
 
@@ -138,9 +138,9 @@ leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode
 leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode reviewer
 
 # Pilot execution (expensive): 5 tasks × 1 run per arm
-python3 eval/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT \
+python3 evals/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT \
   --mode self --execute
-python3 eval/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT \
+python3 evals/runner/run.py --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT \
   --mode reviewer --execute
 ```
 

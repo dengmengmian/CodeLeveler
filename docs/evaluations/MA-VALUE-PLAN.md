@@ -142,7 +142,7 @@ outcome is.
 
 ## Status
 
-- [x] Framework inspected; the existing `eval/suites/multi_agent` is reused, not duplicated
+- [x] Framework inspected; the existing `evals/suites/multi_agent` is reused, not duplicated
 - [x] Control arm verified to actually suppress delegation
 - [x] Treatment-arm variance measured (n=3)
 - [ ] Control-arm variance measured (n=3, running)

@@ -379,6 +379,6 @@ $DOGFOOD_ROOT/eval/state/phase-b-7486c3377f19/
   contract-fingerprint-start.txt
   contract-fingerprint-end.txt
   INVALIDATION_NOTE.txt
-eval/manifests/comparative-phase-b.yaml   lab binding manifest
-eval/baselines/beta-7486c3377f19/         the frozen artifact and its hash
+evals/manifests/comparative-phase-b.yaml   lab binding manifest
+evals/baselines/beta-7486c3377f19/         the frozen artifact and its hash
 ```

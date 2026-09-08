@@ -157,9 +157,9 @@ the mechanism targets — old tool results that have left the working set:
 
 | Case | Why | Reads as share of final request (C2.1) |
 | --- | --- | --- |
-| `evals/realrepo/yq-doc-count` | Breadth: 24 paths read once each, accumulating | 57.4 % |
-| `evals/scale/scale-s800` | Long task on a synthetic 800-file tree | — |
-| `evals/realrepo` + ripgrep | Only if the first two pass | 72.2 % |
+| `evals/cases/realrepo/yq-doc-count` | Breadth: 24 paths read once each, accumulating | 57.4 % |
+| `evals/cases/scale/scale-s800` | Long task on a synthetic 800-file tree | — |
+| `evals/cases/realrepo` + ripgrep | Only if the first two pass | 72.2 % |
 
 Ripgrep is deliberately held back: its trajectory is broad-then-narrow, and
 C2.2 established that its old reads get referred back to. It is the least

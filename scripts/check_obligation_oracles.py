@@ -42,8 +42,8 @@ import yaml
 # outside `evals/` because EvaluationCase::load_dir walks that tree recursively
 # and requires every *.yaml below it to parse as a case.
 OBLIGATIONS_DIR = "fixtures/navigation-obligations"
-CASES_DIR = "evals/navigation"
-REFERENCE_DIR = "evals/navigation/reference"
+CASES_DIR = "evals/cases/navigation"
+REFERENCE_DIR = "evals/cases/navigation/reference"
 
 
 def materialize(case: dict, dest: str) -> None:

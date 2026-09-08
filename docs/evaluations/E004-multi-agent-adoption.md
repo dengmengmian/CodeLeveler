@@ -1,7 +1,7 @@
 # E004 — Multi-Agent adoption micro evaluation
 
 **Status:** landed as observer infrastructure. Does not change MA-WA1 runtime.
-**Suite:** `eval/micro/adoption/`
+**Suite:** `evals/suites/adoption/`
 **Estimand:** adoption rate = P(natural spawn | offer seen, valid). KEEP is first-class.
 
 ## Why this exists

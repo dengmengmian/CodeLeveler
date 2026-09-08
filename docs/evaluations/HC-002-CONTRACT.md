@@ -9,7 +9,7 @@ Qualification: `docs/evaluations/HC-002-QUALIFICATION.md`
 | Field | Value |
 |---|---|
 | HC002_CASE_ID | `icg-5-long-task` |
-| source | `evals/icg/icg-5-long-task.yaml` |
+| source | `evals/cases/icg/icg-5-long-task.yaml` |
 | repo | `fixtures/repos/navsvc` @ `4ff2da88655ff83466d6653e0b79dc873467b6bd` plus YAML overlay (none for this case) then `eval baseline` commit |
 | timeout | **1800 seconds** wall clock, identical for all 6 runs |
 | allowed environment | Go toolchain; no network requirement for the judge; unattended harness permissions as in HC-001 |
@@ -139,7 +139,7 @@ Order:
 5. AtomCode r2
 6. CodeLeveler r2
 
-Machine schedule: `eval/comparative/results/hc-002-prepare-evidence/run-manifest.json` (written by `--prepare-only`).
+Machine schedule: `evals/comparative/results/hc-002-prepare-evidence/run-manifest.json` (written by `--prepare-only`).
 
 ## Harness identities (unchanged from HC-001 except CodeLeveler SHA)
 
@@ -147,7 +147,7 @@ Machine schedule: `eval/comparative/results/hc-002-prepare-evidence/run-manifest
 |---|---|
 | AtomCode | `5.0.9` / `52ca5e6` · `~/.local/bin/atomcode` · real `~/.atomcode/config.toml` · `-p -C -y -v --dev --no-telemetry` |
 | DSH | `0.1.2-alpha.1` / `cd5ef8148` · `~/Develop/app/other/deepseek-harness` · isolated `DSH_HOME` · `danger-full-access` |
-| CodeLeveler | `7a263e931a4f3907c1a05d7407413d9e6a722924` (includes `f759ff4a`) · `eval/comparative/results/bin/leveler-7a263e93` · `leveler 0.2.0-beta.1 (7a263e931a4f)` · `assisted + --auto-approve` |
+| CodeLeveler | `7a263e931a4f3907c1a05d7407413d9e6a722924` (includes `f759ff4a`) · `evals/comparative/results/bin/leveler-7a263e93` · `leveler 0.2.0-beta.1 (7a263e931a4f)` · `assisted + --auto-approve` |
 
 Permissions: `assisted + --auto-approve` / `-y` / `danger-full-access`. `PERMISSION_FAIRNESS=ACCEPTABLE`.
 

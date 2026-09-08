@@ -100,7 +100,7 @@ G2 显式依赖 G3/G4/G5/G6 的结果。报告分列六个维度是为了定位�
 唯一 authoritative 命令仍然只有一条，未新建任何平行 benchmark runner：
 
 ```
-python3 scripts/check_fixture_validity.py --cases evals/navigation
+python3 scripts/check_fixture_validity.py --cases evals/cases/navigation
 ```
 
 - 仅当 N1–N8 **全部 VALID** 时 exit 0；否则非零。
@@ -137,14 +137,14 @@ case 侧新增 `validity:` metadata（`maintained_checks` / `constraints` /
 （"`EvaluationCase` 没有 `deny_unknown_fields`，所以应该会忽略"），而是跑真实 loader：
 
 `crates/leveler-eval/src/lib.rs::navigation_cases_still_load_with_benchmark_validity_metadata`
-用 `EvaluationCase::load_dir` 加载 `evals/navigation`，断言 8 个 case 全部到齐且
+用 `EvaluationCase::load_dir` 加载 `evals/cases/navigation`，断言 8 个 case 全部到齐且
 `task` / `expect` / navigation metadata 未受影响；再用 `EvaluationCase::load` 加载一个
 只带 `validity:` 的最小 case。
 
 **这条测试一加上就红了，而且不是因为 `validity:`。**
 
 `EvaluationCase::load_dir` **递归**遍历目录，并要求其下**每个** `.yaml` 都解析成合法 case。
-`f8b83ea` 把 obligation metadata 放在 `evals/navigation/obligations/`，于是全树加载直接失败：
+`f8b83ea` 把 obligation metadata 放在 `evals/cases/navigation/obligations/`，于是全树加载直接失败：
 
 ```
 Parse("missing field `id` at line 11 column 1")

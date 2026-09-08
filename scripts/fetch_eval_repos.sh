@@ -8,7 +8,7 @@
 #         scripts/fetch_eval_repos.sh ripgrep    # fetch one
 #
 # The scenario YAML references `repo: fixtures/repos/<name>` + `base_ref: <ref>`.
-# Keep the refs here in sync with the `base_ref` fields in evals/scenarios/**.
+# Keep the refs here in sync with the `base_ref` fields in evals/cases/scenarios/**.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +18,7 @@ mkdir -p "$dest_root"
 # name|git-url|pinned-ref   (ref must be a tag or full SHA present after clone)
 REPOS=(
   "ripgrep|https://github.com/BurntSushi/ripgrep|14.1.1"
-  # Second real-repo localization case (Go, ~477 files) — evals/realrepo/.
+  # Second real-repo localization case (Go, ~477 files) — evals/cases/realrepo/.
   "yq|https://github.com/mikefarah/yq|v4.44.3"
   # The real-project TUI matrix (fixtures/matrix/README.md) drives these.
   # Pinned so a case starts from the same tree on every machine.

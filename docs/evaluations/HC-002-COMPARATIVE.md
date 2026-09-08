@@ -4,8 +4,8 @@ One case (`icg-5-long-task`), three Harnesses, two repetitions. Not a claim abou
 
 Frozen contract: `docs/evaluations/HC-002-CONTRACT.md`  
 Frozen environment: `docs/evaluations/HC-002-FREEZE.md`  
-Machine results: `eval/comparative/results/hc-002.jsonl`  
-Evidence: `eval/comparative/results/hc-002-evidence/`
+Machine results: `evals/comparative/results/hc-002.jsonl`  
+Evidence: `evals/comparative/results/hc-002-evidence/`
 
 **Headline:** hidden judge is 6/6 PASS. The case **does** discriminate Harnesses. CodeLeveler delivered the work both times, then the new Completion Reconciliation gate failed closed (`verdict=Unavailable`) and the session ended **Blocked / exit 1**. AtomCode and DSH claimed done and exited 0. Wall clock: DSH ~2.0 min, AtomCode ~2.5 min, CodeLeveler ~4.2 min.
 
@@ -23,7 +23,7 @@ Do not open Phase B until CC/user classify the completion-gate finding.
 | | CodeLeveler | AtomCode | DSH |
 |---|---|---|---|
 | Identity | `7a263e931a4f` (`leveler 0.2.0-beta.1`) includes reconciliation `f759ff4a` | `5.0.9` (`52ca5e6`) | `0.1.2-alpha.1` (`cd5ef8148`) |
-| Binary / source | `eval/comparative/results/bin/leveler-7a263e93` (clean worktree) | `~/.local/bin/atomcode` | `~/Develop/app/other/deepseek-harness` |
+| Binary / source | `evals/comparative/results/bin/leveler-7a263e93` (clean worktree) | `~/.local/bin/atomcode` | `~/Develop/app/other/deepseek-harness` |
 | Invocation | `leveler run --repo <abs> --model deepseek/deepseek-v4-flash --auto-approve` | `-p -C -y -v --dev --no-telemetry` | headless + per-run patch / isolated `DSH_HOME` |
 | Drift after batch | NO | NO | NO |
 
@@ -103,7 +103,7 @@ CODELEVELER_FINDING=HC002-F1
 
 **Symptom:** on a solvable engineering task whose hidden judge is green, `update_goal(complete)` is refused because the independent reconciliation generate returned no JSON (`Unavailable`). Fail-closed then forces `blocked` and a non-zero CLI exit.
 
-**Repro:** HC-002 CodeLeveler r1 and r2, evidence under `eval/comparative/results/hc-002-evidence/leveler/icg-5-long-task-r{1,2}/harness-output.log`. Search `verdict=Unavailable`.
+**Repro:** HC-002 CodeLeveler r1 and r2, evidence under `evals/comparative/results/hc-002-evidence/leveler/icg-5-long-task-r{1,2}/harness-output.log`. Search `verdict=Unavailable`.
 
 **Impact:** terminal truth and automation: a successful delivery looks like a failed/blocked run. Extra rounds. Does **not** undo the files (expect still passes).
 
@@ -157,7 +157,7 @@ Phase B stays closed: a completion-truth defect on the freeze SHA would make a 6
 ```
 CODELEVELER_EVAL_BASELINE=7a263e931a4f3907c1a05d7407413d9e6a722924
 CODELEVELER_RECONCILIATION_COMMIT=f759ff4a510a0e5ceabe87e19539cd38eaed3216
-CODELEVELER_BINARY=eval/comparative/results/bin/leveler-7a263e93
+CODELEVELER_BINARY=evals/comparative/results/bin/leveler-7a263e93
 CODELEVELER_IDENTITY=leveler 0.2.0-beta.1 (7a263e931a4f)
 ATOMCODE_VERSION=5.0.9
 ATOMCODE_SHA=52ca5e6

@@ -55,7 +55,7 @@ and no standalone occurrence of `O2` at all.
 
 ### 3.1 `O1–O11` — an ownership eval matrix, not a gate
 
-`eval/safety/manifest.yaml`, introduced by `999c692` *(feat(eval): add adoption
+`evals/suites/safety/manifest.yaml`, introduced by `999c692` *(feat(eval): add adoption
 micro decision benchmark)*:
 
 ```yaml
@@ -67,7 +67,7 @@ ownership:
 Three things settle what this is:
 
 1. It is a **case index for the safety observer**, alongside sandbox and
-   permission — `eval/safety/README.md` describes the whole directory as
+   permission — `evals/suites/safety/README.md` describes the whole directory as
    "Observer of ownership, sandbox, and permission. These are **not** adoption
    tasks."
 2. The cases are **not in this repository**. The README points at

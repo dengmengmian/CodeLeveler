@@ -6,7 +6,7 @@ Recorded before Run #1. Versions must not drift during the six runs.
 
 ```
 CODELEVELER_EVAL_BASELINE=3b400357342cef4caa760628531ead3bd9eff333
-CODELEVELER_BINARY=eval/comparative/results/bin/leveler-3b400357
+CODELEVELER_BINARY=evals/comparative/results/bin/leveler-3b400357
 CODELEVELER_COMMAND=leveler run "<case task 原文>" --repo <case工作区> --model deepseek/deepseek-v4-flash --auto-approve
 CODELEVELER_CONFIG=isolated LEVELER_HOME copy of ~/.leveler/config.toml (not edited)
 CODELEVELER_MODEL=deepseek/deepseek-v4-flash

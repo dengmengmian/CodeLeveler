@@ -149,8 +149,8 @@ measurement read as a measured zero:
 
 | Where | Defect |
 | --- | --- |
-| `eval/lib/reviewer.py` | `contribution: null` counted as 0 findings |
-| `eval/lib/value.py` | same, in the profile aggregation |
+| `evals/lib/reviewer.py` | `contribution: null` counted as 0 findings |
+| `evals/lib/value.py` | same, in the profile aggregation |
 | **TUI projection** | **`ok: false` with 0 findings read as "nothing to flag"** |
 
 The first two were caught by reasoning about the data. This one needed a real

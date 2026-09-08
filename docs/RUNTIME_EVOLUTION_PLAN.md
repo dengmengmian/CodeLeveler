@@ -136,7 +136,7 @@ TUI/Web/remote surface crates
 CLI-specific config/output
 ```
 
-It may still use eval/admin crates for explicit commands, but normal runtime execution should enter through `leveler-app` or a stable runtime client.
+It may still use evals/admin crates for explicit commands, but normal runtime execution should enter through `leveler-app` or a stable runtime client.
 
 ### Planned change
 

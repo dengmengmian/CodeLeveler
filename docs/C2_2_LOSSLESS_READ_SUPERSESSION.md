@@ -177,7 +177,7 @@ canonical messages (drive loop 的 in-memory 工作上下文)
 
 模型 `deepseek/deepseek-v4-flash`，默认产品行为（无 ablation）。
 
-### C1 Representative Set（`evals/realtask`，11 case）
+### C1 Representative Set（`evals/cases/realtask`，11 case）
 
 **11/11 PASS，`expect_passed` 全 True。False completion 0，loop guard trips 0。**
 

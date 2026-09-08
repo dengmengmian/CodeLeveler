@@ -40,7 +40,7 @@
 
 ## 2. Eval Architecture
 
-复用现有体系，未建平行 runner：`crates/leveler-eval`（case 模型 + 指标）· `evals/navigation/`（8 个 case）· `leveler eval run --cases evals/navigation`。
+复用现有体系，未建平行 runner：`crates/leveler-eval`（case 模型 + 指标）· `evals/cases/navigation/`（8 个 case）· `leveler eval run --cases evals/cases/navigation`。
 
 共享底座 `navsvc` 由 `scripts/gen_nav_fixtures.py` 可复现生成（无随机）：29 文件 / 27 个 `.go` / 1,879 LOC，最大文件 `internal/ingest/decoder.go` **1,024 行**。设计细节见 `docs/C2_3C_NAVIGATION_EVAL_DESIGN.md`。
 
@@ -63,7 +63,7 @@ git remote -v                         → 拿到宿主仓路径（clone 的 orig
 git -C <宿主路径> show HEAD:decoder.go → 读原始 fixture，diff 出注入的改动
 ls  <宿主路径>/evals/                  → 走向 case 文件
 find <宿主路径> -iname '*eval*'
-read_file <宿主路径>/evals/navigation/n6-large-file-region.yaml   ← 被工作区守卫拒绝
+read_file <宿主路径>/evals/cases/navigation/n6-large-file-region.yaml   ← 被工作区守卫拒绝
 ```
 
 **`read_file` 被拒了，`shell_command` 没有。** 守卫不能被信赖 —— 面包屑本身必须消失。

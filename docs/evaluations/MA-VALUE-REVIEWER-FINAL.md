@@ -48,7 +48,7 @@ Verdict: `insufficient_n`. Not a product finding.
 ### 1. Observer never joined the independent verifier — FIXED
 
 `leveler eval run --json-out` had already executed each case's `expect` and
-recorded `expect_passed` per case. `eval/lib/runner.py:score_home()` read only
+recorded `expect_passed` per case. `evals/lib/runner.py:score_home()` read only
 the session DBs and never opened `eval_result.json`, so every run scored
 `verifier.ran = false`, `task_success = null`. The quality signal — the
 experiment's primary estimand — was discarded after being computed.
@@ -57,7 +57,7 @@ Fix: `load_expect_verdicts()` joins the verdict by case id; `score_home()`
 takes `verdicts=` and passes `verifier_ran` / `verifier_passed` /
 `verifier_command` into the run record. A verifier that did not run stays
 `passed=None` (unscored), never `False`. Locked by
-`eval/tests/test_expect_join.py`.
+`evals/tests/test_expect_join.py`.
 
 ### 2. `contribution: null` was read as zero findings — FIXED
 
@@ -73,13 +73,13 @@ The runtime was honest. `crates/leveler-engine/src/turn.rs:753` emits
 > available here. `None` says "not measured", which is the truth; a zeroed
 > projection would read as "contributed nothing".
 
-`eval/lib/reviewer.py` then did exactly what that comment warns against —
+`evals/lib/reviewer.py` then did exactly what that comment warns against —
 `finished.get("contribution") or {}` collapsed "not measured" into `0`.
 
 Fix: an unmeasured projection now yields `contribution_unmeasured: True` with
 `findings_* = None`, and is excluded from `zero_findings` and `noise`. The
 report prints an explicit "lifecycle not observable" block instead of a number.
-Locked by `eval/tests/test_contribution_unmeasured.py`.
+Locked by `evals/tests/test_contribution_unmeasured.py`.
 
 ### 3. The lifecycle had no data source on the treatment arm — FIXED 2026-08-24
 
@@ -187,12 +187,12 @@ and then dropped is now emitted.
 
 | File | Change |
 | --- | --- |
-| `eval/lib/runner.py` | `load_expect_verdicts()`; `score_home(verdicts=)` |
-| `eval/runner/run.py` | join verdicts in `run_reviewer_value` |
-| `eval/lib/reviewer.py` | `contribution: null` → unmeasured, not zero |
-| `eval/lib/report.py` | report unmeasured count + explicit warning block |
-| `eval/tests/test_expect_join.py` | new, 5 tests |
-| `eval/tests/test_contribution_unmeasured.py` | new, 6 tests |
+| `evals/lib/runner.py` | `load_expect_verdicts()`; `score_home(verdicts=)` |
+| `evals/runner/run.py` | join verdicts in `run_reviewer_value` |
+| `evals/lib/reviewer.py` | `contribution: null` → unmeasured, not zero |
+| `evals/lib/report.py` | report unmeasured count + explicit warning block |
+| `evals/tests/test_expect_join.py` | new, 5 tests |
+| `evals/tests/test_contribution_unmeasured.py` | new, 6 tests |
 
 Runtime changes (Phase 1, after this report was first written):
 
@@ -203,14 +203,14 @@ Runtime changes (Phase 1, after this report was first written):
 | `crates/leveler-agent/src/executor/drive.rs` | stamp `ExecutorChild` source |
 | `crates/leveler-engine/tests/direct_test.rs` | 2 tests locking the trace |
 
-`python3 -m unittest discover -s eval/tests` → 114 passed.
+`python3 -m unittest discover -s evals/tests` → 114 passed.
 
 ## Artifacts
 
-- `eval/reports/multi_agent/MA-VALUE-REVIEWER-PILOT/{self,reviewer}/report.md`
-- `eval/reports/multi_agent/MA-VALUE-REVIEWER-PILOT/compare.json`
-- `eval/runs/MA-VALUE-REVIEWER-PILOT-self-20260824T102416Z-b290b1/`
-- `eval/runs/MA-VALUE-REVIEWER-PILOT-reviewer-20260824T103018Z-2f2a76/`
+- `evals/reports/multi_agent/MA-VALUE-REVIEWER-PILOT/{self,reviewer}/report.md`
+- `evals/reports/multi_agent/MA-VALUE-REVIEWER-PILOT/compare.json`
+- `evals/runs/MA-VALUE-REVIEWER-PILOT-self-20260824T102416Z-b290b1/`
+- `evals/runs/MA-VALUE-REVIEWER-PILOT-reviewer-20260824T103018Z-2f2a76/`
 
 Both arms were rescored from the existing EventLogs after the observer fixes.
 No additional model runs were spent.

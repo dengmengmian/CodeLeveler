@@ -188,8 +188,8 @@ automated — an LLM judge scoring its own family's output is not independent.
    each from C1/C2/C4, run control-only at n=3, keep what lands in 50–70 %.
    Authoring twelve cases before measuring one is how the pilot's set happened.
 2. Extend to 6–8 admitted cases, ≥ 1 per category.
-3. Vendor under `evals/reviewer/`, pointers in
-   `eval/suites/multi_agent/reviewer_value/cases/`.
+3. Vendor under `evals/cases/reviewer/`, pointers in
+   `evals/suites/multi_agent/reviewer_value/cases/`.
 4. Record every calibration run, including the rejects, in this document.
 
 Step 1 requires real model runs and is therefore not done here.

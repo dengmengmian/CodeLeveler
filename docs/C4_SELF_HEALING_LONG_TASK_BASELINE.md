@@ -50,7 +50,7 @@ C2=找得到，C3=改得对，**C4=失败发生后能否识别、恢复、继续
 
 ## C4 Benchmark Cases（`5dd13b3`/`77c4ed7`/`9ca41b1`/`2f41a60`）
 
-`evals/recovery/`，全部 navsvc 底材、`recovery: true`（R7 除外，它是纯长任务）：
+`evals/cases/recovery/`，全部 navsvc 底材、`recovery: true`（R7 除外，它是纯长任务）：
 
 | slot | 起始状态 | 测什么 |
 | --- | --- | --- |

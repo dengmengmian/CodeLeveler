@@ -24,7 +24,7 @@ loader 58/58。运行期间 benchmark 与 production 双冻结。
 
 ## Test Matrix
 
-`evals/icg/` 6 case × 3 reps = 18 runs，`deepseek/deepseek-v4-flash`，
+`evals/cases/icg/` 6 case × 3 reps = 18 runs，`deepseek/deepseek-v4-flash`，
 预先固定跑满，identity 18/18（`evals/baselines/icg-run-identity.txt`），18 棵终态树保留。
 
 ```

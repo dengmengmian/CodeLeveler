@@ -44,7 +44,7 @@ matrix instead of discovering the next defect only after fixing this one.
 Exit status is 0 only when every case is VALID.
 
 Usage:
-    python3 scripts/check_fixture_validity.py [--cases evals/navigation]
+    python3 scripts/check_fixture_validity.py [--cases evals/cases/navigation]
                                               [--only n6-large-file-region]
                                               [--json out.json]
 """
@@ -64,7 +64,7 @@ import yaml
 
 # Reference patches live beside the cases they prove: <cases-dir>/reference/.
 # Kept as a module global so the checker's own tests can point it elsewhere.
-REFERENCE_DIR = "evals/navigation/reference"
+REFERENCE_DIR = "evals/cases/navigation/reference"
 
 
 def reference_dir_for(cases_dir: str) -> str:
@@ -401,7 +401,7 @@ def check(path: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cases", default="evals/navigation")
+    ap.add_argument("--cases", default="evals/cases/navigation")
     ap.add_argument("--only")
     ap.add_argument("--json")
     args = ap.parse_args()

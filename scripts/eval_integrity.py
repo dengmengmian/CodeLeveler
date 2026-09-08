@@ -20,7 +20,7 @@ Counted per case:
 
 Usage:
     python3 scripts/eval_integrity.py <session-substring> [...]
-    python3 scripts/eval_integrity.py --cases evals/navigation
+    python3 scripts/eval_integrity.py --cases evals/cases/navigation
 """
 
 from __future__ import annotations

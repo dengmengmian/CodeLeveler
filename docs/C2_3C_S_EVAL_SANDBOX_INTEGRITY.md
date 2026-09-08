@@ -21,7 +21,7 @@ C2.3D 的 control variance 期间，一次 N6 运行写出了与隐藏验收**�
 | 260–297 | `git -C <宿主> show HEAD:decoder.go` + `diff` 原始 fixture | 成功 |
 | 350 | `ls -la ~/.leveler/projects/<自己的会话目录>` | 成功 |
 | 405 | `grep -rn "navsvc" <宿主>/evals/` | 成功 |
-| **414** | `read_file <宿主>/evals/navigation/n6-large-file-region.yaml` | **被工作区守卫拒绝** |
+| **414** | `read_file <宿主>/evals/cases/navigation/n6-large-file-region.yaml` | **被工作区守卫拒绝** |
 | **419** | `cat` **同一个文件** | **成功** |
 | 412/419 | `sqlite3 <自己的 events DB> ".tables"` | 成功 |
 | 424 | 写出与隐藏验收逐字相同的测试 | — |

@@ -5,7 +5,7 @@
 | 树 | 职责 |
 | --- | --- |
 | [`evals/`](../../evals/README.md) + `crates/leveler-eval` | 能力：代码是否做对。独立 `expect`。 |
-| [`eval/`](../../eval/README.md) | 行为：委派决策、offer 时机、安全计数、长任务 EventLog。 |
+| [`evals/`](../../evals/README.md) | 行为：委派决策、offer 时机、安全计数、长任务 EventLog。 |
 
 Adoption 微评测协议见 [`E004-multi-agent-adoption.md`](E004-multi-agent-adoption.md)。
 

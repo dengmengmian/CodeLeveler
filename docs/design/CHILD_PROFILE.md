@@ -93,7 +93,7 @@ Old events replay. `None` / empty means "not recorded".
 
 ## Eval
 
-Observer-only, in `eval/lib/value.py`:
+Observer-only, in `evals/lib/value.py`:
 
 | profile | metrics |
 | --- | --- |

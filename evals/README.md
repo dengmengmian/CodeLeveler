@@ -5,7 +5,7 @@ disposable worktrees and checks the result with an independent `expect` command.
 Each YAML case defines the task, starting files, and acceptance command.
 
 Delegation adoption, offer timing, and EventLog scoring live in the separate
-observer tree [`eval/`](../eval/README.md). That tree does not change product
+observer tree [`evals/`](../evals/README.md). That tree does not change product
 runtime. Keep using this directory for capability cases.
 
 ## Suites
@@ -18,17 +18,17 @@ runtime. Keep using this directory for capability cases.
 
 ```sh
 # Fast smoke suite
-leveler eval run --cases evals/smoke
+leveler eval run --cases evals/cases/smoke
 
 # Run the core suite with a selected model
 leveler eval run \
-  --cases evals/core \
+  --cases evals/cases/core \
   --model deepseek/deepseek-chat \
   --json-out evals/baselines/local-run.json
 
 # Compare two configured models under the same cases
 leveler eval compare \
-  --cases evals/hard \
+  --cases evals/cases/hard \
   --repetitions 3 \
   provider-a/model-a provider-b/model-b \
   --json-out evals/baselines/local-compare.json

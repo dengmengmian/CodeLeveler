@@ -12,7 +12,7 @@ CODELEVELER_RECONCILIATION_COMMIT=f759ff4a510a0e5ceabe87e19539cd38eaed3216
 Clean binary (worktree build, not dirty `~/.cargo/bin/leveler`):
 
 ```
-CODELEVELER_BINARY=eval/comparative/results/bin/leveler-7a263e93
+CODELEVELER_BINARY=evals/comparative/results/bin/leveler-7a263e93
 CODELEVELER_COMMAND=leveler run "<task>" --repo <abs ws> --model deepseek/deepseek-v4-flash --auto-approve
 CODELEVELER_IDENTITY=leveler 0.2.0-beta.1 (7a263e931a4f)
 CODELEVELER_BIN_SHA256=51f6e9235b57a6d7ca722f57e395394c676ffe5cae1a87825e1ce88835818836

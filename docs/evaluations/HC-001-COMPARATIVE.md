@@ -4,8 +4,8 @@ One case, three Harnesses, two repetitions. **Not** a claim about the best codin
 
 Frozen contract: `docs/evaluations/HC-001-CONTRACT.md`  
 Frozen environment: `docs/evaluations/HC-001-FREEZE.md`  
-Machine results: `eval/comparative/results/hc-001.jsonl`  
-Evidence: `eval/comparative/results/hc-001-evidence/`
+Machine results: `evals/comparative/results/hc-001.jsonl`  
+Evidence: `evals/comparative/results/hc-001-evidence/`
 
 **Headline:** all six runs PASS the hidden judge in 37–62 seconds with the same two-file fix. The adapters and the judge work. The case does **not** discriminate Harnesses and is far below the 15–40 minute target. Phase B is not ready.
 
@@ -20,7 +20,7 @@ A first attempt aborted after CodeLeveler r1 hit an adapter bug (relative `--rep
 | Field | Value |
 |---|---|
 | SHA | `3b400357342cef4caa760628531ead3bd9eff333` |
-| Binary | `eval/comparative/results/bin/leveler-3b400357` |
+| Binary | `evals/comparative/results/bin/leveler-3b400357` |
 | Identity | `leveler 0.2.0-beta.1 (3b400357342c)` (clean; not the dirty `~/.cargo/bin/leveler`) |
 | Invocation | `leveler run "<task>" --repo <abs ws> --model deepseek/deepseek-v4-flash --auto-approve` |
 | Config | isolated `LEVELER_HOME` copy of `~/.leveler/config.toml` |
@@ -171,7 +171,7 @@ Truthfulness: all six claimed done and were done. CodeLeveler is the only one wi
 
 ## Adapter / infra notes
 
-1. **Relative path abort (not scored).** First CL r1 used `--repo eval/comparative/.../ws` with cwd already that workspace → `failed to canonicalize workspace root` in 0.1s. Batch killed. Evidence kept under `eval/comparative/results/aborted/`. Runner now resolves absolute `--repo` / `-C` / `DSH_HOME`. Classify that class of startup error as `INFRA_FAILURE`.
+1. **Relative path abort (not scored).** First CL r1 used `--repo evals/comparative/.../ws` with cwd already that workspace → `failed to canonicalize workspace root` in 0.1s. Batch killed. Evidence kept under `evals/comparative/results/aborted/`. Runner now resolves absolute `--repo` / `-C` / `DSH_HOME`. Classify that class of startup error as `INFRA_FAILURE`.
 2. Hidden judge is the YAML `expect` (injects `TestSummarySkipsInvalid` + `TestDistinctSkipsInvalid` after the agent exits). Agent never saw it. 6/6 green.
 3. AtomCode completion precision remains `UNMEASURED_PRECISE` vs CodeLeveler structured stop; heuristic agreed with the judge here.
 
@@ -201,7 +201,7 @@ NEW_CODELEVELER_BETA_BLOCKER=0
 NEW_CODELEVELER_BETA_REQUIRED=0
 ```
 
-No new CodeLeveler product bug from the scored runs. The relative-path failure was the eval adapter, already fixed in `eval/comparative/runner.py`.
+No new CodeLeveler product bug from the scored runs. The relative-path failure was the eval adapter, already fixed in `evals/comparative/runner.py`.
 
 ---
 
@@ -209,7 +209,7 @@ No new CodeLeveler product bug from the scored runs. The relative-path failure w
 
 ```
 CODELEVELER_EVAL_BASELINE=3b400357342cef4caa760628531ead3bd9eff333
-CODELEVELER_BINARY=eval/comparative/results/bin/leveler-3b400357
+CODELEVELER_BINARY=evals/comparative/results/bin/leveler-3b400357
 CODELEVELER_COMMAND=leveler run "<task>" --repo <abs ws> --model deepseek/deepseek-v4-flash --auto-approve
 CODELEVELER_CONFIG=isolated LEVELER_HOME copy of ~/.leveler/config.toml
 CODELEVELER_MODEL=deepseek/deepseek-v4-flash

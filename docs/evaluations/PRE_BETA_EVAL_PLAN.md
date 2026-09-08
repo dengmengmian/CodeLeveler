@@ -43,20 +43,20 @@ Phase C  Real Usage（3-5 个真实工程任务，非评测夹具）
 ## 4. 对照 case 套件（§15 类别映射）
 
 复用现有 `EvaluationCase` YAML（无第二 manifest 格式）；全部 `expect` 自包含、可在工作区外部执行 =
-跨 Harness 统一判分器。注释性元数据见 `eval/comparative/manifest.yaml`。
+跨 Harness 统一判分器。注释性元数据见 `evals/comparative/manifest.yaml`。
 
 | # | 类别 | case | 来源 | 判分 | 超时 | 委派机会 |
 |---|---|---|---|---|---|---|
-| 1 | A 小确定修复 | rust-first-even | evals/smoke | cargo test（基线红） | 15m | NONE |
-| 2 | B 中等仓内 bug | go-normalize-email | evals/core | go test | 15m | NONE |
-| 3 | B 中等仓内 bug | ts-concurrency-limit | evals/core | node --test | 15m | NONE |
-| 4 | C 跨文件推理 | n3-caller-propagation | evals/navigation | 隐藏测试注入 | 20m | LOW |
-| 5 | F 行为保持重构 | rust-area-trait | evals/hard | cargo test | 15m | NONE |
-| 6 | E 测试失败诊断 | c4-r2-test-recovery | evals/recovery | 隐藏链 | 20m | LOW |
-| 7 | F 移动依赖重构 | c3-e5-move-dependency | evals/edit | 符号迁移+隐藏测试 | 20m | LOW |
-| 8 | D 搜索型真实仓 | yq-doc-count | evals/realrepo（yq @v4.44.3，477 文件） | bash 验收脚本 | 30m | MEDIUM |
-| 9 | G 长多阶段 | icg-5-long-task | evals/icg（navsvc） | bash 验收脚本 | 30m | MEDIUM |
-| 10 | H 多 Agent 机会 | scale-s800 | evals/scale（800 文件真实仓形态） | bash 验收+改动范围围栏 | 30m | HIGH |
+| 1 | A 小确定修复 | rust-first-even | evals/cases/smoke | cargo test（基线红） | 15m | NONE |
+| 2 | B 中等仓内 bug | go-normalize-email | evals/cases/core | go test | 15m | NONE |
+| 3 | B 中等仓内 bug | ts-concurrency-limit | evals/cases/core | node --test | 15m | NONE |
+| 4 | C 跨文件推理 | n3-caller-propagation | evals/cases/navigation | 隐藏测试注入 | 20m | LOW |
+| 5 | F 行为保持重构 | rust-area-trait | evals/cases/hard | cargo test | 15m | NONE |
+| 6 | E 测试失败诊断 | c4-r2-test-recovery | evals/cases/recovery | 隐藏链 | 20m | LOW |
+| 7 | F 移动依赖重构 | c3-e5-move-dependency | evals/cases/edit | 符号迁移+隐藏测试 | 20m | LOW |
+| 8 | D 搜索型真实仓 | yq-doc-count | evals/cases/realrepo（yq @v4.44.3，477 文件） | bash 验收脚本 | 30m | MEDIUM |
+| 9 | G 长多阶段 | icg-5-long-task | evals/cases/icg（navsvc） | bash 验收脚本 | 30m | MEDIUM |
+| 10 | H 多 Agent 机会 | scale-s800 | evals/cases/scale（800 文件真实仓形态） | bash 验收+改动范围围栏 | 30m | HIGH |
 | 11 | I Browser（CL-only 能力验证） | 前端行为诊断任务 | 真实前端仓 | 行为脚本 | 30m | LOW |
 | 12 | J Restart（CL-only 能力验证） | SIGKILL 连续性 | 真实任务 | 事件/结果核验 | — | — |
 
@@ -122,10 +122,10 @@ dogfood 真实仓（memos/go-task/tailadmin 类）小 issue、一个前端行为
 - `docs/evaluations/HARNESS_COMPARATIVE_EVAL.md`
 - `docs/evaluations/COMPARATIVE_FAIRNESS.md`
 - `docs/evaluations/REAL_USAGE_FINAL.md`
-- 机读结果：`eval/comparative/results/*.json`（复用 BaselineDocument 风格的扁平 JSON）
+- 机读结果：`evals/comparative/results/*.json`（复用 BaselineDocument 风格的扁平 JSON）
 
 ## 11. 卫生项（顺带发现，非本轮 scope）
 
 `~/.leveler/config.toml` 注释中存在两行明文 `sk-` 密钥字面量；eval 运行会把该文件复制进
-`eval/runs/*/home/`（该目录已 gitignore，未入库——已核实 `git ls-files eval/runs` 仅 README）。
+`evals/runs/*/home/`（该目录已 gitignore，未入库——已核实 `git ls-files evals/runs` 仅 README）。
 建议尽快手工删除这两行注释密钥并轮换。

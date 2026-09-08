@@ -62,7 +62,7 @@ new features, new architecture, or more multi-agent work.
 | 4 | Multi-agent | **PASS (execution)** | FS1–FS16 PASS, 13 safety counters 0, ~500 recorded runs; adoption is `NOT_GUARANTEED` **by decision**, not by defect ([`MA-WA1-FINAL.md`](evaluations/MA-WA1-FINAL.md)) |
 | 5 | Provider layer | **PASS with ISSUE** | two wire protocols wired (`openai_chat`, `anthropic_messages`), retry with exponential backoff, four onboarding presets. **No cross-provider fallback exists** and the preset default models are stale — see R-6, R-7 |
 | 6 | UI / clients | **PASS** | TUI closed (669 tests) with PTY-verified flows; Web v2 closed on Project → Sessions; mobile frozen at `mobile-beta-mvp`; `leveler remote` correctly labelled Unstable |
-| 7 | Eval framework | **PASS with ISSUE** | two trees, both real: `crates/leveler-eval` + `evals/` (capability, with recorded baselines) and `eval/` (behaviour; `EVAL_SELFTEST = PASS`, 49 tests, run during this audit). **Neither runs in CI** — see N-1 |
+| 7 | Eval framework | **PASS with ISSUE** | two trees, both real: `crates/leveler-eval` + `evals/` (capability, with recorded baselines) and `evals/` (behaviour; `EVAL_SELFTEST = PASS`, 49 tests, run during this audit). **Neither runs in CI** — see N-1 |
 | 8 | Documentation | **ISSUE** | user-facing claims verified accurate, including the CI platform claim *as a claim about configuration*; but several status headers are stale, the index omits the newest documents, and the quick start ignores the onboarding command the binary ships — see R-3 … R-5 |
 | 9 | Release quality | **BLOCKER** | CI red on `main` for 28 days / 60 runs; Windows does not compile; candidate not on `main`; no pre-release distribution channel |
 
@@ -229,7 +229,7 @@ is made against a complete list. Nothing here blocks the release.
 
 | # | Item | Why it is only *nice* |
 | --- | --- | --- |
-| N-1 | Neither eval tree runs in CI, so regression detection on agent behaviour is manual and depends on someone remembering. `eval/scripts/selftest.sh` is fast, hermetic and model-free — it could be a CI step today; the model-calling suites cannot. | Beta ships on capability gates, not on eval automation |
+| N-1 | Neither eval tree runs in CI, so regression detection on agent behaviour is manual and depends on someone remembering. `evals/scripts/selftest.sh` is fast, hermetic and model-free — it could be a CI step today; the model-calling suites cannot. | Beta ships on capability gates, not on eval automation |
 | N-2 | No prebuilt `aarch64-unknown-linux-gnu`; ARM Linux users build from source. `install.sh` says so cleanly instead of failing obscurely. | Small audience, honest error |
 | N-3 | Bundled model profiles (`configs/models/`) cover DeepSeek and Kimi only. Presets are self-contained, so OpenAI/Anthropic users are not blocked. | Cosmetic asymmetry |
 | N-4 | Migration numbering jumps 0006 → 0012. | Harmless if intentional; confusing to a new contributor |
@@ -273,7 +273,7 @@ Two rules this audit earned, both from the same root cause:
 
 **Method.** Static audit of the working tree, the git history, the GitHub Actions
 history (`gh run list/view` over the last 60 runs on `main`), plus two things
-actually executed during the audit: `eval/scripts/selftest.sh` (`EVAL_SELFTEST =
+actually executed during the audit: `evals/scripts/selftest.sh` (`EVAL_SELFTEST =
 PASS`, 49 tests) and a full local `cargo test --all-targets --no-fail-fast`.
 
 **Local test result** (macOS 15.5, arm64, `4a7d6616`, two full runs). Second run,
@@ -291,4 +291,4 @@ did not attempt to fix anything: every defect above is recorded with a file, a l
 and a fix direction, and left in place.
 
 **Git constraint honoured.** This audit modified `docs/` only. `crates/`, `apps/`,
-`eval/`, `evals/` and every workflow file are byte-identical to `4a7d6616`.
+`evals/`, `evals/` and every workflow file are byte-identical to `4a7d6616`.

@@ -3,7 +3,7 @@
 Eval observes the product. It does not special-case the agent.
 
 There is no `eval_mode`, no forced `spawn_agent`, and no test-only prompt.
-Experiment parameters live in `eval/configs/<suite>/<experiment>.yaml`.
+Experiment parameters live in `evals/configs/<suite>/<experiment>.yaml`.
 
 ## Adoption
 
@@ -28,7 +28,7 @@ KEEP after an offer is a first-class outcome, not a failure.
 **Do not mix safety probes into this denominator.** A probe that instructs
 spawn inflates adoption.
 
-Config: `eval/configs/adoption/m3-baseline.yaml` sets
+Config: `evals/configs/adoption/m3-baseline.yaml` sets
 `population: model_initiated_only` and `exclude: [scripted_spawn, safety_probe, forced_workflow]`.
 
 ## Safety
@@ -47,7 +47,7 @@ must never enter P_natural.
 ## Capability
 
 Still `evals/` + `leveler eval run --cases …`. Framework config
-`eval/configs/capability/smoke.yaml` only points at that harness.
+`evals/configs/capability/smoke.yaml` only points at that harness.
 
 ## Multi-agent value
 
@@ -89,8 +89,8 @@ n < 6 offer-seen runs → `insufficient_n`, not a published verdict.
 
 | id | config | purpose |
 | --- | --- | --- |
-| M-3 baseline | `eval/configs/adoption/m3-baseline.yaml` | product default, task-shape, no prompt change |
-| M-2 budget | `eval/configs/adoption/m2-budget.yaml` | **metadata only** until a product budget knob exists. Must not inject an eval-only cap. |
-| MA-VALUE-001 | `eval/configs/multi_agent/MA-VALUE-001.yaml` | single vs multi on R005–R010; spawn rate is diagnostic |
-| MA-VALUE-REVIEWER-PILOT | `eval/configs/multi_agent/MA-VALUE-REVIEWER-PILOT.yaml` | self-verify vs independent review; finding count is diagnostic |
-| MA-VALUE-001 | `eval/configs/multi_agent/MA-VALUE-001.yaml` | Single vs multi-agent value on Real Usage R005–R010. Spawn rate is not a success metric. |
+| M-3 baseline | `evals/configs/adoption/m3-baseline.yaml` | product default, task-shape, no prompt change |
+| M-2 budget | `evals/configs/adoption/m2-budget.yaml` | **metadata only** until a product budget knob exists. Must not inject an eval-only cap. |
+| MA-VALUE-001 | `evals/configs/multi_agent/MA-VALUE-001.yaml` | single vs multi on R005–R010; spawn rate is diagnostic |
+| MA-VALUE-REVIEWER-PILOT | `evals/configs/multi_agent/MA-VALUE-REVIEWER-PILOT.yaml` | self-verify vs independent review; finding count is diagnostic |
+| MA-VALUE-001 | `evals/configs/multi_agent/MA-VALUE-001.yaml` | Single vs multi-agent value on Real Usage R005–R010. Spawn rate is not a success metric. |

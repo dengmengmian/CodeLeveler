@@ -92,7 +92,7 @@
 
 ```bash
 # control（默认，无 ablation）
-leveler eval run --cases evals/realrepo --model deepseek/deepseek-v4-flash
+leveler eval run --cases evals/cases/realrepo --model deepseek/deepseek-v4-flash
 # treatment
-LEVELER_EVAL_COMMITMENT_NUDGE=8 leveler eval run --cases evals/realrepo --model deepseek/deepseek-v4-flash
+LEVELER_EVAL_COMMITMENT_NUDGE=8 leveler eval run --cases evals/cases/realrepo --model deepseek/deepseek-v4-flash
 ```

@@ -219,7 +219,7 @@ run by AtomCode 5.0.9?         NO
 run by DSH cd5ef814?           NO
 memory carried across runs?    NO — LEVELER_HOME is run_dir/home/.leveler,
                                created fresh per run and seeded with config
-                               only (eval/adapters/launch.py:143)
+                               only (evals/adapters/launch.py:143)
 ```
 
 The residual exposure is a prior model context on the same repository, three

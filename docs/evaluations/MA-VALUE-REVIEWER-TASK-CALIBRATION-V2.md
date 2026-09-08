@@ -175,9 +175,9 @@ about hidden defects.
 
 ## Artifacts
 
-- `evals/reviewer/*.yaml` — six cases, all past the discriminance gate
-- `evals/reviewer-rejected/` — V1 rejects, kept with the reason
-- `eval/runs/MA-VALUE-REVIEWER-CALIBRATION-self-20260824T163706Z-967aed/`
+- `evals/cases/reviewer/*.yaml` — six cases, all past the discriminance gate
+- `evals/cases/reviewer-rejected/` — V1 rejects, kept with the reason
+- `evals/runs/MA-VALUE-REVIEWER-CALIBRATION-self-20260824T163706Z-967aed/`
 
 ## Related
 

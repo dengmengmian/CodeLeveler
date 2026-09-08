@@ -34,7 +34,7 @@
 
 ## 3. 新增真实仓 case
 
-`evals/realrepo/yq-doc-count.yaml`（Go，**477 文件**，pinned `v4.44.3`，经 `scripts/fetch_eval_repos.sh yq` 获取，不入库）。任务与 ripgrep 同型：加一个全局 flag `--doc-count`，需要从 CLI 表面接到求值路径。提示不含文件名/符号名；无 overlay（`git log` 无泄漏）；hidden acceptance 独立（help 可见 + 三文档流计数 + 文件参数 + 不带 flag 行为不变 + 既有测试通过）。已本地两态验证：基线红、参考实现绿。
+`evals/cases/realrepo/yq-doc-count.yaml`（Go，**477 文件**，pinned `v4.44.3`，经 `scripts/fetch_eval_repos.sh yq` 获取，不入库）。任务与 ripgrep 同型：加一个全局 flag `--doc-count`，需要从 CLI 表面接到求值路径。提示不含文件名/符号名；无 overlay（`git log` 无泄漏）；hidden acceptance 独立（help 可见 + 三文档流计数 + 文件参数 + 不带 flag 行为不变 + 既有测试通过）。已本地两态验证：基线红、参考实现绿。
 
 helm（1363 文件）已抓取备用，本轮未跑（时间预算）。
 
@@ -133,6 +133,6 @@ Evidence：
 
 ```bash
 scripts/fetch_eval_repos.sh yq
-leveler eval run --cases evals/realrepo  --model deepseek/deepseek-v4-flash
-leveler eval run --cases evals/scenarios/feature --model deepseek/deepseek-v4-flash
+leveler eval run --cases evals/cases/realrepo  --model deepseek/deepseek-v4-flash
+leveler eval run --cases evals/cases/scenarios/feature --model deepseek/deepseek-v4-flash
 ```

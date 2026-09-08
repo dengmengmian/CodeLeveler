@@ -5,7 +5,7 @@ Frozen **before Run #1**. Do not edit acceptance after seeing results.
 | Field | Value |
 |---|---|
 | case_id | `HC-001` / `n3-caller-propagation` |
-| source | `evals/navigation/n3-caller-propagation.yaml` |
+| source | `evals/cases/navigation/n3-caller-propagation.yaml` |
 | repo | `fixtures/repos/navsvc` + overlay in the YAML `files:` block |
 | revision | fixture HEAD as cloned, then overlay committed as `eval baseline` |
 | timeout | **1200 seconds** wall clock, identical for all 6 runs |

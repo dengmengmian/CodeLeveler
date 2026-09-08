@@ -2376,16 +2376,16 @@ expect: { program: cargo, args: [test] }
 
     #[test]
     fn load_dir_reads_smoke_and_hard_suites() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases");
         let smoke = EvaluationCase::load_dir(&root.join("smoke")).expect("smoke");
         let hard = EvaluationCase::load_dir(&root.join("hard")).expect("hard");
         assert!(
             !smoke.is_empty(),
-            "evals/smoke must contain at least one case"
+            "evals/cases/smoke must contain at least one case"
         );
         assert!(
             !hard.is_empty(),
-            "evals/hard must contain at least one case"
+            "evals/cases/hard must contain at least one case"
         );
         // Suites are selectable by path; ids must not collide within a suite.
         let mut smoke_ids: Vec<_> = smoke.iter().map(|c| c.id.as_str()).collect();
@@ -2402,8 +2402,8 @@ expect: { program: cargo, args: [test] }
         // metadata and must stay invisible here: the loader has to keep reading
         // these cases exactly as before. Asserting that from the serde
         // attributes alone is not enough — this runs the real loader.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/navigation");
-        let cases = EvaluationCase::load_dir(&root).expect("evals/navigation must parse");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/navigation");
+        let cases = EvaluationCase::load_dir(&root).expect("evals/cases/navigation must parse");
         assert_eq!(cases.len(), 8, "navigation suite is N1-N8");
         for case in &cases {
             assert!(!case.task.trim().is_empty(), "{} lost its task", case.id);
@@ -2440,16 +2440,16 @@ expect: { program: cargo, args: [test] }
 
     #[test]
     fn scenario_suite_parses_and_ids_are_unique_across_the_tree() {
-        // Scenario cases (evals/scenarios/**) must parse under the same schema
+        // Scenario cases (evals/cases/scenarios/**) must parse under the same schema
         // and never collide with an id anywhere else in the tree — a duplicate
         // id silently corrupts checkpoints and cross-suite dedup.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases");
         let all = EvaluationCase::load_dir(&root).expect("recursive eval suite");
         let scenarios =
-            EvaluationCase::load_dir(&root.join("scenarios")).expect("evals/scenarios must parse");
+            EvaluationCase::load_dir(&root.join("scenarios")).expect("evals/cases/scenarios must parse");
         assert!(
             !scenarios.is_empty(),
-            "evals/scenarios must contain at least one case"
+            "evals/cases/scenarios must contain at least one case"
         );
         let mut ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
         let total = ids.len();
@@ -2460,7 +2460,7 @@ expect: { program: cargo, args: [test] }
 
     #[test]
     fn root_suite_is_recursive_and_covers_all_first_class_languages() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases");
         let cases = EvaluationCase::load_dir(&root).expect("recursive eval suite");
         const PUBLIC_CASE_FLOOR: usize = 29;
         assert!(

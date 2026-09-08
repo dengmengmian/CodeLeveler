@@ -117,5 +117,5 @@ Evidence（全部来自唯一发散轨迹的实测，n=1，需在实施前用 1-
 ```bash
 python3 scripts/gen_scale_repos.py                 # S100/S300/S800/S1500
 python3 scripts/gen_scale_repos.py --no-map 300 1500
-leveler eval run --cases evals/scale --model deepseek/deepseek-v4-flash
+leveler eval run --cases evals/cases/scale --model deepseek/deepseek-v4-flash
 ```

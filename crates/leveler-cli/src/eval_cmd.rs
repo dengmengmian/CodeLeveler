@@ -280,7 +280,7 @@ pub(crate) async fn cmd_eval(
                 &config_dir,
                 &model_ref,
                 "quick",
-                &["evals/smoke"],
+                &["evals/cases/smoke"],
                 repetitions,
                 json_out,
             )
@@ -299,7 +299,7 @@ pub(crate) async fn cmd_eval(
                 "daily",
                 // Synthetic recovery scenarios join the daily gate; the heavy
                 // real-repo scenarios stay in `release`.
-                &["evals/core", "evals/hard", "evals/scenarios/debugging"],
+                &["evals/cases/core", "evals/cases/hard", "evals/cases/scenarios/debugging"],
                 repetitions,
                 json_out,
             )
@@ -316,7 +316,7 @@ pub(crate) async fn cmd_eval(
                 &config_dir,
                 &model_ref,
                 "release",
-                &["evals/smoke", "evals/core", "evals/hard", "evals/scenarios"],
+                &["evals/cases/smoke", "evals/cases/core", "evals/cases/hard", "evals/cases/scenarios"],
                 repetitions,
                 json_out,
             )
@@ -327,7 +327,7 @@ pub(crate) async fn cmd_eval(
     }
 }
 
-/// Observer-only framework entry: `eval/runner/run.py`.
+/// Observer-only framework entry: `evals/runner/run.py`.
 fn run_framework(
     layout: &Layout,
     suite: String,
@@ -338,7 +338,7 @@ fn run_framework(
     output: Option<std::path::PathBuf>,
     mode: Option<String>,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let script = layout.repo_root.join("eval/runner/run.py");
+    let script = layout.repo_root.join("evals/runner/run.py");
     if !script.is_file() {
         anyhow::bail!(
             "eval runner not found at {} (run from the CodeLeveler repo)",
@@ -376,13 +376,13 @@ fn run_framework(
     })
 }
 
-/// Observer-only: shells to `eval/micro/adoption/runner/run.py`. No product
+/// Observer-only: shells to `evals/suites/adoption/runner/run.py`. No product
 /// runtime flags, no eval_mode, no forced spawn.
 fn run_adoption_micro(
     layout: &Layout,
     command: AdoptionMicroCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let script = layout.repo_root.join("eval/micro/adoption/runner/run.py");
+    let script = layout.repo_root.join("evals/suites/adoption/runner/run.py");
     if !script.is_file() {
         anyhow::bail!(
             "adoption micro runner not found at {} (run from the CodeLeveler repo)",

@@ -1,4 +1,4 @@
-//! Offline eval smoke: load a real `evals/smoke` case, drive the real agent
+//! Offline eval smoke: load a real `evals/cases/smoke` case, drive the real agent
 //! loop with a scripted mock model, and run the case's own expect command.
 //! No network, no API key — this is the CI-safe canary that keeps the eval
 //! case format, the loop's edit path, and the verification command working
@@ -99,7 +99,7 @@ fn text(t: &str) -> ModelResponse {
 async fn smoke_case_runs_offline_end_to_end() {
     // 1. Load the real committed case — its format must stay parseable.
     let case_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/smoke/rust-mul.yaml");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/smoke/rust-mul.yaml");
     let case = leveler_eval::EvaluationCase::load(&case_path).expect("smoke case must parse");
     assert_eq!(case.id, "rust-mul");
 

@@ -511,7 +511,7 @@ fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 pub enum EvalCommand {
     /// Run all cases with one model and report metrics.
     ///
-    /// Capability path: `--cases evals/smoke` (default).
+    /// Capability path: `--cases evals/cases/smoke` (default).
     /// Framework path: `--suite adoption --experiment m3-baseline`.
     Run {
         /// Model reference.
@@ -523,7 +523,7 @@ pub enum EvalCommand {
         /// Eval framework suite (`adoption` | `capability` | `safety` | `multi_agent`).
         #[arg(long)]
         suite: Option<String>,
-        /// Experiment id under `eval/configs/<suite>/` (requires `--suite`).
+        /// Experiment id under `evals/configs/<suite>/` (requires `--suite`).
         #[arg(long)]
         experiment: Option<String>,
         /// Experiment arm for `--suite multi_agent`.
@@ -532,11 +532,11 @@ pub enum EvalCommand {
         /// Isolated home only. Does not change spawn runtime or reviewer permissions.
         #[arg(long)]
         mode: Option<String>,
-        /// Report directory for framework runs (`eval/reports/<suite>/<experiment>`).
+        /// Report directory for framework runs (`evals/reports/<suite>/<experiment>`).
         #[arg(long)]
         output: Option<PathBuf>,
-        /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
-        #[arg(long, default_value = "evals/smoke")]
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/smoke")]
         cases: PathBuf,
         /// Accepted for backward compatibility; eval always uses the direct
         /// tool loop (the multi-phase orchestrate path was removed).
@@ -560,8 +560,8 @@ pub enum EvalCommand {
         model_a: String,
         /// Second model.
         model_b: String,
-        /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
-        #[arg(long, default_value = "evals/hard")]
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/hard")]
         cases: PathBuf,
         /// Repeat every case for each model under the same conditions.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -570,7 +570,7 @@ pub enum EvalCommand {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
     },
-    /// Quick tier (spec §2, L1): the fast pre-commit gate — `evals/smoke`.
+    /// Quick tier (spec §2, L1): the fast pre-commit gate — `evals/cases/smoke`.
     /// Aim: under 5 minutes, core loop + tools + a simple edit.
     Quick {
         /// Model reference.
@@ -583,7 +583,7 @@ pub enum EvalCommand {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
     },
-    /// Daily tier (spec §2, L2): the regression gate — `evals/core` + `evals/hard`.
+    /// Daily tier (spec §2, L2): the regression gate — `evals/cases/core` + `evals/cases/hard`.
     /// Broader debug/feature/refactor/multi-file coverage.
     Daily {
         /// Model reference.
@@ -595,7 +595,7 @@ pub enum EvalCommand {
         json_out: Option<PathBuf>,
     },
     /// Release tier (spec §2, L3): the full gate — every suite including the
-    /// real-repo `evals/scenarios`. Long-running; run `scripts/fetch_eval_repos.sh`
+    /// real-repo `evals/cases/scenarios`. Long-running; run `scripts/fetch_eval_repos.sh`
     /// first so the pinned real repos are present.
     Release {
         /// Model reference.
@@ -628,8 +628,8 @@ pub enum EvalCommand {
         /// Model reference.
         #[arg(long)]
         model: Option<String>,
-        /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
-        #[arg(long, default_value = "evals/hard")]
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/hard")]
         cases: PathBuf,
         /// Accepted for backward compatibility; eval always uses the direct
         /// tool loop.
@@ -648,7 +648,7 @@ pub enum EvalCommand {
     AdoptionMicro(AdoptionMicroCommand),
 }
 
-/// `leveler eval adoption-micro` — EventLog observer over `eval/micro/adoption`.
+/// `leveler eval adoption-micro` — EventLog observer over `evals/suites/adoption`.
 #[derive(Debug, Subcommand)]
 pub enum AdoptionMicroCommand {
     /// Run the decision benchmark (isolated LEVELER_HOME).
@@ -955,7 +955,7 @@ mod tests {
             "--model",
             "deepseek/v4",
             "--cases",
-            "evals/smoke",
+            "evals/cases/smoke",
             "--direct",
             "--repetitions",
             "3",
@@ -978,7 +978,7 @@ mod tests {
                 assert!(experiment.is_none());
                 assert!(!no_verify_gate, "the ablation is opt-in");
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
-                assert_eq!(cases, PathBuf::from("evals/smoke"));
+                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
                 assert!(direct);
                 assert_eq!(repetitions, 3);
                 assert_eq!(
@@ -1013,7 +1013,7 @@ mod tests {
             })) => {
                 assert_eq!(model_a, "model-a");
                 assert_eq!(model_b, "model-b");
-                assert_eq!(cases, PathBuf::from("evals/hard"));
+                assert_eq!(cases, PathBuf::from("evals/cases/hard"));
                 assert_eq!(repetitions, 2);
                 assert_eq!(json_out.as_deref(), Some(std::path::Path::new("out.json")));
             }
@@ -1038,7 +1038,7 @@ mod tests {
             "--runs",
             "3",
             "--output",
-            "eval/reports/adoption/m3-baseline",
+            "evals/reports/adoption/m3-baseline",
         ]);
         match cli.command {
             Some(Command::Eval(EvalCommand::Run {
@@ -1057,7 +1057,7 @@ mod tests {
                 assert_eq!(repetitions, 3);
                 assert_eq!(
                     output.as_deref(),
-                    Some(std::path::Path::new("eval/reports/adoption/m3-baseline"))
+                    Some(std::path::Path::new("evals/reports/adoption/m3-baseline"))
                 );
             }
             other => panic!("expected Eval Run suite mode, got {other:?}"),
@@ -1137,7 +1137,7 @@ mod tests {
         let cli = parse(&["leveler", "eval", "run"]);
         match cli.command {
             Some(Command::Eval(EvalCommand::Run { cases, direct, .. })) => {
-                assert_eq!(cases, PathBuf::from("evals/smoke"));
+                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
                 assert!(!direct);
             }
             other => panic!("expected Eval Run, got {other:?}"),

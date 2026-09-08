@@ -125,7 +125,7 @@ experiment**, and selecting a different subset does not help.
 
 ### Tests
 
-- `python3 -m unittest discover -s eval/tests` → **114 passed**
+- `python3 -m unittest discover -s evals/tests` → **114 passed**
 - `cargo test --workspace` → see the run log; result recorded below
 
 A first workspace run reported `explorer_profile_cannot_write` failing. It was

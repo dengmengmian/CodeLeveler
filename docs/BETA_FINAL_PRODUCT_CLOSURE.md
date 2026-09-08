@@ -260,7 +260,7 @@ An exhaustive search of the current tree and the full history found no frozen
 definition, acceptance criterion, evidence contract or closure document for
 either label, and no deleted or renamed gate matrix that once held them. The
 one same-named artifact that does exist — `Production matrix O1–O11` in
-`eval/safety/manifest.yaml` — is an ownership **eval case series** whose cases
+`evals/suites/safety/manifest.yaml` — is an ownership **eval case series** whose cases
 live in an external control plane, explicitly excluded from adoption
 denominators. It is not a superseding gate, and the ownership substance it
 measures is separately covered by the Multi-agent execution gate (FS1–FS16

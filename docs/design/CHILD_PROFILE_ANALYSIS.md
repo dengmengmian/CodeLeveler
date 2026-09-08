@@ -96,7 +96,7 @@ stable enough for an eval to group on once custom profiles exist.
 
 ### Eval already scores value, not spawn rate
 
-MA-VALUE-001 (`eval/lib/value.py`) records `child_roles` and contribution
+MA-VALUE-001 (`evals/lib/value.py`) records `child_roles` and contribution
 heuristics. It does not yet bucket *by profile*: explorer findings accepted,
 reviewer bugs confirmed, worker changes accepted / verification passed.
 

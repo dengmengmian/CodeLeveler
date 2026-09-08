@@ -158,10 +158,10 @@ reviewer path, unmeasured is distinguished from zero, and the independent
 
 | Path | Contents |
 | --- | --- |
-| `evals/reviewer-v3/` | 5 V3 cases, all past the discriminance and stability gates |
-| `evals/reviewer/` | V2 cases + `go-maplimit-first-error` (race fixed, needs re-measurement) |
-| `evals/reviewer-rejected/` | V1 rejects, kept with reasons |
-| `eval/runs/MA-VALUE-REVIEWER-CALIBRATION-self-*/` | three calibration batches |
+| `evals/cases/reviewer-v3/` | 5 V3 cases, all past the discriminance and stability gates |
+| `evals/cases/reviewer/` | V2 cases + `go-maplimit-first-error` (race fixed, needs re-measurement) |
+| `evals/cases/reviewer-rejected/` | V1 rejects, kept with reasons |
+| `evals/runs/MA-VALUE-REVIEWER-CALIBRATION-self-*/` | three calibration batches |
 
 The suite is not wasted. Thirteen cases with hidden acceptance criteria and a
 verified discriminance gate are a reusable instrument — for the model swap

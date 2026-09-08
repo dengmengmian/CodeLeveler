@@ -25,8 +25,8 @@ if [[ -z "${MODEL_A:-}" || -z "${MODEL_B:-}" ]]; then
 usage: MODEL_A=<ref> MODEL_B=<ref> ./scripts/run_baseline.sh
 
 Both model refs are required so baselines stay comparable across machines.
-Optional: CASES=evals REPETITIONS=3 OUT_DIR=evals/baselines
-  (use CASES=evals/smoke for a cheap smoke compare)
+Optional: CASES=evals/cases REPETITIONS=3 OUT_DIR=evals/baselines
+  (use CASES=evals/cases/smoke for a cheap smoke compare)
 EOF
   exit 2
 fi
