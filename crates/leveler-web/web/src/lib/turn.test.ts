@@ -36,7 +36,7 @@ describe('turnEndFromEvent', () => {
   });
 
   it('returns null for non-terminal events', () => {
-    expect(turnEndFromEvent({ type: 'turn_progress', phase: 'active', closing: false, no_progress_streak: 0, closeout_deny_rounds: 0 })).toBeNull();
+    expect(turnEndFromEvent({ type: 'turn_progress', phase: 'active', closing: false, no_progress_streak: 0 })).toBeNull();
     expect(turnEndFromEvent({ type: 'runtime_ready' })).toBeNull();
   });
 });
@@ -57,6 +57,13 @@ describe('presentTurnEnd', () => {
     const p = presentTurnEnd({ outcome: 'incomplete', detail: 'failed gate(s): cargo test' });
     expect(p.label).toBe('验证未通过');
     expect(p.tone).toBe('warn');
+  });
+
+  it('checks_failed keeps both facts: done, and the checks failed', () => {
+    const p = presentTurnEnd({ outcome: 'checks_failed', detail: 'failed gate(s): cargo test (a::one)' });
+    expect(p.tone).toBe('warn');
+    expect(p.label).toBe('已完成 · 验证未通过');
+    expect(p.detail).toBe('failed gate(s): cargo test (a::one)');
   });
 
   it('unverified is never presented as plain completed', () => {

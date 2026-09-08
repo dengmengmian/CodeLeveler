@@ -45,8 +45,8 @@ pub(crate) async fn cmd_trace(
         s.request_count, s.input_tokens, s.output_tokens, s.last_latency_ms
     );
     println!(
-        "  tools    started {}  finished {}   verify×{}  agents {}  repair {}",
-        s.tool_started, s.tool_finished, s.verification_runs, s.subagent_started, s.repair_started
+        "  tools    started {}  finished {}   verify×{}  agents {}",
+        s.tool_started, s.tool_finished, s.verification_runs, s.subagent_started
     );
     if let Some(last) = s.last_sequence {
         println!(
@@ -100,9 +100,8 @@ pub(crate) async fn cmd_trace(
     }
     println!("\n{}", Line::heading("Recovery"));
     println!(
-        "  interrupted {}  repair {}  snapshots {}  review {:?}",
+        "  interrupted {}  snapshots {}  review {:?}",
         loaded.recovery.interrupted_turns,
-        loaded.recovery.repair_attempts,
         loaded.recovery.workspace_snapshots,
         loaded.recovery.review_stages
     );

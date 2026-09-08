@@ -58,7 +58,7 @@ pub use permission_rules::{
     RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
     clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
 };
-pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile};
+pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile, WriteScope};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
 pub use trust::{
     TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
@@ -66,8 +66,8 @@ pub use trust::{
 };
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
-    WindowsSandboxError, assert_intent_spawn_allowed, assert_windows_spawn_allowed,
-    doctor_sandbox_line, probe_sandbox_capabilities, process_tree_backend_available,
-    validate_acl_root,
+    WindowsSandboxError, assert_background_intent_spawn_allowed, assert_intent_spawn_allowed,
+    assert_windows_spawn_allowed, doctor_sandbox_line, probe_sandbox_capabilities,
+    process_tree_backend_available, validate_acl_root,
 };
 pub use workspace::{PathAccess, Workspace, WorkspaceError, is_sensitive_file_name};

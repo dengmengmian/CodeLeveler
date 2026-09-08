@@ -1272,6 +1272,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
         checks_passed: 1,
         checks_total: 1,
         success: true,
+        verification: leveler_client_protocol::UiVerificationStatus::Passed,
     });
 
     reduce(
@@ -2691,6 +2692,7 @@ fn session_completed_pushes_completion_block() {
                 checks_passed: 4,
                 checks_total: 4,
                 success: true,
+                verification: leveler_client_protocol::UiVerificationStatus::Passed,
             },
         }),
     );

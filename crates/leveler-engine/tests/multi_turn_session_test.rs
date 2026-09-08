@@ -41,14 +41,6 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(reply);
-        }
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
@@ -160,9 +152,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -517,7 +507,7 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     // Ensure we did not complete successfully (resume must be allowed).
     assert_ne!(
         goal_report.outcome,
-        TaskOutcome::Verified,
+        TaskOutcome::Completed,
         "goal fixture must not fully verify"
     );
 

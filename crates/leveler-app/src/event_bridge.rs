@@ -21,10 +21,6 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
             match outcome.stop_reason {
                 StopReason::Completed => RuntimeEvent::TurnCompleted,
                 StopReason::Answered => RuntimeEvent::TurnAnswered,
-                // Plan done, but the model wouldn't stop re-auditing so a guard
-                // ended the turn. Presented as an ended turn (completion is the
-                // verify layer's call), not as Incomplete.
-                StopReason::CloseoutForced => RuntimeEvent::TurnAnswered,
                 StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
                 },
@@ -46,14 +42,6 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 StopReason::Blocked => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
                 },
-                // Harness policy refused every action and the corrective
-                // directive was ignored — needs the policy step or the user,
-                // never "no progress" (R006 R6-P1).
-                StopReason::PolicyBlocked => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| {
-                        "被策略门拦截（如需 update_plan）· 需要处理后继续".into()
-                    }),
-                },
                 StopReason::Stalled => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
                 },
@@ -61,6 +49,9 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                     reason: detail.unwrap_or_else(|| {
                         leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
                     }),
+                },
+                StopReason::CompletedChecksFailed => RuntimeEvent::TurnCompletedChecksFailed {
+                    reason: detail.unwrap_or_else(|| "验证未通过".to_string()),
                 },
             }
         }
@@ -490,11 +481,10 @@ impl EventBridge {
                     phase: phase.to_string(),
                     closing: ledger.closing,
                     no_progress_streak: ledger.no_progress_streak,
-                    closeout_deny_rounds: ledger.closeout_deny_rounds,
                 });
                 if ledger.closing {
                     let _ = self.events.send(RuntimeEvent::AgentActivity {
-                        label: "收口中 · 勿重复空转观察".into(),
+                        label: "计划已完成 · 收口中".into(),
                     });
                 } else if ledger.no_progress_streak > 0 {
                     let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -1303,10 +1293,7 @@ mod projection_equivalence {
                 phase,
                 closing,
                 no_progress_streak,
-                closeout_deny_rounds,
-            } => format!(
-                "progress:{phase}:closing={closing}:streak={no_progress_streak}:deny={closeout_deny_rounds}"
-            ),
+            } => format!("progress:{phase}:closing={closing}:streak={no_progress_streak}"),
             other => format!("{other:?}"),
         }
     }

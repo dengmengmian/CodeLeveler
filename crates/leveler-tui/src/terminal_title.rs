@@ -88,6 +88,7 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
     match end {
         TurnEndStatus::Completed | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
         TurnEndStatus::Unverified
+        | TurnEndStatus::ChecksFailed
         | TurnEndStatus::Truncated
         | TurnEndStatus::Incomplete
         | TurnEndStatus::Failed
@@ -161,6 +162,7 @@ fn activity(state: &AppState, status: TerminalTaskStatus) -> Option<String> {
         TerminalTaskStatus::Failed => Some(
             match last_turn_end(state) {
                 Some(TurnEndStatus::Unverified) => t.title_unverified,
+                Some(TurnEndStatus::ChecksFailed) => t.title_checks_failed,
                 Some(TurnEndStatus::Cancelled) => t.title_cancelled,
                 Some(TurnEndStatus::Failed) => t.title_failed,
                 _ => t.title_incomplete,

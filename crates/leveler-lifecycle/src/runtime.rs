@@ -83,13 +83,23 @@ impl FromStr for SessionStatus {
     }
 }
 
-/// A task's terminal verdict. `Completed` without evidence is
-/// `CompletedUnverified`, never silently `Verified`.
+/// A task's terminal status: how the run ENDED. It says nothing about whether
+/// the project's checks passed — that is the orthogonal [`VerificationStatus`]
+/// — and nothing about whether the user's intent was met, which no runtime
+/// can mechanically establish.
+///
+/// The wire values `verified` and `completed_unverified` were written by
+/// older runtimes for what is now `Completed`; they are accepted on read as a
+/// legacy alias and never written again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOutcome {
-    Verified,
-    CompletedUnverified,
+    /// The model declared the goal complete (or a conversational turn ended
+    /// normally). Look at [`VerificationStatus`] for the project's checks.
+    #[serde(alias = "verified", alias = "completed_unverified")]
+    Completed,
+    /// The model declared the goal unreachable as stated.
+    Blocked,
     /// Execution stopped at an explicit resource boundary. The task is
     /// incomplete and resumable; this is not evidence of model failure.
     BudgetLimited,
@@ -100,17 +110,18 @@ pub enum TaskOutcome {
 impl TaskOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
-            TaskOutcome::Verified => "verified",
-            TaskOutcome::CompletedUnverified => "completed_unverified",
+            TaskOutcome::Completed => "completed",
+            TaskOutcome::Blocked => "blocked",
             TaskOutcome::BudgetLimited => "budget_limited",
             TaskOutcome::Failed => "failed",
             TaskOutcome::Interrupted => "interrupted",
         }
     }
 
-    /// Whether automation may treat this task as successful and ship it.
-    pub fn is_success(self) -> bool {
-        self == Self::Verified
+    /// Whether the run reached its declared end. Automation that also needs
+    /// the project's checks green must look at [`VerificationStatus`] too.
+    pub fn is_completed(self) -> bool {
+        self == Self::Completed
     }
 }
 
@@ -119,14 +130,69 @@ impl FromStr for TaskOutcome {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "verified" => TaskOutcome::Verified,
-            "completed_unverified" => TaskOutcome::CompletedUnverified,
+            "completed" => TaskOutcome::Completed,
+            // Legacy rows written before the status/verification split.
+            "verified" | "completed_unverified" => TaskOutcome::Completed,
+            "blocked" => TaskOutcome::Blocked,
             "budget_limited" => TaskOutcome::BudgetLimited,
             "failed" => TaskOutcome::Failed,
             "interrupted" => TaskOutcome::Interrupted,
             other => {
                 return Err(UnknownVariant {
                     kind: "task outcome",
+                    value: other.to_string(),
+                });
+            }
+        })
+    }
+}
+
+/// What the project's own mechanical checks said about the tree at the end of
+/// the task. Orthogonal to [`TaskOutcome`]: a task can be `Completed` with
+/// checks `Failed`, and the runtime reports both rather than folding them
+/// into one word.
+///
+/// `Passed` means the configured build/test/lint commands exited 0 over the
+/// edited tree. It does not mean the user's request was satisfied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// Every gating check passed over the final tree.
+    Passed,
+    /// At least one gating check failed over the final tree.
+    Failed,
+    /// No check ran: nothing was modified, no checks are configured, or the
+    /// run ended before the terminal boundary.
+    #[default]
+    NotRun,
+    /// Checks were configured but could not produce a verdict (tool missing,
+    /// environment unavailable, timeout).
+    Unavailable,
+}
+
+impl VerificationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerificationStatus::Passed => "passed",
+            VerificationStatus::Failed => "failed",
+            VerificationStatus::NotRun => "not_run",
+            VerificationStatus::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl FromStr for VerificationStatus {
+    type Err = UnknownVariant;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "passed" => VerificationStatus::Passed,
+            "failed" => VerificationStatus::Failed,
+            "not_run" => VerificationStatus::NotRun,
+            "unavailable" => VerificationStatus::Unavailable,
+            other => {
+                return Err(UnknownVariant {
+                    kind: "verification status",
                     value: other.to_string(),
                 });
             }
@@ -162,12 +228,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_verified_is_automation_success() {
-        assert!(TaskOutcome::Verified.is_success());
-        assert!(!TaskOutcome::CompletedUnverified.is_success());
-        assert!(!TaskOutcome::BudgetLimited.is_success());
-        assert!(!TaskOutcome::Failed.is_success());
-        assert!(!TaskOutcome::Interrupted.is_success());
+    fn only_completed_is_a_declared_end() {
+        assert!(TaskOutcome::Completed.is_completed());
+        assert!(!TaskOutcome::Blocked.is_completed());
+        assert!(!TaskOutcome::BudgetLimited.is_completed());
+        assert!(!TaskOutcome::Failed.is_completed());
+        assert!(!TaskOutcome::Interrupted.is_completed());
+    }
+
+    /// Rows and events written before the status/verification split carry
+    /// `verified` / `completed_unverified`. Both were "the run ended as
+    /// declared" with a verification verdict folded in; they read back as
+    /// `Completed` and are never written again.
+    #[test]
+    fn legacy_outcome_strings_read_as_completed() {
+        assert_eq!(
+            TaskOutcome::from_str("verified").unwrap(),
+            TaskOutcome::Completed
+        );
+        assert_eq!(
+            TaskOutcome::from_str("completed_unverified").unwrap(),
+            TaskOutcome::Completed
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskOutcome>("\"verified\"").unwrap(),
+            TaskOutcome::Completed
+        );
+        assert_eq!(TaskOutcome::Completed.as_str(), "completed");
+    }
+
+    #[test]
+    fn verification_status_round_trips_and_defaults_to_not_run() {
+        assert_eq!(VerificationStatus::default(), VerificationStatus::NotRun);
+        for v in [
+            VerificationStatus::Passed,
+            VerificationStatus::Failed,
+            VerificationStatus::NotRun,
+            VerificationStatus::Unavailable,
+        ] {
+            assert_eq!(VerificationStatus::from_str(v.as_str()), Ok(v));
+        }
+        assert!(VerificationStatus::from_str("verified").is_err());
     }
 
     #[test]
@@ -193,8 +294,9 @@ mod tests {
             assert_eq!(SessionStatus::from_str(s.as_str()), Ok(s));
         }
         for o in [
-            TaskOutcome::Verified,
-            TaskOutcome::CompletedUnverified,
+            TaskOutcome::Completed,
+            TaskOutcome::Blocked,
+            TaskOutcome::BudgetLimited,
             TaskOutcome::Failed,
             TaskOutcome::Interrupted,
         ] {

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_context::{FileStateTracker, RepeatedReadGuard};
 use leveler_execution::{
     Checkpoint, CommandRunner, PermissionProfile, ProcessError, RiskLevel, SharedPermissionProfile,
-    Workspace, WorkspaceError,
+    Workspace, WorkspaceError, WriteScope,
 };
 
 /// Shared, cheaply-cloneable context handed to every tool invocation,
@@ -142,6 +142,23 @@ impl ToolPolicy {
     /// Whether this scope holds an unrestricted-filesystem grant.
     pub fn unrestricted_fs(&self) -> bool {
         self.turn_unrestricted_fs
+    }
+
+    /// The write boundary this execution runs under, read once.
+    ///
+    /// Replaces the predicate `mode().confines_workspace() &&
+    /// !unrestricted_fs()` that `run_command` spelled out at every site, plus
+    /// the separate `has_zero_write_authority()` reading; the answer is the
+    /// same, it is just one answer now. Reads the live profile cell, so a
+    /// mid-turn switch lands on the next call.
+    pub fn write_scope(&self, workspace_root: &std::path::Path) -> WriteScope {
+        if self.turn_unrestricted_fs {
+            return WriteScope::Unrestricted;
+        }
+        match self.mode().write_scope(workspace_root) {
+            WriteScope::Workspace { .. } if self.has_zero_write_authority() => WriteScope::None,
+            scope => scope,
+        }
     }
 
     /// User-approved network grant (from `request_permissions`). The ONLY way
@@ -357,6 +374,11 @@ impl ToolContext {
 
     /// Constrain command-driven workspace mutations. Violations are rolled
     /// back to the pre-command snapshot by `run_command`.
+    /// [`ToolPolicy::write_scope`] anchored on this context's workspace.
+    pub fn write_scope(&self) -> WriteScope {
+        self.policy.write_scope(self.execution.workspace.root())
+    }
+
     pub fn with_command_write_constraints(
         mut self,
         allowlist: Option<Vec<String>>,
@@ -538,4 +560,75 @@ pub trait Tool: Send + Sync {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError>;
+}
+
+#[cfg(test)]
+mod write_scope_tests {
+    use super::*;
+    use leveler_execution::WriteScope;
+
+    fn ctx(mode: PermissionProfile) -> (ToolContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        (ToolContext::new(ws, mode), dir)
+    }
+
+    /// PR 1. `ToolPolicy::write_scope` is the single reading of what today is
+    /// spelled three times in `run_command` as
+    /// `mode().confines_workspace() && !unrestricted_fs()` plus a separate
+    /// `has_zero_write_authority()`. Every row here pins a behavior that
+    /// already exists.
+    #[test]
+    fn assisted_confines_writes_to_the_workspace() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let root = c.execution.workspace.root().to_path_buf();
+        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+    }
+
+    #[test]
+    fn full_access_is_unrestricted() {
+        let (c, _d) = ctx(PermissionProfile::FullAccess);
+        assert_eq!(c.write_scope(), WriteScope::Unrestricted);
+    }
+
+    #[test]
+    fn a_turn_grant_lifts_confinement() {
+        let (mut c, _d) = ctx(PermissionProfile::Assisted);
+        c.policy.grant_unrestricted_fs();
+        assert_eq!(c.write_scope(), WriteScope::Unrestricted);
+    }
+
+    /// A late-bound child before `claim_write_scope`: empty allowlist, no
+    /// read-only overlay → nothing may be written.
+    #[test]
+    fn zero_write_authority_is_none() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let c = c.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        assert_eq!(c.write_scope(), WriteScope::None);
+    }
+
+    /// The read-only OVERLAY (`leveler plan`) is orthogonal: it filters tools
+    /// by risk rather than by write scope, so `has_zero_write_authority` is
+    /// false under it and the scope stays the workspace. Pinned so the adapter
+    /// does not quietly merge two mechanisms.
+    #[test]
+    fn read_only_overlay_does_not_collapse_into_none() {
+        let (mut c, _d) = ctx(PermissionProfile::Assisted);
+        c.policy.read_only = true;
+        let root = c.execution.workspace.root().to_path_buf();
+        let c = c.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+    }
+
+    /// Mirrors the predicate it replaces, for the live profile cell too: a
+    /// switch to 完全访问 mid-turn is seen by the next reading.
+    #[test]
+    fn write_scope_follows_the_live_profile() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        assert!(c.write_scope().confines());
+        c.policy
+            .permission_profile()
+            .set(PermissionProfile::FullAccess);
+        assert!(!c.write_scope().confines());
+    }
 }

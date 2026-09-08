@@ -757,6 +757,7 @@ fn renders_completion_block() {
                 checks_passed: 4,
                 checks_total: 4,
                 success: true,
+                verification: leveler_client_protocol::UiVerificationStatus::Passed,
             },
         }),
     );

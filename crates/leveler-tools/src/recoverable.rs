@@ -31,10 +31,12 @@ pub fn sandbox_write_denied() -> &'static str {
     "\n[recoverable] Command ran under workspace write confinement: writes outside \
      the workspace (except temp/toolchain caches) are blocked, and the workspace \
      `.git` tree is write-protected (so `git pull`/`commit`/`fetch` that touch \
-     index/refs will fail with Operation not permitted). Next: call \
-     `request_permissions` with `filesystem=unrestricted` (and `network=true` for \
-     remote git), or `full_access=true`, wait for approval, then retry. Do not claim \
-     the failure is pre-existing or unrelated.\n"
+     index/refs will fail with Operation not permitted). Next: retry THIS EXACT \
+     command once with `escalate` set — `{\"reason\": \"<one sentence>\", \
+     \"filesystem\": \"unrestricted\"}`, adding `\"network\": true` for remote git, or \
+     `\"full_access\": true` for both. The approval prompt that raises is how the \
+     user consents, so do not ask in prose first. Do not claim the failure is \
+     pre-existing or unrelated.\n"
 }
 
 /// Generic permission/preflight refusal with next action.
@@ -69,9 +71,16 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_hint_mentions_request_permissions() {
+    fn sandbox_hint_steers_to_the_one_round_escalation() {
         let s = sandbox_write_denied();
-        assert!(s.contains("request_permissions"));
+        assert!(
+            s.contains("escalate"),
+            "the hint must name the one-round retry, not a separate request: {s}"
+        );
+        assert!(
+            !s.contains("request_permissions"),
+            "steering a denied command back through the two-step is the bug: {s}"
+        );
         assert!(s.contains("filesystem=unrestricted") || s.contains("full_access"));
         assert!(s.contains("[recoverable]"));
         assert!(

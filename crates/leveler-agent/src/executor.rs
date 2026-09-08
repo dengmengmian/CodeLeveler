@@ -7,7 +7,6 @@ mod gates;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
-pub mod round_verdict;
 mod stream;
 
 use std::sync::Arc;
@@ -453,19 +452,15 @@ pub enum StopReason {
     Completed,
     /// The model naturally ended its answer. This closes the conversational
     /// turn but does not prove that an external task is complete.
+    ///
+    /// `closeout_forced` is a legacy wire value from the deleted closeout
+    /// watchdog; it read as "the plan was done, the turn ended abnormally"
+    /// and decodes here.
+    #[serde(alias = "closeout_forced")]
     Answered,
-    /// The run ended cleanly, but its semantic completeness could not be
-    /// established after bounded audit/repair attempts.
+    /// The run ended without finishing: every attempted action was refused
+    /// for several rounds in a row.
     Incomplete,
-    /// The plan was already complete, but the model kept doing redundant
-    /// closeout work (re-running builds/tests or re-observing) and a guard
-    /// force-stopped the turn after the closeout cap. The task's work IS done —
-    /// completeness is the verify layer's call — so this is an abnormal *end*,
-    /// not an incomplete *task*: it maps to a completed session, never to the
-    /// Execute state (which would misreport a finished task as needing more
-    /// work). Distinct from Incomplete so "how the turn ended" and "was the task
-    /// finished" are not encoded in one value.
-    CloseoutForced,
     /// A token or cost budget was exhausted first.
     BudgetExhausted,
     /// The absolute per-turn round ceiling was hit. This is the unconditional
@@ -476,21 +471,24 @@ pub enum StopReason {
     /// same session outcome as `BudgetExhausted` (Incomplete / Execute).
     TurnLimitReached,
     /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
+    ///
+    /// `policy_blocked` is a legacy wire value from the deleted plan-gate
+    /// escalation track and decodes here.
+    #[serde(alias = "policy_blocked")]
     Blocked,
-    /// The turn ended because HARNESS POLICY refused every attempted action
-    /// for several rounds (plan gate / budgets / allowlist) and the injected
-    /// corrective directive was also ignored. This is the harness blocking
-    /// itself — distinct from `Incomplete` (agent stagnation) so a policy
-    /// dead-end is never reported as "the model made no progress" (R006 R6-P1).
-    PolicyBlocked,
     /// Goal mode: the model went quiet without ever resolving the goal via
     /// `update_goal`, even after the quiet-nudge cap. Not a success.
     Stalled,
-    /// The run finished its work, but no verification gate produced passing
-    /// evidence, so leveler will not claim it verified. Synthesized by the
-    /// app's verification mapping — the token loop never emits this. It means
-    /// "done, but unverified", NOT "failed" or "gave up".
+    /// The run finished its work, but the project's checks did not run or
+    /// could not produce a verdict. Synthesized by the app's verification
+    /// mapping — the token loop never emits this. It means "done, checks not
+    /// run", NOT "failed" or "gave up".
     CompletedUnverified,
+    /// The run finished its work and the project's checks then FAILED over
+    /// the final tree. Synthesized by the app's verification mapping — the
+    /// token loop never emits this. Both facts are reported; neither is
+    /// laundered into the other.
+    CompletedChecksFailed,
 }
 
 /// The result of an executor run.
@@ -715,27 +713,6 @@ impl ModelRequestRecord {
     }
 }
 
-/// Whether `tool` is the terminal report of a role that can do nothing else.
-///
-/// The plan gate's own job is to stop multi-step *work* from starting without a
-/// plan — it already lets every read-only navigation tool through, because "plan
-/// is an execution aid, not a license to navigate code". A read-only child is
-/// nothing but navigation and a report: it holds no mutating tool, so there is
-/// no work for a plan to sequence. Holding its one terminal call to that
-/// ceremony spent a Phase C reviewer's entire budget on discovering it needed a
-/// plan to say what it had already found.
-///
-/// Read off the profile, not a role list, and deliberately NOT off
-/// `output_contract.findings` — every profile declares that, so keying on it
-/// would exempt the Worker and the Default agent too, which is the global
-/// bypass this must not be.
-pub(crate) fn role_reports_findings(role: crate::child_profile::AgentRole, tool: &str) -> bool {
-    let profile = crate::sub_agent::ChildProfile::resolve(role);
-    tool == crate::injected_tools::REPORT_FINDING_TOOL
-        && profile.read_only()
-        && profile.output_contract.findings
-}
-
 /// A sink that persists the transcript as the loop advances, enabling resume.
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
@@ -790,10 +767,9 @@ pub enum ModelCallKind {
     Round,
     /// The summarization behind a compaction fold.
     Compaction,
-    /// A bounded call the runtime makes on its own account: deriving the
-    /// completion contract, or the reconciliation judge. Both arms of any
-    /// comparison pay these equally, but a session's absolute cost is short
-    /// by them until they are recorded.
+    /// A bounded harness-initiated call that is not a main-loop round: a
+    /// compaction summary, or a closeout nudge's extra round. Never a second
+    /// model judging the first — that class of call no longer exists.
     Advisory,
 }
 
@@ -805,26 +781,6 @@ pub enum ModelCallKind {
 /// cost would lose exactly those; a collector the call pushes into before it
 /// returns does not.
 pub type AdvisorySpend = Vec<ModelRequestRecord>;
-
-/// Build the record for one completed advisory call.
-pub(crate) fn advisory_record(
-    model: &leveler_model::ModelRef,
-    response: &leveler_model::ModelResponse,
-    latency_ms: u64,
-) -> ModelRequestRecord {
-    ModelRequestRecord {
-        provider_request_id: Some(response.request_id.to_string()),
-        provider: model.provider.clone(),
-        model: model.model.clone(),
-        usage: response.usage,
-        agent_id: None,
-        cost_usd_micros: None,
-        finish_reason: response.finish_reason,
-        latency_ms,
-        retry_count: 0,
-        kind: ModelCallKind::Advisory,
-    }
-}
 
 /// A sink that discards everything (non-persistent runs, tests).
 pub struct NoopSink;
@@ -983,9 +939,6 @@ pub struct TurnPolicy {
     pub context_tiers: Vec<u32>,
     /// The model's quality boundary: plain evidence never expands past it.
     pub reliable_context: u32,
-    /// One-shot strong-evidence grant from the engine (a repair turn whose
-    /// failure evidence may reference folded state).
-    pub repair_expansion_evidence: bool,
     /// Budget the engine recovered from prior `ContextExpanded` events, so a
     /// resumed task does not silently shrink back to the initial tier.
     pub restored_context_budget: Option<u32>,
@@ -1020,13 +973,10 @@ pub struct TurnPolicy {
     pub goal_mode: bool,
     /// Refuse `update_goal(complete)` while model-declared todos are open.
     pub goal_todo_gate: bool,
-    /// Delivery process evidence gate (mutation → verify).
-    pub delivery_gate: bool,
-    /// Product progress heuristics: the identical-result loop guard and the
-    /// round-verdict machinery (observe-only streaks, closeout-thrash forcing,
-    /// all-refused streaks). OFF disables the heuristics but never the safety
-    /// boundary — the absolute round ceiling, step limits, wall clock, and
-    /// cancellation are host safety and remain unconditional.
+    /// Mechanical loop protection: the identical-call/identical-result loop
+    /// guard and the all-calls-refused streak. OFF disables them but never
+    /// the safety boundary — the absolute round ceiling, step limits, wall
+    /// clock, and cancellation are host safety and remain unconditional.
     pub progress_guards: bool,
 
     // ── Delegation ──────────────────────────────────────────────────────────
@@ -1053,7 +1003,6 @@ impl Default for TurnPolicy {
             adaptive_context: false,
             context_tiers: Vec::new(),
             reliable_context: 0,
-            repair_expansion_evidence: false,
             restored_context_budget: None,
             keep_reasoning: false,
             prune_tool_results: false,
@@ -1061,7 +1010,6 @@ impl Default for TurnPolicy {
             goal_mode: false,
             // Matches the historical `Executor::new` default — the gate is ON.
             goal_todo_gate: true,
-            delivery_gate: false,
             progress_guards: true,
             allow_delegation: true,
             delegation_timing: crate::sub_agent::DelegationTiming::default(),
@@ -1073,8 +1021,8 @@ impl Default for TurnPolicy {
 
 impl TurnPolicy {
     /// The minimal direct policy (convergence plan phase 5): every PRODUCT
-    /// heuristic off — no plan gate, no search cap, no todo/delivery
-    /// completion gates, no progress guards. Safety is untouched: admission
+    /// heuristic off — no search cap, no todo completion gate, no loop
+    /// guards. Safety is untouched: admission
     /// (hooks/rules/approval), the side-effect barrier, step limits, the
     /// absolute round ceiling, and cancellation apply exactly as always.
     pub fn minimal() -> Self {
@@ -1129,22 +1077,6 @@ pub struct Executor {
     /// top of a depth-0 run; the pruned outstanding record is the
     /// once-per-restart mark.
     restart_settled_children: Vec<crate::sub_agent::SettledChildNotice>,
-    /// Cross-model completion judge: the model the Completion Reconciliation
-    /// Gate calls. `None` = the executor's own model (documented fallback).
-    /// Separating judge from executor breaks the correlated-interpretation
-    /// failure where the same model approves its own semantic rescoping.
-    /// If a configured judge model is unreachable the gate fails closed —
-    /// never a silent same-model fallback.
-    reconciliation_model: Option<ModelRef>,
-    /// Ceiling for ONE Completion Reconciliation request (`None` = the gate's
-    /// default). Operational policy, not a semantic rule: a slower independent
-    /// judge needs a longer ceiling than the flash-calibrated default, and
-    /// right-censoring the judge shows up as a false NEGATIVE, never a pass.
-    reconciliation_timeout: Option<std::time::Duration>,
-    /// Obligations derived from the ORIGINAL goal at the start of this run.
-    /// `None` means derivation was unavailable — the semantic gate still runs,
-    /// but nothing may read a missing contract as "nothing was required".
-    completion_contract: Option<leveler_lifecycle::CompletionContract>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1226,9 +1158,6 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
-            reconciliation_model: None,
-            reconciliation_timeout: None,
-            completion_contract: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
@@ -1298,38 +1227,6 @@ impl Executor {
 
     /// Select an independent model for the Completion Reconciliation Gate
     /// (cross-model judge). The main execution model is untouched.
-    pub fn with_reconciliation_model(mut self, model: ModelRef) -> Self {
-        self.reconciliation_model = Some(model);
-        self
-    }
-
-    pub fn with_reconciliation_model_opt(mut self, model: Option<ModelRef>) -> Self {
-        self.reconciliation_model = model;
-        self
-    }
-
-    /// Ceiling for one Completion Reconciliation request. `None` keeps the
-    /// gate's default; the host resolves the configured value.
-    pub fn with_reconciliation_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.reconciliation_timeout = Some(timeout);
-        self
-    }
-
-    /// Seed the contract (restart: the obligations are durable, and a resumed
-    /// run must not silently lose them).
-    pub fn with_completion_contract(
-        mut self,
-        contract: leveler_lifecycle::CompletionContract,
-    ) -> Self {
-        self.completion_contract = Some(contract);
-        self
-    }
-
-    pub fn with_reconciliation_timeout_opt(mut self, timeout: Option<std::time::Duration>) -> Self {
-        self.reconciliation_timeout = timeout;
-        self
-    }
-
     /// Hand the run the durable settlements a dead window left unconsumed
     /// (derived by the host from `SubAgentFinished` facts, MA-RT-3 C10).
     pub fn with_restart_settled_children(
@@ -1352,23 +1249,10 @@ impl Executor {
         self
     }
 
-    /// Apply work-profile process gates (Delivery enables delivery_gate + audit).
-    pub fn with_work_profile(mut self, profile: WorkProfile) -> Self {
-        let gate = GateConfig::for_work_profile(profile);
-        self.policy.goal_todo_gate = gate.goal_todo_gate;
-        self.policy.delivery_gate = gate.delivery_gate;
-        if matches!(profile, WorkProfile::Delivery) {
-            // Delivery may enable answer_audit as a tax when eval/host requests it;
-            // default remains off unless explicitly re-enabled by factory.
-        }
-        self
-    }
-
-    /// Force the Delivery evidence gate on or off after the work profile is set.
-    /// The eval ablation seam uses this to lower the rail without rebuilding
-    /// the whole profile; production hosts should prefer [`Self::with_work_profile`].
-    pub fn with_delivery_gate(mut self, on: bool) -> Self {
-        self.policy.delivery_gate = on;
+    /// Apply the work profile. Every profile keeps the same mechanical
+    /// completion gate; the profile only selects the tool surface elsewhere.
+    pub fn with_work_profile(mut self, _profile: WorkProfile) -> Self {
+        self.policy.goal_todo_gate = GateConfig::default().goal_todo_gate;
         self
     }
 
@@ -1376,11 +1260,6 @@ impl Executor {
     pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
         self.memory_index = index.into();
         self
-    }
-
-    /// Whether delivery process evidence is enforced on update_goal(complete).
-    pub fn delivery_gate_enabled(&self) -> bool {
-        self.policy.delivery_gate
     }
 
     /// Set hard per-run limits on commands, modified files, and duration.
@@ -1391,12 +1270,6 @@ impl Executor {
 
     /// Select whether this executor runs to a semantic terminal state or owns
     /// a fixed number of rounds.
-    /// Whether `tool` is this role's declared output. See
-    /// [`role_reports_findings`].
-    fn reports_findings_by_contract(&self, tool: &str) -> bool {
-        role_reports_findings(self.agent_role, tool)
-    }
-
     pub fn with_continuation_policy(mut self, policy: ContinuationPolicy) -> Self {
         self.continuation = policy;
         self
@@ -1617,7 +1490,6 @@ impl Executor {
                 adaptive_context: false,
                 context_tiers: Vec::new(),
                 reliable_context: self.policy.reliable_context,
-                repair_expansion_evidence: false,
                 restored_context_budget: None,
                 keep_reasoning: self.policy.keep_reasoning,
                 prune_tool_results: self.policy.prune_tool_results,
@@ -1633,7 +1505,6 @@ impl Executor {
                 // run uses explicit goal resolution.
                 goal_mode: false,
                 goal_todo_gate: false,
-                delivery_gate: false,
                 // A child inherits the parent's product-guard stance.
                 progress_guards: self.policy.progress_guards,
             },
@@ -1646,9 +1517,6 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
-            reconciliation_model: None,
-            reconciliation_timeout: None,
-            completion_contract: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits {
@@ -1745,11 +1613,6 @@ impl Executor {
     }
 
     /// C5-S3: one-shot strong-evidence grant for a repair turn.
-    pub fn with_repair_expansion_evidence(mut self, granted: bool) -> Self {
-        self.policy.repair_expansion_evidence = granted;
-        self
-    }
-
     /// C5-S3: budget recovered from prior `ContextExpanded` events, so a
     /// resumed or follow-on turn does not shrink back to the initial tier.
     pub fn with_restored_context_budget(mut self, restored: Option<u32>) -> Self {
@@ -1806,8 +1669,8 @@ impl Executor {
         self
     }
 
-    /// Toggle the product progress heuristics (loop guard, observe/closeout
-    /// round verdicts). Safety limits are unaffected. See
+    /// Toggle the mechanical loop guards (identical-result loop guard and the
+    /// all-refused streak). Safety limits are unaffected. See
     /// [`TurnPolicy::progress_guards`].
     pub fn with_progress_guards(mut self, on: bool) -> Self {
         self.policy.progress_guards = on;
@@ -2726,63 +2589,9 @@ mod child_accounting_tests {
 
 #[cfg(test)]
 mod reviewer_policy_tests {
-    use super::*;
-    use crate::child_profile::{AgentRole, ChildProfile};
     use crate::executor::handlers::CHILD_SETTLEMENT_RESERVE;
-    use crate::injected_tools::REPORT_FINDING_TOOL;
     use crate::sub_agent::SUB_AGENT_MAX_DURATION;
     use std::time::Duration;
-
-    fn exempt(role: AgentRole, tool: &str) -> bool {
-        role_reports_findings(role, tool)
-    }
-
-    /// R1. A reviewer's whole output is findings. Holding `report_finding` to
-    /// the executor plan ceremony spent a Phase C reviewer's entire budget on
-    /// discovering it needed a plan to say what it had already found.
-    #[test]
-    fn a_reviewer_may_report_a_finding_without_a_plan() {
-        assert!(exempt(AgentRole::Reviewer, REPORT_FINDING_TOOL));
-        assert!(exempt(AgentRole::Explorer, REPORT_FINDING_TOOL));
-    }
-
-    /// R2/R3. Not a global bypass. The exemption reads the role's output
-    /// contract, so a role that does not deliver findings is unaffected, and
-    /// no other tool is exempted for anyone.
-    #[test]
-    fn the_exemption_is_the_roles_output_contract_not_the_tool_name() {
-        assert!(
-            !exempt(AgentRole::Worker, REPORT_FINDING_TOOL),
-            "a Worker delivers changed files, not findings"
-        );
-        assert!(!exempt(AgentRole::Default, REPORT_FINDING_TOOL));
-        for tool in ["apply_patch", "run_command", "update_goal", "read_file"] {
-            assert!(
-                !exempt(AgentRole::Reviewer, tool),
-                "{tool} is not a reviewer's declared output"
-            );
-        }
-    }
-
-    /// The exemption tracks the profile rather than a hardcoded role list, so
-    /// the two stay in step if a profile's contract changes.
-    #[test]
-    fn every_role_that_declares_findings_is_exempt_and_only_those() {
-        for role in [
-            AgentRole::Default,
-            AgentRole::Explorer,
-            AgentRole::Worker,
-            AgentRole::Reviewer,
-        ] {
-            let profile = ChildProfile::resolve(role);
-            let declares = profile.read_only() && profile.output_contract.findings;
-            assert_eq!(
-                exempt(role, REPORT_FINDING_TOOL),
-                declares,
-                "{role:?} exemption must equal read-only AND declares findings"
-            );
-        }
-    }
 
     /// R6/R7. A child is a tail, not a claim on the deadline: it gets the
     /// parent's remainder minus what settlement needs.

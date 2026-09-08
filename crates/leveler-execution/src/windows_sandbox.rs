@@ -219,6 +219,60 @@ pub enum WindowsSandboxError {
     /// Job Object create/assign failed (WS1). Must not fall back to plain spawn.
     #[error("Windows Job Object setup failed: {0}")]
     JobSetupFailed(String),
+    /// The background registry has no confining runner on Windows (PR 0).
+    /// A restricted background command is refused rather than plain-spawned.
+    #[error(
+        "Windows background execution cannot confine writes to {write_root}; \
+         refusing to run it unconfined. Run the command in the foreground, \
+         or use FullAccess explicitly"
+    )]
+    ConfinedBackgroundUnsupported { write_root: String },
+}
+
+/// PR 0. Pure decision behind [`assert_background_intent_spawn_allowed`],
+/// testable on every platform: a confined intent may only proceed when a
+/// runner exists that can actually confine a *background* spawn.
+pub(crate) fn confined_background_refusal(
+    intent: &FilesystemIntent,
+    confining_background_runner_available: bool,
+) -> Result<(), WindowsSandboxError> {
+    if intent.is_unrestricted() || confining_background_runner_available {
+        return Ok(());
+    }
+    let write_root = match intent {
+        FilesystemIntent::WorkspaceWrite { write_root, .. } => write_root.display().to_string(),
+        FilesystemIntent::ReadOnly { read_roots } => read_roots
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(read-only intent)".to_string()),
+        FilesystemIntent::Unrestricted => unreachable!("handled above"),
+    };
+    Err(WindowsSandboxError::ConfinedBackgroundUnsupported { write_root })
+}
+
+/// Gate for `BackgroundTaskRegistry::spawn` (PR 0).
+///
+/// [`assert_intent_spawn_allowed`] only checks that a confining backend
+/// EXISTS; the foreground runner then uses it, but the background registry
+/// never did — it plain-spawns — so on a Windows host with AppContainer
+/// linked a restricted background command ran with no confinement at all.
+/// Until background spawns share the foreground runner (PR 4), a confined
+/// intent is refused here on Windows. Off Windows the argv wrappers
+/// (seatbelt / bwrap) confine background spawns already, so the ordinary
+/// gate applies.
+pub fn assert_background_intent_spawn_allowed(
+    intent: &FilesystemIntent,
+    deny_network: bool,
+) -> Result<(), WindowsSandboxError> {
+    assert_intent_spawn_allowed(intent, deny_network)?;
+    #[cfg(windows)]
+    {
+        confined_background_refusal(intent, /* no confining background runner yet */ false)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
 }
 
 /// Whether a restricted process request may proceed on this host.
@@ -449,5 +503,66 @@ mod tests {
         // Legacy mapping still used when intent is None.
         let legacy = FilesystemIntent::from_legacy(Some(Path::new("/ws")), false);
         assert!(matches!(legacy, FilesystemIntent::WorkspaceWrite { .. }));
+    }
+}
+
+#[cfg(test)]
+mod background_gate_tests {
+    use super::*;
+
+    /// PR 0. `BackgroundTaskRegistry` never had a confining runner: it checks
+    /// that a backend EXISTS and then plain-spawns, so on a Windows host with
+    /// AppContainer linked a restricted background command ran unconfined.
+    /// Until the background path shares the foreground runner, a confined
+    /// intent must be refused outright — never degraded to a plain spawn.
+    #[test]
+    fn a_confined_background_intent_is_refused_when_no_confining_runner_exists() {
+        let ws = FilesystemIntent::WorkspaceWrite {
+            write_root: PathBuf::from("C:\\ws"),
+            extra_read_roots: vec![],
+        };
+        let err = confined_background_refusal(&ws, false).expect_err("must refuse");
+        let text = err.to_string();
+        assert!(text.contains("C:\\ws"), "names the root it refused: {text}");
+        assert!(
+            text.to_lowercase().contains("background"),
+            "says which path refused it: {text}"
+        );
+
+        let ro = FilesystemIntent::ReadOnly {
+            read_roots: vec![PathBuf::from("C:\\ws")],
+        };
+        assert!(confined_background_refusal(&ro, false).is_err());
+    }
+
+    #[test]
+    fn an_unrestricted_background_intent_is_never_refused_by_this_gate() {
+        assert!(confined_background_refusal(&FilesystemIntent::Unrestricted, false).is_ok());
+        assert!(confined_background_refusal(&FilesystemIntent::Unrestricted, true).is_ok());
+    }
+
+    #[test]
+    fn a_confined_background_intent_passes_once_a_confining_runner_exists() {
+        let ws = FilesystemIntent::WorkspaceWrite {
+            write_root: PathBuf::from("C:\\ws"),
+            extra_read_roots: vec![],
+        };
+        assert!(confined_background_refusal(&ws, true).is_ok());
+    }
+
+    /// The public gate the background registry calls. Off Windows the
+    /// Unix sandbox wrappers confine background spawns already, so it must
+    /// stay permissive there or every macOS/Linux background task breaks.
+    #[test]
+    fn background_gate_is_permissive_off_windows_and_closed_on_windows() {
+        let ws = FilesystemIntent::WorkspaceWrite {
+            write_root: PathBuf::from("/ws"),
+            extra_read_roots: vec![],
+        };
+        let result = assert_background_intent_spawn_allowed(&ws, false);
+        #[cfg(not(windows))]
+        assert!(result.is_ok(), "{result:?}");
+        #[cfg(windows)]
+        assert!(result.is_err(), "{result:?}");
     }
 }

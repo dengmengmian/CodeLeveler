@@ -220,10 +220,14 @@ pub enum RuntimeEvent {
     /// The executor stopped cleanly but did not reach a successful terminal
     /// state (for example, budget exhaustion or an unresolved goal).
     TurnIncomplete { reason: String },
-    /// The turn finished its work, but leveler could not independently verify
-    /// it (no verification gate produced passing evidence). Done, not verified —
-    /// distinct from `TurnIncomplete` (which means the work did not finish).
+    /// The turn finished its work, but the project's checks did not run or
+    /// could not produce a verdict. Done, not verified — distinct from
+    /// `TurnIncomplete` (which means the work did not finish).
     TurnCompletedUnverified { reason: String },
+    /// The turn finished its work and the project's own checks then FAILED
+    /// over the final tree. Done, checks failed — both facts stand; `reason`
+    /// names the failing checks.
+    TurnCompletedChecksFailed { reason: String },
     /// The current turn failed.
     TurnFailed { error: String },
     /// The current turn was cancelled (resumable).
@@ -341,7 +345,6 @@ pub enum RuntimeEvent {
         phase: String,
         closing: bool,
         no_progress_streak: u32,
-        closeout_deny_rounds: u32,
     },
     /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
     /// projection of durable facts for the current or a historical session.
@@ -434,7 +437,6 @@ mod tests {
                 phase: "closing".into(),
                 closing: true,
                 no_progress_streak: 2,
-                closeout_deny_rounds: 1,
             },
             "turn_progress",
         );
@@ -481,7 +483,6 @@ mod tests {
                 verification_runs: 0,
                 compact_count: 0,
                 subagent_started: 0,
-                repair_started: 0,
             },
             window: Vec::new(),
             window_from: 1,
@@ -491,7 +492,6 @@ mod tests {
             agents: Vec::new(),
             recovery: crate::UiRecoveryObservation {
                 interrupted_turns: 0,
-                repair_attempts: 0,
                 workspace_snapshots: 0,
                 review_stages: Vec::new(),
             },
@@ -867,6 +867,7 @@ mod tests {
                     added: 2,
                     removed: 3,
                     checks_passed: 4,
+                    verification: crate::progress::UiVerificationStatus::Passed,
                     checks_total: 5,
                     success: true,
                 },
@@ -900,6 +901,12 @@ mod tests {
                 reason: "no verification gate".to_string(),
             },
             "turn_completed_unverified",
+        );
+        roundtrip(
+            RuntimeEvent::TurnCompletedChecksFailed {
+                reason: "test: 2 failed".to_string(),
+            },
+            "turn_completed_checks_failed",
         );
     }
 

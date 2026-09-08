@@ -75,6 +75,13 @@ export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 /** The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`). */
 export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
+/** Why a runtime is being asked to retire. Typed rather than a string because the updater will reuse this exact lifecycle: install an artifact, ask the running runtime to retire, verify the replacement's identity. Only the reason differs. */
+export type RestartReason =
+  /** The connecting client is a different build than this runtime. */
+  | 'build_mismatch'
+  /** A newer artifact is installed and waiting to take over. Reserved for the updater; nothing sends it yet. */
+  | 'update_ready';
+
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
 
@@ -153,8 +160,10 @@ export interface UiCompletionReport {
   checks_total: number;
   files_changed: number;
   removed: number;
-  /** Whether the run completed and verified successfully. */
+  /** Whether the run completed and every gating check passed. Kept for existing clients; `verification` carries the full status. */
   success: boolean;
+  /** The project's own checks over the final tree. Absent on reports written before the status/verification split (reads as `not_run`). */
+  verification?: UiVerificationStatus;
 }
 
 /** A summary of working-tree changes. */
@@ -304,7 +313,6 @@ export interface UiReasoningState {
 /** Recovery facts that are already durable and safe to show. */
 export interface UiRecoveryObservation {
   interrupted_turns: number;
-  repair_attempts: number;
   review_stages: string[];
   workspace_snapshots: number;
 }
@@ -338,7 +346,6 @@ export interface UiSessionObservation {
   last_sequence?: number | null;
   model: string;
   output_tokens: number;
-  repair_started: number;
   repository: string;
   request_count: number;
   request_failures: number;
@@ -456,6 +463,9 @@ export interface UiVerification {
   passed?: boolean | null;
 }
 
+/** What the project's own checks reported over the final tree. Orthogonal to whether the run completed: `Passed` means the configured commands exited 0, never that the user's request was satisfied. */
+export type UiVerificationStatus = 'passed' | 'failed' | 'not_run' | 'unavailable';
+
 /** Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation. */
 export type UserShellId = string;
 
@@ -473,6 +483,8 @@ export type ClientCommand =
   | { type: 'add_attachment_data'; data_base64: string; name: string; session_id: SessionId }
   /** Import an image from the system clipboard (spec §38.1). */
   | { type: 'add_clipboard_image'; session_id: SessionId }
+  /** Retire this runtime once its current work has settled. One mechanism covers both cases the caller cares about: an idle runtime drains instantly and exits, a busy one stops taking new work and exits when the work it already owns is done. The caller never polls for idleness and never kills anything — the runtime owns the drain, because only it knows what "still working" means. */
+  | { type: 'shutdown_when_idle'; reason: RestartReason }
   /** Cooperatively cancel the running turn (graceful; resumable). */
   | { type: 'cancel_current_turn'; session_id: SessionId }
   /** Escalate a cancel the user has already requested once. */
@@ -615,8 +627,10 @@ export type RuntimeEvent =
   | { type: 'turn_truncated'; error: string }
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
   | { type: 'turn_incomplete'; reason: string }
-  /** The turn finished its work, but leveler could not independently verify it (no verification gate produced passing evidence). Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish). */
+  /** The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish). */
   | { type: 'turn_completed_unverified'; reason: string }
+  /** The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks. */
+  | { type: 'turn_completed_checks_failed'; reason: string }
   /** The current turn failed. */
   | { type: 'turn_failed'; error: string }
   /** The current turn was cancelled (resumable). */
@@ -650,6 +664,6 @@ export type RuntimeEvent =
   /** Side-question failed. */
   | { type: 'btw_failed'; error: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
-  | { type: 'turn_progress'; closeout_deny_rounds: number; closing: boolean; no_progress_streak: number; phase: string }
+  | { type: 'turn_progress'; closing: boolean; no_progress_streak: number; phase: string }
   /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a 1.6 client must not treat that as ownership. */
   | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null };

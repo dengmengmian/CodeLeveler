@@ -11,7 +11,6 @@ use leveler_agent::{
     ContinuationPolicy, Executor, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
     WorkProfile,
 };
-use leveler_lifecycle::classify_task;
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_tools::{ToolContext, ToolRegistry};
 
@@ -91,25 +90,19 @@ pub struct ExecutorFactory {
     pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
-    /// Cross-model completion judge for the reconciliation gate. `None` =
-    /// executor's own model. Parsed from config; the main model is untouched.
-    pub completion_judge_model: Option<ModelRef>,
-    /// Ceiling for one completion-reconciliation request. `None` = the gate's
-    /// default (60s). Operational policy resolved from config.
-    pub completion_judge_timeout: Option<std::time::Duration>,
-    /// When the harness launches an independent reviewer. Default `Auto`.
+    /// Whether the harness launches an independent reviewer at closure.
+    /// Default `Off`; only explicit configuration turns it on.
     pub independent_review: crate::policy_resolver::IndependentReviewPolicy,
 }
 
 impl ExecutorFactory {
     /// `task` is the turn's raw request text when the caller has it (fresh
-    /// Goal/Content turns; `None` for resumes). It feeds P3 task-class
-    /// grading: conversational turns skip the completion-evidence gate and the
-    /// answer audit.
+    /// Goal/Content turns; `None` for resumes). It is not classified: the
+    /// runtime no longer grades a request as implementation-shaped or not.
     pub async fn build(
         &self,
         profile: TurnProfile,
-        task: Option<&str>,
+        _task: Option<&str>,
     ) -> Result<Executor, EngineError> {
         let model_profile = self
             .runtime
@@ -122,8 +115,6 @@ impl ExecutorFactory {
             &profile,
             self.overrides.as_ref(),
         );
-        let task_class = task.map(classify_task);
-        tracing::info!(task_class = ?task_class, "task classified");
         let child_policy = |role| {
             let policy =
                 resolve_execution_policy(&model_profile, role, &profile, self.overrides.as_ref());
@@ -169,8 +160,6 @@ impl ExecutorFactory {
         .with_context_trace(resolved.context_trace)
         .with_tool_result_pruning(resolved.prune_tool_results)
         .with_kept_reasoning(resolved.keep_reasoning)
-        .with_reconciliation_model_opt(self.completion_judge_model.clone())
-        .with_reconciliation_timeout_opt(self.completion_judge_timeout)
         // A model profile may ship its own system prompt; None keeps the default.
         .with_base_instructions(model_profile.instructions.clone())
         .with_permission_rules(self.permission_rules.clone())
@@ -184,10 +173,10 @@ impl ExecutorFactory {
             resolved.max_parallel_tools,
         )
         .with_structure(resolved.explicit_plan)
-        // Progress heuristics (loop guard + observe/closeout thrash) share the
-        // eval ablation seam with the tools-layer repeated-read guard so a
-        // single-knob flip measures the whole product class. Production default
-        // is on for both; only ExecutionOverrides may lower them.
+        // The mechanical loop guards share the eval ablation seam with the
+        // tools-layer repeated-read guard so a single-knob flip measures the
+        // whole class. Production default is on; only ExecutionOverrides may
+        // lower them.
         .with_progress_guards(resolved.repeated_read_guard)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
@@ -205,13 +194,6 @@ impl ExecutorFactory {
         executor = executor
             .with_work_profile(self.work_profile)
             .with_memory_index(self.memory_index.clone());
-
-        // `completion_evidence` is the eval-only lower of the Delivery evidence
-        // gate. The work profile decides the production default; only the
-        // ablation seam may force the gate off (never raise it above the profile).
-        if !resolved.completion_evidence {
-            executor = executor.with_delivery_gate(false);
-        }
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

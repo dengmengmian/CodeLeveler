@@ -2,7 +2,14 @@
 //!
 //! `create_task` persists WHAT will run (goal/mode/sandbox/kind) so resume
 //! never guesses; `run` executes the session's strategy over fully-persisted
-//! turns and stamps the terminal [`TaskOutcome`] on the session row.
+//! turns and stamps the terminal [`TaskOutcome`] and
+//! [`leveler_lifecycle::VerificationStatus`] on the session row.
+//!
+//! Authority boundary: the engine records how the run ended and what the
+//! project's own checks said about the final tree. It does not judge whether
+//! the work satisfies the user, does not repair on the model's behalf, and
+//! does not launch a second model to grade the first unless configured to
+//! review explicitly.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,20 +19,14 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
 use leveler_core::{SessionId, TaskId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
-use leveler_lifecycle::{AgentState, SessionStatus};
+use leveler_lifecycle::{AgentState, SessionStatus, VerificationStatus};
 use leveler_storage::{EngineStores, EventStore, SessionRecord};
-use leveler_verifier::{
-    CompletionVerdict, ExpectedEvidence, Verdict, VerificationPlan, VerificationReport, Verifier,
-    finalize_task_outcome,
-};
+use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
 use crate::factory::{ExecutorFactory, TurnProfile};
 use crate::log::{DanglingCall, EventLog, SnapshotView};
 use crate::turn::{TurnInput, TurnRunner};
 use crate::{EngineError, EngineEvent, ExecutionKind, TaskOutcome, TurnKind};
-
-/// How many verification-repair turns a direct task may spend.
-const DIRECT_REPAIR_ATTEMPTS: u32 = 1;
 
 /// Whether a dangling call may be re-run automatically after a crash.
 ///
@@ -182,9 +183,9 @@ pub(crate) struct SegmentMarks {
     /// Mutation records that touched a source path (not a test, not a probe,
     /// not `node_modules`).
     pub source_changes: usize,
-    /// Close attempts the gate refused (`update_goal` / reconciliation
-    /// intercepts). An accepted close ends the task, so this is every attempt
-    /// that did not.
+    /// Close attempts the mechanical gate refused (`update_goal` intercepts).
+    /// An accepted close ends the task, so this is every attempt that did
+    /// not.
     pub close_attempts: usize,
 }
 
@@ -208,7 +209,7 @@ pub(crate) fn segment_marks(ledger: &leveler_lifecycle::EvidenceLedger) -> Segme
         close_attempts: ledger
             .intercepts
             .iter()
-            .filter(|i| i.kind == "update_goal" || i.kind == "completion_reconciliation")
+            .filter(|i| i.kind == "update_goal")
             .count(),
     }
 }
@@ -276,38 +277,22 @@ pub(crate) async fn last_persisted_window_state(
     }
 }
 
+/// The session's lifecycle columns for a finished task.
+///
+/// Read off how the run ENDED, never off the verification verdict: a task the
+/// model declared complete is a completed session whether or not the
+/// project's checks passed — the checks are reported beside it as
+/// [`VerificationStatus`], not folded into the status.
 pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentState) {
     use StopReason as S;
-    let verification_failed = report
-        .verification
-        .as_ref()
-        .is_some_and(|verification| verification.verdict() == Verdict::Failed);
-    let did_work = report.stop_reason == S::Completed || !report.modified_files.is_empty();
-    let effective = if verification_failed {
-        S::Incomplete
-    } else {
-        match report.outcome {
-            // A guard-forced Incomplete stop keeps its honest terminal status:
-            // gate-green describes the tree, not task completion (R004 F4).
-            TaskOutcome::Verified if did_work && report.stop_reason != S::Incomplete => {
-                S::Completed
-            }
-            TaskOutcome::CompletedUnverified if did_work && report.stop_reason != S::Incomplete => {
-                S::CompletedUnverified
-            }
-            _ => report.stop_reason,
-        }
-    };
-    match effective {
-        S::Completed | S::Answered | S::CloseoutForced | S::CompletedUnverified => {
+    match report.stop_reason {
+        S::Completed | S::Answered | S::CompletedUnverified | S::CompletedChecksFailed => {
             (SessionStatus::Completed, AgentState::Complete)
         }
         S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
             (SessionStatus::Incomplete, AgentState::Execute)
         }
-        // A harness-policy dead end needs attention, not silent retry: same
-        // resumable-with-attention class as a model-declared block (R006 R6-P1).
-        S::Blocked | S::PolicyBlocked => (SessionStatus::Blocked, AgentState::Execute),
+        S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
     }
 }
 
@@ -486,6 +471,9 @@ pub(crate) fn bound_goal_history(
 #[derive(Debug)]
 pub struct TaskReport {
     pub outcome: TaskOutcome,
+    /// What the project's own checks said over the final tree. Orthogonal to
+    /// `outcome`.
+    pub verification_status: VerificationStatus,
     pub final_text: String,
     pub modified_files: Vec<String>,
     pub verification: Option<VerificationReport>,
@@ -520,6 +508,7 @@ impl TaskReport {
     ) -> Self {
         Self {
             outcome,
+            verification_status: VerificationStatus::NotRun,
             final_text,
             modified_files,
             verification: None,
@@ -637,6 +626,7 @@ impl TaskEngine {
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         reason: Option<String>,
         stop: Option<StopReason>,
         status: SessionStatus,
@@ -645,6 +635,7 @@ impl TaskEngine {
     ) -> Result<(), EngineError> {
         let event = EngineEvent::TaskFinished {
             outcome,
+            verification,
             reason,
             stop,
         };
@@ -657,6 +648,7 @@ impl TaskEngine {
                 &event_type,
                 &payload,
                 outcome,
+                verification,
                 status,
                 state,
                 leveler_core::now(),
@@ -732,7 +724,8 @@ impl TaskEngine {
                     token,
                     session_id,
                     report.outcome,
-                    (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
+                    report.verification_status,
+                    (report.outcome != TaskOutcome::Completed).then(|| report.final_text.clone()),
                     Some(report.stop_reason),
                     status,
                     state,
@@ -745,6 +738,7 @@ impl TaskEngine {
                     token,
                     session_id,
                     TaskOutcome::Interrupted,
+                    VerificationStatus::NotRun,
                     None,
                     None,
                     SessionStatus::Interrupted,
@@ -758,6 +752,7 @@ impl TaskEngine {
                     token,
                     session_id,
                     TaskOutcome::Failed,
+                    VerificationStatus::NotRun,
                     Some(error.to_string()),
                     None,
                     SessionStatus::Failed,
@@ -1144,10 +1139,7 @@ impl TaskEngine {
                 spec.runtime.kind.as_str()
             )));
         }
-        if matches!(
-            outcome,
-            Some(TaskOutcome::Verified) | Some(TaskOutcome::CompletedUnverified)
-        ) {
+        if outcome == Some(TaskOutcome::Completed) {
             return Err(EngineError::Config(format!(
                 "session {session_id} already completed ({}); start a new task instead",
                 outcome.map(|o| o.as_str()).unwrap_or_default()
@@ -2125,7 +2117,7 @@ impl TaskEngine {
             return Ok(ClosureReview::NotRequired);
         }
         use crate::policy_resolver::IndependentReviewPolicy;
-        match self.factory.independent_review {
+        let reason = match self.factory.independent_review {
             IndependentReviewPolicy::Off => {
                 log.append(
                     None,
@@ -2135,21 +2127,11 @@ impl TaskEngine {
                 .await?;
                 return Ok(ClosureReview::NotRequired);
             }
-            IndependentReviewPolicy::Always | IndependentReviewPolicy::Auto => {}
-        }
-        let trigger = crate::policy_resolver::ReviewTrigger::from_modified_paths(
-            &outcome.modified_files,
-            matches!(
-                self.factory.independent_review,
-                IndependentReviewPolicy::Always
+            IndependentReviewPolicy::Required => format!(
+                "independent_review required, {} modified file(s)",
+                outcome.modified_files.len()
             ),
-        );
-        let reason = review_reason(&trigger);
-        if !trigger.review_required() {
-            log.append(None, stage(false, "not_required", reason), observer)
-                .await?;
-            return Ok(ClosureReview::NotRequired);
-        }
+        };
         if crate::turn::session_had_review(runner.stores.events.as_ref(), &runner.session_id)
             .await
             .unwrap_or(false)
@@ -2202,278 +2184,98 @@ impl TaskEngine {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
-        mut outcome: leveler_agent::AgentOutcome,
+        outcome: leveler_agent::AgentOutcome,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Goal continuation and bounded budget extension already happened in
         // `supervise` — one loop, one decision point (convergence plan phase 4).
-
-        // Completed and Answered both count as clean finishes — and both must
-        // verify if they touched files. Most other stop reasons are terminal
-        // failure (Stalled/Blocked/BudgetExhausted never read as success).
-        // Incomplete with mutations is the exception: thrash guards may stop a
-        // turn whose workspace is already gate-green — still enter verify so
-        // expect-green work is not reported as Failed (orchestrate node_status
-        // uses the same rule).
+        //
+        // What happens here is mechanical bookkeeping, not judgement: the
+        // run's stop reason names the outcome, the project's own checks run
+        // once over the final tree and are reported beside it, and an
+        // explicitly configured reviewer is launched. Nothing here repairs
+        // on the model's behalf, re-reads the goal, or downgrades a completed
+        // run because a heuristic disagreed with the model.
         if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
-            let incomplete_with_work =
-                outcome.stop_reason == StopReason::Incomplete && !outcome.modified_files.is_empty();
-            if !incomplete_with_work {
-                // R011-F2: a failed high-risk change needs the required review
-                // MORE, not less. The result is recorded for the user; the
-                // failed outcome itself never changes.
-                let _ = self
-                    .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
-                    .await?;
-                return Ok(report_from_agent_outcome(outcome, terminal));
-            }
+            // A configured review still runs over a failed high-risk change;
+            // the result is recorded for the user, the outcome never changes.
+            let _ = self
+                .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
+                .await?;
+            return Ok(report_from_agent_outcome(outcome, terminal));
         }
 
-        // K19 early short-circuit: no mutation or no gates → never claim Verified
-        // (pure Q&A over a green repo must stay CompletedUnverified).
+        // No mutation, or no checks configured: nothing to run, and the
+        // report says so instead of pretending a verdict.
         if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
             let _ = self
                 .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
                 .await?;
-            return Ok(report_from_agent_outcome(
-                outcome,
-                TaskOutcome::CompletedUnverified,
-            ));
+            return Ok(report_from_agent_outcome(outcome, TaskOutcome::Completed));
         }
 
-        let mut attempts = 0;
-        let mut report = self
+        let report = self
             .verify(
                 log,
                 runner,
                 spec,
                 &[],
                 &outcome.modified_files,
-                attempts,
                 observer,
                 &cancellation,
             )
             .await?;
-        while report.verdict() == Verdict::Failed
-            && attempts < DIRECT_REPAIR_ATTEMPTS
-            && verification_is_repairable(&report)
-            && !cancellation.is_cancelled()
-        {
-            attempts += 1;
-            log.append(
-                None,
-                EngineEvent::RepairStarted { attempt: attempts },
-                observer,
-            )
-            .await?;
-            let repair = runner
-                .run_turn(
-                    TurnKind::Repair { attempt: attempts },
-                    goal_profile(spec),
-                    TurnInput::Goal {
-                        goal: repair_goal(&spec.runtime.goal, &report),
-                        prior: Vec::new(),
-                    },
-                    observer,
-                    cancellation.clone(),
-                )
-                .await?;
-            outcome.rounds += repair.outcome.rounds;
-            outcome.final_text = repair.outcome.final_text;
-            for path in repair.outcome.modified_files {
-                if !outcome.modified_files.contains(&path) {
-                    outcome.modified_files.push(path);
-                }
-            }
-            report = self
-                .verify(
-                    log,
-                    runner,
-                    spec,
-                    &[],
-                    &outcome.modified_files,
-                    attempts,
-                    observer,
-                    &cancellation,
-                )
-                .await?;
-        }
+        let verification_status = verification_status_of(&report);
 
-        // Shared closed-loop exit with Orchestrate (design §1.3–§1.4 / PR-7).
-        // needs_mutation is heuristic/delivery only — never derived from
-        // modified_files (self-referential). has_mutation is separate.
-        //
-        // The project's own gating checks already ran against the edited tree
-        // and that is the verdict. Direct used to spend one more full model call
-        // here asking the model to restate its goal as acceptance criteria and
-        // then evaluate them — criteria that could only ever downgrade a green
-        // gate, and that measurably did so for reasons that had nothing to do
-        // with the code (see `leveler_verifier::outcome` docs). The call is gone.
-        let expected = ExpectedEvidence {
-            needs_mutation: direct_needs_mutation(
-                &spec.runtime.goal,
-                matches!(
-                    self.factory.work_profile,
-                    leveler_agent::WorkProfile::Delivery
-                ),
-            ),
-            has_mutation: !outcome.modified_files.is_empty(),
-        };
-        let mut task_outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
-        // Terminal audit applies the same open-todo rule readiness::check
-        // enforces on the model's own completion claim: green gates over a plan
-        // with open steps is healthy-tree evidence, not task completion. An
-        // honest model that DECLINES to claim completion must not receive a
-        // better verdict than one that claims it (R004 F4).
-        if task_outcome == TaskOutcome::Verified
-            && let Ok(Some(plan)) =
-                crate::turn::last_persisted_plan(runner.stores.events.as_ref(), &runner.session_id)
-                    .await
-            && plan.has_incomplete_model_todos()
-        {
-            task_outcome = TaskOutcome::CompletedUnverified;
-        }
-        // R007b N2: the same rule applied to verification EVIDENCE. A check
-        // that passed before this task changed anything says the tree already
-        // satisfied it — on a goal that was expected to change code, that is
-        // not proof the work was done. R007b's agent watched a reproduction go
-        // green on an untouched tree, concluded the defect did not exist, and
-        // drifted to an unrelated fix; the runtime must not call that verified.
-        if task_outcome == TaskOutcome::Verified
-            && expected.has_mutation
-            && let Ok(Some(ledger)) = crate::turn::last_persisted_ledger(
-                runner.stores.events.as_ref(),
-                &runner.session_id,
-            )
-            .await
-            && ledger.only_baseline_green_evidence()
-        {
-            task_outcome = TaskOutcome::CompletedUnverified;
-        }
-        // TERMINAL TRUTH: the Completion Contract, asked at the boundary rather
-        // than only at the door the executor happens to use. `update_goal`
-        // consults it, but a run can reach this point without ever calling
-        // update_goal — a forced closeout, for instance — and a green
-        // workspace over an unwritten test used to be mapped straight to
-        // verified. Closeout is a lifecycle condition, not proof of
-        // completion; tests going green is evidence, not proof that every
-        // requirement was met. Same debt, whichever door the run came through.
-        if task_outcome == TaskOutcome::Verified {
-            match crate::turn::last_persisted_ledger(
-                runner.stores.events.as_ref(),
-                &runner.session_id,
-            )
-            .await
-            {
-                // Fail closed: an unreadable ledger cannot prove there is no
-                // outstanding obligation.
-                Err(e) => {
-                    task_outcome = TaskOutcome::CompletedUnverified;
-                    log.append(
-                        None,
-                        EngineEvent::ReviewStage {
-                            required: true,
-                            action: "completion_contract_open".to_string(),
-                            detail: format!("completion contract unreadable: {e}"),
-                        },
-                        observer,
-                    )
-                    .await?;
-                }
-                Ok(Some(ledger)) => {
-                    if let Some(debt) = ledger.completion_debt() {
-                        task_outcome = TaskOutcome::CompletedUnverified;
-                        log.append(
-                            None,
-                            EngineEvent::ReviewStage {
-                                required: true,
-                                action: "completion_contract_open".to_string(),
-                                detail: debt,
-                            },
-                            observer,
-                        )
-                        .await?;
-                    }
-                }
-                Ok(None) => {}
-            }
-        }
-        // R007b N7 / R013-F1: the closure-boundary review, staged with durable
+        // Explicitly configured closure-boundary review, staged with durable
         // eligibility/launch/terminal events so an absent reviewer is always
-        // explainable. A required review that did not complete keeps refusing
-        // Verified, exactly as before — but never silently.
-        let review = self
+        // explainable. Its result is recorded, never a verdict on the task.
+        let _ = self
             .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
             .await?;
-        if task_outcome == TaskOutcome::Verified && !review.satisfies_required() {
-            task_outcome = TaskOutcome::CompletedUnverified;
-        }
-        // Blocking-finding closure truth: an open blocking finding (raised by
-        // the reviewer, not yet rejected or verified) refuses Verified. The
-        // check runs AFTER the review stage so a finding adopted moments ago
-        // is seen; Addressed findings are host-promoted first when fresh
-        // post-mutation verification exists, so a fixed-and-proven finding
-        // never blocks. The refusal is staged durably — never silent.
-        if task_outcome == TaskOutcome::Verified {
-            match crate::turn::last_persisted_ledger(
-                runner.stores.events.as_ref(),
-                &runner.session_id,
-            )
-            .await
-            {
-                Err(e) => {
-                    // Fail closed: if we cannot read the ledger we cannot
-                    // prove there is no open blocking finding.
-                    task_outcome = TaskOutcome::CompletedUnverified;
-                    log.append(
-                        None,
-                        EngineEvent::ReviewStage {
-                            required: true,
-                            action: "blocking_finding_open".to_string(),
-                            detail: format!("findings ledger unreadable: {e}"),
-                        },
-                        observer,
-                    )
-                    .await?;
-                }
-                Ok(None) => {}
-                Ok(Some(ledger)) if ledger.findings.is_empty() => {}
-                Ok(Some(mut ledger)) => {
-                    if ledger.promote_addressed_findings(ledger.has_fresh_successful_verify()) > 0 {
-                        log.append(
-                            None,
-                            EngineEvent::EvidenceLedgerUpdated {
-                                ledger: ledger.clone(),
-                            },
-                            observer,
-                        )
-                        .await?;
-                    }
-                    let open: Vec<String> = ledger
-                        .open_blocking_findings()
-                        .iter()
-                        .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
-                        .collect();
-                    if !open.is_empty() {
-                        task_outcome = TaskOutcome::CompletedUnverified;
-                        log.append(
-                            None,
-                            EngineEvent::ReviewStage {
-                                required: true,
-                                action: "blocking_finding_open".to_string(),
-                                detail: open.join("; "),
-                            },
-                            observer,
-                        )
-                        .await?;
-                    }
-                }
+        // Blocking-finding closure truth is a lifecycle fact: a reviewer's
+        // open blocking finding is recorded durably at the boundary, after
+        // the review stage so a finding adopted moments ago is seen. Addressed
+        // findings are host-promoted first when fresh post-mutation
+        // verification exists.
+        if let Ok(Some(mut ledger)) =
+            crate::turn::last_persisted_ledger(runner.stores.events.as_ref(), &runner.session_id)
+                .await
+            && !ledger.findings.is_empty()
+        {
+            if ledger.promote_addressed_findings(ledger.has_fresh_successful_verify()) > 0 {
+                log.append(
+                    None,
+                    EngineEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    },
+                    observer,
+                )
+                .await?;
+            }
+            let open: Vec<String> = ledger
+                .open_blocking_findings()
+                .iter()
+                .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
+                .collect();
+            if !open.is_empty() {
+                log.append(
+                    None,
+                    EngineEvent::ReviewStage {
+                        required: true,
+                        action: "blocking_finding_open".to_string(),
+                        detail: open.join("; "),
+                    },
+                    observer,
+                )
+                .await?;
             }
         }
-        let base = report_from_agent_outcome(outcome, task_outcome);
+        let base = report_from_agent_outcome(outcome, TaskOutcome::Completed);
         Ok(TaskReport {
             verification: Some(report),
+            verification_status,
             ..base
         })
     }
@@ -2485,7 +2287,6 @@ impl TaskEngine {
         spec: &TaskSpec,
         allowed_paths: &[String],
         modified_files: &[String],
-        attempt: u32,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<VerificationReport, EngineError> {
@@ -2551,38 +2352,28 @@ impl TaskEngine {
             observer,
         )
         .await?;
-        self.record_verification_evidence(log, runner, &plan, &report, attempt, observer)
+        self.record_verification_evidence(log, runner, &plan, &report, observer)
             .await?;
         Ok(report)
     }
 
-    /// Record what the runtime's own verification observed, into the ledger
-    /// the completion contract reads.
+    /// Record what the runtime's own verification observed, into the ledger.
     ///
-    /// The engine runs the verification plan in `conclude_direct`, between the
-    /// agent's completion CLAIM and the terminal contract decision. Those runs
-    /// are real commands over the changed tree — the strongest observation the
-    /// runtime makes on its own account — and they reached the EventLog as
-    /// `VerificationCheck` rows but never the `EvidenceLedger`. So the one
-    /// decision that matters was taken without the runtime's own evidence, and
-    /// a rule asking a behavioural obligation for a witness could not be
-    /// satisfied by the very check the product runs to satisfy it (F7-B §6).
+    /// The engine runs the verification plan in `conclude_direct` over the
+    /// changed tree. Those runs are real commands — the strongest observation
+    /// the runtime makes on its own account — and they reach the EventLog as
+    /// `VerificationCheck` rows; recording them on the `EvidenceLedger` too
+    /// keeps one place that answers "what ran, and how did it exit". Facts
+    /// only: nothing here decides what they prove about the task.
     ///
-    /// This makes the engine an evidence PRODUCER and nothing more. It records
-    /// facts; `completion_debt()` remains the only thing that decides whether
-    /// they add up to a finished task. A green gate recorded here still cannot
-    /// complete an obligation the contract holds open.
-    ///
-    /// Identity is `engine-verification:<attempt>:<check>`, so a repeated
-    /// completion attempt re-records the same check under the same id instead
-    /// of growing the ledger, and provenance says which run produced it.
+    /// Identity is `engine-verification:<check>`, so re-recording the same
+    /// check does not grow the ledger.
     async fn record_verification_evidence(
         &self,
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         plan: &VerificationPlan,
         report: &VerificationReport,
-        attempt: u32,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         if report.checks.is_empty() {
@@ -2592,8 +2383,8 @@ impl TaskEngine {
             crate::turn::last_persisted_ledger(runner.stores.events.as_ref(), &runner.session_id)
                 .await
         else {
-            // No ledger yet means no contract to inform, and inventing one here
-            // would be a second place that creates completion state.
+            // No ledger yet: inventing one here would be a second place that
+            // creates run state.
             return Ok(());
         };
         let mut added = false;
@@ -2605,7 +2396,7 @@ impl TaskEngine {
             let Some(command) = plan.commands.iter().find(|c| c.name == check.name) else {
                 continue;
             };
-            let id = format!("engine-verification:{attempt}:{}", check.name);
+            let id = format!("engine-verification:{}", check.name);
             if ledger.verifications.iter().any(|v| v.tool_call_id == id) {
                 continue;
             }
@@ -2615,14 +2406,6 @@ impl TaskEngine {
             );
             let exit_code = i32::from(check.status != leveler_verifier::CheckStatus::Passed);
             ledger.record_verify(id, fingerprint, exit_code);
-            added = true;
-        }
-        // The runtime has now produced everything it produces on its own
-        // account for this attempt. The terminal contract check reads this
-        // ledger next, and the flag is what tells the predicate it is being
-        // asked at the commit point rather than at the claim.
-        if !ledger.runtime_evidence_complete {
-            ledger.runtime_evidence_complete = true;
             added = true;
         }
         if added {
@@ -2637,20 +2420,8 @@ impl TaskEngine {
     }
 }
 
-/// Whether a failed report is worth a repair turn: scope violations are not
-/// repairable, and neither is a failure classified as non-retryable
-/// (environment problems).
-fn verification_is_repairable(report: &VerificationReport) -> bool {
-    report.scope_ok
-        && report
-            .failed_gates()
-            .into_iter()
-            .any(|check| check.failure.as_ref().map(|f| f.retryable).unwrap_or(true))
-}
-
-/// Compose the repair goal from the failed report (engine-local equivalent of
-/// the app layer's compose_repair_goal).
-/// How the closure-boundary review ended, for the Verified label decision.
+/// How the closure-boundary review ended. Recorded through `ReviewStage`
+/// events; never a verdict on the task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosureReview {
     NotRequired,
@@ -2658,29 +2429,6 @@ enum ClosureReview {
     Completed,
     Incomplete,
     LaunchFailed,
-}
-
-impl ClosureReview {
-    /// Whether this result satisfies a required-review obligation.
-    fn satisfies_required(self) -> bool {
-        matches!(
-            self,
-            ClosureReview::NotRequired | ClosureReview::AlreadyReviewed | ClosureReview::Completed
-        )
-    }
-}
-
-/// One sentence naming why policy required (or did not require) a review.
-fn review_reason(trigger: &crate::policy_resolver::ReviewTrigger) -> String {
-    let mut parts = Vec::new();
-    if trigger.security_relevant {
-        parts.push("security-sensitive path".to_string());
-    }
-    if trigger.concurrency_relevant {
-        parts.push("concurrency-sensitive path".to_string());
-    }
-    parts.push(format!("{} modified file(s)", trigger.modified_files));
-    parts.join(", ")
 }
 
 /// Cap on the unified diff embedded in a reviewer brief. Beyond it the diff is
@@ -2800,37 +2548,13 @@ fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     )
 }
 
-fn repair_goal(goal: &str, report: &VerificationReport) -> String {
-    let mut failures = String::new();
-    for check in report.failed_gates() {
-        failures.push_str(&format!(
-            "\n- `{}` failed:\n{}\n",
-            check.name, check.evidence
-        ));
+/// The mechanical verdict of the project's own checks, as a status.
+fn verification_status_of(report: &VerificationReport) -> VerificationStatus {
+    match report.verdict() {
+        Verdict::Verified => VerificationStatus::Passed,
+        Verdict::Failed => VerificationStatus::Failed,
+        Verdict::Unverified(_) => VerificationStatus::Unavailable,
     }
-    format!(
-        "Verification failed after working on: {goal}\n\nFailing checks:{failures}\n\
-         Repair only the failing change, keep the scope narrow, then re-run the \
-         failing checks to prove they pass."
-    )
-}
-
-/// Map verifier [`CompletionVerdict`] onto lifecycle [`TaskOutcome`].
-fn map_completion_verdict(v: CompletionVerdict) -> TaskOutcome {
-    match v {
-        CompletionVerdict::Verified => TaskOutcome::Verified,
-        CompletionVerdict::CompletedUnverified => TaskOutcome::CompletedUnverified,
-        CompletionVerdict::Failed => TaskOutcome::Failed,
-    }
-}
-/// Direct ExpectedMutation decision (design §1.3 / K19).
-///
-/// `needs_mutation = task_looks_like_implementation(goal) || delivery_gate`.
-/// Must **never** use `modified_files` / `has_mutation` (self-referential).
-/// K19 early-exit in `conclude_direct` additionally forbids Verified when
-/// there is no mutation at all (even if `needs_mutation` is false).
-fn direct_needs_mutation(goal: &str, delivery_gate: bool) -> bool {
-    delivery_gate || leveler_lifecycle::task_looks_like_implementation(goal)
 }
 /// The plan the post-edit gate actually runs.
 ///
@@ -2954,34 +2678,41 @@ mod review_brief_tests {
 }
 
 #[cfg(test)]
-mod needs_mutation_tests {
+mod verification_status_tests {
     use super::*;
+    use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus};
 
-    #[test]
-    fn map_completion_verdict_covers_all_variants() {
-        assert_eq!(
-            map_completion_verdict(CompletionVerdict::Verified),
-            TaskOutcome::Verified
-        );
-        assert_eq!(
-            map_completion_verdict(CompletionVerdict::CompletedUnverified),
-            TaskOutcome::CompletedUnverified
-        );
-        assert_eq!(
-            map_completion_verdict(CompletionVerdict::Failed),
-            TaskOutcome::Failed
-        );
+    fn report(status: CheckStatus) -> VerificationReport {
+        VerificationReport {
+            checks: vec![CheckOutcome {
+                name: "test".into(),
+                kind: CheckKind::Test,
+                gating: true,
+                status,
+                evidence: String::new(),
+                failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
+            }],
+            scope_ok: true,
+            scope_violations: vec![],
+            baseline_failures: Vec::new(),
+        }
     }
 
     #[test]
-    fn direct_needs_mutation_is_heuristic_or_delivery_not_files() {
-        // Pure Q&A: no impl verbs → needs_mutation false (regardless of files).
-        assert!(!direct_needs_mutation("explain how auth works", false));
-        // Delivery forces needs_mutation even on a Q&A-shaped goal.
-        assert!(direct_needs_mutation("explain how auth works", true));
-        // Implementation-class goals require mutation.
-        assert!(direct_needs_mutation("add a function", false));
-        assert!(direct_needs_mutation("fix the login bug", false));
+    fn verification_status_mirrors_the_report_verdict() {
+        assert_eq!(
+            verification_status_of(&report(CheckStatus::Passed)),
+            VerificationStatus::Passed
+        );
+        assert_eq!(
+            verification_status_of(&report(CheckStatus::Failed)),
+            VerificationStatus::Failed
+        );
+        assert_eq!(
+            verification_status_of(&report(CheckStatus::ToolMissing)),
+            VerificationStatus::Unavailable
+        );
     }
 }
 
@@ -3264,46 +2995,57 @@ mod continue_cap_tests {
         assert_eq!(next.max_model_tokens, Some(150));
     }
 
-    /// R004 F4: `terminal_status_for` must not launder a guard-forced
-    /// Incomplete stop into a Completed session because the gates were green.
+    /// The session status is read off how the run ended, never off the
+    /// verification verdict: a guard-forced Incomplete stop stays Incomplete
+    /// however green the tree, and a completed run with failed checks is a
+    /// completed session that reports `VerificationStatus::Failed` beside it.
     #[test]
-    fn incomplete_stop_keeps_session_incomplete_even_when_verified() {
-        let report = TaskReport {
-            outcome: TaskOutcome::Verified,
-            final_text: String::new(),
-            modified_files: vec!["a.rs".into()],
-            verification: None,
-            stop_reason: leveler_agent::StopReason::Incomplete,
-            stop_detail: None,
-            rounds: 1,
-            windows: 1,
-            review: None,
-        };
-        let (status, _) = terminal_status_for(&report);
-        assert_eq!(status, SessionStatus::Incomplete);
+    fn terminal_status_follows_the_stop_reason_not_the_checks() {
+        let mut report = TaskReport::new(
+            TaskOutcome::Completed,
+            String::new(),
+            vec!["a.rs".into()],
+            leveler_agent::StopReason::Incomplete,
+            1,
+        );
+        report.verification_status = VerificationStatus::Passed;
+        assert_eq!(terminal_status_for(&report).0, SessionStatus::Incomplete);
 
-        let clean = TaskReport {
-            stop_reason: leveler_agent::StopReason::Completed,
-            outcome: TaskOutcome::Verified,
-            final_text: String::new(),
-            modified_files: vec!["a.rs".into()],
-            verification: None,
-            stop_detail: None,
-            rounds: 1,
-            windows: 1,
-            review: None,
-        };
-        let (status, _) = terminal_status_for(&clean);
-        assert_eq!(status, SessionStatus::Completed);
+        let mut clean = TaskReport::new(
+            TaskOutcome::Completed,
+            String::new(),
+            vec!["a.rs".into()],
+            leveler_agent::StopReason::Completed,
+            1,
+        );
+        clean.verification_status = VerificationStatus::Failed;
+        assert_eq!(
+            terminal_status_for(&clean),
+            (SessionStatus::Completed, AgentState::Complete),
+            "failed checks are reported, not laundered into an incomplete session"
+        );
+
+        let blocked = TaskReport::new(
+            TaskOutcome::Blocked,
+            String::new(),
+            vec![],
+            leveler_agent::StopReason::Blocked,
+            1,
+        );
+        assert_eq!(terminal_status_for(&blocked).0, SessionStatus::Blocked);
     }
 
     #[test]
-    fn thrash_incomplete_maps_to_failed_not_completed() {
-        // conclude_direct uses this mapping: Incomplete thrash must surface as
-        // TaskOutcome::Failed, never success/CompletedUnverified.
+    fn non_success_stops_map_to_their_outcome() {
+        // conclude_direct uses this mapping: an Incomplete stop surfaces as
+        // TaskOutcome::Failed, a model-declared block as Blocked.
         assert_eq!(
             direct_non_success_outcome(leveler_agent::StopReason::Incomplete),
             Some(TaskOutcome::Failed)
+        );
+        assert_eq!(
+            direct_non_success_outcome(leveler_agent::StopReason::Blocked),
+            Some(TaskOutcome::Blocked)
         );
         assert_eq!(
             direct_non_success_outcome(leveler_agent::StopReason::Stalled),
@@ -3371,18 +3113,18 @@ pub async fn acknowledge_crash_window(
 pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Option<TaskOutcome> {
     use leveler_agent::StopReason as S;
     match stop {
-        // Plan done (incl. a forced closeout stop): let verification decide.
-        S::Completed | S::Answered | S::CloseoutForced => None,
+        // A declared end: the project's checks run and are reported beside it.
+        S::Completed | S::Answered | S::CompletedUnverified | S::CompletedChecksFailed => None,
         // The round ceiling is a resource boundary, not a model failure. After a
         // goal has exhausted its bounded work windows (the supervisor already
         // decided to stop opening more), a ceiling stop is BudgetLimited —
         // incomplete and resumable — the same class as an exhausted budget.
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
-        // Incomplete thrash, stalled quiet, blocked (model- or policy-side),
-        // etc. — never success.
-        S::Incomplete | S::Blocked | S::PolicyBlocked | S::Stalled | S::CompletedUnverified => {
-            Some(TaskOutcome::Failed)
-        }
+        // The model said the goal cannot be reached as stated.
+        S::Blocked => Some(TaskOutcome::Blocked),
+        // Every action refused for several rounds, or a goal that went quiet
+        // through every nudge: never success.
+        S::Incomplete | S::Stalled => Some(TaskOutcome::Failed),
     }
 }
 

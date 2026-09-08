@@ -120,8 +120,8 @@ fn overview(
     lines.push(kv(
         "GOAL",
         format!(
-            "verify×{}  compact {}  agents {}  repair {}",
-            s.verification_runs, s.compact_count, s.subagent_started, s.repair_started
+            "verify×{}  compact {}  agents {}",
+            s.verification_runs, s.compact_count, s.subagent_started
         ),
         state,
     ));
@@ -330,7 +330,6 @@ fn recovery(
         r.interrupted_turns.to_string(),
         state,
     ));
-    lines.push(kv("Repair attempts", r.repair_attempts.to_string(), state));
     lines.push(kv(
         "Workspace snapshots",
         r.workspace_snapshots.to_string(),

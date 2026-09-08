@@ -207,6 +207,7 @@ export function shouldRefreshObservability(ev: RuntimeEvent): boolean {
     case 'turn_failed':
     case 'turn_incomplete':
     case 'turn_completed_unverified':
+    case 'turn_completed_checks_failed':
     case 'turn_cancelled':
     case 'context_compacted':
     case 'checkpoint_created':

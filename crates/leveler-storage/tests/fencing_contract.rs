@@ -233,6 +233,7 @@ async fn assert_fencing_contract(
                 "task_finished",
                 "{}",
                 TaskOutcome::Failed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 now(),
@@ -273,7 +274,8 @@ async fn assert_fencing_contract(
             session,
             "task_finished",
             "{}",
-            TaskOutcome::CompletedUnverified,
+            TaskOutcome::Completed,
+            leveler_lifecycle::VerificationStatus::NotRun,
             SessionStatus::Completed,
             AgentState::Complete,
             now(),
@@ -281,7 +283,7 @@ async fn assert_fencing_contract(
         .await
         .unwrap();
     let (_, _, _, outcome) = ports.sessions.execution(session).await.unwrap().unwrap();
-    assert_eq!(outcome, Some(TaskOutcome::CompletedUnverified));
+    assert_eq!(outcome, Some(TaskOutcome::Completed));
 }
 
 #[tokio::test]

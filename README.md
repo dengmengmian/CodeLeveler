@@ -51,7 +51,7 @@ together:
 ## Why CodeLeveler
 
 - **A complete coding loop.** Explore a repository, make focused edits, run
-  project checks, repair failures, and leave a reviewable diff.
+  project checks, and leave a reviewable diff with the check results beside it.
 - **One runtime, multiple clients.** TUI and Web share the same client protocol
   (`ClientCommand` / `RuntimeEvent` / snapshots); work can outlive a single
   terminal process on platforms that support the local daemon.
@@ -233,7 +233,9 @@ the daemon socket transport is not available there yet.
 2. **Change** — apply typed file operations and run commands within the active
    permission and workspace boundaries.
 3. **Verify** — discover or use configured format, build, and test commands;
-   failures can trigger bounded repair attempts.
+   the result is reported beside the outcome (completed · checks passed /
+   failed / not run). The model sees failures in the loop and decides what to
+   do; the runtime does not repair on its behalf.
 4. **Hand off** — keep the diff, transcript, verification result, and session
    state available for review or resume.
 

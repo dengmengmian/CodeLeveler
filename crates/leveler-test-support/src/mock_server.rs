@@ -140,26 +140,6 @@ impl MockServer {
                 tokio::spawn(async move {
                     let mut stream = stream;
                     let body = drain_request(&mut stream).await;
-                    // Completion Reconciliation Gate calls are answered out of
-                    // band: the scripted queue, the request count and the
-                    // recorded bodies stay about the loop under test.
-                    if body
-                        .as_deref()
-                        .is_some_and(|b| b.contains(crate::reconcile::RECONCILE_MARKER))
-                    {
-                        let _ = write_reconcile_autopilot(&mut stream).await;
-                        return;
-                    }
-                    // Contract derivation, same deal: answered out of band with
-                    // a minimal valid contract so the scripted queue and the
-                    // request count stay about the loop under test.
-                    if body
-                        .as_deref()
-                        .is_some_and(|b| b.contains(crate::reconcile::DERIVE_MARKER))
-                    {
-                        let _ = write_derive_autopilot(&mut stream).await;
-                        return;
-                    }
                     if let Some(body) = body {
                         bodies.lock().await.push(body);
                     }
@@ -208,38 +188,6 @@ impl MockServer {
     pub fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
     }
-}
-
-/// The canned non-streaming completion the derivation autopilot serves: one
-/// `behavior` obligation, which [`write_reconcile_autopilot`] accounts for.
-async fn write_derive_autopilot(stream: &mut TcpStream) -> std::io::Result<()> {
-    let contract = r#"{\"requirements\":[{\"text\":\"complete the task as the user asked\",\"kind\":\"behavior\"}]}"#;
-    let body = format!(
-        r#"{{"id":"derive-autopilot","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{contract}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
-    );
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    use tokio::io::AsyncWriteExt;
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
-    stream.flush().await
-}
-
-/// The canned non-streaming completion the reconciliation autopilot serves.
-async fn write_reconcile_autopilot(stream: &mut TcpStream) -> std::io::Result<()> {
-    let verdict = r#"{\"verdict\":\"satisfied\",\"requirements\":[{\"requirement\":\"the requested outcome\",\"satisfied\":true,\"evidence\":\"recorded output\"}],\"contradictions\":[],\"requirement_accounting\":[{\"id\":\"R1\",\"satisfied\":true,\"evidence\":\"recorded output\",\"evidence_strength\":\"observed\"}],\"reason\":\"satisfied as stated\"}"#;
-    let body = format!(
-        r#"{{"id":"reconcile-autopilot","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{verdict}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
-    );
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
-    stream.flush().await
 }
 
 /// Write the scripted response (the request was already drained/recorded).

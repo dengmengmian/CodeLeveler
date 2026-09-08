@@ -328,25 +328,10 @@ pub(crate) fn action_fingerprint(call: &ToolCall) -> String {
 
 /// Pure workspace observation (no mutation, no verification).
 ///
-/// These calls are collapsed for the no-progress loop guard and refused after a
-/// fully completed plan so the model cannot thrash on `git status` variants.
+/// These calls are collapsed for the identical-result loop guard so swapping
+/// `git status` wrappers does not reset the counter.
 pub(crate) fn is_pure_observe_call(name: &str, arguments: &serde_json::Value) -> bool {
     observe_class(name, arguments).is_some()
-}
-
-/// Any read-only tool whose novel result counts as real exploration: the
-/// observe classes above, search tools, AND plain Read-class builtins
-/// (`read_file`, `git_diff`, …) which have no observe key. R007 F1: novel
-/// `read_file` results silently failed to register as exploration because the
-/// novelty predicate only covered observe/search classes.
-pub(crate) fn is_observe_result_tool(name: &str, arguments: &serde_json::Value) -> bool {
-    if is_pure_observe_call(name, arguments) || leveler_model::is_search_tool(name) {
-        return true;
-    }
-    matches!(
-        leveler_model::builtin_tool_metadata(name),
-        Some(metadata) if metadata.class == leveler_model::BuiltinToolClass::Read
-    )
 }
 
 /// Stable observe class for loop-guard fingerprinting.

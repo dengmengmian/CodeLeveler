@@ -11,9 +11,8 @@
 //! folding rewrites it — so when the estimate crosses the current threshold,
 //! an evidence-backed expansion is preferred over a compaction. Evidence is
 //! authoritative runtime state only: repeated-read pressure measured by
-//! `RepeatedReadGuard` after a fold, or a repair turn escalation passed down
-//! from the engine. Budget pressure alone is when the decision happens, never
-//! why the budget grows.
+//! `RepeatedReadGuard` after a fold. Budget pressure alone is when the
+//! decision happens, never why the budget grows.
 
 /// Why the budget expanded — recorded on the event so every climb is
 /// attributable to a real signal.
@@ -22,16 +21,12 @@ pub enum ExpansionReason {
     /// Re-reads of unchanged ranges after a fold: the fold dropped something
     /// the model still needs (measured by `RepeatedReadGuard::total_trips`).
     RereadPressure,
-    /// The engine entered a verification-repair turn: failure evidence may
-    /// reference folded state.
-    RepairEscalation,
 }
 
 impl ExpansionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RereadPressure => "reread_pressure",
-            Self::RepairEscalation => "repair_escalation",
         }
     }
 }
@@ -49,21 +44,18 @@ pub struct ContextBudgetState {
     /// Trip total consumed by the last expansion, so the identical signal
     /// cannot be spent twice without new evidence.
     pub trips_spent: u32,
-    /// Repair escalation is single-use per grant.
-    pub repair_evidence_available: bool,
     pub crossed_reliable_context: bool,
     pub last_expansion_reason: Option<ExpansionReason>,
 }
 
 impl ContextBudgetState {
-    pub fn new(initial_budget: u32, repair_evidence: bool) -> Self {
+    pub fn new(initial_budget: u32) -> Self {
         Self {
             current_budget: initial_budget,
             expansion_count: 0,
             compaction_count: 0,
             trips_at_last_compaction: 0,
             trips_spent: 0,
-            repair_evidence_available: repair_evidence,
             crossed_reliable_context: false,
             last_expansion_reason: None,
         }
@@ -91,9 +83,7 @@ pub const REREAD_PRESSURE_TRIPS: u32 = 3;
 /// which is also what makes the state replayable from the event log.
 ///
 /// `tiers` is the resolver's ladder (sorted, deduped, clamped);
-/// `reliable_context` marks the quality boundary that plain evidence may not
-/// cross — only a repair escalation (strong evidence) climbs past it, and the
-/// crossing is recorded, not hidden.
+/// `reliable_context` marks the quality boundary that evidence may not cross.
 pub fn decide_context_action(
     adaptive: bool,
     tiers: &[u32],
@@ -122,16 +112,8 @@ pub fn decide_context_action(
         .saturating_sub(state.trips_spent);
     let reread_pressure = state.compaction_count > 0 && trips_delta >= REREAD_PRESSURE_TRIPS;
 
-    // Strong evidence (repair escalation) may take any step, including across
-    // the quality boundary. Normal evidence stops at reliable_context.
-    if state.repair_evidence_available {
-        return ContextAction::Expand {
-            from: state.current_budget,
-            to: next,
-            reason: ExpansionReason::RepairEscalation,
-            crossed_reliable: crossing,
-        };
-    }
+    // Evidence stops at reliable_context: the quality boundary is never
+    // crossed on re-read pressure alone.
     if reread_pressure && !crossing {
         return ContextAction::Expand {
             from: state.current_budget,
@@ -162,7 +144,6 @@ pub fn apply_expansion(
         ExpansionReason::RereadPressure => {
             state.trips_spent = guard_trips_now.saturating_sub(state.trips_at_last_compaction);
         }
-        ExpansionReason::RepairEscalation => state.repair_evidence_available = false,
     }
 }
 
@@ -181,7 +162,7 @@ mod tests {
     const RELIABLE: u32 = 786_432;
 
     fn state(budget: u32) -> ContextBudgetState {
-        ContextBudgetState::new(budget, false)
+        ContextBudgetState::new(budget)
     }
 
     #[test]
@@ -261,30 +242,6 @@ mod tests {
             ContextAction::Compact,
             "re-read pressure alone must not cross reliable_context"
         );
-    }
-
-    #[test]
-    fn repair_escalation_may_cross_the_boundary_and_is_single_use() {
-        let tiers = &[262_144, 524_288, 786_432, 900_000];
-        let mut s = ContextBudgetState::new(786_432, true);
-        let a = decide_context_action(true, tiers, RELIABLE, &s, 800_000, 0);
-        let ContextAction::Expand {
-            to,
-            reason,
-            crossed_reliable,
-            ..
-        } = a
-        else {
-            panic!("repair escalation must expand");
-        };
-        assert_eq!(to, 900_000);
-        assert_eq!(reason, ExpansionReason::RepairEscalation);
-        assert!(crossed_reliable, "the crossing is recorded, not hidden");
-        apply_expansion(&mut s, to, reason, crossed_reliable, 0);
-        assert!(s.crossed_reliable_context);
-        // The grant is spent: the next pressure folds.
-        let again = decide_context_action(true, tiers, RELIABLE, &s, 950_000, 0);
-        assert_eq!(again, ContextAction::Compact);
     }
 
     #[test]

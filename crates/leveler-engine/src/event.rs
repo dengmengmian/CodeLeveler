@@ -98,7 +98,8 @@ pub enum TurnKind {
     Chat,
     /// Legacy plan-graph node turn (no longer produced).
     Node { node_id: String },
-    /// A verification-repair attempt.
+    /// Legacy verification-repair turn (no longer produced; kept so rows
+    /// written by the deleted auto-repair loop still replay).
     Repair { attempt: u32 },
 }
 
@@ -156,6 +157,11 @@ pub enum EngineEvent {
     },
     TaskFinished {
         outcome: TaskOutcome,
+        /// What the project's own checks said over the final tree. Absent on
+        /// rows written before the status/verification split (reads as
+        /// `NotRun`).
+        #[serde(default)]
+        verification: leveler_lifecycle::VerificationStatus,
         reason: Option<String>,
         /// Typed executor stop reason for the whole task (raw, not the
         /// product reinterpretation). `None` on legacy rows and on tasks that
@@ -288,7 +294,8 @@ pub enum EngineEvent {
     /// mode this replaces left a downgraded task with zero trace.
     ///
     /// `action`: `not_required` | `already_reviewed` | `launching` |
-    /// `launch_failed` | `finished_ok` | `finished_incomplete`.
+    /// `launch_failed` | `finished_ok` | `finished_incomplete` |
+    /// `blocking_finding_open`.
     /// `detail` carries the policy reason or the launch error — never file
     /// contents or secrets.
     ReviewStage {
@@ -480,6 +487,8 @@ pub enum EngineEvent {
         node_id: String,
         status: NodeStatus,
     },
+    /// Legacy: emitted by the deleted verification-repair loop. Kept only so
+    /// persisted rows still replay; never produced.
     RepairStarted {
         attempt: u32,
     },
@@ -670,9 +679,14 @@ impl EngineEvent {
                 rounds: *rounds,
                 modified_file_count: modified_files.len(),
             },
-            EngineEvent::TaskFinished { outcome, .. } => {
-                PublicEvent::TaskFinished { outcome: *outcome }
-            }
+            EngineEvent::TaskFinished {
+                outcome,
+                verification,
+                ..
+            } => PublicEvent::TaskFinished {
+                outcome: *outcome,
+                verification: *verification,
+            },
             EngineEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -718,7 +732,6 @@ impl EngineEvent {
             EngineEvent::ProgressUpdated { ledger } => PublicEvent::TurnProgress {
                 closing: ledger.closing,
                 no_progress_streak: ledger.no_progress_streak,
-                closeout_deny_rounds: ledger.closeout_deny_rounds,
             },
             EngineEvent::ContextReady {
                 candidate_files,
@@ -807,6 +820,8 @@ pub enum PublicEvent {
     },
     TaskFinished {
         outcome: TaskOutcome,
+        #[serde(default)]
+        verification: leveler_lifecycle::VerificationStatus,
     },
     TokenUsage {
         input_tokens: u32,
@@ -842,11 +857,10 @@ pub enum PublicEvent {
         from: AgentState,
         to: AgentState,
     },
-    /// Coarse thrash/closeout counters only (no paths/tool text).
+    /// Coarse progress counters only (no paths/tool text).
     TurnProgress {
         closing: bool,
         no_progress_streak: u32,
-        closeout_deny_rounds: u32,
     },
     ContextReady {
         candidate_file_count: usize,
@@ -1160,7 +1174,8 @@ mod contract_tests {
     fn lifecycle_and_control_surface_are_projectable() {
         assert_eq!(
             EngineEvent::TaskFinished {
-                outcome: TaskOutcome::Verified,
+                outcome: TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
             }
@@ -1216,6 +1231,7 @@ mod contract_tests {
             },
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some(secret.into()),
                 stop: None,
             },
@@ -1290,6 +1306,7 @@ mod contract_tests {
         assert!(
             !EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
             }

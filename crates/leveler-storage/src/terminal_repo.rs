@@ -1,7 +1,7 @@
 //! Atomic terminal transitions for the execution aggregate.
 
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
+use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
 
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, StorageError};
@@ -36,6 +36,7 @@ impl<'a> TerminalRepository<'a> {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -43,14 +44,15 @@ impl<'a> TerminalRepository<'a> {
         let mut tx = self.db.pool().begin().await?;
         let event = append_event(&mut tx, session_id, None, event_type, payload, &now).await?;
         let updated = sqlx::query(
-            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
-             WHERE id = ?1",
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5, \
+             verification = ?6 WHERE id = ?1",
         )
         .bind(session_id.as_str())
         .bind(outcome.as_str())
         .bind(status.as_str())
         .bind(state.as_str())
         .bind(now.to_rfc3339())
+        .bind(verification.as_str())
         .execute(&mut *tx)
         .await;
         let updated = match updated {
@@ -135,6 +137,7 @@ impl TerminalRepository<'_> {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -158,14 +161,15 @@ impl TerminalRepository<'_> {
             .await
             .map_err(crate::OwnershipError::Storage)?;
         let updated = sqlx::query(
-            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
-             WHERE id = ?1",
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5, \
+             verification = ?6 WHERE id = ?1",
         )
         .bind(session_id.as_str())
         .bind(outcome.as_str())
         .bind(status.as_str())
         .bind(state.as_str())
         .bind(now.to_rfc3339())
+        .bind(verification.as_str())
         .execute(&mut *tx)
         .await;
         match updated {
@@ -343,6 +347,7 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -423,6 +428,7 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -472,6 +478,7 @@ mod tests {
                 "task_finished",
                 &oversized_payload,
                 TaskOutcome::Failed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -504,7 +511,8 @@ mod tests {
                 &session,
                 "task_finished",
                 r#"{"api_key":"terminal-secret-value"}"#,
-                TaskOutcome::CompletedUnverified,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 leveler_core::now(),

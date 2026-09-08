@@ -329,7 +329,7 @@ daemon 与 `RouterService`。详见 `crates/leveler-web/README.md`。
 ## 工作流与 NPC Runtime
 
 复杂任务不靠扩大 direct loop 实现。核心提供持久化生命周期、安全执行和明确终止；
-规划、证据、阶段检查、修复、委派由可替换的 **workflow / policy** 组合。
+规划、证据、阶段检查、委派由可替换的 **workflow / policy** 组合。
 
 ```text
 复杂任务 / NPC（FUTURE 产品化）
@@ -566,6 +566,41 @@ ABI、JSON-RPC 插件协议或 marketplace。这些需有真实实现后才成�
 
 ---
 
+## Runtime 权责边界
+
+```text
+Runtime 只对机械事实拥有 Authority。
+模型负责语义解释。
+用户负责验收。
+```
+
+Runtime 能机械确认的事实：哪些文件被修改、哪些命令执行过及其 exit code、
+build/test/lint 在最终代码树上是否通过、verification 是否发生在最新 mutation
+之后、permission / ownership 边界是否成立、child agent 是否运行并结束、预算或
+绝对回合上限是否触及。
+
+Runtime 不判断：用户需求是否被满足、模型对目标的理解是否正确、某次修改是否
+"足够"、探索是否值得、某个改动是否"需要"reviewer。它也不会偷偷发起第二次模型
+调用去评判第一次的结果。这些问题属于模型的最终回答和用户的审查。
+
+当前成立的推论：
+
+- 任务终态是两个正交值，不是一个词：`TaskOutcome`（如何结束：completed /
+  blocked / budget_limited / failed / interrupted）与 `VerificationStatus`
+  （项目自身检查的结果：passed / failed / not_run / unavailable）。
+  **Checks Passed ≠ 用户意图被证明。**
+- `update_goal(complete)` 只因机械原因被拒绝：委派的子 agent 仍在运行、
+  reviewer 报告的 blocking finding 未处理、模型自己计划中仍有未完成步骤、
+  用户显式写下的 acceptance 命令尚未通过。
+- 检查失败只会被报告，不会代替模型自动修复。模型在循环内看到自己的测试结果，
+  自行决定下一步。
+- 独立 reviewer 只在显式配置（`independent_review: required`）时启动；不再根据
+  文件名或 diff 大小推断。
+- 结构化计划是认知辅助。多步任务没有计划时最多得到一条软提醒；不会因缺少计划
+  拒绝任何工具调用。
+- 默认路径上的隐藏语义模型调用：**0**。压缩摘要与收口提醒是仅有的宿主发起调用，
+  两者都不评判工作本身。
+
 ## 不可破坏的核心约束
 
 - 所有仓库修改与进程执行只能经过 ToolHost / execution 边界。
@@ -662,12 +697,15 @@ Engine 拥有 task/turn 生命周期；Agent 跑 direct 工具循环；宿主代
 
 ### 5. 校验与完成
 
-`leveler-verifier` 发现或接收 format / build / test 命令，记录证据并分类失败。
-修复尝试有界。
+`leveler-verifier` 发现或接收 format / build / test 命令，在最终代码树上执行，
+记录证据并分类失败。结果作为 `VerificationStatus` 与任务终态并列报告；它不重新
+解读目标、不派生验收语义，也不触发自动修复回合。
 
-- `format`：尽力而为，**不门控**完成
-- `build` / `test`：**门控**完成
+- `format`：尽力而为，**不影响**验证状态
+- `build` / `test`：决定 `passed` / `failed`
 - 项目 `verify` 任一字段出现时，**整段替换**语言自动发现计划
+- 任务文本中显式的 `Acceptance:` 块列出的命令，Runtime 会在接受
+  `update_goal(complete)` 前机械核对
 
 ### 6. 持久化与重连
 

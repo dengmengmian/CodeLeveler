@@ -104,15 +104,6 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Contract derivation is answered out of band with an empty (i.e.
-        // unavailable) contract, so a test that did not opt into obligations
-        // keeps its scripted FIFO and its request counts. Tests that want
-        // obligations state them with `with_completion_contract`.
-        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
-            // Out of band: not recorded either, so request-count assertions
-            // stay about the loop's own turns.
-            return Ok(canned);
-        }
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
@@ -423,27 +414,6 @@ fn assistant_tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelRe
     }
 }
 
-fn assistant_parallel_calls(calls: &[(&str, &str, serde_json::Value)]) -> ModelResponse {
-    ModelResponse {
-        request_id: RequestId::generate(),
-        message: Message {
-            role: Role::Assistant,
-            content: calls
-                .iter()
-                .map(|(id, name, args)| ContentPart::ToolCall {
-                    call: ToolCall {
-                        id: ToolCallId::new(*id),
-                        name: (*name).to_string(),
-                        arguments: args.clone(),
-                    },
-                })
-                .collect(),
-        },
-        finish_reason: FinishReason::ToolCalls,
-        usage: TokenUsage::default(),
-    }
-}
-
 fn assistant_text(text: &str) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
@@ -451,14 +421,6 @@ fn assistant_text(text: &str) -> ModelResponse {
         finish_reason: FinishReason::Stop,
         usage: TokenUsage::default(),
     }
-}
-
-/// The Completion Reconciliation Gate's approval, scripted. Every ACCEPTED
-/// goal-mode update_goal(complete) consumes exactly one of these.
-fn reconcile_ok() -> ModelResponse {
-    assistant_text(
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"recorded output","evidence_strength":"observed"}],"reason":"satisfied as stated"}"#,
-    )
 }
 
 fn assistant_text_finished(text: &str, finish_reason: FinishReason) -> ModelResponse {
@@ -677,7 +639,6 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "All requirements verified."}),
         ),
-        reconcile_ok(),
     ]));
 
     let executor = Executor::new(
@@ -706,10 +667,10 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
         outcome.final_text
     );
     // Two model requests: the quiet round was re-prompted, then it resolved.
-    // quiet round re-prompted, resolution, then the reconciliation gate.
+    // No hidden call follows the resolution.
     assert_eq!(
         runtime.recorded_requests().len(),
-        3,
+        2,
         "quiet round was re-prompted"
     );
 
@@ -749,7 +710,6 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "未提交改动已全部回退。"}),
         ),
-        reconcile_ok(),
     ]));
 
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -778,11 +738,11 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
         .filter(|e| matches!(e, AgentEvent::AssistantText(t) if !t.trim().is_empty()))
         .count();
     assert_eq!(summaries, 1, "exactly one summary block: {events:?}");
-    // 无冗余验证轮: revert + summary + resolve — nothing extra.
-    // revert round, summary round, resolution — plus the reconciliation gate.
+    // 无冗余验证轮: revert + summary + resolve — nothing extra, and no hidden
+    // judge call after the resolution.
     assert_eq!(
         runtime.recorded_requests().len(),
-        4,
+        3,
         "no redundant verification rounds"
     );
     let commands = events
@@ -817,14 +777,11 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "Done."}),
-        ),
-        reconcile_ok(),
-    ]));
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "Done."}),
+    )]));
 
     let executor = Executor::new(
         runtime,
@@ -868,1052 +825,6 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
         "update_goal needs a matching successful result so UIs do not mark it failed"
     );
 
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Cross-model judge: the reconciliation request carries the CONFIGURED judge
-/// model with the gate's bounded request profile, while every main-loop
-/// request keeps the executor's own model.
-#[tokio::test]
-async fn reconciliation_uses_the_configured_judge_model_with_bounded_profile() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-crossmodel-{}",
-        std::process::id() as u64 * 67 + 11
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        reconcile_ok(),
-    ]));
-    let outcome = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
-    .run(
-        "do the task",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Completed);
-    let requests = runtime.recorded_requests();
-    let judge: Vec<_> = requests
-        .iter()
-        .filter(|r| r.model.model == "deepseek-v4-pro")
-        .collect();
-    assert_eq!(
-        judge.len(),
-        1,
-        "exactly one judge request on the judge model"
-    );
-    let judge = judge[0];
-    assert_eq!(
-        judge.reasoning_effort,
-        Some(leveler_model::ReasoningEffort::Low),
-        "the gate keeps its bounded effort profile on the stronger model"
-    );
-    assert_eq!(
-        judge.max_output_tokens,
-        Some(16384),
-        "the gate's budget covers reasoning AND the per-obligation accounting"
-    );
-    assert!(
-        requests
-            .iter()
-            .filter(|r| !r
-                .messages
-                .iter()
-                .any(|m| m.text_content().contains("reconciliation judge")))
-            .all(|r| r.model.model == "deepseek-v4-flash"),
-        "every main-loop request stays on the executor model"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §42B documented fallback: with no judge configured the gate runs on the
-/// executor's own model — today's same-model behaviour, unchanged.
-#[tokio::test]
-async fn reconciliation_without_a_configured_judge_uses_the_executor_model() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-samemodel-{}",
-        std::process::id() as u64 * 67 + 13
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        reconcile_ok(),
-    ]));
-    let outcome = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .run(
-        "do the task",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Completed);
-    let requests = runtime.recorded_requests();
-    let judge: Vec<_> = requests
-        .iter()
-        .filter(|r| {
-            r.messages
-                .iter()
-                .any(|m| m.text_content().contains("reconciliation judge"))
-        })
-        .collect();
-    assert_eq!(judge.len(), 1, "exactly one gate request");
-    assert_eq!(
-        judge[0].model,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        "unset judge policy keeps the gate on the executor's own model"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §42C/§39: a configured judge that cannot answer fails closed. It must never
-/// retry the gate on the executor model — a silent same-model fallback would
-/// read as a pass and contaminate the cross-model experiment.
-#[tokio::test]
-async fn an_unreachable_judge_model_fails_closed_without_same_model_fallback() {
-    /// Errors every gate call addressed to the judge model, while a gate call
-    /// addressed to the executor model would succeed — so a fallback, if one
-    /// existed, would show up as a completion.
-    struct JudgeDownRuntime {
-        inner: MockRuntime,
-        generated: Mutex<Vec<ModelRef>>,
-    }
-    #[async_trait]
-    impl ModelRuntime for JudgeDownRuntime {
-        async fn generate(
-            &self,
-            request: ModelRequest,
-            cancellation: CancellationToken,
-        ) -> Result<ModelResponse, ModelError> {
-            if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
-                return Ok(canned);
-            }
-            self.generated.lock().unwrap().push(request.model.clone());
-            if request.model.model == "deepseek-v4-pro" {
-                return Err(ModelError::new(
-                    leveler_model::ModelErrorKind::Other,
-                    "judge model unreachable (injected)",
-                ));
-            }
-            // Would approve the completion — reachable only via a fallback.
-            self.inner.generate(request, cancellation).await
-        }
-        async fn stream(
-            &self,
-            request: ModelRequest,
-            cancellation: CancellationToken,
-        ) -> Result<ModelEventStream, ModelError> {
-            self.inner.stream(request, cancellation).await
-        }
-        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
-            self.inner.profile(m).await
-        }
-    }
-
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-judgedown-{}",
-        std::process::id() as u64 * 67 + 17
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(JudgeDownRuntime {
-        inner: MockRuntime::new(vec![
-            assistant_tool_call(
-                "g1",
-                "update_goal",
-                serde_json::json!({"status": "complete", "summary": "claimed done"}),
-            ),
-            reconcile_ok(),
-            assistant_tool_call(
-                "g2",
-                "update_goal",
-                serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
-            ),
-        ]),
-        generated: Mutex::new(Vec::new()),
-    });
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
-    .run(
-        "do the task",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "an unreachable judge must never become a completion"
-    );
-    let generated = runtime.generated.lock().unwrap().clone();
-    assert!(
-        !generated.is_empty() && generated.iter().all(|m| m.model == "deepseek-v4-pro"),
-        "the gate stays on the configured judge — no same-model fallback: {generated:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("could not run")
-        )),
-        "the refusal names the unavailable verifier: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The shipped default ceiling is one number everyone gets, so it is pinned
-/// here — an experiment configures its own rather than moving everyone's.
-///
-/// 180s, not the original 60s: measured on a saved HC-002 judgment, a
-/// contract-accounting verdict took 21.1s min / 53.6s median / 113.9s max, so
-/// the old ceiling refused correct completions on ordinary latency (F2).
-#[test]
-fn the_default_gate_ceiling_clears_the_measured_judgment_tail() {
-    assert_eq!(
-        leveler_agent::DEFAULT_RECONCILE_TIMEOUT,
-        std::time::Duration::from_secs(180)
-    );
-}
-
-/// A judge that answers only after `delay`, so a test can place the configured
-/// ceiling on either side of it. Honours cancellation, like a real provider.
-struct SlowJudgeRuntime {
-    inner: MockRuntime,
-    delay: std::time::Duration,
-    generated: Mutex<Vec<ModelRef>>,
-}
-
-#[async_trait]
-impl ModelRuntime for SlowJudgeRuntime {
-    async fn generate(
-        &self,
-        request: ModelRequest,
-        cancellation: CancellationToken,
-    ) -> Result<ModelResponse, ModelError> {
-        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(canned);
-        }
-        self.generated.lock().unwrap().push(request.model.clone());
-        tokio::select! {
-            _ = tokio::time::sleep(self.delay) => {}
-            _ = cancellation.cancelled() => {
-                return Err(ModelError::new(
-                    leveler_model::ModelErrorKind::Other,
-                    "request cancelled",
-                ));
-            }
-        }
-        self.inner.generate(request, cancellation).await
-    }
-    async fn stream(
-        &self,
-        request: ModelRequest,
-        cancellation: CancellationToken,
-    ) -> Result<ModelEventStream, ModelError> {
-        self.inner.stream(request, cancellation).await
-    }
-    async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        self.inner.profile(m).await
-    }
-}
-
-fn slow_judge(delay_ms: u64) -> Arc<SlowJudgeRuntime> {
-    Arc::new(SlowJudgeRuntime {
-        inner: MockRuntime::new(vec![
-            assistant_tool_call(
-                "g1",
-                "update_goal",
-                serde_json::json!({"status": "complete", "summary": "done"}),
-            ),
-            reconcile_ok(),
-            assistant_tool_call(
-                "g2",
-                "update_goal",
-                serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
-            ),
-        ]),
-        delay: std::time::Duration::from_millis(delay_ms),
-        generated: Mutex::new(Vec::new()),
-    })
-}
-
-/// §21: a ceiling wide enough for the judge lets its verdict land. Same judge,
-/// same delay as the test below — only the configured ceiling differs.
-#[tokio::test]
-async fn a_ceiling_above_the_judge_latency_lets_the_verdict_land() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-ceiling-wide-{}",
-        std::process::id() as u64 * 71 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = slow_judge(300);
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
-    .with_reconciliation_timeout(std::time::Duration::from_secs(5))
-    .run(
-        "do the task",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "a judge inside the configured ceiling must be allowed to answer"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §25: a judge that overruns the configured ceiling is UNAVAILABLE, and
-/// unavailable is a refusal — never a pass. Right-censoring the judge can only
-/// ever cost a completion, it can never manufacture one.
-#[tokio::test]
-async fn a_judge_that_overruns_the_ceiling_fails_closed() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-ceiling-tight-{}",
-        std::process::id() as u64 * 71 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = slow_judge(2_000);
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
-    .with_reconciliation_timeout(std::time::Duration::from_millis(120))
-    .run(
-        "do the task",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "a timed-out judgment must never become a completion"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("could not run")
-        )),
-        "the refusal names the unavailable verifier: {events:?}"
-    );
-    // §27: and it stays on the judge — a timeout is not a licence to ask the
-    // executor's own model instead.
-    let generated = runtime.generated.lock().unwrap().clone();
-    assert!(
-        !generated.is_empty() && generated.iter().all(|m| m.model == "deepseek-v4-pro"),
-        "no same-model fallback after a timeout: {generated:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §26: a wide ceiling must not make the gate uncancellable. Cancelling wins
-/// immediately instead of waiting out the configured seconds.
-#[tokio::test]
-async fn cancellation_preempts_a_wide_ceiling() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-ceiling-cancel-{}",
-        std::process::id() as u64 * 71 + 7
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    // The judge would take an hour; the ceiling allows it.
-    let runtime = slow_judge(3_600_000);
-    let cancellation = CancellationToken::new();
-    let canceller = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        canceller.cancel();
-    });
-    let started = std::time::Instant::now();
-    let result = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("deepseek", "deepseek-v4-flash"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
-    .with_reconciliation_timeout(std::time::Duration::from_secs(3_600))
-    .run("do the task", &mut |_| {}, &mut NoopSink, cancellation)
-    .await;
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "cancellation must preempt the ceiling, not wait it out ({:?})",
-        started.elapsed()
-    );
-    match result {
-        Err(leveler_agent::AgentError::Cancelled) => {}
-        other => panic!("a cancelled run is Cancelled, never a completion: {other:?}"),
-    }
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// THE scale-s800 DEFECT, as a test. The goal says in so many words that the
-/// boundary rule must be covered by a test. The implementation lands, the
-/// judge is happy with the overall picture, and it accounts for the test
-/// obligation with nothing but its own reading of the work. The completion
-/// must still be refused, and the refusal must name the obligation.
-#[tokio::test]
-async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-contract-prose-{}",
-        std::process::id() as u64 * 73 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "the window boundary rule is [start, start+width)".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-        leveler_lifecycle::CompletionRequirement {
-            id: "R2".into(),
-            text: "the boundary rule is covered by a test".into(),
-            kind: leveler_lifecycle::RequirementKind::Verification,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "fixed the boundary rule"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied",
-                "requirements":[{"requirement":"boundary rule","satisfied":true,"evidence":"fixed"}],
-                "contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,"evidence":"window.go now uses [start, start+width)","evidence_strength":"mechanical"},
-                  {"id":"R2","satisfied":true,"evidence":"I added a test for the boundary","evidence_strength":"semantic"}
-                ],
-                "reason":"all good"}"#,
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "no test written"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "fix the boundary rule; the boundary rule must be covered by a test",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "an obligation to DEMONSTRATE cannot be discharged by saying so"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("R2")
-        )),
-        "the refusal names the obligation that is still open: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The same contract clears once the obligation is backed by a check that
-/// actually ran green over the tree as it stands.
-#[tokio::test]
-async fn a_mechanically_backed_obligation_completes() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-contract-mech-{}",
-        std::process::id() as u64 * 73 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "the CLI reports the rule".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied",
-                "requirements":[{"requirement":"cli","satisfied":true,"evidence":"ok"}],
-                "contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,"evidence":"observed the report output","evidence_strength":"observed"}
-                ],
-                "reason":"ok"}"#,
-        ),
-    ]));
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "make the CLI report the rule",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Completed);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §72: a goal whose contract could not be established cannot complete. The
-/// absence of obligations is not a finding that none existed — nothing was
-/// checked, and nothing checked is not the same as everything satisfied.
-#[tokio::test]
-async fn a_goal_with_no_derivable_contract_cannot_complete() {
-    /// Derivation always answers prose, so no contract can ever be built.
-    struct NoContractRuntime(MockRuntime);
-    #[async_trait]
-    impl ModelRuntime for NoContractRuntime {
-        async fn generate(
-            &self,
-            request: ModelRequest,
-            cancellation: CancellationToken,
-        ) -> Result<ModelResponse, ModelError> {
-            if request.messages.iter().any(|m| {
-                m.text_content()
-                    .contains(leveler_test_support::DERIVE_MARKER)
-            }) {
-                return Ok(assistant_text("the task looks clear enough to me"));
-            }
-            self.0.generate(request, cancellation).await
-        }
-        async fn stream(
-            &self,
-            request: ModelRequest,
-            cancellation: CancellationToken,
-        ) -> Result<ModelEventStream, ModelError> {
-            self.0.stream(request, cancellation).await
-        }
-        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
-            self.0.profile(m).await
-        }
-    }
-
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-nocontract-{}",
-        std::process::id() as u64 * 79 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(NoContractRuntime(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        reconcile_ok(),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "cannot establish obligations"}),
-        ),
-    ])));
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .run(
-        "do the task",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "no contract means nothing was checked, which is not the same as satisfied"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §42: the obligations survive a restart. A resumed run must not get to
-/// reinterpret the goal from scratch just because the process died — that is
-/// the rescoping this whole mechanism exists to prevent, arriving by another
-/// door.
-#[tokio::test]
-async fn a_resumed_run_keeps_the_obligations_it_already_had() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-contract-resume-{}",
-        std::process::id() as u64 * 79 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    // What the dead window left behind: obligations, one of them a test the
-    // run never wrote.
-    let seeded = leveler_lifecycle::EvidenceLedger {
-        completion_contract: Some(leveler_lifecycle::CompletionContract::new(vec![
-            leveler_lifecycle::CompletionRequirement {
-                id: "R1".into(),
-                text: "the boundary rule is covered by a test".into(),
-                kind: leveler_lifecycle::RequirementKind::Verification,
-                source: leveler_lifecycle::RequirementSource::OriginalGoal,
-                status: leveler_lifecycle::RequirementStatus::Pending,
-                evidence_policy: None,
-                evidence: Vec::new(),
-                acceptance_facets: Vec::new(),
-            },
-        ])),
-        ..Default::default()
-    };
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "picked up where I left off"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,"evidence":"I believe a test covers it","evidence_strength":"semantic"}
-                ],
-                "reason":"looks done"}"#,
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "no test"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_seeded_ledger(seeded)
-    .run(
-        "fix the boundary rule; it must be covered by a test",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "the surviving obligation still has no mechanical backing"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, is_error: true, preview, .. }
-                if id == "g1" && preview.contains("R1")
-        )),
-        "the refusal names the obligation that outlived the restart: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// §31/§32: the contract cannot see its own blind spots. If derivation missed
-/// a material requirement, the obligations can all be discharged and the task
-/// still not be done — so the semantic guard's remaining job is exactly this
-/// question, and an omission it names refuses the completion.
-#[tokio::test]
-async fn a_requirement_the_contract_missed_still_refuses_completion() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-contract-omission-{}",
-        std::process::id() as u64 * 83 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "fix the boundary rule".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "boundary fixed"}),
-        ),
-        // Every listed obligation is discharged, and the judge still reports
-        // that the list itself was short.
-        assistant_text(
-            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,"evidence":"window.go updated","evidence_strength":"mechanical"}
-                ],
-                "omitted_requirements":["the CLI report must reflect the rule end to end"],
-                "reason":"listed obligations are met"}"#,
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "cli not updated"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "fix the boundary rule and make the CLI report reflect it",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "an obligation list that missed a requirement is not a satisfied task"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, is_error: true, preview, .. }
-                if id == "g1" && preview.contains("CLI report")
-        )),
-        "the refusal names what the contract missed: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
-/// completion (durable GoalIntercepted + error ToolResult), the run continues,
-/// and the model may then resolve truthfully.
-#[tokio::test]
-async fn reconciliation_blocked_verdict_refuses_completion_and_run_continues() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-reconcile-blocked-{}",
-        std::process::id() as u64 * 61 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "claimed done"}),
-        ),
-        // The gate's verdict: the original contract is not satisfied.
-        assistant_text(
-            r#"{"verdict":"blocked","requirements":[{"requirement":"remove zero rows from both surfaces","satisfied":false,"evidence":"idle total=0 still rendered"}],"contradictions":["claim says both surfaces fixed; output shows idle count=1 total=0"],"reason":"requirement unsatisfied as written"}"#,
-        ),
-        // The model reacts honestly.
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "requirement conflicts with pinned test"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .run(
-        "remove zero rows",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Blocked);
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::GoalIntercepted { kind, detail }
-                if kind == "completion_reconciliation" && detail.contains("contradiction")
-        )),
-        "the refusal must be durably observable: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal"
-                    && preview.contains("independent completion check")
-        )),
-        "the model must receive the refusal with the contract restated: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A verifier that cannot answer must never be read as "complete": malformed
-/// JSON from the reconciliation call refuses the completion, fail closed.
-#[tokio::test]
-async fn reconciliation_malformed_output_fails_closed() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-reconcile-malformed-{}",
-        std::process::id() as u64 * 61 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "claimed done"}),
-        ),
-        assistant_text("I think it looks fine overall!"), // no JSON verdict
-        assistant_text("still prose, no object"),         // repair also fails
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "cannot verify completion"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .run(
-        "do the task",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "a malformed verdict must never become a completion"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("could not run")
-        )),
-        "the unavailable-verifier refusal names itself: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Provider failure on the reconciliation call: completion refused (fail
-/// closed), never silently converted into success. The mock errors on every
-/// non-streaming call while serving the loop's streamed script normally.
-#[tokio::test]
-async fn reconciliation_provider_failure_fails_closed() {
-    struct GateErrorRuntime(MockRuntime);
-    #[async_trait]
-    impl ModelRuntime for GateErrorRuntime {
-        async fn generate(
-            &self,
-            _request: ModelRequest,
-            _cancellation: CancellationToken,
-        ) -> Result<ModelResponse, ModelError> {
-            Err(ModelError::new(
-                leveler_model::ModelErrorKind::Other,
-                "verifier provider down (injected)",
-            ))
-        }
-        async fn stream(
-            &self,
-            request: ModelRequest,
-            cancellation: CancellationToken,
-        ) -> Result<ModelEventStream, ModelError> {
-            self.0.stream(request, cancellation).await
-        }
-        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
-            self.0.profile(m).await
-        }
-    }
-
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-reconcile-provider-{}",
-        std::process::id() as u64 * 61 + 7
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(GateErrorRuntime(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "claimed done"}),
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
-        ),
-    ])));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .run(
-        "do the task",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "verifier unavailable must never be read as complete"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("could not run")
-        )),
-        "the unavailable-verifier refusal names itself: {events:?}"
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3053,553 +1964,6 @@ async fn repeated_identical_call_is_blocked_by_loop_guard() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// R007 F1 accident regression (W1 shape): ONE benign exact re-read early in
-/// the turn must not latch every later novel observation as thrash. Pre-fix,
-/// `repeated_observation` was a whole-history `any()` — after `bearer.ts` was
-/// read twice, rounds of NOVEL greps/lists classified ObserveThrash, the
-/// forced-answer blanket then refused novel calls, and the turn was killed
-/// Incomplete ("重复观察已中止") nine minutes into a healthy diagnosis. If this
-/// test is deleted, that false kill can return unnoticed.
-#[tokio::test]
-async fn an_early_benign_repeat_must_not_latch_later_novel_observation_as_thrash() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-novel-after-repeat-{}",
-        std::process::id() as u64 * 31 + 3
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
-    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
-    std::fs::write(dir.join("src/c.rs"), "pub fn gamma() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let responses = vec![
-        // The benign repeat: same file read twice with identical content
-        // (LOOP_GUARD_THRESHOLD is reached for this one key).
-        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/a.rs"})),
-        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
-        // …followed by rounds of purely NOVEL observation (the W1 tail that
-        // was refused and killed pre-fix).
-        assistant_tool_call(
-            "g1",
-            "grep",
-            serde_json::json!({"pattern": "alpha", "path": "src"}),
-        ),
-        assistant_tool_call(
-            "g2",
-            "grep",
-            serde_json::json!({"pattern": "beta", "path": "src"}),
-        ),
-        assistant_tool_call("l1", "list_files", serde_json::json!({"path": "src"})),
-        assistant_tool_call(
-            "g3",
-            "grep",
-            serde_json::json!({"pattern": "gamma", "path": "src"}),
-        ),
-        assistant_text("diagnosis complete"),
-    ];
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "investigate the alpha/beta/gamma helpers",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Answered,
-        "novel observation after one benign repeat must run to the answer, \
-         never die as thrash: {:?}",
-        outcome.stop_detail
-    );
-    let novel_refused: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            leveler_agent::AgentEvent::ToolResult {
-                id,
-                is_error: true,
-                preview,
-                ..
-            } if ["g1", "g2", "g3", "l1"].contains(&id.as_str()) => {
-                Some((id.clone(), preview.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(
-        novel_refused.is_empty(),
-        "no novel observe call may be refused: {novel_refused:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// R007 F1 §31: even AFTER the forced-answer nudge fires (a genuine thrash
-/// streak reached the cap), a NOVEL observation must still be allowed to run.
-/// Pre-fix a blanket refusal rejected every observe-class call once that flag
-/// was set — regardless of novelty, and inconsistently (read_file escaped it
-/// because it has no observe key, contradicting the refusal's own wording).
-/// That blanket is what turned "answer from what you have" into "you may never
-/// look at anything new again", and it is the second half of the R007 W1 kill.
-#[tokio::test]
-async fn novel_observation_is_still_allowed_after_the_forced_answer_nudge() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-post-forced-novel-{}",
-        std::process::id() as u64 * 41 + 17
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
-    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let responses = vec![
-        // Genuine thrash: identical list twice, then a refused third — this
-        // drives the no-progress streak to the cap and arms forced-answer.
-        assistant_tool_call("l1", "list_files", serde_json::json!({"path": "src"})),
-        assistant_tool_call("l2", "list_files", serde_json::json!({"path": "src"})),
-        assistant_tool_call("l3", "list_files", serde_json::json!({"path": "src"})),
-        // The model takes the hint differently: it looks at something NEW.
-        assistant_tool_call(
-            "g1",
-            "grep",
-            serde_json::json!({"pattern": "beta", "path": "src"}),
-        ),
-        assistant_text("found it"),
-    ];
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "find the beta helper",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let g1_ran = events.iter().any(|e| {
-        matches!(e,
-            leveler_agent::AgentEvent::ToolResult { id, is_error: false, .. }
-                if id.as_str() == "g1")
-    });
-    assert!(
-        g1_ran,
-        "a novel grep after the forced-answer nudge must execute, not be \
-         blanket-refused: {events:?}"
-    );
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Answered,
-        "recovering via novel observation must reach the answer: {:?}",
-        outcome.stop_detail
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// R007 F1, parallel path: rounds where TWO observes actually execute — one
-/// returning an identical earlier result, one genuinely new — must grade as
-/// exploration. The parallel result loop originally counted the repeat but
-/// never credited the novel sibling, so a batch of "re-check this + look at
-/// that" rounds accumulated thrash and hard-stopped a turn doing real work.
-#[tokio::test]
-async fn a_parallel_round_mixing_a_repeat_with_novel_work_is_not_thrash() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-parallel-mixed-{}",
-        std::process::id() as u64 * 43 + 19
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    for (name, sym) in [
-        ("a", "alpha"),
-        ("b", "beta"),
-        ("c", "gamma"),
-        ("d", "delta"),
-    ] {
-        std::fs::write(
-            dir.join(format!("src/{name}.rs")),
-            format!("pub fn {sym}() {{}}\n"),
-        )
-        .unwrap();
-    }
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let grep = |id: &str, pat: &str| {
-        (
-            id.to_string(),
-            "grep".to_string(),
-            serde_json::json!({"pattern": pat, "path": "src"}),
-        )
-    };
-    let pair = |a: (String, String, serde_json::Value), b: (String, String, serde_json::Value)| {
-        assistant_parallel_calls(&[
-            (a.0.as_str(), a.1.as_str(), a.2.clone()),
-            (b.0.as_str(), b.1.as_str(), b.2.clone()),
-        ])
-    };
-    let responses = vec![
-        // Seed two distinct observations.
-        pair(grep("s1", "alpha"), grep("s2", "beta")),
-        // Each later round re-obtains one earlier result (identical output)
-        // alongside a genuinely new one. Three such rounds would exhaust the
-        // no-progress cap AND the forced-answer second chance if they were
-        // mis-graded as pure thrash.
-        pair(grep("m1", "alpha"), grep("m2", "gamma")),
-        pair(grep("m3", "beta"), grep("m4", "delta")),
-        pair(grep("m5", "gamma"), grep("m6", "pub fn")),
-        assistant_text("all four located"),
-    ];
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let outcome = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    )
-    .run(
-        "locate the four helpers",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Answered,
-        "parallel rounds carrying real new observation must not accumulate \
-         thrash: {:?}",
-        outcome.stop_detail
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// R007 F1 §32 Case C/D: a mixed round (one refused true repeat + one novel
-/// observation) is exploration, not thrash — the turn continues and answers.
-/// The single repeat refusal must neither escalate as ordinary stagnation nor
-/// poison the novel work beside it.
-#[tokio::test]
-async fn a_mixed_round_with_novel_work_is_not_thrash() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-mixed-round-{}",
-        std::process::id() as u64 * 37 + 11
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
-    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let responses = vec![
-        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/a.rs"})),
-        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
-        // Mixed rounds: the identical re-read is refused by the per-key guard
-        // while the novel grep beside it executes. TWO of them, so a
-        // mis-grading as pure thrash would reach the no-progress cap and kill
-        // the turn — that is what makes this test discriminate.
-        assistant_parallel_calls(&[
-            ("r3", "read_file", serde_json::json!({"path": "src/a.rs"})),
-            (
-                "g1",
-                "grep",
-                serde_json::json!({"pattern": "beta", "path": "src"}),
-            ),
-        ]),
-        assistant_parallel_calls(&[
-            ("r4", "read_file", serde_json::json!({"path": "src/a.rs"})),
-            (
-                "g2",
-                "grep",
-                serde_json::json!({"pattern": "alpha", "path": "src"}),
-            ),
-        ]),
-        assistant_text("done"),
-    ];
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "inspect the helpers",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Answered,
-        "a mixed round must not end the turn: {:?}",
-        outcome.stop_detail
-    );
-    let g1_ok = events.iter().any(|e| {
-        matches!(e,
-            leveler_agent::AgentEvent::ToolResult { id, is_error: false, .. }
-                if id.as_str() == "g1")
-    });
-    assert!(
-        g1_ok,
-        "the novel grep beside the refused repeat must execute"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The stagnation guard must force-stop a run whose command keeps failing, even
-/// when the model varies the args each round (so the identical-call guard never
-/// fires) — the real-world "edit → run a check that keeps failing" spin. Without
-/// it, such a turn loops until the token budget or the user kills it.
-#[tokio::test]
-async fn a_command_that_keeps_failing_is_force_stopped() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-stagnation-{}",
-        std::process::id() as u64 * 29 + 3
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // `false` always exits non-zero; varying the args each round changes the
-    // loop-guard key so the identical-call guard does not short-circuit it. More
-    // responses than the stagnation cap, so the guard (not exhaustion) ends it.
-    let mut responses: Vec<ModelResponse> = (0..8)
-        .map(|i| {
-            assistant_tool_call(
-                &format!("c{i}"),
-                "run_command",
-                serde_json::json!({"program": "false", "args": [format!("{i}")]}),
-            )
-        })
-        .collect();
-    responses.push(assistant_text("giving up"));
-    let runtime = Arc::new(MockRuntime::new(responses));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    );
-    let outcome = executor
-        .run(
-            "run the failing check until it passes",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Incomplete,
-        "a check that never passes must be force-stopped, not looped: {outcome:?}"
-    );
-    assert!(
-        outcome.rounds <= 6,
-        "must stop within a few rounds, not consume all attempts: rounds={}",
-        outcome.rounds
-    );
-    assert!(
-        outcome
-            .stop_detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("stagnation"),
-        "stop detail should name the stagnation guard: {:?}",
-        outcome.stop_detail
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// After every plan step is completed, pure-observe thrash (git status via
-/// different wrappers) must be refused and the turn must hard-stop rather than
-/// burn rounds re-auditing.
-#[tokio::test]
-async fn completed_plan_refuses_observe_thrash_and_stops() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-closeout-{}",
-        std::process::id() as u64 * 41 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "update docs", "status": "completed"},
-                    {"step": "mark roadmap", "status": "completed"}
-                ]
-            }),
-        ),
-        // Round 1 thrash after plan green.
-        assistant_tool_call(
-            "g1",
-            "shell_command",
-            serde_json::json!({"cmd": "git status --porcelain"}),
-        ),
-        // Round 2 thrash with a different wrapper — still observe:git_status.
-        assistant_tool_call(
-            "g2",
-            "run_command",
-            serde_json::json!({"program": "git", "args": ["status", "-sb"]}),
-        ),
-        // Must not be reached: hard-stop after two deny rounds.
-        assistant_text("should not need another model round"),
-    ]));
-
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "update remaining work docs",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::CloseoutForced,
-        "plan complete + observe thrash → forced closeout stop (not Incomplete)"
-    );
-    assert!(
-        outcome
-            .stop_detail
-            .as_deref()
-            .is_some_and(|d| d.contains("thrash")),
-        "expected an observe-thrash short-circuit detail: {:?}",
-        outcome.stop_detail
-    );
-    let closeout_denials = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                AgentEvent::ToolResult { is_error: true, preview, .. }
-                    if preview.contains("Plan steps are complete")
-            )
-        })
-        .count();
-    assert!(
-        closeout_denials >= 2,
-        "expected ≥2 plan-complete observe denials: {events:?}"
-    );
-    // Third scripted text response must remain unused.
-    assert_eq!(
-        runtime.recorded_requests().len(),
-        3,
-        "plan + 2 thrash rounds only (no extra model call after hard-stop)"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn complex_task_must_register_a_structured_plan_before_tools_run() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-plan-gate-{}",
-        std::process::id() as u64 * 31 + 11
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
-        assistant_tool_call(
-            "c2",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "inspect", "status": "completed"},
-                    {"step": "edit", "status": "in_progress"},
-                    {"step": "verify", "status": "pending"}
-                ]
-            }),
-        ),
-        assistant_tool_call("c3", "apply_patch", serde_json::json!({"patch": patch})),
-        assistant_text("done"),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    )
-    .with_structure(true);
-    let mut events = Vec::new();
-
-    executor
-        .run(
-            "1. inspect the current implementation\n2. change the behavior\n3. run verification",
-            &mut |event| events.push(event),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let first_edit_was_blocked = events.iter().any(|event| {
-        matches!(event,
-            AgentEvent::ToolResult { id, is_error: true, preview, .. }
-                if id == "c1" && preview.contains("update_plan"))
-    });
-    assert!(first_edit_was_blocked, "events: {events:?}");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[tokio::test]
 async fn nested_agents_rules_are_loaded_before_the_first_scoped_edit() {
     let dir = std::env::temp_dir().join(format!(
@@ -4167,7 +2531,6 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "did things, explicitly"}),
         ),
-        reconcile_ok(),
     ]));
 
     let executor = Executor::new(
@@ -4191,10 +2554,10 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    // malformed attempt, retried resolution, then the reconciliation gate.
+    // malformed attempt, then the retried resolution.
     assert_eq!(
         runtime.recorded_requests().len(),
-        3,
+        2,
         "the malformed resolution must be fed back for a retry"
     );
     assert!(
@@ -5325,14 +3688,11 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        reconcile_ok(),
-    ]));
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "done"}),
+    )]));
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
@@ -5352,8 +3712,8 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    // the resolution plus the completion reconciliation gate.
-    assert_eq!(runtime.requests.lock().unwrap().len(), 2);
+    // Exactly the resolution: no hidden completion judge follows it.
+    assert_eq!(runtime.requests.lock().unwrap().len(), 1);
     let plan_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::PlanUpdated { .. }))
@@ -5416,7 +3776,6 @@ async fn update_goal_complete_rejects_incomplete_model_todos() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "yes"}),
         ),
-        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -5494,7 +3853,6 @@ async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
                 "override_incomplete_todos": true
             }),
         ),
-        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -5917,7 +4275,7 @@ async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_n
                 .filter(|m| {
                     m.role == leveler_model::Role::User
                         && m.text_content()
-                            .contains("continue exploring with search/read/symbol/reference")
+                            .contains("may benefit from a structured plan")
                 })
                 .count()
         })
@@ -6058,7 +4416,6 @@ async fn resume_seeded_plan_is_used_by_todo_gate() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "ok"}),
         ),
-        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -6089,219 +4446,6 @@ async fn resume_seeded_plan_is_used_by_todo_gate() {
             ..
         } if name == "update_goal" && preview.contains("incomplete")
     )));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn delivery_gate_blocks_complete_without_mutation() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-delivery-gate-{}",
-        std::process::id() as u64 * 31 + 30
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done without edits"}),
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "cannot complete"}),
-        ),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_goal_mode(true)
-    .with_work_profile(leveler_agent::WorkProfile::Delivery);
-    assert!(executor.delivery_gate_enabled());
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "fix the login bug",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Blocked);
-    assert!(events.iter().any(|e| matches!(
-        e,
-        AgentEvent::ToolResult {
-            name,
-            is_error: true,
-            preview,
-            ..
-        } if name == "update_goal" && preview.contains("mutation")
-    )));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn delivery_complete_step_requires_fresh_verify_evidence() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-complete-step-{}",
-        std::process::id() as u64 * 31 + 40
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "edit", "status": "in_progress"},
-                    {"step": "verify", "status": "pending"}
-                ]
-            }),
-        ),
-        assistant_tool_call(
-            "cs1",
-            "complete_step",
-            serde_json::json!({
-                "step_id": "edit",
-                "summary": "edited",
-                "evidence_ref": "missing-id"
-            }),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "need evidence"}),
-        ),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        12,
-    )
-    .with_goal_mode(true)
-    .with_structure(true)
-    .with_work_profile(leveler_agent::WorkProfile::Delivery);
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "1. edit the file\n2. verify the change",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let stale_refused = events.iter().any(|e| {
-        matches!(
-            e,
-            AgentEvent::ToolResult {
-                id,
-                is_error: true,
-                preview,
-                ..
-            } if id == "cs1" && (preview.contains("stale") || preview.contains("missing") || preview.contains("evidence"))
-        )
-    });
-    assert!(stale_refused, "stale complete_step must fail: {events:?}");
-    assert_eq!(outcome.stop_reason, StopReason::Blocked);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn delivery_complete_step_accepts_fresh_verify_evidence() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-complete-step-ok-{}",
-        std::process::id() as u64 * 31 + 41
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::with_environment(
-        workspace,
-        PermissionProfile::FullAccess,
-        Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
-            std::env::current_dir().unwrap_or_default(),
-            std::env::temp_dir(),
-        )),
-    );
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "edit", "status": "in_progress"},
-                    {"step": "verify", "status": "pending"}
-                ]
-            }),
-        ),
-        assistant_tool_call("m1", "apply_patch", serde_json::json!({"patch": patch})),
-        assistant_tool_call(
-            "v1",
-            "run_command",
-            serde_json::json!({"program": "cargo", "args": ["--version"]}),
-        ),
-        assistant_tool_call(
-            "cs1",
-            "complete_step",
-            serde_json::json!({
-                "step_id": "edit",
-                "summary": "edited a.txt",
-                "evidence_ref": "v1"
-            }),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "stop after step receipt"}),
-        ),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        16,
-    )
-    .with_goal_mode(true)
-    .with_structure(true)
-    .with_work_profile(leveler_agent::WorkProfile::Delivery)
-    .with_approver(Arc::new(leveler_execution::AutoApprove));
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "1. edit the file\n2. verify the change",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let accepted = events.iter().any(|e| {
-        matches!(
-            e,
-            AgentEvent::ToolResult {
-                id,
-                is_error: false,
-                preview,
-                ..
-            } if id == "cs1" && preview.contains("completed")
-        )
-    });
-    assert!(accepted, "fresh complete_step must succeed: {events:?}");
-    assert_eq!(outcome.stop_reason, StopReason::Blocked);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6425,7 +4569,7 @@ async fn shell_command_verification_is_recorded_as_command_evidence() {
         &["--version".to_string()],
     );
     assert!(
-        ledger.fresh_successful_command(&fingerprint),
+        fresh_successful_command(&ledger, &fingerprint),
         "shell_command execution of `cargo --version` must be fresh command evidence: {:?}",
         ledger.verifications
     );
@@ -6509,8 +4653,8 @@ async fn mixed_command_wrappers_share_one_freshness_rule() {
         &["--list".to_string()],
     );
     assert!(
-        ledger.fresh_successful_command(&shell_fp)
-            && ledger.fresh_successful_command(&structured_fp),
+        fresh_successful_command(&ledger, &shell_fp)
+            && fresh_successful_command(&ledger, &structured_fp),
         "both wrappers must produce equivalent fresh evidence: {:?}",
         ledger.verifications
     );
@@ -6518,8 +4662,8 @@ async fn mixed_command_wrappers_share_one_freshness_rule() {
     // mutation-sequence rule as structured evidence.
     ledger.record_mutation("m2", "apply_patch", vec!["notes.txt".to_string()]);
     assert!(
-        !ledger.fresh_successful_command(&shell_fp)
-            && !ledger.fresh_successful_command(&structured_fp),
+        !fresh_successful_command(&ledger, &shell_fp)
+            && !fresh_successful_command(&ledger, &structured_fp),
         "a later mutation must invalidate evidence from either wrapper"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -6626,6 +4770,18 @@ async fn ordinary_shell_command_is_not_verification_evidence() {
 }
 
 /// The last EvidenceLedger the executor emitted.
+/// Did this exact command run green over the tree as it stands? Answered
+/// from the ledger's own record (mechanical: fingerprint + freshness).
+fn fresh_successful_command(ledger: &leveler_lifecycle::EvidenceLedger, fingerprint: &str) -> bool {
+    let last_mut = ledger.last_mutation_seq();
+    ledger.verifications.iter().any(|v| {
+        v.exit_code == 0
+            && v.after_mutation_seq >= last_mut
+            && last_mut > 0
+            && v.command_fingerprint == fingerprint
+    })
+}
+
 fn last_ledger(events: &[AgentEvent]) -> Option<leveler_lifecycle::EvidenceLedger> {
     events.iter().rev().find_map(|e| match e {
         AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
@@ -6887,65 +5043,6 @@ async fn no_plan_observe_streak_hard_stops() {
     assert!(
         !outcome.final_text.contains("should not reach"),
         "must not reach post-thrash assistant text: {}",
-        outcome.final_text
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// After observe thrash hits the no-progress cap, a forced synthesis round that
-/// answers quietly must complete as Answered — not Incomplete with empty text.
-#[tokio::test]
-async fn observe_thrash_force_answer_then_quiet_is_answered() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-othrash-ans-{}",
-        std::process::id() as u64 * 23 + 5
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn skill_loader() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    // Round 1: list (n=1, no thrash). Round 2: list (n=2, streak=1).
-    // Round 3: list denied by loop guard (streak=2) → force-answer chance.
-    // Round 4: quiet final answer → Answered.
-    let mut responses: Vec<ModelResponse> = (0..3)
-        .map(|i| {
-            assistant_tool_call(
-                &format!("ol{i}"),
-                "list_files",
-                serde_json::json!({"path": "."}),
-            )
-        })
-        .collect();
-    responses.push(assistant_text(
-        "Projects load skills from the configured skill_dir when SkillDir is set.",
-    ));
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-    let outcome = executor
-        .run(
-            "what project loads skill?",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Answered,
-        "forced synthesis after thrash must Answered, got {:?}",
-        outcome.stop_reason
-    );
-    assert!(
-        outcome.final_text.contains("skill_dir") || outcome.final_text.contains("SkillDir"),
-        "expected answer from findings: {}",
         outcome.final_text
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -7453,7 +5550,6 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the function"}),
         ),
-        reconcile_ok(),
     ]));
 
     let transcript = Arc::new(Mutex::new(Vec::new()));
@@ -7514,87 +5610,6 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
         "summary must precede the nudge: {done_idx:?} vs {nudge_idx:?}"
     );
     drop(messages);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// #1/#2: after the plan is complete, re-running commands (builds/tests/curl)
-/// is redundant closeout work — NOT a fresh objective. The drive must stop
-/// within the closeout cap. The forced hard-stop is its own terminal state
-/// (CloseoutForced): the task is done so it is not Incomplete, but the model
-/// could not close out on its own so it is not a clean Answered either.
-#[tokio::test]
-async fn plan_complete_then_repeated_execute_stops() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-closeout-exec-{}",
-        std::process::id() as u64 * 131 + 61
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-
-    let runtime = Arc::new(MockRuntime::new(vec![
-        // Plan fully complete → enter closing.
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({"plan": [{"step": "build go backend", "status": "completed"}]}),
-        ),
-        // Redundant re-verification: execute commands (not observe), each
-        // distinct so the loop-guard does not fire — only the closeout cap can.
-        assistant_tool_call(
-            "e1",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["verify 1"]}),
-        ),
-        assistant_tool_call(
-            "e2",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["verify 2"]}),
-        ),
-        assistant_tool_call(
-            "e3",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["verify 3"]}),
-        ),
-        assistant_tool_call(
-            "e4",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["verify 4"]}),
-        ),
-        assistant_text("should never be reached — the audit loop must be cut"),
-    ]));
-
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    )
-    .run(
-        "port the backend to Go",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::CloseoutForced,
-        "forced closeout hard-stop is its own terminal state, not Incomplete: {outcome:?}"
-    );
-    assert!(
-        outcome.rounds <= 5,
-        "the audit loop must be cut within the closeout cap, got {} rounds",
-        outcome.rounds
-    );
-    assert!(
-        !outcome.final_text.contains("should never be reached"),
-        "the drive must stop before running the whole script dry: {}",
-        outcome.final_text
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -7890,77 +5905,6 @@ async fn assisted_gates_a_shell_deletion_before_it_runs() {
 }
 
 // ── R006 R6-P1: harness-policy refusals must not become a stagnation kill ───
-
-/// The R006 accident, verbatim: a multi-step task, the model never calls
-/// update_plan and keeps attempting a gated (non-observe) tool. The plan
-/// gate refuses every round. Those refusals are HARNESS policy — they must
-/// escalate on their own bounded track and stop as PolicyBlocked, never be
-/// counted as agent no-progress (Incomplete) at the 2-round kill cap.
-#[tokio::test]
-async fn plan_gate_refusals_escalate_as_policy_blocked_not_stagnation() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-policy-blocked-{}",
-        std::process::id() as u64 * 131 + 7
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let edit = |i: usize| {
-        assistant_tool_call(
-            &format!("c{i}"),
-            "apply_patch",
-            serde_json::json!({"patch": patch}),
-        )
-    };
-    let runtime = Arc::new(MockRuntime::new(vec![
-        edit(1),
-        edit(2),
-        edit(3),
-        edit(4),
-        edit(5),
-        edit(6),
-        edit(7),
-        edit(8),
-        edit(9),
-        assistant_text("all done"),
-    ]));
-    let outcome = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        12,
-    )
-    .with_structure(true)
-    .run(
-        "1. inspect the current implementation\n2. change the behavior\n3. run verification",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::PolicyBlocked,
-        "policy refusals must stop as PolicyBlocked, not Incomplete: {outcome:?}"
-    );
-    assert!(
-        outcome.rounds >= 5,
-        "the policy track must be more patient than the 2-round kill (got {} rounds)",
-        outcome.rounds
-    );
-    assert_eq!(
-        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
-        "old\n",
-        "the gated edit must never have run"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 /// R006: `git_status` (and shell-wrapped `git status`) are observe-class and
 /// must run BEFORE any plan exists — the incident's very first refusal was a
@@ -8559,223 +6503,6 @@ async fn headless_denial_is_not_labeled_as_user_refusal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Engagement guard (NEVER_ENGAGED_EXPLORATION_SPIRAL).
-///
-/// Eight recorded qualified orchestration runs spent their whole turn budget on
-/// successful, novel observation and produced ZERO material progress — no plan,
-/// no mutation, no passing verification — with `cumulative_modified_files: 0`
-/// and `closeout_deny_rounds: 0` at the ceiling. Neither existing streak can see
-/// it: `round_verdict::classify` grades a round with a successful non-observe
-/// call as `Progress`, and `made_progress` accepts a command that merely exited
-/// 0. Both are correct for what they measure and must not change (dropping the
-/// command term force-stops healthy runs at round ~5).
-///
-/// What was missing is upstream of both: across 100 rounds the model is never
-/// told it has written nothing. This pins that one factual advisory.
-#[tokio::test]
-async fn a_run_that_only_observes_is_told_it_has_made_no_material_progress() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-engagement-advisory-{}",
-        std::process::id() as u64 * 41 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    // Distinct files so every read is NOVEL: this is exploration the product
-    // deliberately allows (R007 F1), not loop-guard thrash.
-    for i in 0..60 {
-        std::fs::write(
-            dir.join(format!("f{i}.rs")),
-            format!("pub fn f{i}() {{}}\n"),
-        )
-        .unwrap();
-    }
-
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-
-    let mut script: Vec<ModelResponse> = (0..50)
-        .map(|i| {
-            assistant_tool_call(
-                &format!("c{i}"),
-                "read_file",
-                serde_json::json!({ "path": format!("f{i}.rs") }),
-            )
-        })
-        .collect();
-    script.push(assistant_text("done"));
-
-    let runtime = Arc::new(MockRuntime::new(script));
-    Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        60,
-    )
-    .run(
-        "add six new verbs to this tool",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let requests = runtime.recorded_requests();
-    let advisory_seen = requests.iter().any(|r| {
-        r.messages
-            .iter()
-            .any(|m| m.text_content().contains("no edit has been applied"))
-    });
-    assert!(
-        advisory_seen,
-        "after 45+ rounds with zero material progress the model must be told so; \
-         it explored {} rounds and was never informed",
-        requests.len()
-    );
-}
-
-/// The advisory must not reach a run that is working. A single successful edit
-/// is material progress, so the counter never reaches the threshold — this is
-/// the guard against turning a factual note into a nag.
-#[tokio::test]
-async fn a_run_that_edits_never_sees_the_engagement_advisory() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-engagement-quiet-{}",
-        std::process::id() as u64 * 43 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    for i in 0..60 {
-        std::fs::write(
-            dir.join(format!("g{i}.rs")),
-            format!("pub fn g{i}() {{}}\n"),
-        )
-        .unwrap();
-    }
-
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-
-    let mut script: Vec<ModelResponse> = vec![assistant_tool_call(
-        "edit",
-        "apply_patch",
-        serde_json::json!({
-            "patch": "*** Begin Patch\n*** Update File: g0.rs\n@@\n-pub fn g0() {}\n+pub fn g0() { let _ = 1; }\n*** End Patch\n"
-        }),
-    )];
-    script.extend((0..50).map(|i| {
-        assistant_tool_call(
-            &format!("r{i}"),
-            "read_file",
-            serde_json::json!({ "path": format!("g{i}.rs") }),
-        )
-    }));
-    script.push(assistant_text("done"));
-
-    let runtime = Arc::new(MockRuntime::new(script));
-    Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        60,
-    )
-    .run(
-        "add six new verbs to this tool",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let advisory_seen = runtime.recorded_requests().iter().any(|r| {
-        r.messages
-            .iter()
-            .any(|m| m.text_content().contains("no edit has been applied"))
-    });
-    assert!(
-        !advisory_seen,
-        "a run that landed a real edit must never be told it made no progress"
-    );
-}
-
-/// Byproduct files must not silence the engagement advisory.
-///
-/// `CTL_LONG_B_ORCH_3` (same-day control, `ec39621a`) ran 139 tool calls across
-/// 99 rounds, registered no plan, applied no edit, and produced nothing — yet
-/// its ledger reports `cumulative_modified_files: 2`, both of them shell
-/// byproducts: `docs/src/reference-verbs.md.bak` and `.tmp`. Workspace diffing
-/// cannot tell an intended edit from a sed-in-place leftover.
-///
-/// The first version of this advisory latched material progress on that ledger
-/// count, so the very run that proves the spiral still exists would have been
-/// silenced by its own `.bak` file. The latch must key on a deliberate edit —
-/// a successful call to a tool the registry declares `mutates_files` — not on
-/// the workspace having changed. Filename heuristics are exactly what the
-/// original observe classifier got wrong, so none are used.
-#[tokio::test]
-async fn a_shell_byproduct_does_not_count_as_material_progress() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-engagement-byproduct-{}",
-        std::process::id() as u64 * 47 + 13
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    for i in 0..60 {
-        std::fs::write(
-            dir.join(format!("h{i}.rs")),
-            format!("pub fn h{i}() {{}}\n"),
-        )
-        .unwrap();
-    }
-
-    let workspace = Workspace::new(&dir).unwrap();
-    // FullAccess so the byproduct-producing command runs without an approval.
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
-
-    // Round 1 leaves a .bak behind — exactly the CTL_LONG_B_ORCH_3 shape.
-    let mut script: Vec<ModelResponse> = vec![assistant_tool_call(
-        "bak",
-        "shell_command",
-        serde_json::json!({ "cmd": "cp h0.rs h0.rs.bak" }),
-    )];
-    script.extend((0..50).map(|i| {
-        assistant_tool_call(
-            &format!("r{i}"),
-            "read_file",
-            serde_json::json!({ "path": format!("h{i}.rs") }),
-        )
-    }));
-    script.push(assistant_text("done"));
-
-    let runtime = Arc::new(MockRuntime::new(script));
-    Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        60,
-    )
-    .run(
-        "add six new verbs to this tool",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let advisory_seen = runtime.recorded_requests().iter().any(|r| {
-        r.messages
-            .iter()
-            .any(|m| m.text_content().contains("no edit has been applied"))
-    });
-    assert!(
-        advisory_seen,
-        "a run whose only workspace change is a shell byproduct has produced \
-         nothing and must still be told so"
-    );
-}
-
 // ── Long-goal P3: durable checkpoint at the compaction boundary ──────────
 
 /// A checkpoint port that hands back a durable block, or fails, and records
@@ -8992,265 +6719,6 @@ impl ModelRuntime for CheckpointProbeRuntime {
     async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
         unimplemented!()
     }
-}
-
-/// F6, END TO END through the real outcome-application path: the judge
-/// accounts for a declared file-scope obligation as satisfied and reports no
-/// contradiction, while the ledger records a mutation outside that scope. The
-/// judge's reading is not what settles a mechanically decided condition, so
-/// the completion is refused and the obligation is named.
-///
-/// This is `scale-s800` Run 07's grounding failure, reduced to something
-/// deterministic: no live model, a fixed parsed verdict, and the runtime's own
-/// mutation record as the only other input.
-#[tokio::test]
-async fn a_judge_cannot_complete_a_run_that_broke_a_declared_file_scope() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f6-scope-violated-{}",
-        std::process::id() as u64 * 97 + 5
-    ));
-    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
-    std::fs::create_dir_all(dir.join("cmd/telemetryd/testdata")).unwrap();
-    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
-    std::fs::write(
-        dir.join("cmd/telemetryd/testdata/boundary_events.txt"),
-        "old\n",
-    )
-    .unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R_SCOPE".into(),
-            text: "no files outside internal/window may be modified".into(),
-            kind: leveler_lifecycle::RequirementKind::Constraint,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: Some(leveler_lifecycle::EvidencePolicy::MutationScope {
-                allowed_paths: vec!["internal/window".into()],
-            }),
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window.go\n-old\n+new\n*** End Patch"}),
-        ),
-        assistant_tool_call(
-            "c2",
-            "apply_patch",
-            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: cmd/telemetryd/testdata/boundary_events.txt\n-old\n+new\n*** End Patch"}),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "fixed the window boundary"}),
-        ),
-        // The Run 07 shape: a confident account of a scope the record refutes,
-        // and not one contradiction reported.
-        assistant_text(
-            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R_SCOPE","satisfied":true,"evidence":"only window.go and test files were modified","evidence_strength":"mechanical"}
-                ],
-                "reason":"the change is contained"}"#,
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "touched a file outside the scope"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "fix the window boundary rule; do not modify files outside internal/window",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "a scope the record says was broken cannot be judged satisfied"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, is_error: true, preview, .. }
-                if id == "g1" && preview.contains("R_SCOPE")
-        )),
-        "the refusal names the obligation the record refutes: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The positive control for the same path: identical obligation, identical
-/// judgment, and every mutation inside the scope the user allowed. The guard
-/// must not cost an honest run its completion.
-#[tokio::test]
-async fn a_run_that_stayed_inside_its_declared_scope_still_completes() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f6-scope-clean-{}",
-        std::process::id() as u64 * 97 + 7
-    ));
-    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
-    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
-    std::fs::write(dir.join("internal/window/window_test.go"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R_SCOPE".into(),
-            text: "no files outside internal/window may be modified".into(),
-            kind: leveler_lifecycle::RequirementKind::Constraint,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: Some(leveler_lifecycle::EvidencePolicy::MutationScope {
-                allowed_paths: vec!["internal/window".into()],
-            }),
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window.go\n-old\n+new\n*** End Patch"}),
-        ),
-        assistant_tool_call(
-            "c2",
-            "apply_patch",
-            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: internal/window/window_test.go\n-old\n+new\n*** End Patch"}),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "fixed the window boundary"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R_SCOPE","satisfied":true,"evidence":"only files under internal/window changed","evidence_strength":"mechanical"}
-                ],
-                "reason":"the change is contained"}"#,
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "fix the window boundary rule; do not modify files outside internal/window",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "work that respected the scope completes: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A behavioural constraint keeps its old meaning. "Nothing else about the
-/// report changes" carries no scope, so the run's mutations are none of the
-/// guard's business and the semantic judgment stands — the Run 07 task itself
-/// must not become retroactively unsatisfiable.
-#[tokio::test]
-async fn a_behavioural_constraint_is_still_settled_semantically() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f6-behavioural-{}",
-        std::process::id() as u64 * 97 + 9
-    ));
-    std::fs::create_dir_all(dir.join("internal/window")).unwrap();
-    std::fs::create_dir_all(dir.join("cmd/telemetryd/testdata")).unwrap();
-    std::fs::write(dir.join("internal/window/window.go"), "old\n").unwrap();
-    std::fs::write(
-        dir.join("cmd/telemetryd/testdata/boundary_events.txt"),
-        "old\n",
-    )
-    .unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "nothing else about the report changes".into(),
-            kind: leveler_lifecycle::RequirementKind::Constraint,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({"patch": "*** Begin Patch\n*** Update File: cmd/telemetryd/testdata/boundary_events.txt\n-old\n+new\n*** End Patch"}),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "boundary events regenerated"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,"evidence":"the report's other columns are unchanged","evidence_strength":"observed"}
-                ],
-                "reason":"nothing else about the report moved"}"#,
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "regenerate the boundary events; nothing else about the report changes",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "a behavioural constraint is not a file-scope restriction: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Six read rounds followed by an answer. The only thing the model sees that
@@ -9626,53 +7094,6 @@ async fn a_folds_summarization_is_recorded_as_a_compaction_call() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Contract derivation is a provider call the runtime makes on its own
-/// account. It went unrecorded, so a goal session's reported cost was short by
-/// every derivation it made — and by the judge, on the same path.
-#[tokio::test]
-async fn contract_derivation_is_recorded_as_an_advisory_call() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-advisory-ledger-{}",
-        std::process::id() as u64 * 23 + 53
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-
-    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
-        "g1",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "done"}),
-    )]));
-    let ledger = Arc::new(Mutex::new(Vec::new()));
-    let _ = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_goal_mode(true)
-    .run(
-        "make src/lib.rs export a mul function and cover it with a test",
-        &mut |_| {},
-        &mut LedgerSink(ledger.clone()),
-        CancellationToken::new(),
-    )
-    .await;
-
-    let ledger = ledger.lock().unwrap();
-    let advisories = ledger
-        .iter()
-        .filter(|(_, k)| *k == leveler_agent::ModelCallKind::Advisory)
-        .count();
-    assert!(
-        advisories > 0,
-        "the derivation the goal path always makes must be on the ledger: {ledger:?}"
-    );
-}
-
 /// A runtime that emits a reasoning delta before its answer, and records what
 /// each request carried back.
 struct ThinkingRuntime {
@@ -9684,12 +7105,9 @@ struct ThinkingRuntime {
 impl ModelRuntime for ThinkingRuntime {
     async fn generate(
         &self,
-        request: ModelRequest,
+        _request: ModelRequest,
         _c: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(canned);
-        }
         Ok(assistant_text("advisory"))
     }
 
@@ -9817,265 +7235,6 @@ async fn kept_reasoning_travels_with_the_message_that_produced_it() {
             .any(|p| matches!(p, ContentPart::ToolCall { .. })),
         "and the tool call it led to is still there"
     );
-}
-
-/// F7, on the real completion path: a behavioural obligation discharged by
-/// citing the edit that was made, rather than any observation of what the code
-/// now does. This is icg-6r run-02's shape with the fixture removed — the
-/// judge names a runtime-issued id, and the id is the `apply_patch` call.
-///
-/// The runtime must refuse: a file changing is not the behaviour changing, and
-/// it knows which of the two that id is.
-#[tokio::test]
-async fn a_behaviour_obligation_citing_the_edit_cannot_complete() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f7-cites-edit-{}",
-        std::process::id() as u64 * 73 + 11
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "records of category A must be absent from every summary".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
-        ),
-        // The judge cites the only candidate there is — the edit — and calls
-        // it an observation of the behaviour.
-        assistant_text(
-            r#"{"verdict":"satisfied",
-                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
-                "contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,
-                   "evidence":"the recorded run printed only the category B row",
-                   "evidence_strength":"observed","evidence_refs":["E1"]}
-                ],
-                "reason":"done"}"#,
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "cannot show the behaviour"}),
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "make records of category A absent from every summary",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_ne!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "an edit is not an observation of the behaviour it was meant to change"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult { id, name, is_error: true, preview }
-                if id == "g1" && name == "update_goal" && preview.contains("R1")
-        )),
-        "and the refusal names the obligation still open: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// THE OPEN GAP on the real completion path, pinned so it stays visible: the
-/// run edits, never runs anything, and the judge declares the behavioural
-/// obligation satisfied without anchoring it to any evidence id — and the run
-/// completes.
-///
-/// The judge is not reading nothing here: it gets the recent tool output, the
-/// executor's claims and the modified path list. But none of that is an
-/// observation of the changed code, so the claim stands on prose.
-///
-/// Gating it was implemented and withdrawn: `update_goal(complete)` asks the
-/// contract from inside the agent loop, while the runtime's own verification
-/// plan runs after that claim and never reaches the evidence ledger, so the
-/// gate made completion unreachable for tasks that verify the way the product
-/// verifies. See `docs/F7B_BEHAVIORAL_WITNESS_ARCHITECTURE.md` §7.
-#[tokio::test]
-async fn an_uncited_behaviour_claim_over_unobserved_work_still_completes() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f7b-unobserved-{}",
-        std::process::id() as u64 * 79 + 3
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "records of category A must be absent from every summary".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied",
-                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
-                "contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,
-                   "evidence":"the change filters category A out of the summary",
-                   "evidence_strength":"semantic"}
-                ],
-                "reason":"done"}"#,
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    .run(
-        "make records of category A absent from every summary",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "the uncited path is ungated; this pins the gap, it does not bless it: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The same run, once a check has actually run over the changed tree: the
-/// uncited claim closes. This is 26 of the 32 behavioural obligations in the
-/// preserved successful cohort, so it has to keep working.
-#[tokio::test]
-async fn an_uncited_behaviour_claim_closes_once_the_work_was_observed() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-f7b-observed-{}",
-        std::process::id() as u64 * 79 + 5
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let contract = leveler_lifecycle::CompletionContract::new(vec![
-        leveler_lifecycle::CompletionRequirement {
-            id: "R1".into(),
-            text: "records of category A must be absent from every summary".into(),
-            kind: leveler_lifecycle::RequirementKind::Behavior,
-            source: leveler_lifecycle::RequirementSource::OriginalGoal,
-            status: leveler_lifecycle::RequirementStatus::Pending,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        },
-    ]);
-    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "apply_patch", serde_json::json!({"patch": patch})),
-        // A verification-class program, so the run records a real check over
-        // the tree it just changed. `true` would run and prove nothing: F1
-        // decides which programs may be authoritative, and this test must not
-        // route around that.
-        assistant_tool_call(
-            "c2",
-            "run_command",
-            serde_json::json!({"program": "python3", "args": ["-c", "pass"]}),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "category A is filtered now"}),
-        ),
-        assistant_text(
-            r#"{"verdict":"satisfied",
-                "requirements":[{"requirement":"A absent","satisfied":true,"evidence":"filtered"}],
-                "contradictions":[],
-                "requirement_accounting":[
-                  {"id":"R1","satisfied":true,
-                   "evidence":"the change filters category A out of the summary",
-                   "evidence_strength":"semantic"}
-                ],
-                "reason":"done"}"#,
-        ),
-    ]));
-    let mut events = Vec::new();
-    let outcome = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_goal_mode(true)
-    .with_completion_contract(contract)
-    // The check has to actually run: under Assisted a command is gated, and a
-    // refused command records no verification, which is the very thing this
-    // test needs the ledger to hold.
-    .with_approver(Arc::new(leveler_execution::AutoApprove))
-    .run(
-        "make records of category A absent from every summary",
-        &mut |e| events.push(e),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await;
-
-    let outcome = outcome.expect("the run completes");
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Completed,
-        "the run observed its own work; the uncited claim may rest on that: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A sink that keeps every finalized record, so a test can compare what
@@ -10235,6 +7394,497 @@ async fn resumed_spend_continues_from_the_seeded_epoch_without_recounting() {
     assert_eq!(
         outcome.progress.cumulative_cost_usd_micros,
         4_000 + this_cost,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// `escalate`: elevate a denied command on its own retry, not through a
+// separate request_permissions round.
+// ---------------------------------------------------------------------------
+
+struct CountingApprover {
+    asks: Arc<Mutex<usize>>,
+    decision: ApprovalDecision,
+}
+
+#[async_trait]
+impl Approver for CountingApprover {
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        *self.asks.lock().unwrap() += 1;
+        self.decision
+    }
+}
+
+fn escalate_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("leveler-escalate-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The whole point of the argument: approval and execution settle in ONE
+/// round. A `request_permissions` detour would cost an extra model turn.
+#[tokio::test]
+async fn an_approved_escalation_runs_the_command_in_the_same_round() {
+    let dir = escalate_dir("approved");
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let asks = Arc::new(Mutex::new(0usize));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({
+                "cmd": "echo escalated-ok",
+                "escalate": {
+                    "reason": "the sandbox denied the .git write this command needs",
+                    "filesystem": "unrestricted"
+                }
+            }),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingApprover {
+        asks: asks.clone(),
+        decision: ApprovalDecision::ApproveOnce,
+    }));
+
+    let outcome = executor
+        .run("pull", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(*asks.lock().unwrap(), 1, "exactly one approval prompt");
+    let sent = format!("{:?}", runtime.requests.lock().unwrap());
+    assert!(
+        sent.contains("escalated-ok"),
+        "the approved command must actually have run: {sent}"
+    );
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        2,
+        "escalation must not cost an extra model round trip"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A denied escalation must stop the command, not run it unelevated.
+#[tokio::test]
+async fn a_denied_escalation_does_not_run_the_command() {
+    let dir = escalate_dir("denied");
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({
+                "cmd": "echo ran > marker.txt",
+                "escalate": { "reason": "needs the network", "network": true }
+            }),
+        ),
+        assistant_text("blocked"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(AutoDeny));
+
+    let outcome = executor
+        .run(
+            "fetch",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "a denied escalation must not fall through to an unelevated run"
+    );
+    assert!(
+        outcome.progress.human_boundary_seen(),
+        "a human denial must land on the ledger"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Denial is final — the second attempt must be refused without re-prompting,
+/// the same rule `request_permissions` already follows.
+#[tokio::test]
+async fn a_second_escalation_after_a_denial_does_not_re_prompt() {
+    let dir = escalate_dir("twice");
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let asks = Arc::new(Mutex::new(0usize));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({
+                "cmd": "echo one",
+                "escalate": { "reason": "needs the network", "network": true }
+            }),
+        ),
+        assistant_tool_call(
+            "c2",
+            "shell_command",
+            serde_json::json!({
+                "cmd": "echo two",
+                "escalate": { "reason": "still needs the network", "network": true }
+            }),
+        ),
+        assistant_text("blocked"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingApprover {
+        asks: asks.clone(),
+        decision: ApprovalDecision::Deny,
+    }));
+
+    executor
+        .run(
+            "fetch",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *asks.lock().unwrap(),
+        1,
+        "a repeat escalation after a human denial must not ask again"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An `escalate` naming no axis is a malformed retry, not a network grant:
+/// it must be refused without interrupting the user.
+#[tokio::test]
+async fn an_escalation_naming_no_axis_is_refused_without_prompting() {
+    let dir = escalate_dir("empty");
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let asks = Arc::new(Mutex::new(0usize));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({
+                "cmd": "echo hi",
+                "escalate": { "reason": "please" }
+            }),
+        ),
+        assistant_text("ok"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingApprover {
+        asks: asks.clone(),
+        decision: ApprovalDecision::ApproveOnce,
+    }));
+
+    executor
+        .run("hi", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *asks.lock().unwrap(),
+        0,
+        "a malformed escalation must not raise an approval prompt"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Nothing to escalate to under 完全访问 — advertising the argument there only
+/// invites a pointless prompt, exactly why `request_permissions` is withheld.
+#[tokio::test]
+async fn escalate_is_advertised_only_while_the_profile_confines() {
+    for (mode, expected) in [
+        (PermissionProfile::Assisted, true),
+        (PermissionProfile::FullAccess, false),
+    ] {
+        let dir = escalate_dir(&format!("advert-{}", mode.as_str()));
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, mode);
+        let runtime = Arc::new(MockRuntime::new(vec![assistant_text("hi")]));
+        let executor = Executor::new(
+            runtime.clone(),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        );
+        executor
+            .run("hi", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = runtime.requests.lock().unwrap();
+        let shell = requests[0]
+            .tools
+            .iter()
+            .find(|t| t.name == "shell_command")
+            .expect("shell_command must be advertised");
+        assert_eq!(
+            shell.input_schema["properties"].get("escalate").is_some(),
+            expected,
+            "escalate advertisement under {mode:?} must be {expected}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ── Runtime authority boundary: mechanical truth only ────────────────────────
+//
+// The runtime owns mechanical facts (which tools ran, which files changed,
+// which commands exited how, what the budgets allow). It does not judge the
+// model's semantic reading of the goal, and it never spends a hidden model
+// call doing so. These cases pin that boundary at the executor seam.
+
+/// Case 1: "fix bug" with no mutation. The model investigated, found nothing
+/// to change, and said so. No keyword classifier may refuse the completion,
+/// and no hidden judge call follows it.
+#[tokio::test]
+async fn a_fix_bug_goal_may_complete_without_mutation_when_the_model_says_so() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-fix-no-mutation-{}",
+        std::process::id() as u64 * 59 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn login() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "调查后发现 bug 不存在：login() 的边界处理已经正确，未做修改。"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        6,
+    )
+    .with_goal_mode(true)
+    .with_work_profile(leveler_agent::WorkProfile::Delivery);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "fix the login bug",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed, "{outcome:?}");
+    assert!(outcome.modified_files.is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::GoalIntercepted { .. })),
+        "no gate may refuse a completion the runtime has no mechanical reason to refuse: {events:?}"
+    );
+    // Exactly the two visible rounds: no contract derivation, no judge.
+    assert_eq!(runtime.recorded_requests().len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Case 7: a task that reads as multi-step, no `update_plan` ever. The model
+/// may still edit and run commands. The plan is a cognitive aid, not a
+/// mutation license; at most one soft reminder is injected and nothing is
+/// refused.
+#[tokio::test]
+async fn a_complex_task_without_a_plan_can_still_edit_and_run() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-advisory-{}",
+        std::process::id() as u64 * 61 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_tool_call("r2", "grep", serde_json::json!({"pattern": "old"})),
+        assistant_tool_call("r3", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        // Round 4: an edit with no plan registered — must run.
+        assistant_tool_call(
+            "e1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({"cmd": "cargo --version"}),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_structure(true);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "1. inspect the implementation\n2. change the behavior\n3. run verification",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\npub fn added() {}\n",
+        "the edit must land without a plan"
+    );
+    let refused: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::ToolResult { id, is_error: true, .. } if id == "e1" || id == "c1")
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "nothing is refused for a missing plan: {refused:?}"
+    );
+    let nudges: usize = runtime
+        .recorded_requests()
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .filter(|m| {
+            m.role == leveler_model::Role::User
+                && m.text_content()
+                    .contains("may benefit from a structured plan")
+        })
+        .count();
+    assert!(
+        nudges <= runtime.recorded_requests().len(),
+        "at most one advisory, repeated only by the transcript itself"
+    );
+    assert!(
+        !runtime.recorded_requests().iter().any(|r| {
+            r.messages
+                .iter()
+                .any(|m| m.text_content().contains("will be refused"))
+        }),
+        "the advisory must not threaten a refusal that no longer exists"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Case 8: a long exploration with novel reads every round. Short of the
+/// absolute round ceiling or an identical-result loop, the runtime injects
+/// no "you have not engaged" advisory and never stops the turn on a
+/// judgement about whether exploring was worthwhile.
+#[tokio::test]
+async fn a_long_novel_exploration_is_not_interrupted_by_a_progress_heuristic() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-long-explore-{}",
+        std::process::id() as u64 * 67 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut responses = Vec::new();
+    const ROUNDS: usize = 50;
+    for i in 0..ROUNDS {
+        let name = format!("f{i}.txt");
+        std::fs::write(dir.join(&name), format!("content {i}\n")).unwrap();
+        responses.push(assistant_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({"path": name}),
+        ));
+    }
+    responses.push(assistant_tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "surveyed every file"}),
+    ));
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_goal_mode(true);
+    let outcome = executor
+        .run(
+            "add six new verbs to this tool",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed, "{outcome:?}");
+    assert_eq!(outcome.rounds as usize, ROUNDS + 1);
+    let injected: Vec<String> = runtime
+        .recorded_requests()
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .filter(|m| m.role == leveler_model::Role::User)
+        .map(|m| m.text_content())
+        .filter(|t| t.contains("Progress check") || t.contains("no edit has been applied"))
+        .collect();
+    assert!(
+        injected.is_empty(),
+        "no engagement advisory may be injected: {injected:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

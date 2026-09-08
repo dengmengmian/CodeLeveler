@@ -6,7 +6,45 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Removed
+- **The runtime no longer judges the model's semantic completion.** The
+  Completion Contract (a model call at goal start that turned the task into
+  obligations with proof policies) and the Completion Reconciliation Gate (a
+  second model call at `update_goal(complete)` that judged the first) are
+  deleted, together with their config (`agents.completion_judge_model`,
+  `agents.completion_judge_timeout_seconds` — still accepted, ignored), their
+  ledger fields, their `GoalIntercepted` kinds, and the
+  `runtime_evidence_complete` / `step_receipts` / `complete_step` proof
+  machinery. Default hidden semantic model calls on a coding goal: zero.
+- **Automatic verification repair.** A failed post-edit check is reported as
+  `VerificationStatus::Failed` beside a completed outcome; the engine no
+  longer opens a repair turn on the model's behalf. `RepairStarted` and
+  `TurnKind::Repair` survive only to replay old rows.
+- **The auto-reviewer heuristic.** `independent_review: auto` (security /
+  concurrency path keywords, wide diffs) is gone. The policy is `off`
+  (default) or `required`; legacy `auto` reads as off and `always` as
+  required.
+- **The plan hard gate.** A multi-step task without `update_plan` gets one
+  soft reminder; editing and command tools are never refused for a missing
+  plan.
+- **Keyword task classification** (`classify_task`,
+  `task_looks_like_implementation`). "fix bug" with no mutation completes
+  when the model says so; the delivery gate's "implementation task has no
+  mutation" and "no fresh verification" refusals are gone.
+- **Semantic progress watchdogs.** Closeout thrash, observe thrash, the
+  stagnation streak and the 45-round engagement advisory are deleted. What
+  remains is mechanical: the identical-call loop guard, the all-calls-refused
+  streak, budgets and the absolute round ceiling.
+
 ### Changed
+- **Task outcome and verification are orthogonal.** `TaskOutcome` is now
+  `completed | blocked | budget_limited | failed | interrupted` (legacy
+  `verified` / `completed_unverified` read as `completed`), and a new
+  `VerificationStatus` (`passed | failed | not_run | unavailable`) travels on
+  `TaskFinished`, on the session row (`sessions.verification`, migration
+  0023) and on `UiCompletionReport.verification`. Clients gained
+  `turn_completed_checks_failed`; `TurnProgress` lost `closeout_deny_rounds`;
+  observability lost `repair_started` / `repair_attempts`.
 - **A context snapshot is persisted only when the context diverges from the
   transcript.** The drive loop wrote `ContextSnapshot` — the whole model
   context — after every round with a next round. Each one was cloned,

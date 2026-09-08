@@ -413,7 +413,7 @@ describe('query observability', () => {
       query_id: queryId,
       observation: {
         agents: [],
-        recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
+        recovery: { interrupted_turns: 0, workspace_snapshots: 0, review_stages: [] },
         requests: [],
         tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
         window: [],
@@ -439,7 +439,6 @@ describe('query observability', () => {
           verification_runs: 1,
           compact_count: 0,
           subagent_started: 0,
-          repair_started: 0,
         },
       },
     });
@@ -481,7 +480,7 @@ describe('event closure', () => {
     const { apply, state } = harness();
     apply({ type: 'command_progress', label: 'cargo test', elapsed_ms: 61_000 });
     expect(state.current?.activity).toBe('运行 cargo test · 01:01');
-    apply({ type: 'turn_progress', phase: 'verification', closing: true, no_progress_streak: 0, closeout_deny_rounds: 0 });
+    apply({ type: 'turn_progress', phase: 'verification', closing: true, no_progress_streak: 0 });
     expect(state.current?.activity).toBe('收口中 · verification');
   });
 });

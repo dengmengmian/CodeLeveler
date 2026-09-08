@@ -145,7 +145,6 @@ pub async fn query_observability(
             verification_runs: count("verification_started"),
             compact_count: count("compacted"),
             subagent_started: count("sub_agent_started"),
-            repair_started: count("repair_started"),
         },
         window,
         window_from: from_seq,
@@ -155,7 +154,6 @@ pub async fn query_observability(
         agents,
         recovery: UiRecoveryObservation {
             interrupted_turns,
-            repair_attempts: count("repair_started"),
             workspace_snapshots: count("workspace_snapshot_created"),
             review_stages,
         },
@@ -385,13 +383,6 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             truncate(detail, 64),
             "info".into(),
             vec![("Action".into(), action.clone())],
-        ),
-        EngineEvent::RepairStarted { attempt } => (
-            ObservationClass::Recovery,
-            "repair started".into(),
-            format!("attempt {attempt}"),
-            "info".into(),
-            vec![("Attempt".into(), attempt.to_string())],
         ),
         EngineEvent::WorkspaceSnapshotCreated { call_id, .. } => (
             ObservationClass::Recovery,
@@ -855,7 +846,6 @@ mod tests {
             EngineEvent::VerificationFinished { passed: false },
         )
         .await;
-        persist(&db, &sid, EngineEvent::RepairStarted { attempt: 1 }).await;
         persist(
             &db,
             &sid,
@@ -948,12 +938,6 @@ mod tests {
                 .window
                 .iter()
                 .any(|r| r.class == ObservationClass::Verify)
-        );
-        assert!(
-            loaded
-                .window
-                .iter()
-                .any(|r| r.class == ObservationClass::Recovery)
         );
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].nickname, "Reviewer");

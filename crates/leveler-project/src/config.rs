@@ -63,10 +63,11 @@ pub struct AgentsConfig {
     /// wording, schema, ownership or settlement rule.
     #[serde(default)]
     pub offer_timing: OfferTiming,
-    /// When the harness launches an independent reviewer after a mutation.
-    /// `auto` (default) is the shipped shape trigger; `always` launches after
-    /// any product mutation; `off` never launches. Isolated eval homes write
-    /// this key; product default stays `auto`.
+    /// Whether the harness launches an independent reviewer at closure.
+    /// `off` (default) never launches; `required` launches after any product
+    /// mutation. Explicit only — the runtime never infers a review from the
+    /// shape of the change. Legacy values `auto` (reads as `off`) and
+    /// `always` (reads as `required`) are still accepted.
     #[serde(default)]
     pub independent_review: IndependentReview,
 }
@@ -92,17 +93,18 @@ pub enum OfferTiming {
     AfterFirstEdit,
 }
 
-/// When the harness launches an independent reviewer (see [`AgentsConfig`]).
+/// Whether the harness launches an independent reviewer (see [`AgentsConfig`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndependentReview {
-    /// Shape-triggered (security / concurrency / wide diff). Shipped default.
+    /// Never. The product default; `auto` (the deleted shape trigger) reads
+    /// as this.
     #[default]
-    Auto,
-    /// After any product mutation. Reviewer Value Eval treatment arm.
-    Always,
-    /// Never. Reviewer Value Eval control arm.
+    #[serde(alias = "auto")]
     Off,
+    /// After any product mutation. `always` is the legacy spelling.
+    #[serde(alias = "always")]
+    Required,
 }
 
 fn default_true() -> bool {
@@ -223,15 +225,28 @@ ignore:
     }
 
     #[test]
-    fn independent_review_defaults_to_auto() {
+    fn independent_review_defaults_to_off_and_reads_legacy_values() {
         let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
-        assert_eq!(cfg.agents.independent_review, IndependentReview::Auto);
+        assert_eq!(cfg.agents.independent_review, IndependentReview::Off);
         let off: ProjectConfig =
             serde_yaml::from_str("agents:\n  independent_review: off\n").unwrap();
         assert_eq!(off.agents.independent_review, IndependentReview::Off);
+        let required: ProjectConfig =
+            serde_yaml::from_str("agents:\n  independent_review: required\n").unwrap();
+        assert_eq!(
+            required.agents.independent_review,
+            IndependentReview::Required
+        );
+        // Legacy spellings from before the shape trigger was deleted.
+        let auto: ProjectConfig =
+            serde_yaml::from_str("agents:\n  independent_review: auto\n").unwrap();
+        assert_eq!(auto.agents.independent_review, IndependentReview::Off);
         let always: ProjectConfig =
             serde_yaml::from_str("agents:\n  independent_review: always\n").unwrap();
-        assert_eq!(always.agents.independent_review, IndependentReview::Always);
+        assert_eq!(
+            always.agents.independent_review,
+            IndependentReview::Required
+        );
     }
 
     #[test]

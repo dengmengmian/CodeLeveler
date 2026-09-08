@@ -73,7 +73,7 @@ pub use observability::{
 pub use origin::ClientOrigin;
 pub use progress::{
     CheckState, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile, UiPlan,
-    UiPlanStep, UiVerification,
+    UiPlanStep, UiVerification, UiVerificationStatus,
 };
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, UiActiveToolCall, UiCheckpoint,

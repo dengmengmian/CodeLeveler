@@ -502,7 +502,6 @@ mod tests {
             StopReason::Completed,
             StopReason::Answered,
             StopReason::Blocked,
-            StopReason::CloseoutForced,
         ] {
             assert_eq!(
                 policy.after_turn(&ended(reason, &progress, &[], None)),
@@ -645,7 +644,6 @@ mod tests {
             StopReason::Completed,
             StopReason::Answered,
             StopReason::Blocked,
-            StopReason::CloseoutForced,
             StopReason::Stalled,
             StopReason::BudgetExhausted,
             StopReason::Incomplete,

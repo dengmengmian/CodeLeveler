@@ -16,7 +16,7 @@ use crate::command::{
     SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths, should_read_host_caches,
 };
 use crate::snapshot::SnapshotId;
-use crate::windows_sandbox::{FilesystemIntent, assert_intent_spawn_allowed};
+use crate::windows_sandbox::{FilesystemIntent, assert_background_intent_spawn_allowed};
 
 /// Pre-spawn workspace snapshot used for wait-end mutation accounting (PR-3b).
 #[derive(Debug, Clone)]
@@ -210,7 +210,10 @@ impl BackgroundTaskRegistry {
                 /* full_access */ request.write_root.is_none(),
             )
         });
-        if let Err(err) = assert_intent_spawn_allowed(&intent, request.deny_network) {
+        // PR 0: this registry has no confining runner on Windows — the spawn
+        // below is a plain one — so a restricted intent must be refused here,
+        // never run unconfined.
+        if let Err(err) = assert_background_intent_spawn_allowed(&intent, request.deny_network) {
             return Err(err.to_string());
         }
 

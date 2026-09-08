@@ -149,6 +149,25 @@
       }
     },
     {
+      "description": "Retire this runtime once its current work has settled.\n\nOne mechanism covers both cases the caller cares about: an idle runtime drains instantly and exits, a busy one stops taking new work and exits when the work it already owns is done. The caller never polls for idleness and never kills anything — the runtime owns the drain, because only it knows what \"still working\" means.",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/definitions/RestartReason"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "shutdown_when_idle"
+          ]
+        }
+      }
+    },
+    {
       "description": "Cooperatively cancel the running turn (graceful; resumable).",
       "type": "object",
       "required": [
@@ -1010,6 +1029,25 @@
         "request_approval",
         "assisted",
         "full_access"
+      ]
+    },
+    "RestartReason": {
+      "description": "Why a runtime is being asked to retire.\n\nTyped rather than a string because the updater will reuse this exact lifecycle: install an artifact, ask the running runtime to retire, verify the replacement's identity. Only the reason differs.",
+      "oneOf": [
+        {
+          "description": "The connecting client is a different build than this runtime.",
+          "type": "string",
+          "enum": [
+            "build_mismatch"
+          ]
+        },
+        {
+          "description": "A newer artifact is installed and waiting to take over. Reserved for the updater; nothing sends it yet.",
+          "type": "string",
+          "enum": [
+            "update_ready"
+          ]
+        }
       ]
     },
     "SessionId": {

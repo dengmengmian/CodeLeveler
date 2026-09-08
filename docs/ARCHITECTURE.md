@@ -360,7 +360,7 @@ mobile product UX remain **FUTURE**.
 
 Complex work does not justify growing the direct loop. The core supplies
 durable lifecycle, safe execution, and explicit termination. Replaceable
-**workflow / policy** composes planning, evidence, stage checks, repair, and
+**workflow / policy** composes planning, evidence, stage checks, and
 delegation.
 
 ```text
@@ -613,6 +613,47 @@ string.
 
 ---
 
+## Runtime authority boundary
+
+```text
+Runtime owns mechanical truth.
+The model owns semantic interpretation.
+The user owns acceptance.
+```
+
+The runtime can mechanically establish: which files changed, which commands
+ran and how they exited, whether build/test/lint passed over the final tree,
+whether a check ran after the latest edit, whether a permission or ownership
+boundary held, whether a child agent ran and settled, and whether a budget or
+the absolute round ceiling was reached.
+
+The runtime does not decide whether the user's request was satisfied, whether
+the model's reading of the goal was right, whether an edit was "enough",
+whether exploration was worthwhile, or whether a change "needs" a reviewer.
+It never spends a hidden model call to have a second model grade the first.
+Those questions belong to the model's final answer and to the user's review.
+
+Consequences that hold today:
+
+- A task's terminal fact is two orthogonal values, never one word:
+  `TaskOutcome` (how the run ended: completed / blocked / budget_limited /
+  failed / interrupted) and `VerificationStatus` (what the project's own
+  checks said: passed / failed / not_run / unavailable). **Checks passed ≠
+  user intent proven.**
+- `update_goal(complete)` is refused only for mechanical reasons: a delegated
+  child is still running, an open blocking finding from a reviewer, an
+  incomplete step in the model's own plan, or an acceptance command the user
+  wrote explicitly that has not run green.
+- A failed check is reported, not repaired on the model's behalf. The model
+  sees its own test results inside the loop and decides what to do.
+- An independent reviewer runs only when configured (`independent_review:
+  required`); nothing is inferred from file names or diff size.
+- A structured plan is a cognitive aid. A multi-step task without one gets
+  one soft reminder; no tool is refused for a missing plan.
+- Hidden semantic model calls on the default path: **zero**. Compaction
+  summaries and closeout nudges are the only harness-initiated calls, and
+  neither judges the work.
+
 ## Non-negotiable invariants
 
 - Every repository mutation and process execution crosses ToolHost/execution.
@@ -712,12 +753,17 @@ Schema validation in `leveler-tools`; host enforcement in `leveler-execution`.
 
 ### 5. Verification and completion
 
-`leveler-verifier` discovers or receives format/build/test commands, records
-evidence, and classifies failures. Repair attempts are bounded.
+`leveler-verifier` discovers or receives format/build/test commands, runs them
+over the final tree, records evidence, and classifies failures. The result is
+reported as `VerificationStatus` beside the task outcome; it never re-reads the
+goal, never derives acceptance semantics, and never triggers an automatic
+repair turn.
 
-- `format`: best-effort, does **not** gate completion
-- `build` / `test`: **gate** completion
+- `format`: best-effort, does **not** affect the verification status
+- `build` / `test`: decide `passed` / `failed`
 - Any field under project `verify` **replaces** the whole auto-discovered plan
+- An explicit `Acceptance:` block in the task text names commands the runtime
+  checks mechanically before accepting `update_goal(complete)`
 
 ### 6. Persistence and reconnect
 

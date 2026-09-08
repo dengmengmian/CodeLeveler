@@ -248,7 +248,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             phase,
             closing,
             no_progress_streak,
-            closeout_deny_rounds: _,
         } => {
             mark_turn_busy(state);
             // Coarse chrome only — no tool dumps. Closing / thrash streaks
@@ -277,6 +276,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::TurnCompletedUnverified { reason } => {
             finish_turn(state, TurnEndStatus::Unverified, Some(reason));
+            state.notification = None;
+        }
+        RuntimeEvent::TurnCompletedChecksFailed { reason } => {
+            finish_turn(state, TurnEndStatus::ChecksFailed, Some(reason));
             state.notification = None;
         }
         RuntimeEvent::TurnFailed { error } => {

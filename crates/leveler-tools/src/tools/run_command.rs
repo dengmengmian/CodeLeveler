@@ -190,9 +190,7 @@ async fn execute_background(
     // environment checks: a refused path is a refusal, not a config gap).
     #[cfg(not(windows))]
     {
-        let confine_writes =
-            context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
-        if confine_writes {
+        if context.write_scope().confines() {
             let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
             allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
             if let Some(output) = refuse_home_escape(program, &args, &allowed, &context) {
@@ -275,23 +273,14 @@ fn background_process_request(
     cwd: std::path::PathBuf,
     context: &ToolContext,
 ) -> ProcessRequest {
-    let confine_writes =
-        context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
     let mut req = ProcessRequest::new(program, args, cwd);
     req.deny_network = context.policy.network_denied();
     req.deny_env = context.policy.deny_env.as_ref().clone();
-    if confine_writes {
-        let write_root = context.execution.workspace.root().to_path_buf();
-        let extra = context.execution.workspace.readonly_roots().to_vec();
-        req.write_root = Some(write_root.clone());
-        req.extra_read_roots = extra.clone();
-        req.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
-            write_root,
-            extra_read_roots: extra,
-        });
-    } else {
-        req.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
+    let scope = context.write_scope();
+    if scope.confines() {
+        req.extra_read_roots = context.execution.workspace.readonly_roots().to_vec();
     }
+    req.apply_write_scope(&scope);
     req
 }
 
@@ -350,9 +339,8 @@ pub(crate) async fn execute_program(
     // parsed script are checked, so `cat /Users/x/other` inside a shell string
     // is seen. On Windows AppContainer the stricter any-absolute-arg gate
     // remains the primary defense.
-    let confine_writes =
-        context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
-    if confine_writes {
+    let scope = context.write_scope();
+    if scope.confines() {
         let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
         allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
         #[cfg(windows)]
@@ -373,44 +361,21 @@ pub(crate) async fn execute_program(
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
     let timeout = resolve_timeout(timeout_seconds);
     request.timeout = timeout;
-    // Pre-claim child: run the process, but make the workspace read-only at
-    // the OS boundary. Observation is exactly what a child must do before it
-    // can know which scope to claim, while every workspace mutation — rmdir,
-    // redirection, sed -i, a Python script — fails in the kernel. Enforcing
-    // the EFFECT beats guessing which commands are read-only, and it closes
-    // the PB_B hole that post-hoc git diffing could not see.
-    request.read_only_workspace = context.policy.has_zero_write_authority();
     request.deny_network = context.policy.network_denied();
     request.deny_env = context.policy.deny_env.as_ref().clone();
-    // OS confinement when not full-access / turn-unrestricted:
-    // - macOS/Linux: broad reads; writes limited to workspace + temp + toolchain
-    // - Windows: AppContainer write-restricted (host-trusted FilesystemIntent)
-    // - turn_unrestricted_fs: approved elevation for this turn only
-    if confine_writes {
-        let write_root = context.execution.workspace.root().to_path_buf();
-        let extra = context.execution.workspace.readonly_roots().to_vec();
-        request.write_root = Some(write_root.clone());
-        request.extra_read_roots = extra.clone();
-        // A pre-claim child declares a READ-ONLY intent, so the Windows
-        // backend gate fails closed when it cannot enforce one (§18) instead
-        // of quietly spawning a writable process.
-        request.filesystem_intent = Some(if request.read_only_workspace {
-            leveler_execution::FilesystemIntent::ReadOnly {
-                read_roots: {
-                    let mut roots = vec![write_root.clone()];
-                    roots.extend(extra.iter().cloned());
-                    roots
-                },
-            }
-        } else {
-            leveler_execution::FilesystemIntent::WorkspaceWrite {
-                write_root,
-                extra_read_roots: extra,
-            }
-        });
-    } else {
-        request.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
+    // OS confinement from the one write boundary (`WriteScope`):
+    // - `Workspace`: macOS/Linux broad reads, writes limited to workspace +
+    //   temp + toolchain; Windows AppContainer write-restricted.
+    // - `None` (pre-claim child): the workspace is mounted read-only, so
+    //   observation works while every mutation — rmdir, redirection, sed -i,
+    //   a Python script — fails in the kernel. Enforcing the EFFECT beats
+    //   guessing which commands are read-only (the PB_B hole). On Windows the
+    //   ReadOnly intent fails closed when the backend cannot enforce it.
+    // - `Unrestricted`: 完全访问, or an approved elevation.
+    if scope.confines() {
+        request.extra_read_roots = context.execution.workspace.readonly_roots().to_vec();
     }
+    request.apply_write_scope(&scope);
 
     // Pre-command workspace snapshot (git only). Read-only overlays skip it,
     // and so does a caller with no write authority at all: its workspace is
@@ -1198,7 +1163,11 @@ mod tests {
         let denied = "exit: 1\n--- stderr ---\nmkdir /Users/x/.config: operation not permitted\n";
         // sandboxed + failed + OS write-denial → hint.
         let hint = sandbox_denial_hint(true, false, denied).expect("hint");
-        assert!(hint.contains("request_permissions"));
+        // The denied command carries its own one-round retry; steering it
+        // back through a separate `request_permissions` spends a round trip
+        // on the same approval prompt.
+        assert!(hint.contains("escalate"), "{hint}");
+        assert!(!hint.contains("request_permissions"), "{hint}");
         assert!(hint.contains("[recoverable]"));
         assert!(
             sandbox_denial_hint(true, false, "cannot create .git/x: Read-only file system")

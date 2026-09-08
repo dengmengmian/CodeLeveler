@@ -465,7 +465,6 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
                     verification_runs: 1,
                     compact_count: 0,
                     subagent_started: 0,
-                    repair_started: 0,
                 },
                 window: Vec::new(),
                 window_from: 1,
@@ -484,7 +483,6 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
                 agents: Vec::new(),
                 recovery: UiRecoveryObservation {
                     interrupted_turns: 0,
-                    repair_attempts: 0,
                     workspace_snapshots: 0,
                     review_stages: Vec::new(),
                 },
@@ -543,7 +541,6 @@ fn trace_observation(window_from: i64, window_to: i64) -> UiObservabilityLoaded 
             verification_runs: 1,
             compact_count: 0,
             subagent_started: 0,
-            repair_started: 0,
         },
         window: Vec::new(),
         window_from,
@@ -553,7 +550,6 @@ fn trace_observation(window_from: i64, window_to: i64) -> UiObservabilityLoaded 
         agents: Vec::new(),
         recovery: UiRecoveryObservation {
             interrupted_turns: 0,
-            repair_attempts: 0,
             workspace_snapshots: 0,
             review_stages: Vec::new(),
         },

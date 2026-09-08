@@ -1,5 +1,7 @@
 //! Risk classification and permission profiles.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 /// How dangerous a tool action is. The permission layer gates on this.
@@ -16,6 +18,39 @@ pub enum RiskLevel {
     Destructive,
     /// Requires elevated privileges.
     Privileged,
+}
+
+/// The one write boundary every execution runs under.
+///
+/// Reads are not modeled here on purpose: the target design lets any tool
+/// read any path, and confines only what may be *changed*. The three-tier
+/// [`PermissionProfile`] is a preset over this (see
+/// [`PermissionProfile::write_scope`]); a late-bound child before
+/// `claim_write_scope` is [`WriteScope::None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteScope {
+    /// Nothing may be written — the workspace is mounted read-only at the OS
+    /// boundary (scratch and toolchain caches stay writable so builds work).
+    None,
+    /// Writes confined to this root plus the standard temp / cache dirs.
+    Workspace { root: PathBuf },
+    /// No write confinement (完全访问, or an approved elevation).
+    Unrestricted,
+}
+
+impl WriteScope {
+    /// Whether an OS write fence is in force at all.
+    pub fn confines(&self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    /// The writable root, when there is one.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            Self::Workspace { root } => Some(root),
+            Self::None | Self::Unrestricted => None,
+        }
+    }
 }
 
 /// User-facing three-tier permission profile.
@@ -76,6 +111,18 @@ impl PermissionProfile {
     /// OS write confinement and absolute-path preflight for `run_command`.
     pub fn confines_workspace(self) -> bool {
         !matches!(self, Self::FullAccess)
+    }
+
+    /// The profile as a preset over [`WriteScope`]. Same answer as
+    /// [`Self::confines_workspace`], spelled as the boundary itself.
+    pub fn write_scope(self, workspace_root: &Path) -> WriteScope {
+        if self.confines_workspace() {
+            WriteScope::Workspace {
+                root: workspace_root.to_path_buf(),
+            }
+        } else {
+            WriteScope::Unrestricted
+        }
     }
 }
 
@@ -249,5 +296,67 @@ mod tests {
             Some(PermissionProfile::Assisted)
         );
         assert_eq!(PermissionProfile::parse("yolo"), None);
+    }
+}
+
+#[cfg(test)]
+mod write_scope_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// PR 1. The three profiles become presets over one write boundary. The
+    /// table is the contract: nothing here may change what a profile can
+    /// write today, only where that fact is spelled.
+    #[test]
+    fn profiles_map_onto_write_scope_presets() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            PermissionProfile::RequestApproval.write_scope(root),
+            WriteScope::Workspace {
+                root: root.to_path_buf()
+            },
+            "request-approval keeps writing the workspace"
+        );
+        assert_eq!(
+            PermissionProfile::Assisted.write_scope(root),
+            WriteScope::Workspace {
+                root: root.to_path_buf()
+            }
+        );
+        assert_eq!(
+            PermissionProfile::FullAccess.write_scope(root),
+            WriteScope::Unrestricted
+        );
+    }
+
+    /// The preset must agree with the predicate it is replacing, for every
+    /// profile, or the adapter changes behavior on the way in.
+    #[test]
+    fn write_scope_agrees_with_confines_workspace() {
+        let root = Path::new("/ws");
+        for profile in [
+            PermissionProfile::RequestApproval,
+            PermissionProfile::Assisted,
+            PermissionProfile::FullAccess,
+        ] {
+            assert_eq!(
+                profile.write_scope(root).confines(),
+                profile.confines_workspace(),
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_scope_predicates() {
+        assert!(!WriteScope::Unrestricted.confines());
+        assert!(WriteScope::Workspace { root: "/ws".into() }.confines());
+        assert!(WriteScope::None.confines());
+        assert_eq!(
+            WriteScope::Workspace { root: "/ws".into() }.root(),
+            Some(Path::new("/ws"))
+        );
+        assert_eq!(WriteScope::None.root(), None);
+        assert_eq!(WriteScope::Unrestricted.root(), None);
     }
 }

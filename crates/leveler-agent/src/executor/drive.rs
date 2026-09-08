@@ -6,9 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
-    ChangeImpact, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, FindingKind, FindingState,
-    GateConfig, ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check,
-    is_build_relevant, task_looks_like_implementation,
+    ChangeImpact, DepthUseMetrics, EvidenceLedger, FindingKind, FindingState, GateConfig,
+    ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check, is_build_relevant,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
@@ -17,15 +16,14 @@ use leveler_model::{
 use leveler_tools::ToolRegistry;
 
 use super::gates;
-use super::round_verdict::{self, RoundVerdict};
 
 use super::closeout::{
     CLOSEOUT_NUDGE_BUDGET, CloseoutAction, CloseoutBudget, CloseoutInput, CloseoutReason, decide,
     stalled_detail,
 };
 use super::dispatch::{
-    collect_modified, compact_json, deny_call, extract_image, extract_plan, is_plan_explore_tool,
-    newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
+    collect_modified, compact_json, deny_call, extract_image, extract_plan, newly_modified_paths,
+    note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::host::AdmitError;
 use super::{
@@ -33,17 +31,18 @@ use super::{
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    collect_scoped_paths_from_call, is_observe_result_tool, is_pure_observe_call, is_search_tool,
-    is_verification_program, observe_class, push_unique_path, unproven_verification_note,
+    collect_scoped_paths_from_call, is_pure_observe_call, is_search_tool, is_verification_program,
+    observe_class, push_unique_path, unproven_verification_note,
 };
 use crate::compaction::{
     COMPACT_KEEP_RECENT, PRUNE_BATCH_BYTES, compact_messages, estimate_tokens,
 };
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL,
-    REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
-    apply_turn_grants, ask_user_tool_definition, claim_write_scope_tool_definition,
-    complete_step_tool_definition, is_user_input_tool, parse_permission_request,
+    CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
+    REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
+    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, ask_user_tool_definition,
+    claim_write_scope_tool_definition, escalation_action, escalation_missing_axis_message,
+    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
     permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     resolve_finding_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
@@ -101,6 +100,14 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// The one soft reminder a multi-step task gets when the model has worked
+/// for a few rounds without registering a plan. Advisory only: no tool is
+/// refused for a missing plan, and the model may keep working without one.
+pub(crate) const PLAN_SOFT_NUDGE_TEXT: &str = "This task may benefit from a structured plan: if you already have a \
+                     clear multi-step execution path, you may register it with update_plan \
+                     (one in_progress step, the rest pending) so progress is visible. A \
+                     plan is not required — continue exploring or editing as you see fit.";
+
 impl Executor {
     /// The core loop over a growing message transcript.
     pub(crate) async fn drive(
@@ -120,6 +127,10 @@ impl Executor {
         // trip and an interruption the user explicitly opted out of.
         if self.tool_context.policy.mode() != leveler_execution::PermissionProfile::FullAccess {
             tools.push(request_permissions_tool_definition());
+            // Same reason, applied to the command tools: a denied command can
+            // carry its own one-shot elevation on the retry instead of
+            // spending a round trip on a separate request.
+            advertise_escalation(&mut tools);
         }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
         // can also hide spawn_agent entirely.
@@ -142,9 +153,6 @@ impl Executor {
         // Goal mode: the model resolves the objective explicitly.
         if self.policy.goal_mode {
             tools.push(update_goal_tool_definition());
-            if self.policy.delivery_gate {
-                tools.push(complete_step_tool_definition());
-            }
         }
         let mut modified_files: Vec<String> = Vec::new();
         let mut scoped_paths: Vec<String> = Vec::new();
@@ -205,75 +213,20 @@ impl Executor {
         }
         let structured_plan_required =
             self.policy.require_explicit_plan && task_needs_structured_plan(&original_task);
-        // Soft plan nudge only: after this many explore rounds without a plan,
-        // inject an advisory once. Never used to strip tools or force ToolChoice
-        // (C2.3A — plan is an execution aid, not a navigation gate).
+        // Soft plan nudge only: after this many rounds without a plan on a
+        // task that reads as multi-step, inject one advisory. Never used to
+        // refuse a tool or force ToolChoice — the plan is the model's
+        // cognitive aid, not a mutation license.
         const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
-        let mut plan_explore_rounds_used = 0u32;
+        let mut plan_rounds_without_plan = 0u32;
         let mut plan_soft_nudge_sent = false;
-        // Engagement guard (NEVER_ENGAGED_EXPLORATION_SPIRAL). Drive-local like
-        // the plan nudge above: these are advisory counters, not durable
-        // lifecycle facts, so they stay out of the ProgressLedger schema.
-        let mut engagement_tool_rounds = 0u32;
-        let mut engagement_advisories_sent = 0u32;
         let mut budget_note_sent = false;
-        let mut engagement_material_progress = false;
         let mut plan_state = self.seeded_plan.clone();
         let mut structured_plan_started = !plan_state.is_empty();
         // Short tasks: no host-seeded one-step plan shell. Plan UI appears only when
         // the model calls update_plan, or resume rehydrates a prior PlanUpdated.
-        // Complex tasks still require ModelExplicit update_plan before mutation;
-        // navigation tools stay available without a plan. HostImplicit remains for
-        // resume of older sessions that already persisted that origin.
-        // The Completion Contract is derived ONCE, here, before the first
-        // model turn — while the task is still only the user's words. Deriving
-        // it later, after the executor has met the obstacle, would let the
-        // obstacle shape the obligations, which is the icg-6r failure exactly.
-        // Top level only: children settle through their parent, and a chat
-        // turn has no goal to account for. A failed derivation leaves `None`,
-        // and `None` means "unavailable", never "nothing was required".
-        let completion_contract: Option<leveler_lifecycle::CompletionContract> = match self
-            .completion_contract
-            .clone()
-            // A resumed run keeps the obligations it already had: the
-            // ledger carried them across the restart.
-            .or_else(|| self.seeded_ledger.completion_contract.clone())
-        {
-            seeded @ Some(_) => seeded,
-            None if self.policy.goal_mode && self.depth == 0 => {
-                let judge_timeout = self
-                    .reconciliation_timeout
-                    .unwrap_or(crate::reconciliation::DEFAULT_RECONCILE_TIMEOUT);
-                let mut spend = crate::AdvisorySpend::new();
-                let derived = crate::completion_contract::derive_contract(
-                    self.runtime.as_ref(),
-                    &self.model,
-                    judge_timeout,
-                    &original_task,
-                    &cancellation,
-                    &mut spend,
-                )
-                .await;
-                for record in &spend {
-                    record_request!(record.clone().priced(self.pricing.as_ref()));
-                }
-                // Failures used to be one indistinguishable `None`, so a
-                // budget ceiling read the same as a provider outage and the
-                // real cause had to be reconstructed by hand afterwards.
-                tracing::info!(
-                    derived = derived.as_ref().map(|c| c.requirements.len()).unwrap_or(0),
-                    available = derived.is_ok(),
-                    failure = derived.as_ref().err().map(|f| f.label()).unwrap_or("none"),
-                    "completion contract derived"
-                );
-                // Durable immediately, and before any mutation can run: a
-                // crash between the first edit and the contract landing
-                // would leave a changed workspace with no record of what
-                // completing it was supposed to mean.
-                derived.ok()
-            }
-            None => None,
-        };
+        // HostImplicit remains for resume of older sessions that already
+        // persisted that origin.
         // Set whenever the model-visible `messages` gain something the durable
         // transcript (`sink`) does not hold — a transient nudge, a fold. That
         // is the only time a `ContextSnapshot` carries information; a round
@@ -290,28 +243,6 @@ impl Executor {
         {
             messages.push(Message::text(Role::User, contract_injection));
             context_diverged = true;
-        }
-        // The obligations stay visible for the whole run. This is what stops a
-        // requirement from being quietly rescoped: the executor cannot retire
-        // R2 by restating the task in easier words, because R2 is still on
-        // screen, in the user's wording, every turn.
-        if let Some(contract) = completion_contract.as_ref() {
-            const OBLIGATIONS_HEADER: &str = "## Completion obligations";
-            if !messages
-                .iter()
-                .any(|m| m.role == Role::User && m.text_content().contains(OBLIGATIONS_HEADER))
-            {
-                let mut text = format!(
-                    "{OBLIGATIONS_HEADER}\n\nThese come from the task as written. Completion is \
-                     refused while any is outstanding, and an obligation to demonstrate something \
-                     is discharged by running it, not by reporting it.\n\n"
-                );
-                for r in &contract.requirements {
-                    text.push_str(&format!("- {}: {}\n", r.id, r.text));
-                }
-                messages.push(Message::text(Role::User, text));
-                context_diverged = true;
-            }
         }
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
         // keywords are not required — ordinary implementation goals must still
@@ -410,7 +341,7 @@ impl Executor {
         // Completion-evidence gate: whether a verification command has passed,
         // and how many times we have refused an unverified completion.
         let mut verification_ran = false;
-        // Delivery EvidenceLedger (mutation/verify/complete_step receipts).
+        // EvidenceLedger (mutations / verifications / findings).
         // Resume may seed prior mutations/verifies from last EvidenceLedgerUpdated.
         let mut ledger = {
             let mut led = self.seeded_ledger.clone();
@@ -419,30 +350,6 @@ impl Executor {
             }
             led
         };
-        // The contract goes durable HERE, before the loop can run a single
-        // mutating tool: a crash between the first edit and the obligations
-        // landing would leave a changed workspace with no record of what
-        // completing it was supposed to mean.
-        if ledger.completion_contract.is_none() {
-            match completion_contract.clone() {
-                Some(contract) => {
-                    ledger.completion_contract = Some(contract);
-                    observer(AgentEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    });
-                }
-                // A goal whose obligations could not be built is recorded as
-                // such, so the terminal boundary can tell it apart from a chat
-                // turn that never needed any.
-                None if self.policy.goal_mode && self.depth == 0 => {
-                    ledger.completion_contract_unavailable = true;
-                    observer(AgentEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    });
-                }
-                None => {}
-            }
-        }
         // Unified closeout nudge budget shared by every quiet-round mechanism
         // (goal resolution, completion evidence, empty answer, audit repair) —
         // the old per-mechanism caps (3 + 2 + 2 + 1) are deliberately gone.
@@ -481,21 +388,13 @@ impl Executor {
         let mut continued_text = String::new();
         const MAX_LENGTH_CONTINUATIONS: u32 = 2;
         // Absolute per-turn round ceiling — the unconditional circuit breaker.
-        // The progress watchdogs are heuristic (they only fire on "no progress"),
-        // so a busy loop that keeps issuing novel-looking reads/searches while a
-        // gate refuses closeout evades them and, under `UntilTerminal`, never
-        // ends. This ceiling guarantees termination regardless of progress or
-        // continuation policy. Set well above any legitimate single turn.
+        // The loop guards are mechanical and narrow (identical results, every
+        // call refused), so a busy loop that keeps issuing novel-looking calls
+        // evades them and, under `UntilTerminal`, never ends. This ceiling
+        // guarantees termination regardless of progress or continuation
+        // policy. Set well above any legitimate single turn.
         const MAX_TURN_ROUNDS: u32 = 100;
         let round_ceiling = self.step_limits.max_rounds.unwrap_or(MAX_TURN_ROUNDS);
-        // Closeout thrash nudge (once): plan complete / delivery closeout.
-        let mut post_plan_closeout_nudged = false;
-        // Observe thrash second chance: once the no-progress cap is hit, give
-        // the model one forced "answer from findings" round instead of dying
-        // with Incomplete and an empty reply (common on pure Q&A / investigate
-        // turns). A second genuine-thrash round after that still hard-stops
-        // (AC3); novel observation stays legal throughout (R007 F1).
-        let mut observe_thrash_answer_forced = false;
         // Hard step limits (spec §27): wall clock from run start, commands
         // executed so far, and the reason once a limit trips. The round that
         // trips a limit still commits its tool results (well-formed transcript)
@@ -703,7 +602,6 @@ impl Executor {
                 .restored_context_budget
                 .unwrap_or(self.policy.context_budget)
                 .max(self.policy.context_budget),
-            self.policy.repair_expansion_evidence,
         );
 
         loop {
@@ -869,60 +767,17 @@ impl Executor {
                 messages.push(rules);
             }
 
-            // C2.3A: after enough plan-less explore rounds, suggest updating the
-            // plan once — without removing navigation tools or forcing ToolChoice.
+            // One soft plan reminder for a multi-step task the model has been
+            // working on without a plan. Advisory: nothing is refused.
             if structured_plan_required
                 && !structured_plan_started
-                && plan_explore_rounds_used >= PLAN_SOFT_NUDGE_AFTER_ROUNDS
+                && plan_rounds_without_plan >= PLAN_SOFT_NUDGE_AFTER_ROUNDS
                 && !plan_soft_nudge_sent
             {
-                let nudge = Message::text(
-                    Role::User,
-                    "If you already have a clear multi-step execution path, you may \
-                     call update_plan with one in_progress step and the rest pending. \
-                     If you still need to locate or understand code, continue exploring \
-                     with search/read/symbol/reference tools — a plan is not required \
-                     before further navigation.",
-                );
+                let nudge = Message::text(Role::User, PLAN_SOFT_NUDGE_TEXT);
                 sink.append(std::slice::from_ref(&nudge)).await?;
                 messages.push(nudge);
                 plan_soft_nudge_sent = true;
-            }
-
-            // Engagement guard: a top-level run that has registered no plan and
-            // modified no file after this many tool-using rounds is told that
-            // fact. Eight recorded qualified runs spent a whole 100-round budget
-            // on successful, novel observation with cumulative_modified_files: 0
-            // and were never informed — neither progress streak can see it,
-            // because a successful non-observe call reads as Progress and a
-            // command that exits 0 clears the stagnation streak.
-            //
-            // Advisory ONLY: no tool is removed, no ToolChoice is forced, no
-            // call is refused, no turn is terminated, and delegation is not
-            // steered. Exploration stays legal at any round (R007 F1).
-            if self.depth == 0
-                && self.policy.progress_guards
-                && round_verdict::engagement_advisory_due(&round_verdict::EngagementInput {
-                    tool_rounds: engagement_tool_rounds,
-                    any_material_progress: engagement_material_progress,
-                    advisories_sent: engagement_advisories_sent,
-                    children_outstanding: !progress.outstanding_children.is_empty(),
-                })
-            {
-                let note = Message::text(
-                    Role::User,
-                    format!(
-                        "Progress check: {engagement_tool_rounds} rounds into this task, \
-                         no edit has been applied and no plan is registered. Exploration \
-                         remains available and nothing is being refused. If you already \
-                         know enough to start, make the first concrete change now. If the \
-                         task cannot be done in this repository, say so plainly and stop \
-                         instead of continuing to look."
-                    ),
-                );
-                sink.append(std::slice::from_ref(&note)).await?;
-                messages.push(note);
-                engagement_advisories_sent = engagement_advisories_sent.saturating_add(1);
             }
 
             // A pinned task budget is the model's to spend: at 80% it is told
@@ -930,7 +785,7 @@ impl Executor {
             // the task total the engine clamped this window to.
             if self.depth == 0
                 && let Some(remaining) = self.continuation.round_limit()
-                && let Some(note) = round_verdict::budget_note(
+                && let Some(note) = budget_note(
                     epoch_rounds_at_start.saturating_add(round),
                     epoch_rounds_at_start.saturating_add(remaining),
                     budget_note_sent,
@@ -1366,23 +1221,13 @@ impl Executor {
             let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
             // spawn_agent calls deferred to run concurrently after this pass.
             let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-            // Tools seen this round for pure-observe streak detection.
-            let mut observe_only_tools_this_round = 0u32;
+            // Successful calls that were not pure observation this round:
+            // the parent acting on model-visible child settlements.
             let mut non_observe_success_this_round = 0u32;
-            // A tool the REGISTRY declares file-mutating succeeded this round.
-            // The engagement latch reads this rather than the workspace diff, so
-            // a shell byproduct (`.bak`, `.tmp`) is not mistaken for an edit.
-            let mut edit_applied_this_round = false;
-            // Calls a guard refused before they ran (loop guard, plan gate,
-            // budgets, allowlist, permission). A round consisting solely of
-            // refusals is no progress — it must not reset the AC3 streak.
+            // Calls a guard refused before they ran (loop guard, budgets,
+            // allowlist, permission). A round consisting solely of refusals is
+            // no progress — it feeds the all-refused streak.
             let mut denied_calls_this_round: usize = 0;
-            // Subset of the above that came from HARNESS POLICY (plan gate,
-            // search budget, write allowlist) rather than genuine-loop guards.
-            // A round consisting solely of policy refusals is the harness
-            // blocking itself — it must be neutral for the kill streak and
-            // escalate separately (R006 R6-P1).
-            let mut policy_blocked_calls_this_round: usize = 0;
             // User cancel observed inside this batch. The batch stops, but the
             // round is still committed (results + spend) before Cancelled
             // surfaces — completed tools' side effects are already on disk.
@@ -1390,53 +1235,8 @@ impl Executor {
             // Ids/names survive the consuming loop below so calls the cancel
             // cut short can still be refused in place (transcript pairing).
             let call_snapshot: Vec<ToolCall> = calls.clone();
-            // Stagnation guard signals. A "failing-command" round (a run/shell
-            // command executed and every one failed, with no other progress) is
-            // the stuck pattern the observe-only guard misses. Progress that
-            // clears it: a passing verification, a novel read/search, a
-            // succeeding command, or a newly-touched file. Rounds with no
-            // command at all are neutral (goal / plan / edit work is not
-            // penalized), so this never fires on them.
-            let mut verify_passed_this_round = false;
-            let mut novel_observe_this_round = false;
-            // Whether the tree was already proven green when this round began;
-            // compared against the ledger at verdict time to tell "produced the
-            // evidence the gate asked for" from "re-ran a check for nothing".
-            let fresh_at_round_start = ledger.has_fresh_successful_verify();
-            // R007 F1: whether THIS round actually repeated an observation
-            // (identical result re-obtained, or a repeat refused by the loop
-            // guard). The thrash verdict keys off this per-round fact — never
-            // off the whole-history latch that killed novel exploration.
-            let mut repeated_observe_this_round = false;
-            let mut command_ran_this_round = false;
-            let mut command_success_this_round = false;
-            // Distinct files touched before this round — a growth means the round
-            // reached a new file (real progress), not just re-editing the same one.
-            let modified_before = modified_files.len();
 
             for (index, call) in calls.into_iter().enumerate() {
-                // Complex tasks must register a structured plan before mutation.
-                // Navigation/explore tools are never denied for a missing plan
-                // (C2.3A). Clarification and permission requests stay available.
-                if let gates::GateVerdict::Refuse(msg) = gates::plan_gate(&gates::PlanGate {
-                    required: structured_plan_required,
-                    plan_started: structured_plan_started,
-                    tool_is_explore: is_plan_explore_tool(&call.name, &call.arguments),
-                    tool_is_exempt: matches!(
-                        call.name.as_str(),
-                        "update_plan"
-                            | "request_user_input"
-                            | "ask_user"
-                            | REQUEST_PERMISSIONS_TOOL
-                    ) || self.reports_findings_by_contract(&call.name),
-                }) {
-                    metrics.plan_first_write_blocked += 1;
-                    denied_calls_this_round += 1;
-                    policy_blocked_calls_this_round += 1;
-                    results[index] = Some(deny_call(observer, call, msg));
-                    continue;
-                }
-
                 // Cap consecutive search calls so the model acts on
                 // what they have instead of searching in circles (spec §17).
                 let tool_is_search = is_search_tool(&call.name);
@@ -1449,102 +1249,7 @@ impl Executor {
                     self.policy.max_search_calls_per_step,
                 ) {
                     denied_calls_this_round += 1;
-                    policy_blocked_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
-                    continue;
-                }
-
-                // Delivery: complete_step with evidence_ref against the ledger.
-                if self.policy.goal_mode
-                    && self.policy.delivery_gate
-                    && call.name == COMPLETE_STEP_TOOL
-                {
-                    observer(AgentEvent::ToolCall {
-                        id: call.id.as_str().to_string(),
-                        name: COMPLETE_STEP_TOOL.to_string(),
-                        arguments: compact_json(&call.arguments),
-                        parallel: false,
-                    });
-                    let step_id = call
-                        .arguments
-                        .get("step_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let summary = call
-                        .arguments
-                        .get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let evidence_ref = call
-                        .arguments
-                        .get("evidence_ref")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let (ok, msg) = if step_id.is_empty() || evidence_ref.is_empty() {
-                        (
-                            false,
-                            "complete_step requires step_id and evidence_ref".to_string(),
-                        )
-                    } else if !ledger.evidence_ref_is_fresh(&evidence_ref) {
-                        (
-                            false,
-                            format!(
-                                "evidence_ref `{evidence_ref}` is missing or stale after a later mutation; re-run verification"
-                            ),
-                        )
-                    } else {
-                        let step_text = plan_state
-                            .steps
-                            .iter()
-                            .find(|s| {
-                                s.id.as_deref() == Some(step_id.as_str()) || s.step == step_id
-                            })
-                            .map(|s| s.step.clone())
-                            .unwrap_or_else(|| step_id.clone());
-                        // Mark matching plan step completed in the mirror.
-                        for s in &mut plan_state.steps {
-                            if s.id.as_deref() == Some(step_id.as_str()) || s.step == step_id {
-                                s.status = "completed".to_string();
-                            }
-                        }
-                        ledger.plan = plan_state.clone();
-                        ledger.record_step_receipt(CompleteStepReceipt {
-                            step_id: step_id.clone(),
-                            step_text: step_text.clone(),
-                            summary: summary.clone(),
-                            evidence_ref: evidence_ref.clone(),
-                        });
-                        metrics.plan_updated += 1;
-                        observer(AgentEvent::PlanUpdated {
-                            steps: plan_state.steps.clone(),
-                        });
-                        observer(AgentEvent::EvidenceLedgerUpdated {
-                            ledger: ledger.clone(),
-                        });
-                        (
-                            true,
-                            format!("Step `{step_text}` completed with evidence `{evidence_ref}`."),
-                        )
-                    };
-                    observer(AgentEvent::ToolResult {
-                        id: call.id.as_str().to_string(),
-                        name: COMPLETE_STEP_TOOL.to_string(),
-                        is_error: !ok,
-                        preview: preview(&msg),
-                    });
-                    results[index] = Some(ContentPart::ToolResult {
-                        result: ToolResultContent {
-                            call_id: call.id,
-                            content: msg,
-                            is_error: !ok,
-                        },
-                    });
                     continue;
                 }
 
@@ -1831,8 +1536,6 @@ impl Executor {
                         let gate = GateConfig {
                             goal_todo_gate: self.policy.goal_todo_gate,
                             todo_override_allowed: true,
-                            delivery_gate: self.policy.delivery_gate,
-                            reject_unproven_no_mutation: self.policy.delivery_gate,
                         };
                         ledger.plan = plan_state.clone();
                         // Explicit structured flag only — never attempt-count bypass.
@@ -1847,7 +1550,6 @@ impl Executor {
                             Some(&task_contract),
                             &gate,
                             explicit_todo_override,
-                            task_looks_like_implementation(&original_task),
                         ) {
                             ledger.record_intercept("update_goal", fail.to_string());
                             ledger.plan = plan_state.clone();
@@ -1859,8 +1561,9 @@ impl Executor {
                                 ledger: ledger.clone(),
                             });
                             let feedback = format!(
-                                "update_goal(complete) refused: {fail}. Finish remaining \
-                                 plan steps and/or satisfy delivery evidence, then try again. \
+                                "update_goal(complete) refused: {fail}. Finish the remaining \
+                                 plan steps (or mark them with update_plan) and run any \
+                                 acceptance command the task named, then try again. \
                                  Incomplete todos require override_incomplete_todos=true \
                                  (only when override is allowed) — a second bare complete is not enough."
                             );
@@ -1878,366 +1581,6 @@ impl Executor {
                                 },
                             });
                             continue;
-                        }
-                        // Completion Reconciliation Gate (ICG-6R closure):
-                        // after every mechanical gate has passed, one fresh,
-                        // independent model request judges whether the
-                        // ORIGINAL user-stated objective — not the executor's
-                        // later interpretation of it — is actually satisfied.
-                        // Top level only: children settle through their
-                        // parent, and a chat turn has no goal to reconcile.
-                        // Fail closed: uncertain, contradictions, malformed
-                        // output, provider failure and timeout all refuse; the
-                        // model may finish the missing work or truthfully
-                        // report blocked, and a later update_goal(complete)
-                        // runs the gate again.
-                        if self.depth == 0 {
-                            let claimed = call
-                                .arguments
-                                .get("summary")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim();
-                            let recent_claims = recent_assistant_claims(&messages);
-                            let recent_evidence = recent_tool_evidence(&messages);
-                            let judge_model =
-                                self.reconciliation_model.as_ref().unwrap_or(&self.model);
-                            let judge_timeout = self
-                                .reconciliation_timeout
-                                .unwrap_or(crate::reconciliation::DEFAULT_RECONCILE_TIMEOUT);
-                            // Runtime names its own evidence before asking:
-                            // the judge cites these, it does not invent an id
-                            // the ledger would then fail to resolve.
-                            let evidence_candidates =
-                                crate::reconciliation::evidence_candidates(&ledger);
-                            let mut judge_spend = crate::AdvisorySpend::new();
-                            // Bound once so the judge and the refusal record
-                            // state the same fact about verification freshness.
-                            // The judge rules on the TASK's tree, not this
-                            // window's: a continuation window that only
-                            // re-ran tests must not present "nothing changed"
-                            // over an epoch that landed the fix.
-                            let judge_paths = epoch_modified_paths(&progress, &modified_files);
-                            let freshness =
-                                crate::reconciliation::freshness_for_judge(&ledger, &judge_paths);
-                            let outcome = crate::reconciliation::reconcile_completion(
-                                self.runtime.as_ref(),
-                                judge_model,
-                                self.policy.reasoning_effort,
-                                judge_timeout,
-                                crate::reconciliation::ReconcileInput {
-                                    original_goal: &original_task,
-                                    claimed_summary: claimed,
-                                    recent_claims: &recent_claims,
-                                    recent_evidence: &recent_evidence,
-                                    modified_files: &judge_paths,
-                                    fresh_verification: freshness,
-                                    evidence_candidates: &evidence_candidates,
-                                    contract: completion_contract.as_ref(),
-                                },
-                                &cancellation,
-                                &mut judge_spend,
-                            )
-                            .await;
-                            for record in &judge_spend {
-                                record_request!(record.clone().priced(self.pricing.as_ref()));
-                            }
-                            tracing::info!(
-                                executor_model = %self.model,
-                                reconciliation_model = %judge_model,
-                                same_model = judge_model == &self.model,
-                                configured_timeout_ms = judge_timeout.as_millis() as u64,
-                                verdict = ?outcome.verdict,
-                                elapsed_ms = outcome.latency_ms,
-                                latency_ms = outcome.latency_ms,
-                                unsatisfied = outcome.unsatisfied.len(),
-                                contradictions = outcome.contradictions.len(),
-                                repaired = outcome.repaired,
-                                failure_kind = outcome.failure_kind.unwrap_or("none"),
-                                "completion reconciliation"
-                            );
-                            // The Completion Contract gate. The obligations
-                            // were written down before the work began, so an
-                            // obligation cannot be discharged by going
-                            // unmentioned, and one that can be DEMONSTRATED is
-                            // not discharged by the judge's reading alone —
-                            // the ledger has to show a check that ran green
-                            // over the tree as it stands. This runs BEFORE the
-                            // semantic verdict is honoured: mechanical account
-                            // first, judgment for the residue.
-                            // A missing contract is NOT consent. Derivation may
-                            // have failed at the start of the run (provider
-                            // hiccup, malformed reply); rather than deadlock the
-                            // goal, try once more here — and if it still cannot
-                            // be established, refuse. Absence must never read as
-                            // "nothing was required".
-                            let completion_contract = match completion_contract.as_ref() {
-                                Some(_) => completion_contract.clone(),
-                                None => {
-                                    let mut spend = crate::AdvisorySpend::new();
-                                    let derived = crate::completion_contract::derive_contract(
-                                        self.runtime.as_ref(),
-                                        &self.model,
-                                        judge_timeout,
-                                        &original_task,
-                                        &cancellation,
-                                        &mut spend,
-                                    )
-                                    .await
-                                    .ok();
-                                    for record in &spend {
-                                        record_request!(
-                                            record.clone().priced(self.pricing.as_ref())
-                                        );
-                                    }
-                                    derived
-                                }
-                            };
-                            let mut rejected_not_accounted = 0usize;
-                            let mut rejected_missing_evidence = 0usize;
-                            let mut rejected_blocked = 0usize;
-                            // F6: obligations whose declared mechanical
-                            // condition the runtime's own record refutes,
-                            // after the judge accounted for them as satisfied.
-                            let mut rejected_mechanical_violation = 0usize;
-                            // F7 final floor: a materially behavioural
-                            // obligation the judge accounted for, with no proof
-                            // standard the runtime can settle. Only ever
-                            // non-zero at the terminal boundary — the request
-                            // point does not judge these, which is what keeps
-                            // the floor from making completion unreachable.
-                            let mut rejected_ungrounded_behavior = 0usize;
-                            type OpenObligation = (String, String, leveler_lifecycle::OpenReason);
-                            let (open_obligations, open_reasons): (
-                                Vec<String>,
-                                Vec<OpenObligation>,
-                            ) = match completion_contract.as_ref() {
-                                None => (
-                                    vec![
-                                        "the completion contract could not be established, so no \
-                                         obligation could be checked"
-                                            .to_string(),
-                                    ],
-                                    // Not knowing what is owed is not the same
-                                    // as knowing nothing is owed: refuse.
-                                    vec![(
-                                        "(contract)".to_string(),
-                                        "the completion contract could not be established"
-                                            .to_string(),
-                                        leveler_lifecycle::OpenReason::NotAccountedFor,
-                                    )],
-                                ),
-                                Some(contract) => {
-                                    let mut accounted = contract.clone();
-                                    let apply =
-                                        |id: &str,
-                                         status: &mut leveler_lifecycle::RequirementStatus,
-                                         evidence: &mut Vec<
-                                            leveler_lifecycle::RequirementEvidence,
-                                        >| {
-                                            if let Some(a) =
-                                                outcome.accounting.iter().find(|a| a.id == id)
-                                            {
-                                                *status = if a.satisfied {
-                                                    leveler_lifecycle::RequirementStatus::Satisfied
-                                                } else {
-                                                    leveler_lifecycle::RequirementStatus::Pending
-                                                };
-                                                evidence.push(
-                                                    leveler_lifecycle::RequirementEvidence {
-                                                        strength: a.strength,
-                                                        detail: a.evidence.clone(),
-                                                        refs: a.refs.clone(),
-                                                    },
-                                                );
-                                            }
-                                        };
-                                    for r in &mut accounted.requirements {
-                                        apply(&r.id.clone(), &mut r.status, &mut r.evidence);
-                                        // Conditions are accounted for by their
-                                        // own id: an objective cannot be
-                                        // reported satisfied over a condition
-                                        // nobody addressed.
-                                        for f in &mut r.acceptance_facets {
-                                            apply(&f.id.clone(), &mut f.status, &mut f.evidence);
-                                        }
-                                    }
-                                    let open = accounted.open_detail(&ledger);
-                                    for (id, _, why) in &open {
-                                        match why {
-                                            leveler_lifecycle::OpenReason::NotAccountedFor => {
-                                                rejected_not_accounted += 1
-                                            }
-                                            leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
-                                                rejected_missing_evidence += 1
-                                            }
-                                            leveler_lifecycle::OpenReason::MechanicalConstraintViolation => {
-                                                rejected_mechanical_violation += 1;
-                                                // The judge said this
-                                                // obligation held and the
-                                                // record says it does not. A
-                                                // reading contradicted by a
-                                                // fact is its own event, not
-                                                // another unfinished item.
-                                                tracing::warn!(
-                                                    requirement_id = %id,
-                                                    policy = "mutation_scope",
-                                                    "judge result conflicted with mechanical fact"
-                                                );
-                                            }
-                                            leveler_lifecycle::OpenReason::MissingAuthoritativeProof => {
-                                                rejected_ungrounded_behavior += 1
-                                            }
-                                            leveler_lifecycle::OpenReason::Blocked => {
-                                                rejected_blocked += 1
-                                            }
-                                        }
-                                    }
-                                    let listed: Vec<String> = open
-                                        .iter()
-                                        .cloned()
-                                        .map(|(id, text, why)| {
-                                            let why = match why {
-                                                leveler_lifecycle::OpenReason::NotAccountedFor => {
-                                                    "not satisfied"
-                                                }
-                                                leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
-                                                    "no check demonstrates it over the current tree"
-                                                }
-                                                leveler_lifecycle::OpenReason::MechanicalConstraintViolation => {
-                                                    "the runtime's own record of this run says this condition does not hold"
-                                                }
-                                                leveler_lifecycle::OpenReason::MissingAuthoritativeProof => {
-                                                    "satisfied by reading only — the runtime has no proof standard for it"
-                                                }
-                                                leveler_lifecycle::OpenReason::Blocked => "blocked",
-                                            };
-                                            format!("{id} ({text}) — {why}")
-                                        })
-                                        .collect();
-                                    // The accounting is durable from here on: the terminal
-                                    // boundary decides on what the ledger KNOWS, so a run
-                                    // that ends by some other door faces the same debt.
-                                    ledger.completion_contract = Some(accounted);
-                                    observer(AgentEvent::EvidenceLedgerUpdated {
-                                        ledger: ledger.clone(),
-                                    });
-                                    (listed, open)
-                                }
-                            };
-                            // A requirement the contract never captured is the
-                            // one thing the contract cannot see about itself.
-                            let omitted = outcome.omitted.clone();
-                            tracing::info!(
-                                contract_available = completion_contract.is_some(),
-                                requirements_total = completion_contract
-                                    .as_ref()
-                                    .map(|c| c.requirements.len())
-                                    .unwrap_or(0),
-                                verification_requirements = completion_contract
-                                    .as_ref()
-                                    .map(|c| c.verification_count())
-                                    .unwrap_or(0),
-                                open = open_obligations.len(),
-                                rejected_not_accounted,
-                                rejected_missing_evidence,
-                                rejected_blocked,
-                                reconciliation_mechanical_conflict_count =
-                                    rejected_mechanical_violation,
-                                rejected_ungrounded_behavior,
-                                omitted = omitted.len(),
-                                "completion contract gate"
-                            );
-                            if completion_claim_refused(
-                                outcome.allows_completion(),
-                                &open_reasons,
-                                &omitted,
-                            ) {
-                                let mut detail = format!("verdict={:?}", outcome.verdict);
-                                if !open_obligations.is_empty() {
-                                    detail.push_str(&format!(
-                                        "; obligations still open: {}",
-                                        open_obligations.join("; ")
-                                    ));
-                                }
-                                if !omitted.is_empty() {
-                                    detail.push_str(&format!(
-                                        "; required by the original task but not in the obligations: {}",
-                                        omitted.join("; ")
-                                    ));
-                                }
-                                if !outcome.reason.is_empty() {
-                                    detail.push_str(&format!("; {}", outcome.reason));
-                                }
-                                if !outcome.unsatisfied.is_empty() {
-                                    detail.push_str(&format!(
-                                        "; unsatisfied as written: {}",
-                                        outcome.unsatisfied.join("; ")
-                                    ));
-                                }
-                                if !outcome.contradictions.is_empty() {
-                                    detail.push_str(&format!(
-                                        "; contradictions: {}",
-                                        outcome.contradictions.join("; ")
-                                    ));
-                                }
-                                // Record what the judge was told about
-                                // freshness alongside its verdict: a refusal
-                                // issued on an `unknown` fact is a different
-                                // event from one issued on `stale`, and only
-                                // the record can say which.
-                                let detail = format!(
-                                    "{detail} [workspace_facts.freshness={}]",
-                                    freshness.label()
-                                );
-                                ledger
-                                    .record_intercept("completion_reconciliation", detail.clone());
-                                observer(AgentEvent::GoalIntercepted {
-                                    kind: "completion_reconciliation".into(),
-                                    detail: detail.clone(),
-                                });
-                                observer(AgentEvent::EvidenceLedgerUpdated {
-                                    ledger: ledger.clone(),
-                                });
-                                let feedback = match outcome.verdict {
-                                    crate::reconciliation::ReconcileVerdict::Unavailable => {
-                                        format!(
-                                            "update_goal(complete) refused: the independent completion check could not run ({detail}). Nothing about your work was judged. Do NOT resubmit the same completion claim unchanged — verification is unavailable, not your work wrong. If a later state change gives new evidence, complete then; otherwise report blocked citing verification unavailability."
-                                        )
-                                    }
-                                    // Only when the judge itself was content
-                                    // and the CONTRACT is what refuses: then
-                                    // the outstanding obligations are the whole
-                                    // story. A semantic refusal keeps its own
-                                    // wording, with the obligations already
-                                    // named in `detail`.
-                                    _ if outcome.allows_completion()
-                                        && (!open_obligations.is_empty()
-                                            || !omitted.is_empty()) =>
-                                    {
-                                        format!(
-                                            "update_goal(complete) refused: {detail}. These obligations come from the ORIGINAL task and are still outstanding. An obligation to demonstrate something (a test, a check, a command that must pass) is discharged by actually running it and showing it green over the current tree — not by stating that it was done. Finish them and complete again, or call update_goal(blocked) naming which one cannot be satisfied and why."
-                                        )
-                                    }
-                                    _ => format!(
-                                        "update_goal(complete) refused by the independent completion check: {detail}. The ORIGINAL objective as the user wrote it is the contract — a reinterpreted or narrowed version does not count. Either finish the objective as stated (then update_goal(complete) again), or, if it cannot be satisfied as written, revert edits that only served the abandoned attempt and call update_goal(blocked) naming the exact conflict."
-                                    ),
-                                };
-                                observer(AgentEvent::ToolResult {
-                                    id: call.id.as_str().to_string(),
-                                    name: UPDATE_GOAL_TOOL.to_string(),
-                                    is_error: true,
-                                    preview: preview(&feedback),
-                                });
-                                results[index] = Some(ContentPart::ToolResult {
-                                    result: ToolResultContent {
-                                        call_id: call.id,
-                                        content: feedback,
-                                        is_error: true,
-                                    },
-                                });
-                                continue;
-                            }
                         }
                         // HostImplicit single-step completes atomically with the goal.
                         if plan_state.is_host_implicit() {
@@ -2494,35 +1837,9 @@ impl Executor {
                              the next model step; review them, then retry the edit."
                         );
                         denied_calls_this_round += 1;
-                        policy_blocked_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
-                }
-
-                // Closing phase: plan fully completed → refuse pure observe thrash.
-                if plan_state.is_fully_completed() {
-                    progress.enter_closing();
-                }
-                if progress.should_refuse_observe_in_closing()
-                    && is_pure_observe_call(&call.name, &call.arguments)
-                {
-                    observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
-                    let msg = "Plan steps are complete. Do not re-check git status, \
-                         re-list files, or re-audit prior questions — reply with a \
-                         final summary only and stop calling tools."
-                        .to_string();
-                    denied_calls_this_round += 1;
-                    results[index] = Some(deny_call(observer, call, msg));
-                    continue;
-                }
-                // R007 F1: there is deliberately NO blanket observe refusal
-                // after the forced-answer nudge. Novel observation is legal at
-                // any point (the killed W1 agent needed exactly two more novel
-                // reads); true repeats stay bounded by the per-key loop guard
-                // below, and a further genuine-thrash round still hard-stops.
-                if is_pure_observe_call(&call.name, &call.arguments) {
-                    observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
                 }
 
                 // No-progress loop guard: same observe class (e.g. git status via
@@ -2543,16 +1860,10 @@ impl Executor {
                     0
                 };
                 if let gates::GateVerdict::Refuse(msg) = gates::loop_guard(&call.name, repeats) {
-                    // A refused repeat IS this round repeating itself…
-                    repeated_observe_this_round = true;
+                    // The loop guard only refuses after the SAME key produced
+                    // IDENTICAL content twice: mechanical repetition, counted
+                    // on the all-refused track like every other refusal.
                     denied_calls_this_round += 1;
-                    // …and it stays on the no-progress track ON PURPOSE. The
-                    // loop guard only refuses after the SAME key produced
-                    // IDENTICAL content twice, so the refusal is evidence of
-                    // agent repetition, not of the harness blocking work the
-                    // agent could otherwise do (the plan gate's R6-P1 case).
-                    // Routing it to PolicyBlocked would report "this is not
-                    // agent stagnation" about a turn that is exactly that.
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -2657,7 +1968,6 @@ impl Executor {
                             owners.join(", ")
                         );
                         denied_calls_this_round += 1;
-                        policy_blocked_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -2675,7 +1985,6 @@ impl Executor {
                 // delegated agent may not reach one at all.
                 if let Some(msg) = self.refuse_unboundable_delegated_tool(&call) {
                     denied_calls_this_round += 1;
-                    policy_blocked_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -2701,9 +2010,81 @@ impl Executor {
                 });
                 collect_scoped_paths_from_call(&call, &mut scoped_paths);
 
-                // Build the effective context: apply turn grants from
-                // request_permissions (network and/or unrestricted FS).
-                let ctx = apply_turn_grants(self.tool_context.clone(), turn_grants);
+                // A command may carry its own elevation for THIS call. Settling
+                // it here — between the call event and the context — is what
+                // makes approval and execution one round trip instead of two.
+                let mut call_grants = TurnPermissionGrants::default();
+                if is_escalatable_tool(&call.name)
+                    && let Some((reason, requested)) = parse_escalation(&call.arguments)
+                {
+                    if requested.is_empty() {
+                        // Malformed: no axis named. Refuse without interrupting
+                        // the user — there is nothing to put in a prompt.
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: escalation_missing_axis_message(),
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                    if progress.covers_denied_request(requested.network, requested.unrestricted_fs)
+                    {
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: permission_already_denied_message(),
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                    let action = escalation_action(&call);
+                    let outcome = self
+                        .decide_permission(
+                            &call,
+                            &action,
+                            &reason,
+                            requested,
+                            GrantScope::SingleCall,
+                            &cancellation,
+                        )
+                        .await?;
+                    match &outcome {
+                        // One-shot by construction: this never touches
+                        // `turn_grants`, so the next call starts confined again.
+                        PermissionRequestOutcome::Granted { grants, .. } => {
+                            call_grants = *grants;
+                        }
+                        PermissionRequestOutcome::DeniedByUser { requested, .. } => {
+                            progress
+                                .record_human_denial(requested.network, requested.unrestricted_fs);
+                            observer(AgentEvent::ProgressUpdated {
+                                ledger: progress.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                    // A refused elevation stops the command. Running it
+                    // unelevated would hand the model the same denial it was
+                    // already answering.
+                    if outcome.is_error() {
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: outcome.message().to_string(),
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                }
+
+                // Build the effective context: turn grants from
+                // request_permissions, plus this call's own escalation.
+                let ctx =
+                    apply_turn_grants(self.tool_context.clone(), turn_grants.merge(call_grants));
                 // Full epoch path set so tools count "new" files correctly
                 // (re-edits of already-budgeted paths do not consume residual).
                 let epoch_paths = epoch_modified_paths(&progress, &modified_files);
@@ -2858,14 +2239,6 @@ impl Executor {
                     non_observe_success_this_round =
                         non_observe_success_this_round.saturating_add(1);
                 }
-                // Track command execution for the stagnation guard: a command
-                // that keeps failing (test/build/script) is the stuck signal.
-                if self.registry.runs_command(&call.name) {
-                    command_ran_this_round = true;
-                    if !is_error {
-                        command_success_this_round = true;
-                    }
-                }
                 if let Some(part) = image {
                     pending_images.push(part);
                 }
@@ -2876,16 +2249,8 @@ impl Executor {
                     Some(entry) if entry.0 == content => {
                         entry.1 += 1;
                         entry.2 = novelty_epoch;
-                        repeated_observe_this_round = true;
                     }
                     _ => {
-                        // A novel, successful read/search is real exploration —
-                        // it resets the stagnation guard. A repeated (stale)
-                        // result does not. Read-class tools without an observe
-                        // key (read_file, git_diff) count too (R007 F1).
-                        if !is_error && is_observe_result_tool(&call.name, &call.arguments) {
-                            novel_observe_this_round = true;
-                        }
                         novelty_epoch = novelty_epoch.saturating_add(1);
                         call_history.insert(loop_key, (content.clone(), 1, novelty_epoch));
                     }
@@ -2983,8 +2348,6 @@ impl Executor {
                     }
                     if !recorded.is_empty() {
                         verification_ran = true;
-                        // A verification-class command that PASSED is real progress.
-                        verify_passed_this_round = true;
                         ledger.plan = plan_state.clone();
                         observer(AgentEvent::EvidenceLedgerUpdated {
                             ledger: ledger.clone(),
@@ -2994,7 +2357,6 @@ impl Executor {
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
                 if !is_error && self.registry.mutates_files(&call.name) {
-                    edit_applied_this_round = true;
                     // Same signal the timing experiment gates on: a deliberate
                     // edit, not a workspace diff.
                     delegation_decision.note_edit_applied();
@@ -3109,21 +2471,8 @@ impl Executor {
                         Some(entry) if entry.0 == content => {
                             entry.1 += 1;
                             entry.2 = novelty_epoch;
-                            repeated_observe_this_round = true;
                         }
                         _ => {
-                            // Same novelty accounting as the sequential path:
-                            // without it a PARALLEL round mixing one repeat
-                            // with real new observation would still grade as
-                            // pure thrash (R007 F1).
-                            if !is_error
-                                && is_observe_result_tool(
-                                    &job.admitted.call.name,
-                                    &job.admitted.call.arguments,
-                                )
-                            {
-                                novel_observe_this_round = true;
-                            }
                             novelty_epoch = novelty_epoch.saturating_add(1);
                             call_history
                                 .insert(job.loop_key.clone(), (content.clone(), 1, novelty_epoch));
@@ -3749,238 +3098,41 @@ impl Executor {
                 }
             }
 
-            // Progress assess: closeout thrash + pure-observe no-progress streaks.
+            // Plan fully completed → closing phase (a lifecycle fact for the
+            // UI and for continuation seeding; nothing is refused for it).
             if plan_state.is_fully_completed() {
                 progress.enter_closing();
             }
-            // A round that ran or attempted a SUBSTANTIVE tool — anything but
-            // plan/goal bookkeeping. Marking the plan complete is not itself
-            // thrash; re-running builds/tests/curl or re-observing after it is.
-            let substantive_round = call_snapshot.iter().any(|c| !is_bookkeeping_tool(&c.name));
-            let pure_observe_round = observe_only_tools_this_round > 0
-                && non_observe_success_this_round == 0
-                && !verification_ran;
-            // Product heuristic (policy-gated): with guards off no round is
-            // ever classified as thrash and no streak accumulates. The safety
-            // boundary (round ceiling, step limits, cancellation) is elsewhere
-            // and unconditional.
-            let verdict = if !self.policy.progress_guards {
-                // Guards off: neither penalty nor reset — the streak machinery
-                // simply never engages.
-                RoundVerdict::ObserveExploring
-            } else {
-                round_verdict::classify(&round_verdict::RoundInput {
-                    closing: progress.closing,
-                    substantive: substantive_round,
-                    pure_observe: pure_observe_round,
-                    // R007 F1: a property of THIS round, never a whole-history
-                    // latch. A round that re-obtained (or was refused re-
-                    // obtaining) an identical observation AND produced nothing
-                    // novel is thrash; any novel observation is exploration.
-                    repeated_observation: repeated_observe_this_round && !novel_observe_this_round,
-                    had_calls: !call_snapshot.is_empty(),
-                    all_denied: denied_calls_this_round == call_snapshot.len(),
-                    // ALL of this round's refusals came from harness policy
-                    // (plan gate / budgets / allowlist): the harness blocked
-                    // itself, so the round is neutral for the kill streak and
-                    // escalates on its own bounded track (R006 R6-P1).
-                    policy_blocked: !call_snapshot.is_empty()
-                        && policy_blocked_calls_this_round == call_snapshot.len(),
-                    fresh_evidence_gained: verification_ran
-                        && !fresh_at_round_start
-                        && ledger.has_fresh_successful_verify(),
-                })
-            };
-            if verdict == RoundVerdict::CloseoutThrash {
-                // Plan complete, but the model kept doing substantive work
-                // (re-running builds/tests/curl, or re-inspecting files). That
-                // is redundant closeout thrash, not new progress — it is what
-                // makes a finished task look like an endless "re-audit" loop.
-                // Count it, nudge for a final summary, and after the cap force a
-                // stop reported as CloseoutForced: the plan is done (so this is
-                // NOT Incomplete — a finished task must not fall back to
-                // Execute), but the model could not close out on its own, so it
-                // is an abnormal end, not a clean Answered either. This also
-                // catches execute-class thrash, which observe-only guards never
-                // could.
-                progress.note_closeout_deny_round();
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
-                if !post_plan_closeout_nudged {
-                    post_plan_closeout_nudged = true;
-                    messages.push(Message::text(
-                        Role::User,
-                        "The plan is complete. Your next message must be the final \
-                         summary only — do not run more builds/tests/commands and do \
-                         not re-inspect files; the work is done."
-                            .to_string(),
-                    ));
-                    context_diverged = true;
-                }
-                if progress.should_hard_stop_closeout(progress_caps) {
-                    stop_now!(
-                        StopReason::CloseoutForced,
-                        "plan complete; closeout thrash short-circuited",
-                        "Stopped: plan complete; ended redundant re-verification."
-                    );
-                }
-            } else if verdict == RoundVerdict::ObserveThrash {
-                // After ProgressCaps::no_progress_rounds of identical thrash,
-                // hard-stop the turn (AC3) so UntilTerminal cannot spin forever.
-                progress.note_no_progress_round(round);
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
-                // Sub-agents may legitimately re-list; only top-level turns
-                // full-stop on observe thrash (AC3). Before hard-stop, give
-                // one forced answer-from-findings round so Q&A / investigate
-                // turns do not end Incomplete with nothing useful on screen.
-                if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
-                    if !observe_thrash_answer_forced {
-                        observe_thrash_answer_forced = true;
-                        messages.push(Message::text(
-                            Role::User,
-                            format!(
-                                "Repeated identical observations made no progress toward:\n\
-                                 <objective>\n{original_task}\n</objective>\n\
-                                 You already have tool results above. Your next message must \
-                                 be the final answer based on those results — do not call \
-                                 list/search/read tools again. If the evidence is incomplete, \
-                                 say what is known and what is still unknown."
-                            ),
-                        ));
-                        context_diverged = true;
-                        // Continue the drive so the model can synthesize.
-                    } else {
-                        stop_now!(
-                            StopReason::Incomplete,
-                            "no-progress streak; observe thrash short-circuited",
-                            "Stopped: no progress (observe-only thrash)."
-                        );
-                    }
-                }
-            } else if verdict == RoundVerdict::AllRefused {
-                // Every call this round was refused before it ran — that is
-                // not progress. Feed the AC3 streak so an UntilTerminal run
-                // cannot spin forever re-issuing guarded actions. (Rounds with
-                // executed-but-failed tools still count as progress: the model
-                // is iterating on real results, and identical failures are
-                // caught by the loop guard above.)
+            // Mechanical no-progress watchdog: a round in which EVERY attempted
+            // call was refused before it ran is not progress. Enough of them in
+            // a row and the turn stops, so an `UntilTerminal` run cannot spin
+            // forever re-issuing guarded actions. Nothing here reads the
+            // model's work for meaning: rounds with executed tools — failed or
+            // not — always count as progress, and identical repeats are
+            // already bounded by the per-key loop guard above.
+            let all_refused = self.policy.progress_guards
+                && !call_snapshot.is_empty()
+                && denied_calls_this_round == call_snapshot.len();
+            if all_refused {
                 progress.note_no_progress_round(round);
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
                 });
                 if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
-                    // Not Answered/Completed — refusals are incomplete progress.
                     stop_now!(
                         StopReason::Incomplete,
                         "no-progress streak; all-refused rounds short-circuited",
                         "Stopped: no progress (every attempted action was refused)."
                     );
                 }
-            } else if verdict == RoundVerdict::NeutralPolicyBlocked {
-                // Every call this round was refused by HARNESS POLICY. That is
-                // the harness blocking itself — neutral for the kill streak
-                // (R006: plan-gate refusals fed the all-refused guard and a
-                // well-behaving agent was killed in 4 minutes). Escalate on a
-                // separate bounded track instead: at the cap inject a
-                // corrective directive; if the model ignores that too, stop
-                // honestly as policy-blocked, never as "no progress".
-                progress.note_policy_blocked_round(round);
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
-                if self.depth == 0 && progress.should_hard_stop_policy_blocked(progress_caps) {
-                    stop_now!(
-                        StopReason::PolicyBlocked,
-                        "policy-blocked streak; corrective directive ignored",
-                        "Stopped: a harness policy (plan gate / budget / allowlist)                          refused every attempted action for several rounds and the                          corrective instruction was not followed. The task needs the                          required policy step (e.g. update_plan) or user attention —                          this is not agent stagnation."
-                    );
-                }
-                if progress.should_escalate_policy_blocked(progress_caps) {
-                    let directive = Message::text(
-                        Role::User,
-                        "POLICY: every action you attempted was refused by a harness                          policy gate. Read the refusal messages and satisfy the stated                          requirement now (for the plan gate: call update_plan with one                          in_progress step and the remaining steps pending). Read-only                          navigation stays available. Do not retry refused calls                          unchanged.",
-                    );
-                    sink.append(std::slice::from_ref(&directive)).await?;
-                    messages.push(directive);
-                }
-            } else if !verdict.is_neutral() {
-                // Successful non-observe work resets the streak. Exploration and
-                // policy-blocked refusals are neutral: they neither grow it nor
-                // clear one that earlier rounds earned.
+            } else if !call_snapshot.is_empty() {
                 progress.note_progress(round);
-                progress.clear_policy_blocked();
             }
 
-            // Stagnation guard (top-level turns only): the observe-only guard
-            // above misses the common "edit → run a check that keeps failing"
-            // spin. A round with real progress — a passing verification, a novel
-            // read/search, a succeeding command, or a newly-touched file — clears
-            // the streak. A round where a command ran and every one failed with
-            // none of those signals grows it. Rounds with no command are neutral
-            // (goal/plan/edit work is never penalized), so this only bites a
-            // genuinely stuck "the check keeps failing" loop.
-            let made_progress = round_verdict::made_progress(
-                verify_passed_this_round,
-                novel_observe_this_round,
-                command_success_this_round,
-                modified_files.len() > modified_before,
-            );
-            if made_progress {
-                progress.note_round_outcome(true);
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
-            } else if self.depth == 0 && command_ran_this_round {
-                progress.note_round_outcome(false);
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
-                if progress.should_hard_stop_stagnation(progress_caps) {
-                    stop_now!(
-                        StopReason::Incomplete,
-                        "no-progress stagnation; force-stopped",
-                        "Stopped: no progress across several rounds — the check kept \
-                         failing or the same information kept coming back. This is \
-                         likely an environment limit or an unsolvable request, so I am \
-                         not looping further."
-                    );
-                }
-                // One round before the cap: warn the model so it can change
-                // approach, work around an environment limit, or stop honestly
-                // instead of repeating the same failing edit-and-recheck.
-            }
-            // Per-round counters are zeroed at the top of the next model round.
-
-            // Count explore rounds without a plan so a single soft nudge can
-            // fire later. Never caps navigation; not a hard budget.
+            // Count rounds without a plan so a single soft nudge can fire
+            // later. Never caps anything; not a budget.
             if structured_plan_required && !structured_plan_started {
-                plan_explore_rounds_used = plan_explore_rounds_used.saturating_add(1);
-            }
-
-            // Engagement guard bookkeeping. Material progress is a LATCH over
-            // deliberate acts: a registered plan, or a successful call to a tool
-            // the REGISTRY declares file-mutating. Never a tool's name, never
-            // its exit status, and never the workspace merely having changed.
-            //
-            // Not the workspace diff: CTL_LONG_B_ORCH_3 ran 139 tool calls over
-            // 99 rounds, registered no plan, applied no edit, and produced
-            // nothing — yet its ledger reports cumulative_modified_files: 2,
-            // both shell byproducts (`reference-verbs.md.bak` and `.tmp`).
-            // Latching on that count would have silenced the advisory on the
-            // very run that proves the spiral. Filename heuristics are not the
-            // answer either — `mutates_files` is a product-declared property.
-            //
-            // Not a passing verification: running the repository's existing
-            // suite proves nothing about what THIS run produced, and would be a
-            // one-command way to silence the advisory for the rest of the turn.
-            if !call_snapshot.is_empty() {
-                engagement_tool_rounds = engagement_tool_rounds.saturating_add(1);
-            }
-            if structured_plan_started || edit_applied_this_round {
-                engagement_material_progress = true;
+                plan_rounds_without_plan = plan_rounds_without_plan.saturating_add(1);
             }
 
             // Goal mode: an explicit update_goal this round ends the run now that
@@ -4392,52 +3544,6 @@ fn fold_child_settlement(
     (content, result.result.status.completed())
 }
 
-/// The executor's most recent user-visible prose (up to two assistant texts,
-/// bounded): where a completion claim — and its self-contradictions — live.
-/// Reconciliation evidence only; never reasoning content.
-fn recent_assistant_claims(messages: &[Message]) -> String {
-    let mut texts: Vec<&str> = Vec::new();
-    for message in messages.iter().rev() {
-        if message.role != Role::Assistant {
-            continue;
-        }
-        for part in &message.content {
-            if let ContentPart::Text { text } = part
-                && !text.trim().is_empty()
-            {
-                texts.push(text);
-            }
-        }
-        if texts.len() >= 2 {
-            break;
-        }
-    }
-    texts.reverse();
-    let joined = texts.join("\n---\n");
-    crate::reconciliation::bounded_tail(&joined, 4000).to_string()
-}
-
-/// Tails of the most recent tool results (up to three, bounded): the recorded
-/// ground a completion claim stands on — test output, command output.
-fn recent_tool_evidence(messages: &[Message]) -> String {
-    let mut outs: Vec<String> = Vec::new();
-    'outer: for message in messages.iter().rev() {
-        for part in message.content.iter().rev() {
-            if let ContentPart::ToolResult { result } = part {
-                let tail = crate::reconciliation::bounded_tail(&result.content, 1500);
-                if !tail.trim().is_empty() {
-                    outs.push(tail.to_string());
-                }
-                if outs.len() >= 3 {
-                    break 'outer;
-                }
-            }
-        }
-    }
-    outs.reverse();
-    outs.join("\n---\n")
-}
-
 /// Remove `id` from the durable outstanding-children record.
 fn clear_outstanding_child(progress: &mut leveler_lifecycle::ProgressLedger, id: &str) {
     progress
@@ -4569,11 +3675,24 @@ fn projected_epoch_file_count(
     epoch_modified_paths(progress, drive_files).len()
 }
 
-/// Pure state-marking tools that do no external work (plan/goal/step
-/// bookkeeping). Calling one is never itself closeout thrash — re-running
-/// substantive tools after the plan is complete is.
-fn is_bookkeeping_tool(name: &str) -> bool {
-    matches!(name, "update_plan" | UPDATE_GOAL_TOOL | COMPLETE_STEP_TOOL)
+/// Once a pinned task budget is 80% spent, the model is told so, once. The
+/// budget is the model's to spend and it cannot see it otherwise. Tiny budgets
+/// (tests, evals with a handful of rounds) get no note — there is nothing to
+/// pace. A resource fact, not a judgement about the work.
+pub(crate) const BUDGET_NOTE_MIN_TOTAL: u32 = 20;
+
+pub(crate) fn budget_note(used: u32, total: u32, already_sent: bool) -> Option<String> {
+    if already_sent
+        || total < BUDGET_NOTE_MIN_TOTAL
+        || used.saturating_mul(5) < total.saturating_mul(4)
+    {
+        return None;
+    }
+    Some(format!(
+        "Budget: {used} of {total} rounds for this task are used. Converge now: land \
+         the change, run the check that proves it, and call update_goal. If the \
+         goal cannot be reached in what remains, say so with update_goal(blocked)."
+    ))
 }
 
 /// How often to emit a [`AgentEvent::CommandProgress`] heartbeat while a command
@@ -4594,27 +3713,6 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
         .map(str::trim)
         .filter(|s| !s.is_empty());
     Some(cmd.map_or_else(|| call.name.clone(), str::to_string))
-}
-
-/// Whether a completion claim must be refused, given what the judge said and
-/// what the contract still owes.
-///
-/// The refusal is an instruction to the agent: finish these and claim again.
-/// An obligation the runtime admits it has no standard for is not something
-/// the agent can finish — see
-/// [`leveler_lifecycle::OpenReason::dischargeable_by_more_work`]. It stays on
-/// the ledger and still withholds the verified claim at the terminal
-/// boundary; it is not a reason to send the agent back to work.
-pub(crate) fn completion_claim_refused(
-    judge_allows_completion: bool,
-    open: &[(String, String, leveler_lifecycle::OpenReason)],
-    omitted: &[String],
-) -> bool {
-    !judge_allows_completion
-        || open
-            .iter()
-            .any(|(_, _, why)| why.dischargeable_by_more_work())
-        || !omitted.is_empty()
 }
 
 /// Epoch + this-drive distinct modified paths (source of truth for residual).
@@ -4860,66 +3958,5 @@ mod residual_budget_tests {
             None,
             "re-edit of counted path must be allowed at residual 0 new"
         );
-    }
-}
-
-#[cfg(test)]
-mod completion_claim_tests {
-    use super::completion_claim_refused;
-    use leveler_lifecycle::OpenReason;
-
-    fn open(why: OpenReason) -> (String, String, OpenReason) {
-        (
-            "R1".into(),
-            "a nested field submits a defined value".into(),
-            why,
-        )
-    }
-
-    /// post-closure C2: the judge said satisfied, the tree passes the frozen
-    /// oracle, and the only open obligation is one the runtime has no proof
-    /// standard for. Refusing here told the agent to go run the check green —
-    /// it already had, three times — and the turn ended in a forced closeout.
-    #[test]
-    fn an_obligation_with_no_proof_standard_does_not_refuse_the_claim() {
-        assert!(!completion_claim_refused(
-            true,
-            &[open(OpenReason::MissingAuthoritativeProof)],
-            &[],
-        ));
-    }
-
-    /// Everything the agent CAN act on still refuses, alone or beside it.
-    #[test]
-    fn an_actionable_obligation_still_refuses_the_claim() {
-        for why in [
-            OpenReason::NotAccountedFor,
-            OpenReason::MissingMechanicalEvidence,
-            OpenReason::MechanicalConstraintViolation,
-            OpenReason::Blocked,
-        ] {
-            assert!(completion_claim_refused(true, &[open(why)], &[]), "{why:?}");
-            assert!(
-                completion_claim_refused(
-                    true,
-                    &[open(OpenReason::MissingAuthoritativeProof), open(why)],
-                    &[],
-                ),
-                "mixed with an impossible one, the actionable one still governs: {why:?}"
-            );
-        }
-    }
-
-    /// The other two refusal grounds are untouched: a judge that did not allow
-    /// completion, and a requirement the contract never captured.
-    #[test]
-    fn a_refusing_judge_or_an_omitted_requirement_still_refuses() {
-        assert!(completion_claim_refused(false, &[], &[]));
-        assert!(completion_claim_refused(
-            true,
-            &[open(OpenReason::MissingAuthoritativeProof)],
-            &["re-run the failing checks".to_string()],
-        ));
-        assert!(!completion_claim_refused(true, &[], &[]));
     }
 }

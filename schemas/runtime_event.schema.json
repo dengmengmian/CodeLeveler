@@ -822,7 +822,7 @@
       }
     },
     {
-      "description": "The turn finished its work, but leveler could not independently verify it (no verification gate produced passing evidence). Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish).",
+      "description": "The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish).",
       "type": "object",
       "required": [
         "reason",
@@ -836,6 +836,25 @@
           "type": "string",
           "enum": [
             "turn_completed_unverified"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks.",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed_checks_failed"
           ]
         }
       }
@@ -1308,18 +1327,12 @@
       "description": "Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).\n\nNo free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`].",
       "type": "object",
       "required": [
-        "closeout_deny_rounds",
         "closing",
         "no_progress_streak",
         "phase",
         "type"
       ],
       "properties": {
-        "closeout_deny_rounds": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
         "closing": {
           "type": "boolean"
         },
@@ -1841,8 +1854,17 @@
           "minimum": 0.0
         },
         "success": {
-          "description": "Whether the run completed and verified successfully.",
+          "description": "Whether the run completed and every gating check passed. Kept for existing clients; `verification` carries the full status.",
           "type": "boolean"
+        },
+        "verification": {
+          "description": "The project's own checks over the final tree. Absent on reports written before the status/verification split (reads as `not_run`).",
+          "default": "not_run",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiVerificationStatus"
+            }
+          ]
         }
       }
     },
@@ -2369,17 +2391,11 @@
       "type": "object",
       "required": [
         "interrupted_turns",
-        "repair_attempts",
         "review_stages",
         "workspace_snapshots"
       ],
       "properties": {
         "interrupted_turns": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "repair_attempts": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -2480,7 +2496,6 @@
         "input_tokens",
         "model",
         "output_tokens",
-        "repair_started",
         "repository",
         "request_count",
         "request_failures",
@@ -2543,11 +2558,6 @@
         "output_tokens": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
-        },
-        "repair_started": {
-          "type": "integer",
-          "format": "uint32",
           "minimum": 0.0
         },
         "repository": {
@@ -2992,6 +3002,16 @@
           ]
         }
       }
+    },
+    "UiVerificationStatus": {
+      "description": "What the project's own checks reported over the final tree. Orthogonal to whether the run completed: `Passed` means the configured commands exited 0, never that the user's request was satisfied.",
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "not_run",
+        "unavailable"
+      ]
     },
     "UserShellId": {
       "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",

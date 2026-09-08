@@ -42,101 +42,30 @@ pub enum ExecutionRole {
     Reviewer,
 }
 
-/// How the harness launches an independent reviewer after a mutation.
+/// Whether the harness launches an independent reviewer at closure.
 ///
-/// `Auto` is the shipped product (shape trigger). `Always` / `Off` exist so
-/// Reviewer Value Eval can assign the factor without `eval_mode`.
+/// Explicit only: the user, the eval, or the caller says so. The runtime
+/// never infers from file names or diff size that a change "needs" a second
+/// model — that is a judgement about the work, not a mechanical fact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IndependentReviewPolicy {
     #[default]
-    Auto,
-    Always,
     Off,
-}
-
-/// When an independent review is warranted.
-///
-/// The batch refutes "always review": R008 and R009 both passed with no
-/// reviewer at all, so making every task pay for one would be cost without
-/// evidence. It equally refutes "never" — the tasks that went wrong went
-/// wrong in ways a second pair of eyes is built for. The trigger is therefore
-/// the shape of the change, not the difficulty of the task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReviewTrigger {
-    /// Distinct files the task modified.
-    pub modified_files: usize,
-    /// The change touches security-relevant surface (auth, crypto, secrets,
-    /// permissions) by path.
-    pub security_relevant: bool,
-    /// The change touches concurrency surface, where a reviewer's independent
-    /// reasoning is worth most (R009's race was invisible to its own tests).
-    pub concurrency_relevant: bool,
-    /// The user or eval policy asked for review explicitly.
-    pub explicitly_requested: bool,
-}
-
-/// Files at or above which a diff is "wide" enough that independent review
-/// pays for itself. Deliberately generous: R008 (2 files) and R009 (3 files)
-/// both succeeded solo and must NOT start demanding a reviewer.
-const WIDE_DIFF_FILES: usize = 6;
-
-impl ReviewTrigger {
-    /// Whether this change warrants an independent review.
-    pub fn review_required(self) -> bool {
-        self.explicitly_requested
-            || self.security_relevant
-            || self.concurrency_relevant
-            || self.modified_files >= WIDE_DIFF_FILES
-    }
-
-    /// Classify a change from the paths it touched.
-    pub fn from_modified_paths(paths: &[String], explicitly_requested: bool) -> Self {
-        let hit = |needles: &[&str]| {
-            paths.iter().any(|p| {
-                let lower = p.to_ascii_lowercase();
-                needles.iter().any(|n| lower.contains(n))
-            })
-        };
-        Self {
-            modified_files: paths.len(),
-            security_relevant: hit(&[
-                "auth",
-                "crypt",
-                "secret",
-                "credential",
-                "permission",
-                "token",
-                "password",
-                "sandbox",
-                "policy",
-            ]),
-            concurrency_relevant: hit(&[
-                "concurren",
-                "parallel",
-                "thread",
-                "mutex",
-                "atomic",
-                "async",
-                "lock",
-                "race",
-            ]),
-            explicitly_requested,
-        }
-    }
+    /// Launch a read-only reviewer child over every product mutation.
+    Required,
 }
 
 /// eval-only injection seam for single-variable ablation. Production assembly
-/// never constructs one; every `None` inherits the resolved default. Safety
-/// rails (`completion_evidence`, `repeated_read_guard`) can ONLY be switched
-/// off through here — that is deliberate: measuring a rail's value is an
-/// experiment, not a configuration.
+/// never constructs one; every `None` inherits the resolved default. The
+/// loop-guard rail (`repeated_read_guard`) can ONLY be switched off through
+/// here — that is deliberate: measuring a rail's value is an experiment, not
+/// a configuration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionOverrides {
     pub explicit_plan: Option<bool>,
     pub max_search_calls_per_step: Option<usize>,
     pub max_parallel_tools: Option<usize>,
     pub max_files_per_step: Option<usize>,
-    pub completion_evidence: Option<bool>,
     pub repeated_read_guard: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_output_bytes: Option<usize>,
@@ -273,7 +202,6 @@ pub struct ResolvedExecutionPolicy {
     pub max_search_calls_per_step: usize,
     pub max_files_per_step: usize,
     pub explicit_plan: bool,
-    pub completion_evidence: bool,
     pub repeated_read_guard: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte budget for a single tool result (the central output cap).
@@ -343,11 +271,11 @@ pub fn resolve_execution_policy(
         max_parallel_tools,
         max_search_calls_per_step: o.max_search_calls_per_step.unwrap_or(0),
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
-        // Planning is task-driven, not model-tier-driven. Enabling the gate here
-        // lets the executor enforce it only when the actual request is complex.
+        // Planning is task-driven, not model-tier-driven. This only shapes the
+        // prompt's planning guidance and the one soft plan reminder; nothing
+        // is refused for a missing plan.
         explicit_plan: o.explicit_plan.unwrap_or(true),
-        // Safety rails: only the eval seam may lower them.
-        completion_evidence: o.completion_evidence.unwrap_or(true),
+        // Safety rail: only the eval seam may lower it.
         repeated_read_guard: o.repeated_read_guard.unwrap_or(true),
         reasoning_effort: leveler_model::resolve_reasoning_effort(
             o.reasoning_effort,
@@ -421,9 +349,8 @@ mod tests {
         assert_eq!(new.max_search_calls_per_step, 0, "0 = unlimited");
         assert!(
             new.explicit_plan,
-            "complex tasks must have a structured-plan gate"
+            "complex tasks get structured-plan guidance"
         );
-        assert!(new.completion_evidence);
         assert_eq!(new.max_files_per_step, 8, "task budget, was policy field");
         assert!(new.repeated_read_guard, "safety rail is always on");
         assert_eq!(
@@ -629,16 +556,13 @@ mod tests {
     fn safety_rails_are_on_without_overrides_and_only_eval_can_lower_them() {
         let p = profile();
         let plain = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
-        assert!(plain.completion_evidence);
         assert!(plain.repeated_read_guard);
 
         let ablated = ExecutionOverrides {
-            completion_evidence: Some(false),
             repeated_read_guard: Some(false),
             ..ExecutionOverrides::default()
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&ablated));
-        assert!(!r.completion_evidence);
         assert!(!r.repeated_read_guard);
     }
 
@@ -720,81 +644,5 @@ mod tests {
             resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&complex_task));
         assert!(!r.explicit_plan);
         assert_eq!(r.max_search_calls_per_step, 6);
-    }
-}
-#[cfg(test)]
-mod review_trigger_tests {
-    use super::*;
-
-    fn paths(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The batch's own successes are the negative cases. R008 changed two
-    /// files and R009 three, both passed solo, and neither may start
-    /// demanding a reviewer — "always review" is refuted by evidence.
-    #[test]
-    fn small_ordinary_changes_do_not_require_review() {
-        let r008 = ReviewTrigger::from_modified_paths(
-            &paths(&["crates/core/flags/hiargs.rs", "tests/feature.rs"]),
-            false,
-        );
-        assert!(!r008.review_required(), "R008 succeeded solo: {r008:?}");
-
-        let r010 = ReviewTrigger::from_modified_paths(
-            &paths(&[
-                "src/components/tables/BasicTableOne.tsx",
-                "src/components/tables/basicTableLogic.ts",
-            ]),
-            false,
-        );
-        assert!(!r010.review_required(), "{r010:?}");
-    }
-
-    /// A wide diff is where an independent read pays for itself.
-    #[test]
-    fn a_wide_diff_requires_review() {
-        let wide: Vec<String> = (0..WIDE_DIFF_FILES)
-            .map(|i| format!("src/module_{i}.rs"))
-            .collect();
-        assert!(ReviewTrigger::from_modified_paths(&wide, false).review_required());
-        // One file below the line stays solo.
-        assert!(!ReviewTrigger::from_modified_paths(&wide[1..], false).review_required());
-    }
-
-    /// Security surface: the class F6 came from. A small diff here still
-    /// warrants review precisely because it is small and easy to wave through.
-    #[test]
-    fn security_relevant_changes_require_review_however_small() {
-        for path in [
-            "crates/leveler-core/src/secret.rs",
-            "src/auth/session.rs",
-            "internal/permission/policy.go",
-        ] {
-            let t = ReviewTrigger::from_modified_paths(&paths(&[path]), false);
-            assert!(t.review_required(), "{path} should require review: {t:?}");
-        }
-    }
-
-    /// Concurrency surface: R009's race was invisible to the repo's own tests
-    /// and needed reasoning, not more assertions.
-    #[test]
-    fn concurrency_relevant_changes_require_review() {
-        let t = ReviewTrigger::from_modified_paths(&paths(&["internal/parallel/runner.go"]), false);
-        assert!(t.review_required(), "{t:?}");
-    }
-
-    /// An explicit request always wins — this is how an eval or a user policy
-    /// asks for review WITHOUT putting it in the agent-visible goal.
-    #[test]
-    fn an_explicit_request_requires_review_regardless_of_shape() {
-        let t = ReviewTrigger::from_modified_paths(&paths(&["README.md"]), true);
-        assert!(t.review_required(), "{t:?}");
-    }
-
-    /// A task that changed nothing has nothing to review.
-    #[test]
-    fn a_change_free_task_needs_no_review() {
-        assert!(!ReviewTrigger::from_modified_paths(&[], false).review_required());
     }
 }

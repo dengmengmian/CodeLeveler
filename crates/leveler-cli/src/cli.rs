@@ -542,10 +542,9 @@ pub enum EvalCommand {
         /// tool loop (the multi-phase orchestrate path was removed).
         #[arg(long)]
         direct: bool,
-        /// Ablation: run WITHOUT the post-edit verification gate and its repair
-        /// loop, so the model's own "done" is final. The case still passes or
-        /// fails on the independent `expect` command, so this measures how often
-        /// verify→repair rescues a run the model would have gotten wrong.
+        /// Ablation: run WITHOUT the post-edit verification gate, so the
+        /// model's own "done" is final. The case still passes or fails on the
+        /// independent `expect` command.
         #[arg(long)]
         no_verify_gate: bool,
         /// Repeat every case to expose run-to-run variance (`--runs` is the same flag).
@@ -623,7 +622,7 @@ pub enum EvalCommand {
     /// (control) vs flipped (ablated) — and report what the knob is worth.
     /// Run once per model to measure whether the mechanism helps or hurts it.
     Ablate {
-        /// The resolver input to flip: explicit_plan, completion_evidence,
+        /// The resolver input to flip: explicit_plan,
         /// repeated_read_guard / progress_guards (legacy require_* names accepted).
         knob: String,
         /// Model reference.

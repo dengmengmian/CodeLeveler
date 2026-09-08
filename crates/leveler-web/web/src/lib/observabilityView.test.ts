@@ -23,7 +23,6 @@ function loaded(over: Partial<UiObservabilityLoaded> = {}): UiObservabilityLoade
     agents: [],
     recovery: {
       interrupted_turns: 0,
-      repair_attempts: 0,
       workspace_snapshots: 0,
       review_stages: [],
     },
@@ -53,7 +52,6 @@ function loaded(over: Partial<UiObservabilityLoaded> = {}): UiObservabilityLoade
       verification_runs: 1,
       compact_count: 0,
       subagent_started: 0,
-      repair_started: 0,
     },
     ...over,
   };

@@ -249,20 +249,23 @@ impl Application {
             main_git.remove_worktree(path, branch, &cancellation).await;
         }
 
-        // Terminal outcome (阶段A semantics): integrated + at least one
-        // verified candidate → Verified; integrated only → unverified; no
-        // integration → Failed.
-        let outcome = if !merge.integrated.is_empty() && verified > 0 {
-            TaskOutcome::Verified
-        } else if !merge.integrated.is_empty() {
-            TaskOutcome::CompletedUnverified
+        // Terminal outcome: something integrated → Completed, with the
+        // candidates' own checks reported beside it; nothing integrated →
+        // Failed.
+        let outcome = if !merge.integrated.is_empty() {
+            TaskOutcome::Completed
         } else {
             TaskOutcome::Failed
         };
-        // Operational status; the verified-vs-unverified verdict is `outcome`.
+        let verification = if merge.integrated.is_empty() {
+            leveler_lifecycle::VerificationStatus::NotRun
+        } else if verified > 0 {
+            leveler_lifecycle::VerificationStatus::Passed
+        } else {
+            leveler_lifecycle::VerificationStatus::Failed
+        };
         let (status, state) = match outcome {
-            TaskOutcome::Verified => (SessionStatus::Completed, AgentState::Complete),
-            TaskOutcome::CompletedUnverified => (SessionStatus::Completed, AgentState::Complete),
+            TaskOutcome::Completed => (SessionStatus::Completed, AgentState::Complete),
             _ => (SessionStatus::Failed, AgentState::Failed),
         };
         // Terminal event + every lifecycle column in ONE transaction — the
@@ -272,7 +275,8 @@ impl Application {
         let event = EngineEvent::TaskFinished {
             stop: None,
             outcome,
-            reason: (outcome != TaskOutcome::Verified).then(|| {
+            verification,
+            reason: (outcome != TaskOutcome::Completed).then(|| {
                 format!(
                     "{} candidate(s), {} verified, {} integrated",
                     candidates.len(),
@@ -291,6 +295,7 @@ impl Application {
             &event_type,
             &payload,
             outcome,
+            verification,
             status,
             state,
             leveler_core::now(),

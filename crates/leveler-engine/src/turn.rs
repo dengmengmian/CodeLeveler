@@ -229,7 +229,6 @@ impl TurnRunner<'_> {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TurnRecordedOutcome, EngineError> {
-        let is_repair_turn = matches!(kind, TurnKind::Repair { .. });
         let payload = match &kind {
             TurnKind::Node { node_id } => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
             TurnKind::Repair { attempt } => Some(format!(r#"{{"attempt":{attempt}}}"#)),
@@ -345,7 +344,6 @@ impl TurnRunner<'_> {
                 .factory
                 .build(profile, task_text.as_deref())
                 .await?
-                .with_repair_expansion_evidence(is_repair_turn)
                 .with_restored_context_budget(restored)
                 .with_approver(Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
@@ -435,35 +433,6 @@ impl TurnRunner<'_> {
                 }
                 if !settled_notices.is_empty() {
                     executor = executor.with_restart_settled_children(settled_notices);
-                }
-            } else if is_repair_turn
-                && progress.as_ref().is_some_and(|p| {
-                    p.delegation_decision_offered
-                        || p.delegation_kept_recorded
-                        || p.delegation_delegated_recorded
-                })
-            {
-                // A repair turn continues the SAME goal even though it runs as
-                // a fresh epoch (terminal progress is not inherited). The
-                // one-shot delegation decision point was already offered and
-                // must not be raised again, and its disposition facts must not
-                // be re-recorded (MA-WA1: one fact per epoch). Seed only those
-                // flags.
-                let prior = progress.as_ref().expect("guarded by is_some_and");
-                executor = executor.with_seeded_progress(leveler_agent::ProgressLedger {
-                    delegation_decision_offered: prior.delegation_decision_offered,
-                    delegation_kept_recorded: prior.delegation_kept_recorded,
-                    delegation_delegated_recorded: prior.delegation_delegated_recorded,
-                    // MA-RT-1: a repair turn continues the same goal, so the
-                    // total-delegation quota it consumed carries — a repair is
-                    // not a fresh allowance.
-                    children_spawned_total: prior.children_spawned_total,
-                    ..Default::default()
-                });
-                if let Some(carried) = seeded_ledger_for_repair(
-                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?,
-                ) {
-                    executor = executor.with_seeded_ledger(carried);
                 }
             } else if let Some(ledger) =
                 last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
@@ -737,19 +706,6 @@ fn content_text(content: &[leveler_model::ContentPart]) -> String {
 ///
 /// The ledger a verification-repair window starts from.
 ///
-/// A repair continues the same goal: it exists because the tree was edited
-/// and a check failed. The edits and that failed check ARE its starting
-/// facts. Carrying only open findings (as a genuinely new goal does) left the
-/// repair window with `last_mutation == 0` over a changed tree, unable to
-/// order anything it did against what came before. Progress is still not
-/// inherited here — that is MA-WA1's one-fact-per-epoch rule and is decided
-/// separately — only the evidence.
-pub(crate) fn seeded_ledger_for_repair(
-    persisted: Option<leveler_lifecycle::EvidenceLedger>,
-) -> Option<leveler_lifecycle::EvidenceLedger> {
-    persisted
-}
-
 /// Resume always seeds (caller uses `TurnInput::Resume`). For Content/Goal we
 /// seed only when the prior task is still open — never Closing/Terminal or a
 /// fully completed plan (that would be a finished epoch).
@@ -1218,24 +1174,6 @@ mod seed_gate_tests {
     #[test]
     fn a_goal_continuation_seeds_even_when_the_plan_is_fully_completed() {
         assert!(should_seed_task_state(Some(&completed_plan()), None, true));
-    }
-
-    /// A repair turn exists BECAUSE the tree was edited and a check failed.
-    /// Its ledger used to keep only open findings — the edits and the failed
-    /// verification that motivated the repair were dropped, so the repair
-    /// window began with `last_mutation == 0` over a changed tree and could
-    /// not order anything it did against what came before. Same goal, next
-    /// window: the evidence carries, and the workspace revision decides what
-    /// is still current.
-    #[test]
-    fn a_repair_turn_carries_the_edits_and_the_failed_check_it_is_repairing() {
-        let mut led = leveler_lifecycle::EvidenceLedger::default();
-        led.record_mutation("m1", "apply_patch", vec!["a.rs".into()]);
-        led.record_verify("v1", "cargo\u{1f}test", 1);
-        let seeded = seeded_ledger_for_repair(Some(led)).expect("evidence carries");
-        assert_eq!(seeded.mutations.len(), 1, "the edit is still on record");
-        assert_eq!(seeded.verifications.len(), 1, "so is the failed check");
-        assert!(seeded.last_mutation_seq() > 0);
     }
 
     #[test]

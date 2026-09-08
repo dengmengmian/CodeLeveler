@@ -43,6 +43,7 @@ pub fn should_refresh_trace(event: &leveler_client_protocol::RuntimeEvent) -> bo
             | TurnFailed { .. }
             | TurnIncomplete { .. }
             | TurnCompletedUnverified { .. }
+            | TurnCompletedChecksFailed { .. }
             | TurnCancelled
             | ContextCompacted { .. }
             | CheckpointCreated { .. }

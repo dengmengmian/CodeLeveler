@@ -7,7 +7,6 @@
 
 pub mod discover;
 pub mod failure;
-pub mod outcome;
 pub mod plan;
 pub mod report;
 pub mod test_results;
@@ -15,7 +14,6 @@ mod toolchain;
 mod verifier;
 
 pub use failure::{ClassifiedFailure, FailureKind, RecoveryStrategy, classify};
-pub use outcome::{CompletionVerdict, ExpectedEvidence, finalize_task_outcome};
 pub use plan::{CheckKind, VerificationCommand, VerificationPlan};
 pub use report::{CheckOutcome, CheckStatus, Verdict, VerificationReport};
 pub use verifier::Verifier;

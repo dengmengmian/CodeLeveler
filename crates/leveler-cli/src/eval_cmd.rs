@@ -598,10 +598,6 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.explicit_plan = Some(false);
             (true, false)
         }
-        "completion_evidence" | "require_completion_evidence" => {
-            o.completion_evidence = Some(false);
-            (true, false)
-        }
         // Tools-layer read guard and agent-level progress heuristics share this
         // seam (factory wires both from the resolved flag).
         "repeated_read_guard" | "progress_guards" => {
@@ -625,7 +621,7 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
         }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
-             completion_evidence, repeated_read_guard, progress_guards, \
+             repeated_read_guard, progress_guards, \
              adaptive_context, prune_tool_results, keep_reasoning"
         ),
     };
@@ -913,9 +909,13 @@ async fn run_bare_case(
             let termination = termination_from_report(report.outcome, report.stop_reason);
             (
                 Some(session_id),
-                report.outcome.is_success(),
+                // Completed AND the project's checks passed. Completion alone
+                // is the model's claim; the eval's own expectation check
+                // still decides pass/fail.
+                report.outcome.is_completed()
+                    && report.verification_status == leveler_lifecycle::VerificationStatus::Passed,
                 report.rounds,
-                format!("{:?}", report.outcome),
+                format!("{:?}/{:?}", report.outcome, report.verification_status),
                 termination,
                 None,
             )
@@ -935,55 +935,15 @@ async fn run_bare_case(
     }
 }
 
-/// Count engine repair turns and whether verification passed after the last
-/// one, from the persisted event log. `repair_started` / `verification_finished`
-/// are the engine's own canonical rows — a repair is only reported when the
-/// engine actually started one.
-async fn repair_metrics_from_events(
-    db: &leveler_storage::Database,
-    session_id: &leveler_core::SessionId,
-) -> (u32, Option<bool>) {
-    let events = match leveler_storage::EventRepository::new(db)
-        .load(session_id)
-        .await
-    {
-        Ok(events) => events,
-        Err(_) => return (0, None),
-    };
-    let mut repairs = 0u32;
-    let mut last_repair_seq: Option<i64> = None;
-    for event in &events {
-        if event.event_type == "repair_started" {
-            repairs += 1;
-            last_repair_seq = Some(event.sequence);
-        }
-    }
-    let Some(repair_seq) = last_repair_seq else {
-        return (0, None);
-    };
-    // The first verification verdict AFTER the last repair is its outcome.
-    let post_repair_verdict = events
-        .iter()
-        .filter(|e| e.sequence > repair_seq && e.event_type == "verification_finished")
-        .find_map(|e| {
-            serde_json::from_str::<serde_json::Value>(&e.payload)
-                .ok()?
-                .get("payload")?
-                .get("passed")?
-                .as_bool()
-        });
-    (repairs, post_repair_verdict)
-}
-
 fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::TerminationClass {
     match reason {
         StopReason::Completed
         | StopReason::Answered
         | StopReason::CompletedUnverified
-        | StopReason::CloseoutForced => leveler_eval::TerminationClass::Completed,
+        | StopReason::CompletedChecksFailed => leveler_eval::TerminationClass::Completed,
         StopReason::BudgetExhausted => leveler_eval::TerminationClass::BudgetLimited,
         StopReason::TurnLimitReached => leveler_eval::TerminationClass::BudgetLimited,
-        StopReason::Blocked | StopReason::PolicyBlocked => leveler_eval::TerminationClass::Blocked,
+        StopReason::Blocked => leveler_eval::TerminationClass::Blocked,
         StopReason::Incomplete | StopReason::Stalled => leveler_eval::TerminationClass::Incomplete,
     }
 }
@@ -1161,8 +1121,6 @@ async fn run_eval_case(
         narrow_reads: 0,
         verification_driven_impact_discovery: false,
         missed_impact_paths: Vec::new(),
-        repair_attempts: 0,
-        repair_success: None,
     };
 
     // Materialize the workspace. Two modes:
@@ -1298,7 +1256,7 @@ async fn run_eval_case(
     let (session_id, completed, rounds, mut note, termination, infrastructure_cause) =
         if no_verify_gate {
             // Ablation: the SAME direct loop with ONE variable removed — the
-            // post-edit verification gate and the repair turn it drives.
+            // post-edit verification gate.
             run_bare_case(&app, model, case, &mut collector).await
         } else {
             let _ = direct; // flag retained for CLI compatibility; always direct.
@@ -1400,17 +1358,6 @@ async fn run_eval_case(
         (0, 0, 0)
     };
 
-    // Repair metrics come from the canonical persisted event log, not the
-    // AgentEvent stream (the engine-to-agent mapping drops RepairStarted): a
-    // repair only counts when the engine actually emitted the event.
-    let (repair_attempts, repair_success) = if let Some(session_id) = &session_id {
-        match app.open_database().await {
-            Ok(db) => repair_metrics_from_events(&db, session_id).await,
-            Err(_) => (0, None),
-        }
-    } else {
-        (0, None)
-    };
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
 
     // Cost only when the model profile carries auditable pricing — never invented.
@@ -1515,8 +1462,6 @@ async fn run_eval_case(
         narrow_reads: signals.narrow_reads,
         verification_driven_impact_discovery: signals.verification_driven_impact_discovery,
         missed_impact_paths,
-        repair_attempts,
-        repair_success,
     }
 }
 
@@ -1570,17 +1515,6 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
                 c.first_edit_round.unwrap_or(0)
             ));
         }
-        if c.repair_attempts > 0 {
-            shape.push_str(&format!(
-                " repair={}({})",
-                c.repair_attempts,
-                match c.repair_success {
-                    Some(true) => "pass",
-                    Some(false) => "fail",
-                    None => "?",
-                }
-            ));
-        }
         println!(
             "  {mark} {:<24} run={} steps={} tokens={}/{} latency={}ms{shape} {}{}{}",
             c.id,
@@ -1609,12 +1543,6 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
             "  → self-recovered edit cases: {} ({})",
             self_recovered.len(),
             self_recovered.join(", ")
-        );
-    }
-    let (repair_triggered, repair_succeeded) = report.repair_counts();
-    if repair_triggered > 0 {
-        println!(
-            "  → engine repair: triggered in {repair_triggered} case(s), post-repair verification passed in {repair_succeeded}"
         );
     }
     // Headline agent-quality signal: the agent claimed "done" but the
@@ -1711,15 +1639,10 @@ mod ablation_tests {
         assert!(before && !after);
         assert_eq!(o.explicit_plan, Some(false), "the named knob flipped OFF");
         // The single-variable contract: nothing else moved.
-        assert_eq!(o.completion_evidence, None);
         assert_eq!(o.repeated_read_guard, None);
         assert_eq!(o.max_parallel_tools, None);
 
         // Safety rails ablate in the OFF direction (they default on).
-        let (o, before, after) = super::ablation_overrides("completion_evidence").unwrap();
-        assert!(before && !after);
-        assert_eq!(o.completion_evidence, Some(false));
-
         let (o, before, after) = super::ablation_overrides("progress_guards").unwrap();
         assert!(before && !after);
         assert_eq!(o.repeated_read_guard, Some(false));
@@ -1730,7 +1653,7 @@ mod ablation_tests {
 
         let err = super::ablation_overrides("not_a_knob").unwrap_err();
         assert!(
-            err.to_string().contains("completion_evidence"),
+            err.to_string().contains("repeated_read_guard"),
             "unknown knob lists the valid ones: {err}"
         );
     }
@@ -1756,8 +1679,7 @@ mod ablation_tests {
     }
 
     /// The whole point of `--no-verify-gate` is that ONE variable changes: the
-    /// post-edit verification plan is empty, so the gate (and the repair turn it
-    /// drives) never runs. Every other knob must match the normal direct path,
+    /// post-edit verification plan is empty, so the gate never runs. Every other knob must match the normal direct path,
     /// or a difference in results is not attributable to the gate.
     #[test]
     fn the_bare_spec_differs_from_the_direct_spec_only_in_verification() {

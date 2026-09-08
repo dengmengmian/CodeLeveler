@@ -1,7 +1,7 @@
-//! Process evidence ledger (Delivery). Pure types — no I/O, no shell.
+//! Process evidence ledger. Pure types — no I/O, no shell.
 //!
 //! Event log remains SoT for resume; this is the host in-memory projection
-//! the readiness gate reads during a drive.
+//! the mechanical readiness gate reads during a drive.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,27 +28,19 @@ pub struct VerifyRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompleteStepReceipt {
-    pub step_id: String,
-    pub step_text: String,
-    pub summary: String,
-    /// Must match a successful VerifyRecord.tool_call_id when delivery_gate.
-    pub evidence_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterceptRecord {
     pub kind: String,
     pub detail: String,
 }
 
-/// In-memory process evidence for Gate / Delivery.
+/// What this run mechanically did: mutations, verifications, intercepts and
+/// multi-agent findings. Facts only — the ledger never says what those facts
+/// prove about the user's intent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceLedger {
     pub plan: PlanState,
     pub mutations: Vec<MutationRecord>,
     pub verifications: Vec<VerifyRecord>,
-    pub step_receipts: Vec<CompleteStepReceipt>,
     pub intercepts: Vec<InterceptRecord>,
     pub next_seq: u64,
     /// Every successful mutating tool call, INCLUDING repeat edits of files
@@ -70,44 +62,9 @@ pub struct EvidenceLedger {
     /// Serde-default so pre-findings snapshots still replay.
     #[serde(default)]
     pub findings: Vec<FindingRecord>,
-    /// Whether the runtime has finished producing its own evidence for this
-    /// completion attempt.
-    ///
-    /// The completion contract is asked twice on the same ledger, and the two
-    /// moments know different amounts. `update_goal(complete)` asks from
-    /// inside the agent loop — the REQUEST — while the runtime's verification
-    /// plan runs afterwards and records what it saw; the terminal boundary
-    /// then asks again — the COMMIT. One predicate, one authority, two points
-    /// on a ledger that grew in between.
-    ///
-    /// This flag is what lets the predicate tell them apart. Set once the
-    /// verification plan's observations are on the ledger. A rule that needs
-    /// runtime evidence stays silent while this is false, because refusing
-    /// there asks for proof that does not exist yet — the mistake F7-B made
-    /// and had to withdraw.
-    ///
-    /// Serde-default so snapshots written before it existed replay as "still
-    /// gathering", which is the conservative reading: they are judged exactly
-    /// as they were.
-    #[serde(default)]
-    pub runtime_evidence_complete: bool,
     /// Monotonic id source for findings owned by THIS ledger.
     #[serde(default)]
     pub next_finding_seq: u64,
-    /// The goal's Completion Contract, once derived. It rides the ledger
-    /// because the ledger is already the durable, replayed record of what this
-    /// run knows — a restart that lost the obligations would be free to
-    /// reinterpret the goal from scratch, which is the failure the contract
-    /// exists to prevent. Serde-default so pre-contract snapshots still replay.
-    #[serde(default)]
-    pub completion_contract: Option<crate::CompletionContract>,
-    /// A goal ran, and its obligations could not be established. Recorded so
-    /// the terminal boundary can tell "no contract was needed" (a chat turn)
-    /// apart from "the contract could not be built" (a goal whose obligations
-    /// are unknown). The second must never terminate as success: nothing was
-    /// checked, and nothing checked is not everything satisfied.
-    #[serde(default)]
-    pub completion_contract_unavailable: bool,
 }
 
 impl EvidenceLedger {
@@ -115,7 +72,6 @@ impl EvidenceLedger {
     /// Advances the freshness sequence even when no path is new, so a
     /// verification recorded before this call is no longer current after it.
     pub fn note_mutation_op(&mut self) {
-        self.note_tree_moved();
         self.total_mutation_ops = self.total_mutation_ops.saturating_add(1);
         self.next_seq = self.next_seq.saturating_add(1);
         self.last_mutation_op_seq = self.next_seq;
@@ -137,7 +93,6 @@ impl EvidenceLedger {
         tool: impl Into<String>,
         paths: Vec<String>,
     ) {
-        self.note_tree_moved();
         self.next_seq = self.next_seq.saturating_add(1);
         self.mutations.push(MutationRecord {
             seq: self.next_seq,
@@ -145,15 +100,6 @@ impl EvidenceLedger {
             tool: tool.into(),
             paths,
         });
-    }
-
-    /// The tree just changed, so the verification plan's observations no
-    /// longer describe it: the next completion claim is a REQUEST again, not a
-    /// COMMIT. Only ever setting this flag left every claim after the first
-    /// verification cycle judged at the commit standard, which for an
-    /// obligation with no proof standard can never be met.
-    fn note_tree_moved(&mut self) {
-        self.runtime_evidence_complete = false;
     }
 
     pub fn record_verify(
@@ -172,123 +118,11 @@ impl EvidenceLedger {
         });
     }
 
-    /// Successful verify that is still valid after the latest mutation.
-    /// Did this exact command run green over the tree as it stands?
-    ///
-    /// Matched on the normalized fingerprint the ledger already records, so
-    /// "`go test ./...` must pass" is not satisfied by some other command
-    /// that happened to succeed. The runtime answers this from its own
-    /// record; no reading of anyone's description is involved.
-    pub fn fresh_successful_command(&self, fingerprint: &str) -> bool {
-        let last_mut = self.last_mutation_seq();
-        self.verifications.iter().any(|v| {
-            v.exit_code == 0
-                && v.after_mutation_seq >= last_mut
-                && last_mut > 0
-                && v.command_fingerprint == fingerprint
-        })
-    }
-
-    /// Does this durable id name something that actually happened?
-    ///
-    /// Evidence that cites nothing resolvable is prose wearing a citation's
-    /// clothes, so a binding is checked against the record rather than
-    /// believed.
-    pub fn resolves_evidence_ref(&self, id: &str) -> bool {
-        self.mutations.iter().any(|m| m.tool_call_id == id)
-            || self.verifications.iter().any(|v| v.tool_call_id == id)
-    }
-
-    /// Whether `id` names an OBSERVATION this ledger holds: a command that
-    /// ran green over code this run had already changed.
-    ///
-    /// The distinction a citation needs. `resolves_evidence_ref` answers "does
-    /// the runtime know this id at all" — F3's rule, which an invented id
-    /// fails. This answers "can this id witness what the code does", which a
-    /// file edit fails: a path changing is a fact about the tree, not about
-    /// its behaviour. A failing run is not a witness either, nor is one that
-    /// ran before anything changed — that says what the code already did, not
-    /// what the work achieved.
-    ///
-    /// F7-B: the test is "after ANY mutation", not "at or after the LAST
-    /// one". The stricter form discarded a check that had genuinely observed
-    /// the work as soon as any later write landed — a harness sanity file was
-    /// enough — and it blocked four obligations of an externally accepted
-    /// run. Whether the newest edit has been re-checked is a different
-    /// question, and [`Self::has_fresh_successful_verify`] is where it is
-    /// asked.
-    pub fn witnesses_behavior(&self, id: &str) -> bool {
-        self.verifications
-            .iter()
-            .any(|v| v.tool_call_id == id && v.exit_code == 0 && v.after_mutation_seq > 0)
-    }
-
-    // `observed_the_changed_tree()` lived here: "did this run ever see a green
-    // check over code it had changed", and it was the floor under a behavioural
-    // claim the judge could not anchor to an id.
-    //
-    // It is gone because that question cannot carry that weight. It is true of
-    // a run whose only check was `/usr/bin/true`, and true of a run whose green
-    // command exercised a neighbouring behaviour — which is the F7 substitution
-    // arriving through the floor rather than through a citation. Whether the
-    // run observed ANYTHING is not evidence about a PARTICULAR obligation, and
-    // the predicate now asks for a proof standard instead
-    // (`completion_contract::authoritative_proof_holds`).
-    //
-    // Deleted rather than left unused: an authority with no callers is an
-    // invitation to wire the same hole back in.
-
     pub fn has_fresh_successful_verify(&self) -> bool {
         let last_mut = self.last_mutation_seq();
         self.verifications
             .iter()
             .any(|v| v.exit_code == 0 && v.after_mutation_seq >= last_mut && last_mut > 0)
-    }
-
-    /// Verifications that PASSED before this task changed anything.
-    ///
-    /// R007b N2: on a bug-fix goal the agent added a reproduction, watched it
-    /// go green on the untouched tree, and concluded the defect did not
-    /// exist — then drifted to an unrelated fix. A check that passes before
-    /// any mutation has demonstrated that the current code satisfies it; on a
-    /// fix goal that is the *opposite* of reproducing the bug, so it must
-    /// never be presented as proof that the work is done.
-    ///
-    /// This is evidence semantics, not a policy: nothing is blocked, the
-    /// verification is simply not counted as reproduction proof.
-    pub fn baseline_green_verifications(&self) -> Vec<&VerifyRecord> {
-        self.verifications
-            .iter()
-            .filter(|v| v.exit_code == 0 && v.after_mutation_seq == 0)
-            .collect()
-    }
-
-    /// Whether every successful verification so far ran on an unmodified
-    /// tree — i.e. nothing has been proven about a change that was never made.
-    pub fn only_baseline_green_evidence(&self) -> bool {
-        let successful: Vec<_> = self
-            .verifications
-            .iter()
-            .filter(|v| v.exit_code == 0)
-            .collect();
-        !successful.is_empty() && successful.iter().all(|v| v.after_mutation_seq == 0)
-    }
-
-    pub fn find_successful_verify(&self, evidence_ref: &str) -> Option<&VerifyRecord> {
-        self.verifications
-            .iter()
-            .find(|v| v.tool_call_id == evidence_ref && v.exit_code == 0)
-    }
-
-    /// Verify is still valid relative to current last mutation.
-    pub fn evidence_ref_is_fresh(&self, evidence_ref: &str) -> bool {
-        let last_mut = self.last_mutation_seq();
-        self.find_successful_verify(evidence_ref)
-            .is_some_and(|v| v.after_mutation_seq >= last_mut)
-    }
-
-    pub fn record_step_receipt(&mut self, receipt: CompleteStepReceipt) {
-        self.step_receipts.push(receipt);
     }
 
     pub fn record_intercept(&mut self, kind: impl Into<String>, detail: impl Into<String>) {
@@ -473,59 +307,8 @@ mod tests {
         assert!(led.has_fresh_successful_verify());
         led.record_mutation("c2", "replace", vec!["a.rs".into()]);
         assert!(!led.has_fresh_successful_verify());
-        assert!(!led.evidence_ref_is_fresh("v1"));
         led.record_verify("v2", "cargo\u{1f}test", 0);
         assert!(led.has_fresh_successful_verify());
-        assert!(led.evidence_ref_is_fresh("v2"));
-    }
-
-    #[test]
-    fn step_receipt_records_after_fresh_evidence() {
-        let mut led = EvidenceLedger::default();
-        led.record_mutation("m1", "apply_patch", vec!["a.rs".into()]);
-        led.record_verify("v1", "cargo\u{1f}test", 0);
-        assert!(led.evidence_ref_is_fresh("v1"));
-        led.record_step_receipt(CompleteStepReceipt {
-            step_id: "edit".into(),
-            step_text: "edit file".into(),
-            summary: "done".into(),
-            evidence_ref: "v1".into(),
-        });
-        assert_eq!(led.step_receipts.len(), 1);
-        assert_eq!(led.step_receipts[0].evidence_ref, "v1");
-    }
-
-    /// R007b N2 accident shape: a reproduction that passes on the untouched
-    /// tree proves nothing about a fix that has not been written.
-    #[test]
-    fn a_verification_that_passes_before_any_change_is_not_proof() {
-        let mut led = EvidenceLedger::default();
-        led.record_verify("c1", "vitest run repro", 0);
-        assert_eq!(led.baseline_green_verifications().len(), 1);
-        assert!(
-            led.only_baseline_green_evidence(),
-            "green on an unmodified tree must not read as proof"
-        );
-        assert!(
-            !led.has_fresh_successful_verify(),
-            "and it must not satisfy the fresh-verify gate either"
-        );
-
-        led.record_mutation("c2", "apply_patch", vec!["src/lib.rs".into()]);
-        led.record_verify("c3", "vitest run repro", 0);
-        assert!(!led.only_baseline_green_evidence());
-        assert!(led.has_fresh_successful_verify());
-        assert_eq!(led.baseline_green_verifications().len(), 1);
-    }
-
-    /// A FAILING check on an unmodified tree is exactly what a reproduction
-    /// should look like, and must not be flagged.
-    #[test]
-    fn a_red_reproduction_on_the_baseline_is_not_flagged() {
-        let mut led = EvidenceLedger::default();
-        led.record_verify("c1", "vitest run repro", 1);
-        assert!(led.baseline_green_verifications().is_empty());
-        assert!(!led.only_baseline_green_evidence());
     }
 }
 
@@ -790,328 +573,5 @@ mod finding_tests {
         )
         .unwrap();
         assert!(legacy.findings.is_empty());
-    }
-}
-
-impl EvidenceLedger {
-    /// Why completion truth forbids calling this run a success — `None` when
-    /// nothing outstanding is known.
-    ///
-    /// THE canonical contract question, asked in exactly one place. Both the
-    /// executor's completion gate and the engine's terminal boundary call it,
-    /// so a run cannot reach success by arriving at the boundary through a
-    /// door the gate never watched. That is not hypothetical: a forced
-    /// closeout over a green workspace used to be mapped straight to verified
-    /// while the contract still recorded an unwritten test.
-    pub fn completion_debt(&self) -> Option<String> {
-        if self.completion_contract_unavailable && self.completion_contract.is_none() {
-            return Some("the completion contract could not be established".to_string());
-        }
-        let contract = self.completion_contract.as_ref()?;
-        let open = contract.open_obligations(self);
-        if open.is_empty() {
-            return None;
-        }
-        Some(
-            open.iter()
-                .map(|(r, why)| {
-                    let why = match why {
-                        crate::OpenReason::NotAccountedFor => "not satisfied",
-                        crate::OpenReason::MissingMechanicalEvidence => {
-                            "no check demonstrates it over the current tree"
-                        }
-                        crate::OpenReason::MechanicalConstraintViolation => {
-                            "the runtime's own record says this condition does not hold"
-                        }
-                        crate::OpenReason::MissingAuthoritativeProof => {
-                            "satisfied by reading only — the runtime has no proof standard for it"
-                        }
-                        crate::OpenReason::Blocked => "blocked",
-                    };
-                    format!("{} ({}) — {}", r.id, r.text, why)
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    }
-}
-
-#[cfg(test)]
-mod completion_debt_tests {
-    use super::*;
-    use crate::{
-        CompletionContract, CompletionRequirement, RequirementKind, RequirementSource,
-        RequirementStatus,
-    };
-
-    fn contract(status: RequirementStatus) -> CompletionContract {
-        CompletionContract::new(vec![CompletionRequirement {
-            id: "R1".into(),
-            text: "the boundary rule is covered by a test".into(),
-            kind: RequirementKind::Behavior,
-            source: RequirementSource::OriginalGoal,
-            status,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        }])
-    }
-
-    /// A task with nothing outstanding owes nothing — a run that genuinely
-    /// finished must still be able to succeed, however it reached its end.
-    #[test]
-    fn a_satisfied_contract_owes_nothing() {
-        let ledger = EvidenceLedger {
-            completion_contract: Some(contract(RequirementStatus::Satisfied)),
-            ..Default::default()
-        };
-        assert_eq!(ledger.completion_debt(), None);
-    }
-
-    /// This is the scale-s800 false completion, at the boundary: obligations
-    /// still open, and the route to the boundary is irrelevant.
-    #[test]
-    fn an_open_obligation_is_debt_whatever_the_route() {
-        let ledger = EvidenceLedger {
-            completion_contract: Some(contract(RequirementStatus::Pending)),
-            ..Default::default()
-        };
-        let debt = ledger.completion_debt().expect("open obligation is debt");
-        assert!(debt.contains("R1"), "the debt names what is owed: {debt}");
-    }
-
-    /// F6 at the terminal boundary: a violated file scope is debt at whatever
-    /// door the run leaves by, forced closeout included. The boundary asks
-    /// this one predicate, so a mechanically refuted obligation cannot be
-    /// walked past by ending the run some other way.
-    #[test]
-    fn a_violated_scope_is_debt_at_the_terminal_boundary() {
-        let mut ledger = EvidenceLedger {
-            completion_contract: Some(CompletionContract::new(vec![CompletionRequirement {
-                id: "R_SCOPE".into(),
-                text: "no files outside internal/window may be modified".into(),
-                kind: RequirementKind::Constraint,
-                source: RequirementSource::OriginalGoal,
-                // The judge already accounted for it as satisfied.
-                status: RequirementStatus::Satisfied,
-                evidence_policy: Some(crate::EvidencePolicy::MutationScope {
-                    allowed_paths: vec!["internal/window".into()],
-                }),
-                evidence: Vec::new(),
-                acceptance_facets: Vec::new(),
-            }])),
-            ..Default::default()
-        };
-        ledger.record_mutation(
-            "c1",
-            "apply_patch",
-            vec!["internal/window/window.go".into()],
-        );
-        assert_eq!(
-            ledger.completion_debt(),
-            None,
-            "in-scope work owes nothing at the boundary either"
-        );
-        ledger.record_mutation(
-            "c2",
-            "apply_patch",
-            vec!["cmd/telemetryd/testdata/boundary_events.txt".into()],
-        );
-        let debt = ledger
-            .completion_debt()
-            .expect("a scope the record refutes is debt");
-        assert!(debt.contains("R_SCOPE"), "{debt}");
-        assert!(
-            debt.contains("record says this condition does not hold"),
-            "the debt says the record refutes it, not that proof is missing: {debt}"
-        );
-    }
-
-    /// A chat turn has no obligations and owes nothing. Absence of a contract
-    /// is only debt when a goal actually failed to build one.
-    #[test]
-    fn no_contract_and_none_expected_owes_nothing() {
-        assert_eq!(EvidenceLedger::default().completion_debt(), None);
-    }
-
-    #[test]
-    fn a_contract_that_could_not_be_built_is_debt() {
-        let ledger = EvidenceLedger {
-            completion_contract_unavailable: true,
-            ..Default::default()
-        };
-        assert!(ledger.completion_debt().is_some());
-    }
-}
-
-#[cfg(test)]
-mod terminal_truth_matrix {
-    use super::*;
-    use crate::{
-        CompletionContract, CompletionRequirement, EvidenceStrength, RequirementEvidence,
-        RequirementKind, RequirementSource, RequirementStatus,
-    };
-
-    /// The debt a run carries is a property of the run, not of the door it
-    /// leaves by. These cases are named for the terminal route that used to
-    /// slip past — a forced closeout over a green workspace — but the
-    /// predicate never sees the route, which is the entire point of the fix.
-    fn ledger_with(reqs: Vec<CompletionRequirement>) -> EvidenceLedger {
-        EvidenceLedger {
-            completion_contract: Some(CompletionContract::new(reqs)),
-            ..Default::default()
-        }
-    }
-
-    fn req(kind: RequirementKind, status: RequirementStatus) -> CompletionRequirement {
-        CompletionRequirement {
-            id: "R1".into(),
-            text: "the boundary rule is covered by a test".into(),
-            kind,
-            source: RequirementSource::OriginalGoal,
-            status,
-            evidence_policy: None,
-            evidence: Vec::new(),
-            acceptance_facets: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn closeout_with_a_pending_requirement_owes_debt() {
-        let l = ledger_with(vec![req(
-            RequirementKind::Behavior,
-            RequirementStatus::Pending,
-        )]);
-        assert!(l.completion_debt().is_some());
-    }
-
-    #[test]
-    fn closeout_with_a_blocked_requirement_owes_debt() {
-        let l = ledger_with(vec![req(
-            RequirementKind::Behavior,
-            RequirementStatus::Blocked,
-        )]);
-        assert!(l.completion_debt().is_some());
-    }
-
-    /// THE scale-s800 case. The workspace is green — the existing suite passes
-    /// — and the judge called the test obligation satisfied on its own say-so.
-    /// Green tests are evidence that the tree is healthy, not proof that the
-    /// test the user asked for exists.
-    #[test]
-    fn a_green_workspace_does_not_settle_an_unproven_test_obligation() {
-        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
-        r.evidence.push(RequirementEvidence {
-            strength: EvidenceStrength::Semantic,
-            detail: "I added a test for the boundary".into(),
-            refs: Vec::new(),
-        });
-        let mut l = ledger_with(vec![r]);
-        l.record_mutation(
-            "c1",
-            "apply_patch",
-            vec!["internal/window/window.go".into()],
-        );
-        l.record_verify("v1", "go\u{1f}test", 0);
-        let debt = l
-            .completion_debt()
-            .expect("a green suite is not the required test");
-        assert!(debt.contains("no check demonstrates it"), "{debt}");
-    }
-
-    #[test]
-    fn closeout_without_a_contract_that_should_exist_owes_debt() {
-        let l = EvidenceLedger {
-            completion_contract_unavailable: true,
-            ..Default::default()
-        };
-        assert!(l.completion_debt().is_some());
-    }
-
-    /// Stale evidence is not evidence: a check that went green and was then
-    /// invalidated by a later edit proves nothing about the tree that shipped.
-    #[test]
-    fn a_stale_check_owes_debt() {
-        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
-        r.evidence.push(RequirementEvidence {
-            strength: EvidenceStrength::Mechanical,
-            detail: "go test ./...".into(),
-            refs: Vec::new(),
-        });
-        let mut l = ledger_with(vec![r]);
-        l.record_mutation("c1", "apply_patch", vec!["a.go".into()]);
-        l.record_verify("v1", "go\u{1f}test", 0);
-        l.record_mutation("c2", "apply_patch", vec!["b.go".into()]);
-        assert!(l.completion_debt().is_some());
-    }
-
-    /// And the other direction, which matters just as much: a run that really
-    /// did finish owes nothing, however it reached its end. Truth closure must
-    /// not become blanket pessimism.
-    #[test]
-    fn a_genuinely_finished_run_owes_nothing_even_after_a_forced_closeout() {
-        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
-        r.evidence.push(RequirementEvidence {
-            strength: EvidenceStrength::Mechanical,
-            detail: "go test ./... covering the boundary".into(),
-            refs: Vec::new(),
-        });
-        r.evidence_policy = Some(crate::EvidencePolicy::CommandSuccess {
-            commands: vec!["go\u{1f}test".into()],
-            mode: crate::CommandMode::All,
-        });
-        let mut l = ledger_with(vec![r]);
-        l.record_mutation(
-            "c1",
-            "apply_patch",
-            vec!["internal/window/window_test.go".into()],
-        );
-        l.record_verify("v1", "go\u{1f}test", 0);
-        assert_eq!(l.completion_debt(), None);
-    }
-}
-
-#[cfg(test)]
-mod request_point_tests {
-    use super::*;
-
-    /// `runtime_evidence_complete` says the verification plan's observations
-    /// are on the ledger FOR THIS TREE. It was only ever set, never cleared,
-    /// so after the first verification cycle every later in-loop completion
-    /// claim was judged at the commit standard — post-closure C2 edited more
-    /// files in a second window and was refused three times for an obligation
-    /// that, at the request point, had nothing to prove yet.
-    #[test]
-    fn a_mutation_after_the_verification_plan_reopens_the_request_point() {
-        let mut l = EvidenceLedger::default();
-        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
-        l.runtime_evidence_complete = true;
-        l.record_mutation("c2", "apply_patch", vec!["src/b.ts".into()]);
-        assert!(
-            !l.runtime_evidence_complete,
-            "the plan has not observed the tree this mutation just made"
-        );
-    }
-
-    /// A re-edit of a path already on record is the same fact (R011-F1): the
-    /// tree moved, so the plan's observations no longer describe it.
-    #[test]
-    fn a_re_edit_also_reopens_the_request_point() {
-        let mut l = EvidenceLedger::default();
-        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
-        l.runtime_evidence_complete = true;
-        l.note_mutation_op();
-        assert!(!l.runtime_evidence_complete);
-    }
-
-    /// A verification does not reopen it: observing the tree is what the flag
-    /// is about, and the engine sets it once the plan has run.
-    #[test]
-    fn recording_a_check_does_not_reopen_the_request_point() {
-        let mut l = EvidenceLedger::default();
-        l.record_mutation("c1", "apply_patch", vec!["src/a.ts".into()]);
-        l.runtime_evidence_complete = true;
-        l.record_verify("v1", "jest", 0);
-        assert!(l.runtime_evidence_complete);
     }
 }

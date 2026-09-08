@@ -264,9 +264,11 @@ impl TurnContext {
              `list_files` for directories and `read_file` only for files. Do not answer a \
              task-like message with only a greeting.\n\
              - Git mutate (`git pull`/`fetch`/`commit`/`rebase`/…): under assisted/request-approval, \
-             workspace `.git` is write-protected. Call `request_permissions` with \
-             `filesystem=unrestricted` (and `network=true` when contacting a remote) first, \
-             then run the git command. Read-only git (`status`/`diff`/`log`) does not need elevation.\n\
+             workspace `.git` is write-protected. Just run the git command; when the sandbox \
+             denies it, retry that same command with `escalate` set (`filesystem` = \
+             `unrestricted`, plus `network` = true when contacting a remote) — one call, \
+             no separate permission round. Read-only git (`status`/`diff`/`log`) does not \
+             need elevation.\n\
              - Host openers (`open` / `xdg-open` / Windows `start`): these leave the sandbox and \
              will prompt the user for approval. Prefer them when the user asks to preview a file \
              in the browser/Finder; do not claim they are blocked without having been denied.\n",
@@ -290,10 +292,14 @@ impl TurnContext {
             rules.push_str(
                 "- NETWORK IS BLOCKED. A command that fails on DNS resolution, a package \
                  registry, or a dependency download is failing because of the sandbox — \
-                 that is not a bug in the code, so do not edit code in response. Call the \
-                 request_permissions tool with network=true (or full_access if you also \
-                 need unrestricted writes), saying what you need and why, and wait for the \
-                 answer. Do not retry the same command hoping it works this time.\n",
+                 that is not a bug in the code, so do not edit code in response. For a \
+                 command, retry that exact command once with `escalate` set (`network` = true, \
+                 plus `filesystem` = `unrestricted` when it also writes outside the \
+                 workspace) — the approval prompt it raises is how the user consents, so \
+                 do not ask in prose first. For anything that is not a command \
+                 (`web_fetch`, `web_search`), call the request_permissions tool with \
+                 network=true, saying what you need and why, and wait for the answer. \
+                 Do not retry the same command hoping it works this time.\n",
             );
         }
         rules.push_str(
@@ -766,6 +772,48 @@ mod tests {
         );
     }
 
+    /// A command that hit the sandbox already has an escalation path ON the
+    /// retry — routing it through `request_permissions` first spends a whole
+    /// extra model round trip for the same approval prompt.
+    #[test]
+    fn a_blocked_command_escalates_on_its_own_retry() {
+        let prompt = PromptBuilder::new()
+            .turn_context(context(PermissionProfile::Assisted, false))
+            .build();
+
+        assert!(
+            prompt.contains("escalate"),
+            "the one-round escape must be named"
+        );
+        assert!(
+            prompt.contains("request_permissions"),
+            "tools that are not commands still need the separate request"
+        );
+    }
+
+    /// Git mutate is the canonical two-step the prompt used to teach. It must
+    /// now teach the same single call the tool schema advertises, or the
+    /// prompt and the tool contradict each other.
+    #[test]
+    fn git_mutate_guidance_matches_the_tool_contract() {
+        let prompt = PromptBuilder::new()
+            .turn_context(context(PermissionProfile::Assisted, false))
+            .build();
+        let git_rule = prompt
+            .lines()
+            .find(|line| line.contains("Git mutate"))
+            .expect("git mutate rule must exist");
+
+        assert!(
+            git_rule.contains("escalate"),
+            "git mutate must use the command's own escalation: {git_rule}"
+        );
+        assert!(
+            !git_rule.contains("request_permissions"),
+            "the superseded two-step must be gone: {git_rule}"
+        );
+    }
+
     /// The security rule: a denied approval is final. Without this a model
     /// routes around the user (denied `run_command` → same thing via a script).
     #[test]
@@ -835,9 +883,10 @@ mod tests {
             "must ban greeting-only replies to tasks: {prompt}"
         );
         assert!(
-            prompt.contains("filesystem=unrestricted")
+            prompt.contains("escalate")
+                && prompt.contains("unrestricted")
                 && (prompt.contains("git pull") || prompt.contains("Git mutate")),
-            "must require FS elevation before git mutate: {prompt}"
+            "must route git mutate through the command's own FS escalation: {prompt}"
         );
     }
 
@@ -896,7 +945,7 @@ mod tests {
         // The git-mutate elevation rule depends on the permission mode, so it
         // lives in the turn context (see operating_rules), not the base prompt.
         assert!(
-            !prompt.contains("filesystem=unrestricted"),
+            !prompt.contains("escalate"),
             "git elevation is a turn-context rule, not a base-prompt one"
         );
         assert!(

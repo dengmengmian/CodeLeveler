@@ -460,7 +460,8 @@ mod tests {
         log.append(
             None,
             EngineEvent::TaskFinished {
-                outcome: crate::TaskOutcome::Verified,
+                outcome: crate::TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
             },
@@ -473,7 +474,8 @@ mod tests {
         assert_eq!(
             replayed,
             vec![EngineEvent::TaskFinished {
-                outcome: crate::TaskOutcome::Verified,
+                outcome: crate::TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
             }],
@@ -1226,7 +1228,8 @@ mod tests {
                 to: leveler_lifecycle::AgentState::Localize,
             },
             EngineEvent::TaskFinished {
-                outcome: crate::TaskOutcome::CompletedUnverified,
+                outcome: crate::TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some("no gating checks".into()),
                 stop: None,
             },
@@ -1245,7 +1248,8 @@ mod tests {
         let store = MemoryEventStore::new();
         let session = SessionId::generate();
         let event = EngineEvent::TaskFinished {
-            outcome: crate::TaskOutcome::Verified,
+            outcome: crate::TaskOutcome::Completed,
+            verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             stop: None,
         };
@@ -1278,7 +1282,8 @@ mod tests {
         log.append(
             None,
             EngineEvent::TaskFinished {
-                outcome: crate::TaskOutcome::CompletedUnverified,
+                outcome: crate::TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
             },
@@ -1297,7 +1302,7 @@ mod tests {
                 EngineEvent::TaskFinished { outcome, .. } => Some(outcome),
                 _ => None,
             });
-        assert_eq!(outcome, Some(crate::TaskOutcome::CompletedUnverified));
+        assert_eq!(outcome, Some(crate::TaskOutcome::Completed));
     }
 
     #[tokio::test]

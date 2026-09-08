@@ -34,7 +34,7 @@ The runtime is not a generic chatbot framework. Its differentiators are durable 
 5. **Commands go to the owner; canonical events come from the owner.**
 6. **Local and cloud databases do not use naive bidirectional table synchronization.**
 7. **Agent decisions cannot bypass ToolHost, permission, sandbox, cancellation, or durable side-effect barriers.**
-8. **The model cannot promote its own work to verified completion.**
+8. **The model cannot write its own verification status.** The runtime records how the run ended and what the project's checks said, as two orthogonal facts; neither is a claim that the user's intent was satisfied.
 9. **Coding, NPC, local execution, cloud execution, and possible container deployment reuse the same Runtime Core.**
 10. **NPC does not create a second agent loop, permission system, event model, or recovery model.**
 11. **Scheduler belongs to Runtime / Control Plane infrastructure, not to NPC.**
@@ -384,7 +384,7 @@ The Agent must not:
 - directly mutate runtime lifecycle state;
 - acquire task ownership;
 - bypass cancellation;
-- mark itself `Verified`.
+- write its own `VerificationStatus`.
 
 ---
 
@@ -775,7 +775,7 @@ Domain Completion Gate
 Engine commits terminal outcome
 ```
 
-For Coding, `Verified` is stronger than a model completion statement.
+For Coding, the terminal fact is `TaskOutcome` (how the run ended) plus `VerificationStatus` (what the project's checks said). The runtime records both mechanically and never grades the model's semantic reading of the goal with a second model.
 
 For NPC and future domains, completion policy may differ, but the model still does not write its own authoritative terminal status.
 

@@ -43,17 +43,9 @@ impl MockRuntime {
 impl ModelRuntime for MockRuntime {
     async fn generate(
         &self,
-        request: ModelRequest,
+        _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(reply);
-        }
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })
@@ -189,9 +181,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

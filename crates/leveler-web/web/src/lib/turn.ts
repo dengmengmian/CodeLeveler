@@ -1,4 +1,4 @@
-// Turn Truth：runtime 7 个终态 → web 状态与展示的唯一映射点。
+// Turn Truth：runtime 8 个终态 → web 状态与展示的唯一映射点。
 // 原则：状态层永不丢失 outcome/detail；presentation 层的措辞与 TUI 对齐
 // （crates/leveler-tui/src/render/transcript_lines.rs::turn_end_lines），
 // 软 token（no_code_changes / no_automatic_verification）折叠成平静收场，
@@ -11,6 +11,7 @@ export type TurnOutcome =
   | 'answered'
   | 'incomplete'
   | 'unverified'
+  | 'checks_failed'
   | 'truncated'
   | 'failed'
   | 'cancelled';
@@ -34,6 +35,8 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
       return { outcome: 'incomplete', detail: ev.reason };
     case 'turn_completed_unverified':
       return { outcome: 'unverified', detail: ev.reason };
+    case 'turn_completed_checks_failed':
+      return { outcome: 'checks_failed', detail: ev.reason };
     case 'turn_failed':
       return { outcome: 'failed', detail: ev.error };
     case 'turn_cancelled':
@@ -64,8 +67,7 @@ function localizeDetail(detail: string): string {
   if (d.includes('budget_exhausted') || d.includes('budget exhausted') || d.includes('预算已耗尽')) {
     return '预算用尽 · 说「继续」接着做';
   }
-  if (d.includes('observe thrash') && d.includes('plan complete')) return '计划已完成 · 重复观察已中止';
-  if (d.includes('observe thrash') || d.startsWith('no-progress streak')) return '无进展 · 重复观察已中止';
+  if (d.startsWith('no-progress streak')) return '无进展 · 每个动作都被拒绝';
   return d;
 }
 
@@ -104,6 +106,14 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
       return {
         glyph: '⚠',
         label: '已完成但未验证',
+        tone: 'warn',
+        detail: token ? localizeDetail(token) : null,
+      };
+    case 'checks_failed':
+      // Done, and the project's checks failed: both facts, one marker.
+      return {
+        glyph: '⚠',
+        label: '已完成 · 验证未通过',
         tone: 'warn',
         detail: token ? localizeDetail(token) : null,
       };

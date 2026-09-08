@@ -99,12 +99,8 @@ pub struct LoadedConfig {
     pub agents_delegation: bool,
     /// Multi-agent experiment: delegation offer timing (default shipped).
     pub agents_offer_timing: leveler_project::OfferTiming,
-    /// When the harness launches an independent reviewer (default Auto).
+    /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
-    /// Cross-model completion judge (`provider/model`); None = executor model.
-    pub agents_completion_judge_model: Option<String>,
-    /// Ceiling for one completion-reconciliation request, in seconds.
-    pub agents_completion_judge_timeout_seconds: Option<u64>,
 }
 
 impl Default for LoadedConfig {
@@ -119,8 +115,6 @@ impl Default for LoadedConfig {
             agents_delegation: true,
             agents_offer_timing: leveler_project::OfferTiming::default(),
             agents_independent_review: leveler_project::IndependentReview::default(),
-            agents_completion_judge_model: None,
-            agents_completion_judge_timeout_seconds: None,
         }
     }
 }
@@ -131,10 +125,10 @@ fn combine_independent_review(
 ) -> leveler_engine::IndependentReviewPolicy {
     use leveler_engine::IndependentReviewPolicy as P;
     use leveler_project::IndependentReview as I;
+    // Explicit only: a review runs when either layer requires it.
     match (global, project) {
-        (I::Off, _) | (_, I::Off) => P::Off,
-        (I::Always, _) | (_, I::Always) => P::Always,
-        _ => P::Auto,
+        (I::Required, _) | (_, I::Required) => P::Required,
+        (I::Off, I::Off) => P::Off,
     }
 }
 
@@ -296,8 +290,6 @@ impl Application {
             agents_delegation: global.agents_delegation,
             agents_offer_timing: global.agents_offer_timing,
             agents_independent_review: global.agents_independent_review,
-            agents_completion_judge_model: global.agents_completion_judge_model,
-            agents_completion_judge_timeout_seconds: global.agents_completion_judge_timeout_seconds,
         })
     }
 
@@ -667,12 +659,6 @@ impl Application {
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,
-                completion_judge_model: resolve_completion_judge_model(
-                    self.config.agents_completion_judge_model.as_deref(),
-                )?,
-                completion_judge_timeout: resolve_completion_judge_timeout(
-                    self.config.agents_completion_judge_timeout_seconds,
-                )?,
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,
                     self.project_config().agents.independent_review,
@@ -750,45 +736,6 @@ impl Application {
                 tracing::debug!(error = %err, "memory candidate enqueue skipped");
             }
         }
-    }
-}
-
-/// Resolve the cross-model Completion Reconciliation judge from config.
-///
-/// Unset keeps the documented fallback (the gate runs on the executor's own
-/// model). A configured-but-unparseable value is a loud config ERROR, never a
-/// silent same-model fallback — that would hide a typo and quietly run a
-/// same-model gate under a cross-model configuration.
-fn resolve_completion_judge_model(
-    raw: Option<&str>,
-) -> Result<Option<leveler_model::ModelRef>, AppError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    leveler_model::ModelRef::parse(raw)
-        .map(Some)
-        .ok_or_else(|| {
-            AppError::GlobalConfig(format!(
-                "agents.completion_judge_model `{raw}` is not `provider/model`"
-            ))
-        })
-}
-
-/// Resolve the configured ceiling for one completion-reconciliation request.
-///
-/// Unset keeps the gate's own default. Zero is rejected rather than coerced:
-/// a zero ceiling would time every judgment out instantly and turn the gate
-/// into a blanket refusal, which reads as "the work is incomplete" and would
-/// be indistinguishable from a real verdict.
-fn resolve_completion_judge_timeout(
-    seconds: Option<u64>,
-) -> Result<Option<std::time::Duration>, AppError> {
-    match seconds {
-        None => Ok(None),
-        Some(0) => Err(AppError::GlobalConfig(
-            "agents.completion_judge_timeout_seconds must be greater than zero".to_string(),
-        )),
-        Some(s) => Ok(Some(std::time::Duration::from_secs(s))),
     }
 }
 
@@ -884,17 +831,11 @@ impl Application {
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
         request.deny_network = sandbox;
         request.deny_env = provider_secret_env_names(&self.config.providers);
-        if mode.confines_workspace() {
-            let extra = self.readonly_roots.clone();
-            request.write_root = Some(cwd.clone());
-            request.extra_read_roots = extra.clone();
-            request.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
-                write_root: cwd.clone(),
-                extra_read_roots: extra,
-            });
-        } else {
-            request.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
+        let scope = mode.write_scope(&cwd);
+        if scope.confines() {
+            request.extra_read_roots = self.readonly_roots.clone();
         }
+        request.apply_write_scope(&scope);
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
     }
@@ -1021,73 +962,6 @@ mod merge_tests {
         );
         assert_eq!(limits.max_commands, None);
         assert_eq!(limits.max_modified_files, None);
-    }
-}
-
-#[cfg(test)]
-mod completion_judge_tests {
-    use super::{AppError, resolve_completion_judge_model};
-
-    /// §8/§42B: unset keeps the documented fallback — the gate runs on the
-    /// executor's own model.
-    #[test]
-    fn an_unset_judge_stays_on_the_executor_model() {
-        assert!(resolve_completion_judge_model(None).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_configured_judge_parses_into_a_model_ref() {
-        let judge = resolve_completion_judge_model(Some("deepseek/deepseek-v4-pro"))
-            .unwrap()
-            .expect("a configured judge resolves");
-        assert_eq!(judge.provider, "deepseek");
-        assert_eq!(judge.model, "deepseek-v4-pro");
-    }
-
-    /// §39: a typo must be loud. Falling back to the executor's model here
-    /// would silently run a same-model gate under a cross-model config.
-    #[test]
-    fn a_malformed_judge_reference_is_a_loud_config_error() {
-        let err = resolve_completion_judge_model(Some("deepseek-v4-pro"))
-            .expect_err("a reference without a provider must not be accepted");
-        assert!(
-            matches!(&err, AppError::GlobalConfig(m) if m.contains("completion_judge_model")),
-            "the error names the setting: {err}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod completion_judge_timeout_tests {
-    use super::{AppError, resolve_completion_judge_timeout};
-
-    /// §20: unset resolves to no override — the gate keeps its own default.
-    #[test]
-    fn an_unset_timeout_leaves_the_gate_default_in_place() {
-        assert_eq!(resolve_completion_judge_timeout(None).unwrap(), None);
-    }
-
-    /// §21: the experiment's explicit ceiling reaches the gate as configured.
-    #[test]
-    fn an_explicit_timeout_resolves_to_that_duration() {
-        assert_eq!(
-            resolve_completion_judge_timeout(Some(180)).unwrap(),
-            Some(std::time::Duration::from_secs(180))
-        );
-    }
-
-    /// §8/§22: zero is a config error, never coerced. A zero ceiling would
-    /// time out every judgment instantly — a blanket refusal wearing the
-    /// costume of a verdict.
-    #[test]
-    fn a_zero_timeout_is_a_config_error_not_a_silent_default() {
-        let err = resolve_completion_judge_timeout(Some(0))
-            .expect_err("zero must not be accepted as a ceiling");
-        assert!(
-            matches!(&err, AppError::GlobalConfig(m)
-                if m.contains("completion_judge_timeout_seconds")),
-            "the error names the setting: {err}"
-        );
     }
 }
 

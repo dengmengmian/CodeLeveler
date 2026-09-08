@@ -116,7 +116,6 @@ pub struct UiSessionObservation {
     pub verification_runs: u32,
     pub compact_count: u32,
     pub subagent_started: u32,
-    pub repair_started: u32,
 }
 
 /// One durable model-request row (no prompt/body).
@@ -178,7 +177,6 @@ pub struct UiAgentObservation {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiRecoveryObservation {
     pub interrupted_turns: u32,
-    pub repair_attempts: u32,
     pub workspace_snapshots: u32,
     pub review_stages: Vec<String>,
 }

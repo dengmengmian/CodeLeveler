@@ -48,17 +48,9 @@ impl MockRuntime {
 impl ModelRuntime for MockRuntime {
     async fn generate(
         &self,
-        request: ModelRequest,
+        _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(reply);
-        }
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })
@@ -182,9 +174,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> TaskEn
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -317,7 +307,7 @@ async fn control_the_same_script_reaches_verified_without_a_ghost() {
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
 }
 
 /// MA_RT_GHOST_WORKER_INCOMPLETE + MA_RT_GHOST_WORKER_BLOCKING_DEBT +
@@ -350,7 +340,7 @@ async fn a_ghost_worker_from_a_dead_window_denies_verified_and_leaves_debt() {
 
     assert_ne!(
         report.outcome,
-        TaskOutcome::Verified,
+        TaskOutcome::Completed,
         "a lost Worker is unresolved original-goal debt; Verified past it is a false claim"
     );
 
@@ -433,7 +423,7 @@ async fn resolving_the_ghost_debt_restores_verified() {
         .unwrap();
     assert_eq!(
         report.outcome,
-        TaskOutcome::Verified,
+        TaskOutcome::Completed,
         "settled debt must not keep blocking: the gate is truth, not punishment"
     );
 }
@@ -787,7 +777,7 @@ async fn ghost_reconciliation_survives_a_real_database_reopen() {
 
     assert_ne!(
         report.outcome,
-        TaskOutcome::Verified,
+        TaskOutcome::Completed,
         "a restart must not launder a lost Worker into a verified closure"
     );
     let events = event_rows(&db, &session).await;

@@ -45,14 +45,6 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::derive_autopilot(&request) {
-            return Ok(reply);
-        }
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
@@ -197,9 +189,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -253,6 +243,7 @@ impl leveler_storage::TerminalStore for FailingTerminal {
         _: &str,
         _: &str,
         _: leveler_engine::TaskOutcome,
+        _: leveler_lifecycle::VerificationStatus,
         _: leveler_lifecycle::SessionStatus,
         _: leveler_lifecycle::AgentState,
         _: leveler_core::Timestamp,
@@ -283,6 +274,7 @@ impl leveler_storage::TerminalStore for FailingTerminal {
         _: &str,
         _: &str,
         _: leveler_engine::TaskOutcome,
+        _: leveler_lifecycle::VerificationStatus,
         _: leveler_lifecycle::SessionStatus,
         _: leveler_lifecycle::AgentState,
         _: leveler_core::Timestamp,
@@ -437,11 +429,6 @@ impl ModelRuntime for HijackingRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         if !self
             .hijacked
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -779,7 +766,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     assert_eq!(report.modified_files, vec!["src/lib.rs".to_string()]);
 
     // Session row: execution config + terminal outcome.
@@ -790,7 +777,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         .unwrap();
     assert_eq!(
         (mode.as_str(), sandbox, kind.as_str(), outcome),
-        ("assisted", false, "direct", Some(TaskOutcome::Verified))
+        ("assisted", false, "direct", Some(TaskOutcome::Completed))
     );
 
     // One user turn, completed, owning the transcript messages.
@@ -838,14 +825,15 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
     assert!(seen.iter().any(|e| matches!(
         e,
         EngineEvent::TaskFinished {
-            outcome: TaskOutcome::Verified,
+            outcome: TaskOutcome::Completed,
+            verification: leveler_lifecycle::VerificationStatus::NotRun,
             ..
         }
     )));
 }
 
 #[tokio::test]
-async fn no_gates_means_completed_unverified() {
+async fn no_gates_means_completed_with_verification_not_run() {
     let h = harness(patch_then_resolve()).await;
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -854,19 +842,19 @@ async fn no_gates_means_completed_unverified() {
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(outcome, Some(TaskOutcome::CompletedUnverified));
+    assert_eq!(outcome, Some(TaskOutcome::Completed));
 }
 
-/// K19: pure Q&A (no mutations) with a green gate plan must stay
-/// CompletedUnverified — never claim Verified just because the repo is healthy.
+/// Pure Q&A (no mutations) with a green gate plan: the run completed and no
+/// check ran — the repo being healthy is not a verdict about the answer.
 #[tokio::test]
-async fn pure_qa_with_green_gates_is_completed_unverified() {
+async fn pure_qa_with_green_gates_is_completed_with_verification_not_run() {
     let h = harness(vec![tool_call(
         "g1",
         "update_goal",
@@ -882,7 +870,7 @@ async fn pure_qa_with_green_gates_is_completed_unverified() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     assert!(
         report.modified_files.is_empty(),
         "Q&A must not leave mutations: {:?}",
@@ -890,22 +878,21 @@ async fn pure_qa_with_green_gates_is_completed_unverified() {
     );
     assert!(
         report.verification.is_none(),
-        "K19 early-exit skips verify when there is no mutation"
+        "no mutation: the checks are not run"
     );
-    assert!(!report.outcome.is_success());
+    assert_eq!(
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::NotRun
+    );
 }
 
-/// Implementation-class Direct task with real edits and all-green gates → Verified
-/// via shared `finalize_task_outcome` (needs_mutation + has_mutation).
+/// Case 2: real edits, the project's checks pass over the final tree, and
+/// the model declared completion → Completed with checks Passed. No hidden
+/// judge, reviewer, or repair turn runs.
 #[tokio::test]
-async fn impl_with_mutations_and_green_gates_is_verified() {
+async fn edits_with_green_gates_complete_with_checks_passed() {
     let h = harness(patch_resolve_and_proven_ac()).await;
-    // Goal contains "add" → task_looks_like_implementation; patch mutates src/lib.rs.
     let s = spec(&h, gate("ok", "true"));
-    assert!(
-        s.runtime.goal.to_lowercase().contains("add"),
-        "fixture goal must look like implementation"
-    );
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -913,13 +900,19 @@ async fn impl_with_mutations_and_green_gates_is_verified() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
-    assert!(
-        !report.modified_files.is_empty(),
-        "impl path requires observed mutation"
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::Passed
     );
+    assert!(!report.modified_files.is_empty());
     assert!(report.verification.is_some());
-    assert!(report.outcome.is_success());
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    assert_eq!(
+        turns.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>(),
+        vec!["user"],
+        "exactly one turn: no repair turn was opened on the model's behalf"
+    );
 }
 
 /// Green gates + real mutation is Verified even when the model never produced
@@ -940,12 +933,11 @@ async fn impl_green_gates_are_verified_without_proven_acceptance() {
         .run(&session, &s, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a passing gate on real changes is the completion evidence"
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::Passed
     );
-    assert!(report.outcome.is_success());
 }
 
 /// Delete a workspace file; understand fails (no response) → mutation-derived
@@ -982,11 +974,10 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
         !std::path::Path::new(&h.dir.path().join("quicksort.py")).exists(),
         "file must be gone on disk"
     );
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "delete + green gates + MUT-DEL Met must Verified; got {:?}",
-        report.outcome
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::Passed
     );
     assert!(
         report
@@ -996,7 +987,7 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
         "modified_files should track delete: {:?}",
         report.modified_files
     );
-    assert!(report.outcome.is_success());
+    assert!(report.outcome.is_completed());
 }
 
 #[tokio::test]
@@ -1048,7 +1039,7 @@ async fn active_goal_automatically_continues_in_a_new_persisted_turn_after_stall
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     assert_eq!(report.stop_reason, StopReason::Completed);
     assert_eq!(report.rounds, 5);
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
@@ -1109,109 +1100,6 @@ async fn direct_budget_stop_preserves_the_executor_detail() {
 }
 
 #[tokio::test]
-async fn a_successful_repair_converges_on_fresh_verification() {
-    // The goal turn leaves the tree failing the gate; the repair turn creates
-    // the marker the gate checks for. Verified must come from the fresh
-    // post-repair verification — the gate genuinely fails before the repair
-    // and can only pass against the repaired tree.
-    let mut responses = patch_then_resolve();
-    responses.push(tool_call(
-        "r1",
-        "apply_patch",
-        serde_json::json!({
-            "patch": "*** Begin Patch\n*** Add File: repaired.marker\n+ok\n*** End Patch"
-        }),
-    ));
-    responses.push(tool_call(
-        "g2",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "repaired"}),
-    ));
-    let h = harness(responses).await;
-    let plan = VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: "marker".into(),
-            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
-            args: if cfg!(windows) {
-                vec![
-                    "/c".into(),
-                    "if exist repaired.marker (exit 0) else (exit 1)".into(),
-                ]
-            } else {
-                vec!["-c".into(), "test -f repaired.marker".into()]
-            },
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-            scope_policy: Default::default(),
-        }],
-    };
-    let spec = spec(&h, plan);
-    let session = h.engine.create_task(&spec).await.unwrap();
-
-    let report = h
-        .engine
-        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a repaired tree with a green fresh verification must verify"
-    );
-
-    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
-    let kinds: Vec<&str> = turns.iter().map(|t| t.kind.as_str()).collect();
-    assert_eq!(
-        kinds,
-        vec!["user", "repair"],
-        "exactly one repair turn, then convergence"
-    );
-}
-
-#[tokio::test]
-async fn failed_verification_repairs_once_then_fails() {
-    // Goal turn (patch + resolve), one repair turn (resolve again), gate
-    // always fails → Failed after the bounded repair.
-    let mut responses = patch_then_resolve();
-    responses.push(tool_call(
-        "g2",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "repaired"}),
-    ));
-    let h = harness(responses).await;
-    let spec = spec(&h, gate("bad", "false"));
-    let session = h.engine.create_task(&spec).await.unwrap();
-
-    let report = h
-        .engine
-        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::Failed);
-    assert!(
-        !report.outcome.is_success(),
-        "failed verification must never count as automation success"
-    );
-
-    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
-    let kinds: Vec<&str> = turns.iter().map(|t| t.kind.as_str()).collect();
-    assert_eq!(kinds, vec!["user", "repair"]);
-    assert_eq!(
-        turns[1].payload.as_deref(),
-        Some(r#"{"attempt":1}"#),
-        "the repair turn records its attempt"
-    );
-
-    let (_, _, _, outcome) = SessionRepository::new(&h.db)
-        .execution(&session)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(outcome, Some(TaskOutcome::Failed));
-}
-
-#[tokio::test]
 async fn agent_failure_persists_terminal_task_and_turn_events() {
     // No scripted response makes the first model request fail inside the turn.
     // The query projections already become failed; the canonical log must carry
@@ -1260,6 +1148,7 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
             event,
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 ..
             }
         )),
@@ -1316,7 +1205,7 @@ async fn starting_a_turn_reaps_orphan_running_siblings() {
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
 
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert!(
@@ -1412,9 +1301,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -1441,7 +1328,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         .resume(&session, &spec2, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
 
     // Two turns: the interrupted original and the completed resume.
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
@@ -1452,7 +1339,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(outcome, Some(TaskOutcome::CompletedUnverified));
+    assert_eq!(outcome, Some(TaskOutcome::Completed));
 }
 
 #[tokio::test]
@@ -1541,14 +1428,8 @@ async fn quiet_without_update_goal_is_not_task_success() {
 
     assert_ne!(
         report.outcome,
-        TaskOutcome::Verified,
-        "quiet must never claim verified: {:?}",
-        report.outcome
-    );
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "quiet must never claim completed-unverified success: {:?}",
+        TaskOutcome::Completed,
+        "quiet must never read as a completed run: {:?}",
         report.outcome
     );
     assert!(
@@ -1578,7 +1459,7 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
 }
 
 /// The supervision decision is injectable: the same stalled script that the
@@ -1621,149 +1502,13 @@ async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
     );
 }
 
-/// R007b N7 (mechanism half): a change policy classifies as review-worthy gets
-/// an independent review that the **harness** launches. The model never calls
-/// `spawn_agent` here — before this, the reviewer designation could only be
-/// honoured by a model that chose to delegate, which R008 and R009 both did not.
 #[tokio::test]
-async fn security_shaped_change_gets_a_harness_launched_review() {
-    let mut responses = vec![
-        tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
-            }),
-        ),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
-        ),
-    ];
-    // The reviewer child drives its own rounds against the same mock runtime.
-    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
-    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
-
-    let h = harness(responses).await;
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let mut seen: Vec<EngineEvent> = Vec::new();
-    let report = h
-        .engine
-        .run(
-            &session,
-            &s,
-            &mut |event| seen.push(event),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let reviewers: Vec<String> = seen
-        .iter()
-        .filter_map(|event| match event {
-            EngineEvent::SubAgentStarted { id, role, .. } if role == "reviewer" => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        reviewers.len(),
-        1,
-        "the harness must launch exactly one reviewer for a security-shaped change"
-    );
-    assert!(
-        seen.iter().any(|event| matches!(
-            event,
-            EngineEvent::SubAgentFinished { id, ok: true, .. } if *id == reviewers[0]
-        )),
-        "the reviewer must reach a terminal result, not merely be announced"
-    );
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a review that actually happened must not leave the task downgraded"
-    );
-}
-
-/// The reviewer is not a tax on every task: an ordinary edit that policy does
-/// not classify as review-worthy runs no reviewer at all.
-#[tokio::test]
-async fn ordinary_change_launches_no_reviewer() {
-    let h = harness(patch_then_resolve()).await;
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let mut seen: Vec<EngineEvent> = Vec::new();
-    let report = h
-        .engine
-        .run(
-            &session,
-            &s,
-            &mut |event| seen.push(event),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !seen
-            .iter()
-            .any(|event| matches!(event, EngineEvent::SubAgentStarted { .. })),
-        "a narrow, non-security edit must not pay for an independent review"
-    );
-    assert_eq!(report.outcome, TaskOutcome::Verified);
-}
-
-#[tokio::test]
-async fn independent_review_off_skips_even_security_shaped_changes() {
-    let mut h = harness(vec![
-        tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
-            }),
-        ),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
-        ),
-    ])
-    .await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Off;
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let mut seen: Vec<EngineEvent> = Vec::new();
-    h.engine
-        .run(
-            &session,
-            &s,
-            &mut |event| seen.push(event),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        !seen.iter().any(|event| matches!(
-            event,
-            EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"
-        )),
-        "independent_review=off must not launch a reviewer, even on auth.rs"
-    );
-    assert!(seen.iter().any(|event| matches!(
-        event,
-        EngineEvent::ReviewStage { action, .. } if action == "not_required"
-    )));
-}
-
-#[tokio::test]
-async fn independent_review_always_launches_on_an_ordinary_change() {
+async fn independent_review_required_launches_on_an_ordinary_change() {
     let mut responses = patch_then_resolve();
     responses.push(text("ordinary change: no blocking defect"));
     responses.push(text("ordinary change: no blocking defect"));
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Always;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -1786,7 +1531,7 @@ async fn independent_review_always_launches_on_an_ordinary_change() {
     assert_eq!(
         reviewers.len(),
         1,
-        "always must launch a reviewer after any product mutation"
+        "required must launch a reviewer after any product mutation"
     );
 }
 
@@ -1820,7 +1565,8 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
     responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
     responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
 
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
@@ -1992,7 +1738,7 @@ async fn pure_observation_windows_still_terminate() {
         report.stop_reason
     );
     assert!(
-        !report.outcome.is_success(),
+        !report.outcome.is_completed(),
         "a goal that stopped making progress must not read as success"
     );
 }
@@ -2025,7 +1771,7 @@ async fn review_stage_rows(
 /// fact is written — a failed high-risk change needs eyes more, not less.
 #[tokio::test]
 async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
-    let h = harness(vec![
+    let mut h = harness(vec![
         // Window 1 (the only one this spec allows): touch a security path,
         // then keep "working" until the 2-round ceiling.
         patch_add("c1", "src/auth.rs", "pub fn login() {}"),
@@ -2036,6 +1782,7 @@ async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
         text("unused"),
     ])
     .await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let mut s = spec_windowed(&h, "harden the login path", 2);
     // Pin the round budget so the ceiling is the GOAL terminal (no next window)
     // — exactly R011's ending, minus the wait.
@@ -2054,7 +1801,7 @@ async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
         .unwrap();
 
     assert!(
-        !report.outcome.is_success(),
+        !report.outcome.is_completed(),
         "the goal still fails — review must not launder a ceiling stop: {:?}",
         report.outcome
     );
@@ -2083,11 +1830,6 @@ impl ModelRuntime for FailingProfileRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        // Completion Reconciliation Gate calls are answered out of band so
-        // scripted FIFOs and request-count assertions stay about the loop.
-        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
-            return Ok(reply);
-        }
         self.inner.generate(request, cancellation).await
     }
     async fn stream(
@@ -2166,9 +1908,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Required,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -2198,7 +1938,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
 
     assert_eq!(
         report.outcome,
-        TaskOutcome::CompletedUnverified,
+        TaskOutcome::Completed,
         "an unlaunchable required review still refuses Verified"
     );
     let stages = review_stage_rows(&db, &session).await;
@@ -2283,7 +2023,8 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
             serde_json::json!({"path": "src/auth.rs"}),
         ));
     }
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2342,7 +2083,7 @@ async fn persisted_ledger(
 /// survives durably: adopted into the persisted ledger at Acknowledged, with
 /// the refusal staged as a review_stage row — never a silent downgrade.
 #[tokio::test]
-async fn a_blocking_reviewer_finding_refuses_verified_closure() {
+async fn a_blocking_reviewer_finding_is_recorded_at_closure() {
     let responses = vec![
         tool_call(
             "c1",
@@ -2371,7 +2112,8 @@ async fn a_blocking_reviewer_finding_refuses_verified_closure() {
         text("reviewed src/auth.rs: one blocking defect reported"),
     ];
 
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -2382,8 +2124,8 @@ async fn a_blocking_reviewer_finding_refuses_verified_closure() {
 
     assert_eq!(
         report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "an open blocking finding must refuse Verified"
+        TaskOutcome::Completed,
+        "the model's declared end stands; the finding is recorded beside it"
     );
 
     let stages = review_stage_rows(&h.db, &session).await;
@@ -2436,7 +2178,8 @@ async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
         text("reviewed src/auth.rs: nothing blocking"),
     ];
 
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -2445,11 +2188,7 @@ async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
         .await
         .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a non-blocking finding must not downgrade a reviewed task"
-    );
+    assert_eq!(report.outcome, TaskOutcome::Completed);
     let ledger = persisted_ledger(&h.db, &session)
         .await
         .expect("the finding must still be adopted durably");
@@ -2489,7 +2228,8 @@ async fn persisted_findings_reload_without_duplication() {
         text("reviewed: one blocking defect"),
         text("reviewed: one blocking defect"),
     ];
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
@@ -2552,7 +2292,8 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
         text("reviewed src/auth.rs: one blocking defect reported"),
     ];
 
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2613,7 +2354,8 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
 
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2691,10 +2433,21 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
         .await
         .unwrap();
 
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a red gate cannot verify"
+    // Case 3: the model declared completion, the project's checks failed.
+    // Both facts are reported; no repair turn is opened on the model's behalf.
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::Failed
+    );
+    assert_eq!(
+        TurnRepository::new(&h.db)
+            .list(&session)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a failed check must not open an automatic repair turn"
     );
     let ledger = persisted_ledger(&h.db, &session)
         .await
@@ -2703,34 +2456,6 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
         ledger.verifications.iter().any(|v| v.exit_code != 0),
         "the failure must be on the record, not merely absent: {:?}",
         ledger.verifications
-    );
-}
-
-/// F7-C TEST C. Recording the verification must not become a second way to
-/// finish. A run whose gate is green but whose goal produced no mutation is
-/// still not Verified: the gate says the tree is healthy, which is not the
-/// same claim as the work being done, and only the contract decides that.
-#[tokio::test]
-async fn a_green_gate_over_no_work_is_not_a_completion_decision() {
-    let h = harness(vec![tool_call(
-        "g1",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "auth uses JWT sessions"}),
-    )])
-    .await;
-    let mut s = spec(&h, gate("ok", "true"));
-    s.runtime.goal = "explain how auth works".to_string();
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a green gate is evidence about the tree, not a completion decision"
     );
 }
 
@@ -2765,405 +2490,6 @@ async fn recording_the_same_verification_twice_does_not_duplicate_it() {
         ids.len(),
         before,
         "one observation per check per attempt: {engine_records:?}"
-    );
-}
-
-/// F7-C TEST D / TEST J — the GAP 1 gate, on the real Direct completion path.
-///
-/// A behavioural obligation, a run that edits, and no gates for the runtime to
-/// run: nothing anywhere observes the changed tree. The claim is judged at the
-/// commit point, where the runtime has finished producing evidence and has
-/// none, and it must not verify.
-#[tokio::test]
-async fn a_behavioural_obligation_with_nothing_observed_does_not_verify() {
-    let h = harness(patch_resolve_and_proven_ac()).await;
-    // No verification plan: the runtime will not produce an observation, and
-    // the fixture's run does not run one either.
-    let s = spec(&h, VerificationPlan::default());
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a behavioural claim nothing observed cannot verify"
-    );
-}
-
-/// F7 FINAL FLOOR — TRUE POSITIVE on the real Direct path.
-///
-/// The floor refuses obligations with no proof standard; it must not refuse
-/// obligations that have one, or it would buy truth by making completion
-/// unreachable. The task names a command that has to pass, derivation carries
-/// it as `CommandSuccess`, the agent runs exactly that command green over the
-/// changed tree, and the run verifies.
-///
-/// This is what grounded means end to end: not that a check was seen, but that
-/// the check the obligation names was seen.
-///
-/// It replaces `the_runtime_s_own_verification_lets_a_behavioural_claim_close`,
-/// whose premise the floor removes — that test asserted a behavioural claim
-/// closing on a `true` gate, which is the GAP 2 shape with a friendlier name.
-#[tokio::test]
-async fn a_named_command_that_ran_green_still_verifies() {
-    let script = vec![
-        tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        // The agent runs the command the task named, so the obligation is
-        // already answered at the request point — the ordinary shape for a
-        // CommandSuccess obligation.
-        tool_call(
-            "v1",
-            "run_command",
-            serde_json::json!({"program": "python3", "args": ["-c", "pass"]}),
-        ),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "added the function"}),
-        ),
-        understand_met_required_ac(),
-    ];
-    let mut h = harness(script.clone()).await;
-    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
-        script,
-        r#"{"requirements":[{"text":"the checks must pass","kind":"verification",
-            "proof":"command_success","commands":["python3 -c pass"]}]}"#,
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"the check ran green","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
-    ));
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    assert!(
-        ledger.runtime_evidence_complete,
-        "the contract was asked at the commit point"
-    );
-    assert_eq!(
-        ledger.completion_debt(),
-        None,
-        "the named command ran green over the current tree; nothing is owed"
-    );
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "an obligation whose named command ran green is grounded"
-    );
-}
-
-/// A runtime that answers the contract derivation and the reconciliation judge
-/// from a fixed script, so a test can state the obligations the run is judged
-/// against instead of taking the autopilot's single generic one. Every other
-/// call falls through to the ordinary FIFO.
-struct ScriptedContractRuntime {
-    inner: MockRuntime,
-    derived: String,
-    reconciled: String,
-}
-
-impl ScriptedContractRuntime {
-    fn new(script: Vec<ModelResponse>, derived: &str, reconciled: &str) -> Self {
-        Self {
-            inner: MockRuntime::new(script),
-            derived: derived.to_string(),
-            reconciled: reconciled.to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl ModelRuntime for ScriptedContractRuntime {
-    async fn generate(
-        &self,
-        request: ModelRequest,
-        cancellation: CancellationToken,
-    ) -> Result<ModelResponse, ModelError> {
-        let says = |marker: &str| {
-            request
-                .messages
-                .iter()
-                .any(|m| m.text_content().contains(marker))
-        };
-        if says(leveler_test_support::DERIVE_MARKER) {
-            return Ok(text_response("derive-scripted", &self.derived));
-        }
-        if says(leveler_test_support::RECONCILE_MARKER) {
-            return Ok(text_response("reconcile-scripted", &self.reconciled));
-        }
-        self.inner.generate(request, cancellation).await
-    }
-
-    async fn stream(
-        &self,
-        request: ModelRequest,
-        cancellation: CancellationToken,
-    ) -> Result<ModelEventStream, ModelError> {
-        let response = self.generate(request, cancellation).await?;
-        Ok(leveler_model::stream_from_response(response))
-    }
-
-    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        self.inner.profile(model).await
-    }
-}
-
-fn text_response(id: &str, body: &str) -> ModelResponse {
-    ModelResponse {
-        request_id: RequestId::new(id),
-        message: Message::text(Role::Assistant, body),
-        finish_reason: FinishReason::Stop,
-        usage: TokenUsage::default(),
-    }
-}
-
-fn patch_call(id: &str, file: &str, line: &str) -> ModelResponse {
-    tool_call(
-        id,
-        "apply_patch",
-        serde_json::json!({
-            "patch": format!(
-                "*** Begin Patch\n*** Add File: {file}\n+{line}\n*** End Patch"
-            )
-        }),
-    )
-}
-
-/// A gating check that passes only once `path` exists — so the first run over a
-/// tree without it fails and the run after the repair turn creates it passes.
-fn gate_requires(name: &str, path: &str) -> VerificationPlan {
-    let (program, args) = if cfg!(windows) {
-        (
-            "cmd".to_string(),
-            vec![
-                "/c".into(),
-                format!(
-                    "if exist {} (exit 0) else (exit 1)",
-                    path.replace('/', "\\")
-                ),
-            ],
-        )
-    } else {
-        (
-            "sh".to_string(),
-            vec!["-c".into(), format!("test -e {path}")],
-        )
-    };
-    VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: name.into(),
-            program,
-            args,
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-            scope_policy: Default::default(),
-        }],
-    }
-}
-
-/// Every `ReviewStage` action staged for one session, in order.
-async fn review_stage_actions(db: &Database, session: &leveler_core::SessionId) -> Vec<String> {
-    let store = leveler_storage::EngineStores::from_database(db);
-    let mut out = Vec::new();
-    for row in store.events.load(session).await.unwrap() {
-        if row.event_type == "review_stage"
-            && let Ok(leveler_engine::EngineEvent::ReviewStage { action, .. }) =
-                leveler_engine::EngineEvent::from_payload(&row.payload)
-        {
-            out.push(action);
-        }
-    }
-    out
-}
-
-/// F7-C TERMINAL TRUTH — the Completion Contract decides AFTER the runtime has
-/// finished acting, over a completion claim that was legitimately accepted.
-///
-/// `conclude_direct` -> `last_persisted_ledger` -> `completion_debt()` -> demote
-/// is the contract's single production enforcement point, and it had no
-/// end-to-end test. `a_behavioural_obligation_with_nothing_observed_does_not_verify`
-/// does not reach it: with no gates `conclude_direct` returns at its K19 exit
-/// before the contract is ever consulted.
-///
-/// The shape that does reach it is the one the boundary exists for — the ledger
-/// grows between the two questions. The user's task confines the work to
-/// `src/lib.rs`. The agent obeys, claims completion, and the request-point gate
-/// rightly accepts: at that moment nothing is outside the scope. The engine's
-/// gate then fails, its own repair turn writes `src/other.rs`, and the re-run
-/// goes green. Verification says Verified. The contract, asked at the boundary
-/// on a ledger that now holds a mutation outside the declared scope, says no.
-#[tokio::test]
-async fn a_repair_turn_that_breaks_the_declared_scope_cannot_verify() {
-    let script = vec![
-        patch_call("c1", "src/feature.rs", "pub fn feature() {}"),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "wrote the feature"}),
-        ),
-        // The engine's repair turn, after its gate fails: it creates the file
-        // the gate demands — outside the scope the user declared.
-        patch_call("c2", "src/other.rs", "pub fn other() {}"),
-        // Ends the repair turn. Only its rounds, text and modified files are
-        // merged back — the original turn's `Completed` stop reason is what
-        // carries into the conclusion.
-        tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "created the missing file"}),
-        ),
-        understand_met_required_ac(),
-    ];
-    let mut h = harness(script.clone()).await;
-    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
-        script,
-        r#"{"requirements":[{"text":"add the feature, changing only src/feature.rs",
-            "kind":"constraint","proof":"mutation_scope","allowed_paths":["src/feature.rs"]}]}"#,
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"only src/feature.rs was touched","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
-    ));
-    let s = spec(&h, gate_requires("needs-other", "src/other.rs"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    // The repair turn really did write outside the scope, and the gate really
-    // did go green over that tree — so verification alone reads as Verified.
-    assert!(
-        ledger
-            .mutations
-            .iter()
-            .any(|m| m.paths.iter().any(|p| p.contains("other.rs"))),
-        "the repair turn's write must be on the ledger: {:?}",
-        ledger.mutations
-    );
-    assert!(
-        ledger
-            .verifications
-            .iter()
-            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
-        "the re-run gate must be recorded green: {:?}",
-        ledger.verifications
-    );
-    // The obligation was accounted for as satisfied, and the record disagrees.
-    assert!(
-        ledger.completion_debt().is_some(),
-        "a mutation outside the declared scope is still owed"
-    );
-    // Verification itself said Verified — so the contract is what changed the
-    // answer, not a gate that had already failed.
-    assert_eq!(
-        report.verification.as_ref().map(|v| v.verdict()),
-        Some(leveler_verifier::Verdict::Verified),
-        "the verification report must be green for this to be the contract's call"
-    );
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "a green gate does not discharge a constraint the record refutes"
-    );
-    // And the refusal came from THIS wire, not from another guard that happens
-    // to demote the same run.
-    assert!(
-        review_stage_actions(&h.db, &session)
-            .await
-            .iter()
-            .any(|a| a == "completion_contract_open"),
-        "the contract's refusal must be staged durably"
-    );
-}
-
-/// F7 FINAL FLOOR — GAP 2 CLOSED, on the real completion path.
-///
-/// This test used to assert the defect. It now asserts the fix, and the
-/// scenario is unchanged: that is the point.
-///
-/// The obligation names a specific behaviour. The runtime's own gate is a real
-/// command: runtime-issued, correctly kinded, exit 0, run after the work landed
-/// — every discrimination F7-A and F7-B added, satisfied. It checks that a file
-/// exists. It exercises nothing the obligation is about.
-///
-/// The runtime still cannot tell that command apart from one that would prove
-/// the behaviour; its evidence vocabulary holds a fingerprint, an exit code and
-/// a mutation watermark, never what a command was asking of the code. It no
-/// longer has to. It asks the question it CAN answer — is there a proof
-/// standard here that the record settles — finds none, and declines to call
-/// the task Verified on a reading alone.
-///
-/// The refusal says the runtime cannot confirm the behaviour. It does not say
-/// the behaviour is absent, and the work is still delivered.
-#[tokio::test]
-async fn gap2_an_observation_of_something_else_no_longer_discharges_a_behavioural_claim() {
-    let script = patch_resolve_and_proven_ac();
-    let mut h = harness(script.clone()).await;
-    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
-        script,
-        r#"{"requirements":[{"text":"the summary must omit rows whose amount is zero","kind":"behavior"}]}"#,
-        // Satisfied, anchored to nothing — the normal shape: 26 of the 32
-        // behavioural obligations in the preserved cohort cite no id at all.
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"zero rows are omitted now","evidence_strength":"observed"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
-    ));
-    // A real, green, post-work observation of something entirely unrelated to
-    // the obligation: it checks that a file exists.
-    let s = spec(&h, gate_requires("unrelated", "src/lib.rs"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    assert!(
-        ledger.runtime_evidence_complete,
-        "the contract was asked at the commit point"
-    );
-    // The unrelated observation really is on the ledger, green and post-work,
-    // so nothing weaker than the floor is doing the refusing.
-    assert!(
-        ledger
-            .verifications
-            .iter()
-            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
-        "the unrelated gate must be recorded green: {:?}",
-        ledger.verifications
-    );
-    // Fail-closed, and BOUNDED: the run ends, it does not spin looking for
-    // proof that cannot exist. The request point does not judge this
-    // obligation, which is exactly what keeps the floor terminating.
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "the work is delivered; only the claim of proof is refused"
-    );
-    assert_eq!(report.stop_reason, StopReason::Completed);
-    let debt = ledger.completion_debt().expect("the obligation is owed");
-    assert!(
-        debt.contains("no proof standard"),
-        "the refusal must say what is missing, not that the behaviour is wrong: {debt}"
     );
 }
 
@@ -3234,7 +2560,8 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     ];
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -3295,62 +2622,6 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     assert!(
         after >= before + reviewer_rows as u32,
         "the reviewer's {reviewer_rows} round(s) must be in the session's cumulative rounds: before={before} after={after}"
-    );
-}
-
-/// THE safety half of the authority-yield change. A behavioural obligation the
-/// contract gave no proof standard is not a reason to send the agent back to
-/// work — but it is still debt, and debt still withholds the verified claim.
-///
-/// post-closure C2 is the run this pins: judge satisfied, tree green, the only
-/// open obligation one the runtime admits it has no standard for. The claim is
-/// now accepted; the task must still end CompletedUnverified.
-#[tokio::test]
-async fn a_behaviour_with_no_proof_standard_is_accepted_but_never_verified() {
-    let script = vec![
-        patch_call("c1", "src/feature.rs", "pub fn feature() {}"),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "the nested field now submits a defined value"}),
-        ),
-        understand_met_required_ac(),
-    ];
-    let mut h = harness(script.clone()).await;
-    h.engine.factory.runtime = Arc::new(ScriptedContractRuntime::new(
-        script,
-        // A bug report: how the thing must behave. No command named, no
-        // coverage asked for — so the derivation gives it no proof standard.
-        r#"{"requirements":[{"text":"a nested field under a null parent submits a defined value","kind":"behavior"}]}"#,
-        // The judge reads it as satisfied and cites the check that ran.
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"the suite is green"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"the suite is green over the change","evidence_strength":"mechanical"}],"omitted_requirements":[],"reason":"satisfied as stated"}"#,
-    ));
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    assert!(
-        ledger.runtime_evidence_complete,
-        "the contract was asked at the commit point"
-    );
-    let debt = ledger
-        .completion_debt()
-        .expect("an obligation with no proof standard is still owed");
-    assert!(
-        debt.contains("no proof standard"),
-        "the debt must name why it can never be discharged: {debt}"
-    );
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "a behaviour read as satisfied with no standard behind it is not Verified"
     );
 }
 
@@ -3510,9 +2781,7 @@ fn restarted_engine(h: &Harness, responses: Vec<ModelResponse>) -> TaskEngine {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
-            completion_judge_model: None,
-            completion_judge_timeout: None,
+            independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

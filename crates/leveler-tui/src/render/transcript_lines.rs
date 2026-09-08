@@ -448,6 +448,10 @@ fn turn_end_lines(
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
         ),
+        // Done, and the project's checks failed: both facts, one marker.
+        TurnEndStatus::ChecksFailed => {
+            (format!("⚠ {}", t.turn_checks_failed), theme.status.warning)
+        }
         TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.status.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
         TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.text.secondary),
@@ -455,7 +459,10 @@ fn turn_end_lines(
     let mut stats = String::new();
     if matches!(
         block.status,
-        TurnEndStatus::Completed | TurnEndStatus::Answered | TurnEndStatus::Unverified
+        TurnEndStatus::Completed
+            | TurnEndStatus::Answered
+            | TurnEndStatus::Unverified
+            | TurnEndStatus::ChecksFailed
     ) {
         if block.tool_calls > 0 {
             stats.push_str(
@@ -1529,6 +1536,7 @@ mod tests {
             checks_passed: 4,
             checks_total: 5,
             success: true,
+            verification: leveler_client_protocol::UiVerificationStatus::Passed,
         };
         let item = TranscriptItem::Completion(report);
         let zh = item_render(&item, &theme, 120, false, Locale::Zh.text())

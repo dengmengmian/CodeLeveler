@@ -1,7 +1,5 @@
 //! Cross-round progress ledger for the agent tool loop.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 /// Coarse phase of the in-turn controller (UI / remote waiting surface).
@@ -17,34 +15,24 @@ pub enum TurnPhase {
     Terminal,
 }
 
-/// Policy caps for no-progress and post-closeout thrash.
+/// Resource caps for the mechanical no-progress watchdog: rounds in which
+/// every attempted call was refused before it ran, or a goal-mode model went
+/// quiet without resolving the goal. No cap here reads the model's work for
+/// meaning; the absolute round ceiling and budgets remain the hard boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressCaps {
+    /// Consecutive no-progress rounds (all calls refused, or a quiet goal
+    /// drive) before the turn stops.
     pub no_progress_rounds: u32,
-    pub closeout_deny_rounds: u32,
+    /// The engine re-drives a stalled goal only while the streak is under this.
     pub continue_streak_cap: u32,
-    /// Consecutive rounds with no *real* progress (no passing verification and no
-    /// novel read/search) before the turn is force-stopped. Broader than
-    /// `no_progress_rounds` (which only catches pure-observe thrash): this also
-    /// catches the common "edit → run a check that keeps failing" spin. Set
-    /// higher so legitimate fail→fix→pass iteration is not cut short.
-    pub stagnation_rounds: u32,
-    /// Consecutive rounds where EVERY attempted call was refused by a harness
-    /// POLICY gate (plan gate / budgets / allowlist). These are the harness
-    /// blocking itself, not agent stagnation (R006 R6-P1): at this cap a
-    /// corrective directive is injected; at 2× the cap the turn stops with an
-    /// honest policy-blocked reason instead of a fake "no progress".
-    pub policy_blocked_rounds: u32,
 }
 
 impl Default for ProgressCaps {
     fn default() -> Self {
         Self {
             no_progress_rounds: 2,
-            closeout_deny_rounds: 2,
             continue_streak_cap: 2,
-            stagnation_rounds: 4,
-            policy_blocked_rounds: 3,
         }
     }
 }
@@ -55,16 +43,6 @@ pub struct ProgressLedger {
     pub round: u32,
     pub last_progress_round: u32,
     pub no_progress_streak: u32,
-    /// Consecutive tool-using rounds with no *real* progress — no passing
-    /// verification and no novel read/search. Edits alone do NOT reset it (an
-    /// edit is not progress until a check passes), so a "keep editing while the
-    /// check keeps failing" loop accumulates here and is force-stopped.
-    #[serde(default)]
-    pub stagnation_streak: u32,
-    /// Consecutive all-policy-refused rounds (see `ProgressCaps::policy_blocked_rounds`).
-    #[serde(default)]
-    pub policy_blocked_streak: u32,
-    pub closeout_deny_rounds: u32,
     pub closing: bool,
     pub phase: TurnPhase,
     pub objective_version: u32,
@@ -106,8 +84,6 @@ pub struct ProgressLedger {
     /// Keeps continue/resume from double-counting re-edits of the same file.
     #[serde(default)]
     pub cumulative_modified_paths: Vec<String>,
-    #[serde(default)]
-    pub observe_hits: BTreeMap<String, (String, u32)>,
     /// MA-WA1: the one-shot keep-vs-delegate decision point was already offered
     /// this goal epoch. Persisted so continue/resume windows never re-ask
     /// (no nag loop across windows).
@@ -296,75 +272,12 @@ impl ProgressLedger {
         self.no_progress_streak = self.no_progress_streak.saturating_add(1);
     }
 
-    /// A round where every attempted call was refused by harness policy.
-    pub fn note_policy_blocked_round(&mut self, round: u32) {
-        self.round = round;
-        self.policy_blocked_streak = self.policy_blocked_streak.saturating_add(1);
-    }
-
-    /// Any non-policy-blocked round clears the policy streak.
-    pub fn clear_policy_blocked(&mut self) {
-        self.policy_blocked_streak = 0;
-    }
-
-    /// At the cap: inject a corrective directive (do not stop yet).
-    pub fn should_escalate_policy_blocked(&self, caps: ProgressCaps) -> bool {
-        self.policy_blocked_streak == caps.policy_blocked_rounds
-    }
-
-    /// At 2x the cap the model has ignored both the per-call refusals AND the
-    /// injected directive: stop honestly as policy-blocked.
-    pub fn should_hard_stop_policy_blocked(&self, caps: ProgressCaps) -> bool {
-        self.policy_blocked_streak >= caps.policy_blocked_rounds.saturating_mul(2)
-    }
-
-    pub fn note_closeout_deny_round(&mut self) {
-        self.closeout_deny_rounds = self.closeout_deny_rounds.saturating_add(1);
-        self.phase = TurnPhase::Closing;
-    }
-
-    pub fn fingerprint_content(content: &str) -> String {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in content.as_bytes() {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        format!("{:016x}:{}", hash, content.len())
-    }
-
-    pub fn should_refuse_observe_in_closing(&self) -> bool {
-        self.closing
-    }
-
-    pub fn should_hard_stop_closeout(&self, caps: ProgressCaps) -> bool {
-        self.closing && self.closeout_deny_rounds >= caps.closeout_deny_rounds
-    }
-
     pub fn should_hard_stop_no_progress(&self, caps: ProgressCaps) -> bool {
         self.no_progress_streak >= caps.no_progress_rounds
     }
 
-    /// Record a tool-using round for the unified stagnation guard. `made_progress`
-    /// must be true ONLY for real forward motion: a verification-class command
-    /// that passed, or a novel successful read/search. Edits and failing checks
-    /// are NOT progress, so a loop that keeps editing while its check keeps
-    /// failing accumulates here and is eventually force-stopped.
-    pub fn note_round_outcome(&mut self, made_progress: bool) {
-        if made_progress {
-            self.stagnation_streak = 0;
-        } else {
-            self.stagnation_streak = self.stagnation_streak.saturating_add(1);
-        }
-    }
-
-    pub fn should_hard_stop_stagnation(&self, caps: ProgressCaps) -> bool {
-        self.stagnation_streak >= caps.stagnation_rounds
-    }
-
     pub fn allows_engine_continue(&self, caps: ProgressCaps) -> bool {
-        self.no_progress_streak < caps.continue_streak_cap
-            && self.closeout_deny_rounds < caps.closeout_deny_rounds
-            && !self.human_boundary_seen()
+        self.no_progress_streak < caps.continue_streak_cap && !self.human_boundary_seen()
     }
 
     /// Record a human explicit denial. Capabilities accumulate for the epoch.
@@ -394,24 +307,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_stable_and_sensitive() {
-        let a = ProgressLedger::fingerprint_content("git status\nok");
-        let b = ProgressLedger::fingerprint_content("git status\nok");
-        let c = ProgressLedger::fingerprint_content("git status\nok\n");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn closeout_and_streak_caps() {
+    fn no_progress_streak_caps() {
         let caps = ProgressCaps::default();
-        let mut led = ProgressLedger::default();
-        led.enter_closing();
-        led.note_closeout_deny_round();
-        assert!(!led.should_hard_stop_closeout(caps));
-        led.note_closeout_deny_round();
-        assert!(led.should_hard_stop_closeout(caps));
-
         let mut led2 = ProgressLedger::default();
         led2.note_no_progress_round(1);
         led2.note_no_progress_round(2);
@@ -454,36 +351,25 @@ mod tests {
     #[test]
     fn missing_denial_fields_default_on_old_snapshots() {
         let led: ProgressLedger = serde_json::from_str(
-            r#"{"round":0,"last_progress_round":0,"no_progress_streak":0,"closeout_deny_rounds":0,"closing":false,"phase":"active","objective_version":0}"#,
+            r#"{"round":0,"last_progress_round":0,"no_progress_streak":0,"closeout_deny_rounds":0,"stagnation_streak":3,"closing":false,"phase":"active","objective_version":0}"#,
         )
         .unwrap();
         assert!(!led.denied_network);
         assert!(!led.denied_unrestricted_fs);
     }
 
+    /// Snapshots written by older runtimes carry the streak counters of the
+    /// deleted thrash/stagnation/policy watchdogs. They are ignored on read
+    /// and never feed a decision again.
     #[test]
-    fn stagnation_streak_stops_repeated_no_progress_but_a_pass_resets_it() {
-        let caps = ProgressCaps::default(); // stagnation_rounds = 4
-        let mut led = ProgressLedger::default();
-
-        // Three no-progress rounds (edit + failing check): accumulates, no stop.
-        for _ in 0..3 {
-            led.note_round_outcome(false);
-        }
-        assert_eq!(led.stagnation_streak, 3);
-        assert!(!led.should_hard_stop_stagnation(caps));
-
-        // A round with real progress (check passed / novel read) resets it, so
-        // legitimate fail→fail→fail→pass iteration is never cut short.
-        led.note_round_outcome(true);
-        assert_eq!(led.stagnation_streak, 0);
-        assert!(!led.should_hard_stop_stagnation(caps));
-
-        // Four consecutive no-progress rounds → force-stop.
-        for _ in 0..4 {
-            led.note_round_outcome(false);
-        }
-        assert!(led.should_hard_stop_stagnation(caps));
+    fn legacy_watchdog_counters_are_ignored_on_old_snapshots() {
+        let led: ProgressLedger = serde_json::from_str(
+            r#"{"round":9,"last_progress_round":1,"no_progress_streak":0,"closeout_deny_rounds":5,"stagnation_streak":9,"policy_blocked_streak":9,"observe_hits":{"k":["v",3]},"closing":true,"phase":"closing","objective_version":0}"#,
+        )
+        .unwrap();
+        assert_eq!(led.round, 9);
+        assert!(led.closing);
+        assert!(led.allows_engine_continue(ProgressCaps::default()) || led.closing);
     }
 
     #[test]

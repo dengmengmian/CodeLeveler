@@ -116,6 +116,59 @@ impl ProcessRequest {
     }
 }
 
+impl ProcessRequest {
+    /// Set the legacy confinement triple (`write_root`, `read_only_workspace`,
+    /// `filesystem_intent`) from one [`WriteScope`]. Every call site used to
+    /// assemble the three by hand; this is the only place that knows how they
+    /// relate. `extra_read_roots` must already be set — the Windows intent
+    /// carries it.
+    ///
+    /// `cwd` is the workspace anchor for `None`: the OS wrappers need a root
+    /// to mount read-only even when nothing under it may be written.
+    pub fn apply_write_scope(&mut self, scope: &crate::WriteScope) {
+        use crate::WriteScope;
+        use crate::windows_sandbox::FilesystemIntent;
+        match scope {
+            WriteScope::Unrestricted => {
+                self.write_root = None;
+                self.read_only_workspace = false;
+                self.filesystem_intent = Some(FilesystemIntent::Unrestricted);
+            }
+            WriteScope::Workspace { root } => {
+                self.write_root = Some(root.clone());
+                self.read_only_workspace = false;
+                self.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
+                    write_root: root.clone(),
+                    extra_read_roots: self.extra_read_roots.clone(),
+                });
+            }
+            WriteScope::None => {
+                let root = self.cwd.clone();
+                self.write_root = Some(root.clone());
+                self.read_only_workspace = true;
+                let mut read_roots = vec![root];
+                read_roots.extend(self.extra_read_roots.iter().cloned());
+                self.filesystem_intent = Some(FilesystemIntent::ReadOnly { read_roots });
+            }
+        }
+    }
+
+    /// The scope the OS wrappers will actually enforce for this request.
+    ///
+    /// Derived from `write_root` first because that is what every wrapper
+    /// anchors on: `read_only_workspace` without a `write_root` is ignored by
+    /// all of them, so it reads back as `Unrestricted` here — the truth, not
+    /// the flag. (Legacy gap; PR 3 closes it.)
+    pub fn write_scope(&self) -> crate::WriteScope {
+        use crate::WriteScope;
+        match &self.write_root {
+            None => WriteScope::Unrestricted,
+            Some(_) if self.read_only_workspace => WriteScope::None,
+            Some(root) => WriteScope::Workspace { root: root.clone() },
+        }
+    }
+}
+
 /// Whether a confined command should expose the host's existing dependency
 /// caches through a read-only overlay. Network-denied requests always do; the
 /// token check also covers explicit `cargo --offline`/`npm --offline`, including
@@ -4268,5 +4321,96 @@ mod streaming_tests {
             begun.elapsed() < Duration::from_secs(4),
             "cancel returned within the kill bound"
         );
+    }
+}
+
+#[cfg(test)]
+mod write_scope_adapter_tests {
+    use super::*;
+    use crate::WriteScope;
+    use crate::windows_sandbox::FilesystemIntent;
+
+    fn req() -> ProcessRequest {
+        ProcessRequest::new("echo", vec![], PathBuf::from("/ws"))
+    }
+
+    /// PR 1. One setter replaces the hand-assembled triple every call site
+    /// used to write out: `write_root` + `read_only_workspace` +
+    /// `filesystem_intent`. It must produce exactly what those sites produce
+    /// today, so the OS wrappers see no difference.
+    #[test]
+    fn applying_workspace_scope_sets_the_legacy_triple() {
+        let mut r = req();
+        r.extra_read_roots = vec![PathBuf::from("/other")];
+        r.apply_write_scope(&WriteScope::Workspace {
+            root: PathBuf::from("/ws"),
+        });
+        assert_eq!(r.write_root.as_deref(), Some(Path::new("/ws")));
+        assert!(!r.read_only_workspace);
+        assert_eq!(
+            r.filesystem_intent,
+            Some(FilesystemIntent::WorkspaceWrite {
+                write_root: PathBuf::from("/ws"),
+                extra_read_roots: vec![PathBuf::from("/other")],
+            })
+        );
+    }
+
+    /// `None` is the pre-claim child: workspace mounted read-only, and the
+    /// Windows gate sees a ReadOnly intent whose roots are workspace + extras
+    /// (the exact list `run_command` builds by hand today).
+    #[test]
+    fn applying_none_scope_makes_the_workspace_read_only() {
+        let mut r = req();
+        r.extra_read_roots = vec![PathBuf::from("/other")];
+        r.apply_write_scope(&WriteScope::None);
+        // Legacy shape: the OS wrapper still needs the workspace as its
+        // anchor even though nothing under it may be written.
+        assert_eq!(r.write_root.as_deref(), Some(Path::new("/ws")));
+        assert!(r.read_only_workspace);
+        assert_eq!(
+            r.filesystem_intent,
+            Some(FilesystemIntent::ReadOnly {
+                read_roots: vec![PathBuf::from("/ws"), PathBuf::from("/other")],
+            })
+        );
+    }
+
+    #[test]
+    fn applying_unrestricted_scope_clears_confinement() {
+        let mut r = req();
+        r.apply_write_scope(&WriteScope::Unrestricted);
+        assert_eq!(r.write_root, None);
+        assert!(!r.read_only_workspace);
+        assert_eq!(r.filesystem_intent, Some(FilesystemIntent::Unrestricted));
+    }
+
+    /// Reading the scope back from a request round-trips through the setter.
+    #[test]
+    fn write_scope_round_trips() {
+        for scope in [
+            WriteScope::Unrestricted,
+            WriteScope::Workspace {
+                root: PathBuf::from("/ws"),
+            },
+            WriteScope::None,
+        ] {
+            let mut r = req();
+            r.apply_write_scope(&scope);
+            assert_eq!(r.write_scope(), scope);
+        }
+    }
+
+    /// Legacy quirk, preserved on purpose in PR 1: `read_only_workspace`
+    /// without a `write_root` is IGNORED by every OS wrapper (they anchor on
+    /// `write_root`), so a zero-authority child under 完全访问 runs
+    /// unconfined today. The adapter reports what actually happens, not what
+    /// the flag says. Closing the gap is PR 3's job.
+    #[test]
+    fn read_only_flag_without_a_write_root_reads_back_as_unrestricted() {
+        let mut r = req();
+        r.write_root = None;
+        r.read_only_workspace = true;
+        assert_eq!(r.write_scope(), WriteScope::Unrestricted);
     }
 }

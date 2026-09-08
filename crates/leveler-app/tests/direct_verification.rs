@@ -126,7 +126,7 @@ fn gate_config(unix_body: &str, windows_body: &str) -> String {
 }
 
 #[tokio::test]
-async fn direct_run_fails_when_post_edit_verification_fails() {
+async fn direct_run_reports_checks_failed_when_post_edit_verification_fails() {
     let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
@@ -183,8 +183,13 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
         )
         .await;
 
-    let outcome = result.expect("verification failure is a completed run with an unmet gate");
-    assert_eq!(outcome.stop_reason, leveler_agent::StopReason::Incomplete);
+    // Case 3 at the app seam: the run completed and the project's checks
+    // failed. Both facts are reported; the run is not relabelled incomplete.
+    let outcome = result.expect("verification failure is a completed run with a failed check");
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::CompletedChecksFailed
+    );
     let detail = outcome.stop_detail.unwrap_or_default();
     assert!(
         detail.contains("test") && !detail.contains("VERIFY_SENTINEL"),
@@ -201,7 +206,7 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
 }
 
 #[tokio::test]
-async fn direct_content_run_fails_when_post_edit_verification_fails() {
+async fn direct_content_run_reports_checks_failed_when_post_edit_verification_fails() {
     let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
@@ -254,8 +259,13 @@ async fn direct_content_run_fails_when_post_edit_verification_fails() {
         )
         .await;
 
-    let outcome = result.expect("verification failure is a completed run with an unmet gate");
-    assert_eq!(outcome.stop_reason, leveler_agent::StopReason::Incomplete);
+    // Case 3 at the app seam: the run completed and the project's checks
+    // failed. Both facts are reported; the run is not relabelled incomplete.
+    let outcome = result.expect("verification failure is a completed run with a failed check");
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::CompletedChecksFailed
+    );
     let detail = outcome.stop_detail.unwrap_or_default();
     assert!(
         detail.contains("test") && !detail.contains("CONTENT_VERIFY_SENTINEL"),
@@ -463,8 +473,11 @@ async fn direct_content_run_emits_verification_events() {
     }));
 }
 
+/// Case 3: a failed post-edit check is reported, never repaired on the
+/// model's behalf. The script offers a repair patch that the engine must
+/// never request: the run ends after the model's own completion claim.
 #[tokio::test]
-async fn direct_run_repairs_once_after_failed_verification() {
+async fn direct_run_does_not_open_a_repair_turn_after_failed_verification() {
     let first_patch = "*** Begin Patch\n*** Update File: code.rs\n old\n+bad\n*** End Patch";
     let repair_patch =
         "*** Begin Patch\n*** Update File: code.rs\n old\n-bad\n+fixed\n*** End Patch";
@@ -480,6 +493,7 @@ async fn direct_run_repairs_once_after_failed_verification() {
             ),
             finish_frame("tool_calls"),
         ]),
+        // Would only be consumed by an automatic repair turn.
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": repair_patch })),
             finish_frame("tool_calls"),
@@ -489,8 +503,6 @@ async fn direct_run_repairs_once_after_failed_verification() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    // A root-level `.rs` file is build-relevant (keeps the gate active) and its
-    // bare name avoids path-separator quirks in the cross-platform gate command.
     std::fs::write(tmp.path().join("code.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
@@ -523,12 +535,22 @@ async fn direct_run_repairs_once_after_failed_verification() {
             CancellationToken::new(),
         )
         .await
-        .expect("repair should make verification pass");
+        .expect("a failed check is a reported fact, not an error");
 
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::CompletedChecksFailed
+    );
     assert_eq!(outcome.modified_files, vec!["code.rs"]);
     assert!(
         std::fs::read_to_string(tmp.path().join("code.rs"))
             .unwrap()
-            .contains("fixed")
+            .contains("bad"),
+        "no repair turn may edit on the model's behalf"
+    );
+    assert_eq!(
+        server.request_count(),
+        2,
+        "exactly the model's own two rounds — no hidden repair request"
     );
 }

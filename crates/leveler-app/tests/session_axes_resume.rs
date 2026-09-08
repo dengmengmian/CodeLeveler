@@ -154,12 +154,6 @@ async fn resume_session_rebuilds_engine_with_persisted_delivery_profile() {
         .await
         .unwrap();
     assert_eq!(engine.factory.work_profile, WorkProfile::Delivery);
-    // Same mapping factory.build uses for Goal/Delivery (no live model profile needed).
-    let gate = leveler_agent::GateConfig::for_work_profile(engine.factory.work_profile);
-    assert!(
-        gate.delivery_gate,
-        "resumed delivery session must keep delivery_gate on"
-    );
 }
 
 #[test]

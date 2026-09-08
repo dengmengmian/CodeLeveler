@@ -184,11 +184,10 @@ fn render_event_text(event: AgentEvent) {
         AgentEvent::ProgressUpdated { ledger } => {
             if ledger.closing || ledger.no_progress_streak > 0 {
                 println!(
-                    "  {} progress · closing={} streak={} closeout_denies={}",
+                    "  {} progress · closing={} streak={}",
                     console::style("📈").blue(),
                     ledger.closing,
                     ledger.no_progress_streak,
-                    ledger.closeout_deny_rounds
                 );
             }
         }
@@ -377,13 +376,11 @@ fn render_event_jsonl(event: AgentEvent) {
             "mutations": ledger.mutations.len(),
             "verifications": ledger.verifications.len(),
             "intercepts": ledger.intercepts.len(),
-            "step_receipts": ledger.step_receipts.len(),
         }),
         AgentEvent::ProgressUpdated { ledger } => serde_json::json!({
             "type": "progress_updated",
             "closing": ledger.closing,
             "no_progress_streak": ledger.no_progress_streak,
-            "closeout_deny_rounds": ledger.closeout_deny_rounds,
         }),
         AgentEvent::AdvisoryStarted { kind } => serde_json::json!({
             "type": "advisory_started", "kind": kind.as_key(),

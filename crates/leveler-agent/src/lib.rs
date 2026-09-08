@@ -2,11 +2,13 @@
 //!
 //! The crate provides an **executor**: given a goal and the tool registry, it
 //! drives a model↔tool loop (call model → run requested tools → feed results
-//! back → repeat). Top-level turns run until a semantic terminal state;
-//! delegated and measured units may carry an explicit round budget. The full
-//! role-based state machine (Requirement /
-//! Locator / Planner / Executor / Debugger / Reviewer) and verification gates
-//! are owned by the orchestration and verification layers.
+//! back → repeat). Top-level turns run until the model resolves the goal;
+//! delegated and measured units may carry an explicit round budget.
+//!
+//! Authority boundary: the loop owns mechanical truth — which tools ran,
+//! which files changed, which commands exited how, what the budgets allow.
+//! It never judges whether the model's work satisfies the user's request;
+//! that reading belongs to the model, and acceptance belongs to the user.
 #![forbid(unsafe_code)]
 
 pub mod admission;
@@ -14,7 +16,6 @@ mod authorization;
 mod budget;
 mod child_profile;
 mod compaction;
-mod completion_contract;
 pub mod context_budget;
 mod executor;
 mod injected_tools;
@@ -22,8 +23,6 @@ pub mod named_agent;
 mod nudges;
 pub mod ownership;
 mod prompt;
-mod reconciliation;
-pub use reconciliation::DEFAULT_RECONCILE_TIMEOUT;
 mod sub_agent;
 pub mod usage;
 
@@ -47,9 +46,9 @@ pub use executor::{
     SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };
 pub use leveler_lifecycle::{
-    CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,
-    ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps,
-    ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
+    CollaborationMode, DepthUseMetrics, EvidenceLedger, GateConfig, ObjectiveAnchor,
+    ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TaskContract,
+    TurnPhase, WorkProfile, check,
 };
 pub use sub_agent::{ChildResult, ChildStatus, DelegationTiming, SettledChildNotice};
 pub use sub_agent::{

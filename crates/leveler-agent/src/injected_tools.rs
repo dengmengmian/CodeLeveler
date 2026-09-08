@@ -1,7 +1,7 @@
 //! Definitions of the executor-injected tools (request_user_input / ask_user,
 //! update_goal, request_permissions, spawn_agent) advertised to the model.
 
-use leveler_model::ToolDefinition;
+use leveler_model::{ToolCall, ToolDefinition};
 
 /// Primary name for mid-turn clarification.
 pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
@@ -128,38 +128,6 @@ pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
 
 /// The name of the injected sub-agent spawn tool.
 pub(crate) const SPAWN_AGENT_TOOL: &str = "spawn_agent";
-
-/// Delivery: mark one plan step complete with a verification evidence ref.
-pub(crate) const COMPLETE_STEP_TOOL: &str = "complete_step";
-
-pub(crate) fn complete_step_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: COMPLETE_STEP_TOOL.to_string(),
-        description: "Mark one plan step completed with a verification evidence \
-            reference (tool_call_id of a successful verification run_command). \
-            Required under Delivery work profile for multi-step plans before \
-            update_goal(complete)."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "step_id": {
-                    "type": "string",
-                    "description": "Plan step id or exact step text."
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "What was done for this step."
-                },
-                "evidence_ref": {
-                    "type": "string",
-                    "description": "tool_call_id of a successful verification command."
-                }
-            },
-            "required": ["step_id", "summary", "evidence_ref"]
-        }),
-    }
-}
 
 /// The tool the model calls to run a focused sub-agent on a self-contained
 /// subtask, getting back only its final result. Emitting several calls in one
@@ -376,57 +344,210 @@ pub(crate) fn parse_permission_request(
         .unwrap_or("")
         .to_string();
 
+    let (mut grants, named) = parse_grant_axes(args);
+    if !named {
+        // Legacy: only action/reason → network elevation.
+        grants.network = true;
+    }
+    (action, reason, grants)
+}
+
+/// The command tools whose calls may carry an `escalate` retry.
+const ESCALATABLE_TOOLS: [&str; 2] = ["shell_command", "run_command"];
+
+/// Read the grant axes (`network` / `filesystem` / `full_access`) shared by
+/// `request_permissions` and a command's `escalate`. Returns the grants plus
+/// whether any axis was actually named — the two callers disagree on what an
+/// unnamed axis means, so that judgement stays with them.
+fn parse_grant_axes(args: &serde_json::Value) -> (TurnPermissionGrants, bool) {
     let full_access = args
         .get("full_access")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let network_explicit = args.get("network").and_then(|v| v.as_bool());
+    let network = args.get("network").and_then(|v| v.as_bool());
     let filesystem = args
         .get("filesystem")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-
-    let mut grants = TurnPermissionGrants::default();
     if full_access {
-        grants.network = true;
-        grants.unrestricted_fs = true;
-    } else {
-        let any_new_field = network_explicit.is_some() || !filesystem.is_empty();
-        if any_new_field {
-            grants.network = network_explicit.unwrap_or(false);
-            grants.unrestricted_fs = matches!(
+        return (
+            TurnPermissionGrants {
+                network: true,
+                unrestricted_fs: true,
+            },
+            true,
+        );
+    }
+    let named = network.is_some() || !filesystem.is_empty();
+    (
+        TurnPermissionGrants {
+            network: network.unwrap_or(false),
+            unrestricted_fs: matches!(
                 filesystem,
                 "unrestricted" | "full" | "full_access" | "danger-full-access"
-            );
-        } else {
-            // Legacy: only action/reason → network elevation.
-            grants.network = true;
+            ),
+        },
+        named,
+    )
+}
+
+/// Whether a tool's calls may carry `escalate`.
+pub(crate) fn is_escalatable_tool(name: &str) -> bool {
+    ESCALATABLE_TOOLS.contains(&name)
+}
+
+/// Parse a command call's `escalate` retry into its reason and grants.
+///
+/// `None` means the call is an ordinary one. Unlike `request_permissions`,
+/// an `escalate` naming no axis yields EMPTY grants rather than the legacy
+/// network default: this argument exists to answer a denial the model just
+/// saw, so it must name the axis that denial was about. The caller turns
+/// empty grants into a refusal.
+pub(crate) fn parse_escalation(args: &serde_json::Value) -> Option<(String, TurnPermissionGrants)> {
+    let escalate = args.get("escalate")?;
+    if !escalate.is_object() {
+        return None;
+    }
+    let reason = escalate
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (grants, _) = parse_grant_axes(escalate);
+    Some((reason, grants))
+}
+
+/// The command line an `escalate` prompt shows the user. The command IS the
+/// action here — unlike `request_permissions`, the model does not restate it.
+pub(crate) fn escalation_action(call: &ToolCall) -> String {
+    if let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) {
+        return cmd.to_string();
+    }
+    let program = call
+        .arguments
+        .get("program")
+        .and_then(|v| v.as_str())
+        .unwrap_or(call.name.as_str());
+    let args: Vec<&str> = call
+        .arguments
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|args| args.iter().filter_map(|arg| arg.as_str()).collect())
+        .unwrap_or_default();
+    format!("{program} {}", args.join(" ")).trim().to_string()
+}
+
+/// An `escalate` that names no axis. Refused without a prompt: there is
+/// nothing concrete to ask the user to approve.
+pub(crate) fn escalation_missing_axis_message() -> String {
+    "escalate named no permission: set `network: true`, `filesystem: \"unrestricted\"`, \
+     or `full_access: true` on it, matching the access the sandbox actually denied. \
+     The command was NOT run."
+        .to_string()
+}
+
+/// The `escalate` property added to each command tool's published schema.
+fn escalation_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Retry this EXACT command with elevated permission after the \
+            sandbox denied it. The approval prompt this raises is how the user consents \
+            — do not ask in prose first, and do not call request_permissions for it. \
+            Ground it in a denial you just saw: never escalate speculatively. The grant \
+            covers this one call only. If the user denies, that answer is final.",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "One sentence for the user: why this exact command needs the wider access."
+            },
+            "network": {
+                "type": "boolean",
+                "description": "This call needs network access."
+            },
+            "filesystem": {
+                "type": "string",
+                "enum": ["workspace", "unrestricted"],
+                "description": "unrestricted = drop the workspace write confinement (and the `.git` write protection) for this call."
+            },
+            "full_access": {
+                "type": "boolean",
+                "description": "Shorthand for network=true and filesystem=unrestricted."
+            }
+        },
+        "required": ["reason"]
+    })
+}
+
+/// Publish `escalate` on the command tools.
+///
+/// Mounted only while the profile actually confines something — under
+/// 完全访问 there is nothing to escalate to, so the argument would only invite
+/// a pointless prompt (same reason `request_permissions` is withheld there).
+pub(crate) fn advertise_escalation(tools: &mut [ToolDefinition]) {
+    for tool in tools
+        .iter_mut()
+        .filter(|tool| is_escalatable_tool(&tool.name))
+    {
+        if let Some(properties) = tool
+            .input_schema
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            properties.insert("escalate".to_string(), escalation_property());
         }
     }
-    (action, reason, grants)
+}
+
+/// How long an approved elevation lasts. The approval prompt must say which:
+/// `request_permissions` holds for the rest of the turn, a command's
+/// `escalate` for that one call. Telling the user "本轮" while granting less
+/// would be harmless; telling them "本轮" is what we must not do when it is
+/// actually broader than the words, and either way the prompt should not lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantScope {
+    Turn,
+    SingleCall,
+}
+
+impl GrantScope {
+    fn fs_note(self) -> &'static str {
+        match self {
+            Self::Turn => "文件系统(本轮写不受工作区沙箱限制,近似 full-access)",
+            Self::SingleCall => "文件系统(仅此一次调用写不受工作区沙箱限制)",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Turn => "模型请求",
+            Self::SingleCall => "模型请求(仅此一次)",
+        }
+    }
 }
 
 pub(crate) fn permission_request_description(
     action: &str,
     reason: &str,
     grants: TurnPermissionGrants,
+    scope: GrantScope,
 ) -> String {
     let mut parts = Vec::new();
     if grants.network {
         parts.push("网络");
     }
     if grants.unrestricted_fs {
-        parts.push("文件系统(本轮写不受工作区沙箱限制,近似 full-access)");
+        parts.push(scope.fs_note());
     }
     let what = if parts.is_empty() {
         "权限".to_string()
     } else {
         parts.join("+")
     };
+    let prefix = scope.prefix();
     if reason.is_empty() {
-        format!("模型请求{what}:{action}")
+        format!("{prefix}{what}:{action}")
     } else {
-        format!("模型请求{what}:{action}(原因:{reason})")
+        format!("{prefix}{what}:{action}(原因:{reason})")
     }
 }
 
@@ -796,6 +917,101 @@ mod tests {
         assert_eq!(
             primary.input_schema["required"],
             legacy.input_schema["required"]
+        );
+    }
+
+    /// The prompt is the user's only view of what they are approving. A
+    /// one-call escalation must not be described as lasting the whole turn.
+    #[test]
+    fn a_single_call_escalation_prompt_does_not_claim_the_turn() {
+        let grants = TurnPermissionGrants {
+            network: false,
+            unrestricted_fs: true,
+        };
+        let turn = permission_request_description("git pull", "", grants, GrantScope::Turn);
+        assert!(turn.contains("本轮"), "{turn}");
+
+        let once = permission_request_description("git pull", "", grants, GrantScope::SingleCall);
+        assert!(
+            !once.contains("本轮"),
+            "a one-call grant must not be sold as a turn-long one: {once}"
+        );
+        assert!(once.contains("仅此一次"), "{once}");
+    }
+
+    #[test]
+    fn escalation_is_absent_when_the_call_carries_no_escalate_field() {
+        assert!(parse_escalation(&serde_json::json!({"cmd": "git pull"})).is_none());
+    }
+
+    #[test]
+    fn escalation_parses_the_same_axes_as_request_permissions() {
+        let (reason, grants) = parse_escalation(&serde_json::json!({
+            "cmd": "git pull --rebase",
+            "escalate": { "reason": "remote git needs the network and .git writes", "full_access": true }
+        }))
+        .expect("escalate must parse");
+        assert!(reason.contains("remote git"));
+        assert!(grants.network && grants.unrestricted_fs);
+
+        let (_, fs_only) = parse_escalation(&serde_json::json!({
+            "escalate": { "reason": "write outside the workspace", "filesystem": "unrestricted" }
+        }))
+        .unwrap();
+        assert!(fs_only.unrestricted_fs && !fs_only.network);
+    }
+
+    /// Unlike `request_permissions`, a bare `escalate` must NOT silently mean
+    /// network: the model has to name the axis its command was denied on.
+    #[test]
+    fn an_escalation_naming_no_axis_is_empty_not_a_network_grant() {
+        let (_, grants) = parse_escalation(&serde_json::json!({
+            "escalate": { "reason": "please" }
+        }))
+        .unwrap();
+        assert!(grants.is_empty(), "a bare escalate must not grant network");
+    }
+
+    #[test]
+    fn escalation_is_advertised_on_command_tools_only() {
+        let mut tools = vec![
+            ToolDefinition {
+                name: "shell_command".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "run_command".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"program":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            },
+        ];
+        advertise_escalation(&mut tools);
+
+        for tool in tools.iter().filter(|t| t.name != "read_file") {
+            let escalate = tool.input_schema["properties"]
+                .get("escalate")
+                .unwrap_or_else(|| panic!("{} must advertise escalate", tool.name));
+            let props = escalate["properties"].as_object().unwrap();
+            for axis in ["reason", "network", "filesystem", "full_access"] {
+                assert!(props.contains_key(axis), "{} missing {axis}", tool.name);
+            }
+            assert_eq!(escalate["required"], serde_json::json!(["reason"]));
+        }
+        assert!(
+            tools[2].input_schema["properties"]
+                .get("escalate")
+                .is_none(),
+            "a read-only tool has nothing to escalate"
+        );
+        assert!(
+            tools[0].input_schema["properties"].get("cmd").is_some(),
+            "augmenting the schema must not drop the tool's own fields"
         );
     }
 }

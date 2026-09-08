@@ -307,13 +307,6 @@ pub struct CaseResult {
     /// Impact paths the run never reached, by name — the half-fix, named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missed_impact_paths: Vec<String>,
-    /// Engine repair turns started (persisted `repair_started` events).
-    #[serde(default)]
-    pub repair_attempts: u32,
-    /// Whether the verification AFTER the last repair passed. `None` when no
-    /// repair ran (or the event log was unavailable).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_success: Option<bool>,
 }
 
 const fn default_repetition() -> u32 {
@@ -1274,21 +1267,6 @@ impl EvalReport {
             .collect()
     }
 
-    /// `(cases where a repair turn started, of those where the post-repair
-    /// verification passed)`.
-    pub fn repair_counts(&self) -> (usize, usize) {
-        let triggered: Vec<_> = self
-            .cases
-            .iter()
-            .filter(|c| c.repair_attempts > 0)
-            .collect();
-        let succeeded = triggered
-            .iter()
-            .filter(|c| c.repair_success == Some(true))
-            .count();
-        (triggered.len(), succeeded)
-    }
-
     /// Case ids whose repetitions disagree on passing — the flaky set that a
     /// completion-rate average silently hides.
     pub fn unstable_case_ids(&self) -> Vec<String> {
@@ -1463,8 +1441,6 @@ mod tests {
             repeated_search_queries: 0,
             first_relevant_file_round: None,
             first_plan_round: None,
-            repair_attempts: 0,
-            repair_success: None,
             relevant_paths_touched: 0,
             relevant_paths_before_edit: 0,
             impact_paths_touched: 0,
@@ -2150,8 +2126,6 @@ mod tests {
             repeated_search_queries: 0,
             first_relevant_file_round: None,
             first_plan_round: None,
-            repair_attempts: 0,
-            repair_success: None,
             relevant_paths_touched: 0,
             relevant_paths_before_edit: 0,
             impact_paths_touched: 0,
@@ -2507,8 +2481,8 @@ expect: { program: cargo, args: [test] }
         assert!(has_extension("ts"), "suite must contain TypeScript cases");
     }
 
-    /// Eval pass requires agent success AND independent expect — matching
-    /// `TaskOutcome::is_success` only for Verified plus an external check.
+    /// Eval pass requires agent success AND independent expect — `completed`
+    /// (a completed run whose project checks passed) plus an external check.
     #[test]
     fn case_result_never_passes_on_completion_alone() {
         assert!(
@@ -2546,8 +2520,6 @@ expect: { program: cargo, args: [test] }
                 repeated_search_queries: 0,
                 first_relevant_file_round: None,
                 first_plan_round: None,
-                repair_attempts: 0,
-                repair_success: None,
                 relevant_paths_touched: 0,
                 relevant_paths_before_edit: 0,
                 impact_paths_touched: 0,
@@ -2596,8 +2568,6 @@ expect: { program: cargo, args: [test] }
                 repeated_search_queries: 0,
                 first_relevant_file_round: None,
                 first_plan_round: None,
-                repair_attempts: 0,
-                repair_success: None,
                 relevant_paths_touched: 0,
                 relevant_paths_before_edit: 0,
                 impact_paths_touched: 0,

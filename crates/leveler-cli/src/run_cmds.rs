@@ -1458,13 +1458,6 @@ fn finish(
                             outcome.rounds
                         ))
                     ),
-                    StopReason::CloseoutForced => println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "Plan complete; stopped redundant closeout after {} round(s).",
-                            outcome.rounds
-                        ))
-                    ),
                     StopReason::Incomplete => println!(
                         "{}",
                         Line::warn(&format!(
@@ -1488,13 +1481,6 @@ fn finish(
                             outcome.rounds
                         ))
                     ),
-                    StopReason::PolicyBlocked => println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "Policy-blocked after {} round(s): a harness gate refused every action (e.g. plan required).",
-                            outcome.rounds
-                        ))
-                    ),
                     StopReason::Blocked => println!(
                         "{}",
                         Line::warn(&format!(
@@ -1513,8 +1499,19 @@ fn finish(
                     StopReason::CompletedUnverified => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Completed in {} round(s), but not independently verified (no verification gate).",
+                            "Completed in {} round(s); the project's checks did not run.",
                             outcome.rounds
+                        ))
+                    ),
+                    StopReason::CompletedChecksFailed => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Completed in {} round(s), but the project's checks failed: {}",
+                            outcome.rounds,
+                            outcome
+                                .stop_detail
+                                .as_deref()
+                                .unwrap_or("see verification output")
                         ))
                     ),
                 }

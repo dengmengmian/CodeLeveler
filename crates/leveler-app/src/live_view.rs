@@ -89,6 +89,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
         | RuntimeEvent::TurnCompletedUnverified { .. }
+        | RuntimeEvent::TurnCompletedChecksFailed { .. }
         | RuntimeEvent::TurnFailed { .. }
         | RuntimeEvent::TurnCancelled => view.active_tools.clear(),
         _ => {}

@@ -97,16 +97,12 @@ impl FromStr for WorkProfile {
 /// Counters for continuous-use / latency hard gates (S0/S3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepthUseMetrics {
-    /// Post-turn answer_audit generate invocations this drive.
-    pub answer_audit_invocations: u32,
     /// Extra model generates caused by harness tax (audit + recovery nudges).
     pub extra_model_calls: u32,
     /// Successful PlanUpdated emissions.
     pub plan_updated: u32,
     /// True if a mutation tool ran before any plan was registered.
     pub first_write_before_plan: bool,
-    /// Times a mutation was blocked for missing structured plan.
-    pub plan_first_write_blocked: u32,
     /// Coarse model-token spend for this drive (input+output when known).
     #[serde(default)]
     pub model_tokens: u64,

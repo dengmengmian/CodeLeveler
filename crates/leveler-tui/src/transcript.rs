@@ -68,6 +68,9 @@ pub enum TurnEndStatus {
     /// Work finished, but leveler could not independently verify it. Done, not
     /// verified — rendered as a ✓ with an "unverified" caveat, not an alarm.
     Unverified,
+    /// Work finished and the project's own checks then failed over the final
+    /// tree. Done, checks failed — both facts on one marker.
+    ChecksFailed,
     Failed,
     Cancelled,
 }

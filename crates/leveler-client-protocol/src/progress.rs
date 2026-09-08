@@ -125,6 +125,20 @@ mod tests {
     }
 }
 
+/// What the project's own checks reported over the final tree. Orthogonal
+/// to whether the run completed: `Passed` means the configured commands
+/// exited 0, never that the user's request was satisfied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiVerificationStatus {
+    Passed,
+    Failed,
+    #[default]
+    NotRun,
+    Unavailable,
+}
+
 /// The final completion report (spec §23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -134,6 +148,11 @@ pub struct UiCompletionReport {
     pub removed: u32,
     pub checks_passed: usize,
     pub checks_total: usize,
-    /// Whether the run completed and verified successfully.
+    /// Whether the run completed and every gating check passed. Kept for
+    /// existing clients; `verification` carries the full status.
     pub success: bool,
+    /// The project's own checks over the final tree. Absent on reports
+    /// written before the status/verification split (reads as `not_run`).
+    #[serde(default)]
+    pub verification: UiVerificationStatus,
 }

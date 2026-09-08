@@ -94,6 +94,7 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
         "task_finished",
         "{}",
         TaskOutcome::Failed,
+        leveler_lifecycle::VerificationStatus::NotRun,
         SessionStatus::Failed,
         AgentState::Failed,
         leveler_core::now(),

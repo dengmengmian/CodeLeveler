@@ -298,13 +298,8 @@ pub struct GlobalBundle {
     pub agents_delegation: bool,
     /// Multi-agent experiment: delegation offer timing.
     pub agents_offer_timing: leveler_project::OfferTiming,
-    /// When the harness launches an independent reviewer (default Auto).
+    /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
-    /// Cross-model completion judge (`provider/model`); None = executor model.
-    pub agents_completion_judge_model: Option<String>,
-    /// Ceiling for one completion-reconciliation request, in seconds; None =
-    /// the gate's default.
-    pub agents_completion_judge_timeout_seconds: Option<u64>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -454,6 +449,14 @@ pub fn save_default_model_at(path: &Path, model: &str) -> Result<(), GlobalConfi
 impl GlobalConfig {
     /// Expand into provider/model/policy configs with sensible defaults filled.
     pub fn into_bundle(self) -> GlobalBundle {
+        if self.agents.completion_judge_model.is_some()
+            || self.agents.completion_judge_timeout_seconds.is_some()
+        {
+            tracing::warn!(
+                "agents.completion_judge_model / completion_judge_timeout_seconds are legacy \
+                 keys: the completion judge no longer exists and the values are ignored"
+            );
+        }
         let providers = self
             .providers
             .into_iter()
@@ -552,8 +555,6 @@ impl GlobalConfig {
             agents_delegation: self.agents.delegation,
             agents_offer_timing: self.agents.offer_timing,
             agents_independent_review: self.agents.independent_review,
-            agents_completion_judge_model: self.agents.completion_judge_model,
-            agents_completion_judge_timeout_seconds: self.agents.completion_judge_timeout_seconds,
         }
     }
 }
@@ -683,42 +684,19 @@ mod tests {
         GlobalConfig::from_toml_str(&text).expect("escaped values must still parse");
     }
 
-    /// §40/§42: the cross-model judge is a plain global setting — it reaches
-    /// the bundle verbatim, and stays `None` when the section omits it.
+    /// The completion judge is gone. Its keys are still accepted so an
+    /// existing config file keeps parsing under `deny_unknown_fields`, and
+    /// they reach nothing.
     #[test]
-    fn carries_the_completion_judge_model_into_the_bundle() {
-        let with_judge = GlobalConfig::from_toml_str(
-            r#"
-            [agents]
-            completion_judge_model = "deepseek/deepseek-v4-pro"
-            "#,
+    fn legacy_completion_judge_keys_still_parse_and_are_ignored() {
+        let legacy = GlobalConfig::from_toml_str(
+            "[agents]
+completion_judge_model = \"deepseek/deepseek-v4-pro\"
+completion_judge_timeout_seconds = 180
+",
         )
-        .expect("the judge setting must parse under deny_unknown_fields");
-        assert_eq!(
-            with_judge
-                .into_bundle()
-                .agents_completion_judge_model
-                .as_deref(),
-            Some("deepseek/deepseek-v4-pro")
-        );
-
-        let with_timeout =
-            GlobalConfig::from_toml_str("[agents]\ncompletion_judge_timeout_seconds = 180\n")
-                .expect("the judge timeout must parse under deny_unknown_fields");
-        assert_eq!(
-            with_timeout
-                .into_bundle()
-                .agents_completion_judge_timeout_seconds,
-            Some(180)
-        );
-
-        let without = GlobalConfig::from_toml_str("[agents]\ndelegation = true\n")
-            .expect("an agents section without the judge must still parse");
-        assert_eq!(
-            without.into_bundle().agents_completion_judge_model,
-            None,
-            "unset stays unset — the documented same-model fallback"
-        );
+        .expect("legacy judge keys must still parse");
+        let _ = legacy.into_bundle();
     }
 
     #[test]

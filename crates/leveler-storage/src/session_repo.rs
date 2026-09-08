@@ -489,7 +489,7 @@ mod tests {
         repo.set_execution(&id, "full_access", true, "orchestrate", leveler_core::now())
             .await
             .unwrap();
-        repo.set_outcome(&id, TaskOutcome::CompletedUnverified, leveler_core::now())
+        repo.set_outcome(&id, TaskOutcome::Completed, leveler_core::now())
             .await
             .unwrap();
 
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(mode, "full_access");
         assert!(sandbox);
         assert_eq!(kind, "orchestrate");
-        assert_eq!(outcome, Some(TaskOutcome::CompletedUnverified));
+        assert_eq!(outcome, Some(TaskOutcome::Completed));
     }
 
     #[tokio::test]

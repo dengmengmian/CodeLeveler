@@ -16,7 +16,7 @@
 use async_trait::async_trait;
 
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
+use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
 
 use crate::{Database, EventRecord, StorageError, TerminalRepository};
 
@@ -24,7 +24,8 @@ use crate::{Database, EventRecord, StorageError, TerminalRepository};
 #[async_trait]
 pub trait TerminalStore: Send + Sync {
     /// Commit the session's terminal event and the whole terminal lifecycle
-    /// (`outcome`, `status`, `state`) atomically. Returns the appended event.
+    /// (`outcome`, `verification`, `status`, `state`) atomically. Returns the
+    /// appended event.
     ///
     /// # Errors
     ///
@@ -37,6 +38,7 @@ pub trait TerminalStore: Send + Sync {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -70,6 +72,7 @@ pub trait TerminalStore: Send + Sync {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -99,12 +102,22 @@ impl TerminalStore for Database {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         TerminalRepository::new(self)
-            .finish_task(session_id, event_type, payload, outcome, status, state, now)
+            .finish_task(
+                session_id,
+                event_type,
+                payload,
+                outcome,
+                verification,
+                status,
+                state,
+                now,
+            )
             .await
     }
 
@@ -129,13 +142,22 @@ impl TerminalStore for Database {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
         TerminalRepository::new(self)
             .finish_task_owned(
-                token, session_id, event_type, payload, outcome, status, state, now,
+                token,
+                session_id,
+                event_type,
+                payload,
+                outcome,
+                verification,
+                status,
+                state,
+                now,
             )
             .await
     }
@@ -215,6 +237,7 @@ impl MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -239,6 +262,7 @@ impl MemoryTerminalStore {
             let mut rows = self.sessions.rows.lock().unwrap();
             if let Some(session) = rows.get_mut(session_id.as_str()) {
                 session.outcome = Some(outcome);
+                session.verification = Some(verification);
                 session.status = status;
                 session.state = state;
             }
@@ -305,11 +329,21 @@ impl TerminalStore for MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
-        self.finish_task_sync(session_id, event_type, payload, outcome, status, state, now)
+        self.finish_task_sync(
+            session_id,
+            event_type,
+            payload,
+            outcome,
+            verification,
+            status,
+            state,
+            now,
+        )
     }
 
     async fn finish_turn(
@@ -331,6 +365,7 @@ impl TerminalStore for MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -343,7 +378,16 @@ impl TerminalStore for MemoryTerminalStore {
         // Ownership lock held across the WHOLE commit body — no CAS window.
         ownership
             .with_current(token, || {
-                self.finish_task_sync(session_id, event_type, payload, outcome, status, state, now)
+                self.finish_task_sync(
+                    session_id,
+                    event_type,
+                    payload,
+                    outcome,
+                    verification,
+                    status,
+                    state,
+                    now,
+                )
             })?
             .map_err(crate::OwnershipError::Storage)
     }
@@ -398,6 +442,7 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Failed,
+                    leveler_lifecycle::VerificationStatus::NotRun,
                     SessionStatus::Failed,
                     AgentState::Failed,
                     leveler_core::now(),
@@ -443,6 +488,7 @@ mod tests {
                 "task_finished",
                 r#"{"outcome":"interrupted"}"#,
                 TaskOutcome::Interrupted,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Interrupted,
                 AgentState::Execute,
                 leveler_core::now(),
@@ -530,7 +576,8 @@ mod tests {
                     &session,
                     "task_finished",
                     "{}",
-                    TaskOutcome::Verified,
+                    TaskOutcome::Completed,
+                    leveler_lifecycle::VerificationStatus::NotRun,
                     SessionStatus::Completed,
                     AgentState::Complete,
                     leveler_core::now(),
@@ -601,7 +648,8 @@ mod tests {
                 &session,
                 "task_finished",
                 "{}",
-                TaskOutcome::Verified,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 leveler_core::now(),
@@ -613,7 +661,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(outcome, Some(TaskOutcome::Verified));
+        assert_eq!(outcome, Some(TaskOutcome::Completed));
         assert_eq!(
             EventStore::load(events.as_ref(), &session)
                 .await

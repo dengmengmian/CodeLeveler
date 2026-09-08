@@ -21,13 +21,12 @@ fn stop_reason_wording(reason: StopReason) -> String {
         StopReason::BudgetExhausted => "its token or cost budget ran out",
         StopReason::TurnLimitReached => "it hit the round ceiling",
         StopReason::Blocked => "it declared the task blocked",
-        StopReason::PolicyBlocked => "harness policy refused its actions",
         StopReason::Stalled => "it went quiet without resolving the task",
         StopReason::Incomplete => "it stopped without finishing",
         StopReason::Completed
         | StopReason::Answered
         | StopReason::CompletedUnverified
-        | StopReason::CloseoutForced => "",
+        | StopReason::CompletedChecksFailed => "",
     }
     .to_string()
 }
@@ -103,15 +102,43 @@ impl Executor {
         call: &ToolCall,
         cancellation: &CancellationToken,
     ) -> Result<crate::injected_tools::PermissionRequestOutcome, AgentError> {
+        let (action, reason, grants) =
+            crate::injected_tools::parse_permission_request(&call.arguments);
+        self.decide_permission(
+            call,
+            &action,
+            &reason,
+            grants,
+            crate::injected_tools::GrantScope::Turn,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Ask the user to approve one elevation.
+    ///
+    /// Shared by `request_permissions` and by a command call's `escalate`, so
+    /// the two spell the same prompt, the same risk level, and the same
+    /// human-vs-headless distinction. Only the grant's LIFETIME differs, and
+    /// that belongs to the caller: `request_permissions` merges into the turn,
+    /// `escalate` applies to its own call and nothing else.
+    pub(crate) async fn decide_permission(
+        &self,
+        call: &ToolCall,
+        action: &str,
+        reason: &str,
+        grants: crate::injected_tools::TurnPermissionGrants,
+        scope: crate::injected_tools::GrantScope,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::injected_tools::PermissionRequestOutcome, AgentError> {
         use crate::injected_tools::{
-            PermissionRequestOutcome, parse_permission_request, permission_denied_by_user_message,
+            PermissionRequestOutcome, permission_denied_by_user_message,
             permission_denied_unattended_message, permission_grant_message,
             permission_request_description,
         };
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let (action, reason, grants) = parse_permission_request(&call.arguments);
         if grants.is_empty() {
             return Ok(PermissionRequestOutcome::Invalid {
                 message:
@@ -130,7 +157,7 @@ impl Executor {
                 grants,
             });
         }
-        let description = permission_request_description(&action, &reason, grants);
+        let description = permission_request_description(action, reason, grants, scope);
         // Risk: filesystem elevation is at least as sensitive as network.
         let risk = if grants.unrestricted_fs {
             RiskLevel::Privileged
@@ -491,7 +518,7 @@ async fn run_prepared_sub_agent(
                 StopReason::Completed
                     | StopReason::Answered
                     | StopReason::CompletedUnverified
-                    | StopReason::CloseoutForced
+                    | StopReason::CompletedChecksFailed
             );
             // A non-clean stop's `final_text` is usually the SYNTHETIC stop
             // sentence ("reached the N-round ceiling…"), not the child's

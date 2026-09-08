@@ -416,6 +416,7 @@ class SessionState extends ChangeNotifier {
       case 'turn_truncated':
       case 'turn_incomplete':
       case 'turn_completed_unverified':
+      case 'turn_completed_checks_failed':
       case 'turn_failed':
       case 'turn_cancelled':
         status = 'idle';
@@ -665,6 +666,7 @@ class SessionState extends ChangeNotifier {
   static String _turnLabel(String type) => switch (type) {
         'turn_completed' || 'turn_answered' => '回合完成',
         'turn_completed_unverified' => '回合完成（未验证）',
+        'turn_completed_checks_failed' => '回合完成（验证未通过）',
         'turn_incomplete' || 'turn_truncated' => '回合未完成',
         'turn_failed' => '回合失败',
         'turn_cancelled' => '已取消',

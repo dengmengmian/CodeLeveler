@@ -154,6 +154,7 @@ function verifyState(s: SessionView): VerifyState {
   if (v?.passed === false) return 'failed';
   if (v && v.passed == null && v.checks.some((c) => c.status === 'running')) return 'running';
   const detail = s.lastTurn?.detail ?? '';
+  if (s.lastTurn?.outcome === 'checks_failed') return 'failed';
   if (s.lastTurn?.outcome === 'incomplete' && detail.startsWith('failed gate(s)')) return 'failed';
   if (s.lastTurn?.outcome === 'unverified' && detail === 'no_automatic_verification') return 'incomplete';
   if (s.lastTurn?.outcome === 'unverified' && detail === 'no_code_changes') return 'none';
