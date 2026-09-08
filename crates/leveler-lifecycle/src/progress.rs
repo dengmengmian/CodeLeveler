@@ -15,14 +15,24 @@ pub enum TurnPhase {
     Terminal,
 }
 
-/// Resource caps for the mechanical no-progress watchdog: rounds in which
-/// every attempted call was refused before it ran, or a goal-mode model went
-/// quiet without resolving the goal. No cap here reads the model's work for
-/// meaning; the absolute round ceiling and budgets remain the hard boundary.
+/// Resource caps for the mechanical no-progress watchdog. Two things tick it,
+/// both structural: a round in which every attempted call was refused before
+/// it ran, and a goal-mode drive that *terminated* without `update_goal` (one
+/// tick per stalled drive, so `continue_active_goal` cannot re-drive it
+/// forever).
+///
+/// This is not a quiet-round rule. A running drive never ticks: any executed
+/// tool, failed or not, counts as progress, and rounds that merely produce
+/// text are untouched. Ending a run because recent rounds looked quiet was
+/// measured and refuted — seven successful runs went quiet for 26 to 129
+/// rounds and still finished. No cap here reads the model's work for meaning;
+/// the absolute round ceiling and budgets remain the hard boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressCaps {
-    /// Consecutive no-progress rounds (all calls refused, or a quiet goal
-    /// drive) before the turn stops.
+    /// Consecutive no-progress ticks (all-refused round, or a stalled goal
+    /// drive) before the turn stops. Not a calibrated threshold: both inputs
+    /// are binary, so this only answers "how many repeats of a fully blocked
+    /// round to allow".
     pub no_progress_rounds: u32,
 }
 

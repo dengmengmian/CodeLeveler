@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# One-night single-knob ablation matrix: flash × evals/cases/hard × 4 resolver
-# knobs (post-tier-retirement names; legacy require_* still accepted).
+# One-night single-knob ablation matrix: flash × evals/cases/hard × the
+# resolver knobs `leveler eval ablate` accepts (legacy require_* still
+# aliased). Keep KNOBS in sync with `ablation_overrides` in eval_cmd.rs —
+# an unknown name fails in seconds and the loop below only reports it.
 # Each run carries its own control+ablated pair — never compare arms across
 # network conditions (0e2ae4a). Proxy env is stripped: through the local proxy
 # the same suite runs ~5× slower and throws StreamInterrupted infra failures.
@@ -17,7 +19,7 @@ cd "$(dirname "$0")/.."
 LEVELER=target/release/leveler
 MODEL=deepseek/deepseek-v4-flash
 CASES=evals/cases/hard
-KNOBS=(explicit_plan step_summary completion_evidence repeated_read_guard)
+KNOBS=(explicit_plan repeated_read_guard)
 
 for knob in "${KNOBS[@]}"; do
   out="evals/baselines/ablate-flash-${knob//_/-}.json"
