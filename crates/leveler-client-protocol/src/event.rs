@@ -152,9 +152,9 @@ pub enum RuntimeEvent {
     /// became `to`. A stable product fact — clients own the wording and the
     /// locale; the runtime does not send prose for this.
     ContextCompacted { from: u32, to: u32 },
-    /// The context fold threshold climbed one tier on authoritative evidence
-    /// (adaptive context; production default off). Token budgets, not message
-    /// counts. `reason` is a stable machine key (e.g. `reread_pressure`).
+    /// Replay-only. The adaptive-context ladder that climbed the fold
+    /// threshold was deleted; the variant survives so an old event log still
+    /// decodes, and nothing emits one. Token budgets, not message counts.
     ContextExpanded {
         from_tokens: u32,
         to_tokens: u32,

@@ -1,84 +1,176 @@
-//! Whether the runtime may spend another main-task model call.
+//! Mechanical limits on a run and the decision whether another model round
+//! may start.
 //!
-//! The drive loop's top already decided this — it just never said so. Six
-//! guards sat inline at the head of the round loop, each with its own early
-//! return, and every path that wanted another round (`continue` from a tool
-//! batch, a refused close, a settled child, a nudge) reached them by falling
-//! back to the top. That made the loop's shape the authority: correct, but
-//! unnamed and unreadable, and impossible to hand a fact it did not already
-//! have in a local variable.
-//!
-//! This is that decision, named. It is deliberately NOT a new policy: the
-//! predicates and their order are the ones the loop already ran, so the same
-//! state yields the same verdict. What changes is that there is now one place
+//! A hard limit is hard: nothing here decides that a run deserves more. The
+//! predicates and their order are the loop's own; naming them gives one place
 //! to ask, one input type to extend, and one thing to test.
-//!
-//! Three kinds of model call are **not** admitted here, each for a reason:
-//!
-//! - **Protocol repair** — a malformed tool call, a truncated response, a
-//!   `tool_calls` finish with no calls. These are one logical round failing to
-//!   complete, not the runtime choosing to spend another. They carry their own
-//!   tight consecutive-only bounds.
-//! - **Human input** — a steering message is not a runtime decision, and
-//!   admission may not veto it.
-//! - **Runtime overhead** — folds, contract derivation, the reconciliation
-//!   judge. These are the runtime's own spend, governed by the usage
-//!   projection, not by whether the task should take another turn.
 
 use std::time::Duration;
 
-use crate::budget::{BudgetDimension, BudgetExhaustion};
+/// The absolute per-run round ceiling when the host pins none — the
+/// unconditional circuit breaker that guarantees an unbounded run terminates.
+pub const DEFAULT_ROUND_CEILING: u32 = 100;
+
+/// Which resource limit terminated a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetDimension {
+    ModelTokens,
+    Cost,
+    Duration,
+    Commands,
+    ModifiedFiles,
+}
+
+impl BudgetDimension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelTokens => "model_tokens",
+            Self::Cost => "cost",
+            Self::Duration => "duration",
+            Self::Commands => "commands",
+            Self::ModifiedFiles => "modified_files",
+        }
+    }
+}
+
+/// Structured budget-exhaust facts: which dimension fired, spent vs cap.
+///
+/// `spent` / `cap` units:
+/// - model tokens: total provider (or estimated) tokens
+/// - cost: micro-USD
+/// - duration: milliseconds of wall clock
+/// - commands / modified files: counts
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetExhaustion {
+    pub dimension: BudgetDimension,
+    pub spent: u64,
+    pub cap: u64,
+}
+
+impl BudgetExhaustion {
+    pub fn new(dimension: BudgetDimension, spent: u64, cap: u64) -> Self {
+        Self {
+            dimension,
+            spent,
+            cap,
+        }
+    }
+
+    /// Parseable stop-detail contract used by logs and older consumers.
+    /// Format: `budget_exhausted dimension=<name> spent=<n> cap=<n>`.
+    pub fn stop_detail(&self) -> String {
+        format!(
+            "budget_exhausted dimension={} spent={} cap={}",
+            self.dimension.as_str(),
+            self.spent,
+            self.cap
+        )
+    }
+}
+
+/// Spend a host already made against the same limits before this run began
+/// (a continuation of an earlier window). The loop measures every cap against
+/// `spent_before + this run`, so the limits stay task-level, not per-run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpentBefore {
+    pub model_tokens: u64,
+    pub cost_usd_micros: u64,
+    pub duration: Duration,
+}
+
+/// Every mechanical bound the loop enforces on its own.
+///
+/// **Semantics:** `None` = unlimited; `Some(0)` = hard exhausted (no further
+/// spend allowed); `Some(n)` = the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundLimits {
+    /// Absolute round ceiling for this run. Fires regardless of progress or
+    /// policy; the host cannot lift it mid-run.
+    pub round_ceiling: u32,
+    /// This run's own round limit, when the host pins one. Reaching it ends
+    /// the run normally (`StopReason::WindowLimit`), not as a budget stop.
+    pub window_round_limit: Option<u32>,
+    /// Max provider-reported (or estimated) input + output tokens.
+    pub max_model_tokens: Option<u64>,
+    /// Max auditable model cost in micro-USD. Requires pricing on the agent;
+    /// the loop refuses to start with a cost cap it cannot measure.
+    pub max_cost_usd_micros: Option<u64>,
+    /// Max wall-clock duration. The loop arms a deadline timer that cancels
+    /// in-flight work through the run's cancellation token.
+    pub max_duration: Option<Duration>,
+    /// Spend already made against these caps before this run.
+    pub spent_before: SpentBefore,
+}
+
+impl Default for RoundLimits {
+    fn default() -> Self {
+        Self {
+            round_ceiling: DEFAULT_ROUND_CEILING,
+            window_round_limit: None,
+            max_model_tokens: None,
+            max_cost_usd_micros: None,
+            max_duration: None,
+            spent_before: SpentBefore::default(),
+        }
+    }
+}
+
+impl RoundLimits {
+    /// Whether the run may start another round after `round` completed
+    /// rounds, as far as the pinned window limit is concerned.
+    pub fn allows_round_after(&self, round: u32) -> bool {
+        self.window_round_limit.is_none_or(|max| round < max)
+    }
+}
 
 /// Everything the round-admission decision reads. All of it already exists;
 /// nothing here is derived for the purpose.
 #[derive(Debug, Clone, Copy)]
 pub struct RoundAdmissionInput {
-    /// Rounds completed so far in this drive.
+    /// Rounds completed so far in this run.
     pub round: u32,
-    /// The absolute per-turn ceiling — the unconditional circuit breaker.
+    /// The absolute round ceiling — the unconditional circuit breaker.
     pub round_ceiling: u32,
-    /// The window's own round limit, when the continuation policy pins one.
+    /// The run's own round limit, when one is pinned.
     pub window_round_limit: Option<u32>,
-    /// Epoch tokens as the usage projection reports them, and the cap if set.
+    /// Tokens spent against the cap (prior spend included), and the cap.
     pub model_tokens_spent: u64,
     pub max_model_tokens: Option<u64>,
-    /// Epoch cost in micro-USD from the same projection, and the cap if set.
+    /// Cost spent against the cap in micro-USD, and the cap.
     pub cost_spent_micros: u64,
     pub max_cost_usd_micros: Option<u64>,
-    /// Wall clock consumed by this epoch, and the cap if set.
+    /// Wall clock consumed against the cap, and the cap.
     pub elapsed: Duration,
     pub max_duration: Option<Duration>,
-    /// The turn was cancelled from outside — as opposed to the deadline timer
+    /// The run was cancelled from outside — as opposed to the deadline timer
     /// cancelling it, which is a budget stop and reports as one.
     pub cancelled: bool,
     pub deadline_expired: bool,
 }
 
-/// The verdict. Each non-admitting arm names what the drive loop already did
-/// for that case, so the mapping back to an outcome stays mechanical.
+/// The verdict. Each non-admitting arm names what the loop does for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundAdmission {
-    /// Spend another main-task model call.
+    /// Spend another model call.
     Admit,
-    /// A resource cap is spent. Reports as `BudgetExhausted` with the
-    /// dimension that fired.
+    /// A resource cap is spent, with the dimension that fired.
     StopBudget(BudgetExhaustion),
-    /// The absolute per-turn round ceiling. Not a budget: a circuit breaker
-    /// that fires regardless of progress or policy.
+    /// The absolute round ceiling. Not a budget: a circuit breaker that fires
+    /// regardless of progress or policy.
     StopRoundCeiling { ceiling: u32 },
-    /// This window's pinned round limit is reached. The turn ends normally and
-    /// the supervisor decides whether another window opens.
+    /// The run's pinned round limit is reached. The run ends normally; the
+    /// host decides whether another run opens.
     StopWindowLimit,
-    /// Cancelled from outside the turn.
+    /// Cancelled from outside the run.
     Cancelled,
 }
 
-/// Admit — or refuse — the next main-task model call.
+/// Admit — or refuse — the next model call.
 ///
-/// Order matters and is the loop's own: token cap, cost cap, round ceiling,
-/// window limit, cancellation, duration cap. The first three are checked
-/// against the round just completed; the last two against the round about to
-/// start, which is why `elapsed` is read after the round counter advances.
+/// Order matters: token cap, cost cap, round ceiling, window limit,
+/// cancellation, duration cap. The first four are checked against the round
+/// just completed; the last two against the round about to start, which is
+/// why `elapsed` is read after the round counter advances.
 pub fn admit_next_round(input: &RoundAdmissionInput) -> RoundAdmission {
     if let Some(max) = input.max_model_tokens
         && input.model_tokens_spent >= max
@@ -109,7 +201,7 @@ pub fn admit_next_round(input: &RoundAdmissionInput) -> RoundAdmission {
     {
         return RoundAdmission::StopWindowLimit;
     }
-    // An external cancel ends the turn as cancelled; the deadline timer
+    // An external cancel ends the run as cancelled; the deadline timer
     // cancels through the same token but must report as the duration budget,
     // so it falls through to the duration check below.
     if input.cancelled && !input.deadline_expired {
@@ -132,6 +224,15 @@ pub fn admit_next_round(input: &RoundAdmissionInput) -> RoundAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_detail_is_parseable() {
+        let e = BudgetExhaustion::new(BudgetDimension::Commands, 10, 10);
+        assert_eq!(
+            e.stop_detail(),
+            "budget_exhausted dimension=commands spent=10 cap=10"
+        );
+    }
 
     fn open() -> RoundAdmissionInput {
         RoundAdmissionInput {
@@ -192,8 +293,8 @@ mod tests {
         );
     }
 
-    /// A window limit ends the turn without claiming a budget was exhausted —
-    /// the supervisor still gets to open the next window.
+    /// A window limit ends the run without claiming a budget was exhausted —
+    /// the host still gets to open the next run.
     #[test]
     fn a_window_limit_is_not_a_budget_exhaustion() {
         let mut input = open();
@@ -202,8 +303,8 @@ mod tests {
         assert_eq!(admit_next_round(&input), RoundAdmission::StopWindowLimit);
     }
 
-    /// A token cap that is already spent outranks the window limit, exactly as
-    /// the inline guards did: the budget is reported, not the window boundary.
+    /// A token cap that is already spent outranks the window limit: the
+    /// budget is reported, not the window boundary.
     #[test]
     fn a_spent_budget_outranks_the_window_boundary() {
         let mut input = open();
@@ -246,5 +347,16 @@ mod tests {
             admit_next_round(&input),
             RoundAdmission::StopBudget(_)
         ));
+    }
+
+    #[test]
+    fn the_window_limit_bounds_the_next_round() {
+        let limits = RoundLimits {
+            window_round_limit: Some(3),
+            ..RoundLimits::default()
+        };
+        assert!(limits.allows_round_after(2));
+        assert!(!limits.allows_round_after(3));
+        assert!(RoundLimits::default().allows_round_after(1_000));
     }
 }

@@ -13,8 +13,8 @@ pub enum ModelCallKind {
     Round,
     /// The summarization behind a compaction fold.
     Compaction,
-    /// A bounded call the runtime makes on its own account — contract
-    /// derivation, the completion reconciliation judge.
+    /// A bounded call the runtime makes on its own account. Never a second
+    /// model judging the first — that class of call no longer exists.
     Advisory,
 }
 

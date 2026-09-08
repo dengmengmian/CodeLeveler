@@ -714,7 +714,6 @@ impl TaskEngine {
             session_id.clone(),
             token.clone(),
         );
-        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -723,9 +722,6 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
-            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-                expanded_seed,
-            )),
             repo: Some(spec.coding.repository.clone()),
         };
         log.append(
@@ -864,7 +860,6 @@ impl TaskEngine {
                 observer,
             )
             .await?;
-        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -873,9 +868,6 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
-            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-                expanded_seed,
-            )),
             repo: Some(spec.coding.repository.clone()),
         };
         let result = async {
@@ -972,7 +964,6 @@ impl TaskEngine {
                 observer,
             )
             .await?;
-        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -981,9 +972,6 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
-            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-                expanded_seed,
-            )),
             repo: Some(spec.coding.repository.clone()),
         };
 

@@ -11,9 +11,7 @@
 //! that reading belongs to the model, and acceptance belongs to the user.
 #![forbid(unsafe_code)]
 
-pub mod admission;
 mod authorization;
-mod budget;
 mod child_profile;
 mod compaction;
 pub mod executor;
@@ -23,9 +21,9 @@ mod nudges;
 pub mod ownership;
 mod prompt;
 mod sub_agent;
-pub mod usage;
 
-pub use budget::{BudgetDimension, BudgetExhaustion};
+// The kernel owns these: one definition of what a spent budget is, shared by
+// the loop that enforces it and the outcome that reports it.
 pub use child_profile::child_profile_trace;
 pub use compaction::{
     COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages,
@@ -40,6 +38,7 @@ pub use executor::{
     ModelCallKind, ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
     SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };
+pub use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
 pub use leveler_lifecycle::{
     CollaborationMode, DepthUseMetrics, EvidenceLedger, GateConfig, ObjectiveAnchor,
     ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TurnPhase,

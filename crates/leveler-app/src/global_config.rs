@@ -95,10 +95,8 @@ struct GlobalAgents {
     /// Reconciliation Gate. Unset = the executor's own model.
     #[serde(default)]
     completion_judge_model: Option<String>,
-    /// Ceiling for ONE completion-reconciliation request, in seconds. Unset =
-    /// the gate's own default. A slower independent judge needs a longer
-    /// ceiling than the flash-calibrated default; the value is operational
-    /// policy and never depends on which model is configured.
+    /// Legacy: the completion-reconciliation gate this bounded was deleted.
+    /// Still accepted so an existing config file loads, and ignored.
     #[serde(default)]
     completion_judge_timeout_seconds: Option<u64>,
 }

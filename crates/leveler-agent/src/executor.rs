@@ -7,13 +7,13 @@ mod gates;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
-mod stream;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent_core::BudgetExhaustion;
 use leveler_context::load_rules;
 use leveler_core::{ClarificationId, TurnId};
 use leveler_execution::{ApprovalPolicy, Approver, AutoApprove, AutoReviewer, NeedUserReviewer};
@@ -389,10 +389,6 @@ impl ContinuationPolicy {
             Self::Bounded { max_rounds } => Some(max_rounds.get()),
         }
     }
-
-    fn allows_round_after(self, round: u32) -> bool {
-        self.round_limit().is_none_or(|max| round < max)
-    }
 }
 
 /// Optional per-run resource limits, enforced at model/tool boundaries (spec §27).
@@ -486,7 +482,7 @@ pub struct AgentOutcome {
     /// When `stop_reason` is [`StopReason::BudgetExhausted`], which limit fired
     /// and spent vs cap. `None` for other stops (and for legacy bounded-round
     /// exits that reuse the BudgetExhausted label without a resource dimension).
-    pub budget_exhaustion: Option<crate::budget::BudgetExhaustion>,
+    pub budget_exhaustion: Option<BudgetExhaustion>,
     /// Continuous-use / latency counters for S0/S3 hard gates.
     pub metrics: leveler_lifecycle::DepthUseMetrics,
     /// Final progress / closeout state (engine continue_active_goal reads this).
@@ -531,7 +527,7 @@ impl AgentOutcome {
         final_text: String,
         rounds: u32,
         modified_files: Vec<String>,
-        exhaustion: crate::budget::BudgetExhaustion,
+        exhaustion: BudgetExhaustion,
         metrics: &leveler_lifecycle::DepthUseMetrics,
         progress: &ProgressLedger,
         objective: &ObjectiveAnchor,
@@ -570,6 +566,21 @@ pub enum AgentError {
     InvalidBudget(String),
     #[error("persistence error: {0}")]
     Persistence(String),
+}
+
+impl From<leveler_agent_core::AgentCoreError> for AgentError {
+    /// The kernel's neutral failures, in this crate's vocabulary. A tool
+    /// runtime never fails here — this harness dispatches its own tools — so
+    /// that arm exists only to keep the mapping total.
+    fn from(error: leveler_agent_core::AgentCoreError) -> Self {
+        use leveler_agent_core::AgentCoreError as Kernel;
+        match error {
+            Kernel::Model(error) => AgentError::Model(error),
+            Kernel::Cancelled => AgentError::Cancelled,
+            Kernel::InvalidLimits(reason) => AgentError::InvalidBudget(reason),
+            Kernel::ToolRuntime(error) => AgentError::Persistence(error.to_string()),
+        }
+    }
 }
 
 /// Awaitable durability barrier for canonical tool events (side-effect
@@ -835,15 +846,6 @@ impl TranscriptSink for SubAgentProgressSink {
         });
         Ok(())
     }
-}
-
-pub(crate) struct StreamRoundResult {
-    request_id: String,
-    message: Message,
-    usage: TokenUsage,
-    finish_reason: FinishReason,
-    latency_ms: u64,
-    retry_count: u32,
 }
 
 /// The execution-policy slice a delegated executor needs. The engine resolves
@@ -1717,6 +1719,30 @@ impl Executor {
     pub fn with_clarifier(mut self, clarifier: Arc<dyn Clarifier>) -> Self {
         self.clarifier = clarifier;
         self
+    }
+
+    /// Ask the model to write a handoff briefing for the rounds compaction is
+    /// about to elide. Returns None when there is nothing to fold or the call
+    /// fails — the caller then folds with a bare breadcrumb rather than aborting
+    /// the run, because an unsummarized fold still beats overflowing the window.
+    /// The breadcrumb says the details are lost, so the loss is never silent.
+    pub(crate) async fn summarize_for_compaction(
+        &self,
+        messages: &[Message],
+        keep_recent: usize,
+        keep_recent_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> Option<crate::compaction::CompactionSummary> {
+        crate::compaction::summarize_with_model(
+            self.runtime.as_ref(),
+            &self.model,
+            self.policy.reasoning_effort,
+            messages,
+            keep_recent,
+            keep_recent_tokens,
+            cancellation,
+        )
+        .await
     }
 
     /// Start a fresh run for `goal`.

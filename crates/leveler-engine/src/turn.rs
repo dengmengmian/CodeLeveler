@@ -207,11 +207,6 @@ pub struct TurnRunner<'a> {
     pub factory: &'a ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
-    /// C5-S3: the highest fold threshold any prior turn of this task expanded
-    /// to (seeded from replayed `ContextExpanded` events on resume, updated
-    /// live as this runner forwards them). Later turns start from it instead
-    /// of shrinking back to the initial tier.
-    pub expanded_context_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Repository root for bounded workspace metadata on goal checkpoints
     /// (long-goal P3). `None` = no workspace facts captured, never assumed.
     pub repo: Option<std::path::PathBuf>,

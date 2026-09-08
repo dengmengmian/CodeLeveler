@@ -1769,6 +1769,7 @@ version = "0.2.0-beta.1"
 dependencies = [
  "async-trait",
  "futures",
+ "leveler-agent-core",
  "leveler-context",
  "leveler-core",
  "leveler-execution",
@@ -1783,6 +1784,21 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "leveler-agent-core"
+version = "0.2.0-beta.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "leveler-core",
+ "leveler-model",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1878,7 +1894,6 @@ dependencies = [
  "leveler-relay",
  "leveler-remote-agent",
  "leveler-remote-protocol",
- "leveler-session-wire",
  "leveler-storage",
  "leveler-tools",
  "leveler-tui",
@@ -2164,7 +2179,6 @@ dependencies = [
  "leveler-local-transport",
  "leveler-relay",
  "leveler-remote-protocol",
- "leveler-session-wire",
  "reqwest",
  "serde",
  "serde_json",
@@ -2184,20 +2198,10 @@ dependencies = [
  "base64",
  "chrono",
  "leveler-client-protocol",
- "leveler-session-wire",
  "ring",
  "serde",
  "serde_json",
  "thiserror",
-]
-
-[[package]]
-name = "leveler-session-wire"
-version = "0.2.0-beta.1"
-dependencies = [
- "leveler-client-protocol",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2341,7 +2345,6 @@ dependencies = [
  "leveler-core",
  "leveler-local-transport",
  "leveler-project",
- "leveler-session-wire",
  "leveler-storage",
  "leveler-test-support",
  "mime_guess",

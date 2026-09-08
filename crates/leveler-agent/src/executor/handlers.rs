@@ -623,7 +623,7 @@ fn cap_activity_preview(s: &str) -> String {
 /// Wall time held back from a child so the parent can still settle.
 ///
 /// Settlement is not free: the parent folds the child's result into its
-/// ledger, may run a reconciliation judge, and writes the outcome. A child
+/// ledger and writes the outcome. A child
 /// granted the parent's entire remainder leaves none of that, and the run ends
 /// on a deadline rather than on a decision.
 pub(crate) const CHILD_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);

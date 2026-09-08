@@ -209,7 +209,6 @@ async fn run_chat_turn(
         factory: &h.factory,
         approver,
         clarifier: Arc::new(AutoClarify),
-        expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         repo: None,
     };
     runner

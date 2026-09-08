@@ -11,6 +11,7 @@ members = [
     "crates/leveler-project",
     "crates/leveler-execution",
     "crates/leveler-tools",
+    "crates/leveler-agent-core",
     "crates/leveler-agent",
     "crates/leveler-verifier",
     "crates/leveler-context",
@@ -21,7 +22,6 @@ members = [
     "crates/leveler-engine",
     "crates/leveler-app",
     "crates/leveler-client-protocol",
-    "crates/leveler-session-wire",
     "crates/leveler-remote-protocol",
     "crates/leveler-remote-agent",
     "crates/leveler-local-transport",
@@ -54,6 +54,7 @@ leveler-storage = { version = "0.2.0-beta.1", path = "crates/leveler-storage" }
 leveler-project = { version = "0.2.0-beta.1", path = "crates/leveler-project" }
 leveler-execution = { version = "0.2.0-beta.1", path = "crates/leveler-execution" }
 leveler-tools = { version = "0.2.0-beta.1", path = "crates/leveler-tools" }
+leveler-agent-core = { version = "0.2.0-beta.1", path = "crates/leveler-agent-core" }
 leveler-agent = { version = "0.2.0-beta.1", path = "crates/leveler-agent" }
 leveler-verifier = { version = "0.2.0-beta.1", path = "crates/leveler-verifier" }
 leveler-context = { version = "0.2.0-beta.1", path = "crates/leveler-context" }
@@ -64,7 +65,6 @@ leveler-eval = { version = "0.2.0-beta.1", path = "crates/leveler-eval" }
 leveler-engine = { version = "0.2.0-beta.1", path = "crates/leveler-engine" }
 leveler-app = { version = "0.2.0-beta.1", path = "crates/leveler-app" }
 leveler-client-protocol = { version = "0.2.0-beta.1", path = "crates/leveler-client-protocol" }
-leveler-session-wire = { version = "0.2.0-beta.1", path = "crates/leveler-session-wire" }
 leveler-remote-protocol = { version = "0.2.0-beta.1", path = "crates/leveler-remote-protocol" }
 leveler-remote-agent = { version = "0.2.0-beta.1", path = "crates/leveler-remote-agent" }
 leveler-relay = { version = "0.2.0-beta.1", path = "services/leveler-relay" }

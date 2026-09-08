@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "The CodeLeveler agent tool-execution loop."
+description = "The CodeLeveler coding harness: prompt, repository context, memory, skills, ToolHost admission, write ownership and sub-agents, driven by the leveler-agent-core kernel."
 
 [dependencies]
 leveler-core = { workspace = true }
@@ -14,6 +14,7 @@ leveler-lifecycle = { workspace = true }
 leveler-model = { workspace = true }
 leveler-tools = { workspace = true }
 leveler-memory = { workspace = true }
+leveler-agent-core = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-context = { workspace = true }
 leveler-skills = { workspace = true }
@@ -29,8 +30,8 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 leveler-test-support = { workspace = true }
-# Test-only: the reconciliation availability probe (F2) measures the gate
-# against a real provider, so it needs the same runtime the product uses.
+# Test-only: the tests that measure against a real provider need the same
+# runtime the product uses.
 leveler-provider = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

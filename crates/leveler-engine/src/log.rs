@@ -200,26 +200,6 @@ impl<'a> EventLog<'a> {
         }
     }
 
-    /// The highest fold threshold this session has durably expanded to
-    /// (C5-S3). Budgets only climb within a task, so the LAST
-    /// `ContextExpanded` event carries the maximum; `None` means the session
-    /// never expanded and the initial tier stands.
-    pub async fn max_expanded_context_budget(&self) -> Result<Option<u32>, EngineError> {
-        let Some(row) = self
-            .store
-            .load_last_by_type(&self.session_id, "context_expanded", None)
-            .await?
-        else {
-            return Ok(None);
-        };
-        match decode_row(&row)? {
-            EngineEvent::ContextExpanded { to, .. } => Ok(Some(to)),
-            _ => Err(EngineError::Corrupt(
-                "context_expanded row carried a different event".into(),
-            )),
-        }
-    }
-
     /// Children with a persisted `SubAgentStarted` and no `SubAgentFinished`,
     /// in the order they were started.
     ///
