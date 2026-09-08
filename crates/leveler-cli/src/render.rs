@@ -196,7 +196,6 @@ fn render_event_text(event: AgentEvent) {
             // wait instead of showing a bare "waiting for model".
             let label = match kind {
                 AdvisoryKind::ContextCompaction => "compacting context",
-                AdvisoryKind::GoalContinuation => "continuing active goal",
                 AdvisoryKind::CloseoutNudge(reason) => match reason {
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved => {
                         "nudge: goal unresolved"

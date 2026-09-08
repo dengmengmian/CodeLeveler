@@ -211,14 +211,10 @@ pub enum AgentEvent {
     /// Host process gate refused `update_goal(complete)` (or similar).
     /// Persisted so resume/UI can show intercept history (not only ToolResult).
     GoalIntercepted { kind: String, detail: String },
-    /// MA-WA1 delegation decision observability. `action`: `offered` (the
-    /// one-shot keep-vs-delegate decision point was injected; `detail` names
-    /// the trigger: `plan` | `mutation_fallback`), `delegated` (first Worker
-    /// admitted; `detail` = its file scope), `kept` (first mutation after the
-    /// offer with no Worker spawned — a first-class outcome, not a failure).
-    /// Each fact is recorded at most once per goal epoch (ProgressLedger
-    /// carries the flags across continue/resume/repair windows). Facts only:
-    /// never a gate, never completion-relevant.
+    /// Durable ownership provenance for a child's write scope: `action` is
+    /// `ownership_granted` / `ownership_denied`, `detail` names the owner and
+    /// the paths. Recorded so an offline audit can tell an authorized write
+    /// from a bypass. Facts only: never a gate, never completion-relevant.
     DelegationStage { action: String, detail: String },
     /// Full process-evidence ledger snapshot after a mutation/verify/receipt/
     /// intercept change. SoT for resume of Delivery gates (last snapshot wins).
@@ -252,11 +248,6 @@ pub enum AdvisoryKind {
     /// model is being re-prompted. Without this the user sees the "final"
     /// answer, then an unexplained extra model round.
     CloseoutNudge(closeout::CloseoutReason),
-    /// The engine opened another goal turn after a stalled one
-    /// (`continue_active_goal`). This is a whole turn, not one round, and it
-    /// starts after the user already read a final answer — unlabelled it is
-    /// indistinguishable from a hang.
-    GoalContinuation,
 }
 
 impl AdvisoryKind {
@@ -264,7 +255,6 @@ impl AdvisoryKind {
     pub fn as_key(&self) -> &'static str {
         match self {
             AdvisoryKind::ContextCompaction => "context_compaction",
-            AdvisoryKind::GoalContinuation => "goal_continuation",
             AdvisoryKind::CloseoutNudge(reason) => match reason {
                 closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
                 closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
@@ -276,7 +266,6 @@ impl AdvisoryKind {
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "context_compaction" => Some(AdvisoryKind::ContextCompaction),
-            "goal_continuation" => Some(AdvisoryKind::GoalContinuation),
             _ => {
                 let reason = closeout::CloseoutReason::from_key(key.strip_prefix("nudge_")?)?;
                 Some(AdvisoryKind::CloseoutNudge(reason))
@@ -294,7 +283,6 @@ mod advisory_kind_tests {
     fn advisory_kind_keys_round_trip() {
         let all = [
             AdvisoryKind::ContextCompaction,
-            AdvisoryKind::GoalContinuation,
             AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
             AdvisoryKind::CloseoutNudge(CloseoutReason::EmptyAnswer),
         ];
@@ -982,10 +970,6 @@ pub struct TurnPolicy {
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
     pub allow_delegation: bool,
-    /// H-C experiment: WHEN the keep-vs-delegate surface is raised. Default is
-    /// `PlanRegistration`, the shipped behaviour; the other arm exists solely
-    /// so the timing hypothesis can be tested causally.
-    pub delegation_timing: crate::sub_agent::DelegationTiming,
     /// Max sub-agents running at once (within a spawn batch).
     pub max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
@@ -1012,7 +996,6 @@ impl Default for TurnPolicy {
             goal_todo_gate: true,
             progress_guards: true,
             allow_delegation: true,
-            delegation_timing: crate::sub_agent::DelegationTiming::default(),
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
         }
@@ -1098,8 +1081,6 @@ pub struct Executor {
     permission_rules_path: Option<std::path::PathBuf>,
     /// Optional Pre/Post tool hooks (SEC-8).
     hook_runner: leveler_execution::HookRunner,
-    /// Project state dir for durable permission grants (SEC-2); None disables.
-    grants_state_dir: Option<std::path::PathBuf>,
     /// Side-effect barrier: canonical tool events must be durable before a
     /// tool with possible side effects is dispatched. `None` = no durable
     /// host (standalone library use); the loop proceeds without waiting.
@@ -1168,7 +1149,6 @@ impl Executor {
             hook_runner: leveler_execution::HookRunner::empty(
                 leveler_core::environment().current_dir().to_path_buf(),
             ),
-            grants_state_dir: None,
             event_barrier: None,
             compaction_checkpoint: None,
             execution_fence: None,
@@ -1192,18 +1172,6 @@ impl Executor {
     /// Install Pre/Post tool hooks.
     pub fn with_hook_runner(mut self, hooks: leveler_execution::HookRunner) -> Self {
         self.hook_runner = hooks;
-        self
-    }
-
-    /// Enable durable project grants under this state directory.
-    pub fn with_grants_state_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.grants_state_dir = Some(dir.into());
-        self
-    }
-
-    /// Optional durable grants directory (None disables).
-    pub fn with_grants_state_dir_opt(mut self, dir: Option<std::path::PathBuf>) -> Self {
-        self.grants_state_dir = dir;
         self
     }
 
@@ -1498,9 +1466,6 @@ impl Executor {
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
                 allow_delegation: false,
-                // Irrelevant for a child (no offer is ever raised), carried so
-                // the field stays a single source of truth.
-                delegation_timing: self.policy.delegation_timing,
                 // A sub-agent finishes when it goes quiet; only the top-level
                 // run uses explicit goal resolution.
                 goal_mode: false,
@@ -1531,7 +1496,6 @@ impl Executor {
             ),
             permission_rules_path: self.permission_rules_path.clone(),
             hook_runner: self.hook_runner.clone(),
-            grants_state_dir: self.grants_state_dir.clone(),
             // A child shares the parent's barrier: its tool events are
             // recorded on the SAME ordered queue the barrier flushes, so a
             // delegated side effect is as durable-before-execution as a
@@ -1578,13 +1542,6 @@ impl Executor {
     /// Product kill-switch: when false, `spawn_agent` is not in the tool list.
     pub fn with_delegation(mut self, allow: bool) -> Self {
         self.policy.allow_delegation = allow;
-        self
-    }
-
-    /// H-C experiment: when the keep-vs-delegate surface is raised. Leaving
-    /// this unset keeps the shipped `PlanRegistration` behaviour.
-    pub fn with_delegation_timing(mut self, timing: crate::sub_agent::DelegationTiming) -> Self {
-        self.policy.delegation_timing = timing;
         self
     }
 

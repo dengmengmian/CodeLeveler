@@ -83,8 +83,6 @@ pub struct ExecutorFactory {
     pub permission_rules_path: Option<std::path::PathBuf>,
     /// SEC-8 tool hooks (may be empty).
     pub hook_runner: leveler_execution::HookRunner,
-    /// SEC-2 durable grants directory under project state.
-    pub grants_state_dir: Option<std::path::PathBuf>,
     /// Mid-turn user input for the main turn, when the host supplies any.
     /// Sub-agents deliberately do not inherit it (see `Executor::child_for_role_on`).
     pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
@@ -165,7 +163,6 @@ impl ExecutorFactory {
         .with_permission_rules(self.permission_rules.clone())
         .with_permission_rules_path(self.permission_rules_path.clone())
         .with_hook_runner(self.hook_runner.clone())
-        .with_grants_state_dir_opt(self.grants_state_dir.clone())
         .with_steering_opt(self.steering.clone())
         .with_commit_co_author(self.commit_co_author)
         .with_execution_controls(
@@ -180,14 +177,6 @@ impl ExecutorFactory {
         .with_progress_guards(resolved.repeated_read_guard)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
-        // H-C experiment: read from the ablation seam, never a production
-        // field. Absent (the default everywhere) keeps `PlanRegistration`.
-        .with_delegation_timing(
-            self.overrides
-                .as_ref()
-                .and_then(|o| o.delegation_timing)
-                .unwrap_or_default(),
-        )
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 

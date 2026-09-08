@@ -83,11 +83,6 @@ pub struct ExecutionOverrides {
     /// (`ContextSnapshot`), not only when it diverges from the transcript.
     /// Context-cost attribution reads those rows; production never sets it.
     pub context_trace: Option<bool>,
-    /// H-C ablation knob: WHEN the keep-vs-delegate surface is raised. `None`
-    /// (everywhere except a configured experiment) keeps the shipped
-    /// `PlanRegistration`. Measuring delegation timing is an experiment, not a
-    /// configuration — hence this seam rather than a production field.
-    pub delegation_timing: Option<leveler_agent::DelegationTiming>,
 }
 
 /// How this runtime USES a model's context capability (C5-S1). The capability

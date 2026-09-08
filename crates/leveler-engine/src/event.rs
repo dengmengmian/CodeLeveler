@@ -281,9 +281,9 @@ pub enum EngineEvent {
         kind: String,
         detail: String,
     },
-    /// MA-WA1 delegation decision fact (`offered` / `delegated` / `kept`).
-    /// Persisted so a KEEP run is distinguishable from a run where delegation
-    /// was never evaluated. `detail` may carry file paths → LocalOnly.
+    /// Ownership provenance for a child's write scope (`ownership_granted` /
+    /// `ownership_denied`). Persisted so an offline audit can tell an
+    /// authorized write from a bypass. `detail` carries paths → LocalOnly.
     DelegationStage {
         action: String,
         detail: String,
@@ -327,9 +327,8 @@ pub enum EngineEvent {
     ProgressUpdated {
         ledger: leveler_lifecycle::ProgressLedger,
     },
-    /// The supervisor's window-admission control state, as it stands after the
-    /// window that just ended. Durable so a crash inside a goal invocation
-    /// cannot hand the resumed run a clean slate of guards.
+    /// Replay-only: the deleted supervisor's window-control state. Old logs
+    /// carry these rows; nothing writes or reads them anymore.
     WindowStateUpdated {
         state: crate::window::WindowState,
     },
@@ -1346,14 +1345,14 @@ mod contract_tests {
         assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
     }
 
-    /// MA-WA1: DelegationStage is a persisted disposition fact whose `detail`
-    /// may carry file paths — it must replay exactly, never travel beyond the
-    /// local machine, and never be dropped as transient.
+    /// DelegationStage is a persisted ownership fact whose `detail` carries
+    /// file paths — it must replay exactly, never travel beyond the local
+    /// machine, and never be dropped as transient.
     #[test]
     fn delegation_stage_is_persisted_local_only_and_round_trips() {
         let event = EngineEvent::DelegationStage {
-            action: "delegated".to_string(),
-            detail: "src/output, src/cmd/dedup.rs".to_string(),
+            action: "ownership_granted".to_string(),
+            detail: "agent-1: src/output, src/cmd/dedup.rs".to_string(),
         };
         assert!(!event.is_transient());
         assert_eq!(event.data_class(), DataClass::LocalOnly);

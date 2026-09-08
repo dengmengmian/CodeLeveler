@@ -31,8 +31,8 @@ use super::{
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    collect_scoped_paths_from_call, is_pure_observe_call, is_search_tool, is_verification_program,
-    observe_class, push_unique_path, unproven_verification_note,
+    collect_scoped_paths_from_call, is_search_tool, is_verification_program, observe_class,
+    push_unique_path, unproven_verification_note,
 };
 use crate::compaction::{
     COMPACT_KEEP_RECENT, PRUNE_BATCH_BYTES, compact_messages, estimate_tokens,
@@ -49,9 +49,9 @@ use crate::injected_tools::{
 };
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
-    AgentRole, ChildProfile, DelegationDecisionPoint, DelegationRoundAction, MAX_SUB_AGENT_DEPTH,
-    agent_nickname, delegation_decision_request, lost_children_note, multi_agent_steer_hint,
-    new_delegated_agent_id, scopes_overlap, settlement_notice, should_inject_delegation_hint,
+    AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
+    multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
+    should_inject_delegation_hint,
 };
 
 /// One still-running background delegation (V2). The join handle is owned by
@@ -258,12 +258,6 @@ impl Executor {
             context_diverged = true;
         }
         let mut session_approved: HashSet<String> = HashSet::new();
-        if let Some(dir) = &self.grants_state_dir {
-            let file = leveler_execution::load_grants(dir);
-            for sig in leveler_execution::signatures_from_file(&file) {
-                session_approved.insert(sig);
-            }
-        }
         // V2 background delegation state: children the model started with
         // run_in_background (the default). One run-level concurrency semaphore
         // covers foreground batches AND background children; the progress
@@ -312,21 +306,6 @@ impl Executor {
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
         }
-        // MA-WA1: keep-vs-delegate decision point (one offer + at most one
-        // event-driven reconsideration per goal epoch). Eligible only for
-        // top-level runs with delegation on; a prior window's offer and
-        // disposition facts (seeded via ProgressLedger) are never re-asked or
-        // re-recorded.
-        let mut delegation_decision = DelegationDecisionPoint::with_timing(
-            self.policy.allow_delegation && self.depth == 0,
-            crate::sub_agent::DelegationPrior {
-                offered: progress.delegation_decision_offered,
-                kept: progress.delegation_kept_recorded,
-                delegated: progress.delegation_delegated_recorded,
-                reconsidered: progress.delegation_reconsidered,
-            },
-            self.policy.delegation_timing,
-        );
         // Accumulated elevations from approved request_permissions this turn.
         let mut turn_grants = crate::injected_tools::TurnPermissionGrants::default();
         // Leveling: consecutive search calls with no intervening action. Reset
@@ -624,12 +603,6 @@ impl Executor {
             // nudge continue), the model never runs a round blind to a child
             // that already finished.
             settle_finished_children!(round);
-            // Everything in the debt counter NOW is model-visible this round
-            // (the notices are already in `messages`). Debt added later in the
-            // round — a foreground spawn folding mid-batch, a child settling
-            // at the round's end — is invisible until the next model call and
-            // must survive this round's consumption reset.
-            let visible_settlement_debt = progress.unconsumed_child_settlements;
             // The one place that decides whether another main-task model call
             // happens. These six predicates ran inline here, each with its own
             // early return, and every path that wanted another round reached
@@ -1221,9 +1194,6 @@ impl Executor {
             let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
             // spawn_agent calls deferred to run concurrently after this pass.
             let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-            // Successful calls that were not pure observation this round:
-            // the parent acting on model-visible child settlements.
-            let mut non_observe_success_this_round = 0u32;
             // Calls a guard refused before they ran (loop guard, budgets,
             // allowlist, permission). A round consisting solely of refusals is
             // no progress — it feeds the all-refused streak.
@@ -2235,10 +2205,6 @@ impl Executor {
                         snapshot,
                     });
                 }
-                if !is_error && !is_pure_observe_call(&call.name, &call.arguments) {
-                    non_observe_success_this_round =
-                        non_observe_success_this_round.saturating_add(1);
-                }
                 if let Some(part) = image {
                     pending_images.push(part);
                 }
@@ -2275,19 +2241,6 @@ impl Executor {
                                 plan_state = next;
                                 structured_plan_started = true;
                                 metrics.plan_updated += 1;
-                                delegation_decision.note_plan_registered(
-                                    &plan_state
-                                        .steps
-                                        .iter()
-                                        .filter(|s| s.status != "completed")
-                                        .map(|s| s.step.clone())
-                                        .collect::<Vec<_>>(),
-                                    plan_state
-                                        .steps
-                                        .iter()
-                                        .filter(|s| s.status == "completed")
-                                        .count() as u32,
-                                );
                                 observer(AgentEvent::PlanUpdated {
                                     steps: plan_state.steps.clone(),
                                 });
@@ -2356,18 +2309,8 @@ impl Executor {
                 }
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
-                if !is_error && self.registry.mutates_files(&call.name) {
-                    // Same signal the timing experiment gates on: a deliberate
-                    // edit, not a workspace diff.
-                    delegation_decision.note_edit_applied();
-                }
                 if !is_error && call_mutated {
-                    delegation_decision.note_mutation();
                     if !newly_modified.is_empty() {
-                        if self.registry.mutates_files(&call.name) {
-                            non_observe_success_this_round =
-                                non_observe_success_this_round.saturating_add(1);
-                        }
                         verification_ran = false;
                     }
                     // Record what THIS call touched. `newly_modified` is the
@@ -2453,7 +2396,6 @@ impl Executor {
                         }
                     }
                     if !is_error && !job_files.is_empty() {
-                        delegation_decision.note_mutation();
                         verification_ran = false;
                         note_tool_side_effects(
                             &mut ledger,
@@ -2717,7 +2659,6 @@ impl Executor {
                     let role = profile.role;
                     if role == AgentRole::Worker {
                         admitted_worker_scopes.push(files.clone());
-                        delegation_decision.note_worker_admitted(&files);
                     }
                     progress.children_spawned_total += 1;
                     let id = new_delegated_agent_id();
@@ -3003,100 +2944,10 @@ impl Executor {
                 return Err(AgentError::Cancelled);
             }
 
-            // A successful non-observe action this round ran with the round's
-            // MODEL-VISIBLE settlement notices in context — the parent has
-            // acted on those, so exactly that portion of the debt is consumed.
-            // Debt added during this round (foreground folds, this boundary's
-            // settle below) was never seen by a model call and survives.
-            if non_observe_success_this_round > 0 {
-                progress.unconsumed_child_settlements = progress
-                    .unconsumed_child_settlements
-                    .saturating_sub(visible_settlement_debt);
-            }
-
             // V2: forward background children's live progress and settle any
             // that finished — the notice must be in context before the next
             // model round ("you are told when one finishes"; no polling).
             settle_finished_children!(round);
-
-            // MA-WA1: resolve this round's delegation-decision facts. Facts
-            // (`delegated` / `kept`) are durable events only; the offer is one
-            // neutral user message, at most once per goal epoch.
-            for action in delegation_decision.end_round() {
-                match action {
-                    DelegationRoundAction::RecordDelegated(scope) => {
-                        progress.delegation_delegated_recorded = true;
-                        observer(AgentEvent::DelegationStage {
-                            action: "delegated".to_string(),
-                            detail: scope,
-                        });
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
-                    }
-                    DelegationRoundAction::RecordKept => {
-                        progress.delegation_kept_recorded = true;
-                        observer(AgentEvent::DelegationStage {
-                            action: "kept".to_string(),
-                            detail: String::new(),
-                        });
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
-                    }
-                    DelegationRoundAction::Offer {
-                        trigger: "reconsideration",
-                        steps,
-                    } => {
-                        // The one event-driven re-ask: the plan materially
-                        // changed after a kept disposition. Grounded in the
-                        // ledger's first-touch mutation paths — the parent's
-                        // real context boundary, not an inferred scope.
-                        progress.delegation_reconsidered = true;
-                        observer(AgentEvent::DelegationStage {
-                            action: "reoffered".to_string(),
-                            detail: "plan_progress".to_string(),
-                        });
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
-                        let parent_edited: Vec<String> = {
-                            let mut seen = Vec::new();
-                            for m in &ledger.mutations {
-                                for p in &m.paths {
-                                    if !seen.contains(p) {
-                                        seen.push(p.clone());
-                                    }
-                                }
-                            }
-                            seen
-                        };
-                        messages.push(Message::text(
-                            Role::User,
-                            crate::sub_agent::delegation_reconsideration_request(
-                                &steps,
-                                &parent_edited,
-                            ),
-                        ));
-                        context_diverged = true;
-                    }
-                    DelegationRoundAction::Offer { trigger, steps } => {
-                        progress.delegation_decision_offered = true;
-                        observer(AgentEvent::DelegationStage {
-                            action: "offered".to_string(),
-                            detail: trigger.to_string(),
-                        });
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
-                        messages.push(Message::text(
-                            Role::User,
-                            delegation_decision_request(&steps),
-                        ));
-                        context_diverged = true;
-                    }
-                }
-            }
 
             // Plan fully completed → closing phase (a lifecycle fact for the
             // UI and for continuation seeding; nothing is refused for it).
@@ -3455,12 +3306,6 @@ fn fold_child_settlement(
     // travel this way: every model call it made already reached the parent as a
     // record and was folded into the usage projection when it arrived.
     progress.absorb_child_work(&result.progress);
-    // Settlement × continuation seam: every settled result starts as debt the
-    // parent has not acted on. The round loop resets the counter when a round
-    // with the notice model-visible performs a successful non-observe action,
-    // so a nonzero value at a window boundary means a stranded result the
-    // continuation layer must give the parent a bounded window to integrate.
-    progress.unconsumed_child_settlements = progress.unconsumed_child_settlements.saturating_add(1);
     *commands_run = progress.cumulative_commands;
     for path in &result.modified_files {
         if !modified_files.iter().any(|p| p == path) {

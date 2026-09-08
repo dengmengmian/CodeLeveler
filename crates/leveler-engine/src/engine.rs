@@ -61,12 +61,6 @@ pub struct RuntimeTaskSpec {
     /// Optional top-level token/cost/duration limits. Defaults are unlimited.
     /// Evaluation may additionally supply an explicit case-wide round budget.
     pub limits: StepLimits,
-    /// Engine-paced task budget. `Some` means `continuation` is
-    /// `Bounded(base)` owned by the engine: windows continue at the per-turn
-    /// ceiling while rounds remain, and the total grows by `extension` (at most
-    /// `max_extensions` times) only for a segment that landed a source change
-    /// and attempted a close. `None` keeps the pinned budget the caller's.
-    pub round_budget: Option<crate::continuation::TaskRoundBudget>,
 }
 
 /// The Coding-domain half of a task: where the work happens and how its
@@ -101,179 +95,6 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
         continuation: spec.runtime.continuation,
         limits: spec.runtime.limits,
         continues_active_goal: false,
-    }
-}
-
-/// The round policy for the NEXT supervised window. A pinned (bounded) budget
-/// is a task TOTAL: a follow-up window may only consume rounds the epoch has
-/// not already spent — `None` means the total is exhausted and no window may
-/// open, whatever the policy decided (settlement × continuation seam: the
-/// integration window spends the remainder, it never manufactures budget).
-pub(crate) fn continuation_for_next_window(
-    policy: ContinuationPolicy,
-    epoch_rounds_spent: u32,
-) -> Option<ContinuationPolicy> {
-    match policy.round_limit() {
-        Some(total) if epoch_rounds_spent >= total => None,
-        Some(total) => Some(ContinuationPolicy::bounded(total - epoch_rounds_spent)),
-        None => Some(policy),
-    }
-}
-
-/// Fold a continuation turn's outcome into the running aggregate — the ONE
-/// merge that both goal continuation and budget extension use. Rounds, token
-/// spend, and modified files accumulate; the latest turn's text, stop reason,
-/// stop detail, budget exhaustion, and progress ledger replace the previous
-/// ones (epoch spend inside `progress` is already absolute after seeding).
-fn merge_continued_outcome(
-    outcome: &mut leveler_agent::AgentOutcome,
-    continued: leveler_agent::AgentOutcome,
-) {
-    outcome.rounds = outcome.rounds.saturating_add(continued.rounds);
-    outcome.final_text = continued.final_text;
-    outcome.stop_reason = continued.stop_reason;
-    outcome.stop_detail = continued.stop_detail;
-    outcome.budget_exhaustion = continued.budget_exhaustion;
-    outcome.progress = continued.progress;
-    outcome.metrics.model_tokens = outcome
-        .metrics
-        .model_tokens
-        .saturating_add(continued.metrics.model_tokens);
-    outcome.metrics.extra_model_calls = outcome
-        .metrics
-        .extra_model_calls
-        .saturating_add(continued.metrics.extra_model_calls);
-    for path in continued.modified_files {
-        if !outcome.modified_files.contains(&path) {
-            outcome.modified_files.push(path);
-        }
-    }
-}
-
-/// The user-facing terminal lifecycle columns for a finished task. This is
-/// the product interpretation of the report (a passing gate upgrades a mere
-/// "answered" to completed; a failed verification reads as incomplete), moved
-/// here from the app layer so the engine is the single lifecycle writer.
-/// The goal-invocation no-progress window counter update. A window that made
-/// material progress (grew the modified-file set) resets it to 0; one that did
-/// not increments it. `after_turn` stops opening windows once it reaches
-/// `MAX_NO_PROGRESS_WINDOWS`, so a stuck goal converges in a couple of windows
-/// rather than burning the absolute `MAX_SUPERVISED_TURNS` ceiling. Extracted so
-/// the hard-bound termination is unit-testable without a live model.
-/// Window-progress marks from the persisted evidence ledger: (total mutation
-/// operations, does a green verification cover the latest mutations). Absent
-/// or unreadable ledger degrades to zeros — the file-set signal still works,
-/// so a load failure can only under-credit, never spin a goal forever.
-async fn evidence_progress_marks(
-    events: &dyn leveler_storage::EventStore,
-    session_id: &SessionId,
-) -> (u64, bool) {
-    match crate::turn::last_persisted_ledger(events, session_id).await {
-        Ok(Some(ledger)) => (
-            ledger.total_mutation_ops,
-            ledger.has_fresh_successful_verify(),
-        ),
-        _ => (0, false),
-    }
-}
-
-/// What a budget segment is judged by when the task total runs out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct SegmentMarks {
-    /// Mutation records that touched a source path (not a test, not a probe,
-    /// not `node_modules`).
-    pub source_changes: usize,
-    /// Close attempts the mechanical gate refused (`update_goal` intercepts).
-    /// An accepted close ends the task, so this is every attempt that did
-    /// not.
-    pub close_attempts: usize,
-}
-
-/// A path whose change is the task's work rather than its investigation.
-pub(crate) fn is_source_change_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    !(leveler_context::repo_map::is_test(&lower)
-        || lower.contains("__tests__")
-        || lower == "node_modules"
-        || lower.starts_with("node_modules/")
-        || lower.contains("/node_modules/"))
-}
-
-pub(crate) fn segment_marks(ledger: &leveler_lifecycle::EvidenceLedger) -> SegmentMarks {
-    SegmentMarks {
-        source_changes: ledger
-            .mutations
-            .iter()
-            .filter(|m| m.paths.iter().any(|p| is_source_change_path(p)))
-            .count(),
-        close_attempts: ledger
-            .intercepts
-            .iter()
-            .filter(|i| i.kind == "update_goal")
-            .count(),
-    }
-}
-
-/// Did this window end because the task's round total is spent? Two stop
-/// reasons say so: the per-turn ceiling coinciding with the total
-/// (`TurnLimitReached`), and the pinned window limit itself, which the
-/// executor reports as `BudgetExhausted` with no budget dimension — that is
-/// the rounds budget, as opposed to tokens, cost or time, which name theirs.
-pub(crate) fn round_budget_spent(
-    stop_reason: StopReason,
-    exhausted_dimension: bool,
-    cumulative_rounds: u32,
-    total: u32,
-) -> bool {
-    cumulative_rounds >= total
-        && match stop_reason {
-            StopReason::TurnLimitReached => true,
-            StopReason::BudgetExhausted => !exhausted_dimension,
-            _ => false,
-        }
-}
-
-/// Write the supervisor's control state to the log, segment baseline folded
-/// in. The segment lives in a `SegmentMarks` while the loop runs and on the
-/// state when it is at rest — one fact, two shapes, joined here so nothing
-/// else has to know both.
-async fn persist_window_state(
-    log: &EventLog<'_>,
-    state: &crate::window::WindowState,
-    segment: &SegmentMarks,
-    observer: &mut (dyn FnMut(EngineEvent) + Send),
-) -> Result<(), EngineError> {
-    let mut state = *state;
-    state.segment_source_changes = segment.source_changes;
-    state.segment_close_attempts = segment.close_attempts;
-    log.append(None, EngineEvent::WindowStateUpdated { state }, observer)
-        .await
-}
-
-/// The supervisor's control state as the log last recorded it, or a clean
-/// slate when the session has none.
-pub(crate) async fn last_persisted_window_state(
-    events: &dyn leveler_storage::EventStore,
-    session_id: &SessionId,
-) -> crate::window::WindowState {
-    match events
-        .load_last_by_type(session_id, "window_state_updated", None)
-        .await
-    {
-        Ok(Some(row)) => match EngineEvent::from_payload(&row.payload) {
-            Ok(EngineEvent::WindowStateUpdated { state }) => state,
-            // An unreadable row must not be read as "no guards were ever
-            // spent" — but there is nothing better to offer, so say so.
-            _ => {
-                tracing::warn!("window state row could not be read; guards restart clean");
-                crate::window::WindowState::default()
-            }
-        },
-        Ok(None) => crate::window::WindowState::default(),
-        Err(error) => {
-            tracing::warn!(%error, "window state could not be loaded; guards restart clean");
-            crate::window::WindowState::default()
-        }
     }
 }
 
@@ -482,13 +303,9 @@ pub struct TaskReport {
     /// The executor's concrete reason for a non-success stop, when available.
     pub stop_detail: Option<String>,
     pub rounds: u32,
-    /// Work windows this invocation opened for the goal, the first drive
-    /// included. At least 1 for any run that started.
-    ///
-    /// The supervisor's continuation loop is the only thing that knows this,
-    /// and until it was reported the durable `goals.windows_run` had no writer
-    /// at all — the column read zero for a goal that had just spent two full
-    /// windows on the problem.
+    /// Turns this invocation ran for the goal. One: the engine no longer
+    /// opens further windows on the model's behalf, so an invocation is one
+    /// turn. Kept as the writer of the durable `goals.windows_run` count.
     pub windows: u32,
     /// Legacy review findings (unused; kept for report shape stability).
     pub review: Option<Vec<String>>,
@@ -515,8 +332,6 @@ impl TaskReport {
             stop_reason,
             stop_detail: None,
             rounds,
-            // One window unless the supervisor says otherwise: a report is
-            // built from a drive that ran.
             windows: 1,
             review: None,
         }
@@ -559,16 +374,7 @@ pub struct TaskEngine {
     pub factory: ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
-    /// Decides whether a finished turn gets a successor. The engine owns the
-    /// mechanism and the hard bounds; this owns the judgement. `None` uses
-    /// [`DefaultSupervisorPolicy`] (historical behavior).
-    pub supervisor: Option<Arc<dyn crate::SupervisorPolicy>>,
 }
-
-/// Absolute ceiling on supervisor-initiated turns for one task. Policies are
-/// replaceable; this bound is not — it guarantees the supervision loop
-/// terminates even if a policy keeps asking for another turn.
-const MAX_SUPERVISED_TURNS: u32 = 32;
 
 /// [`crate::ContextSummarizer`] backed by the engine's own model runtime:
 /// one bounded, tool-free request over the messages about to be folded.
@@ -603,18 +409,6 @@ impl TaskEngine {
     pub fn with_steering(mut self, source: Option<Arc<dyn leveler_agent::SteeringSource>>) -> Self {
         self.factory.steering = source;
         self
-    }
-
-    /// Install a supervision policy (see [`crate::SupervisorPolicy`]).
-    pub fn with_supervisor(mut self, policy: Arc<dyn crate::SupervisorPolicy>) -> Self {
-        self.supervisor = Some(policy);
-        self
-    }
-
-    fn supervisor_policy(&self) -> Arc<dyn crate::SupervisorPolicy> {
-        self.supervisor
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::DefaultSupervisorPolicy::default()))
     }
 
     /// Commit the canonical terminal event and every session lifecycle column
@@ -1539,8 +1333,9 @@ impl TaskEngine {
         )
         .await
     }
-    /// Continue the direct strategy from a prior transcript: one resume turn,
-    /// then the same verify + bounded repair as a fresh run.
+    /// Continue the direct strategy from a prior transcript — the EXPLICIT
+    /// continuation (`resume`, a caller asking for another turn): one resume
+    /// turn, then the same conclusion as a fresh run.
     async fn resume_direct(
         &self,
         log: &EventLog<'_>,
@@ -1559,29 +1354,11 @@ impl TaskEngine {
                 cancellation.clone(),
             )
             .await?;
-        let (outcome, windows) = self
-            .supervise(
-                log,
-                runner,
-                spec,
-                recorded.outcome,
-                // Continuing an interrupted invocation: the guards it had already
-                // spent are the guards it still has.
-                last_persisted_window_state(runner.stores.events.as_ref(), &runner.session_id)
-                    .await,
-                observer,
-                cancellation.clone(),
-            )
-            .await?;
-        // Stamped once, here: `conclude_direct` reaches a report through
-        // several paths and none of them can see the supervisor's loop.
-        let report = self
-            .conclude_direct(log, runner, spec, outcome, observer, cancellation)
-            .await?;
-        Ok(TaskReport { windows, ..report })
+        self.conclude_direct(log, runner, spec, recorded.outcome, observer, cancellation)
+            .await
     }
 
-    /// The direct strategy: one goal turn, then verify + bounded repair.
+    /// The direct strategy: one goal turn, then mechanical verification.
     async fn run_direct(
         &self,
         log: &EventLog<'_>,
@@ -1614,29 +1391,11 @@ impl TaskEngine {
                 cancellation.clone(),
             )
             .await?;
-        // Epoch spend lives on ProgressLedger inside the drive (seeded across
-        // continue/resume). Do not re-accumulate here — that would double-count.
-        let (outcome, windows) = self
-            .supervise(
-                log,
-                runner,
-                spec,
-                recorded.outcome,
-                // A fresh invocation of the goal is a fresh mandate: the user asked
-                // again, so the convergence guards and the extension quota start
-                // clean. What carries across invocations is the goal record's window
-                // count and the progress ledger's spend, which have their own homes.
-                crate::window::WindowState::default(),
-                observer,
-                cancellation.clone(),
-            )
-            .await?;
-        // Stamped once, here: `conclude_direct` reaches a report through
-        // several paths and none of them can see the supervisor's loop.
-        let report = self
-            .conclude_direct(log, runner, spec, outcome, observer, cancellation)
-            .await?;
-        Ok(TaskReport { windows, ..report })
+        // One turn: where the model stops, or a hard limit stops it, is where
+        // the run ends. Epoch spend lives on ProgressLedger inside the drive
+        // (seeded across explicit resumes); nothing re-accumulates it here.
+        self.conclude_direct(log, runner, spec, recorded.outcome, observer, cancellation)
+            .await
     }
 
     /// Load session messages (prefer snapshot), bound length for Goal injection.
@@ -1674,411 +1433,6 @@ impl TaskEngine {
             )
             .await?;
         Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
-    }
-
-    /// Goal continuity: a quiet turn does not end an unbounded
-    /// goal. Start another persisted turn from the latest model-visible context
-    /// until the model explicitly completes/blocks, the user cancels, or an
-    /// explicit resource limit stops the executor.
-    /// The stalled-goal rule, kept as a named delegate onto the default
-    /// policy so the rule has one implementation and its tests keep pointing
-    /// at the behavior users actually get.
-    #[cfg(test)]
-    pub(crate) fn stalled_goal_may_continue(
-        stop_reason: leveler_agent::StopReason,
-        progress: &leveler_lifecycle::ProgressLedger,
-        caps: leveler_lifecycle::ProgressCaps,
-    ) -> bool {
-        stop_reason == leveler_agent::StopReason::Stalled && progress.allows_engine_continue(caps)
-    }
-
-    /// The ONE supervision loop: after each turn, ask the policy whether the
-    /// task deserves another one and run the mechanism it names. The engine
-    /// keeps every bound — a pinned round budget, the extension cap, the
-    /// absolute [`MAX_SUPERVISED_TURNS`] ceiling, and cancellation — so a
-    /// policy can shorten a run but never make one unbounded.
-    async fn supervise(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        spec: &TaskSpec,
-        mut outcome: leveler_agent::AgentOutcome,
-        // The control state this invocation continues from. A fresh run starts
-        // clean; a resume hands in what the log last recorded, so a crash
-        // inside a goal cannot give the recovered run a full quota of
-        // extensions and a no-progress counter back at zero.
-        mut state: crate::window::WindowState,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: CancellationToken,
-    ) -> Result<(leveler_agent::AgentOutcome, u32), EngineError> {
-        let policy = self.supervisor_policy();
-        let mut limits = spec.runtime.limits;
-        // Engine-paced round budget: the task total the windows below spend,
-        // grown only when the supervisor policy says a segment earned it.
-        // Caller-pinned budgets
-        // (`round_budget: None`) never change.
-        // The task total this invocation is spending. Derived, not stored: it
-        // is the configured base grown by the round extensions the state
-        // already records, so a resume does not start growing it again from
-        // the base it was originally given.
-        let mut round_budget = spec.runtime.continuation;
-        if let (Some(budget), Some(base)) = (spec.runtime.round_budget, round_budget.round_limit())
-            && state.round_extensions > 0
-        {
-            round_budget = ContinuationPolicy::bounded(
-                base.saturating_add(budget.extension.saturating_mul(state.round_extensions)),
-            );
-        }
-        // The segment baseline a round extension is judged against. A resumed
-        // invocation keeps the one it was using; only a first window reads the
-        // ledger for it.
-        let mut segment = if state.window_index > 0 {
-            SegmentMarks {
-                source_changes: state.segment_source_changes,
-                close_attempts: state.segment_close_attempts,
-            }
-        } else {
-            match crate::turn::last_persisted_ledger(
-                runner.stores.events.as_ref(),
-                &runner.session_id,
-            )
-            .await
-            {
-                Ok(Some(ledger)) => segment_marks(&ledger),
-                _ => SegmentMarks::default(),
-            }
-        };
-        // The initial drive is this invocation's first window.
-        state.open_window();
-        let mut progress_mark = outcome.modified_files.len().max(state.progress_files_mark);
-        // R011-F1: the file-set mark alone starved refinement windows (fixing
-        // files already written read as no progress and killed the goal). The
-        // persisted evidence ledger carries two more window-grained signals:
-        // total mutation OPERATIONS (re-edits included) and whether a green
-        // verification now covers the latest mutations. Loaded per window —
-        // windows are rare, so the full-log scan is affordable here.
-        let (ops_seen, fresh_seen) =
-            evidence_progress_marks(runner.stores.events.as_ref(), &runner.session_id).await;
-        // A resumed invocation keeps the baselines it had; a fresh one reads
-        // them off the ledger. Taking the larger of the two can only
-        // under-credit progress, never invent it.
-        let mut ops_mark = ops_seen.max(state.progress_ops_mark);
-        let mut fresh_verify_mark = fresh_seen || state.progress_fresh_verify_mark;
-        // Publish the opening state before any window can be admitted on it:
-        // a crash between here and the first boundary must still find a record
-        // saying this invocation had begun.
-        persist_window_state(log, &state, &segment, observer).await?;
-
-        for _ in 0..MAX_SUPERVISED_TURNS {
-            if cancellation.is_cancelled() {
-                break;
-            }
-            // The segment as it stands now, read before the decision rather
-            // than after it: whether the total was moved is an input to the
-            // question, not a second answer to it.
-            let segment_now = match crate::turn::last_persisted_ledger(
-                runner.stores.events.as_ref(),
-                &runner.session_id,
-            )
-            .await
-            {
-                Ok(Some(ledger)) => segment_marks(&ledger),
-                _ => segment,
-            };
-            let decision = policy.after_turn(&crate::TurnEnded {
-                stop_reason: outcome.stop_reason,
-                stop_detail: outcome.stop_detail.as_deref(),
-                progress: &outcome.progress,
-                budget_exhaustion: outcome.budget_exhaustion.as_ref(),
-                modified_files: &outcome.modified_files,
-                extensions_granted: state.budget_extensions,
-                round_budget,
-                windows_without_progress: state.windows_without_progress,
-                engine_paced: spec.runtime.round_budget.is_some(),
-                segment_advanced: segment_now.source_changes > segment.source_changes
-                    && segment_now.close_attempts > segment.close_attempts,
-                round_extensions_granted: state.round_extensions,
-                task_round_budget: spec.runtime.round_budget,
-            });
-            let continued = match decision {
-                crate::Continuation::Stop => {
-                    // Name why a quiet goal was not nudged again, so the stop
-                    // reads as a decision instead of an unexplained end.
-                    if outcome.stop_reason == StopReason::Stalled && outcome.stop_detail.is_none() {
-                        outcome.stop_detail =
-                            Some("continue suppressed: no-progress cap".to_string());
-                    }
-                    break;
-                }
-                crate::Continuation::ExtendRoundBudget => {
-                    // Mechanical application of a decision already made: grow
-                    // the total by one slice, re-baseline the segment, then
-                    // open the window exactly as `DriveGoalAgain` does.
-                    let Some(budget) = spec.runtime.round_budget else {
-                        break;
-                    };
-                    let Some(total) = round_budget.round_limit() else {
-                        break;
-                    };
-                    state.round_extensions = state.round_extensions.saturating_add(1);
-                    round_budget =
-                        ContinuationPolicy::bounded(total.saturating_add(budget.extension));
-                    segment = segment_now;
-                    observer(EngineEvent::AdvisoryStarted {
-                        kind: format!(
-                            "round_budget_extension:{}/{}:+{}",
-                            state.round_extensions, budget.max_extensions, budget.extension
-                        ),
-                    });
-                    let Some(continuation) = continuation_for_next_window(
-                        round_budget,
-                        outcome.progress.cumulative_rounds,
-                    ) else {
-                        break;
-                    };
-                    self.drive_goal_again(
-                        log,
-                        runner,
-                        spec,
-                        continuation,
-                        &outcome,
-                        observer,
-                        &cancellation,
-                    )
-                    .await?
-                }
-                crate::Continuation::DriveGoalAgain => {
-                    // Engine bound, not policy: a pinned round budget is a task
-                    // TOTAL. The next window may only consume what the epoch
-                    // has not already spent; at zero remainder no window opens,
-                    // whatever the policy asked for.
-                    let Some(continuation) = continuation_for_next_window(
-                        round_budget,
-                        outcome.progress.cumulative_rounds,
-                    ) else {
-                        break;
-                    };
-                    self.drive_goal_again(
-                        log,
-                        runner,
-                        spec,
-                        continuation,
-                        &outcome,
-                        observer,
-                        &cancellation,
-                    )
-                    .await?
-                }
-                crate::Continuation::ExtendBudget(exhaustion) => {
-                    state.budget_extensions = state.budget_extensions.saturating_add(1);
-                    limits = crate::continuation::extended_limits(limits, &exhaustion);
-                    observer(EngineEvent::AdvisoryStarted {
-                        kind: format!(
-                            "budget_extension:{}/{}:{}",
-                            state.budget_extensions,
-                            crate::MAX_EXTENSIONS,
-                            exhaustion.dimension.as_str()
-                        ),
-                    });
-                    match self
-                        .resume_with_limits(log, runner, spec, limits, observer, &cancellation)
-                        .await?
-                    {
-                        Some(continued) => continued,
-                        // Nothing to resume from: stop rather than spin.
-                        None => break,
-                    }
-                }
-            };
-            merge_continued_outcome(&mut outcome, continued);
-            state.open_window();
-            // Effective work this window, from three independent signals:
-            //   1. the modified-file set grew (first-touch writes),
-            //   2. mutation OPERATIONS advanced — refinement of files already
-            //      written counts (R011-F1),
-            //   3. a green verification newly covers the latest mutations
-            //      (a window spent turning red checks green is progress).
-            // Repeated reads/searches and rerunning an already-green check move
-            // none of these, so genuine spinning still hits the cap.
-            let (ops_now, fresh_now) =
-                evidence_progress_marks(runner.stores.events.as_ref(), &runner.session_id).await;
-            let made_progress = outcome.modified_files.len() > progress_mark
-                || ops_now > ops_mark
-                || (fresh_now && !fresh_verify_mark);
-            progress_mark = outcome.modified_files.len();
-            ops_mark = ops_mark.max(ops_now);
-            fresh_verify_mark = fresh_now;
-            state.note_window_progress(made_progress);
-            state.progress_files_mark = progress_mark;
-            state.progress_ops_mark = ops_mark;
-            state.progress_fresh_verify_mark = fresh_verify_mark;
-            // Durable at every window boundary, not only at the end: the
-            // boundary is exactly where a killed process leaves the guards
-            // that decide whether the next window may open.
-            persist_window_state(log, &state, &segment, observer).await?;
-        }
-        Ok((outcome, state.window_index))
-    }
-
-    /// Mechanism for [`crate::Continuation::DriveGoalAgain`]: restate the
-    /// objective over the latest model-visible context and run one more turn.
-    /// `continuation` is the window's round policy — for pinned budgets the
-    /// supervisor passes the REMAINING total, never the original.
-    #[allow(clippy::too_many_arguments)]
-    async fn drive_goal_again(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        spec: &TaskSpec,
-        continuation: ContinuationPolicy,
-        outcome: &leveler_agent::AgentOutcome,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<leveler_agent::AgentOutcome, EngineError> {
-        // Announce BEFORE the transcript load / compaction / model call.
-        // Everything below is invisible work that happens after the user
-        // already read a final answer; without this the status line shows
-        // a bare "waiting for model" for the whole continuation.
-        observer(EngineEvent::AdvisoryStarted {
-            kind: leveler_agent::AdvisoryKind::GoalContinuation
-                .as_key()
-                .to_string(),
-        });
-        let raw = self
-            .load_request_transcript(
-                &runner.session_id,
-                Some("goal transcript during continuation"),
-            )
-            .await?;
-        // Long-goal P3: a window boundary over the fold threshold continues
-        // from a durable checkpoint (fresh or cut here) instead of replaying
-        // the earlier windows' history.
-        let prior = self
-            .assembled_prior(
-                log,
-                &runner.session_id,
-                raw,
-                Some(spec.runtime.goal.as_str()),
-                Some(&spec.coding.repository),
-                cancellation,
-                observer,
-            )
-            .await?;
-        // Full objective restatement — not a vague "Continue…" only. When
-        // the previous drive recorded WHY its closeout stalled, name that
-        // gap so the continuation addresses it instead of repeating the
-        // same summary into the same wall.
-        let closeout_note = outcome
-            .stop_detail
-            .as_deref()
-            .and_then(leveler_agent::closeout::reason_from_stalled_detail)
-            .map(|reason| {
-                format!(
-                    "\n\nThe previous turn's closeout stalled on: {}. Close that specific \
-                     gap first instead of re-stating what was already done.",
-                    reason.as_key()
-                )
-            })
-            .unwrap_or_default();
-        // The budget is the model's to spend, so it is told where it stands:
-        // a pinned total names rounds used and rounds left; an unbounded goal
-        // names rounds used.
-        let budget_note = match continuation.round_limit() {
-            Some(remaining) => format!(
-                " Rounds used so far: {} of {} for this task.",
-                outcome.progress.cumulative_rounds,
-                outcome.progress.cumulative_rounds.saturating_add(remaining)
-            ),
-            None => format!(
-                " Rounds used so far: {}.",
-                outcome.progress.cumulative_rounds
-            ),
-        };
-        let continue_text = format!(
-            "Continue working toward the active goal. The previous turn ended without \
-             proving completion.{closeout_note}{budget_note}\n\n\
-             <objective>\n{}\n</objective>\n\n\
-             Inspect the current workspace, make concrete progress, and call update_goal \
-             only when the full objective is complete or genuinely blocked. Do not \
-             re-audit already finished plan steps with git status thrash.",
-            spec.runtime.goal
-        );
-        let recorded = runner
-            .run_turn(
-                TurnKind::User,
-                TurnProfile::Goal {
-                    continuation,
-                    limits: spec.runtime.limits,
-                    // Same goal, next window. The seeder must carry the
-                    // ledger and plan across; only a NEW goal starts an epoch.
-                    continues_active_goal: true,
-                },
-                TurnInput::Content {
-                    prior,
-                    content: vec![leveler_model::ContentPart::Text {
-                        text: continue_text,
-                    }],
-                },
-                observer,
-                cancellation.clone(),
-            )
-            .await?;
-        Ok(recorded.outcome)
-    }
-
-    /// Mechanism for [`crate::Continuation::ExtendBudget`]: resume the
-    /// transcript with the granted allowance. `None` when there is no
-    /// transcript to resume from.
-    async fn resume_with_limits(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        spec: &TaskSpec,
-        limits: StepLimits,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
-        let raw = self
-            .load_request_transcript(
-                &runner.session_id,
-                Some("transcript during budget extension"),
-            )
-            .await?;
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        // Assembled like every other resumed turn. This used to hand
-        // `TurnInput::Resume` the raw transcript, so a long session resent its
-        // entire history on every budget extension — the one path where a
-        // model request was not bounded by anything.
-        let prior = self
-            .assembled_prior(
-                log,
-                &runner.session_id,
-                raw,
-                Some(spec.runtime.goal.as_str()),
-                Some(&spec.coding.repository),
-                cancellation,
-                observer,
-            )
-            .await?;
-        if prior.is_empty() {
-            return Ok(None);
-        }
-        let recorded = runner
-            .run_turn(
-                TurnKind::User,
-                TurnProfile::Goal {
-                    continuation: spec.runtime.continuation,
-                    limits,
-                    continues_active_goal: false,
-                },
-                TurnInput::Resume(prior),
-                observer,
-                cancellation.clone(),
-            )
-            .await?;
-        Ok(Some(recorded.outcome))
     }
 
     /// Shared tail of fresh and resumed direct runs: map the stop reason,
@@ -2717,283 +2071,8 @@ mod verification_status_tests {
 }
 
 #[cfg(test)]
-mod continue_cap_tests {
+mod terminal_mapping_tests {
     use super::*;
-    use leveler_lifecycle::{ProgressCaps, ProgressLedger};
-
-    #[test]
-    fn stalled_with_no_progress_cap_must_not_auto_continue() {
-        let caps = ProgressCaps::default();
-        let mut progress = ProgressLedger::default();
-        progress.note_no_progress_round(1);
-        progress.note_no_progress_round(2);
-        assert!(
-            !TaskEngine::stalled_goal_may_continue(
-                leveler_agent::StopReason::Stalled,
-                &progress,
-                caps,
-            ),
-            "engine must not open another turn after no-progress cap"
-        );
-    }
-
-    // M-2 — the multi-window loop is hard-bounded. These drive the SAME policy
-    // (`after_turn`) and the SAME counter rule (`WindowState::note_window_progress`)
-    // that `supervise()` uses, in the same order, so the termination guarantee is
-    // exercised deterministically without a live model.
-    fn goal_ended(
-        progress: &ProgressLedger,
-        windows_without_progress: u32,
-    ) -> crate::TurnEnded<'_> {
-        crate::TurnEnded {
-            stop_reason: leveler_agent::StopReason::TurnLimitReached,
-            stop_detail: None,
-            progress,
-            budget_exhaustion: None,
-            modified_files: &[],
-            extensions_granted: 0,
-            round_budget: leveler_agent::ContinuationPolicy::UntilTerminal,
-            windows_without_progress,
-            segment_advanced: false,
-            round_extensions_granted: 0,
-            task_round_budget: None,
-            engine_paced: false,
-        }
-    }
-
-    #[test]
-    fn a_stuck_goal_stops_within_the_no_progress_cap_not_the_hard_bound() {
-        use crate::SupervisorPolicy;
-        use crate::continuation::MAX_NO_PROGRESS_WINDOWS;
-        let policy = crate::DefaultSupervisorPolicy::default();
-        let progress = ProgressLedger {
-            phase: leveler_lifecycle::TurnPhase::Active,
-            closing: false,
-            ..Default::default()
-        };
-        let mut guard = crate::window::WindowState::default();
-        let mut windows_opened = 0u32;
-        let mut stopped = false;
-        // Every window hits the ceiling and grows no files (no material progress).
-        for _ in 0..MAX_SUPERVISED_TURNS {
-            match policy.after_turn(&goal_ended(&progress, guard.windows_without_progress)) {
-                crate::Continuation::Stop => {
-                    stopped = true;
-                    break;
-                }
-                _ => {
-                    windows_opened += 1;
-                    guard.note_window_progress(/*made_progress*/ false);
-                }
-            }
-        }
-        assert!(
-            stopped,
-            "a stuck goal must stop, never reach the {MAX_SUPERVISED_TURNS}-window hard bound"
-        );
-        assert!(
-            windows_opened <= MAX_NO_PROGRESS_WINDOWS,
-            "opened {windows_opened} windows; must converge within the no-progress cap {MAX_NO_PROGRESS_WINDOWS} (< the {MAX_SUPERVISED_TURNS}-window hard bound)"
-        );
-    }
-
-    #[test]
-    fn even_a_progressing_never_completing_goal_is_capped_by_the_hard_bound() {
-        use crate::SupervisorPolicy;
-        let policy = crate::DefaultSupervisorPolicy::default();
-        let progress = ProgressLedger {
-            phase: leveler_lifecycle::TurnPhase::Active,
-            closing: false,
-            ..Default::default()
-        };
-        let mut guard = crate::window::WindowState::default();
-        let mut windows_opened = 0u32;
-        // Every window makes progress (counter resets), so the no-progress cap
-        // never fires — only the absolute MAX_SUPERVISED_TURNS bounds the loop.
-        for _ in 0..MAX_SUPERVISED_TURNS {
-            match policy.after_turn(&goal_ended(&progress, guard.windows_without_progress)) {
-                crate::Continuation::Stop => break,
-                _ => {
-                    windows_opened += 1;
-                    guard.note_window_progress(/*made_progress*/ true);
-                }
-            }
-        }
-        assert_eq!(
-            windows_opened, MAX_SUPERVISED_TURNS,
-            "a progressing goal opens windows up to — and never beyond — the hard bound"
-        );
-    }
-
-    #[test]
-    fn the_next_window_gets_the_remaining_pinned_budget_only() {
-        use leveler_agent::ContinuationPolicy;
-        // ORC-B1 shape: 280 total, first window spent 100 → the integration
-        // window may consume at most the remaining 180.
-        assert_eq!(
-            continuation_for_next_window(ContinuationPolicy::bounded(280), 100),
-            Some(ContinuationPolicy::bounded(180))
-        );
-        // Exhausted total: no window opens, whatever the policy decided.
-        assert_eq!(
-            continuation_for_next_window(ContinuationPolicy::bounded(280), 280),
-            None
-        );
-        assert_eq!(
-            continuation_for_next_window(ContinuationPolicy::bounded(280), 300),
-            None
-        );
-        // Unpinned goals keep their policy untouched.
-        assert_eq!(
-            continuation_for_next_window(ContinuationPolicy::UntilTerminal, 100),
-            Some(ContinuationPolicy::UntilTerminal)
-        );
-    }
-
-    #[test]
-    fn settlement_debt_windows_consume_the_pinned_total_and_terminate() {
-        // Deterministic simulation of the supervise loop for the accident
-        // shape: SAME policy decision (`after_turn`), SAME counter rule
-        // (`WindowState::note_window_progress`), SAME engine clamp
-        // (`continuation_for_next_window`) — a goal whose every window ceilings
-        // with unconsumed settlement debt spends the 280 total exactly, never
-        // more, across clamped windows (100-round local ceiling per window).
-        use crate::SupervisorPolicy;
-        use leveler_agent::ContinuationPolicy;
-        const TOTAL: u32 = 280;
-        const LOCAL_WINDOW: u32 = 100;
-        let policy = crate::DefaultSupervisorPolicy::default();
-        let mut spent = LOCAL_WINDOW; // window 1 hit the local ceiling
-        let mut guard = crate::window::WindowState::default();
-        let mut windows_opened = 0u32;
-        for _ in 0..MAX_SUPERVISED_TURNS {
-            let progress = ProgressLedger {
-                phase: leveler_lifecycle::TurnPhase::Active,
-                closing: false,
-                cumulative_rounds: spent,
-                unconsumed_child_settlements: 1,
-                ..Default::default()
-            };
-            let mut ended = goal_ended(&progress, guard.windows_without_progress);
-            ended.round_budget = ContinuationPolicy::bounded(TOTAL);
-            match policy.after_turn(&ended) {
-                crate::Continuation::Stop => break,
-                crate::Continuation::DriveGoalAgain => {
-                    let Some(next) =
-                        continuation_for_next_window(ContinuationPolicy::bounded(TOTAL), spent)
-                    else {
-                        break;
-                    };
-                    let window = next
-                        .round_limit()
-                        .expect("pinned budgets clamp to a bounded window")
-                        .min(LOCAL_WINDOW);
-                    windows_opened += 1;
-                    spent += window;
-                    // Integration windows move the workspace in this shape.
-                    guard.note_window_progress(/*made_progress*/ true);
-                }
-                other => panic!("unexpected continuation {other:?}"),
-            }
-        }
-        assert!(
-            spent <= TOTAL,
-            "debt windows must never spend past the pinned total (spent {spent})"
-        );
-        assert_eq!(
-            spent, TOTAL,
-            "with debt standing the goal consumes the full remaining budget"
-        );
-        assert_eq!(
-            windows_opened, 2,
-            "280 total / 100 local = two follow-up windows"
-        );
-    }
-
-    #[test]
-    fn stalled_with_fresh_progress_may_continue() {
-        let caps = ProgressCaps::default();
-        let mut progress = ProgressLedger::default();
-        progress.note_progress(1);
-        assert!(TaskEngine::stalled_goal_may_continue(
-            leveler_agent::StopReason::Stalled,
-            &progress,
-            caps,
-        ));
-    }
-
-    #[test]
-    fn non_stalled_never_continues() {
-        let caps = ProgressCaps::default();
-        let progress = ProgressLedger::default();
-        assert!(!TaskEngine::stalled_goal_may_continue(
-            leveler_agent::StopReason::Answered,
-            &progress,
-            caps,
-        ));
-        assert!(!TaskEngine::stalled_goal_may_continue(
-            leveler_agent::StopReason::Incomplete,
-            &progress,
-            caps,
-        ));
-    }
-
-    #[test]
-    fn budget_extension_policy_grants_refuses_and_caps() {
-        use leveler_agent::{
-            BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, StepLimits,
-            budget_extension_allowed, grant_budget_extension, stop_detail_indicates_no_progress,
-        };
-
-        // Grant path: BudgetExhausted + mutation + room under MAX.
-        assert!(budget_extension_allowed(
-            leveler_agent::StopReason::BudgetExhausted,
-            0,
-            true,
-            false
-        ));
-        // Refuse: no real progress.
-        assert!(!budget_extension_allowed(
-            leveler_agent::StopReason::BudgetExhausted,
-            0,
-            false,
-            false
-        ));
-        // Refuse: stagnation / no-progress detail.
-        assert!(stop_detail_indicates_no_progress(Some(
-            "no-progress streak; all-refused rounds short-circuited"
-        )));
-        assert!(!budget_extension_allowed(
-            leveler_agent::StopReason::BudgetExhausted,
-            0,
-            true,
-            true
-        ));
-        // Refuse: absolute round ceiling.
-        assert!(!budget_extension_allowed(
-            leveler_agent::StopReason::TurnLimitReached,
-            0,
-            true,
-            false
-        ));
-        // Cap exhaustion.
-        assert!(!budget_extension_allowed(
-            leveler_agent::StopReason::BudgetExhausted,
-            MAX_BUDGET_EXTENSIONS,
-            true,
-            false
-        ));
-        // Grant raises the fired dimension above spent.
-        let limits = StepLimits {
-            max_model_tokens: Some(100),
-            ..StepLimits::default()
-        };
-        let next = grant_budget_extension(
-            limits,
-            &BudgetExhaustion::new(BudgetDimension::ModelTokens, 100, 100),
-        );
-        assert_eq!(next.max_model_tokens, Some(150));
-    }
 
     /// The session status is read off how the run ended, never off the
     /// verification verdict: a guard-forced Incomplete stop stays Incomplete
@@ -3115,10 +2194,9 @@ pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Opt
     match stop {
         // A declared end: the project's checks run and are reported beside it.
         S::Completed | S::Answered | S::CompletedUnverified | S::CompletedChecksFailed => None,
-        // The round ceiling is a resource boundary, not a model failure. After a
-        // goal has exhausted its bounded work windows (the supervisor already
-        // decided to stop opening more), a ceiling stop is BudgetLimited —
-        // incomplete and resumable — the same class as an exhausted budget.
+        // The round ceiling is a resource boundary, not a model failure: a
+        // ceiling stop is BudgetLimited — incomplete and resumable — the same
+        // class as an exhausted budget.
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
         // The model said the goal cannot be reached as stated.
         S::Blocked => Some(TaskOutcome::Blocked),
@@ -3140,7 +2218,6 @@ mod gate_plan_tests {
                 kind: ExecutionKind::Direct,
                 continuation: ContinuationPolicy::UntilTerminal,
                 limits: StepLimits::default(),
-                round_budget: None,
             },
             coding: CodingTaskSpec {
                 repository,
@@ -3513,92 +2590,5 @@ mod multi_turn_session_tests {
             Some(&progress),
             false
         ));
-    }
-}
-
-#[cfg(test)]
-mod round_budget_tests {
-    use super::{SegmentMarks, is_source_change_path, round_budget_spent};
-    use leveler_agent::StopReason;
-
-    /// exp9/m40: `--max-rounds 40` stopped at 40 as `BudgetExhausted` (the
-    /// pinned window limit), and the extension gate, keyed on
-    /// `TurnLimitReached` only, never looked. Both are "the rounds are spent".
-    #[test]
-    fn the_total_is_spent_by_either_rounds_stop_but_not_by_other_budgets() {
-        assert!(round_budget_spent(
-            StopReason::TurnLimitReached,
-            false,
-            200,
-            200
-        ));
-        assert!(round_budget_spent(
-            StopReason::BudgetExhausted,
-            false,
-            40,
-            40
-        ));
-        // Tokens / cost / time exhaustion names its dimension: not rounds.
-        assert!(!round_budget_spent(
-            StopReason::BudgetExhausted,
-            true,
-            40,
-            40
-        ));
-        // Rounds left, or a different ending: the total is not the reason.
-        assert!(!round_budget_spent(
-            StopReason::BudgetExhausted,
-            false,
-            30,
-            40
-        ));
-        assert!(!round_budget_spent(StopReason::Stalled, false, 40, 40));
-    }
-
-    fn marks(source_changes: usize, close_attempts: usize) -> SegmentMarks {
-        SegmentMarks {
-            source_changes,
-            close_attempts,
-        }
-    }
-
-    /// exp2/f1 and exp7/f1: 300 rounds, probe tests only, never tried to
-    /// close. Neither buys another hundred.
-    ///
-    /// "Did the segment move?" is the fact the engine now hands the supervisor
-    /// as `TurnEnded::segment_advanced`; the cap and the rest of the decision
-    /// live in the policy (see `window_admission_decisions_are_unchanged_by_the_move`).
-    /// What this pins is the fact itself, computed from the two baselines.
-    #[test]
-    fn investigation_alone_is_not_a_segment_that_advanced() {
-        assert!(!segment_advanced(marks(0, 0), marks(0, 0)));
-        // A source change without a close attempt is not enough either: the
-        // extension is for finishing, not for continuing to edit.
-        assert!(!segment_advanced(marks(0, 0), marks(2, 0)));
-        // A close attempt over an unchanged tree is a claim, not work.
-        assert!(!segment_advanced(marks(1, 0), marks(1, 1)));
-    }
-
-    #[test]
-    fn a_segment_that_landed_a_change_and_tried_to_close_advanced() {
-        assert!(segment_advanced(marks(0, 0), marks(1, 1)));
-        assert!(segment_advanced(marks(3, 2), marks(4, 3)));
-    }
-
-    /// The same expression the supervise loop builds, named once so the test
-    /// and the loop cannot drift.
-    fn segment_advanced(before: SegmentMarks, after: SegmentMarks) -> bool {
-        after.source_changes > before.source_changes && after.close_attempts > before.close_attempts
-    }
-
-    #[test]
-    fn source_paths_exclude_tests_probes_and_dependencies() {
-        assert!(is_source_change_path("src/useController.ts"));
-        assert!(is_source_change_path("internal/window/window.go"));
-        assert!(!is_source_change_path("src/__tests__/zz-scratch.test.tsx"));
-        assert!(!is_source_change_path("src/__tests__/helper.tsx"));
-        assert!(!is_source_change_path("internal/window/window_test.go"));
-        assert!(!is_source_change_path("node_modules"));
-        assert!(!is_source_change_path("node_modules/.bin/jest"));
     }
 }

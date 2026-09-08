@@ -97,8 +97,6 @@ pub struct LoadedConfig {
     pub mcp_servers: Vec<leveler_tools::mcp::McpServerConfig>,
     /// Global multi-agent kill-switch default (project config can override).
     pub agents_delegation: bool,
-    /// Multi-agent experiment: delegation offer timing (default shipped).
-    pub agents_offer_timing: leveler_project::OfferTiming,
     /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
 }
@@ -113,7 +111,6 @@ impl Default for LoadedConfig {
             vcs_co_author: true,
             mcp_servers: Vec::new(),
             agents_delegation: true,
-            agents_offer_timing: leveler_project::OfferTiming::default(),
             agents_independent_review: leveler_project::IndependentReview::default(),
         }
     }
@@ -132,14 +129,6 @@ fn combine_independent_review(
     }
 }
 
-/// CLI `--readonly-root` values registered once at process start (before assemble).
-static PROCESS_READONLY_ROOTS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
-
-/// Record extra read-only roots from the CLI (composition root). Safe to call once.
-pub fn set_process_readonly_roots(roots: Vec<std::path::PathBuf>) {
-    let _ = PROCESS_READONLY_ROOTS.set(roots);
-}
-
 /// A fully-assembled application.
 pub struct Application {
     pub layout: Layout,
@@ -152,16 +141,14 @@ pub struct Application {
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
     execution_overrides: Option<leveler_engine::ExecutionOverrides>,
-    /// Extra trees allowed for read-only file tools (cross-repo compare).
-    readonly_roots: Vec<std::path::PathBuf>,
     /// Product work profile (economy / balanced / delivery).
     work_profile: WorkProfile,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
-    /// Engine-paced task budget for headless goal runs (`leveler run`). `None`
-    /// keeps a goal until-terminal; the CLI sets it from `--max-rounds` or the
+    /// Round limit for headless goal runs (`leveler run`). `None` keeps a
+    /// goal until-terminal; the CLI sets it from `--max-rounds` or the
     /// default. Eval and the interactive UI never set it.
-    task_round_budget: Option<leveler_engine::TaskRoundBudget>,
+    task_round_limit: Option<u32>,
     environment: Arc<leveler_core::EnvSnapshot>,
     /// Process-lived background task registry, shared (cloned) into every
     /// engine/turn so `background=true` servers survive between messages. A
@@ -288,7 +275,6 @@ impl Application {
             vcs_co_author: global.vcs_co_author,
             mcp_servers: global.mcp_servers,
             agents_delegation: global.agents_delegation,
-            agents_offer_timing: global.agents_offer_timing,
             agents_independent_review: global.agents_independent_review,
         })
     }
@@ -331,7 +317,6 @@ impl Application {
         })?;
 
         // Project config + env (composition root may read env — AGENTS.md).
-        let readonly_roots = Self::default_readonly_roots(&layout.repo_root);
         let background_tasks = Arc::new(
             leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone()),
         );
@@ -348,10 +333,9 @@ impl Application {
             mcp_tools: Arc::new(tokio::sync::Mutex::new(None)),
             database: Arc::new(tokio::sync::Mutex::new(None)),
             execution_overrides: None,
-            readonly_roots,
             work_profile: WorkProfile::Balanced,
             collaboration: CollaborationMode::Chat,
-            task_round_budget: None,
+            task_round_limit: None,
             environment,
             background_tasks,
             browser,
@@ -384,15 +368,12 @@ impl Application {
     }
 
     /// Engine-paced task budget for headless goal runs, from the CLI's
-    /// `--max-rounds`: absent means the default (200 / +100 / twice), `0`
-    /// means unbounded, `n` means a base of `n` rounds.
+    /// `--max-rounds`: absent means the default ([`DEFAULT_TASK_ROUNDS`]),
+    /// `0` means unbounded, `n` means `n` rounds. A hard limit: the run
+    /// stops there and reports it, nothing extends it.
     pub fn with_task_round_budget(mut self, max_rounds: Option<u32>) -> Self {
-        self.task_round_budget = task_round_budget_from_flag(max_rounds);
+        self.task_round_limit = task_round_limit_from_flag(max_rounds);
         self
-    }
-
-    pub fn task_round_budget(&self) -> Option<leveler_engine::TaskRoundBudget> {
-        self.task_round_budget
     }
 
     pub fn work_profile(&self) -> WorkProfile {
@@ -403,84 +384,9 @@ impl Application {
         self.collaboration
     }
 
-    /// Paths from `.leveler/config.yaml` `readonly_roots` and optional
-    /// `LEVELER_READONLY_ROOTS` (OS path-list separator: `:` on Unix, `;` on Windows).
-    fn default_readonly_roots(repo_root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        if let Some(cfg) = leveler_project::ProjectConfig::load(repo_root) {
-            for entry in cfg.readonly_roots {
-                let p = std::path::PathBuf::from(entry.trim());
-                if p.as_os_str().is_empty() {
-                    continue;
-                }
-                out.push(if p.is_absolute() {
-                    p
-                } else {
-                    repo_root.join(p)
-                });
-            }
-        }
-        if let Ok(raw) = std::env::var("LEVELER_READONLY_ROOTS") {
-            let sep = if cfg!(windows) { ';' } else { ':' };
-            for part in raw.split(sep) {
-                let part = part.trim();
-                if !part.is_empty() {
-                    out.push(std::path::PathBuf::from(part));
-                }
-            }
-        }
-        if let Some(cli) = PROCESS_READONLY_ROOTS.get() {
-            out.extend(cli.iter().cloned());
-        }
-        out
-    }
-
-    /// Extra directories the agent may read (not write). Missing paths are ignored.
-    pub fn with_readonly_roots(
-        mut self,
-        roots: impl IntoIterator<Item = std::path::PathBuf>,
-    ) -> Self {
-        for root in roots {
-            if !self.readonly_roots.iter().any(|r| r == &root) {
-                self.readonly_roots.push(root);
-            }
-        }
-        self
-    }
-
     /// Override the resolved execution policy for every execution path — the
     /// `leveler eval ablate` seam. Use on a freshly assembled Application so
     /// control and ablated runs differ in exactly the flipped knob.
-    /// The ablation seam, plus the H-C delegation-timing knob resolved from
-    /// config (project wins over global; both default to the shipped
-    /// `PlanRegistration`, in which case nothing is set and the seam stays
-    /// exactly as the caller left it).
-    fn execution_overrides_with_delegation_timing(
-        &self,
-    ) -> Option<leveler_engine::ExecutionOverrides> {
-        let configured = match (
-            self.project_config().agents.offer_timing,
-            self.config.agents_offer_timing,
-        ) {
-            (leveler_project::OfferTiming::AfterFirstEdit, _)
-            | (_, leveler_project::OfferTiming::AfterFirstEdit) => {
-                Some(leveler_agent::DelegationTiming::AfterFirstEdit)
-            }
-            _ => None,
-        };
-        match (self.execution_overrides.clone(), configured) {
-            (base, None) => base,
-            (Some(mut base), timing) => {
-                base.delegation_timing = timing;
-                Some(base)
-            }
-            (None, timing) => Some(leveler_engine::ExecutionOverrides {
-                delegation_timing: timing,
-                ..Default::default()
-            }),
-        }
-    }
-
     pub fn with_execution_overrides(
         mut self,
         overrides: leveler_engine::ExecutionOverrides,
@@ -573,8 +479,7 @@ impl Application {
         read_only: bool,
         session_scope: Option<&str>,
     ) -> Result<leveler_engine::TaskEngine, AppError> {
-        let workspace = Workspace::new(&self.layout.repo_root)?
-            .with_readonly_roots(self.readonly_roots.iter().cloned());
+        let workspace = Workspace::new(&self.layout.repo_root)?;
         // The ablation seam (`leveler eval ablate`): overrides reach BOTH
         // consumers — the executor factory's resolver and the tool-context
         // limits — so a run differs from control in exactly the flipped knob.
@@ -646,13 +551,12 @@ impl Application {
                 tool_context,
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
-                overrides: self.execution_overrides_with_delegation_timing(),
+                overrides: self.execution_overrides.clone(),
                 work_profile,
                 memory_index,
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
-                grants_state_dir: Some(self.layout.state_dir.clone()),
                 // Per-session; attached by the caller that knows the session
                 // (see `TaskEngine::with_steering`).
                 steering: None,
@@ -669,7 +573,6 @@ impl Application {
             // Default supervision (goal continuation + bounded budget
             // extension). A host that owns its own pacing installs its policy
             // with `TaskEngine::with_supervisor`.
-            supervisor: None,
         })
     }
 
@@ -831,11 +734,7 @@ impl Application {
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
         request.deny_network = sandbox;
         request.deny_env = provider_secret_env_names(&self.config.providers);
-        let scope = mode.write_scope(&cwd);
-        if scope.confines() {
-            request.extra_read_roots = self.readonly_roots.clone();
-        }
-        request.apply_write_scope(&scope);
+        request.write_scope = mode.write_scope(&cwd);
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
     }
@@ -965,59 +864,46 @@ mod merge_tests {
     }
 }
 
-/// `--max-rounds` → task budget: absent = default, `0` = unbounded, `n` = base n.
-pub fn task_round_budget_from_flag(
-    max_rounds: Option<u32>,
-) -> Option<leveler_engine::TaskRoundBudget> {
+/// The default round limit for `leveler run`. From the C2 batches: every
+/// run that closed did so within 169 rounds.
+pub const DEFAULT_TASK_ROUNDS: u32 = 200;
+
+/// `--max-rounds` → round limit: absent = default, `0` = unbounded, `n` = n.
+pub fn task_round_limit_from_flag(max_rounds: Option<u32>) -> Option<u32> {
     match max_rounds {
-        None => Some(leveler_engine::DEFAULT_TASK_ROUND_BUDGET),
+        None => Some(DEFAULT_TASK_ROUNDS),
         Some(0) => None,
-        Some(base) => Some(leveler_engine::TaskRoundBudget {
-            base,
-            ..leveler_engine::DEFAULT_TASK_ROUND_BUDGET
-        }),
+        Some(n) => Some(n),
     }
 }
 
-/// The continuation a goal runs under for a given task budget: pinned to the
-/// budget's base when the engine paces it, until-terminal otherwise.
-pub fn goal_continuation_for(
-    budget: Option<leveler_engine::TaskRoundBudget>,
-) -> leveler_agent::ContinuationPolicy {
-    match budget {
-        Some(b) => leveler_agent::ContinuationPolicy::bounded(b.base),
+/// The continuation a goal runs under for a given round limit: pinned to the
+/// limit when there is one, until-terminal otherwise.
+pub fn goal_continuation_for(limit: Option<u32>) -> leveler_agent::ContinuationPolicy {
+    match limit {
+        Some(n) => leveler_agent::ContinuationPolicy::bounded(n),
         None => leveler_agent::ContinuationPolicy::UntilTerminal,
     }
 }
 
 #[cfg(test)]
-mod task_round_budget_tests {
-    use super::{goal_continuation_for, task_round_budget_from_flag};
-    use leveler_engine::DEFAULT_TASK_ROUND_BUDGET;
+mod task_round_limit_tests {
+    use super::{DEFAULT_TASK_ROUNDS, goal_continuation_for, task_round_limit_from_flag};
 
     #[test]
-    fn the_flag_maps_to_default_unbounded_or_a_base() {
-        assert_eq!(
-            task_round_budget_from_flag(None),
-            Some(DEFAULT_TASK_ROUND_BUDGET)
-        );
-        assert_eq!(task_round_budget_from_flag(Some(0)), None);
-        let custom = task_round_budget_from_flag(Some(40)).unwrap();
-        assert_eq!(custom.base, 40);
-        assert_eq!(custom.extension, DEFAULT_TASK_ROUND_BUDGET.extension);
-        assert_eq!(
-            custom.max_extensions,
-            DEFAULT_TASK_ROUND_BUDGET.max_extensions
-        );
+    fn the_flag_maps_to_default_unbounded_or_a_limit() {
+        assert_eq!(task_round_limit_from_flag(None), Some(DEFAULT_TASK_ROUNDS));
+        assert_eq!(task_round_limit_from_flag(Some(0)), None);
+        assert_eq!(task_round_limit_from_flag(Some(40)), Some(40));
     }
 
-    /// The bug exp8 ran with: a budget on the spec and an until-terminal
-    /// continuation pinned over it is a budget that never binds.
+    /// The bug exp8 ran with: a limit on the spec and an until-terminal
+    /// continuation pinned over it is a limit that never binds.
     #[test]
-    fn a_budget_pins_the_continuation_to_its_base() {
+    fn a_limit_pins_the_continuation() {
         assert_eq!(
-            goal_continuation_for(Some(DEFAULT_TASK_ROUND_BUDGET)).round_limit(),
-            Some(DEFAULT_TASK_ROUND_BUDGET.base)
+            goal_continuation_for(Some(DEFAULT_TASK_ROUNDS)).round_limit(),
+            Some(DEFAULT_TASK_ROUNDS)
         );
         assert_eq!(goal_continuation_for(None).round_limit(), None);
     }

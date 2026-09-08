@@ -9,8 +9,6 @@ pub mod config;
 pub mod detect;
 pub mod layout;
 
-pub use config::{
-    CommandSpec, IndependentReview, OfferTiming, ProjectConfig, RunLimitsConfig, VerifySpec,
-};
+pub use config::{CommandSpec, IndependentReview, ProjectConfig, RunLimitsConfig, VerifySpec};
 pub use detect::{Language, detect_languages};
 pub use layout::Layout;

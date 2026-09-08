@@ -363,8 +363,8 @@ impl EventBridge {
                 });
             }
             EngineEvent::DelegationStage { action, detail } => {
-                // Durable delegation-disposition fact; surfaced as a light
-                // activity label so a KEEP/DELEGATE outcome is visible live.
+                // Durable ownership-provenance fact; surfaced as a light
+                // activity label so a grant/denial is visible live.
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
                     label: format!("delegation {action}: {detail}"),
                 });
@@ -446,7 +446,6 @@ impl EventBridge {
                 let kind = AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::ContextCompaction);
                 let label = match kind {
                     AdvisoryKind::ContextCompaction => "压缩上下文中…",
-                    AdvisoryKind::GoalContinuation => "目标未确认完成,续跑一轮",
                     AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
@@ -687,7 +686,6 @@ mod bridge_tests {
     fn advisory_started_becomes_a_labeled_activity() {
         for (kind, needle) in [
             (leveler_agent::AdvisoryKind::ContextCompaction, "压缩"),
-            (leveler_agent::AdvisoryKind::GoalContinuation, "续跑"),
             (
                 leveler_agent::AdvisoryKind::CloseoutNudge(
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved,

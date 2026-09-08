@@ -3985,20 +3985,6 @@ async fn child_observability_reconstructs_from_authoritative_events() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ── MA-WA1: keep-vs-delegate decision point + disposition observability ──────
-
-fn delegation_stages(events: &[AgentEvent]) -> Vec<(String, String)> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::DelegationStage { action, detail } => {
-                Some((action.clone(), detail.clone()))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 fn patch_call(id: &str, file: &str, from: &str, to: &str) -> ContentPart {
     tool_call_part(
         id,
@@ -4007,472 +3993,6 @@ fn patch_call(id: &str, file: &str, from: &str, to: &str) -> ContentPart {
             "patch": format!("*** Begin Patch\n*** Update File: {file}\n-{from}\n+{to}\n*** End Patch")
         }),
     )
-}
-
-/// Accident regression (MA-WA1 root defect): once the model registers its own
-/// multi-step decomposition, the harness must raise the one-shot
-/// keep-vs-delegate decision point — and a mutation after the offer with no
-/// Worker records an observable KEEP. Before this repair the harness had no
-/// decision point and a KEEP run left zero trace.
-#[tokio::test]
-async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded() {
-    let dir = tmp("decision-plan", 41);
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![tool_call_part(
-                    "p1",
-                    "update_plan",
-                    serde_json::json!({
-                        "plan": [
-                            {"step": "edit the file", "status": "in_progress"},
-                            {"step": "verify", "status": "pending"}
-                        ]
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![patch_call("e1", "a.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![patch_call("e2", "a.txt", "new", "newer")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("done"),
-        ],
-        Duration::from_millis(1),
-    ));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    );
-    let mut events = Vec::new();
-    executor
-        .run(
-            "improve the file handling",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let stages = delegation_stages(&events);
-    assert_eq!(
-        stages
-            .iter()
-            .filter(|(action, _)| action == "offered")
-            .count(),
-        1,
-        "exactly one decision point: {stages:?}"
-    );
-    assert!(
-        stages
-            .iter()
-            .any(|(action, detail)| action == "offered" && detail == "plan"),
-        "plan registration is the trigger: {stages:?}"
-    );
-    assert_eq!(
-        stages.iter().filter(|(action, _)| action == "kept").count(),
-        1,
-        "first mutation after the offer records KEEP exactly once: {stages:?}"
-    );
-
-    // The offer reaches the model exactly once, after the plan round.
-    let requests = runtime.requests.lock().unwrap();
-    let offer_count_in = |messages: &[Message]| {
-        messages
-            .iter()
-            .filter(|m| {
-                m.role == Role::User
-                    && m.text_content()
-                        .contains("## Background delegation is available")
-            })
-            .count()
-    };
-    assert_eq!(
-        offer_count_in(&requests[0]),
-        0,
-        "no offer before the decomposition exists"
-    );
-    let last = requests.last().unwrap();
-    assert_eq!(
-        offer_count_in(last),
-        1,
-        "the offer is injected once and never repeated"
-    );
-    let offer_text = last
-        .iter()
-        .find(|m| {
-            m.role == Role::User
-                && m.text_content()
-                    .contains("## Background delegation is available")
-        })
-        .unwrap()
-        .text_content();
-    assert!(
-        offer_text.contains("1. edit the file") && offer_text.contains("2. verify"),
-        "the plan-triggered offer enumerates the model's own open steps: {offer_text}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Fallback trigger: a run that never registers a structured plan still gets
-/// exactly one decision point — at its SECOND mutating round (a lone prep
-/// edit leaves room for a plan to land first) — and a later mutation records
-/// KEEP.
-#[tokio::test]
-async fn the_second_mutating_round_is_the_fallback_decision_point_without_a_plan() {
-    let dir = tmp("decision-mutation", 42);
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![patch_call("e1", "a.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![patch_call("e2", "a.txt", "new", "newer")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![patch_call("e3", "a.txt", "newer", "newest")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("done"),
-        ],
-        Duration::from_millis(1),
-    ));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    );
-    let mut events = Vec::new();
-    executor
-        .run(
-            "tweak the file",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let stages = delegation_stages(&events);
-    assert_eq!(
-        stages
-            .iter()
-            .filter(|(action, _)| action == "offered")
-            .count(),
-        1,
-        "{stages:?}"
-    );
-    assert!(
-        stages
-            .iter()
-            .any(|(action, detail)| action == "offered" && detail == "mutation_fallback"),
-        "{stages:?}"
-    );
-    assert_eq!(
-        stages.iter().filter(|(action, _)| action == "kept").count(),
-        1,
-        "{stages:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// MA-WA1 repair accident regression (EB-3 shape), executor level: the offer
-/// lands at plan registration when the tail steps are dependency-blocked →
-/// rational KEEP; the plan then progresses (a step completes, ≥2 bounded
-/// steps remain) — the harness raises exactly ONE reconsideration, grounded
-/// in the parent's own edited paths, records the durable `reoffered` fact,
-/// and never asks again.
-#[tokio::test]
-async fn plan_progress_after_keep_raises_one_reconsideration_with_parent_scope_facts() {
-    let dir = tmp("decision-reconsider", 44);
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            // r1: decomposition on record → offer this round.
-            assistant_with(
-                vec![tool_call_part(
-                    "p1",
-                    "update_plan",
-                    serde_json::json!({
-                        "plan": [
-                            {"step": "implement core", "status": "in_progress"},
-                            {"step": "add regression tests", "status": "pending"},
-                            {"step": "update docs", "status": "pending"}
-                        ]
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // r2: mutation after the visible offer → durable KEEP.
-            assistant_with(
-                vec![patch_call("e1", "a.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            // r3: core completed; two bounded steps remain open → the one
-            // reconsideration fires at this round boundary.
-            assistant_with(
-                vec![tool_call_part(
-                    "p2",
-                    "update_plan",
-                    serde_json::json!({
-                        "plan": [
-                            {"step": "implement core", "status": "completed"},
-                            {"step": "add regression tests", "status": "in_progress"},
-                            {"step": "update docs", "status": "pending"}
-                        ]
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // r4: more progress — must NOT re-ask again.
-            assistant_with(
-                vec![tool_call_part(
-                    "p3",
-                    "update_plan",
-                    serde_json::json!({
-                        "plan": [
-                            {"step": "implement core", "status": "completed"},
-                            {"step": "add regression tests", "status": "completed"},
-                            {"step": "update docs", "status": "in_progress"}
-                        ]
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("done"),
-        ],
-        Duration::from_millis(1),
-    ));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    );
-    let mut events = Vec::new();
-    executor
-        .run(
-            "land the feature",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let stages = delegation_stages(&events);
-    assert_eq!(
-        stages
-            .iter()
-            .filter(|(action, _)| action == "offered")
-            .count(),
-        1,
-        "{stages:?}"
-    );
-    assert_eq!(
-        stages.iter().filter(|(action, _)| action == "kept").count(),
-        1,
-        "{stages:?}"
-    );
-    assert_eq!(
-        stages
-            .iter()
-            .filter(|(action, _)| action == "reoffered")
-            .count(),
-        1,
-        "exactly one event-driven reconsideration: {stages:?}"
-    );
-    assert!(
-        stages
-            .iter()
-            .any(|(action, detail)| action == "reoffered" && detail == "plan_progress"),
-        "{stages:?}"
-    );
-
-    // The durable fact survives into the ledger (resume windows never re-ask).
-    let last_ledger = events
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            AgentEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
-            _ => None,
-        })
-        .expect("progress ledger updates exist");
-    assert!(last_ledger.delegation_reconsidered);
-    assert!(last_ledger.delegation_kept_recorded);
-
-    // The reconsideration reaches the model exactly once, enumerates the
-    // remaining open steps, and grounds independence in the parent's own
-    // edited paths.
-    let requests = runtime.requests.lock().unwrap();
-    let last = requests.last().unwrap();
-    let reconsider_count = last
-        .iter()
-        .filter(|m| {
-            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
-        })
-        .count();
-    assert_eq!(reconsider_count, 1, "one reconsideration, never repeated");
-    let text = last
-        .iter()
-        .find(|m| {
-            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
-        })
-        .unwrap()
-        .text_content();
-    assert!(
-        text.contains("1. add regression tests") && text.contains("2. update docs"),
-        "remaining open steps are enumerated: {text}"
-    );
-    assert!(
-        text.contains("a.txt"),
-        "parent-edited paths ground the boundary: {text}"
-    );
-    // Phase B: the surface states availability and expects no answer —
-    // not calling spawn_agent already IS keeping the work.
-    assert!(
-        text.to_ascii_lowercase().contains("no reply is expected"),
-        "the reconsideration must not demand a disposition: {text}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A spontaneous Worker spawn IS the delegation decision: record `delegated`
-/// with its scope and never raise the offer afterwards (no nagging a model
-/// that already decided).
-#[tokio::test]
-async fn worker_admission_records_a_delegated_disposition_and_suppresses_the_offer() {
-    let dir = tmp("decision-delegate", 43);
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({
-                        "task": "change old to new in a.txt",
-                        "role": "worker",
-                        "files": ["a.txt"]
-                    }),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Worker child: one edit, then reports.
-            assistant_with(
-                vec![patch_call("w1", "a.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("worker: edited a.txt"),
-            // Parent integrates and finishes.
-            assistant_text("integrated the worker result"),
-        ],
-        Duration::from_millis(1),
-    ));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    );
-    let mut events = Vec::new();
-    executor
-        .run(
-            "update the file",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let stages = delegation_stages(&events);
-    assert!(
-        stages
-            .iter()
-            .any(|(action, detail)| action == "delegated" && detail.contains("a.txt")),
-        "{stages:?}"
-    );
-    assert!(
-        stages.iter().all(|(action, _)| action != "offered"),
-        "a model that already delegated must not be offered: {stages:?}"
-    );
-    assert!(
-        stages.iter().all(|(action, _)| action != "kept"),
-        "{stages:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Kill-switch: with delegation off there is no decision point and no
-/// disposition noise at all.
-#[tokio::test]
-async fn no_decision_point_when_delegation_is_disabled() {
-    let dir = tmp("decision-off", 44);
-    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![patch_call("e1", "a.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("done"),
-        ],
-        Duration::from_millis(1),
-    ));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    )
-    .with_delegation(false);
-    let mut events = Vec::new();
-    executor
-        .run(
-            "tweak the file",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        delegation_stages(&events).is_empty(),
-        "no delegation facts when delegation is off"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ── V2 background-first delegation contract ─────────────────────────────────
@@ -5312,12 +4832,11 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Settlement × continuation seam (FA-2 / ORC-B1): a child that settles at the
-/// exit drain — the parent's window closed before it could act on the notice —
-/// must be recorded as UNCONSUMED settlement debt on the progress ledger, so
-/// the continuation layer above can tell a stranded result from a consumed one.
+/// A child that settles at the exit drain — the parent's turn closed before
+/// it could act on the notice — is still drained, not aborted: its work lands
+/// and its notice is persisted for the next explicit turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_settlement_at_the_exit_drain_is_recorded_as_unconsumed_debt() {
+async fn a_settlement_at_the_exit_drain_still_lands() {
     let dir = tmp("bg-debt-strand", 69);
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
@@ -5374,7 +4893,7 @@ async fn a_settlement_at_the_exit_drain_is_recorded_as_unconsumed_debt() {
         ModelRef::new("mock", "m"),
         3,
     );
-    let outcome = executor
+    executor
         .run(
             "delegate then run out of window",
             &mut |_| {},
@@ -5383,13 +4902,8 @@ async fn a_settlement_at_the_exit_drain_is_recorded_as_unconsumed_debt() {
         )
         .await
         .unwrap();
-    // The child's work is real and settled (drained, not aborted) …
+    // The child's work is real and settled (drained, not aborted).
     assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
-    // … and the ledger names it as debt the parent never got to act on.
-    assert_eq!(
-        outcome.progress.unconsumed_child_settlements, 1,
-        "a settlement the parent had no round to act on must read as unconsumed debt"
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6314,9 +5828,9 @@ async fn a_denied_claim_does_not_kill_the_child() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The debt resets once the parent ACTS after the settlement notice became
-/// model-visible — a consumed settlement must not read as debt (and must not
-/// buy a spurious continuation window upstream).
+/// A settlement notice that became model-visible is acted on in the same
+/// turn: the parent integrates the child's result without any runtime
+/// re-drive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settlement_the_parent_acts_on_is_consumed() {
     let dir = tmp("bg-debt-consume", 70);
@@ -6367,7 +5881,7 @@ async fn a_settlement_the_parent_acts_on_is_consumed() {
         ModelRef::new("mock", "m"),
         12,
     );
-    let outcome = executor
+    executor
         .run(
             "delegate, then integrate the result",
             &mut |_| {},
@@ -6380,96 +5894,6 @@ async fn a_settlement_the_parent_acts_on_is_consumed() {
     assert_eq!(
         std::fs::read_to_string(dir.join("a.txt")).unwrap(),
         "parent-integrated\n"
-    );
-    assert_eq!(
-        outcome.progress.unconsumed_child_settlements, 0,
-        "a settlement the parent acted on must not read as debt"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Review 必改A: a FOREGROUND spawn folds mid-batch, so its report is not
-/// model-visible until the NEXT round — a successful sibling tool call in the
-/// same batch must not consume that debt. Only settlements the model already
-/// saw when the round's actions ran are consumable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_foreground_settlement_is_not_consumed_by_same_round_siblings() {
-    let dir = tmp("bg-debt-foreground", 71);
-    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
-    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let runtime = Arc::new(RoutedRuntime::new(
-        vec![
-            // r1: foreground spawn AND a sibling patch in the SAME batch. The
-            // child's report lands as this round's tool result — the model has
-            // not seen it yet; the sibling patch is a non-observe success that
-            // must NOT consume the just-folded settlement.
-            assistant_with(
-                vec![
-                    spawn_call(
-                        "s1",
-                        serde_json::json!({
-                            "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
-                            "role": "worker",
-                            "files": ["b.txt"],
-                            "run_in_background": false
-                        }),
-                    ),
-                    patch_call("e1", "a.txt", "parent", "parent-edited"),
-                ],
-                FinishReason::ToolCalls,
-            ),
-            // r2/r3: observe-only rounds run out the window — the parent never
-            // acts WITH the report in context.
-            assistant_with(
-                vec![tool_call_part(
-                    "r1",
-                    "read_file",
-                    serde_json::json!({"path": "a.txt"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            assistant_with(
-                vec![tool_call_part(
-                    "r2",
-                    "read_file",
-                    serde_json::json!({"path": "a.txt"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-        ],
-        vec![
-            assistant_with(
-                vec![patch_call("w1", "b.txt", "old", "new")],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("child done"),
-        ],
-        CHILD_MARKER,
-        Duration::from_millis(20),
-    ));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        3,
-    );
-    let outcome = executor
-        .run(
-            "delegate in the foreground, then run out of window",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
-    assert_eq!(
-        outcome.progress.unconsumed_child_settlements, 1,
-        "a settlement the model has not seen must survive same-round consumption"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

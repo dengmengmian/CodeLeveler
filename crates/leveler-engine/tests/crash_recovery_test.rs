@@ -162,14 +162,12 @@ async fn harness(
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-            grants_state_dir: None,
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver,
         clarifier: Arc::new(AutoClarify),
-        supervisor: None,
     };
     (engine, db, dir)
 }
@@ -181,7 +179,6 @@ fn direct_spec(dir: &Path) -> TaskSpec {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
-            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir.to_path_buf(),

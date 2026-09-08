@@ -186,14 +186,12 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-            grants_state_dir: None,
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
-        supervisor: None,
     };
     Harness {
         engine,
@@ -702,7 +700,6 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
-            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
@@ -1017,42 +1014,6 @@ async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
 }
 
 #[tokio::test]
-async fn active_goal_automatically_continues_in_a_new_persisted_turn_after_stall() {
-    let h = harness(vec![
-        text("still working 1"),
-        text("still working 2"),
-        text("still working 3"),
-        text("still working 4"),
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "finished after continuation"}),
-        ),
-    ])
-    .await;
-    let spec = spec(&h, VerificationPlan::default());
-    let session = h.engine.create_task(&spec).await.unwrap();
-
-    let report = h
-        .engine
-        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert_eq!(report.outcome, TaskOutcome::Completed);
-    assert_eq!(report.stop_reason, StopReason::Completed);
-    assert_eq!(report.rounds, 5);
-    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
-    assert_eq!(
-        turns
-            .iter()
-            .map(|turn| (turn.kind.as_str(), turn.status.as_str()))
-            .collect::<Vec<_>>(),
-        vec![("user", "completed"), ("user", "completed")]
-    );
-}
-
-#[tokio::test]
 async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
     let h = harness(vec![
         tool_call("c1", "list_files", serde_json::json!({"path": "."})),
@@ -1298,14 +1259,12 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-            grants_state_dir: None,
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
-        supervisor: None,
     };
     let spec2 = TaskSpec {
         runtime: leveler_engine::RuntimeTaskSpec {
@@ -1313,7 +1272,6 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
-            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir2.path().to_path_buf(),
@@ -1358,51 +1316,6 @@ async fn resume_refuses_a_successfully_completed_session() {
         .await
         .expect_err("a finished session must not be re-driven");
     assert!(err.to_string().contains("already completed"), "{err}");
-}
-
-/// The engine's goal continuation (`continue_active_goal`) opens a whole new
-/// turn AFTER the user already saw a final answer. Without an advisory event a
-/// UI can only show a bare "waiting for model" for the entire continuation —
-/// which reads as a hang. Every continuation round must name itself.
-#[tokio::test]
-async fn goal_continuation_announces_itself_before_re_prompting() {
-    // Code change + a real answer, but `update_goal` never called: the closeout
-    // spends its nudge budget on GoalUnresolved and stalls, which is exactly
-    // what drives the engine into a continuation turn.
-    let mut responses = vec![tool_call(
-        "c1",
-        "apply_patch",
-        serde_json::json!({
-            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-        }),
-    )];
-    for _ in 0..8 {
-        responses.push(text("已经改完了。"));
-    }
-    let h = harness(responses).await;
-    let spec = spec(&h, VerificationPlan::default());
-    let session = h.engine.create_task(&spec).await.unwrap();
-
-    let mut seen: Vec<EngineEvent> = Vec::new();
-    // Response exhaustion may end the run in an error; the advisory must have
-    // been emitted before the continuation turn asked the model anything.
-    let _ = h
-        .engine
-        .run(
-            &session,
-            &spec,
-            &mut |e| seen.push(e),
-            CancellationToken::new(),
-        )
-        .await;
-
-    assert!(
-        seen.iter().any(|event| matches!(
-            event,
-            EngineEvent::AdvisoryStarted { kind } if kind == "goal_continuation"
-        )),
-        "a goal continuation turn must announce itself: {seen:?}"
-    );
 }
 
 /// Quiet text without `update_goal` must not read as a successful task finish.
@@ -1462,13 +1375,12 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
     assert_eq!(report.outcome, TaskOutcome::Completed);
 }
 
-/// The supervision decision is injectable: the same stalled script that the
-/// default policy nudges into a second turn produces exactly ONE turn under a
-/// supervisor that never continues. Mechanism stays in the engine; the
-/// judgement is replaceable (convergence plan phase 4/5).
+/// A goal the model lets go quiet ends where the model stopped. The runtime
+/// records the stall; it does not open a second turn on the model's behalf —
+/// the `update_goal` scripted for a fifth response is never reached.
 #[tokio::test]
-async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
-    let mut h = harness(vec![
+async fn a_stalled_goal_ends_after_one_turn() {
+    let h = harness(vec![
         text("still working 1"),
         text("still working 2"),
         text("still working 3"),
@@ -1480,9 +1392,6 @@ async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
         ),
     ])
     .await;
-    h.engine = h
-        .engine
-        .with_supervisor(std::sync::Arc::new(leveler_engine::NoContinuation));
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -1492,13 +1401,13 @@ async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
         .await
         .unwrap();
 
-    // The goal was never resolved, because the supervisor did not re-drive it.
+    // The goal was never resolved, and nothing re-drove it.
     assert_eq!(report.stop_reason, StopReason::Stalled);
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(
         turns.len(),
         1,
-        "a no-continuation supervisor must not open a second turn: {turns:?}"
+        "the runtime must not open a second turn on the model's behalf: {turns:?}"
     );
 }
 
@@ -1601,20 +1510,6 @@ fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
     s
 }
 
-/// An engine-paced task budget (`leveler run`): `base` rounds in total,
-/// spent across windows of `rounds_per_window`, extendable only by
-/// finishing work.
-fn spec_budgeted(h: &Harness, goal: &str, rounds_per_window: u32, base: u32) -> TaskSpec {
-    let mut s = spec_windowed(h, goal, rounds_per_window);
-    s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(base);
-    s.runtime.round_budget = Some(leveler_engine::TaskRoundBudget {
-        base,
-        extension: 2,
-        max_extensions: 1,
-    });
-    s
-}
-
 fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
     tool_call(
         id,
@@ -1625,122 +1520,8 @@ fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
     )
 }
 
-fn patch_update(id: &str, path: &str, old: &str, new: &str) -> ModelResponse {
-    tool_call(
-        id,
-        "apply_patch",
-        serde_json::json!({
-            "patch": format!(
-                "*** Begin Patch\n*** Update File: {path}\n-{old}\n+{new}\n*** End Patch"
-            )
-        }),
-    )
-}
-
 fn read_call_named(id: &str, path: &str) -> ModelResponse {
     tool_call(id, "read_file", serde_json::json!({"path": path}))
-}
-
-/// Refinement windows — real writes to files the goal already touched — are
-/// progress. The goal must survive them and reach its natural finish.
-#[tokio::test]
-async fn refinement_windows_count_as_progress() {
-    let h = harness(vec![
-        // Window 1 (2 rounds): create the file, then read it → round ceiling.
-        patch_add("w1a", "src/feature.rs", "pub fn feature() { /* v1 */ }"),
-        read_call_named("w1b", "src/feature.rs"),
-        // Window 2: REWRITE the same file (no new paths), then read → ceiling.
-        patch_update(
-            "w2a",
-            "src/feature.rs",
-            "pub fn feature() { /* v1 */ }",
-            "pub fn feature() { /* v2 */ }",
-        ),
-        read_call_named("w2b", "src/feature.rs"),
-        // Window 3: rewrite again — still no new paths.
-        patch_update(
-            "w3a",
-            "src/feature.rs",
-            "pub fn feature() { /* v2 */ }",
-            "pub fn feature() { /* v3 */ }",
-        ),
-        read_call_named("w3b", "src/feature.rs"),
-        // Window 4: the model closes the goal out explicitly. (Continued
-        // windows run in goal mode, where bare prose never ends the turn.)
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "refinement done"}),
-        ),
-        // Slack for advisory calls; unused responses are harmless.
-        text("unused"),
-        text("unused"),
-    ])
-    .await;
-    let s = spec_windowed(&h, "add the feature and polish it", 2);
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(
-            report.stop_reason,
-            leveler_agent::StopReason::Completed
-                | leveler_agent::StopReason::Answered
-                | leveler_agent::StopReason::CompletedUnverified
-        ),
-        "three windows of real work must reach the natural finish, not a \
-         no-progress kill; got {:?} ({:?})",
-        report.stop_reason,
-        report.outcome,
-    );
-    let file = std::fs::read_to_string(h.dir.path().join("src/feature.rs")).unwrap();
-    assert!(
-        file.contains("v3"),
-        "every refinement window's write must have landed: {file}"
-    );
-}
-
-/// The counter-guard: windows that only re-observe — no mutation, no
-/// verification advancement — must still terminate the goal.
-#[tokio::test]
-async fn pure_observation_windows_still_terminate() {
-    let h = harness(vec![
-        // Window 1: real work.
-        patch_add("s1", "src/feature.rs", "pub fn feature() {}"),
-        read_call_named("s2", "src/feature.rs"),
-        // Windows 2..: nothing but re-reads. The engine must stop granting
-        // windows once the no-progress cap is hit; extra responses stay unused.
-        read_call_named("s3", "src/feature.rs"),
-        read_call_named("s4", "src/feature.rs"),
-        read_call_named("s5", "src/feature.rs"),
-        read_call_named("s6", "src/feature.rs"),
-        read_call_named("s7", "src/feature.rs"),
-        read_call_named("s8", "src/feature.rs"),
-        text("should never be reached"),
-    ])
-    .await;
-    let s = spec_windowed(&h, "add the feature", 2);
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        report.stop_reason,
-        leveler_agent::StopReason::TurnLimitReached,
-        "pure re-observation must exhaust the no-progress cap, not run forever: {:?}",
-        report.stop_reason
-    );
-    assert!(
-        !report.outcome.is_completed(),
-        "a goal that stopped making progress must not read as success"
-    );
 }
 
 // ── R011-F2 / R013-F1: reviewer reach and observability ─────────────────────
@@ -1905,14 +1686,12 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-            grants_state_dir: None,
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Required,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
-        supervisor: None,
     };
     let s = TaskSpec {
         runtime: leveler_engine::RuntimeTaskSpec {
@@ -1920,7 +1699,6 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
-            round_budget: None,
         },
         coding: leveler_engine::CodingTaskSpec {
             repository: dir.path().to_path_buf(),
@@ -2493,50 +2271,6 @@ async fn recording_the_same_verification_twice_does_not_duplicate_it() {
     );
 }
 
-/// The engine-paced budget is a task total, not a window: a per-turn ceiling
-/// inside it opens the next window (no child settlement needed), and the
-/// total itself is where a goal that only investigated stops — with what it
-/// has, before the close-out it never earned.
-#[tokio::test]
-async fn an_engine_paced_budget_spans_windows_and_stops_at_the_total() {
-    let h = harness(vec![
-        // Window 1 (2 rounds): create a file, then read → ceiling.
-        patch_add("b1", "src/feature.rs", "pub fn feature() {}"),
-        read_call_named("b2", "src/feature.rs"),
-        // Window 2: only reads → ceiling, and the 4-round total is spent.
-        read_call_named("b3", "src/feature.rs"),
-        read_call_named("b4", "src/feature.rs"),
-        // Never reached: no source change + close attempt in the segment, so
-        // no extension; the total is the end.
-        tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
-        ),
-        text("unused"),
-        text("unused"),
-    ])
-    .await;
-    let s = spec_budgeted(&h, "add the feature", 2, 4);
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        report.stop_reason,
-        leveler_agent::StopReason::TurnLimitReached,
-        "the task total is the bound; got {:?} ({:?})",
-        report.stop_reason,
-        report.outcome,
-    );
-    assert_eq!(
-        report.rounds, 4,
-        "two windows of two rounds spend exactly the total"
-    );
-}
-
 /// The harness-launched closure reviewer is a model consumer like any child:
 /// every call it makes is a `model_requests` row under its own agent id, and
 /// its rounds land in the session's persisted progress. Before this, six
@@ -2745,138 +2479,5 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
         "the first round reports no usage at all; the estimate standing in for \
          it is what keeps a token budget binding, and it must stay visible as \
          an estimate rather than blend into the audited total"
-    );
-}
-
-/// A second `TaskEngine` over the same database and workspace: what a restart
-/// after a crash actually has — the durable log, and nothing else.
-fn restarted_engine(h: &Harness, responses: Vec<ModelResponse>) -> TaskEngine {
-    let workspace = Workspace::new(h.dir.path()).unwrap();
-    let tool_context = ToolContext::with_environment(
-        workspace,
-        PermissionProfile::Assisted,
-        Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
-            std::env::current_dir().unwrap_or_default(),
-            std::env::temp_dir(),
-        )),
-    );
-    TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&h.db),
-        // The same runtime identity coming back: ownership is reclaimed, which
-        // is what a restart of this machine's daemon actually looks like.
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
-        factory: ExecutorFactory {
-            runtime: Arc::new(MockRuntime::new(responses)),
-            registry: Arc::new(default_registry()),
-            tool_context,
-            model: ModelRef::new("mock", "m"),
-            commit_co_author: true,
-            overrides: None,
-            work_profile: leveler_agent::WorkProfile::Balanced,
-            memory_index: String::new(),
-            permission_rules: leveler_execution::PermissionRuleSet::default(),
-            permission_rules_path: None,
-            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
-            grants_state_dir: None,
-            steering: None,
-            allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
-        },
-        approver: Arc::new(AutoApprove),
-        clarifier: Arc::new(AutoClarify),
-        supervisor: None,
-    }
-}
-
-/// The window-admission control state as the durable log holds it.
-async fn persisted_window_state(
-    h: &Harness,
-    session: &leveler_core::SessionId,
-) -> serde_json::Value {
-    let rows = leveler_storage::EventRepository::new(&h.db)
-        .load(session)
-        .await
-        .unwrap();
-    rows.iter()
-        .rev()
-        .find_map(|row| {
-            let value: serde_json::Value = serde_json::from_str(&row.payload).ok()?;
-            (value.get("type")?.as_str()? == "window_state_updated")
-                .then(|| value.get("payload")?.get("state").cloned())?
-        })
-        .expect("a run that opened a window records the state that admitted it")
-}
-
-/// RCP-C. The guards that decide whether another window opens survive the
-/// process that was counting them.
-///
-/// They lived in local variables inside the supervision loop, so a runtime
-/// that died mid-goal and came back handed the resumed run a clean slate: full
-/// extension quota, no-progress counter at zero, segment baseline forgotten.
-/// The guards were not merely stale after a crash — they were gone, and
-/// nothing in the recovered state said so.
-#[tokio::test]
-async fn window_admission_guards_survive_a_restart() {
-    // Two windows of two rounds over a four-round total, none of which touches
-    // a file: the convergence guard advances and the total runs out.
-    let h = harness(vec![
-        tool_call("r1", "list_files", serde_json::json!({"path": "."})),
-        tool_call("r2", "list_files", serde_json::json!({"path": "."})),
-        tool_call("r3", "list_files", serde_json::json!({"path": "."})),
-        tool_call("r4", "list_files", serde_json::json!({"path": "."})),
-        text("unused"),
-    ])
-    .await;
-    let s = spec_budgeted(&h, "investigate the layout", 2, 4);
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert!(
-        report.windows >= 2,
-        "the fixture must actually open a second window: {report:?}"
-    );
-    let before = persisted_window_state(&h, &session).await;
-    assert_eq!(
-        before["window_index"].as_u64(),
-        Some(u64::from(report.windows)),
-        "the log's window count must be the one the report carries: {before}"
-    );
-    assert!(
-        before["windows_without_progress"].as_u64().unwrap_or(0) > 0,
-        "windows that touched nothing must have advanced the convergence \
-         guard, or this proves nothing: {before}"
-    );
-
-    // The process dies here. A new one comes back to the same database with
-    // no memory of any of it.
-    let resumed = restarted_engine(
-        &h,
-        vec![
-            tool_call("r5", "list_files", serde_json::json!({"path": "."})),
-            tool_call("r6", "list_files", serde_json::json!({"path": "."})),
-            tool_call("r7", "list_files", serde_json::json!({"path": "."})),
-            text("unused"),
-        ],
-    );
-    resumed
-        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let after = persisted_window_state(&h, &session).await;
-    assert!(
-        after["windows_without_progress"].as_u64().unwrap_or(0)
-            >= before["windows_without_progress"].as_u64().unwrap_or(0),
-        "the restarted run must continue counting from what it was left, not \
-         from zero: before={before}, after={after}"
-    );
-    assert!(
-        after["window_index"].as_u64().unwrap_or(0) > before["window_index"].as_u64().unwrap_or(0),
-        "and it must know which window it is on: before={before}, after={after}"
     );
 }

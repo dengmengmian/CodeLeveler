@@ -326,14 +326,6 @@ pub(crate) fn action_fingerprint(call: &ToolCall) -> String {
     format!("{:x}", digest.finalize())
 }
 
-/// Pure workspace observation (no mutation, no verification).
-///
-/// These calls are collapsed for the identical-result loop guard so swapping
-/// `git status` wrappers does not reset the counter.
-pub(crate) fn is_pure_observe_call(name: &str, arguments: &serde_json::Value) -> bool {
-    observe_class(name, arguments).is_some()
-}
-
 /// Stable observe class for loop-guard fingerprinting.
 ///
 /// `git status` via dedicated tool, `run_command`, or `shell_command` share one

@@ -26,10 +26,7 @@ mod prompt;
 mod sub_agent;
 pub mod usage;
 
-pub use budget::{
-    BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, budget_extension_allowed,
-    grant_budget_extension, stop_detail_indicates_no_progress,
-};
+pub use budget::{BudgetDimension, BudgetExhaustion};
 pub use child_profile::child_profile_trace;
 pub use compaction::{
     COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, PRUNE_BATCH_BYTES,
@@ -50,7 +47,5 @@ pub use leveler_lifecycle::{
     ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TaskContract,
     TurnPhase, WorkProfile, check,
 };
-pub use sub_agent::{ChildResult, ChildStatus, DelegationTiming, SettledChildNotice};
-pub use sub_agent::{
-    multi_agent_steer_hint, should_inject_delegation_hint, task_suggests_delegation,
-};
+pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
+pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

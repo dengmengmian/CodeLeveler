@@ -8,7 +8,6 @@
 
 mod baseline;
 mod checkpoint;
-mod continuation;
 mod engine;
 mod event;
 mod factory;
@@ -34,10 +33,6 @@ pub use event::{
 pub use checkpoint::{
     ProjectedCheckpoint, SemanticRecap, checkpoint_created_event, create_goal_checkpoint,
     project_goal_checkpoint, resume_prior_from_checkpoint,
-};
-pub use continuation::{
-    Continuation, DEFAULT_TASK_ROUND_BUDGET, DefaultSupervisorPolicy, MAX_EXTENSIONS,
-    NoContinuation, SupervisorPolicy, TaskRoundBudget, TurnEnded,
 };
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};

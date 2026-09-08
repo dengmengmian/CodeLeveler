@@ -24,15 +24,12 @@ pub struct ProgressCaps {
     /// Consecutive no-progress rounds (all calls refused, or a quiet goal
     /// drive) before the turn stops.
     pub no_progress_rounds: u32,
-    /// The engine re-drives a stalled goal only while the streak is under this.
-    pub continue_streak_cap: u32,
 }
 
 impl Default for ProgressCaps {
     fn default() -> Self {
         Self {
             no_progress_rounds: 2,
-            continue_streak_cap: 2,
         }
     }
 }
@@ -84,32 +81,6 @@ pub struct ProgressLedger {
     /// Keeps continue/resume from double-counting re-edits of the same file.
     #[serde(default)]
     pub cumulative_modified_paths: Vec<String>,
-    /// MA-WA1: the one-shot keep-vs-delegate decision point was already offered
-    /// this goal epoch. Persisted so continue/resume windows never re-ask
-    /// (no nag loop across windows).
-    #[serde(default)]
-    pub delegation_decision_offered: bool,
-    /// A `kept` disposition fact was already recorded this goal epoch, so
-    /// continue/resume/repair windows do not re-record it (one fact per epoch,
-    /// not one per window).
-    #[serde(default)]
-    pub delegation_kept_recorded: bool,
-    /// A `delegated` disposition fact was already recorded this goal epoch.
-    #[serde(default)]
-    pub delegation_delegated_recorded: bool,
-    /// The one event-driven delegation reconsideration was already raised this
-    /// goal epoch (MA-WA1 repair), so later windows never raise it again.
-    #[serde(default)]
-    pub delegation_reconsidered: bool,
-    /// Settled background-child results whose settlement notice the parent has
-    /// not acted on yet (no successful non-observe call in a round at-or-after
-    /// the notice becoming model-visible). Nonzero at a window boundary is
-    /// material orchestration debt: the continuation layer may open a bounded
-    /// follow-up window while the goal's total round budget still permits it,
-    /// instead of terminalizing with a settled child result stranded
-    /// (settlement × continuation seam — FA-2 / ORC-B1).
-    #[serde(default)]
-    pub unconsumed_child_settlements: u32,
     /// V2 background children still running when this snapshot was taken, as
     /// `id|nickname|role|scope` records. In-process children do not survive a
     /// restart: a resumed run reads this, tells the model truthfully which
@@ -276,10 +247,6 @@ impl ProgressLedger {
         self.no_progress_streak >= caps.no_progress_rounds
     }
 
-    pub fn allows_engine_continue(&self, caps: ProgressCaps) -> bool {
-        self.no_progress_streak < caps.continue_streak_cap && !self.human_boundary_seen()
-    }
-
     /// Record a human explicit denial. Capabilities accumulate for the epoch.
     pub fn record_human_denial(&mut self, network: bool, unrestricted_fs: bool) {
         if network {
@@ -313,7 +280,6 @@ mod tests {
         led2.note_no_progress_round(1);
         led2.note_no_progress_round(2);
         assert!(led2.should_hard_stop_no_progress(caps));
-        assert!(!led2.allows_engine_continue(caps));
     }
 
     #[test]
@@ -337,18 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn human_denial_blocks_engine_continue() {
-        let caps = ProgressCaps::default();
-        let mut led = ProgressLedger::default();
-        assert!(led.allows_engine_continue(caps));
-        led.record_human_denial(false, true);
-        assert!(
-            !led.allows_engine_continue(caps),
-            "supervisor must not DriveGoalAgain past a human no"
-        );
-    }
-
-    #[test]
     fn missing_denial_fields_default_on_old_snapshots() {
         let led: ProgressLedger = serde_json::from_str(
             r#"{"round":0,"last_progress_round":0,"no_progress_streak":0,"closeout_deny_rounds":0,"stagnation_streak":3,"closing":false,"phase":"active","objective_version":0}"#,
@@ -369,7 +323,7 @@ mod tests {
         .unwrap();
         assert_eq!(led.round, 9);
         assert!(led.closing);
-        assert!(led.allows_engine_continue(ProgressCaps::default()) || led.closing);
+        assert_eq!(led.no_progress_streak, 0);
     }
 
     #[test]
@@ -442,14 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn text_only_quiet_streak_blocks_engine_continue() {
+    fn text_only_quiet_rounds_feed_the_hard_stop() {
         let caps = ProgressCaps::default();
         let mut led = ProgressLedger::default();
-        // Goal quiet rounds (no tools, no update_goal) must feed the same streak.
+        // Goal quiet rounds (no tools, no update_goal) feed the same streak
+        // as all-refused rounds: both are mechanical facts about the round.
         led.note_no_progress_round(1);
-        assert!(led.allows_engine_continue(caps));
+        assert!(!led.should_hard_stop_no_progress(caps));
         led.note_no_progress_round(2);
-        assert!(!led.allows_engine_continue(caps));
         assert!(led.should_hard_stop_no_progress(caps));
     }
 }

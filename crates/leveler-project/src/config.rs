@@ -57,12 +57,6 @@ pub struct AgentsConfig {
     /// When false, `spawn_agent` is not advertised. Default true when omitted.
     #[serde(default = "default_true")]
     pub delegation: bool,
-    /// EXPERIMENT KNOB (H-C). When the keep-vs-delegate surface is raised:
-    /// `plan_registration` (default, shipped behaviour) or `after_first_edit`.
-    /// Exists so delegation timing can be tested causally; it changes no
-    /// wording, schema, ownership or settlement rule.
-    #[serde(default)]
-    pub offer_timing: OfferTiming,
     /// Whether the harness launches an independent reviewer at closure.
     /// `off` (default) never launches; `required` launches after any product
     /// mutation. Explicit only — the runtime never infers a review from the
@@ -76,21 +70,9 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             delegation: true,
-            offer_timing: OfferTiming::default(),
             independent_review: IndependentReview::default(),
         }
     }
-}
-
-/// Serialized form of the delegation offer timing (see `AgentsConfig`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OfferTiming {
-    /// Offer as soon as the model registers a decomposition (product default).
-    #[default]
-    PlanRegistration,
-    /// Hold the offer until a file-mutating tool has applied an edit.
-    AfterFirstEdit,
 }
 
 /// Whether the harness launches an independent reviewer (see [`AgentsConfig`]).
@@ -132,10 +114,6 @@ pub struct ProjectConfig {
     /// Extra ignore globs.
     #[serde(default)]
     pub ignore: Vec<String>,
-    /// Additional directories the agent may **read** (absolute or repo-relative).
-    /// Writes remain confined to the primary workspace root.
-    #[serde(default)]
-    pub readonly_roots: Vec<String>,
 }
 
 impl ProjectConfig {

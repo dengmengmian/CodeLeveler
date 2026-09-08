@@ -3895,8 +3895,9 @@ async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Goal text-only stall increments no-progress once per drive so Engine
-/// continue is capped after consecutive stalls.
+/// A goal that goes quiet (text only, no `update_goal`) stalls, and the stall
+/// is recorded as one no-progress tick on the ledger — a fact for the next
+/// explicit turn, not a trigger for an automatic one.
 #[tokio::test]
 async fn goal_text_only_quiet_increments_no_progress_and_stalls() {
     let dir = std::env::temp_dir().join(format!(
@@ -3935,20 +3936,6 @@ async fn goal_text_only_quiet_increments_no_progress_and_stalls() {
         outcome.progress.no_progress_streak, 1,
         "one stalled drive → one no-progress tick: {:?}",
         outcome.progress
-    );
-    assert!(
-        outcome
-            .progress
-            .allows_engine_continue(leveler_lifecycle::ProgressCaps::default()),
-        "first stall may still continue once"
-    );
-
-    // Second stalled drive with seeded streak=1 must hit the continue cap.
-    let mut seeded = outcome.progress.clone();
-    seeded.note_no_progress_round(99);
-    assert!(
-        !seeded.allows_engine_continue(leveler_lifecycle::ProgressCaps::default()),
-        "two consecutive stall ticks block engine continue"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
