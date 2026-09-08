@@ -594,7 +594,7 @@ export type RuntimeEvent =
   | { type: 'context_updated'; candidate_files: string[]; estimated_tokens: number }
   /** The runtime folded conversation history: `from` transcript messages became `to`. A stable product fact — clients own the wording and the locale; the runtime does not send prose for this. */
   | { type: 'context_compacted'; from: number; to: number }
-  /** The context fold threshold climbed one tier on authoritative evidence (adaptive context; production default off). Token budgets, not message counts. `reason` is a stable machine key (e.g. `reread_pressure`). */
+  /** Replay-only. The adaptive-context ladder that climbed the fold threshold was deleted; the variant survives so an old event log still decodes, and nothing emits one. Token budgets, not message counts. */
   | { type: 'context_expanded'; from_tokens: number; reason: string; to_tokens: number }
   /** A user shell execution (`!command`) started. User-originated direct host execution — not an agent tool call; clients render it as its own block and never feed it to the model conversation. */
   | { type: 'user_shell_started'; command: string; cwd: string; execution_id: UserShellId }

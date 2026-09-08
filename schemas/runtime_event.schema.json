@@ -580,7 +580,7 @@
       }
     },
     {
-      "description": "The context fold threshold climbed one tier on authoritative evidence (adaptive context; production default off). Token budgets, not message counts. `reason` is a stable machine key (e.g. `reread_pressure`).",
+      "description": "Replay-only. The adaptive-context ladder that climbed the fold threshold was deleted; the variant survives so an old event log still decodes, and nothing emits one. Token budgets, not message counts.",
       "type": "object",
       "required": [
         "from_tokens",
