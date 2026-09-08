@@ -95,16 +95,16 @@ leveler eval ablate  KNOB --model M --cases DIR [--direct] [--repetitions N] [--
 
 | 要加的能力 | 用现有哪个扩展点 | 是否需要动核心 |
 |-----------|----------------|--------------|
-| 真实大仓 case（ripgrep…） | `EvaluationCase.repo + base_ref`，新增 `evals/scenarios/**/*.yaml` | 否（纯 case） |
+| 真实大仓 case（ripgrep…） | `EvaluationCase.repo + base_ref`，新增 `evals/cases/scenarios/**/*.yaml` | 否（纯 case） |
 | 权限评分 case | 新 `expect` 断言 + 权限 profile；可能需要 case 级 permission 字段 | 视断言方式，可能小改 |
 | TUI 纳入门禁 | 把上述 2 个测试暴露为 `leveler eval` 可触发的一等场景 | 小接线 |
-| 回归集 | `evals/regression/` 目录 + 历史失败 case 固化 | 否（纯 case） |
+| 回归集 | `evals/cases/regression/` 目录 + 历史失败 case 固化 | 否（纯 case） |
 | Agent 质量指标补全 | `EvalReport` 加方法（同 false_completion 的做法） | 否（纯 metric） |
 
 ## 下一步（对应用户分阶段计划）
 
-- Phase 2：`evals/scenarios/{basic_task,debugging,feature,long_context,permission,tui}/` 场景化。
+- Phase 2：`evals/cases/scenarios/{basic_task,debugging,feature,long_context,permission,tui}/` 场景化。
 - Phase 3：ripgrep 固定 commit 接入（`repo` 机制），先只上 ripgrep，tokio/starship 克隆编译过重后置。
 - Phase 4：把 TUI 两套测试提升为门禁一等公民。
 - Phase 6：其余质量指标（verification_rate / recovery_success_rate / permission_violation）。
-- Phase 7：`evals/regression/`。
+- Phase 7：`evals/cases/regression/`。

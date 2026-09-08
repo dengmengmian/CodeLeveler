@@ -1,11 +1,11 @@
 # 评测
 
-两条树，一条原则：**评测是观察层，不给产品加 eval 特殊行为。**
+一棵树（[`evals/`](../../evals/README.md)）、两个入口、一条原则：**评测是观察层，不给产品加 eval 特殊行为。**
 
-| 树 | 职责 |
+| 入口 | 职责 |
 | --- | --- |
-| [`evals/`](../../evals/README.md) + `crates/leveler-eval` | 能力：代码是否做对。独立 `expect`。 |
-| [`evals/`](../../evals/README.md) | 行为：委派决策、offer 时机、安全计数、长任务 EventLog。 |
+| `evals/cases/` + `crates/leveler-eval` | 能力：代码是否做对。独立 `expect`。 |
+| `evals/suites/` + `evals/runner/` | 行为：委派决策、offer 时机、安全计数、长任务 EventLog。 |
 
 Adoption 微评测协议见 [`E004-multi-agent-adoption.md`](E004-multi-agent-adoption.md)。
 

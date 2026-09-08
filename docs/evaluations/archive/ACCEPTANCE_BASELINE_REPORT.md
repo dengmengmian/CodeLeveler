@@ -18,7 +18,7 @@
 ## Phase 4/5 · smoke 基线（真实，已完成）
 
 ```
-tier: quick (3 cases across evals/smoke), mode: orchestrated
+tier: quick (3 cases across evals/cases/smoke), mode: orchestrated
 ✓ go-triple        steps=11 tokens=141186/1457 latency=59337ms  Verified
 ✓ rust-first-even  steps=12 tokens=166242/2741 latency=107343ms Verified
 ✓ rust-mul         steps=7  tokens=86660/957   latency=97712ms  Verified

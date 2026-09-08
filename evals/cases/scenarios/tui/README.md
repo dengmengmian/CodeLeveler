@@ -22,7 +22,7 @@ cargo test -p leveler-tui  --test tui_session_e2e
 
 ## 与质量系统的关系
 
-- 现在：作为 `cargo test` 门禁纳入 CI（见 `AGENT_EVAL_SYSTEM_DESIGN.md` §7 CI 集成）。
+- 现在：作为 `cargo test` 门禁纳入 CI（见 `docs/evaluations/archive/AGENT_EVAL_SYSTEM_DESIGN.md` §7 CI 集成）。
 - 待接（round 2）：把 soak 的"是否达终态 + 轮数 + 有无 hang"折算成 `QualityScore.tui_stability`
   的 0..1 分量（占 10% 权重）。当前该分量为 `None`，按诚实性原则不计入分母，**不以假值充数**。
 

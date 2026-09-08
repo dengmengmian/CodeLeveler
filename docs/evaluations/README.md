@@ -1,11 +1,11 @@
 # Evaluations
 
-Two trees, one rule: **eval observes the product; it does not special-case it.**
+One tree ([`evals/`](../../evals/README.md)), two entry points, one rule: **eval observes the product; it does not special-case it.**
 
-| tree | job |
+| entry point | job |
 | --- | --- |
-| [`evals/`](../../evals/README.md) + `crates/leveler-eval` | Capability: did the agent produce a correct tree? Independent `expect`. |
-| [`evals/`](../../evals/README.md) | Behaviour: delegation decision, timing, safety counters, long-task EventLog. |
+| `evals/cases/` + `crates/leveler-eval` | Capability: did the agent produce a correct tree? Independent `expect`. |
+| `evals/suites/` + `evals/runner/` | Behaviour: delegation decision, timing, safety counters, long-task EventLog. |
 
 Gate map and the adoption micro protocol: [`E004-multi-agent-adoption.md`](E004-multi-agent-adoption.md).
 

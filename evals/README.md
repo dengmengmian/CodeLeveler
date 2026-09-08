@@ -1,20 +1,48 @@
 # Evaluations
 
-CodeLeveler's evaluation harness runs self-contained repository tasks in
-disposable worktrees and checks the result with an independent `expect` command.
-Each YAML case defines the task, starting files, and acceptance command.
+One eval system, two entry points, one rule: **eval observes the product; it
+does not special-case it.** Nothing under `evals/` changes spawn, claim,
+ownership, settlement, prompts, or tool schema. There is no `eval_mode`.
 
-Delegation adoption, offer timing, and EventLog scoring live in the separate
-observer tree [`evals/`](../evals/README.md). That tree does not change product
-runtime. Keep using this directory for capability cases.
+```
+evals/
+  cases/        what is evaluated: capability cases (EvaluationCase YAML)
+  suites/       how each behaviour suite is run: adoption / safety / long-task / multi_agent / …
+  configs/      experiment YAML, one file per <suite>/<experiment>
+  runner/       observer runner (`leveler eval run --suite …` shells here)
+  metrics/      metric contract
+  lib/          EventLog parser, stats, report, JSON schema (lib/schema/)
+  comparative/  CodeLeveler vs other agents (HC-001 / HC-002)
+  scripts/      compare_arms, score_eventlog, selftest
+  tests/        framework unit tests (offline, no model)
+  reports/      generated per experiment (gitignored except README/EXAMPLE)
+  runs/         per-batch isolated LEVELER_HOME + batch.json (gitignored)
+  baselines/    recorded capability results referenced by docs/
+```
 
-## Suites
+| entry point | question | implementation |
+| --- | --- | --- |
+| `leveler eval run --cases evals/cases/<suite>` | Capability: did the agent produce a correct tree? Independent `expect`. | Rust, `crates/leveler-eval` |
+| `leveler eval run --suite <suite> --experiment <id>` | Behaviour: delegation decision, timing, safety counters, long-task EventLog. | Python, `evals/runner/run.py` |
+
+Methodology: `docs/eval-methodology.md`. Gate map: `docs/evaluations/`.
+
+## Capability cases (`cases/`)
+
+Self-contained repository tasks run in disposable worktrees and checked with an
+independent `expect` command. Each YAML case defines the task, starting files,
+and acceptance command.
 
 - `smoke/` — small, fast checks for local development and pull requests.
 - `core/` — Rust, Go, and TypeScript behavior tasks.
 - `hard/` — broader debugging and implementation tasks.
+- `navigation/`, `edit/`, `recovery/`, `context/`, `scale/`, `icg/`,
+  `realtask/`, `realrepo/`, `scenarios/`, `reviewer*/`, `regression/` —
+  focused suites; each directory README states what it discriminates on.
 
-## Run
+`EvaluationCase::load_dir` walks a directory recursively and requires every
+`*.yaml` below it to parse as a case. Keep non-case YAML (configs, suite
+pointers, manifests) out of `cases/`.
 
 ```sh
 # Fast smoke suite
@@ -36,11 +64,42 @@ leveler eval compare \
 
 Use `leveler eval --help` for ablation and repetition options.
 
+## Behaviour experiments (`suites/`, `configs/`, `runner/`)
+
+```sh
+python3 -m unittest discover -s evals/tests -v
+
+# M-3 baseline (task shape, product default)
+leveler eval run --suite adoption --experiment m3-baseline
+
+# Multi-agent value (R005–R010, isolated home, no runtime change)
+leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode single
+leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode multi
+
+# Independent Reviewer vs self-verify (pilot, isolated home)
+leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode self
+leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode reviewer
+
+# Overrides
+leveler eval run \
+  --suite adoption \
+  --experiment m3-baseline \
+  --provider deepseek \
+  --model deepseek-v4-flash \
+  --runs 3 \
+  --output evals/reports/adoption/m3-baseline
+
+# Adoption micro runner without the framework wrapper
+leveler eval adoption-micro run --model deepseek/deepseek-v4-flash --shape parallel
+```
+
+Reports land at `evals/reports/<suite>/<experiment>/report.md`.
+
 ## Result handling
 
-Files under `evals/baselines/` are generated local output and are ignored by
-Git. They can contain model identifiers, prompts, repository paths, timestamps,
-and diagnostic excerpts; inspect them before sharing.
+Files under `evals/baselines/`, `evals/reports/`, and `evals/runs/` are
+generated local output. They can contain model identifiers, prompts, repository
+paths, timestamps, and diagnostic excerpts; inspect them before sharing.
 
 A meaningful comparison should keep the following fixed:
 

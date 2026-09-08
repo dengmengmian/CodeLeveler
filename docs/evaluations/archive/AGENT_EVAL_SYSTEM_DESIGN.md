@@ -27,15 +27,15 @@ evals/history/*.json ──► leveler eval trend ──► REGRESSION_REPORT.md
 
 | 命令 | case 集 | 用途 | 目标耗时 |
 |------|---------|------|---------|
-| `leveler eval quick` | `evals/smoke` | 每次开发前快速验证核心 loop+工具+简单编辑 | <5 min |
-| `leveler eval daily` | `evals/core` + `evals/hard` | 每日回归：debug/feature/refactor/multi-file | 中等 |
-| `leveler eval release` | 全部 + `evals/scenarios`（真实仓） | 发版前完整能力 | 长（20min+） |
+| `leveler eval quick` | `evals/cases/smoke` | 每次开发前快速验证核心 loop+工具+简单编辑 | <5 min |
+| `leveler eval daily` | `evals/cases/core` + `evals/cases/hard` | 每日回归：debug/feature/refactor/multi-file | 中等 |
+| `leveler eval release` | 全部 + `evals/cases/scenarios`（真实仓） | 发版前完整能力 | 长（20min+） |
 
 均为薄封装，复用同一 `run_eval`；退出码：全过=0，否则=1（可作 CI gate）。
 
 ## 三、Scenario 系统（spec §3）
 
-`evals/scenarios/{feature,debugging,refactor,permission,tui,long_context}/`，与其他套件同 schema。
+`evals/cases/scenarios/{feature,debugging,refactor,permission,tui,long_context}/`，与其他套件同 schema。
 每个 case 五要素落在 `EvaluationCase` 上：**task**（自然语言，独立于实现）、**setup**（`repo`/`files`）、
 **execute**（`max_rounds` 内 agent 运行）、**validator**（`expect` 独立命令，非仅 exit code）、
 **metrics**（自动采集，见下）。真实仓由 `scripts/fetch_eval_repos.sh` 按固定 commit 拉取，不入库。

@@ -1,6 +1,6 @@
 # Suite: capability
 
-Not a second harness. Cases live in `evals/` (`smoke`, `core`, `hard`, …).
+Not a second harness. Cases live in `evals/cases/` (`smoke`, `core`, `hard`, …).
 
 ```sh
 leveler eval run --cases evals/cases/smoke --model <model>

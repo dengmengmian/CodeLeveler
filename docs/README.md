@@ -23,7 +23,7 @@
 | [design/CHILD_PROFILE.md](design/CHILD_PROFILE.md) | Contributors | Child capability contract: Explorer / Reviewer / Worker |
 | [BETA_RELEASE_READINESS.md](BETA_RELEASE_READINESS.md) | Maintainers | Beta release gate: blockers, required items, release recommendation |
 | [BETA_BLOCKER_RESOLUTION.md](BETA_BLOCKER_RESOLUTION.md) | Maintainers | How those blockers were closed, and what verification backs each |
-| [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `evals/` |
+| [evaluations/README.md](evaluations/README.md) | Contributors | Eval system: capability cases and behaviour observer under `evals/` |
 | [eval-methodology.md](eval-methodology.md) | Contributors | Adoption vs safety denominators; what counts as a spawn |
 | [MOBILE_UI_UX_CLOSURE.md](MOBILE_UI_UX_CLOSURE.md) | Contributors | Mobile UI/UX closure: workspace, not chat (v1.0) |
 | [MOBILE_UI_UX_CLOSURE.zh-CN.md](MOBILE_UI_UX_CLOSURE.zh-CN.md) | Contributors (中文) | 同上 |

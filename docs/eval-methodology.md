@@ -39,14 +39,14 @@ Record, from EventLog only:
 
 - `ownership_denied` / `ownership_granted` (durable facts; a denial is often a PASS)
 - unauthorized write — only if the runtime recorded it; the harness does not reimplement the fence
-- sandbox escape — existing navigation/sandbox cases under `evals/`, not this adoption set
+- sandbox escape — existing navigation/sandbox cases under `evals/cases/`, not this adoption set
 
 A safety PASS on overlap is “denied and the owner still wrote.” That number
 must never enter P_natural.
 
 ## Capability
 
-Still `evals/` + `leveler eval run --cases …`. Framework config
+Still `evals/cases/` + `leveler eval run --cases …`. Framework config
 `evals/configs/capability/smoke.yaml` only points at that harness.
 
 ## Multi-agent value

@@ -13,7 +13,7 @@
 | **Tool Efficiency**（avg tool calls / case） | `CaseResult::tool_calls` + `EvalReport::avg_tool_calls` | ✅ 持久化 |
 | **Loop Rate**（触发无进展循环守卫的 case 比例） | `CaseResult::loop_guard_trips` + `EvalReport::loop_rate` | ✅ 持久化 |
 | **Validation Rate**（跑过 build/test 的 case 比例） | `CaseResult::verification_ran` + `EvalReport::validation_rate` | ✅ 持久化 |
-| **Scenario 系统** | `evals/scenarios/{feature,debugging,…}/` + `README.md` | ✅ 结构+约定 |
+| **Scenario 系统** | `evals/cases/scenarios/{feature,debugging,…}/` + `README.md` | ✅ 结构+约定 |
 | **真实大仓机制** | `scripts/fetch_eval_repos.sh`（ripgrep@14.1.1）+ `feature/ripgrep-total-count.yaml` | ✅ RED 已验证 |
 | 架构分析 | `evals/CURRENT_EVAL_ARCHITECTURE.md` | ✅ |
 
@@ -53,12 +53,12 @@
 scripts/fetch_eval_repos.sh ripgrep
 
 # 跑场景（换成你配置的模型）
-leveler eval run --cases evals/scenarios/feature --model <provider/model> \
+leveler eval run --cases evals/cases/scenarios/feature --model <provider/model> \
   --json-out evals/baselines/scenarios-feature.json
 
 # 现有套件仍可用
-leveler eval run --cases evals/smoke --model <provider/model>
-leveler eval compare <model_a> <model_b> --cases evals/hard   # 含 Regression Rate
+leveler eval run --cases evals/cases/smoke --model <provider/model>
+leveler eval compare <model_a> <model_b> --cases evals/cases/hard   # 含 Regression Rate
 ```
 
 打印摘要现在含：completion / completion accuracy / **false completion** / avg tool calls / loop rate / validation rate / 失败首因分布 / 跨 repetition 不稳定 case。

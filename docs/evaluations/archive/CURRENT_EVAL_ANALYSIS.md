@@ -28,7 +28,7 @@
 
 ## 扩展点
 
-- 加真实任务 → `evals/scenarios/**` 或 `evals/{core,hard}`（同 schema）。
+- 加真实任务 → `evals/cases/scenarios/**` 或 `evals/{core,hard}`（同 schema）。
 - 加运行透明度指标 → 同 false_completion 做法给 `EvalReport` 加方法（L5）。
 - 结果趋势 → `--json-out evals/history/<commit>.json` + `leveler eval trend`。
 

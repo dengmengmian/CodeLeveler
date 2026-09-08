@@ -27,7 +27,7 @@
 |------|------|------|
 | Eval quick | `leveler eval quick --model deepseek/deepseek-v4-pro` | 真实 orchestrated agent + expect |
 | Eval daily | `leveler eval daily …` | 更宽 case（耗时长） |
-| Regression | `leveler eval run --cases evals/regression` | 失败固化集 |
+| Regression | `leveler eval run --cases evals/cases/regression` | 失败固化集 |
 | TUI soak | `cargo test -p leveler-app --test tui_path_soak` | 客户端路径稳定性（hang=失败） |
 | TUI e2e | `cargo test -p leveler-tui --test tui_session_e2e` | 会话/取消/UI 逻辑 |
 

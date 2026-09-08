@@ -104,7 +104,7 @@
 
 1. 保留 `9e5bfdf` 早期反馈与 TTFF 指标。  
 2. 门禁：`quick` 盯 TTFF&lt;5s + 3/3；`daily` 夜间，接受偶发模型方差。  
-3. 可选：把 `ts-group-by` 放进 `evals/regression/` 做稳定性跟踪。
+3. 可选：把 `ts-group-by` 放进 `evals/cases/regression/` 做稳定性跟踪。
 
 **结论**：两项残留均已完成——**TTFF 主机侧 &lt;5s 可测且实测达标**；**daily 全量在修复后已整轮重跑（27/28，fc 0%，TTFF 全绿）**。
 
