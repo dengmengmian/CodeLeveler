@@ -5,8 +5,7 @@ Desktop Client should inherit. Presentation only. Runtime, protocol,
 EventLog, Observatory semantics, and local-transport EOF are out of
 scope.
 
-Supersedes the rail + four-tab Inspector described in
-`WEB_PRODUCT_UX_CLOSURE.md` and `CURRENT_WEBUI_ANALYSIS.md`.
+Supersedes the earlier rail + four-tab Inspector shell.
 
 ## Desktop Shell
 

@@ -957,8 +957,6 @@ Agent → browser_* tools (leveler-tools)
 - **Permissions:** reuses `RiskLevel`/`ApprovalPolicy` (reads = Safe, actions =
   Network); `browser_navigate` runs the SSRF gate (`web_fetch::is_blocked_ip`).
 
-See `docs/BROWSER_CAPABILITY_ANALYSIS.md` and `docs/BROWSER_CAPABILITY_REPORT.md`.
-
 ---
 
 ## Repository guide

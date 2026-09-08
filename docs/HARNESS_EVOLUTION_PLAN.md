@@ -3,7 +3,7 @@
 > Status: architecture roadmap and decision record  
 > Snapshot date: 2026-08-14  
 > CodeLeveler baseline at snapshot: `f610d1d`  
-> Related docs: [`ARCHITECTURE.md`](ARCHITECTURE.md), [`RUNTIME_EVOLUTION_PLAN.md`](RUNTIME_EVOLUTION_PLAN.md), [`FUTURE_RUNTIME_ARCHITECTURE.md`](FUTURE_RUNTIME_ARCHITECTURE.md), [`multi-agent.md`](multi-agent.md), [`BROWSER_CAPABILITY_REPORT.md`](BROWSER_CAPABILITY_REPORT.md)
+> Related docs: [`ARCHITECTURE.md`](ARCHITECTURE.md), [`RUNTIME_EVOLUTION_PLAN.md`](RUNTIME_EVOLUTION_PLAN.md), [`FUTURE_RUNTIME_ARCHITECTURE.md`](FUTURE_RUNTIME_ARCHITECTURE.md), [`multi-agent.md`](multi-agent.md)
 >
 > Core rule:
 >

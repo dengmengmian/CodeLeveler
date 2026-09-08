@@ -336,9 +336,9 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
             }
             // Tool payloads are JSON/log shaped — brackets, quotes, repeated
             // keys, hex ids — and tokenize far denser than prose: measured
-            // ~2.5–2.9 bytes/token against DeepSeek-reported usage (C5-S2,
-            // docs/C5_S2_MEASUREMENT_CALIBRATION.md), where a flat ÷4
-            // under-counted tool-heavy transcripts by 27–38% and fired
+            // ~2.5–2.9 bytes/token against DeepSeek-reported usage (C5-S2),
+            // where a flat ÷4 under-counted tool-heavy transcripts by
+            // 27–38% and fired
             // compaction only after the request was already oversized.
             // Weighted at 2.5 so the residual error sits on the safe
             // (slightly over-estimating) side.

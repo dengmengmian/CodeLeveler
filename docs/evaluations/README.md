@@ -11,7 +11,7 @@ Gate map and the adoption micro protocol: [`E004-multi-agent-adoption.md`](E004-
 
 Real-usage rounds run the product against third-party repositories. Batches #1
 (`R001–R010`) and #2 are closed and live in the dogfood-control repo; what they
-concluded is in [`BETA_CLOSURE_PROGRAM.md`](../BETA_CLOSURE_PROGRAM.md). The
+concluded is folded into [`../ROADMAP.md`](../ROADMAP.md). The
 next round runs against the **published** `v0.2.0-beta.1` binary rather than a
 `main` checkout: [`REAL_USAGE_BETA_001.md`](REAL_USAGE_BETA_001.md).
 

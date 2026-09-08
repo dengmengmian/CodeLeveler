@@ -17,7 +17,6 @@
 | 远程桥 | `leveler-remote-agent` + `leveler-relay`（CURRENT） |
 | 未来运行时 | [`FUTURE_RUNTIME_ARCHITECTURE.md`](FUTURE_RUNTIME_ARCHITECTURE.md) |
 | 现有 App | `apps/leveler-mobile/` |
-| Web 远程就绪 | [`WEBUI_V2_FINAL_PRODUCT_CLOSURE.md`](WEBUI_V2_FINAL_PRODUCT_CLOSURE.md) § Mobile |
 
 ---
 

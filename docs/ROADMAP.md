@@ -28,9 +28,8 @@ for it.
 
 ## Now — Beta
 
-Gate-by-gate execution lives in
-[`BETA_CLOSURE_PROGRAM.md`](BETA_CLOSURE_PROGRAM.md). The multi-agent portion of
-it is settled and splits in two:
+Gate-by-gate execution is closed. The multi-agent portion of it is settled
+and splits in two:
 
 | area | state | why |
 | --- | --- | --- |
@@ -139,5 +138,3 @@ These are not preferences; each is the product of a measured failure.
 | MA-WA1 closing record and hypothesis elimination | [`evaluations/MA-WA1-FINAL.md`](evaluations/MA-WA1-FINAL.md) |
 | adoption micro-eval protocol | [`evaluations/E004-multi-agent-adoption.md`](evaluations/E004-multi-agent-adoption.md) |
 | Delegation Advisor design | [`design/DELEGATION_ADVISOR_DESIGN.md`](design/DELEGATION_ADVISOR_DESIGN.md) |
-| Beta gate execution | [`BETA_CLOSURE_PROGRAM.md`](BETA_CLOSURE_PROGRAM.md) |
-| multi-agent architecture as shipped | [`MULTI_AGENT_PRODUCT_CLOSURE.md`](MULTI_AGENT_PRODUCT_CLOSURE.md) |

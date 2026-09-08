@@ -8,7 +8,6 @@
 **Document Version:** v2.0  
 **Status:** Proposed  
 **Target:** WebUI + future Desktop Client  
-**Companion:** [`CURRENT_WEBUI_ANALYSIS.md`](CURRENT_WEBUI_ANALYSIS.md)
 
 This is a **constraint document**, not a visual mock. Implementation must
 treat it as the acceptance standard. It does **not** authorize a second

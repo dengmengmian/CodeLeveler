@@ -6,8 +6,7 @@ synthesizes child results. Sub-agents do not talk to each other (star topology).
 
 > Structured child results, role profiles, and a durable findings lifecycle
 > are now shipped on top of the existing `spawn_agent` primitive. Provider
-> seams and continuable children are still **not** implied. See
-> [`MULTI_AGENT_PRODUCT_DESIGN.md`](MULTI_AGENT_PRODUCT_DESIGN.md).
+> seams and continuable children are still **not** implied.
 
 ## When it runs
 

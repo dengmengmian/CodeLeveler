@@ -37,7 +37,7 @@ brief names, and keep every security fence that already works.
 | `Reviewer` | harness only (`run_reviewer_child`) | same registry as Explorer | structurally read-only | 20 rounds | yes |
 
 `ChildProfile::resolve` / `admit` is already the single resolve point the
-2016-era audit (`docs/MULTI_AGENT_EXISTING_ARCHITECTURE.md` §14) asked for.
+earlier multi-agent architecture audit (§14) asked for.
 Admission is honest: an unscoped worker is refused, a read-only role asking for
 `files` is refused, overlapping same-batch worker scopes are refused.
 

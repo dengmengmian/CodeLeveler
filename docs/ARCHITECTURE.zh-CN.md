@@ -858,8 +858,6 @@ Agent → browser_* 工具（leveler-tools）
 - **权限**：复用 `RiskLevel`/`ApprovalPolicy`（读=Safe，动作=Network）；`browser_navigate`
   走 SSRF 门（`web_fetch::is_blocked_ip`）。
 
-见 `docs/BROWSER_CAPABILITY_ANALYSIS.md` 与 `docs/BROWSER_CAPABILITY_REPORT.md`。
-
 ---
 
 ## 仓库导览

@@ -8,8 +8,8 @@ one stresses a different thing the Beta claims to do.
 
 ## Why this is not "Batch #1"
 
-"Real Usage Batch #1" is taken: `R001–R010`, closed, and the evidence base that
-[`BETA_CLOSURE_PROGRAM.md`](../BETA_CLOSURE_PROGRAM.md) derives every gate from
+"Real Usage Batch #1" is taken: `R001–R010`, closed, and the evidence base the
+Beta gates were derived from
 (ledger: `batch-01/BATCH_01_FINAL_FINDING_LEDGER.md` in the dogfood-control
 repo). Batch #2 is closed too. Reusing those IDs would renumber settled history,
 so this round gets its own prefix: **`BR-01` … `BR-06`**.

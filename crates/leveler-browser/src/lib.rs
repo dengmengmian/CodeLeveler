@@ -6,7 +6,7 @@
 //! (Playwright, driven over structured IPC) is only an implementation detail
 //! behind this boundary; nothing outside sees raw protocol frames.
 //!
-//! Design invariants (see `docs/BROWSER_CAPABILITY_ANALYSIS.md`):
+//! Design invariants:
 //! - Semantic snapshot + safe refs are the primary control protocol; a ref
 //!   never silently retargets a lookalike element ([`BrowserError::RefStale`]).
 //! - The runtime is owned by the daemon, survives client disconnect, and lives

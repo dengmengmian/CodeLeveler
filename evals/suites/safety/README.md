@@ -19,5 +19,5 @@ an eval gap.
 Pointers (private control plane + in-repo evals):
 
 - ownership: `$CONTROL_ROOT/ownership-final/cases` (DJ, OV, PF, …)
-- sandbox: `docs/C2_3C_S_EVAL_SANDBOX_INTEGRITY.md` and `evals/` navigation cases
+- sandbox: `evals/cases/navigation/` cases inside the sealed eval sandbox
 - permission: `evals/cases/scenarios/permission/`
