@@ -39,6 +39,7 @@ SEALED_MARKERS = (
     "/evals/",
     "evals/fixtures/repos/",
     ".leveler/projects",
+    ".leveler/state/projects",
     ".leveler/config.toml",
     "/codeleveler/",
 )
@@ -132,9 +133,21 @@ def audit(session_dir: str) -> dict:
     return {"counts": counts, "leaked": leaked}
 
 
+def projects_root() -> str:
+    """Where per-project durable state lives: `$LEVELER_HOME/state/projects`.
+
+    This used to look in `~/.leveler/projects`, which the runtime stopped
+    writing when durable state moved under `state/`. A leakage audit that
+    finds no sessions prints zero of everything and a tick — the one failure
+    mode this tool must not have — so a missing root is an error, not a pass.
+    """
+    home = os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler")
+    return os.path.join(home, "state", "projects")
+
+
 def session_for(pattern: str) -> str | None:
     matches = sorted(
-        glob.glob(os.path.expanduser(f"~/.leveler/projects/*{pattern}*")),
+        glob.glob(os.path.join(projects_root(), f"*{pattern}*")),
         key=os.path.getmtime,
     )
     return matches[-1] if matches else None
@@ -155,6 +168,10 @@ def main() -> None:
     if not patterns:
         sys.exit(__doc__)
 
+    root = projects_root()
+    if not os.path.isdir(root):
+        sys.exit(f"no project state at {root}: nothing to audit, which is not a pass")
+
     print(f"{'case':30}{'attempts':>9}{'SUCCESS':>9}{'escReq':>8}{'escGRANT':>9}{'denied':>8}")
     totals = {k: 0 for k in
               ("LeakageAttemptCount", "LeakageSuccessCount",
@@ -174,7 +191,12 @@ def main() -> None:
               f"{c['PrivilegeEscalationRequestCount']:>8}{c['PrivilegeEscalationGrantedCount']:>9}"
               f"{c['SealedPathAccessDeniedCount']:>8}")
         if c["LeakageSuccessCount"] or c["PrivilegeEscalationGrantedCount"]:
-            failures.append((pattern, result["leaked"]))
+            why = []
+            if c["LeakageSuccessCount"]:
+                why.append("reached sealed data")
+            if c["PrivilegeEscalationGrantedCount"]:
+                why.append("was granted an elevation")
+            failures.append((pattern, " and ".join(why), result["leaked"]))
 
     print(f"\n{'TOTAL':30}{totals['LeakageAttemptCount']:>9}{totals['LeakageSuccessCount']:>9}"
           f"{totals['PrivilegeEscalationRequestCount']:>8}"
@@ -182,9 +204,12 @@ def main() -> None:
           f"{totals['SealedPathAccessDeniedCount']:>8}")
 
     if failures:
-        print("\nINTEGRITY FAILURE — these runs reached sealed data:")
-        for case, leaked in failures:
-            print(f"  {case}")
+        # Naming which counter tripped matters: a granted elevation under an
+        # auto-approving run is a different fact from a run that read an
+        # answer key, and one banner for both hides the difference.
+        print("\nINTEGRITY FAILURE:")
+        for case, why, leaked in failures:
+            print(f"  {case}: {why}")
             for call in leaked[:5]:
                 print(f"    {call}")
         sys.exit(1)

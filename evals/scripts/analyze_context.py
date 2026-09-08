@@ -33,6 +33,17 @@ import os
 import sqlite3
 import sys
 
+def _projects_root() -> str:
+    """`$LEVELER_HOME/state/projects` — where per-project durable state lives.
+
+    Not `~/.leveler/projects`: durable state moved under `state/`, and an
+    analyzer pointed at the old path silently finds no sessions and reports
+    nothing rather than saying it looked in the wrong place.
+    """
+    home = os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler")
+    return os.path.join(home, "state", "projects")
+
+
 IMAGE_BYTE_EQUIV = 4096
 
 READ_TOOLS = {"read_file", "read_symbol"}
@@ -66,7 +77,7 @@ def estimate(text: str) -> int:
 
 def load(pattern: str):
     matches = sorted(
-        glob.glob(os.path.expanduser(f"~/.leveler/projects/*{pattern}*")),
+        glob.glob(os.path.join(_projects_root(), f"*{pattern}*")),
         key=os.path.getmtime,
     )
     if not matches:

@@ -40,6 +40,17 @@ import sys
 
 import yaml
 
+def _projects_root() -> str:
+    """`$LEVELER_HOME/state/projects` — where per-project durable state lives.
+
+    Not `~/.leveler/projects`: durable state moved under `state/`, and an
+    analyzer pointed at the old path silently finds no sessions and reports
+    nothing rather than saying it looked in the wrong place.
+    """
+    home = os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler")
+    return os.path.join(home, "state", "projects")
+
+
 READ_TOOLS = {"read_file", "read_symbol"}
 NUMBERED = re.compile(r"^\s*(\d+)\t", re.M)
 TRUNCATION = "… [truncated"
@@ -68,7 +79,7 @@ def arguments_of(raw):
 
 def session_for(case_id: str) -> str | None:
     matches = sorted(
-        glob.glob(os.path.expanduser(f"~/.leveler/projects/*{case_id}*")),
+        glob.glob(os.path.join(_projects_root(), f"*{case_id}*")),
         key=os.path.getmtime,
     )
     return matches[-1] if matches else None

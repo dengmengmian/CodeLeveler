@@ -121,3 +121,10 @@ The unified dogfood run is deferred at the user's request until the eval tree
 reorganisation settles. Until it runs, this wave is verified by the engineering
 gate only: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 --all-features -D warnings`, and `cargo test --workspace`.
+
+*Update:* the eval tree reorganisation landed with the agent-kernel work, and a
+structural dogfood ran against a real model at that point — ordinary edits,
+cross-module navigation, a long task, an honest block, delegation with disjoint
+write ownership, and a one-shot command elevation. A *unified* dogfood
+acceptance still has no suite and no oracle defined anywhere in this
+repository, so it remains not done rather than passed.

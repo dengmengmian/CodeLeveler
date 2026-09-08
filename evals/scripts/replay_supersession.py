@@ -38,6 +38,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyze_context import READ_TOOLS, estimate, tool_names  # noqa: E402
 
+def _projects_root() -> str:
+    """`$LEVELER_HOME/state/projects` — where per-project durable state lives.
+
+    Not `~/.leveler/projects`: durable state moved under `state/`, and an
+    analyzer pointed at the old path silently finds no sessions and reports
+    nothing rather than saying it looked in the wrong place.
+    """
+    home = os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler")
+    return os.path.join(home, "state", "projects")
+
+
 EDIT_TOOLS = {"apply_patch", "replace"}
 SUPERSEDED_PREFIX = "[read_file result superseded:"
 LINE_PREFIX = re.compile(r"^\s*(\d+)\t", re.MULTILINE)
@@ -180,7 +191,7 @@ def project_backward(reads) -> int:
 
 def report(pattern: str) -> None:
     matches = sorted(
-        glob.glob(os.path.expanduser(f"~/.leveler/projects/*{pattern}*")),
+        glob.glob(os.path.join(_projects_root(), f"*{pattern}*")),
         key=os.path.getmtime,
     )
     if not matches:

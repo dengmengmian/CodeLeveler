@@ -10,7 +10,7 @@ failure in hand)?
 Usage:
     python3 evals/scripts/analyze_trajectory.py <substring-of-session-dir> [--full]
 
-The substring matches a directory under ~/.leveler/projects; the most recently
+The substring matches a directory under $LEVELER_HOME/state/projects; the most recently
 modified match wins, so `... ripgrep-total-count` picks the latest run.
 """
 
@@ -24,6 +24,17 @@ import re
 import sqlite3
 import sys
 
+def _projects_root() -> str:
+    """`$LEVELER_HOME/state/projects` — where per-project durable state lives.
+
+    Not `~/.leveler/projects`: durable state moved under `state/`, and an
+    analyzer pointed at the old path silently finds no sessions and reports
+    nothing rather than saying it looked in the wrong place.
+    """
+    home = os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler")
+    return os.path.join(home, "state", "projects")
+
+
 EDIT_TOOLS = {"apply_patch", "replace"}
 READ_TOOLS = {"read_file", "read_symbol"}
 SEARCH_TOOLS = {"grep", "find_files", "find_symbol", "list_files", "find_references"}
@@ -33,7 +44,7 @@ SHELL_TOOLS = {"shell_command", "run_command"}
 def load(pattern: str) -> list[dict]:
     """Flatten one session into ordered actions with their results."""
     matches = sorted(
-        glob.glob(os.path.expanduser(f"~/.leveler/projects/*{pattern}*")),
+        glob.glob(os.path.join(_projects_root(), f"*{pattern}*")),
         key=os.path.getmtime,
     )
     if not matches:
