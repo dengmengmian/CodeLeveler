@@ -151,8 +151,6 @@ impl ExecutorFactory {
         .with_context_budget(resolved.context_budget)
         .with_reasoning_effort(resolved.reasoning_effort)
         .with_context_trace(resolved.context_trace)
-        .with_tool_result_pruning(resolved.prune_tool_results)
-        .with_kept_reasoning(resolved.keep_reasoning)
         // A model profile may ship its own system prompt; None keeps the default.
         .with_base_instructions(model_profile.instructions.clone())
         .with_permission_rules(self.permission_rules.clone())

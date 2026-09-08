@@ -69,13 +69,6 @@ pub struct ExecutionOverrides {
     pub repeated_read_guard: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_output_bytes: Option<usize>,
-    /// Candidate knob: keep a streamed round's reasoning on its assistant
-    /// message, so a pass-back provider is given the chain instead of an
-    /// empty string. Unmeasured in both directions; default off.
-    pub keep_reasoning: Option<bool>,
-    /// Candidate knob: trim oversized old tool results before folding.
-    /// Production default stays off until an A/B demonstrates the value.
-    pub prune_tool_results: Option<bool>,
     /// Measurement knob: persist the model context after every round
     /// (`ContextSnapshot`), not only when it diverges from the transcript.
     /// Context-cost attribution reads those rows; production never sets it.
@@ -104,10 +97,6 @@ pub struct ResolvedExecutionPolicy {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte budget for a single tool result (the central output cap).
     pub max_tool_output_bytes: usize,
-    /// Keep a round's reasoning in history (candidate; default off).
-    pub keep_reasoning: bool,
-    /// Trim oversized old tool results before folding (candidate; default off).
-    pub prune_tool_results: bool,
     /// Persist the model context every round (eval measurement seam).
     pub context_trace: bool,
 }
@@ -184,8 +173,6 @@ pub fn resolve_execution_policy(
                 leveler_tools::registry::MIN_TOOL_OUTPUT,
                 leveler_tools::registry::MAX_TOOL_OUTPUT,
             ),
-        keep_reasoning: o.keep_reasoning.unwrap_or(false),
-        prune_tool_results: o.prune_tool_results.unwrap_or(false),
         context_trace: o.context_trace.unwrap_or(false),
     }
 }
@@ -228,89 +215,6 @@ mod tests {
 
     /// Migration contract: for a main seat with no overrides, resolution must
     /// equal what the retired `default_policy()` produced through the old
-    /// `leveling_from_policy` — pinned here as literals so deleting the old
-    /// path cannot silently shift behavior.
-    #[test]
-    fn main_seat_resolution_equals_the_retired_default_policy_leveling() {
-        let p = profile();
-        let new = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
-
-        assert_eq!(new.max_output_tokens, 8192);
-        assert_eq!(new.context_budget, 65536);
-        assert_eq!(new.max_parallel_tools, 4);
-        assert_eq!(new.max_search_calls_per_step, 0, "0 = unlimited");
-        assert!(
-            new.explicit_plan,
-            "complex tasks get structured-plan guidance"
-        );
-        assert_eq!(new.max_files_per_step, 8, "task budget, was policy field");
-        assert!(new.repeated_read_guard, "safety rail is always on");
-        assert_eq!(
-            new.max_tool_output_bytes,
-            48 * 1024,
-            "no profile/override opinion → today's central cap, zero drift"
-        );
-    }
-
-    #[test]
-    fn chat_policy_pins_the_historical_pre_request_threshold() {
-        // The chat path folds at 24k; routing it through the same seam must
-        // not move the number. If someone changes the threshold, this failure
-        // forces them to say so.
-        assert_eq!(
-            u64::from(CHAT_CONTEXT_BUDGET),
-            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD
-        );
-        assert_eq!(CHAT_CONTEXT_BUDGET, 24_000);
-    }
-
-    #[test]
-    fn model_limits_carry_no_runtime_policy() {
-        // Capability purity: a profile deserialized without any policy-ish
-        // key still yields a fold threshold from the resolver — policy is
-        // derived, never stored on the model. And context_quality is absent
-        // unless measured.
-        let p = profile();
-        assert!(p.context_quality.is_none(), "unmeasured must stay None");
-        let r = resolve_execution_policy(&p, ExecutionRole::Worker, &goal_turn(), None);
-        assert_eq!(r.context_budget, p.limits.reliable_context);
-    }
-
-    #[test]
-    fn keeping_reasoning_is_off_unless_the_eval_seam_asks_for_it() {
-        let p = profile();
-        assert!(
-            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None).keep_reasoning,
-            "an unmeasured candidate never ships on by default"
-        );
-        let o = ExecutionOverrides {
-            keep_reasoning: Some(true),
-            ..ExecutionOverrides::default()
-        };
-        assert!(
-            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o))
-                .keep_reasoning
-        );
-    }
-
-    #[test]
-    fn tool_result_pruning_is_off_unless_the_eval_seam_asks_for_it() {
-        let p = profile();
-        assert!(
-            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None)
-                .prune_tool_results,
-            "an unmeasured candidate never ships on by default"
-        );
-        let o = ExecutionOverrides {
-            prune_tool_results: Some(true),
-            ..ExecutionOverrides::default()
-        };
-        assert!(
-            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o))
-                .prune_tool_results
-        );
-    }
-
     #[test]
     fn context_trace_is_off_unless_the_eval_seam_asks_for_it() {
         let p = profile();

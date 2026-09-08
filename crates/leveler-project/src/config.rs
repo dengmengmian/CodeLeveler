@@ -114,12 +114,6 @@ pub struct ProjectConfig {
     /// Extra ignore globs.
     #[serde(default)]
     pub ignore: Vec<String>,
-    /// Run the language formatter on a file right after an edit tool writes
-    /// it. Off by default: the runtime rewriting a file the model just wrote,
-    /// without the model asking, is a hidden mutation. A model that wants its
-    /// code formatted can run the formatter itself.
-    #[serde(default)]
-    pub auto_format: bool,
 }
 
 impl ProjectConfig {

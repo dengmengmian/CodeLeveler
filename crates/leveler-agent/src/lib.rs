@@ -28,9 +28,8 @@ pub mod usage;
 pub use budget::{BudgetDimension, BudgetExhaustion};
 pub use child_profile::child_profile_trace;
 pub use compaction::{
-    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, PRUNE_BATCH_BYTES,
-    PRUNE_MARKER, PRUNE_TRIGGER_BYTES, compact_messages, estimate_tokens, prune_tool_results,
-    reclaimable_tool_result_bytes, summarize_with_model,
+    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages,
+    estimate_tokens, summarize_with_model,
 };
 pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};

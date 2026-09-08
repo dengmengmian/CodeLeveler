@@ -911,24 +911,6 @@ pub struct TurnPolicy {
     /// request's reported token count exceeds this, the in-memory transcript is
     /// compacted before the next round so a long task never overflows.
     pub context_budget: u32,
-    /// Keep the reasoning a streamed round produced on the assistant message,
-    /// so a provider with the pass-back contract receives the chain it asked
-    /// for instead of an empty string.
-    ///
-    /// Off by default, which is today's behaviour: the deltas are shown and
-    /// dropped. Keeping them is not free — the chain re-enters the input of
-    /// every later request in the turn and accumulates like a tool result —
-    /// and whether that buys enough continuity to pay for itself is
-    /// unmeasured in both directions. See `docs/REASONING_CAPABILITY_AUDIT.md`
-    /// §9 and the measurement plan.
-    pub keep_reasoning: bool,
-    /// Reclaim context by trimming the middle out of oversized tool results
-    /// that have left the working set, BEFORE folding the transcript. The
-    /// cheap tier: no model call, nothing dropped, and the request prefix
-    /// keeps its structure. Off by default — the value is unmeasured on real
-    /// workloads (C2.2 showed the lossless variant reclaimed nothing), so it
-    /// ships behind the eval seam until an A/B says otherwise.
-    pub prune_tool_results: bool,
     /// Persist the exact model context after EVERY round (`ContextSnapshot`),
     /// not only when it diverges from the durable transcript. Measurement
     /// seam for `leveler eval` (context-cost attribution reads those rows);
@@ -965,8 +947,6 @@ impl Default for TurnPolicy {
             require_explicit_plan: false,
             reasoning_effort: None,
             context_budget: 0,
-            keep_reasoning: false,
-            prune_tool_results: false,
             context_trace: false,
             goal_mode: false,
             // Matches the historical `Executor::new` default — the gate is ON.
@@ -1432,8 +1412,6 @@ impl Executor {
                 // Sub-agents keep the static behavior in S3 v1: a child's
                 // transcript is short-lived and expansion evidence is a
                 // top-level task concern.
-                keep_reasoning: self.policy.keep_reasoning,
-                prune_tool_results: self.policy.prune_tool_results,
                 context_trace: self.policy.context_trace,
                 max_concurrent_agents: self.policy.max_concurrent_agents,
                 max_total_agents: self.policy.max_total_agents,
@@ -1487,20 +1465,6 @@ impl Executor {
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
         self.policy.max_concurrent_agents = max_concurrent.max(1);
         self.policy.max_total_agents = max_total;
-        self
-    }
-
-    /// Keep a streamed round's reasoning on the assistant message (see
-    /// [`TurnPolicy::keep_reasoning`]).
-    pub fn with_kept_reasoning(mut self, keep: bool) -> Self {
-        self.policy.keep_reasoning = keep;
-        self
-    }
-
-    /// Trim oversized old tool results before folding the transcript (see
-    /// [`TurnPolicy::prune_tool_results`]).
-    pub fn with_tool_result_pruning(mut self, prune: bool) -> Self {
-        self.policy.prune_tool_results = prune;
         self
     }
 

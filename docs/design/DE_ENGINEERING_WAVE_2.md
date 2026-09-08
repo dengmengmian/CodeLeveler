@@ -27,7 +27,7 @@ The user owns acceptance.
 | 5 | Task-text interpretation | `TaskContract::parse` split the goal prose on `Request:` / `Constraints:` headers, guessed `accept:` commands out of it, and re-injected a `## Task contract` block | The user's words reach the model as the user wrote them. Mechanical acceptance is the project's own `verify:` commands |
 | 6 | Adaptive context | `RereadPressure` → expand one tier of a ladder, `ExpansionPolicy`, `ContextBudgetState`, the restore-on-resume path, and two one-variant policy enums | One fold threshold: cross it, fold. Model re-reads are not evidence that it deserves a bigger window |
 | 7 | Hidden model coaching | `max_files_per_step` defaulted to 8 — a patch touching nine files was refused | Default `0` (unlimited). A wide refactor is a wide refactor; only an explicit caller budget bounds it |
-| 9 | Hidden mutation | The app turned `auto_format` on for every session: the runtime rewrote a file the model had just written, without the model asking | `auto_format: false` in project config; opt-in. A model that wants formatting runs the formatter |
+| 9 | Hidden mutation | The app turned `auto_format` on for every session: the runtime rewrote a file the model had just written, without the model asking | Deleted outright. A model that wants its code formatted runs the formatter |
 | 10 | Capability taxonomy | `ChildCapability` (`repository_analysis`, `code_review`, …), `OutputContract`, `purpose`, `description` on every ChildProfile | The structural bound the runtime enforces: `read_only`. See the bug below |
 
 Module 8 (eval knobs out of the production domain) fell out of 1 and 6: the
@@ -74,31 +74,42 @@ old sessions still decode and render:
 ## Cost
 
 ```
-Wave 2, excluding the concurrent permission work:   +1490  −8748   net −7258
-  leveler-agent                                     +830  −3837   net −3007
-  leveler-engine                                    +165  −2736   net −2571
-  leveler-lifecycle                                 +171  −1199   net −1028
-  leveler-tui                                       +102   −435   net  −333
-  leveler-app                                       +107   −322   net  −215
-  leveler-client-protocol                            +16    −68   net   −52
+Wave 2, excluding the concurrent permission work:   +1637  −9791   net −8154
 
-Files deleted: continuation.rs, context_budget.rs, contract.rs
+Files deleted: continuation.rs   the supervisor and its continuation policy
+                context_budget.rs the adaptive-context ladder
+                contract.rs       the free-text task contract parser
+                format.rs         post-edit auto-formatting
 ```
+
+## The unmeasured candidates, deleted
+
+Three mechanisms shipped switched off, reachable only by an eval ablation that
+never ran. "We will measure it someday" is the debt that produced half of what
+this wave deleted, so they went with it:
+
+- **`auto_format`** — after an edit tool wrote a file, the runtime ran
+  `gofmt` / `rustfmt` / `ruff format` on it and re-fingerprinted it so the next
+  patch would not see the rewrite as an outside edit. A hidden mutation with no
+  enabler. `format.rs` deleted.
+- **`keep_reasoning`** — keep a streamed round's reasoning on its assistant
+  message so a pass-back provider gets the chain. Unmeasured in both
+  directions.
+- **`prune_tool_results`** — trim the middle out of oversized stale tool
+  results before folding. C2.2 measured the lossless variant reclaiming
+  nothing. The whole path went: the drive branch, `prune_tool_results`,
+  `reclaimable_tool_result_bytes` and the four `PRUNE_*` constants.
 
 ## Remaining suspicious complexity
 
 Named rather than quietly kept:
 
-- **`keep_reasoning` / `prune_tool_results` / `context_trace`** — unmeasured
-  candidate mechanisms behind the eval override seam, default off. They are
-  mechanism knobs with working implementations, not supervisor judgement, so
-  they survived; but "we will measure it someday" is the debt that produced
-  half of what this wave deleted.
+- **`context_trace`** — kept, and it is not in the class above: `leveler eval`
+  sets it on every run, so it is a live measurement seam rather than a
+  candidate awaiting a verdict.
 - **`independent_review: required`** — explicit-only and off by default, so it
   is a user capability rather than runtime judgement. Its reviewer child is now
   a plain read-only agent with no special completion authority.
-- **`auto_format`** — kept as a capability with no shipped enabler beyond the
-  new config field. If nobody turns it on, it is dead code and should go.
 - **`ProgressCaps::no_progress_rounds`** — still a runtime decision that two
   consecutive no-progress rounds end a turn. It is mechanical (all calls
   refused, or a quiet goal round), but it is a threshold, and thresholds drift

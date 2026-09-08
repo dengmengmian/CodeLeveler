@@ -169,7 +169,7 @@ impl Executor {
         };
 
         let mut text = String::new();
-        let mut reasoning = String::new();
+        let reasoning = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         // Some providers (and some gateways) emit `usage` in a chunk *after*
         // `finish_reason`. Breaking at MessageCompleted drops that chunk and the
@@ -215,9 +215,6 @@ impl Executor {
                 }
                 Ok(ModelEvent::ReasoningDelta { delta }) if !completed => {
                     if !delta.is_empty() {
-                        if self.policy.keep_reasoning {
-                            reasoning.push_str(&delta);
-                        }
                         observer(AgentEvent::ReasoningDelta(delta));
                     }
                 }

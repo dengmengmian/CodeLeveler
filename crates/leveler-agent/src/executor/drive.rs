@@ -34,9 +34,7 @@ use crate::authorization::{
     collect_scoped_paths_from_call, is_search_tool, is_verification_program, observe_class,
     push_unique_path, unproven_verification_note,
 };
-use crate::compaction::{
-    COMPACT_KEEP_RECENT, PRUNE_BATCH_BYTES, compact_messages, estimate_tokens,
-};
+use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
     REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
@@ -2906,42 +2904,7 @@ impl Executor {
             // gateways don't report streaming usage, and without a fallback
             // compaction would silently never fire. The persisted transcript
             // (sink) is untouched — only what we resend shrinks.
-            let mut context_tokens = used_tokens.max(estimate_tokens(&messages));
-            // C5-S3 decision point: over-budget pressure is WHEN we decide,
-            // evidence is WHY the budget may grow. An eligible expansion keeps
-            // the request prefix (cache-preserving); folding rewrites it — so
-            // expand-before-compact whenever the evidence supports it.
-            // The deterministic tier runs on its OWN trigger, not the fold's.
-            // It was wired inside the fold decision, and the fold does not
-            // happen: a real task run peaks around a tenth of the threshold
-            // (see docs/CONTEXT_COST_MEASUREMENT_PLAN.md §0b), so the trimming
-            // never executed. What it reclaims — stale tool results that have
-            // left the working set — is worth reclaiming whether or not the
-            // window is ever threatened.
-            //
-            // It fires on a BATCH of reclaimable bytes rather than every
-            // round, because trimming rewrites bytes the provider has already
-            // cached: one prefix-cache break for a large reclaim, instead of
-            // one per round as results go stale singly.
-            if self.policy.prune_tool_results && has_next_round {
-                let reclaimable = crate::compaction::reclaimable_tool_result_bytes(
-                    &messages,
-                    COMPACT_KEEP_RECENT,
-                );
-                if reclaimable >= PRUNE_BATCH_BYTES {
-                    let before = context_tokens;
-                    messages =
-                        crate::compaction::prune_tool_results(&messages, COMPACT_KEEP_RECENT);
-                    context_tokens = used_tokens.max(estimate_tokens(&messages));
-                    context_diverged = true;
-                    tracing::debug!(
-                        reclaimable_bytes = reclaimable,
-                        tokens_before = before,
-                        tokens_after = context_tokens,
-                        "trimmed stale tool results"
-                    );
-                }
-            }
+            let context_tokens = used_tokens.max(estimate_tokens(&messages));
             // Fold when the last request's estimate crossed the budget. One
             // threshold, one action: the runtime does not read the model's
             // re-reads as evidence that it "deserves" a bigger window.
