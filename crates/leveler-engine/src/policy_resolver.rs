@@ -276,7 +276,12 @@ mod tests {
 
     #[test]
     fn tool_limits_resolve_to_task_budget_and_always_on_guard() {
-        assert_eq!(resolve_tool_limits(None), (8, true));
+        // De-engineering Wave 2 made the per-step file budget unlimited by
+        // default: a patch touching nine files is a wide refactor, not a
+        // mistake, and only an explicit caller budget bounds it. The guard
+        // stays on.
+        assert_eq!(resolve_tool_limits(None), (DEFAULT_FILES_PER_STEP, true));
+        assert_eq!(DEFAULT_FILES_PER_STEP, 0, "0 means unlimited");
         let o = ExecutionOverrides {
             max_files_per_step: Some(2),
             repeated_read_guard: Some(false),

@@ -330,6 +330,13 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         ("quit", ClientCommand::Quit, false),
+        (
+            "shutdown_when_idle",
+            ClientCommand::ShutdownWhenIdle {
+                reason: leveler_client_protocol::RestartReason::BuildMismatch,
+            },
+            false,
+        ),
     ]
 }
 
