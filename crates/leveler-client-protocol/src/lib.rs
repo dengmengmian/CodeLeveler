@@ -47,6 +47,8 @@ mod media;
 mod observability;
 mod origin;
 mod progress;
+/// WebSocket framing for a session: the shapes every session client speaks.
+pub mod session_wire;
 mod snapshot;
 mod version;
 mod wire_types;
@@ -75,6 +77,7 @@ pub use progress::{
     CheckState, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile, UiPlan,
     UiPlanStep, UiVerification, UiVerificationStatus,
 };
+pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, UiActiveToolCall, UiCheckpoint,
     UiMessage, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary, UiUserShell,

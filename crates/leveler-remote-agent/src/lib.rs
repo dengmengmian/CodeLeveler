@@ -8,7 +8,7 @@
 //! It deliberately does **not** depend on `leveler-web`: reaching the session
 //! frame types through the browser server would drag axum and the embedded SPA
 //! into a process whose entire job is to be small and auditable. The framing
-//! comes from `leveler-session-wire` instead.
+//! comes from `leveler-client-protocol` instead.
 #![forbid(unsafe_code)]
 
 mod approvals;

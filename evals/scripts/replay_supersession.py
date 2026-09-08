@@ -22,7 +22,7 @@ because `read_lifecycle` did not exist when these runs were captured:
                       over-estimate. Reported separately for that reason.
 
 Usage:
-    python3 scripts/replay_supersession.py <substring-of-session-dir> ...
+    python3 evals/scripts/replay_supersession.py <substring-of-session-dir> ...
 """
 
 from __future__ import annotations

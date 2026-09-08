@@ -28,7 +28,7 @@ use leveler_client_protocol::{
     ClientCommand, ClientError, CommandEnvelope, CommandId, ProtocolEnvelope, RuntimeEvent,
     SessionId,
 };
-use leveler_session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
+use leveler_client_protocol::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 
 use crate::auth;
 use crate::server::AppState;

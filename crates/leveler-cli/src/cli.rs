@@ -590,7 +590,7 @@ pub enum EvalCommand {
         json_out: Option<PathBuf>,
     },
     /// Release tier (spec §2, L3): the full gate — every suite including the
-    /// real-repo `evals/cases/scenarios`. Long-running; run `scripts/fetch_eval_repos.sh`
+    /// real-repo `evals/cases/scenarios`. Long-running; run `evals/scripts/fetch_eval_repos.sh`
     /// first so the pinned real repos are present.
     Release {
         /// Model reference.

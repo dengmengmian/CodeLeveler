@@ -547,7 +547,7 @@ async fn run_tier(
     if cases.is_empty() {
         anyhow::bail!(
             "tier `{tier}` found no cases in [{}] — run from the repo root; \
-             for release, fetch real repos first (scripts/fetch_eval_repos.sh)",
+             for release, fetch real repos first (evals/scripts/fetch_eval_repos.sh)",
             dirs.join(", ")
         );
     }
@@ -1223,7 +1223,7 @@ async fn run_eval_case(
     };
     // Ablation arm: pin the flipped resolver input on every execution path.
     // Every eval run (control included) also traces the per-round context:
-    // `scripts/analyze_context.py` attributes cost from those snapshots, and
+    // `evals/scripts/analyze_context.py` attributes cost from those snapshots, and
     // production only persists a context that diverged from the transcript.
     let mut overrides = overrides.cloned().unwrap_or_default();
     overrides.context_trace = Some(true);

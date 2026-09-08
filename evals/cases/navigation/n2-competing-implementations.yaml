@@ -8,7 +8,7 @@
 # report.Aggregate → Summary.Render, i.e. by following the call, not the name.
 id: n2-competing-implementations
 name: "[nav] add a grand-total line to the summary"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 60
 relevant_paths:
   - internal/report/summary.go
@@ -55,7 +55,7 @@ expect:
       go test ./... > /dev/null
 
 # Benchmark-author validity metadata. Metrics-only: consumed by
-# scripts/check_fixture_validity.py, never placed in agent context.
+# evals/scripts/check_fixture_validity.py, never placed in agent context.
 validity:
   maintained_checks:
     - ["go", "build", "./..."]

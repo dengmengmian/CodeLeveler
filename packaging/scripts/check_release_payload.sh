@@ -11,7 +11,7 @@
 # would drift, and a drifted guard is worse than none.
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/release.yml"
 
 [ -f "$WORKFLOW" ] || { echo "missing $WORKFLOW" >&2; exit 1; }

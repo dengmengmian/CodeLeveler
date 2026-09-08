@@ -23,7 +23,7 @@ mod ws;
 
 use std::net::SocketAddr;
 
-pub use leveler_session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
+pub use leveler_client_protocol::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use projects::{ProjectError, ProjectInfo, ProjectManager};
 pub use router::RouterService;
 pub use server::{WebServer, bind, bind_multi, build_router, build_router_multi, serve};

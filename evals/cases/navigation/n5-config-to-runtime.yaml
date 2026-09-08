@@ -7,7 +7,7 @@
 # option's effect is applied by a registered stage rather than at a call site.
 id: n5-config-to-runtime
 name: "[nav] a minimum-value floor that reaches the pipeline"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 60
 relevant_paths:
   - internal/config/config.go
@@ -68,7 +68,7 @@ expect:
       go test ./... > /dev/null
 
 # Benchmark-author validity metadata. Metrics-only: consumed by
-# scripts/check_fixture_validity.py, never placed in agent context.
+# evals/scripts/check_fixture_validity.py, never placed in agent context.
 validity:
   maintained_checks:
     - ["go", "build", "./..."]

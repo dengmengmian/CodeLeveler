@@ -4,7 +4,7 @@
 # alive at the end. Navigation is not the difficulty — every surface is named.
 id: c4-r7-long-multistep
 name: "[recovery] five output/report improvements land together"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 80
 relevant_paths:
   - internal/report/summary.go

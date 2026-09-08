@@ -158,7 +158,8 @@ than rewritten to look like it was always settled.
 ## Storage: migrations and backup
 
 - Schema migrations are append-only and applied automatically at startup
-  (`migrations/README.md` has the authoring rules). Canonical events carry a
+  (`crates/leveler-storage/migrations/README.md` has the authoring rules).
+  Canonical events carry a
   `schema_version`; a newer row than the binary understands is a hard, named
   replay error — never a guessed repair.
 - The state to back up is the global Leveler home (default `~/.leveler`):

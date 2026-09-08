@@ -4,7 +4,7 @@
 # both defects, fix both, and iterate until green.
 id: icg-4-verification-recovery
 name: "[icg] the suite is red after a bad merge — make it green"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 60
 recovery: true
 relevant_paths:

@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use leveler_client_protocol::ProjectStatus;
 use leveler_local_transport::LocalRuntimeService;
-use leveler_session_wire::ProjectStatus;
 use serde::{Deserialize, Serialize};
 
 /// One project as the phone sees it.

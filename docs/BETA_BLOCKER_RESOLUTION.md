@@ -247,7 +247,7 @@ Every gate CI runs, run here first.
 | Tests (host, macOS arm64) | `cargo test --workspace --all-targets --all-features --locked --no-fail-fast` | **3146 passed · 0 failed · 6 ignored** (3145/0 before the second wave of Windows fixes) |
 | Tests (Linux, container) | `rust:1.90` + bubblewrap, `-p leveler-execution --lib -p leveler-app --test user_shell` | **216 / 0** and **9 / 0** — the four SBPL failures and the hard-gate failure are gone |
 | Supply chain | `cargo deny check` | **PASS** — `advisories ok, bans ok, licenses ok, sources ok` |
-| Installer | `sh scripts/test_install.sh` | **PASS**, including two new pinned-version canaries (verified red without the pin support) |
+| Installer | `sh packaging/scripts/test_install.sh` | **PASS**, including two new pinned-version canaries (verified red without the pin support) |
 | Manifest | `cargo metadata --no-deps` after the version bump | **PASS** |
 
 **CI result — run `32552025802`, the first run in a month that got past

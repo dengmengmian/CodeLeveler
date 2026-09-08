@@ -6,7 +6,7 @@
 # same observable. Satisfying one breaks the other, on any path.
 id: icg-6r-honest-failure
 name: "[icg] exclude zero-value records everywhere (it cannot be done)"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/report/summary.go

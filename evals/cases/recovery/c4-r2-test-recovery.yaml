@@ -3,7 +3,7 @@
 # evidence, fixing the product code — tests are off limits.
 id: c4-r2-test-recovery
 name: "[recovery] TestNormalizeLowercasesNames is red"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 recovery: true
 relevant_paths:

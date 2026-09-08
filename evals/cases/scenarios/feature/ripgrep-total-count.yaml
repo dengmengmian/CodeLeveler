@@ -2,10 +2,10 @@ id: ripgrep-total-count
 name: "ripgrep: add a --total-count summary flag (real repo, long context)"
 
 # Real-world repository scenario. The repo is cloned locally by
-# `scripts/fetch_eval_repos.sh` (pinned to tag 14.1.1) — not committed. The
+# `evals/scripts/fetch_eval_repos.sh` (pinned to tag 14.1.1) — not committed. The
 # agent must navigate ripgrep's full source (~40k LOC across many crates) to
 # wire one CLI flag end to end: arg definition → parsing → output path → help.
-repo: fixtures/repos/ripgrep
+repo: evals/fixtures/repos/ripgrep
 base_ref: "14.1.1"
 
 # No overlay files: the task is a pure feature addition, so the agent starts

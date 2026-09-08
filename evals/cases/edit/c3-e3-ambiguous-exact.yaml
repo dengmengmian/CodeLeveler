@@ -4,7 +4,7 @@
 # changed and the other byte-for-byte in behavior.
 id: c3-e3-ambiguous-exact
 name: "[edit] trim the label helper only, its twin stays put"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/report/trim.go

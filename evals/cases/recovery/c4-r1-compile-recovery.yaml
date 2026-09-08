@@ -3,7 +3,7 @@
 # repair, re-verify, end green — not first-try authoring.
 id: c4-r1-compile-recovery
 name: "[recovery] the build is broken in summary.go"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 recovery: true
 relevant_paths:

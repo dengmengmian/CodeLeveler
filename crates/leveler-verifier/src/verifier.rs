@@ -438,10 +438,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs a full cargo check over the ripgrep fixture; opt in with --ignored"]
     async fn probe_real_repo_gate_under_host_rustc_wrapper() {
-        let repo =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/repos/ripgrep");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../evals/fixtures/repos/ripgrep");
         if !repo.join("Cargo.toml").exists() {
-            eprintln!("skipping: fixtures/repos/ripgrep not fetched");
+            eprintln!("skipping: evals/fixtures/repos/ripgrep not fetched");
             return;
         }
         let plan = VerificationPlan {

@@ -1,19 +1,19 @@
 //! Session WebSocket wire DTOs: the client ↔ server message shapes.
 //!
-//! These mirror the stable client protocol (commands in, events/snapshots out)
+//! These mirror the protocol in this crate (commands in, events/snapshots out)
 //! with WebSocket-specific framing: each upstream command delivery carries a
 //! client-chosen `command_id` the server echoes in its `ack`, so the client can
 //! match acknowledgements to queued messages. Golden fixtures pin the wire
 //! shape — the TypeScript client depends on it byte for byte.
 //!
-//! The framing lives in its own crate so every session client speaks one
-//! dialect: the browser server (`leveler-web`) and, once it lands, the remote
-//! agent, which must reach these types without pulling in axum and the
-//! embedded SPA. Nothing here may depend on a transport or a UI shell.
+//! The framing sits beside the protocol it frames so every session client
+//! speaks one dialect — the browser server (`leveler-web`) and the remote
+//! agent both reach these types without pulling in axum and the embedded SPA.
+//! Nothing here may depend on a transport or a UI shell.
 
 use serde::{Deserialize, Serialize};
 
-use leveler_client_protocol::{ClientCommand, RuntimeEvent, UiSessionSnapshot};
+use crate::{ClientCommand, RuntimeEvent, UiSessionSnapshot};
 
 /// Where a registered project's daemon currently stands. Serialized lowercase
 /// on both the REST payloads and the WS `project_status` frames.
@@ -69,7 +69,7 @@ pub enum DownstreamMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_client_protocol::{NotificationLevel, SessionId};
+    use crate::{NotificationLevel, SessionId};
 
     #[test]
     fn upstream_deliver_matches_golden_fixture() {
@@ -191,7 +191,7 @@ mod tests {
             repository: "/repo".to_string(),
             goal: "interactive session".to_string(),
             model: None,
-            mode: leveler_client_protocol::PermissionProfile::Assisted,
+            mode: crate::PermissionProfile::Assisted,
             branch: None,
             status: "idle".to_string(),
             messages: Vec::new(),

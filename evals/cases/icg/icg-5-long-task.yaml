@@ -4,7 +4,7 @@
 # the stated interactions.
 id: icg-5-long-task
 name: "[icg] the observability batch: grouping, totals, stats, hygiene"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 90
 relevant_paths:
   - internal/report/summary.go

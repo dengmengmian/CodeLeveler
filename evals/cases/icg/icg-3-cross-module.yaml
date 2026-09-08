@@ -4,7 +4,7 @@
 # leaves the feature silently half-alive.
 id: icg-3-cross-module
 name: "[icg] records carry a unit from input to output"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 70
 relevant_paths:
   - pkg/api/types.go

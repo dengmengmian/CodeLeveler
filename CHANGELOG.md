@@ -6,6 +6,26 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **The agent loop is a reusable kernel.** `leveler-agent-core` now owns the
+  one generic model↔tool loop — rounds, the model round with its retries,
+  admission against round/token/cost/duration limits, cancellation, the
+  deadline, usage accounting, and semantically neutral stop reasons. It
+  depends on `leveler-model` and nothing else in the workspace, and
+  `cargo run -p leveler-agent-core --example minimal` runs it with no
+  repository, database, or configuration. `leveler-agent` keeps everything
+  that makes the loop a *coding* agent and drives it as a harness rather than
+  maintaining a second loop; the ToolHost admission pipeline is untouched and
+  is still the only authorization point. See `docs/AGENT_KERNEL.md`.
+- **Every root directory has one owner.** SQLite migrations moved to
+  `crates/leveler-storage/migrations/` (contents byte-identical, so an
+  existing database is unaffected), evaluation fixtures to `evals/fixtures/`,
+  the evaluation tools to `evals/scripts/`, and the two release guards CI runs
+  to `packaging/scripts/`. `leveler-session-wire` folded into
+  `leveler-client-protocol::session_wire`: it had no independent security,
+  process, release, or compatibility boundary, and all four of its consumers
+  already depended on the protocol crate.
+
 ### Removed
 - **The runtime no longer judges the model's semantic completion.** The
   Completion Contract (a model call at goal start that turned the task into
@@ -124,35 +144,13 @@ All notable changes to CodeLeveler are documented here. The format follows
   cannot come back by omission, and a source tripwire pins it.
 
 ### Added
-- **Every model call the runtime makes on its own account is recorded.**
-  Contract derivation and the completion reconciliation judge wrote nothing to
-  `model_requests`, so a goal session's reported cost was short by all of
-  them. Both now write the `advisory` lane, including on the paths that spend
-  tokens and then fail — a reply the judge could not parse is still a reply
-  the provider billed.
-- **`keep_reasoning`** (off by default, eval knob): keep a streamed round's
-  reasoning on the assistant message that produced it, so a provider with the
-  pass-back contract receives the chain instead of the empty string it gets
-  today. This exists so the question can be measured; neither direction is
-  evidence-backed yet (`docs/REASONING_CAPABILITY_AUDIT.md` §9).
-- **Deterministic tool-result trimming before a fold** (`prune_tool_results`,
-  off by default). When the context is over budget, the middle of oversized
-  tool results that have left the working set can be trimmed in place — no
-  model call, no message dropped, every `tool_result` keeping its `call_id`
-  and error flag. When that alone brings the request under budget the fold,
-  which rewrites the prefix and pays for a summary, does not happen. The value
-  on real workloads is unmeasured (C2.2 found the lossless variant reclaimed
-  almost nothing), so it ships behind the `prune_tool_results` eval knob until
-  an A/B says otherwise.
-
-  Its trigger moved off the fold after the first run showed the fold does not
-  happen: a real task run peaks near a tenth of the threshold, so a mechanism
-  wired to the fold never executed. It now fires on a batch of reclaimable
-  bytes instead. Batching is deliberate — a trim rewrites bytes the provider
-  has already cached, so it costs one prefix-cache break each time, and one
-  break for a large reclaim pays for itself where one break per round does
-  not.
-
+- **Every model call the runtime makes on its own account is recorded.** The
+  runtime's own calls wrote nothing to `model_requests`, so a goal session's
+  reported cost was short by all of them. They now write the `advisory` lane,
+  including on the paths that spend tokens and then fail — a reply that could
+  not be parsed is still a reply the provider billed. (The two callers that
+  motivated this, contract derivation and the reconciliation judge, were
+  themselves deleted in this release; compaction folds remain.)
 ### Fixed
 - **`leveler upgrade` understands pre-releases.** Publishing `0.2.0-beta.1` and
   then running the binary exposed four defects with one root cause: the version

@@ -4,7 +4,7 @@
 # the compiler. Deterministic: no network, no timing, no flakiness.
 id: c4-r5-transient-artifact
 name: "[recovery] a stale backup file breaks the build"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 30
 recovery: true
 relevant_paths:

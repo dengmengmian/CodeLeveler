@@ -18,9 +18,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 
+use leveler_client_protocol::ProjectStatus;
 use leveler_local_transport::LocalSocketRuntimeClient;
 use leveler_project::Layout;
-use leveler_session_wire::ProjectStatus;
 
 use crate::router::RouterService;
 

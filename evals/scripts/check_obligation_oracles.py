@@ -24,7 +24,7 @@ Oracles come in two shapes, matching what the behaviour actually lives on:
                   property of the process — exit status, stderr, file output.
 
 Usage:
-    python3 scripts/check_obligation_oracles.py [--case n3-caller-propagation]
+    python3 evals/scripts/check_obligation_oracles.py [--case n3-caller-propagation]
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import yaml
 # Obligation files are benchmark-author metadata, not eval cases. They live
 # outside `evals/` because EvaluationCase::load_dir walks that tree recursively
 # and requires every *.yaml below it to parse as a case.
-OBLIGATIONS_DIR = "fixtures/navigation-obligations"
+OBLIGATIONS_DIR = "evals/fixtures/navigation-obligations"
 CASES_DIR = "evals/cases/navigation"
 REFERENCE_DIR = "evals/cases/navigation/reference"
 

@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use leveler_client_protocol::UpstreamMessage;
 use leveler_client_protocol::{
     ClientCommand, ClientOrigin, CommandEnvelope, CommandId, ProtocolEnvelope, SessionId,
 };
@@ -29,7 +30,6 @@ use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload};
 use leveler_remote_protocol::{
     ContentType, Sender, SignedEnvelope, SigningKey, VerifyParams, VerifyingKey,
 };
-use leveler_session_wire::UpstreamMessage;
 
 use crate::attachments::{
     ChunkOutcome, FETCH_CHUNK_BYTES, FetchChunkRequest, FetchChunkResponse, MAX_ATTACHMENT_BYTES,

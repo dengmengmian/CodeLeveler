@@ -108,13 +108,39 @@ Crate count does not define a boundary; responsibility and data ownership do:
 | Piece | Sole responsibility | Must not own | Where it lives (CURRENT) |
 | --- | --- | --- | --- |
 | **1a. Engine** | Task/turn lifecycle, EventLog, recovery, resume, explicit stop, durable runtime facts. | Concrete tool behavior; UI; provider wire formats. | `leveler-engine` |
-| **1b. Agent Loop** | Model → tool call → host runs tool → tool result → model. | Session durability; transport; UI; product planning policy. | `leveler-agent` |
+| **1b. Agent kernel** | The generic loop: model → tool call → tool result → next request, with round/token/cost/duration limits, cancellation, and neutral stop reasons. | Anything CodeLeveler-specific: permission, write scope, repository, prompts, persistence, delegation. | `leveler-agent-core` |
+| **1c. Coding harness** | What makes that loop a *coding* agent: prompt, repository context, memory, skills, compaction policy, ToolHost admission, ownership, sub-agents, goal protocol, verification bridge. | Session durability; transport; UI; the iteration itself. | `leveler-agent` |
 | **2. ToolHost / execution** | Schema validation, risk/approval, path constraints, durable tool start/finish, process/FS execution, cancellation. | Conversation orchestration; task completion policy; UI state. | `leveler-tools` + `leveler-execution` |
 | **3. Session state** | Persist messages, canonical events, snapshots, migrations as ordered auditable facts. | Agent policy or implicit product decisions. | `leveler-storage` + engine EventLog |
 | **4. Model adaptation** | Provider-neutral request, streaming, tool-call semantics. | Session state, tool permissions, workflow decisions. | `leveler-model` + provider/protocol adapters |
 
-**Do not merge Engine and Agent Loop in prose.** The engine supervises; the
-agent executes one model–tool feedback loop.
+**Do not merge Engine, kernel, and harness in prose.** The engine owns durable
+task lifecycle; the kernel owns the iteration; the harness owns what the
+iteration is *for*. The engine does not supervise the model's judgement — it
+persists what mechanically happened and hands the next turn back to the user
+or to an explicit continuation.
+
+### Ownership layering
+
+```text
+Foundation          leveler-core · leveler-model · leveler-protocol · leveler-provider
+        ↓
+Generic agent       leveler-agent-core          embeddable, repository-agnostic
+kernel                                          one model↔tool loop
+        ↓
+CodeLeveler         leveler-agent               prompt · context · memory · skills
+coding harness                                  ToolHost admission · ownership
+                                                sub-agents · goal protocol
+        ↓
+Reliable runtime    leveler-lifecycle · leveler-verifier · leveler-storage · leveler-engine
+        ↓
+Product             leveler-app · leveler-cli · leveler-tui · leveler-web · remote
+```
+
+Dependencies point downward only. The kernel depends on `leveler-model` and
+nothing else in the workspace, which is asserted by a test rather than trusted:
+`crates/leveler-agent-core/tests/kernel_boundary.rs`. Full contract:
+[AGENT_KERNEL.md](AGENT_KERNEL.md).
 
 ### Target layering (all clients)
 
@@ -219,16 +245,16 @@ stay on that path via goal mode (`update_goal` until complete or blocked) and
 optional `spawn_agent` fan-out. Legacy log kinds named `orchestrate` are
 accepted and run as direct.
 
-**A goal spans bounded work windows, not one giant turn.** The per-turn
-100-round ceiling ends a *work window*, not the goal: the supervisor
-(`DefaultSupervisorPolicy::after_turn`) opens the next window
-(`DriveGoalAgain`, a fresh objective-restated turn) instead of failing. Windows
-are bounded twice — an in-memory cross-window no-progress counter
-(`MAX_NO_PROGRESS_WINDOWS`, reset by material workspace change) under the
-absolute `MAX_SUPERVISED_TURNS` ceiling — so a stuck goal converges rather than
-spins. A window that exhausts the round budget is `BudgetLimited` (incomplete,
-resumable), **not** `Failed`. Goal identity is the session; the window budget is
-in-memory (daemon-crash window recovery is future work, not current).
+**A turn ends where the model stops.** The per-turn 100-round ceiling is an
+unconditional circuit breaker, not a scheduling decision: nothing re-drives a
+goal on the runtime's own initiative. De-engineering Wave 2 deleted the
+supervisor that used to open a second window (`SupervisorPolicy`,
+`DriveGoalAgain`, `ExtendBudget` and the cross-window no-progress counters);
+`WindowState` survives only so old event logs still decode, and nothing reads
+it. Continuing an unfinished goal is an explicit act — the user resumes, or the
+engine's `continue_active_goal` opens the next turn — and a turn that exhausts
+its round budget is incomplete and resumable, never `Failed`. Goal identity is
+the session.
 
 ---
 
@@ -316,7 +342,7 @@ Transports may vary; the contract does not:
 
 - In-process (`InProcessRuntimeClient`)
 - Local daemon / Unix socket (`leveler-local-transport`)
-- Session wire / WebSocket (`leveler-session-wire`, Web)
+- Session wire / WebSocket (`leveler-client-protocol::session_wire`, Web)
 - Remote bridge (`leveler-remote-agent` + `leveler-remote-protocol` / relay)
 
 Do **not** invent a parallel “Presentation Protocol”, “UI Protocol”, or
@@ -373,7 +399,7 @@ bind; 256-bit bearer token; multi-project via per-repo daemons and
 ### Remote / APP (**CURRENT bridge, FUTURE full product**)
 
 `leveler-remote-agent` is the **host-side remote bridge**. It deliberately does
-**not** depend on `leveler-web`; it works through `leveler-session-wire` and the
+**not** depend on `leveler-web`; it works through `leveler-client-protocol::session_wire` and the
 runtime/client protocol boundary. That infrastructure already exists for a
 future desktop/mobile APP experience.
 
@@ -619,7 +645,7 @@ Only structural gaps confirmed in code. Not a wishlist.
 
 | | |
 | --- | --- |
-| **CURRENT** | `CheckpointStore` owns both checkpoint maps and their joint invariant; `LiveViews` owns reconnect state with a pure fold; `stage_turn` is the single turn-launch preamble. The facade routes commands and delegates (2739 → 2501 lines, 12 state fields). |
+| **CURRENT** | `CheckpointStore` owns both checkpoint maps and their joint invariant; `LiveViews` owns reconnect state with a pure fold; `stage_turn` is the single turn-launch preamble. The facade routes commands and delegates: it assembles nothing itself and holds no runtime of its own. |
 | **Remaining** | Delivery middleware, session directory CRUD, runtime-config store, media/memory arms stay inline (stateless or single-path; extraction not yet justified by the rule "own state + own invariant + multiple paths"). Per-session map eviction on delete remains a KNOWN SEAM. |
 | **Status** | **CORE CLUSTERS DONE**; remainder tracked. A new client use case = a small handler + facade route, not another inline block. |
 
@@ -633,7 +659,7 @@ string.
 
 | | |
 | --- | --- |
-| **Migrated** | `ContextCompacted { from, to }` and `ContextExpanded { from_tokens, to_tokens, reason }` (protocol 1.4, additive; schemas + envelope golden regenerated; TUI localizes ZH/EN; Web mirror updated). Also fixed: the TUI reason-localizer matched `budget exhausted` (space) while the executor emits `budget_exhausted` — users saw the raw machine token. |
+| **Migrated** | `ContextCompacted { from, to }` (protocol 1.4, additive; schemas + envelope golden regenerated; TUI localizes ZH/EN; Web mirror updated). Also fixed: the TUI reason-localizer matched `budget exhausted` (space) while the executor emits `budget_exhausted` — users saw the raw machine token. `ContextExpanded` is replay-only: Wave 2 deleted the adaptive-context ladder, so the variant still decodes an old log and nothing writes one. |
 | **Remaining** | AgentActivity advisory labels, turn-incomplete reason defaults, and assorted `interactive.rs` notices remain preformatted — tracked, migrate opportunistically under the rule above. |
 | **Status** | **POLICY IN FORCE; HIGH-CONFIDENCE FACTS DONE** |
 
@@ -666,10 +692,11 @@ Consequences that hold today:
   failed / interrupted) and `VerificationStatus` (what the project's own
   checks said: passed / failed / not_run / unavailable). **Checks passed ≠
   user intent proven.**
-- `update_goal(complete)` is refused only for mechanical reasons: a delegated
-  child is still running, an open blocking finding from a reviewer, an
-  incomplete step in the model's own plan, or an acceptance command the user
-  wrote explicitly that has not run green.
+- `update_goal(complete)` is refused only for mechanical reasons, and there
+  are exactly two: a delegated child is still running, or a step in the
+  model's own plan is still open. Wave 2 deleted the other two — a finding is
+  inert information a reviewer reports, and acceptance is the project's own
+  `verify` commands, not a contract parsed out of the task prose.
 - A failed check is reported, not repaired on the model's behalf. The model
   sees its own test results inside the loop and decides what to do.
 - An independent reviewer runs only when configured (`independent_review:
@@ -715,14 +742,15 @@ User
   leveler-client-protocol    leveler-app  ◀── composition / config / projection
           │                       │
   leveler-local-transport         ▼
-  leveler-session-wire     leveler-engine
-  leveler-remote-agent            │
+  leveler-remote-agent     leveler-engine
   leveler-remote-protocol         │
   services/leveler-relay          │
+                                  │
                  ┌────────────────┼─────────────────┐
                  ▼                ▼                 ▼
           leveler-agent                    leveler-verifier
                  │                                  │
+                 ├────────▶ leveler-agent-core      │
                  ├────────▶ leveler-context         │
                  └────────▶ leveler-tools ◀─────────┘
                                   │
@@ -788,8 +816,9 @@ repair turn.
 - `format`: best-effort, does **not** affect the verification status
 - `build` / `test`: decide `passed` / `failed`
 - Any field under project `verify` **replaces** the whole auto-discovered plan
-- An explicit `Acceptance:` block in the task text names commands the runtime
-  checks mechanically before accepting `update_goal(complete)`
+- Acceptance is those commands and nothing else. The runtime does not read the
+  task prose for an `Acceptance:` block — that parser went with Wave 2's
+  `TaskContract`, because a sentence is not a contract.
 
 ### 6. Persistence and reconnect
 
@@ -961,11 +990,22 @@ Agent → browser_* tools (leveler-tools)
 
 ## Repository guide
 
-- `crates/` — Rust workspace
+Every directory has one owner, and nothing lives at the root because it once
+did.
+
+- `crates/` — Rust workspace. SQLite migrations belong to the crate that runs
+  them: `crates/leveler-storage/migrations/`.
 - `configs/` — provider/model profiles
 - `docs/` — architecture and examples
-- `evals/` — evaluation harness
-- `migrations/` — SQLite migrations
+- `evals/` — the evaluation system, and everything only it uses: `cases/`,
+  `suites/`, `fixtures/` (the repositories cases run against), and `scripts/`
+  (generators, integrity checks, offline analyzers)
+- `packaging/` — release packaging: the Homebrew formula and the two scripts
+  CI runs to guard a release payload
+- `schemas/` — the public client-protocol contract, generated from the Rust
+  types and consumed by the TypeScript and Dart clients
+- `testdata/` — cross-language golden vectors: one answer key the Rust host and
+  the phone client are both checked against
 - `services/leveler-relay` — remote relay service
 - `.github/workflows/` — CI
 

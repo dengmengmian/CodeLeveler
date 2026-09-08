@@ -19,8 +19,8 @@ Counted per case:
   SealedPathAccessDeniedCount    attempts the sandbox or a guard refused
 
 Usage:
-    python3 scripts/eval_integrity.py <session-substring> [...]
-    python3 scripts/eval_integrity.py --cases evals/cases/navigation
+    python3 evals/scripts/eval_integrity.py <session-substring> [...]
+    python3 evals/scripts/eval_integrity.py --cases evals/cases/navigation
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import sys
 # it arrived as a `path` argument or inside a shell string.
 SEALED_MARKERS = (
     "/evals/",
-    "fixtures/repos/",
+    "evals/fixtures/repos/",
     ".leveler/projects",
     ".leveler/config.toml",
     "/codeleveler/",

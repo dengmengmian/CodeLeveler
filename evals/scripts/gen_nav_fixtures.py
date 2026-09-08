@@ -21,7 +21,7 @@ What makes it navigable-but-not-trivial, by construction:
 
 Written once, reproducibly, with no randomness: same input, same repo.
 
-    python3 scripts/gen_nav_fixtures.py [--out fixtures/repos/navsvc]
+    python3 evals/scripts/gen_nav_fixtures.py [--out evals/fixtures/repos/navsvc]
 """
 
 from __future__ import annotations
@@ -1195,7 +1195,7 @@ def build(out: pathlib.Path, defect: str | None = None) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="fixtures/repos/navsvc")
+    ap.add_argument("--out", default="evals/fixtures/repos/navsvc")
     ap.add_argument(
         "--defect",
         choices=DEFECTS,

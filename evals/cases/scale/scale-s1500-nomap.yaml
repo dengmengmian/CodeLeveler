@@ -3,14 +3,14 @@
 # dependency chain to the bug (cmd -> pipeline -> sink interface -> rollup
 # impl -> window helper) is identical at every scale, so a difference in
 # outcome is a difference in SCALE, not in difficulty. Generate the tree with
-# `python3 scripts/gen_scale_repos.py --no-map 1500` (deterministic, not committed).
+# `python3 evals/scripts/gen_scale_repos.py --no-map 1500` (deterministic, not committed).
 # Controlled variant: identical tree MINUS the architecture map (README
 # layout + docs/pipeline.md). The mapped rungs all found the defect in round
 # 2 regardless of size, so the map — not the file count — was carrying
 # localization. This isolates that. Budget unchanged.
 id: scale-s1500-nomap
 name: "[scale] telemetryd window boundary, ~1500 files, no architecture map"
-repo: fixtures/repos/scale-s1500-nomap
+repo: evals/fixtures/repos/scale-s1500-nomap
 max_rounds: 100
 # Metrics only — never rendered into the task or shown to the agent.
 relevant_paths:

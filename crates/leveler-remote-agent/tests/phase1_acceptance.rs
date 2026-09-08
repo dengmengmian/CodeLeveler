@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt as _, StreamExt as _};
+use leveler_client_protocol::ProjectStatus;
 use leveler_client_protocol::{
     ApprovalId, ClientCommand, ClientError, InteractiveRuntimeClient, PermissionProfile,
     RuntimeEvent, SessionId, UiApprovalRequest, UiSessionSnapshot,
@@ -38,7 +39,6 @@ use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload, rpc_stream_i
 use leveler_remote_protocol::{
     ContentType, Sender, SignedEnvelope, SigningKey, VerifyParams, VerifyingKey,
 };
-use leveler_session_wire::ProjectStatus;
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;

@@ -401,9 +401,9 @@ async fn projects() -> anyhow::Result<std::process::ExitCode> {
     println!("手机可见的项目：");
     for project in listed {
         let status = match project.status {
-            leveler_session_wire::ProjectStatus::Online => "在线",
-            leveler_session_wire::ProjectStatus::Starting => "启动中",
-            leveler_session_wire::ProjectStatus::Offline => "离线",
+            leveler_client_protocol::ProjectStatus::Online => "在线",
+            leveler_client_protocol::ProjectStatus::Starting => "启动中",
+            leveler_client_protocol::ProjectStatus::Offline => "离线",
         };
         println!(
             "  {:<20} {:<10} {}",

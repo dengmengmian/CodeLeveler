@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Fetch real-world repositories used by scenario eval cases, pinned to fixed
-# refs for reproducibility. Repos land in `fixtures/repos/<name>` (gitignored,
+# refs for reproducibility. Repos land in `evals/fixtures/repos/<name>` (gitignored,
 # never committed) and are cloned — not copied — so eval runs stay deterministic
 # across machines and time.
 #
-# Usage:  scripts/fetch_eval_repos.sh            # fetch all
-#         scripts/fetch_eval_repos.sh ripgrep    # fetch one
+# Usage:  evals/scripts/fetch_eval_repos.sh            # fetch all
+#         evals/scripts/fetch_eval_repos.sh ripgrep    # fetch one
 #
-# The scenario YAML references `repo: fixtures/repos/<name>` + `base_ref: <ref>`.
+# The scenario YAML references `repo: evals/fixtures/repos/<name>` + `base_ref: <ref>`.
 # Keep the refs here in sync with the `base_ref` fields in evals/cases/scenarios/**.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ REPOS=(
   "ripgrep|https://github.com/BurntSushi/ripgrep|14.1.1"
   # Second real-repo localization case (Go, ~477 files) — evals/cases/realrepo/.
   "yq|https://github.com/mikefarah/yq|v4.44.3"
-  # The real-project TUI matrix (fixtures/matrix/README.md) drives these.
+  # The real-project TUI matrix (evals/fixtures/matrix/README.md) drives these.
   # Pinned so a case starts from the same tree on every machine.
   "rust-csv|https://github.com/BurntSushi/rust-csv|1.4.0"
   "rust-semver|https://github.com/dtolnay/semver|280ebcb"

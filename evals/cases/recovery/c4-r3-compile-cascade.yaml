@@ -4,7 +4,7 @@
 # not silence one error. Starting module named to keep navigation out of it.
 id: c4-r3-compile-cascade
 name: "[recovery] Sink gained Describe() and nothing implements it"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 50
 recovery: true
 relevant_paths:

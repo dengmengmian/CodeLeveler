@@ -8,7 +8,7 @@
 # a naive change to one sink leaves the other two unable to receive the limit.
 id: n7-cross-package
 name: "[nav] a per-run output cap that reaches every sink"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 70
 relevant_paths:
   - internal/sink/sink.go
@@ -65,7 +65,7 @@ expect:
       go test ./... > /dev/null
 
 # Benchmark-author validity metadata. Metrics-only: consumed by
-# scripts/check_fixture_validity.py, never placed in agent context.
+# evals/scripts/check_fixture_validity.py, never placed in agent context.
 validity:
   maintained_checks:
     - ["go", "build", "./..."]

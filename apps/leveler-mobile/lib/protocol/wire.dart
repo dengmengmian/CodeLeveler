@@ -1,6 +1,6 @@
 /// The session messages carried inside an envelope's payload.
 ///
-/// Mirrors `leveler-session-wire`. Two rules from the design shape this file:
+/// Mirrors `leveler-client-protocol`. Two rules from the design shape this file:
 ///
 /// - **Upstream is closed.** The app sends only what it can name; a command the
 ///   host would refuse should not leave the phone at all.

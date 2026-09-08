@@ -44,7 +44,7 @@ matrix instead of discovering the next defect only after fixing this one.
 Exit status is 0 only when every case is VALID.
 
 Usage:
-    python3 scripts/check_fixture_validity.py [--cases evals/cases/navigation]
+    python3 evals/scripts/check_fixture_validity.py [--cases evals/cases/navigation]
                                               [--only n6-large-file-region]
                                               [--json out.json]
 """

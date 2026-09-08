@@ -47,7 +47,7 @@ cargo test --workspace
 ```
 
 Library crates should expose typed errors. Keep `anyhow` at application
-boundaries, preserve `#![forbid(unsafe_code)]`, and avoid adding a dependency
+boundaries, preserve `#![forbid(unsafe_code)]` (`leveler-execution` is the documented exception and uses `deny`), and avoid adding a dependency
 edge from a lower-level crate back to a user-facing layer.
 
 ## Evaluation cases

@@ -4,7 +4,7 @@
 # repair has to come from reading that evidence, not from syntax.
 id: c4-r4-behavior-recovery
 name: "[recovery] the filter stage keeps the wrong records"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 recovery: true
 relevant_paths:

@@ -10,15 +10,37 @@ evals/
   suites/       how each behaviour suite is run: adoption / safety / long-task / multi_agent / …
   configs/      experiment YAML, one file per <suite>/<experiment>
   runner/       observer runner (`leveler eval run --suite …` shells here)
-  metrics/      metric contract
-  lib/          EventLog parser, stats, report, JSON schema (lib/schema/)
+  lib/          EventLog parser, metrics, stats, report, JSON schema (lib/schema/)
   comparative/  CodeLeveler vs other agents (HC-001 / HC-002)
-  scripts/      compare_arms, score_eventlog, selftest
+  fixtures/     evaluation repositories and per-obligation oracles
+  scripts/      generators, integrity checks, offline analyzers, report tools
   tests/        framework unit tests (offline, no model)
   reports/      generated per experiment (gitignored except README/EXAMPLE)
   runs/         per-batch isolated LEVELER_HOME + batch.json (gitignored)
   baselines/    recorded capability results referenced by docs/
 ```
+
+`fixtures/repos/` holds the repositories cases run against. They are generated
+or cloned, never committed: `evals/scripts/fetch_eval_repos.sh` clones the real
+ones at pinned refs, and `gen_nav_fixtures.py` / `gen_scale_repos.py` /
+`gen_e2_fixture.py` build the synthetic ones deterministically.
+
+## Metrics
+
+Implemented in `evals/lib/metrics.py` and `evals/lib/schema.py`; there is no
+separate metrics package.
+
+- adoption rate (spawn | offer seen)
+- spawn statistics
+- Wilson interval
+- mean / median / variance
+- compact JSON record (`run_id`, `task`, `model`, `delegation`, `execution`, `safety`)
+- MA-VALUE-001 value metrics (`evals/lib/value.py`): task success, efficiency,
+  child consumption. Spawn rate is diagnostic only.
+- Profile effectiveness (`profile_effectiveness`): per-profile findings / bugs /
+  accepted changes. Old EventLogs fall back to `role`.
+- Reviewer value (`evals/lib/reviewer.py`): useful findings, verified findings,
+  noise. Finding count is not a success metric.
 
 | entry point | question | implementation |
 | --- | --- | --- |

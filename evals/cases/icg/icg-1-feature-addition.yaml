@@ -3,7 +3,7 @@
 # change and a new test are all on the agent.
 id: icg-1-feature-addition
 name: "[icg] add a --names-only mode"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 60
 relevant_paths:
   - cmd/navsvc/main.go

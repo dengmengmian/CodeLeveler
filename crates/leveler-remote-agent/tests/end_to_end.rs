@@ -721,7 +721,7 @@ async fn events_do_not_cross_between_two_open_projects() {
                 .map(|id| leveler_remote_agent::ProjectInfo {
                     project_id: id.to_string(),
                     path_display: id.to_string(),
-                    status: leveler_session_wire::ProjectStatus::Online,
+                    status: leveler_client_protocol::ProjectStatus::Online,
                 })
                 .collect()
         }

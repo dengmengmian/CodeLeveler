@@ -207,7 +207,7 @@ fn no_relay_facing_parser_falls_over_on_mangled_input() {
         // The inner session message, which is parsed only after a signature
         // checks out — but the payload it covers is still attacker-chosen.
         let bytes = mutate(&mut rng, PAYLOAD);
-        let _ = serde_json::from_slice::<leveler_session_wire::UpstreamMessage>(&bytes);
+        let _ = serde_json::from_slice::<leveler_client_protocol::UpstreamMessage>(&bytes);
 
         // Header parsing: these arrive as raw strings on control-plane requests,
         // before anything has been authenticated.

@@ -5,7 +5,7 @@
 # behaviour is pinned.
 id: c3-e4-repeated-context
 name: "[edit] MaxValue survives all-negative input, MinValue untouched"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/report/extremes.go

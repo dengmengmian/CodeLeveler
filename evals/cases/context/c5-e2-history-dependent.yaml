@@ -1,6 +1,6 @@
 id: c5-e2-history-dependent
 name: '[context] every feed adapter describes its own dialect'
-repo: fixtures/repos/telemetryd-e2
+repo: evals/fixtures/repos/telemetryd-e2
 max_rounds: 160
 relevant_paths:
 - internal/adapters/registry.go

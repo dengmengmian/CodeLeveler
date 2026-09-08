@@ -2,7 +2,7 @@
 # jsonl decoder drops the `depth` field (see `--defect jsonl-depth`). The first
 # version of this case pointed at the healthy fixture, where the described
 # behaviour already worked: the hidden acceptance passed untouched and the case
-# measured nothing. `scripts/check_fixture_validity.py` now refuses that.
+# measured nothing. `evals/scripts/check_fixture_validity.py` now refuses that.
 #
 # decoder.go is ~1030 lines. The live jsonl
 # decoder sits near line 510, between 33 exporter-revision helpers before it
@@ -15,7 +15,7 @@
 # file is allowed and is not scored as an error.
 id: n6-large-file-region
 name: "[nav] JSON input never carries record depth"
-repo: fixtures/repos/navsvc-n6
+repo: evals/fixtures/repos/navsvc-n6
 max_rounds: 60
 relevant_paths:
   - internal/ingest/decoder.go
@@ -120,7 +120,7 @@ expect:
       go test ./internal/pipeline/ ./internal/report/ ./internal/config/ > /dev/null
 
 # Benchmark-author validity metadata. Metrics-only: consumed by
-# scripts/check_fixture_validity.py, never placed in agent context.
+# evals/scripts/check_fixture_validity.py, never placed in agent context.
 validity:
   maintained_checks:
     - ["go", "build", "./..."]

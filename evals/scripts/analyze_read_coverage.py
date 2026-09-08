@@ -24,8 +24,8 @@ Reports per case, for every path the case declares relevant or impact:
     MISS     never returned successfully
 
 Usage:
-    python3 scripts/analyze_read_coverage.py [--cases evals/cases/navigation]
-                                             [--repo fixtures/repos/navsvc]
+    python3 evals/scripts/analyze_read_coverage.py [--cases evals/cases/navigation]
+                                             [--repo evals/fixtures/repos/navsvc]
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ def widest_reads(session_dir: str, wanted: list[str]) -> dict[str, tuple[int, in
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default="evals/cases/navigation")
-    ap.add_argument("--repo", default="fixtures/repos/navsvc")
+    ap.add_argument("--repo", default="evals/fixtures/repos/navsvc")
     args = ap.parse_args()
 
     print(f"{'case':30}{'path':40}{'returned':>13}{'clip':>6}{'verdict':>9}{'lines':>7}")

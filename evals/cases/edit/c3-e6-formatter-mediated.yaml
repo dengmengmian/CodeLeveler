@@ -4,7 +4,7 @@
 # built against the formatted tree, not the stale pre-format text.
 id: c3-e6-formatter-mediated
 name: "[edit] raise the line cap and fix the label clamp in one dirty file"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/config/limits.go

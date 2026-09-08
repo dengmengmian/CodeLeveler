@@ -4,7 +4,7 @@
 # two lines once found.
 id: icg-2-bug-fix
 name: "[icg] the last CSV label on a line disappears"
-repo: fixtures/repos/navsvc-icg2
+repo: evals/fixtures/repos/navsvc-icg2
 max_rounds: 60
 recovery: true
 relevant_paths:

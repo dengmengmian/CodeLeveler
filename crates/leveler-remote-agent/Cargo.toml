@@ -12,7 +12,6 @@ description = "Host-side bridge for remote APP control: verifies signed device f
 leveler-client-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-remote-protocol = { workspace = true, features = ["policy"] }
-leveler-session-wire = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

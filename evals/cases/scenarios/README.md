@@ -19,7 +19,7 @@
 ```yaml
 id: <唯一 id>
 name: <人类可读标题>
-repo: fixtures/repos/<name>   # 可选：clone 真实仓（本地、gitignored、不复制进仓库）
+repo: evals/fixtures/repos/<name>   # 可选：clone 真实仓（本地、gitignored、不复制进仓库）
 base_ref: "<tag 或 SHA>"       # 可选：固定 commit，保证可复现
 files: {}                      # 无 repo 时即整个 workspace；有 repo 时作为 overlay 注入 bug/失败测试
 max_rounds: 140                # 真实大仓给更大预算
@@ -34,7 +34,7 @@ expect:                        # 独立验收命令，退出码 0 = 通过
 
 1. **验收与"模型说完成"解耦**：`expect` 是独立命令，`false_completion_rate` 就靠它兜底。
 2. **验收脚本放在 `expect` 里，不落工作区**：Agent 改不到验收逻辑，杜绝"改测试骗过"。
-3. **真实仓不入库**：`fixtures/` 整体 gitignored，由 `scripts/fetch_eval_repos.sh` 按固定 ref 拉取。
+3. **真实仓不入库**：`evals/fixtures/` 整体 gitignored，由 `evals/scripts/fetch_eval_repos.sh` 按固定 ref 拉取。
 4. **task 独立于实现**：任务描述只讲契约（要什么行为），不泄露该改哪个文件/怎么改。
 
 ## 运行
@@ -55,4 +55,4 @@ leveler eval run --cases evals/cases/scenarios/feature --model <provider/model> 
 1. **红**：未实现时 `expect` 失败（`git checkout <base_ref>` 干净仓上直接跑 `expect` 应失败）。
 2. **绿**：贴一份已知可行实现后 `expect` 通过。
 
-只有红/绿都验证过，这个 case 才不是"摆设"。ripgrep 场景的固定 ref 见 `scripts/fetch_eval_repos.sh`。
+只有红/绿都验证过，这个 case 才不是"摆设"。ripgrep 场景的固定 ref 见 `evals/scripts/fetch_eval_repos.sh`。

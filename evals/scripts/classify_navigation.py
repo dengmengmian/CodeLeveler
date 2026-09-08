@@ -19,7 +19,7 @@ to the agent. `relevant` / `impact` come from the eval case's metrics-only
 path lists.
 
 Usage:
-    python3 scripts/classify_navigation.py <session-substring> \\
+    python3 evals/scripts/classify_navigation.py <session-substring> \\
         [--relevant a.go,b.go] [--impact a.go,c.go]
 """
 

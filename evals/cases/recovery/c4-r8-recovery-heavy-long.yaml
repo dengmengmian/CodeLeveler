@@ -5,7 +5,7 @@
 # sustained construction, converging on one fully-green final tree.
 id: c4-r8-recovery-heavy-long
 name: "[recovery] fix the build, then ship --stats"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 80
 recovery: true
 relevant_paths:

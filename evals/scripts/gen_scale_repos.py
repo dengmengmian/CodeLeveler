@@ -20,11 +20,11 @@ runs at the same scale produce byte-identical repositories, and the sizes are
 comparable to each other.
 
 Usage:
-    python3 scripts/gen_scale_repos.py                 # all scales
-    python3 scripts/gen_scale_repos.py 100 300         # selected scales
+    python3 evals/scripts/gen_scale_repos.py                 # all scales
+    python3 evals/scripts/gen_scale_repos.py 100 300         # selected scales
 
-Output: fixtures/repos/scale-s<N>/ (git repo, one commit). Not committed —
-regenerate on demand, like scripts/fetch_eval_repos.sh does for ripgrep.
+Output: evals/fixtures/repos/scale-s<N>/ (git repo, one commit). Not committed —
+regenerate on demand, like evals/scripts/fetch_eval_repos.sh does for ripgrep.
 """
 
 from __future__ import annotations

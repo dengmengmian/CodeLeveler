@@ -6,7 +6,7 @@ the smallest fixture that reproduces its structure. They run on synthetic
 cases rather than the real ones so the tripwire keeps working while N1-N8 are
 being repaired — and so a repair cannot quietly make the tripwire vacuous.
 
-    python3 scripts/test_fixture_validity_gates.py
+    python3 evals/scripts/test_fixture_validity_gates.py
 """
 
 from __future__ import annotations

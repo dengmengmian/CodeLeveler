@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """C5-E2 fixture: a history-dependent long-context coding task.
 
-Builds `fixtures/repos/telemetryd-e2`: the scale-s1500 filler family for
+Builds `evals/fixtures/repos/telemetryd-e2`: the scale-s1500 filler family for
 repository realism (distractor packages, same telemetryd core), plus a REAL
 relevant working set — 56 ingest adapters, each ~15-20KB of differentiated Go
 whose parsing behavior carries seeded local quirks along four dimensions:
@@ -23,8 +23,8 @@ cross-check drives parse() itself to derive ACTUAL behavior — a snapshot that
 lies about its adapter fails on behavior, not on string matching.
 
 Usage:
-    python3 scripts/gen_e2_fixture.py                 # build the fixture repo
-    python3 scripts/gen_e2_fixture.py --emit-reference <workspace>
+    python3 evals/scripts/gen_e2_fixture.py                 # build the fixture repo
+    python3 evals/scripts/gen_e2_fixture.py --emit-reference <workspace>
 """
 
 from __future__ import annotations

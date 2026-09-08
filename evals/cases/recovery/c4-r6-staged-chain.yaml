@@ -4,7 +4,7 @@
 # second. Measured: continuing through layered failures, not one repair.
 id: c4-r6-staged-chain
 name: "[recovery] fixing the build reveals a red suite behind it"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 60
 recovery: true
 relevant_paths:

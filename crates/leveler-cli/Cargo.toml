@@ -33,7 +33,6 @@ leveler-remote-protocol = { workspace = true }
 leveler-relay = { workspace = true }
 axum = { workspace = true }
 leveler-local-transport = { workspace = true }
-leveler-session-wire = { workspace = true }
 leveler-tui = { workspace = true }
 leveler-web = { workspace = true }
 clap = { workspace = true }

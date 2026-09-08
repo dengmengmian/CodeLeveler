@@ -3,11 +3,11 @@
 # dependency chain to the bug (cmd -> pipeline -> sink interface -> rollup
 # impl -> window helper) is identical at every scale, so a difference in
 # outcome is a difference in SCALE, not in difficulty. Generate the tree with
-# `python3 scripts/gen_scale_repos.py 300` (deterministic, not committed).
+# `python3 evals/scripts/gen_scale_repos.py 300` (deterministic, not committed).
 # Budget is deliberately the same at every rung.
 id: scale-s300
 name: "[scale] telemetryd window boundary, ~300-file repository"
-repo: fixtures/repos/scale-s300
+repo: evals/fixtures/repos/scale-s300
 max_rounds: 100
 # Metrics only — never rendered into the task or shown to the agent.
 relevant_paths:

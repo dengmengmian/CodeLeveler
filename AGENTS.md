@@ -22,7 +22,7 @@ dependency edge back to a user-facing layer. Those are not repeated here.
 
 ## The unsafe policy has exactly one exception
 
-Twenty-five crates carry `#![forbid(unsafe_code)]`. `leveler-execution` is
+Every crate but one carries `#![forbid(unsafe_code)]`. `leveler-execution` is
 deliberately different: `crates/leveler-execution/src/lib.rs` uses
 `#![deny(unsafe_code)]`, because `forbid` cannot be relaxed by a scoped
 `allow`, and this crate needs exactly one — the Linux `PR_SET_PDEATHSIG`

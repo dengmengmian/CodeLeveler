@@ -21,7 +21,7 @@ image. Using the same function means the numbers here line up with the ones
 compaction would see.
 
 Usage:
-    python3 scripts/analyze_context.py <substring-of-session-dir> [--curve]
+    python3 evals/scripts/analyze_context.py <substring-of-session-dir> [--curve]
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ failure) or thrashing (the same failure, or exploration that ignores the
 failure in hand)?
 
 Usage:
-    python3 scripts/analyze_trajectory.py <substring-of-session-dir> [--full]
+    python3 evals/scripts/analyze_trajectory.py <substring-of-session-dir> [--full]
 
 The substring matches a directory under ~/.leveler/projects; the most recently
 modified match wins, so `... ripgrep-total-count` picks the latest run.

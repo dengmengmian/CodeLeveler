@@ -4,7 +4,7 @@
 # propagation across all four implementors satisfies the acceptance.
 id: c3-e2-contract-propagation
 name: "[edit] every sink refuses writes after Close"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 50
 relevant_paths:
   - internal/sink/sink.go

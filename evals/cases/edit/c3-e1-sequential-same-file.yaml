@@ -4,7 +4,7 @@
 # the task names the exact file.
 id: c3-e1-sequential-same-file
 name: "[edit] summary skips nameless records and gains Reset"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/report/summary.go
@@ -73,7 +73,7 @@ expect:
       go test ./... > /dev/null
 
 # Benchmark-author validity metadata. Metrics-only: consumed by
-# scripts/check_fixture_validity.py, never placed in agent context.
+# evals/scripts/check_fixture_validity.py, never placed in agent context.
 validity:
   maintained_checks:
     - ["go", "build", "./..."]

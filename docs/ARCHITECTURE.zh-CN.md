@@ -95,13 +95,36 @@ crate 数量不是边界，职责和数据所有权才是：
 | 块 | 唯一职责 | 不应承担 | 主要落点（CURRENT） |
 | --- | --- | --- | --- |
 | **1a. Engine** | Task/turn 生命周期、EventLog、恢复、resume、明确停止、可持久化 runtime 事实。 | 工具具体实现；UI；provider 线格式。 | `leveler-engine` |
-| **1b. Agent Loop** | 模型 → 工具调用 → 宿主执行 → 结果回灌 → 模型。 | 会话持久化；transport；UI；硬编码产品规划策略。 | `leveler-agent` |
+| **1b. Agent kernel** | 通用循环：模型 → 工具调用 → 结果 → 下一次请求，含 round/token/成本/时长上限、取消与语义中立的停止原因。 | 任何 CodeLeveler 专有的东西：权限、写边界、仓库、提示词、持久化、委派。 | `leveler-agent-core` |
+| **1c. Coding harness** | 让这个循环成为*编码* agent 的一切：提示词、仓库上下文、记忆、技能、压缩策略、ToolHost admission、写所有权、子 agent、goal 协议、验证桥接。 | 会话持久化；transport；UI；迭代本身。 | `leveler-agent` |
 | **2. ToolHost / 执行** | Schema 校验、风险与审批、路径约束、可靠工具起止记录、进程/文件执行与取消。 | 对话编排；任务完成策略；UI 状态。 | `leveler-tools` + `leveler-execution` |
 | **3. 会话状态** | 持久化消息、规范事件、快照与迁移，作为有序可审计事实。 | Agent 策略或隐式产品决策。 | `leveler-storage` + engine EventLog |
 | **4. 模型适配** | 厂商中立的请求、流式与工具调用语义。 | 会话状态、工具权限、工作流决策。 | `leveler-model` + provider/protocol 适配 |
 
-**正文不要把 Agent Loop 与 Engine 合并描述。** Engine 监督；Agent 只跑一轮
-模型–工具反馈循环。
+**正文不要把 Engine、kernel 与 harness 合并描述。** Engine 拥有持久的任务生命周期；
+kernel 拥有迭代；harness 拥有这次迭代*是为了什么*。Engine 不监督模型的判断——它只
+持久化机械上发生了什么，并把下一个 turn 交回给用户或一次显式的继续。
+
+### 所有权分层
+
+```text
+Foundation          leveler-core · leveler-model · leveler-protocol · leveler-provider
+        ↓
+通用 agent kernel    leveler-agent-core          可嵌入、与仓库无关
+                                                只有一个 model↔tool 循环
+        ↓
+CodeLeveler         leveler-agent               提示词 · 上下文 · 记忆 · 技能
+coding harness                                  ToolHost admission · 写所有权
+                                                子 agent · goal 协议
+        ↓
+可靠 runtime         leveler-lifecycle · leveler-verifier · leveler-storage · leveler-engine
+        ↓
+产品                 leveler-app · leveler-cli · leveler-tui · leveler-web · remote
+```
+
+依赖只向下。kernel 只依赖 `leveler-model`，workspace 里没有别的——这一点由测试断言
+而非靠自觉：`crates/leveler-agent-core/tests/kernel_boundary.rs`。完整契约见
+[AGENT_KERNEL.md](AGENT_KERNEL.md)。
 
 ### 目标分层（全体客户端）
 
@@ -203,14 +226,13 @@ Engine、Agent Loop、工具 + MCP、execution、client protocol、持久化。
 模式（`update_goal` 直到 complete 或 blocked）与可选的 `spawn_agent` 扇出。
 日志里遗留的 `orchestrate` kind 会被接受并按 direct 跑。
 
-**一个 goal 跨多个 bounded work window，而不是一个巨大的 turn。** 单 turn 的
-100-round 上限结束的是一个 *work window*，不是整个 goal：supervisor
-（`DefaultSupervisorPolicy::after_turn`）会开下一个 window（`DriveGoalAgain`，
-一个重述目标的全新 turn）而非直接失败。窗口受双重 bound——内存级跨窗
-no-progress 计数器（`MAX_NO_PROGRESS_WINDOWS`，被实质工作区改动重置）在绝对
-`MAX_SUPERVISED_TURNS` 上限之下——所以卡住的 goal 会收敛而非空转。用尽 round
-预算的窗口是 `BudgetLimited`（未完成、可恢复），**不是** `Failed`。goal 身份即
-session；window 预算在内存中（daemon 崩溃后的窗口恢复是未来工作，非当前）。
+**一个 turn 在模型停下的地方结束。** 单 turn 的 100-round 上限是无条件断路器，
+不是调度决策：runtime 不会自作主张重新驱动一个 goal。De-engineering Wave 2 删除了
+那个会开第二个窗口的 supervisor（`SupervisorPolicy`、`DriveGoalAgain`、
+`ExtendBudget` 以及跨窗 no-progress 计数器）；`WindowState` 之所以还在，只是为了让
+旧事件日志仍能解码，没有任何代码读它。继续一个未完成的 goal 是一次显式动作——用户
+resume，或 engine 的 `continue_active_goal` 开下一个 turn——用尽 round 预算的 turn
+是未完成、可恢复，绝不是 `Failed`。goal 身份即 session。
 
 ---
 
@@ -269,7 +291,7 @@ Transport 可变，契约不变：
 
 - 进程内（`InProcessRuntimeClient`）
 - 本地 daemon / Unix socket（`leveler-local-transport`）
-- Session wire / WebSocket（`leveler-session-wire`、Web）
+- Session wire / WebSocket（`leveler-client-protocol::session_wire`、Web）
 - 远程 bridge（`leveler-remote-agent` + remote protocol / relay）
 
 除非真实需求强制，否则不要平行新造「Presentation Protocol」「UI Protocol」
@@ -318,7 +340,7 @@ daemon 与 `RouterService`。详见 `crates/leveler-web/README.md`。
 ### Remote / APP（**CURRENT** bridge，**FUTURE** 完整产品）
 
 `leveler-remote-agent` 是 **host 侧远程 bridge**。它刻意**不**依赖
-`leveler-web`，而是通过 `leveler-session-wire` 与 runtime/client 协议边界工作。
+`leveler-web`，而是通过 `leveler-client-protocol::session_wire` 与 runtime/client 协议边界工作。
 面向未来桌面/移动 APP 的基础设施已经存在。
 
 不要写「未来从零增加 Remote APP architecture」。完整 Desktop APP 与移动产品
@@ -548,7 +570,7 @@ ABI、JSON-RPC 插件协议或 marketplace。这些需有真实实现后才成�
 
 | | |
 | --- | --- |
-| **CURRENT** | `CheckpointStore`（双 map 联合不变量）、`LiveViews`（重连状态 + 纯 fold）、`stage_turn`（唯一 turn 启动前奏）已提取；facade 只做路由与委托（2739 → 2501 行，12 个状态字段）。 |
+| **CURRENT** | `CheckpointStore`（双 map 联合不变量）、`LiveViews`（重连状态 + 纯 fold）、`stage_turn`（唯一 turn 启动前奏）已提取；facade 只做路由与委托：它自己不装配任何东西，也不持有自己的 runtime。 |
 | **残余** | 交付中间件、会话目录 CRUD、runtime-config store、media/memory 臂保持内联（无独立状态/单一路径，按提取规则暂不拆）；删除会话时 per-session map 不清理仍为 KNOWN SEAM。 |
 | **状态** | **核心簇 DONE**；其余登记在案。新增 client use case = 小 handler + facade 路由。 |
 
@@ -560,7 +582,7 @@ ABI、JSON-RPC 插件协议或 marketplace。这些需有真实实现后才成�
 
 | | |
 | --- | --- |
-| **已迁移** | `ContextCompacted { from, to }` 与 `ContextExpanded { from_tokens, to_tokens, reason }`（协议 1.4 additive；schema+golden 已再生成；TUI 双语本地化；Web 镜像更新）。顺带修复：TUI 曾以 `budget exhausted`（空格）嗅探而执行器发 `budget_exhausted`（下划线）——用户看到裸机器串。 |
+| **已迁移** | `ContextCompacted { from, to }`（协议 1.4 additive；schema+golden 已再生成；TUI 双语本地化；Web 镜像更新）。顺带修复：TUI 曾以 `budget exhausted`（空格）嗅探而执行器发 `budget_exhausted`（下划线）——用户看到裸机器串。`ContextExpanded` 仅用于回放：Wave 2 删除了自适应上下文阶梯，该变体只为解码旧日志保留，没有任何代码写入。 |
 | **残余** | AgentActivity 咨询标签、turn-incomplete 默认 reason、interactive.rs 各处通知仍为预格式化——登记在案，按上方规则机会性迁移。 |
 | **状态** | **政策生效；高置信事实 DONE** |
 
@@ -589,9 +611,10 @@ Runtime 不判断：用户需求是否被满足、模型对目标的理解是否
   blocked / budget_limited / failed / interrupted）与 `VerificationStatus`
   （项目自身检查的结果：passed / failed / not_run / unavailable）。
   **Checks Passed ≠ 用户意图被证明。**
-- `update_goal(complete)` 只因机械原因被拒绝：委派的子 agent 仍在运行、
-  reviewer 报告的 blocking finding 未处理、模型自己计划中仍有未完成步骤、
-  用户显式写下的 acceptance 命令尚未通过。
+- `update_goal(complete)` 只因机械原因被拒绝，而且只剩两条：委派的子 agent 仍在
+  运行，或模型自己计划中仍有未完成步骤。另外两条被 Wave 2 删除了——finding 是
+  reviewer 报告的惰性信息，acceptance 是项目自己的 `verify` 命令，而不是从任务
+  文本里解析出来的契约。
 - 检查失败只会被报告，不会代替模型自动修复。模型在循环内看到自己的测试结果，
   自行决定下一步。
 - 独立 reviewer 只在显式配置（`independent_review: required`）时启动；不再根据
@@ -636,7 +659,7 @@ User
   leveler-client-protocol    leveler-app  ◀── 组合 / 配置 / 投影
           │                       │
   leveler-local-transport         ▼
-  leveler-session-wire     leveler-engine
+  leveler-remote-agent     leveler-engine
   leveler-remote-agent            │
   leveler-remote-protocol         │
   services/leveler-relay          │
@@ -704,8 +727,8 @@ Engine 拥有 task/turn 生命周期；Agent 跑 direct 工具循环；宿主代
 - `format`：尽力而为，**不影响**验证状态
 - `build` / `test`：决定 `passed` / `failed`
 - 项目 `verify` 任一字段出现时，**整段替换**语言自动发现计划
-- 任务文本中显式的 `Acceptance:` 块列出的命令，Runtime 会在接受
-  `update_goal(complete)` 前机械核对
+- acceptance 就是这些命令，没有别的。Runtime 不会去任务文本里读 `Acceptance:`
+  块——那个解析器随 Wave 2 的 `TaskContract` 一起删掉了，因为一句话不是契约
 
 ### 6. 持久化与重连
 
@@ -862,11 +885,18 @@ Agent → browser_* 工具（leveler-tools）
 
 ## 仓库导览
 
-- `crates/` — Rust workspace
+每个目录只有一个 owner；没有任何东西因为"历史上就在那儿"而留在根目录。
+
+- `crates/` — Rust workspace。SQLite 迁移属于执行它们的 crate：
+  `crates/leveler-storage/migrations/`。
 - `configs/` — provider/model 档案
 - `docs/` — 架构与配置示例
-- `evals/` — 评测
-- `migrations/` — SQLite 迁移
+- `evals/` — 评测系统，以及只有它使用的一切：`cases/`、`suites/`、
+  `fixtures/`（case 运行所针对的仓库）、`scripts/`（生成器、完整性检查、离线分析）
+- `packaging/` — 发布打包：Homebrew formula，以及 CI 用来守护发布载荷的两个脚本
+- `schemas/` — 公开的 client-protocol 契约，从 Rust 类型生成，供 TypeScript 与
+  Dart 客户端消费
+- `testdata/` — 跨语言 golden 向量：Rust 宿主与手机客户端共用的同一份答案
 - `services/leveler-relay` — 远程中继服务
 - `.github/workflows/` — CI
 

@@ -5,7 +5,7 @@
 # that looks done.
 id: c3-e8-final-tree
 name: "[edit] --stats reports records, invalid and distinct — all three"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 50
 relevant_paths:
   - cmd/navsvc/main.go

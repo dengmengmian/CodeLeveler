@@ -17,6 +17,7 @@ use leveler_remote_agent::{AgentBridge, ProjectInfo, ProjectRoutes, RouteError, 
 // The registry-backed router and the daemon it attaches to are Unix-only, and
 // so are the two tests at the bottom that use them. The project-isolation tests
 // above them are not, and must keep running everywhere.
+use leveler_client_protocol::ProjectStatus;
 #[cfg(unix)]
 use leveler_local_transport::LocalSocketServer;
 #[cfg(unix)]
@@ -26,7 +27,6 @@ use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload, rpc_stream_i
 use leveler_remote_protocol::{
     ContentType, Sender, SignedEnvelope, SigningKey, VerifyParams, VerifyingKey,
 };
-use leveler_session_wire::ProjectStatus;
 use tokio::sync::broadcast;
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;

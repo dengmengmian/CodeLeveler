@@ -4,7 +4,7 @@
 # left behind — are what the acceptance rules out.
 id: c3-e5-move-dependency
 name: "[edit] Distinct moves out of aggregate.go as DistinctNames"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 40
 relevant_paths:
   - internal/report/aggregate.go

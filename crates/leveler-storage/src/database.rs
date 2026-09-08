@@ -7,7 +7,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 
 /// Embedded migrations, applied at startup.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Storage-layer errors.
 #[derive(Debug, thiserror::Error)]

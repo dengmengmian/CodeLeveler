@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt as _, StreamExt as _};
+use leveler_client_protocol::DownstreamMessage;
 use leveler_remote_protocol::auth::AgentRegisterAssertion;
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent, RoutingError};
 use leveler_remote_protocol::{ContentType, SignedEnvelope};
-use leveler_session_wire::DownstreamMessage;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;

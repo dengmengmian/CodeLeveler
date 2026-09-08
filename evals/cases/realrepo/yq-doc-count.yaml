@@ -3,10 +3,10 @@
 # wired from the CLI surface down through the evaluation path, on a real
 # third-party codebase the agent has never seen. No overlay, so nothing in
 # git history hints at the answer; the prompt names no file and no symbol.
-# Fetch with `scripts/fetch_eval_repos.sh yq` (pinned tag, not committed).
+# Fetch with `evals/scripts/fetch_eval_repos.sh yq` (pinned tag, not committed).
 id: yq-doc-count
 name: "yq: add a --doc-count flag (real repo, Go)"
-repo: fixtures/repos/yq
+repo: evals/fixtures/repos/yq
 base_ref: "v4.44.3"
 files: {}
 max_rounds: 100

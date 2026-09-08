@@ -4,7 +4,7 @@
 # composition order must hold when both are on.
 id: c3-e7-overlapping-config
 name: "[edit] output name_prefix and uppercase_names compose in order"
-repo: fixtures/repos/navsvc
+repo: evals/fixtures/repos/navsvc
 max_rounds: 50
 relevant_paths:
   - internal/config/config.go
