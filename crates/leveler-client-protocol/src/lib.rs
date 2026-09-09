@@ -68,7 +68,7 @@ pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
 pub use observability::{
     OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,
-    UiEventRelation, UiObservabilityLoaded, UiObservationField, UiObservationRow,
+    UiEventRelation, UiLaneAccounting, UiObservabilityLoaded, UiObservationField, UiObservationRow,
     UiRecoveryObservation, UiRequestObservation, UiSessionObservation, UiToolAggregate,
     classify_tool,
 };

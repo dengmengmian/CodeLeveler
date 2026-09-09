@@ -114,8 +114,43 @@ pub struct UiSessionObservation {
     pub tool_started: u32,
     pub tool_finished: u32,
     pub verification_runs: u32,
+    /// The latest verdict the runtime actually recorded: `passed`, `failed`,
+    /// `not_run` (nothing ever started), or `unavailable` (started and never
+    /// reached a verdict). A count of runs is not a verdict.
+    pub verification: String,
     pub compact_count: u32,
     pub subagent_started: u32,
+    /// Wall clock from the session's first to its latest durable timestamp.
+    /// `None` when either end is unparseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Prompt tokens the provider served from cache — a SUBSET of
+    /// `input_tokens`. `None` when no request recorded the figure at all; that
+    /// is an absence of measurement, and summing it as zero would report a
+    /// cache miss nobody observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Summed over the requests that carry a price. `None` when none does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Spend split by who did it: the root session, its children, and the
+    /// total. Present whenever there is a request to attribute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<UiLaneAccounting>,
+}
+
+/// What one lane of a session spent. `lane` is `main`, `children` or `total`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiLaneAccounting {
+    pub lane: String,
+    pub requests: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
 }
 
 /// One durable model-request row (no prompt/body).
@@ -134,6 +169,13 @@ pub struct UiRequestObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     pub retry_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// The sub-agent that made the call; absent for the root session's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub created_at: String,
 }
 

@@ -99,19 +99,67 @@ fn overview(
         dim,
     )));
     lines.push(Line::from(""));
+    let compact = |n: u64| fmt_tokens_compact(n.min(u32::MAX as u64) as u32);
+    // A figure nobody recorded shows as an em dash, never as a zero.
+    let unknown = "—".to_string();
     lines.push(kv(
         "MODEL",
         format!(
-            "requests {}  in {}  out {}  last {}",
+            "requests {}  in {}  cached {}  out {}  last {}",
             s.request_count,
-            fmt_tokens_compact(s.input_tokens.min(u32::MAX as u64) as u32),
-            fmt_tokens_compact(s.output_tokens.min(u32::MAX as u64) as u32),
+            compact(s.input_tokens),
+            s.cached_input_tokens
+                .map(compact)
+                .unwrap_or_else(|| unknown.clone()),
+            compact(s.output_tokens),
             s.last_latency_ms
                 .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_else(|| "—".into()),
+                .unwrap_or_else(|| unknown.clone()),
         ),
         state,
     ));
+    lines.push(kv(
+        "SPEND",
+        format!(
+            "{}  ·  {}",
+            s.cost_usd_micros
+                .map(|m| format!("${:.4}", m as f64 / 1_000_000.0))
+                .unwrap_or_else(|| unknown.clone()),
+            s.duration_ms
+                .map(|ms| {
+                    let secs = ms / 1000;
+                    if secs >= 60 {
+                        format!("{}m {:02}s", secs / 60, secs % 60)
+                    } else {
+                        format!("{secs}s")
+                    }
+                })
+                .unwrap_or_else(|| unknown.clone()),
+        ),
+        state,
+    ));
+    for lane in s
+        .lanes
+        .iter()
+        .filter(|l| l.requests > 0 && l.lane != "total")
+    {
+        lines.push(kv(
+            &lane.lane.to_uppercase(),
+            format!(
+                "requests {}  in {}  cached {}  out {}  cost {}",
+                lane.requests,
+                compact(lane.input_tokens),
+                lane.cached_input_tokens
+                    .map(compact)
+                    .unwrap_or_else(|| unknown.clone()),
+                compact(lane.output_tokens),
+                lane.cost_usd_micros
+                    .map(|m| format!("${:.4}", m as f64 / 1_000_000.0))
+                    .unwrap_or_else(|| unknown.clone()),
+            ),
+            state,
+        ));
+    }
     lines.push(kv(
         "TOOLS",
         format!("started {}  finished {}", s.tool_started, s.tool_finished),
@@ -120,8 +168,8 @@ fn overview(
     lines.push(kv(
         "GOAL",
         format!(
-            "verify×{}  compact {}  agents {}",
-            s.verification_runs, s.compact_count, s.subagent_started
+            "verify {} ×{}  compact {}  agents {}",
+            s.verification, s.verification_runs, s.compact_count, s.subagent_started
         ),
         state,
     ));

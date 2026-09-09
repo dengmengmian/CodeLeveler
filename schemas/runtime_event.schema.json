@@ -2046,6 +2046,52 @@
         }
       }
     },
+    "UiLaneAccounting": {
+      "description": "What one lane of a session spent. `lane` is `main`, `children` or `total`.",
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "lane",
+        "output_tokens",
+        "requests"
+      ],
+      "properties": {
+        "cached_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost_usd_micros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "lane": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "UiMemoryEntry": {
       "description": "Compact durable-memory row for TUI list surfaces.",
       "type": "object",
@@ -2360,6 +2406,29 @@
         "retry_count"
       ],
       "properties": {
+        "agent_id": {
+          "description": "The sub-agent that made the call; absent for the root session's own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cached_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost_usd_micros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "created_at": {
           "type": "string"
         },
@@ -2440,11 +2509,21 @@
         "tool_finished",
         "tool_started",
         "updated_at",
+        "verification",
         "verification_runs",
         "work_profile"
       ],
       "properties": {
         "avg_latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cached_input_tokens": {
+          "description": "Prompt tokens the provider served from cache — a SUBSET of `input_tokens`. `None` when no request recorded the figure at all; that is an absence of measurement, and summing it as zero would report a cache miss nobody observed.",
           "type": [
             "integer",
             "null"
@@ -2460,8 +2539,26 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "cost_usd_micros": {
+          "description": "Summed over the requests that carry a price. `None` when none does.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "created_at": {
           "type": "string"
+        },
+        "duration_ms": {
+          "description": "Wall clock from the session's first to its latest durable timestamp. `None` when either end is unparseable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         },
         "goal": {
           "type": "string"
@@ -2470,6 +2567,13 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "lanes": {
+          "description": "Spend split by who did it: the root session, its children, and the total. Present whenever there is a request to attribute.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiLaneAccounting"
+          }
         },
         "last_latency_ms": {
           "type": [
@@ -2534,6 +2638,10 @@
           "minimum": 0.0
         },
         "updated_at": {
+          "type": "string"
+        },
+        "verification": {
+          "description": "The latest verdict the runtime actually recorded: `passed`, `failed`, `not_run` (nothing ever started), or `unavailable` (started and never reached a verdict). A count of runs is not a verdict.",
           "type": "string"
         },
         "verification_runs": {

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use leveler_client_protocol::{
     OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,
-    UiEventRelation, UiObservabilityLoaded, UiObservationField, UiObservationRow,
+    UiEventRelation, UiLaneAccounting, UiObservabilityLoaded, UiObservationField, UiObservationRow,
     UiRecoveryObservation, UiRequestObservation, UiSessionObservation, UiToolAggregate,
     classify_tool,
 };
@@ -76,19 +76,31 @@ pub async fn query_observability(
             .unwrap_or(0)
     };
 
-    // Whole-session `model_requests` (not the event window). Display list is
-    // capped; overview counts below use this same store.
-    let mut requests = db
+    // Whole-session `model_requests` (not the event window). The DISPLAY list
+    // is capped; the accounting is not — a session past the cap used to report
+    // the token total of its last 200 calls as if it were the whole session.
+    let requests = db
         .load_for_session(session_id)
         .await
         .map_err(AppError::from)?;
-    if requests.len() > OBSERVABILITY_REQUESTS_MAX {
-        let skip = requests.len() - OBSERVABILITY_REQUESTS_MAX;
-        requests = requests.split_off(skip);
-    }
-    let request_views: Vec<UiRequestObservation> = requests.iter().map(request_view).collect();
     let (avg_latency_ms, last_latency_ms, request_failures, request_retries, in_tok, out_tok) =
         request_stats(&requests);
+    let request_count = requests.len() as u32;
+    let lanes = lanes_for(&requests);
+    let cached_input_tokens = lanes
+        .iter()
+        .find(|l| l.lane == "total")
+        .and_then(|l| l.cached_input_tokens);
+    let cost_usd_micros = lanes
+        .iter()
+        .find(|l| l.lane == "total")
+        .and_then(|l| l.cost_usd_micros);
+    let shown = if requests.len() > OBSERVABILITY_REQUESTS_MAX {
+        &requests[requests.len() - OBSERVABILITY_REQUESTS_MAX..]
+    } else {
+        &requests[..]
+    };
+    let request_views: Vec<UiRequestObservation> = shown.iter().map(request_view).collect();
 
     let turns = TurnRepository::new(db)
         .list(session_id)
@@ -98,6 +110,20 @@ pub async fn query_observability(
         .iter()
         .filter(|t| t.status == "interrupted" || (t.status == "running" && t.finished_at.is_none()))
         .count() as u32;
+
+    // Session-wide: the verdict is the latest one recorded, which may sit
+    // outside the event window entirely.
+    let verdict_rows = db
+        .load_by_types(
+            session_id,
+            &["verification_started", "verification_finished"],
+        )
+        .await
+        .map_err(AppError::from)?;
+    let verdict_decoded = decode_records(&verdict_rows)?;
+    let session_duration_ms = parse_millis(&session.created_at)
+        .zip(parse_millis(&session.updated_at))
+        .and_then(|(a, b)| u64::try_from(b - a).ok());
 
     let window = project_window(&decoded);
     // Session-wide: tool lifecycle rows only. Never the event window, never
@@ -133,7 +159,7 @@ pub async fn query_observability(
             work_profile: session.work_profile,
             collaboration: session.collaboration,
             last_sequence: latest,
-            request_count: request_views.len() as u32,
+            request_count,
             input_tokens: in_tok,
             output_tokens: out_tok,
             avg_latency_ms,
@@ -143,8 +169,13 @@ pub async fn query_observability(
             tool_started: count("tool_call_started"),
             tool_finished: count("tool_call_finished"),
             verification_runs: count("verification_started"),
+            verification: verification_verdict(&verdict_decoded).to_string(),
             compact_count: count("compacted"),
             subagent_started: count("sub_agent_started"),
+            duration_ms: session_duration_ms,
+            cached_input_tokens,
+            cost_usd_micros,
+            lanes,
         },
         window,
         window_from: from_seq,
@@ -713,7 +744,69 @@ fn request_view(r: &leveler_storage::ModelRequestRecord) -> UiRequestObservation
         error_kind: r.error_kind.clone(),
         latency_ms: r.latency_ms,
         retry_count: r.retry_count,
+        cached_input_tokens: r.cached_input_tokens,
+        cost_usd_micros: r.cost_usd_micros,
+        agent_id: r.agent_id.clone(),
         created_at: r.created_at.to_rfc3339(),
+    }
+}
+
+/// Sum one lane's spend. `cached` and `cost` stay `None` unless at least one
+/// row carried the figure — an unmeasured column is not a zero.
+fn lane(name: &str, rows: &[&leveler_storage::ModelRequestRecord]) -> UiLaneAccounting {
+    let sum_opt = |pick: fn(&leveler_storage::ModelRequestRecord) -> Option<u64>| {
+        rows.iter()
+            .filter_map(|r| pick(r))
+            .fold(None, |acc: Option<u64>, v| Some(acc.unwrap_or(0) + v))
+    };
+    UiLaneAccounting {
+        lane: name.to_string(),
+        requests: rows.len() as u32,
+        input_tokens: rows.iter().map(|r| r.input_tokens).sum(),
+        output_tokens: rows.iter().map(|r| r.output_tokens).sum(),
+        cached_input_tokens: sum_opt(|r| r.cached_input_tokens),
+        cost_usd_micros: sum_opt(|r| r.cost_usd_micros),
+    }
+}
+
+/// Split spend by who did it. Empty when there is nothing to attribute.
+fn lanes_for(rows: &[leveler_storage::ModelRequestRecord]) -> Vec<UiLaneAccounting> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let main: Vec<&_> = rows.iter().filter(|r| r.agent_id.is_none()).collect();
+    let children: Vec<&_> = rows.iter().filter(|r| r.agent_id.is_some()).collect();
+    let all: Vec<&_> = rows.iter().collect();
+    vec![
+        lane("main", &main),
+        lane("children", &children),
+        lane("total", &all),
+    ]
+}
+
+/// The latest verdict the runtime recorded, never a count of attempts.
+/// `not_run` means nothing started; `unavailable` means something started and
+/// never reached a verdict.
+fn verification_verdict(decoded: &[(EventRecord, EngineEvent)]) -> &'static str {
+    let mut verdict = None;
+    let mut started = false;
+    for (_, ev) in decoded {
+        match ev {
+            EngineEvent::VerificationStarted => {
+                started = true;
+                verdict = None;
+            }
+            EngineEvent::VerificationFinished { passed } => {
+                verdict = Some(*passed);
+            }
+            _ => {}
+        }
+    }
+    match (started, verdict) {
+        (_, Some(true)) => "passed",
+        (_, Some(false)) => "failed",
+        (true, None) => "unavailable",
+        (false, None) => "not_run",
     }
 }
 
@@ -1403,5 +1496,186 @@ mod tests {
         assert_eq!(by_name(&loaded.tools, "grep").unfinished, 1);
         assert_eq!(by_name(&loaded.tools, "grep").succeeded, 0);
         assert_eq!(by_name(&loaded.tools, "grep").total_ms, None);
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    //! Beta Product Closure, Phase D. The durable stores already carry cached
+    //! tokens, cost and the sub-agent that spent them; the session projection
+    //! did not report any of it, so a user could see a token total but never
+    //! what it cost or which lane spent it.
+    use super::*;
+    use leveler_core::now;
+    use leveler_engine::EngineEvent;
+    use leveler_storage::{
+        EventStore, ModelRequestRecord, ModelRequestStore, SessionRecord, SessionRepository,
+    };
+
+    async fn persist(db: &Database, sid: &SessionId, ev: EngineEvent) {
+        let (ty, payload) = ev.to_row().unwrap();
+        db.append(sid, None, &ty, &payload, now()).await.unwrap();
+    }
+
+    fn req(
+        id: &str,
+        agent: Option<&str>,
+        input: u64,
+        cached: Option<u64>,
+        output: u64,
+        cost: Option<u64>,
+        sid: &SessionId,
+    ) -> ModelRequestRecord {
+        ModelRequestRecord {
+            id: id.into(),
+            provider_request_id: None,
+            session_id: sid.clone(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            input_tokens: input,
+            output_tokens: output,
+            finish_reason: Some("stop".into()),
+            error_kind: None,
+            latency_ms: Some(4200),
+            retry_count: 0,
+            kind: leveler_storage::ModelCallKind::Round,
+            cached_input_tokens: cached,
+            cost_usd_micros: cost,
+            agent_id: agent.map(str::to_string),
+            created_at: now(),
+        }
+    }
+
+    async fn seeded() -> (Database, SessionId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "count the docs", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        // Two root calls and one a reviewer child made.
+        for r in [
+            req("r1", None, 1000, Some(900), 50, Some(1200), &sid),
+            req("r2", None, 2000, Some(1800), 70, Some(2300), &sid),
+            req("c1", Some("ag1"), 500, Some(400), 30, Some(600), &sid),
+        ] {
+            db.insert(&r).await.unwrap();
+        }
+        (db, sid)
+    }
+
+    #[tokio::test]
+    async fn the_session_reports_cached_tokens_and_cost() {
+        let (db, sid) = seeded().await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let s = &loaded.session;
+        assert_eq!(s.input_tokens, 3500);
+        assert_eq!(s.cached_input_tokens, Some(3100));
+        assert_eq!(s.cost_usd_micros, Some(4100));
+        assert!(s.duration_ms.is_some(), "a session has a duration");
+    }
+
+    /// A row written before the cache column existed is an absence of
+    /// measurement. Summing it as zero would report a cache miss that was
+    /// never observed.
+    #[tokio::test]
+    async fn unmeasured_cache_and_cost_read_as_unavailable_not_zero() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "g", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        db.insert(&req("r1", None, 1000, None, 50, None, &sid))
+            .await
+            .unwrap();
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.session.cached_input_tokens, None);
+        assert_eq!(loaded.session.cost_usd_micros, None);
+    }
+
+    #[tokio::test]
+    async fn spend_is_split_between_the_root_session_and_its_children() {
+        let (db, sid) = seeded().await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let lanes = &loaded.session.lanes;
+        let main = lanes.iter().find(|l| l.lane == "main").expect("main lane");
+        let children = lanes
+            .iter()
+            .find(|l| l.lane == "children")
+            .expect("children lane");
+        assert_eq!(
+            (main.requests, main.input_tokens, main.output_tokens),
+            (2, 3000, 120)
+        );
+        assert_eq!(main.cost_usd_micros, Some(3500));
+        assert_eq!(
+            (
+                children.requests,
+                children.input_tokens,
+                children.output_tokens
+            ),
+            (1, 500, 30)
+        );
+        assert_eq!(children.cost_usd_micros, Some(600));
+    }
+
+    /// The display list is capped at 200 rows. The accounting must not be:
+    /// a long session used to report the token total of its last 200 calls as
+    /// if it were the whole session.
+    #[tokio::test]
+    async fn accounting_covers_every_request_even_past_the_display_cap() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "long", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let n = leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX + 50;
+        for i in 0..n {
+            db.insert(&req(&format!("r{i}"), None, 10, Some(4), 1, Some(2), &sid))
+                .await
+                .unwrap();
+        }
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.session.request_count, n as u32);
+        assert_eq!(loaded.session.input_tokens, (n as u64) * 10);
+        assert_eq!(loaded.session.cached_input_tokens, Some((n as u64) * 4));
+        assert_eq!(loaded.session.cost_usd_micros, Some((n as u64) * 2));
+        assert_eq!(
+            loaded.requests.len(),
+            leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX,
+            "the display list stays capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_reports_its_verdict_not_only_that_it_ran() {
+        let (db, sid) = seeded().await;
+        let before = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(before.session.verification, "not_run");
+
+        persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        let running = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(
+            running.session.verification, "unavailable",
+            "started and never finished is not a verdict"
+        );
+
+        persist(
+            &db,
+            &sid,
+            EngineEvent::VerificationFinished { passed: false },
+        )
+        .await;
+        let failed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(failed.session.verification, "failed");
+
+        persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::VerificationFinished { passed: true },
+        )
+        .await;
+        let passed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(
+            passed.session.verification, "passed",
+            "the latest verdict wins"
+        );
     }
 }
