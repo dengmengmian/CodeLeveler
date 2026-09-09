@@ -126,8 +126,11 @@ the release workflow — none of which this closure did, because cutting a
 release is the owner's call.
 
 The `beta.1` upgrade defect its own notes disclosed is fixed here and verified
-side by side: the published binary reports `current: v0.2.0`, the candidate
-reports `current: v0.2.0-beta.2`.
+side by side. The candidate still carries `0.2.0-beta.1` in `Cargo.toml`, so
+what the comparison shows is the suffix surviving at all: the published binary
+reports `current: v0.2.0`, dropping the `-beta.1`, and the candidate reports
+`current: v0.2.0-beta.1`, keeping it. That is the defect and its fix. Once the
+workspace version is bumped, the same code will report `v0.2.0-beta.2`.
 
 ## Open blockers
 
