@@ -112,7 +112,13 @@ fn spawn_call(id: &str, args: serde_json::Value) -> ContentPart {
 }
 
 fn tmp(tag: &str, salt: u64) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("leveler-child-profile-{tag}-{salt}"));
+    // Scoped to this process: the path is fixed otherwise, so two concurrent
+    // runs of this binary share one fixture directory and each test's
+    // `remove_dir_all` deletes the other's files mid-run.
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-child-profile-{tag}-{salt}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
