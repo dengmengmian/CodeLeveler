@@ -1,7 +1,16 @@
 # Local / team build helpers. Do not put rustc-wrapper here (breaks CI if sccache missing).
 
+# Off, deliberately. Incremental pays off when you edit one crate and rebuild
+# it repeatedly; it loses when the common command is `cargo test --workspace`
+# or a fresh check after a pull, because every run deposits a new cache
+# generation and none of them are reused. Measured on this tree: 15 GB of
+# `target/debug/incremental` in five days, on top of a `deps/` that reached
+# 1.13 M files / 64 GB in the same window — and cargo walks those fingerprints
+# on every invocation whether or not anything changed. The cost of turning it
+# off is a slower inner loop on single-crate edits; use the narrow `c-*` and
+# `t-*` aliases below, which rebuild one package instead of the graph.
 [build]
-incremental = true
+incremental = false
 
 # Narrow-scope aliases — prefer these while developing; use full workspace only for DoD.
 [alias]
@@ -19,6 +28,10 @@ c-perm = "check -p leveler-execution -p leveler-agent -p leveler-cli -p leveler-
 # Definition of done (slow — run once before push)
 dod-test = "test --workspace"
 dod-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+
+# Cap the artifact directory instead of letting it grow to six figures of
+# files. Run after a workspace test round; needs `cargo install cargo-sweep`.
+sweep-target = "sweep --maxsize 20000"
 
 # Windows gives the main thread a 1 MB stack where Unix gives 8 MB, and that
 # difference is not academic: `leveler completions bash` overflowed it in CI
