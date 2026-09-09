@@ -6,6 +6,29 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A refused escalation now closes the tool call it announced.** A command
+  whose one-shot elevation the user denied was answered into the model's
+  transcript and nowhere else: the announcing `ToolCallStarted` never got a
+  terminal, so `EventLog::dangling_tool_calls` kept returning it and
+  `recover_crash_window` — which runs first on every `resume` and every
+  interactive chat turn — read it as a call that may have run and left a side
+  effect, blocking the session on `RecoveryConfirmationRequired` until
+  `acknowledge_crash_window` was run by hand. A command the runtime itself
+  refused to run was being reported as one that might have. All three
+  pre-admission refusals (no axis named, an axis already denied, the denial
+  itself) now answer the model *and* record the call's errored terminal.
+  Found by the first run of the Unified Dogfood Acceptance gate.
+
+### Added
+- **Unified Dogfood Acceptance V1** (`docs/evaluations/`) — a thin release
+  gate: seven committed cases, one revision, one model, and a list of
+  mechanical counters that must be zero before a baseline is frozen. No eval
+  framework, no `eval_mode`, no dogfood prompt or budget; it runs
+  `leveler eval run` over case YAML and reads the durable record back. Its
+  first run failed on the defect above; the accepted run and the new Beta
+  baseline are recorded in `docs/BETA_BASELINE_POST_CLOSURE.md`.
+
 ### Changed
 - **The agent loop is a reusable kernel.** `leveler-agent-core` now owns the
   one generic model↔tool loop — rounds, the model round with its retries,
