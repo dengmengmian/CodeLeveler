@@ -27,16 +27,32 @@ CORE_FREEZE             = UNCHANGED
 ## 2. What changed, and what deliberately did not
 
 The evaluation baseline moves from `reasoning_effort = "max"` to `"high"`, in
-one file: the dogfood lab's CodeLeveler config. Nothing user-facing moves,
-because there is nothing user-facing to move.
+one file: the dogfood lab's CodeLeveler config. No shipped default was changed.
 
-`reasoning_effort` has **no product default**. `ModelRequest::reasoning_effort`
-is `Option<ReasoningEffort>` initialised to `None`, and
-`resolve_reasoning_effort` returns `effective: None` when neither a request
-override nor a model-config default exists — so a CodeLeveler installed with no
-reasoning configuration sends no effort field at all and the provider decides.
-`max` existed only as a lab convention. Changing it is an evaluation decision,
-not a product change, and it is confined to:
+> **Correction, 2026-09-10 (Phase E).** This section first claimed
+> `reasoning_effort` has *no* product default and that there was "nothing
+> user-facing to move". That was wrong, and the correction matters because it
+> changes the size of what is left open.
+>
+> `ModelRequest::reasoning_effort` is indeed `Option<ReasoningEffort>` at
+> `None`, and `resolve_reasoning_effort` returns `effective: None` when neither
+> a request override nor a model-config default exists — so an **installed**
+> CodeLeveler, working in a repository that has no `configs/` bundle of its
+> own, sends no effort field and the provider decides. That path is unaffected.
+>
+> But this repository's own bundle sets one:
+> `configs/models/deepseek-v4-flash.yaml` (and `-pro`, and `k3`) carries
+> `default_effort: max`, and `configs/example.yaml` documents
+> `reasoning_effort = "max"` as "CodeLeveler default (provider default is
+> high)". `leveler doctor` inside this repo reports `default=max
+> effective=max`. So `max` ships — to anyone working in this repo, and to
+> anyone who copies those model files as a starting point.
+>
+> Phase A was still right to move only the lab; §3 forbids changing a shipped
+> default on the strength of an experiment. **Whether the shipped
+> `default_effort` should follow is a product decision, and it is open.**
+
+The change is confined to:
 
 ```text
 dogfood/config/codeleveler/config.toml      max -> high
