@@ -1,0 +1,87 @@
+[05:04:42] COHORT START baseline=leveler 0.2.0-beta.1 (2c50188f096f)
+[05:04:42] START rust-first-even--leveler--r1
+[05:05:10] END   rust-first-even--leveler--r1 exit=0
+[05:05:10] START rust-first-even--atomcode--r1
+[05:05:29] END   rust-first-even--atomcode--r1 exit=0
+[05:05:29] START rust-first-even--dsh--r1
+[05:09:53] END   rust-first-even--dsh--r1 exit=0
+[05:09:53] START rust-first-even--dsh--r2
+[05:10:28] END   rust-first-even--dsh--r2 exit=0
+[05:10:28] START rust-first-even--atomcode--r2
+[05:10:56] END   rust-first-even--atomcode--r2 exit=0
+[05:10:56] START rust-first-even--leveler--r2
+[05:11:50] END   rust-first-even--leveler--r2 exit=0
+[05:11:50] START n3-caller-propagation--atomcode--r1
+[05:12:38] END   n3-caller-propagation--atomcode--r1 exit=0
+[05:12:38] START n3-caller-propagation--dsh--r1
+[05:32:40] END   n3-caller-propagation--dsh--r1 exit=0
+[05:32:40] START n3-caller-propagation--leveler--r1
+[05:34:41] END   n3-caller-propagation--leveler--r1 exit=0
+[05:34:41] START n3-caller-propagation--leveler--r2
+[05:35:30] END   n3-caller-propagation--leveler--r2 exit=0
+[05:35:30] START n3-caller-propagation--dsh--r2
+[05:36:38] END   n3-caller-propagation--dsh--r2 exit=0
+[05:36:38] START n3-caller-propagation--atomcode--r2
+[05:37:31] END   n3-caller-propagation--atomcode--r2 exit=0
+[05:37:31] START mf1-refund-propagation--dsh--r1
+[05:38:58] END   mf1-refund-propagation--dsh--r1 exit=0
+[05:38:58] START mf1-refund-propagation--leveler--r1
+[05:40:48] END   mf1-refund-propagation--leveler--r1 exit=0
+[05:40:48] START mf1-refund-propagation--atomcode--r1
+[05:42:26] END   mf1-refund-propagation--atomcode--r1 exit=0
+[05:42:26] START mf1-refund-propagation--atomcode--r2
+[05:44:08] END   mf1-refund-propagation--atomcode--r2 exit=0
+[05:44:08] START mf1-refund-propagation--leveler--r2
+[05:45:17] END   mf1-refund-propagation--leveler--r2 exit=0
+[05:45:17] START mf1-refund-propagation--dsh--r2
+[05:47:11] END   mf1-refund-propagation--dsh--r2 exit=0
+[05:47:11] START icg-5-long-task--leveler--r1
+[05:56:04] END   icg-5-long-task--leveler--r1 exit=0
+[05:56:04] START icg-5-long-task--atomcode--r1
+[05:56:09] END   icg-5-long-task--atomcode--r1 exit=0
+[05:56:09] START icg-5-long-task--dsh--r1
+[05:59:24] END   icg-5-long-task--dsh--r1 exit=0
+[05:59:24] START icg-5-long-task--dsh--r2
+[06:01:47] END   icg-5-long-task--dsh--r2 exit=0
+[06:01:47] START icg-5-long-task--atomcode--r2
+[06:01:51] END   icg-5-long-task--atomcode--r2 exit=0
+[06:01:51] START icg-5-long-task--leveler--r2
+[06:06:22] END   icg-5-long-task--leveler--r2 exit=0
+[06:06:22] START scale-s800--atomcode--r1
+[06:07:54] END   scale-s800--atomcode--r1 exit=0
+[06:07:54] START scale-s800--dsh--r1
+[06:13:06] END   scale-s800--dsh--r1 exit=0
+[06:13:06] START scale-s800--leveler--r1
+[06:17:00] END   scale-s800--leveler--r1 exit=0
+[06:17:00] START scale-s800--leveler--r2
+[06:22:34] END   scale-s800--leveler--r2 exit=0
+[06:22:34] START scale-s800--dsh--r2
+[06:31:23] END   scale-s800--dsh--r2 exit=0
+[06:31:23] START scale-s800--atomcode--r2
+[06:35:13] END   scale-s800--atomcode--r2 exit=0
+[06:35:13] START yq-doc-count--dsh--r1
+[07:05:18] END   yq-doc-count--dsh--r1 exit=0
+[07:05:18] START yq-doc-count--leveler--r1
+[07:23:08] END   yq-doc-count--leveler--r1 exit=0
+[07:23:08] START yq-doc-count--atomcode--r1
+[07:28:15] END   yq-doc-count--atomcode--r1 exit=0
+[07:28:15] START yq-doc-count--atomcode--r2
+[07:32:22] END   yq-doc-count--atomcode--r2 exit=0
+[07:32:22] START yq-doc-count--leveler--r2
+[07:50:10] END   yq-doc-count--leveler--r2 exit=0
+[07:50:10] START yq-doc-count--dsh--r2
+[07:57:29] END   yq-doc-count--dsh--r2 exit=0
+[07:57:29] MAIN LANE DONE — honesty lane next
+[07:57:29] START icg-6r--leveler--r1
+[08:03:27] END   icg-6r--leveler--r1 exit=0
+[08:03:27] START icg-6r--atomcode--r1
+[08:05:53] END   icg-6r--atomcode--r1 exit=0
+[08:05:53] START icg-6r--dsh--r1
+[08:15:53] END   icg-6r--dsh--r1 exit=0
+[08:15:53] START icg-6r--dsh--r2
+[08:17:30] END   icg-6r--dsh--r2 exit=0
+[08:17:30] START icg-6r--atomcode--r2
+[08:21:22] END   icg-6r--atomcode--r2 exit=0
+[08:21:22] START icg-6r--leveler--r2
+[08:33:54] END   icg-6r--leveler--r2 exit=0
+[08:33:54] COHORT DONE

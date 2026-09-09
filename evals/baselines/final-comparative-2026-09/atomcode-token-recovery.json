@@ -1,0 +1,65 @@
+{
+  "mf1-refund-propagation--atomcode--r1": {
+    "input_tokens": 358456,
+    "output_tokens": 8255,
+    "cached_input_tokens": 328960,
+    "turns": 14,
+    "tool_calls": 25
+  },
+  "mf1-refund-propagation--atomcode--r2": {
+    "input_tokens": 385091,
+    "output_tokens": 8698,
+    "cached_input_tokens": 354816,
+    "turns": 15,
+    "tool_calls": 25
+  },
+  "n3-caller-propagation--atomcode--r1": {
+    "input_tokens": 200271,
+    "output_tokens": 3303,
+    "cached_input_tokens": 175104,
+    "turns": 8,
+    "tool_calls": 18
+  },
+  "n3-caller-propagation--atomcode--r2": {
+    "input_tokens": 204727,
+    "output_tokens": 3552,
+    "cached_input_tokens": 176896,
+    "turns": 8,
+    "tool_calls": 20
+  },
+  "rust-first-even--atomcode--r1": {
+    "input_tokens": 92872,
+    "output_tokens": 497,
+    "cached_input_tokens": 77568,
+    "turns": 5,
+    "tool_calls": 6
+  },
+  "rust-first-even--atomcode--r2": {
+    "input_tokens": 133476,
+    "output_tokens": 1165,
+    "cached_input_tokens": 116480,
+    "turns": 7,
+    "tool_calls": 9
+  },
+  "scale-s800--atomcode--r2": {
+    "input_tokens": 691274,
+    "output_tokens": 8994,
+    "cached_input_tokens": 652288,
+    "turns": 24,
+    "tool_calls": 34
+  },
+  "yq-doc-count--atomcode--r1": {
+    "input_tokens": 2052803,
+    "output_tokens": 20404,
+    "cached_input_tokens": 1974784,
+    "turns": null,
+    "tool_calls": null
+  },
+  "yq-doc-count--atomcode--r2": {
+    "input_tokens": 1532224,
+    "output_tokens": 16842,
+    "cached_input_tokens": 1459456,
+    "turns": null,
+    "tool_calls": null
+  }
+}

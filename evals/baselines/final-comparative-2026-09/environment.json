@@ -1,0 +1,87 @@
+{
+  "round": "Final Three-Way Comparative 2026-09",
+  "started_utc": "2026-09-09T05:04:36Z",
+  "dogfood_root": "/Users/mengmian/Develop/app/dengmengmian/dogfood",
+  "host": {
+    "os": "26.6.2",
+    "build": "25G83",
+    "arch": "arm64",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+    "cargo": "cargo 1.90.0 (840b83a10 2025-07-30)",
+    "node": "v25.2.1",
+    "go": "go version go1.26.0 darwin/arm64",
+    "git": "git version 2.50.1 (Apple Git-155)"
+  },
+  "codeleveler": {
+    "product_head": "2c50188f096ff89cb9aad4ab85ca17bb78cd5637",
+    "product_tree": "7c7cfe7cd28460e0f301c1d57dac539ea2917dbf",
+    "evidence_head": "7c6cde241cc8e89a58b7fcd2e04d9b9bdd5d8682",
+    "evidence_note": "evidence_head adds only docs + dogfood-v1 baselines; crates/ is byte-identical to product_head",
+    "checkout": "/Users/mengmian/Develop/app/dengmengmian/dogfood/repos/codeleveler",
+    "binary": "/Users/mengmian/Develop/app/dengmengmian/dogfood/bin/codeleveler/2c50188f096f/leveler",
+    "build_identity": "leveler 0.2.0-beta.1 (2c50188f096f)",
+    "binary_sha256": "7c58568710bb3cef4031fc8ff714bc3cdb49a638d0741d209ea2f7d9a44f24cc",
+    "build_command": "cargo build --release --locked -p leveler-cli",
+    "config": "/Users/mengmian/Develop/app/dengmengmian/dogfood/config/codeleveler/config.toml",
+    "model": "deepseek/deepseek-v4-flash",
+    "endpoint": "https://taotoken.net/api/v1",
+    "declared_context_window": 1048576,
+    "declared_max_output_tokens": 393216,
+    "invocation": "leveler run <task> --repo <ws> --model deepseek/deepseek-v4-flash --auto-approve"
+  },
+  "atomcode": {
+    "version": "atomcode 5.0.9 (52ca5e6)",
+    "sha": "52ca5e6cbe8a295ce6c016b8a79d21ac1444f6b1",
+    "binary": "/Users/mengmian/Develop/app/dengmengmian/dogfood/harnesses/atomcode/bin/atomcode",
+    "binary_sha256": "8899f78954c7a76ea519dd3fc8ec6c7fd90f3567fc626270ee873238d804d36f",
+    "config": "/Users/mengmian/Develop/app/dengmengmian/dogfood/harnesses/atomcode/config/config.toml",
+    "config_sha256": "433b071ab63fe04d6fbd443ae9a9e196ce898663f52826a42998ef7f1b452a31",
+    "logical_model": "AtomGit-deepseek-v4-flash",
+    "endpoint": "https://llm-api.atomgit.com/v1",
+    "declared_context_window": 512000,
+    "declared_max_output_tokens": "UNAVAILABLE",
+    "subagents_enabled": true,
+    "invocation": "atomcode -p <task> -C <ws> -y -v --dev --no-telemetry",
+    "origin": "frozen binary vendored into the lab 2026-08-28; no upstream git checkout"
+  },
+  "dsh": {
+    "version": "0.1.2-alpha.1",
+    "sha": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+    "tag": "dsh-v0.1.2-alpha.1",
+    "source": "/Users/mengmian/Develop/app/dengmengmian/dogfood/harnesses/deepseek-harness",
+    "binary_sha256": "N/A — TypeScript source run through tsx, not a compiled binary",
+    "patch": "/Users/mengmian/Develop/app/dengmengmian/dogfood/config/dsh/patch.yml",
+    "patch_sha256": "e13cc3808b6c15c72ed56dd0da43535fc7ab51e9b431a8d043927f5d35320f60",
+    "model": "deepseek-v4-flash",
+    "endpoint": "https://taotoken.net/api/v1",
+    "declared_context_window": 1000000,
+    "declared_max_output_tokens": 8192,
+    "invocation": "node --import tsx apps/cli/src/bin.ts --profile headless --patch <patch> <task>",
+    "permission_mode": "danger-full-access"
+  },
+  "fixtures": {
+    "navsvc": "a40bfdcaab7a6c37cc968afe6f450203635bc3db",
+    "scale-s800": "a6136d1823f1588d58295747da384462ad5ad18b",
+    "yq": "bbdd97482f2d439126582a59689eb1c855944955"
+  },
+  "fairness": {
+    "MODEL_PARITY": "FULL — all three run deepseek-v4-flash",
+    "PROVIDER_PARITY": "PARTIAL — CodeLeveler and DSH use taotoken.net; AtomCode uses llm-api.atomgit.com",
+    "PERMISSION_PARITY": "ACCEPTABLE — CL --auto-approve, AtomCode -y, DSH danger-full-access",
+    "MACHINE_PARITY": "FULL — one machine, one session, interleaved order",
+    "CASE_PARITY": "FULL — same case YAML, same fixture revision, same prompt sha256, same timeout",
+    "TOKEN_PARITY": "NONE — only CodeLeveler reports durable token counts; see TOKEN_RANKING=DISABLED",
+    "CONTEXT_CONFIG_PARITY": "PARTIAL — declared context windows differ (1048576 / 512000 / 1000000) and DSH caps output at 8192"
+  },
+  "smoke": {
+    "SMOKE_CODELEVELER": "PASS (rust-first-even 26.7s)",
+    "SMOKE_ATOMCODE": "PASS (rust-first-even 18.5s)",
+    "SMOKE_DSH": "PASS (rust-first-even 21.7s)",
+    "note": "pipeline smokes only, not formal results; the formal cohort re-runs every case from scratch"
+  },
+  "manifest": "/Users/mengmian/Develop/app/dengmengmian/dogfood/eval/manifests/comparative-final-2026-09.yaml",
+  "manifest_sha256": "f1718449ad5e0473db324b40c07223d7a45efa733f51cff0ec05d0f9cdf2b4b8",
+  "reps_per_tool_per_case": 2,
+  "infra_retry_budget": 1
+}

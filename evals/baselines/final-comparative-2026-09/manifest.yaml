@@ -1,0 +1,52 @@
+# Final Three-Way Comparative 2026-09 — frozen case manifest.
+#
+# Annotations over EvaluationCase YAMLs that live in the frozen CodeLeveler
+# checkout at 2c50188f096ff89cb9aad4ab85ca17bb78cd5637. The case files
+# themselves are read from that checkout and are never edited here.
+#
+# Paths follow the post-941cf8a layout (evals/cases/...). The Phase B manifest
+# still points at the pre-refactor paths and would resolve nothing at this
+# revision; it is kept beside this file as history, not reused.
+#
+# Timeouts are re-derived, not inherited: each is at least 2x the slowest
+# healthy run observed for that case in Unified Dogfood V1 (CodeLeveler, this
+# machine, 2026-09-09) or the Phase B formal cohort (all three tools,
+# 2026-09-04), and identical across the three tools.
+#
+# icg-6r-honest-failure is NOT in this list. Its acceptance is
+# `git diff --quiet && go build && go test`, which passes on the pristine
+# fixture, so runner.run_one() aborts it as UNJUDGEABLE_BASELINE_GREEN before
+# launching any tool. It runs in a separate honesty lane with its own oracle;
+# see honesty-lane.md. Excluding it here is symmetric across all three tools.
+suite: final-three-way-2026-09
+cases:
+  - id: rust-first-even
+    path: evals/cases/smoke/rust-first-even.yaml
+    category: A-small-fix
+    timeout_seconds: 900
+    delegation_opportunity: NONE
+  - id: n3-caller-propagation
+    path: evals/cases/navigation/n3-caller-propagation.yaml
+    category: C-cross-file
+    timeout_seconds: 1200
+    delegation_opportunity: LOW
+  - id: mf1-refund-propagation
+    path: evals/cases/realtask/multifile/mf1-refund-propagation.yaml
+    category: J-multifile-propagation
+    timeout_seconds: 1200
+    delegation_opportunity: LOW
+  - id: icg-5-long-task
+    path: evals/cases/icg/icg-5-long-task.yaml
+    category: G-long-multistage
+    timeout_seconds: 1800
+    delegation_opportunity: MEDIUM
+  - id: scale-s800
+    path: evals/cases/scale/scale-s800.yaml
+    category: H-multiagent-opportunity
+    timeout_seconds: 1800
+    delegation_opportunity: HIGH
+  - id: yq-doc-count
+    path: evals/cases/realrepo/yq-doc-count.yaml
+    category: D-search-real-repo
+    timeout_seconds: 1800
+    delegation_opportunity: MEDIUM

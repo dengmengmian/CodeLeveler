@@ -1,0 +1,15 @@
+INFRA_RETRY = NOT TAKEN (owner decision, 2026-09-09)
+
+Three AtomCode runs were invalidated by an AtomGit provider rate limit
+("5h window exhausted", tokens=0 turns=0 tool_calls=0, stopped=RateLimited):
+  icg-5-long-task--atomcode--r1
+  icg-5-long-task--atomcode--r2
+  scale-s800--atomcode--r1
+
+A probe at 08:37Z confirmed the limit had cleared (rust-first-even, PASS in
+21.3s), so the retry was available. The owner chose not to spend it. The probe
+artifacts were deleted so no stray rep-9 row can be mistaken for cohort data.
+
+Consequence, stated rather than papered over: AtomCode has NO valid result for
+icg-5-long-task and only one of two reps for scale-s800. Those cells are
+reported as NO VALID DATA, never as a failure and never as a pass.
