@@ -2,10 +2,21 @@
 
 Measured 2026-09-09 against `23afdc8`.
 
-## Verdict first
+## Verdict
+
+| | |
+| --- | --- |
+| Latency diagnosis | **PASS** — the root causes are mechanically located |
+| Runtime latency optimization | **OPEN** — no lever was implemented |
+| Overall | **PARTIAL** |
+
+The planned optimizations were dropped because the measurement refutes them,
+not because they were hard. Nothing was changed for the sake of having changed
+something.
 
 Wall-clock time is `model round trips × ~3.8s`, and ~80% of each round trip is
-the provider's time-to-first-byte. The runtime accounts for under 9% of wall.
+spent before the response stream opens. The runtime accounts for under 9% of
+wall.
 
 The levers this investigation set out to build — a smaller Balanced tool
 surface, a pre-request context budget, tighter tool-result caps — all reduce
@@ -51,7 +62,7 @@ Across the 7 cases — 84 model requests:
 | Output tokens | 10,119 |
 | Average request input | 22,048 |
 | Largest request input | 32,416 |
-| Median time-to-first-byte | 2,647 ms |
+| Median time to response headers (TTFB) | 2,647 ms |
 | Median round total | 2,980 ms |
 | TTFB share of a round | 79.8% |
 | Total model wait | 287.8 s |
@@ -75,6 +86,20 @@ Per case, wall time is almost exactly linear in round count:
 Median wall 26.7 s, p90 29.0 s (excluding the 45-round navigation case, which
 failed on understanding, not latency).
 
+### What "TTFB" means here, exactly
+
+The number measured is `connect_ms` in `model_round.rs`: request start until
+`ModelRuntime::stream` returns, which under the HTTP transport is when the
+response **headers** arrive. That is time-to-first-byte, not the model's
+time-to-first-token.
+
+A true TTFT — request start to the first *meaningful* streamed delta — is not
+separately measurable today: `first_event_ms` equals `connect_ms` in every one
+of the 84 rounds, because the first stream event is synthesized locally rather
+than sent by the provider. Whether this gateway emits headers when it accepts
+the request or when generation starts was not isolated. The two are used
+interchangeably nowhere in this document: every figure below is TTFB.
+
 ### Does input size drive latency?
 
 This is the question that decides every token-reduction lever. It does not:
@@ -97,8 +122,13 @@ weaker still:
 | 10,000–13,000 | 7 | 2,708 ms |
 
 A request carrying 13,000 uncached tokens costs 6% more first-byte latency
-than one carrying under 500. TTFB is a fixed ~2.5 s of provider and model time,
-not prefill.
+than one carrying under 500.
+
+**Scope of this claim:** every request observed carried 15k–32k of input. These
+figures bound the sensitivity across that range only. They say nothing about a
+200k request, where prefill may well dominate — the point is that in the range
+CodeLeveler actually operates in on these tasks, the per-round fixed cost is
+what is paid, not the payload.
 
 ### The fixed prefix
 
@@ -121,12 +151,14 @@ plus the full tool schema almost exactly. Every later round pays 200–900.
 Evidence: wall/round is 3.1–4.5 s across every case, including the 45-round
 one. 91.3% of wall is model wait. Nothing else is within an order of magnitude.
 
-### Root cause #2 — provider time-to-first-byte, ~2.5 s of every round trip
+### Root cause #2 — a fixed ~2.5 s before the response stream opens
 
-Evidence: TTFB is 79.8% of round total; median 2,647 ms; nearly flat against
-input size. Streaming the answer takes ~330 ms. This is the model's own
-thinking (`reasoning_effort = max`) plus gateway overhead, and the runtime
-cannot shorten it.
+Evidence: TTFB is 79.8% of round total; median 2,647 ms; across 15k–32k of
+input its sensitivity to request size is low (+16% for a doubled request).
+Streaming the answer then takes ~330 ms. Within this range the dominant cost is
+the fixed per-round trip, not the payload. What that 2.5 s is made of —
+model thinking at `reasoning_effort = max`, gateway queueing, or both — was not
+isolated, and the runtime does not control any of it.
 
 ### Root cause #3 — ceremony rounds
 
@@ -146,13 +178,16 @@ round 6  update_goal   ttfb 2308  total 2627
 
 6% of rounds, ~6% of wall.
 
-### Root cause #4 — serial exploration on a model that cannot batch
+### Root cause #4 — serial exploration, one tool call per round
 
-Evidence: `calls=1` on every one of the 79 tool rounds. The configured model
-sets `max_parallel_tool_calls = 1`, so `read_file → list_files → read_file`
-is three round trips (8.7 s) to look at a two-file crate. The executor already
+Evidence: `calls=1` on every one of the 79 tool rounds. The configured profile
+sets `max_parallel_tool_calls = 1`, so `read_file → list_files → read_file` is
+three round trips (8.7 s) to look at a two-file crate. The executor already
 runs independent read-only calls concurrently when the model emits them
-together; this model never does.
+together; it never got the chance here. Whether the limit is the model, the
+gateway, the protocol adapter, or only the profile declaration is **not
+established by this investigation** — it is the first thing the follow-up
+should probe.
 
 ## 5. What was not built, and why
 
@@ -175,13 +210,18 @@ lever should be sized against round-trip count, not tokens.
 
 ## 6. Changes made
 
-| file | change |
-| --- | --- |
-| `crates/leveler-tools/src/registry.rs` | test: the advertised tool surface stays within its measured byte budget |
-| `crates/leveler-agent/src/prompt.rs` | test: the system prompt stays within its measured byte budget |
+Four files, across three commits:
 
-Both are tripwires on the fixed per-session prefix, so a large addition is a
-decision rather than a surprise. No runtime behaviour was changed.
+| file | commit | change |
+| --- | --- | --- |
+| `crates/leveler-tools/src/registry.rs` | `a1534eb` | test: the advertised tool surface stays within its measured byte budget |
+| `crates/leveler-agent/src/prompt.rs` | `a1534eb` | test: the system prompt stays within its measured byte budget |
+| `docs/RUNTIME_LATENCY_CLOSURE.md` | `6a1883d` | this document |
+| `crates/leveler-agent/tests/child_profile_spawn.rs` | `e695b82` | unrelated test-isolation fix found while running the suite |
+
+The two tests are budget tripwires, not byte snapshots: they assert generous
+ceilings (20 KB core, 40 KB full, 30/32 KB prompt) so an ordinary reword passes
+and a doubling fails. No runtime behaviour was changed.
 
 ## 7. Correctness
 
