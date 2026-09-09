@@ -1831,8 +1831,12 @@ mod tests {
         async fn revive(&self) -> Result<(), String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Idempotent ensure with a short retry (a dying predecessor may
-            // still be tearing down its socket): a live daemon answering the
-            // probe returns AlreadyRunning, which is success for a reviver.
+            // still be tearing down its socket). Reporting success means the
+            // runtime is REACHABLE — the same contract the real reviver keeps
+            // by returning a connected client. Anything weaker breaks the
+            // caller: a safe request replays exactly once after revival, so a
+            // premature success spends that one attempt on a socket that is
+            // not there yet.
             for _ in 0..40 {
                 match LocalSocketServer::bind(
                     &self.path,
@@ -1844,7 +1848,15 @@ mod tests {
                         tokio::spawn(server.serve(self.shutdown.clone()));
                         return Ok(());
                     }
-                    Err(TransportError::AlreadyRunning(_)) => return Ok(()),
+                    // Someone else owns the socket. That is only success once
+                    // it answers: the ownership lock is taken BEFORE the
+                    // socket file is created, so a concurrent binder can hold
+                    // the lock while nothing is listening yet.
+                    Err(TransportError::AlreadyRunning(_))
+                        if tokio::net::UnixStream::connect(&self.path).await.is_ok() =>
+                    {
+                        return Ok(());
+                    }
                     Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
                 }
             }
@@ -2006,6 +2018,48 @@ mod tests {
         );
         // Safe requests work against the revived daemon (same client object).
         assert!(LocalRuntimeService::runtime_info(&client).await.is_ok());
+        reviver.shutdown.cancel();
+    }
+
+    /// A reviver reporting success promises the runtime is REACHABLE. The
+    /// ownership lock is taken before the socket file exists, so a concurrent
+    /// binder holds it through a window where nothing is listening — and the
+    /// transport replays a safe request exactly once after revival, so a
+    /// premature success spends that one attempt on ENOENT. This is the shape
+    /// behind the intermittent `deliver_envelope_can_retry…` failure under a
+    /// loaded machine, where a subscription-loop revive and a request-path
+    /// revive run at once.
+    #[tokio::test]
+    async fn a_reviver_reports_success_only_once_the_socket_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        // Stand exactly where a binder stands between taking the ownership
+        // lock and creating the socket.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+
+        let reviver = TestReviver {
+            path: path.clone(),
+            runtime: Arc::new(TestRuntime::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            shutdown: CancellationToken::new(),
+        };
+        // The other binder finishes shortly after; the reviver must wait it
+        // out rather than declare victory on the lock alone.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(lock);
+        });
+        reviver.revive().await.expect("the socket does come up");
+        assert!(
+            tokio::net::UnixStream::connect(&path).await.is_ok(),
+            "success means reachable"
+        );
         reviver.shutdown.cancel();
     }
 
