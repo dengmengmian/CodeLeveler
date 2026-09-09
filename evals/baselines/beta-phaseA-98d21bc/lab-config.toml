@@ -1,0 +1,21 @@
+# Dogfood-owned CodeLeveler config. Loaded via LEVELER_HOME, never ~/.leveler.
+# Keys come from environment variables. Do not put secret values here.
+
+default_model = "deepseek/deepseek-v4-flash"
+
+[providers.deepseek]
+base_url = "https://taotoken.net/api/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek-v4-flash"]
+provider = "deepseek"
+model_id = "deepseek-v4-flash"
+context_window = 1048576
+reliable_context = 786432
+max_output_tokens = 393216
+streaming = true
+tool_calling = true
+structured_output = true
+reasoning = true
+reasoning_style = "thinking_flag"
+reasoning_effort = "high"

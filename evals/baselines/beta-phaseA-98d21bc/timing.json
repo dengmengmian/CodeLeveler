@@ -1,0 +1,286 @@
+[
+  {
+    "stage": "evidence",
+    "case": "icg-5-long-task",
+    "rep": "1",
+    "arm": "leveler",
+    "wall_ms": 305314,
+    "rounds": 13,
+    "model": {
+      "requests": 13,
+      "total_ms": 299447,
+      "median_ms": 6530,
+      "p95_ms": 38382,
+      "max_ms": 158542,
+      "latencies_ms": [
+        5753,
+        5101,
+        38382,
+        15038,
+        37749,
+        158542,
+        4086,
+        6530,
+        8591,
+        3880,
+        4428,
+        4632,
+        6735
+      ],
+      "retries": 0,
+      "input_tokens": 420568,
+      "cached_input_tokens": 381440,
+      "output_tokens": 16076,
+      "slow_requests_over_20s": [
+        {
+          "latency_ms": 38382,
+          "output_tokens": 201,
+          "cached": 16384,
+          "input": 20046,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 37749,
+          "output_tokens": 3006,
+          "cached": 32512,
+          "input": 33701,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 158542,
+          "output_tokens": 9988,
+          "cached": 34560,
+          "input": 34810,
+          "finish": "tool_calls",
+          "retries": 0
+        }
+      ],
+      "ttfb_ms": {
+        "median": 3636,
+        "n": 13
+      }
+    },
+    "tools": {
+      "calls": 28,
+      "total_ms": 5299,
+      "median_ms": 3,
+      "max_ms": 2270,
+      "by_tool": {
+        "apply_patch": {
+          "calls": 3,
+          "total_ms": 35
+        },
+        "grep": {
+          "calls": 1,
+          "total_ms": 24
+        },
+        "list_files": {
+          "calls": 1,
+          "total_ms": 10
+        },
+        "read_file": {
+          "calls": 18,
+          "total_ms": 92
+        },
+        "run_command": {
+          "calls": 2,
+          "total_ms": 4187
+        },
+        "shell_command": {
+          "calls": 2,
+          "total_ms": 951
+        },
+        "update_goal": {
+          "calls": 1,
+          "total_ms": 0
+        }
+      }
+    },
+    "verification_ms": 585,
+    "harness_ms": 568,
+    "share": {
+      "model": 0.9808,
+      "tool": 0.0174,
+      "verification_within_tool": 0.0019,
+      "harness": 0.0019
+    },
+    "derived": {
+      "s_per_round": 23.49,
+      "s_per_model_request": 23.03,
+      "tool_calls_per_round": 2.15,
+      "input_tokens_per_round": 32351,
+      "cache_hit_rate": 0.907
+    },
+    "plan": {
+      "updates": 0,
+      "advisories": []
+    }
+  },
+  {
+    "stage": "evidence",
+    "case": "n3-caller-propagation",
+    "rep": "1",
+    "arm": "leveler",
+    "wall_ms": 47091,
+    "rounds": 8,
+    "model": {
+      "requests": 8,
+      "total_ms": 42760,
+      "median_ms": 5345,
+      "p95_ms": 8087,
+      "max_ms": 8087,
+      "latencies_ms": [
+        5349,
+        5944,
+        4587,
+        5342,
+        8087,
+        4003,
+        6017,
+        3431
+      ],
+      "retries": 0,
+      "input_tokens": 160804,
+      "cached_input_tokens": 142592,
+      "output_tokens": 2230,
+      "slow_requests_over_20s": [],
+      "ttfb_ms": {
+        "median": 3469,
+        "n": 8
+      }
+    },
+    "tools": {
+      "calls": 13,
+      "total_ms": 4220,
+      "median_ms": 10,
+      "max_ms": 2131,
+      "by_tool": {
+        "apply_patch": {
+          "calls": 1,
+          "total_ms": 18
+        },
+        "grep": {
+          "calls": 1,
+          "total_ms": 39
+        },
+        "read_file": {
+          "calls": 8,
+          "total_ms": 113
+        },
+        "run_command": {
+          "calls": 2,
+          "total_ms": 4050
+        },
+        "update_goal": {
+          "calls": 1,
+          "total_ms": 0
+        }
+      }
+    },
+    "verification_ms": 167,
+    "harness_ms": 111,
+    "share": {
+      "model": 0.908,
+      "tool": 0.0896,
+      "verification_within_tool": 0.0035,
+      "harness": 0.0024
+    },
+    "derived": {
+      "s_per_round": 5.89,
+      "s_per_model_request": 5.34,
+      "tool_calls_per_round": 1.62,
+      "input_tokens_per_round": 20100,
+      "cache_hit_rate": 0.8867
+    },
+    "plan": {
+      "updates": 0,
+      "advisories": [
+        "nudge_goal_unresolved"
+      ]
+    }
+  },
+  {
+    "stage": "evidence",
+    "case": "rust-first-even",
+    "rep": "1",
+    "arm": "leveler",
+    "wall_ms": 63677,
+    "rounds": 4,
+    "model": {
+      "requests": 4,
+      "total_ms": 61691,
+      "median_ms": 9008,
+      "p95_ms": 39874,
+      "max_ms": 39874,
+      "latencies_ms": [
+        39874,
+        13686,
+        3801,
+        4330
+      ],
+      "retries": 0,
+      "input_tokens": 70704,
+      "cached_input_tokens": 52992,
+      "output_tokens": 596,
+      "slow_requests_over_20s": [
+        {
+          "latency_ms": 39874,
+          "output_tokens": 157,
+          "cached": 2048,
+          "input": 17247,
+          "finish": "tool_calls",
+          "retries": 0
+        }
+      ],
+      "ttfb_ms": {
+        "median": 8048,
+        "n": 4
+      }
+    },
+    "tools": {
+      "calls": 6,
+      "total_ms": 1708,
+      "median_ms": 10,
+      "max_ms": 1668,
+      "by_tool": {
+        "apply_patch": {
+          "calls": 1,
+          "total_ms": 12
+        },
+        "read_file": {
+          "calls": 3,
+          "total_ms": 28
+        },
+        "run_command": {
+          "calls": 1,
+          "total_ms": 1668
+        },
+        "update_goal": {
+          "calls": 1,
+          "total_ms": 0
+        }
+      }
+    },
+    "verification_ms": 207,
+    "harness_ms": 278,
+    "share": {
+      "model": 0.9688,
+      "tool": 0.0268,
+      "verification_within_tool": 0.0033,
+      "harness": 0.0044
+    },
+    "derived": {
+      "s_per_round": 15.92,
+      "s_per_model_request": 15.42,
+      "tool_calls_per_round": 1.5,
+      "input_tokens_per_round": 17676,
+      "cache_hit_rate": 0.7495
+    },
+    "plan": {
+      "updates": 0,
+      "advisories": []
+    }
+  }
+]
