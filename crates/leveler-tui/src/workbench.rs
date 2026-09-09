@@ -1416,15 +1416,22 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut state))
             .unwrap();
         let buf = terminal.backend().buffer();
+        // Probe the chip's own first character, whatever the locale calls it —
+        // a bare "C" also matches the key hints two rows up.
+        let head = state
+            .t()
+            .footer_context
+            .chars()
+            .next()
+            .expect("the context chip has a label")
+            .to_string();
         let mut context_x = None;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "C") {
-                    // First 'C' of "Context" near the bottom.
-                    if y + 3 >= buf.area.height {
-                        context_x = Some(x);
-                        break;
-                    }
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == head) && y + 3 >= buf.area.height
+                {
+                    context_x = Some(x);
+                    break;
                 }
             }
         }

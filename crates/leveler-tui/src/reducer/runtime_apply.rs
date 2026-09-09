@@ -122,17 +122,18 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::AgentActivity { label } => {
             mark_turn_busy(state);
             state.activity = Some(label);
+            state.activity_elapsed_secs = None;
         }
         RuntimeEvent::CommandProgress { label, elapsed_ms } => {
             // Long-command heartbeat: name the running command with a live
             // elapsed so the status line reads "运行 cargo test · 02:31" instead
             // of a bare "等待模型". Reuses the activity slot (single source).
             mark_turn_busy(state);
-            let secs = elapsed_ms / 1000;
-            state.activity = Some(format!(
-                "运行 {label} · {}",
-                crate::status_line::fmt_elapsed(secs)
-            ));
+            // The command owns this elapsed. The status line shows it INSTEAD
+            // of the turn's, so a running command reads as one duration rather
+            // than two adjacent unlabelled ones.
+            state.activity = Some(state.t().running_command.replace("{}", &label));
+            state.activity_elapsed_secs = Some(elapsed_ms / 1000);
         }
         RuntimeEvent::ProjectRulesLoaded { sources } => {
             mark_turn_busy(state);
@@ -179,7 +180,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // The tool is done; leaving its label up while the model thinks
             // reads as a hung tool ("读取 x… (4m)"). Fall back to the
             // thinking indicator until the next activity arrives.
-            state.activity = None;
+            clear_activity(state);
             seal_analysis_segment(state);
         }
         RuntimeEvent::PlanUpdated { plan } => {
@@ -285,7 +286,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::TurnFailed { error } => {
             state.status = RuntimeStatus::Error;
-            state.activity = None;
+            clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
@@ -305,7 +306,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::TurnCancelled => {
             state.status = RuntimeStatus::Idle;
-            state.activity = None;
+            clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
@@ -556,7 +557,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BtwCompleted => {
             state.transcript.finish_btw(false);
             if state.activity.as_deref() == Some(state.t().btw_label) {
-                state.activity = None;
+                clear_activity(state);
             }
         }
         RuntimeEvent::BtwFailed { error } => {
@@ -565,7 +566,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 .append_btw(&format!("{}: {error}", state.t().btw_failed));
             state.transcript.finish_btw(true);
             if state.activity.as_deref() == Some(state.t().btw_label) {
-                state.activity = None;
+                clear_activity(state);
             }
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
@@ -675,7 +676,7 @@ fn dismiss_resolved_interaction(
 
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
     state.status = RuntimeStatus::Idle;
-    state.activity = None;
+    clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
     state.cancel_armed = false;
@@ -793,11 +794,17 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
 }
 
 fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
+    let t = state.t();
     let mut parts = Vec::new();
     if let Some(diff) = &state.diff
         && !diff.files.is_empty()
     {
-        parts.push(format!("{} files", diff.files.len()));
+        let n = diff.files.len();
+        parts.push(if n == 1 {
+            t.summary_files_one.to_string()
+        } else {
+            t.summary_files_many.replace("{}", &n.to_string())
+        });
     }
     // Unverified / incomplete / failed / cancelled: no success verify mark.
     let allow_success_verify = matches!(status, TurnEndStatus::Completed | TurnEndStatus::Answered);
@@ -823,19 +830,23 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
                             .iter()
                             .all(|c| c.status == leveler_client_protocol::CheckState::Passed);
                     if all_passed || v.checks.is_empty() {
-                        parts.push("verify ✓".to_string());
+                        parts.push(t.summary_verify_ok.to_string());
                     } else {
                         let ok = v
                             .checks
                             .iter()
                             .filter(|c| c.status == leveler_client_protocol::CheckState::Passed)
                             .count();
-                        parts.push(format!("verify {ok}/{}", v.checks.len()));
+                        parts.push(
+                            t.summary_verify_partial
+                                .replacen("{}", &ok.to_string(), 1)
+                                .replacen("{}", &v.checks.len().to_string(), 1),
+                        );
                     }
                 }
                 // else: Unverified turn — omit success chrome entirely
             } else {
-                parts.push("verify ✗".to_string());
+                parts.push(t.summary_verify_failed.to_string());
             }
         } else if !v.checks.is_empty() {
             let ok = v
@@ -843,17 +854,32 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
                 .iter()
                 .filter(|c| c.status == leveler_client_protocol::CheckState::Passed)
                 .count();
-            parts.push(format!("verify {ok}/{}", v.checks.len()));
+            parts.push(
+                t.summary_verify_partial
+                    .replacen("{}", &ok.to_string(), 1)
+                    .replacen("{}", &v.checks.len().to_string(), 1),
+            );
         }
     }
     if let Some((k, n)) = plan_open {
-        parts.push(format!("计划 {k}/{n}"));
+        parts.push(t.summary_plan.replacen("{}", &k.to_string(), 1).replacen(
+            "{}",
+            &n.to_string(),
+            1,
+        ));
     }
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// The activity label and the clock that belongs to it are one fact; clearing
+/// half of it would leave a stale command elapsed on the status line.
+fn clear_activity(state: &mut AppState) {
+    state.activity = None;
+    state.activity_elapsed_secs = None;
 }
 
 pub(super) fn start_turn(state: &mut AppState) {
@@ -983,7 +1009,7 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         state.project_rule_sources.clear();
         state.background_task_labels.clear();
         seal_analysis_segment(state);
-        state.activity = None;
+        clear_activity(state);
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;
         state.pending_attachments.clear();

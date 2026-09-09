@@ -205,11 +205,13 @@ pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
     if used == 0 {
         return None;
     }
-    Some(format!(
-        "Context {}/{}",
-        fmt_tokens_compact(used),
-        fmt_tokens_compact(window)
-    ))
+    Some(
+        state
+            .t()
+            .footer_context
+            .replacen("{}", &fmt_tokens_compact(used), 1)
+            .replacen("{}", &fmt_tokens_compact(window), 1),
+    )
 }
 
 /// Prefix-cache hit rate when the provider reported cached tokens.
@@ -222,7 +224,7 @@ pub(crate) fn footer_cache_chip(state: &AppState) -> Option<String> {
         return None;
     }
     let pct = (cached as u64 * 100 / input as u64).min(100);
-    Some(format!("cache {pct}%"))
+    Some(state.t().footer_cache.replace("{}", &pct.to_string()))
 }
 
 /// Full footer status: `Context 21k/1M · cache 42%` — each part optional.
@@ -415,9 +417,12 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     } else {
         String::new()
     };
+    // An activity that owns a clock — a long command's heartbeat — reports its
+    // own elapsed. Appending the turn's as well printed two adjacent durations
+    // with nothing to tell them apart.
     let mut parts = vec![
         format!("{frame} {turn_mode}{label}"),
-        fmt_elapsed(state.elapsed_secs),
+        fmt_elapsed(state.activity_elapsed_secs.unwrap_or(state.elapsed_secs)),
     ];
     // Totals are only reported when a round ENDS, so on their own they
     // freeze for the whole of the next round. Show them, then always
@@ -590,18 +595,15 @@ mod tests {
         let mut state = test_state();
         state.context_tokens = 41_181;
         state.context_window_tokens = 1_048_576;
-        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("Context 41k/1M"));
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 41k/1M"));
         assert_eq!(footer_cache_chip(&state), None);
-        assert_eq!(
-            footer_status_line(&state).as_deref(),
-            Some("Context 41k/1M")
-        );
+        assert_eq!(footer_status_line(&state).as_deref(), Some("上下文 41k/1M"));
         state.token_input = 1000;
         state.token_cached = 420;
-        assert_eq!(footer_cache_chip(&state).as_deref(), Some("cache 42%"));
+        assert_eq!(footer_cache_chip(&state).as_deref(), Some("缓存 42%"));
         assert_eq!(
             footer_status_line(&state).as_deref(),
-            Some("Context 41k/1M · cache 42%")
+            Some("上下文 41k/1M · 缓存 42%")
         );
     }
 
@@ -802,6 +804,42 @@ mod tests {
         assert!(
             status.contains('~'),
             "a live round must show a live estimate, not only frozen totals: {status}"
+        );
+    }
+
+    /// Beta Product Closure, Phase B. A running command already carries its own
+    /// elapsed in the activity label; appending the turn's elapsed printed two
+    /// adjacent durations with nothing to tell them apart —
+    /// "运行 cargo test --workspace · 2m 17s · 0s".
+    #[test]
+    fn a_running_command_shows_one_elapsed_not_two() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.elapsed_secs = 0;
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(
+                leveler_client_protocol::RuntimeEvent::CommandProgress {
+                    label: "cargo test --workspace".into(),
+                    elapsed_ms: 137_000,
+                },
+            ),
+        );
+        let text = status_text(&state);
+        let durations = text
+            .split(" · ")
+            .filter(|p| {
+                p.ends_with('s') && p.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || p.contains("m ") && p.ends_with('s')
+            })
+            .count();
+        assert_eq!(
+            durations, 1,
+            "one running command, one elapsed — got {durations} in: {text}"
+        );
+        assert!(
+            text.contains("2m 17s"),
+            "and it must be the command's: {text}"
         );
     }
 

@@ -213,6 +213,11 @@ pub struct AppState {
     pub turn_tool_calls: usize,
     /// Coarse activity label shown while busy (e.g. "运行 cargo test").
     pub activity: Option<String>,
+    /// Elapsed for whatever `activity` names, when the activity owns a clock of
+    /// its own — a long command's heartbeat. The status line shows this in
+    /// place of the turn's elapsed, so one running command reads as one
+    /// duration. `None` for every activity that has no clock but the turn's.
+    pub activity_elapsed_secs: Option<u64>,
     pub notification: Option<Notification>,
 
     /// The running embedded Web UI URL (with token), once `/web` has started it.
@@ -371,6 +376,7 @@ impl AppState {
             status: RuntimeStatus::Idle,
             turn_tool_calls: 0,
             activity: None,
+            activity_elapsed_secs: None,
             notification: None,
             web_url: None,
             web_starting: false,

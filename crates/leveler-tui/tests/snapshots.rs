@@ -90,6 +90,17 @@ fn render_at(width: u16, height: u16, state: &mut AppState) -> String {
 }
 
 /// Last `n` buffer lines — sticky footer/input chrome only (splash may use ↑/↓).
+/// The footer context chip's label, without its counts — the tests here assert
+/// placement and presence, never the wording, which the locale table owns.
+fn ctx_label() -> &'static str {
+    leveler_tui::Locale::Zh
+        .text()
+        .footer_context
+        .split(" {}")
+        .next()
+        .expect("the context chip has a label")
+}
+
 fn sticky_chrome(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -135,7 +146,7 @@ fn renders_welcome_header_and_composer_at_standard_sizes() {
             "idle token counts should be hidden at {w}x{h}: {chrome}"
         );
         assert!(
-            !chrome.contains("Context "),
+            !chrome.contains(ctx_label()),
             "fresh-session context line should be hidden at {w}x{h}: {chrome}"
         );
     }
@@ -155,7 +166,7 @@ fn context_chip_appears_on_footer_after_usage_update() {
     let text = render_at(100, 24, &mut state);
     // Footer is context-only: Context 24k/200k (compact, not full commas).
     assert!(
-        text.contains("Context 24k/"),
+        text.contains(&format!("{} 24k/", ctx_label())),
         "footer context line missing: {text}"
     );
     let chrome = sticky_chrome(&text, 6);
@@ -181,8 +192,14 @@ fn footer_shows_cache_hit_rate_when_provider_reports_it() {
     state.context_tokens = 1000;
     let text = render_at(100, 24, &mut state);
     assert!(
-        text.contains("Context") && text.contains("cache 70%"),
-        "footer should show Context + cache: {text}"
+        text.contains(ctx_label())
+            && text.contains(
+                &leveler_tui::Locale::Zh
+                    .text()
+                    .footer_cache
+                    .replace("{}", "70")
+            ),
+        "footer should show the context and cache chips: {text}"
     );
 }
 

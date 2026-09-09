@@ -40,6 +40,28 @@ fn assert_send_interaction(
     }
 }
 
+/// Render the whole screen to text. Some contracts — a status line's single
+/// elapsed — are only true of what the user sees, not of any one field.
+fn rendered(state: &mut AppState, w: u16, h: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| leveler_tui::render::render(f, state))
+        .unwrap();
+    let buf = term.backend().buffer();
+    let mut out = String::new();
+    for y in 0..h {
+        let mut x = 0u16;
+        while x < w {
+            let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+            out.push_str(sym);
+            x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn state() -> AppState {
     AppState::new(
         Theme::no_color(),
@@ -429,8 +451,8 @@ fn completed_turn_end_may_show_success_verify_chrome() {
     assert_eq!(end.status, TurnEndStatus::Completed);
     let summary = end.summary.as_deref().unwrap_or("");
     assert!(
-        summary.contains("verify ✓"),
-        "Completed with green gates may show verify ✓; summary={summary:?}"
+        summary.contains(leveler_tui::Locale::Zh.text().summary_verify_ok),
+        "Completed with green gates may show the success verify mark; summary={summary:?}"
     );
 }
 
@@ -885,9 +907,13 @@ fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
         }),
     );
     assert_eq!(s.status, RuntimeStatus::Busy);
+    // The elapsed belongs to the command, not to the label — assert what the
+    // status line actually renders.
     let activity = s.activity.clone().unwrap_or_default();
     assert!(activity.contains("cargo test"), "activity: {activity}");
-    assert!(activity.contains("2m 31s"), "activity: {activity}");
+    let frame = rendered(&mut s, 120, 20);
+    assert!(frame.contains("cargo test"), "status: {frame}");
+    assert!(frame.contains("2m 31s"), "status: {frame}");
 }
 
 #[test]
@@ -5449,8 +5475,19 @@ fn a_completed_turn_marker_does_not_deny_itself_with_a_stale_plan() {
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = format!("{:?}", s.transcript.items());
-    assert!(!text.contains("计划 5/9"), "{text}");
-    assert!(text.contains("verify ✓"), "the real outcome stays: {text}");
+    let zh = leveler_tui::Locale::Zh.text();
+    assert!(
+        !text.contains(
+            &zh.summary_plan
+                .replacen("{}", "5", 1)
+                .replacen("{}", "9", 1)
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(zh.summary_verify_ok),
+        "the real outcome stays: {text}"
+    );
 }
 
 /// D7: an incomplete turn keeps the plan fraction — there it is true progress
@@ -5642,4 +5679,113 @@ fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
         vec!["user", "assistant", "recap", "user"],
         "the recap sits after the messages it represents, before the delta"
     );
+}
+
+// --- Beta Product Closure, Phase B: the turn-end summary and the command
+// --- heartbeat are user-facing prose and must come from the locale table.
+
+fn opened_in(locale: leveler_tui::Locale) -> AppState {
+    let mut s = AppState::new(
+        Theme::no_color(),
+        Boot {
+            session_id: SessionId::new("s1"),
+            user: "麻凡".to_string(),
+            version: "0.1.0".to_string(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 0,
+            locale,
+            untrusted_config: Vec::new(),
+            reasoning_effort: None,
+        },
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    s
+}
+
+fn finished_turn_summary(locale: leveler_tui::Locale) -> String {
+    let mut s = opened_in(locale);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            diff: leveler_client_protocol::UiDiff {
+                files: vec![leveler_client_protocol::UiDiffFile {
+                    path: "src/lib.rs".into(),
+                    added: 4,
+                    removed: 1,
+                    patch: None,
+                }],
+            },
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::VerificationUpdated {
+            verification: leveler_client_protocol::UiVerification {
+                checks: vec![leveler_client_protocol::UiCheck {
+                    name: "cargo test".into(),
+                    status: leveler_client_protocol::CheckState::Passed,
+                    evidence: None,
+                }],
+                passed: Some(true),
+            },
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    let Some(TranscriptItem::TurnEnd(end)) = s
+        .transcript
+        .items()
+        .iter()
+        .rev()
+        .find(|item| matches!(item, TranscriptItem::TurnEnd(_)))
+    else {
+        panic!("expected turn end");
+    };
+    end.summary.clone().unwrap_or_default()
+}
+
+fn has_han(s: &str) -> bool {
+    s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
+#[test]
+fn the_turn_end_summary_speaks_one_language_in_each_locale() {
+    let zh = finished_turn_summary(leveler_tui::Locale::Zh);
+    let en = finished_turn_summary(leveler_tui::Locale::En);
+    assert!(has_han(&zh), "the zh summary must be Chinese: {zh}");
+    assert!(
+        !zh.contains("files") && !zh.contains("verify"),
+        "the zh summary must not carry English words: {zh}"
+    );
+    assert!(!has_han(&en), "the en summary must not carry Chinese: {en}");
+}
+
+#[test]
+fn one_changed_file_is_not_reported_in_the_plural() {
+    let en = finished_turn_summary(leveler_tui::Locale::En);
+    assert!(!en.contains("1 files"), "one file is not \"1 files\": {en}");
+}
+
+#[test]
+fn the_running_command_heartbeat_follows_the_locale() {
+    let mut s = opened_in(leveler_tui::Locale::En);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::CommandProgress {
+            label: "cargo test".into(),
+            elapsed_ms: 137_000,
+        }),
+    );
+    let activity = s.activity.clone().unwrap_or_default();
+    assert!(
+        !has_han(&activity),
+        "an English session must not be told 运行: {activity}"
+    );
+    assert!(activity.contains("cargo test"), "{activity}");
 }
