@@ -73,9 +73,17 @@ pub(crate) fn render_group(
             .filter(|c| c.status == ToolStatus::Ok && !is_edit_call(c))
             .collect();
         if !settled.is_empty() {
-            let label = disclosure_presentation(&settled, false, t).label;
+            // Done for now, inside a burst that is still open — not a result.
+            // Exploration that merely succeeded gets the quiet dot; anything
+            // that actually produced something keeps the success mark.
+            let (glyph, color) = if settled.iter().all(|c| is_exploratory(c)) {
+                ("\u{b7} ", theme.text.muted)
+            } else {
+                ("\u{2713} ", theme.status.success)
+            };
+            let label = aggregate_label(&settled, Tense::Settled, t);
             out.push(Line::from(vec![
-                Span::styled("\u{2713} ", Style::default().fg(theme.status.success)),
+                Span::styled(glyph, Style::default().fg(color)),
                 Span::styled(
                     truncate_display(&label, width.saturating_sub(2).max(1)),
                     Style::default().fg(theme.text.muted),
@@ -96,10 +104,18 @@ pub(crate) fn render_group(
             .filter(|c| c.status == ToolStatus::Running)
             .collect();
         if running.len() >= 2 {
-            out.push(Line::from(Span::styled(
-                truncate_display(&running_header_label(&running, t), width),
-                Style::default().fg(theme.text.muted),
-            )));
+            // The same three-glyph ladder the settled and closed forms use:
+            // ◌ happening, · done for now, ▸ history.
+            out.push(Line::from(vec![
+                Span::styled("\u{25cc} ", Style::default().fg(theme.accent.primary)),
+                Span::styled(
+                    truncate_display(
+                        &aggregate_label(&running, Tense::Running, t),
+                        width.saturating_sub(2).max(1),
+                    ),
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]));
         }
     } else {
         let parallel_n = visible.iter().filter(|c| c.parallel).count();
@@ -338,6 +354,9 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
             _ => {}
         }
     }
+    if !uniform && visible.iter().all(|c| is_exploratory(c)) {
+        return t.disclosure_explore.to_string();
+    }
     let parallel = visible.iter().filter(|c| c.parallel).count() >= 2;
     if parallel && !uniform {
         return t.disclosure_parallel.replace("{}", &n.to_string());
@@ -353,18 +372,47 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
     }
 }
 
-/// The live header for a batch that is running NOW, in the same user language
-/// as the finished disclosure label: "正在读取 7 个文件", not "7 个工具".
-fn running_header_label(running: &[&ToolCallBlock], t: &UiText) -> String {
+/// When an aggregate happened. The shape and the counts are identical across
+/// all three; only the tense — and what the glyph in front of it may claim —
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tense {
+    /// Happening now.
+    Running,
+    /// Finished, but the burst is still open (the model may stream more).
+    Settled,
+}
+
+/// One aggregate described in user language: "正在读取 7 个文件", not
+/// "7 个工具". Reads and searches together are ONE activity — the agent
+/// looking around — so a mixed exploratory batch is not forced to call itself
+/// a file read.
+fn aggregate_label(calls: &[&ToolCallBlock], tense: Tense, t: &UiText) -> String {
     use DisclosureClass::*;
-    let n = running.len();
-    let class = disclosure_class(&running[0].name);
-    let uniform = running.iter().all(|c| disclosure_class(&c.name) == class);
+    let n = calls.len();
+    let class = disclosure_class(&calls[0].name);
+    let uniform = calls.iter().all(|c| disclosure_class(&c.name) == class);
     let template = match (uniform, class) {
-        (true, Read) => t.running_read_many,
-        (true, Shell) => t.running_shell_many,
-        (true, Search) => t.running_search,
-        _ => t.running_work_many,
+        (true, Read) => match tense {
+            Tense::Running => t.running_read_many,
+            Tense::Settled => t.settled_read_many,
+        },
+        (true, Search) => match tense {
+            Tense::Running => t.running_search,
+            Tense::Settled => t.settled_search,
+        },
+        (true, Shell) => match tense {
+            Tense::Running => t.running_shell_many,
+            Tense::Settled => t.settled_shell_many,
+        },
+        _ if calls.iter().all(|c| is_exploratory(c)) => match tense {
+            Tense::Running => t.running_explore,
+            Tense::Settled => t.settled_explore,
+        },
+        _ => match tense {
+            Tense::Running => t.running_work_many,
+            Tense::Settled => t.settled_work_many,
+        },
     };
     template.replace("{}", &n.to_string())
 }
@@ -528,7 +576,7 @@ fn unit_lines(
     let (glyph, glyph_color) = if guard_denial {
         ("⚠", theme.status.warning)
     } else {
-        status_glyph(call.status, theme)
+        status_glyph(call, theme)
     };
     let action = if call.name == "task" {
         t.unsupported_task_action.to_string()
@@ -637,11 +685,26 @@ fn failed_patch_target(preview: Option<&str>) -> Option<String> {
     }
 }
 
-fn status_glyph(status: ToolStatus, theme: &Theme) -> (&'static str, ratatui::style::Color) {
-    match status {
-        ToolStatus::Running => ("◌", theme.accent.primary),
-        ToolStatus::Ok => ("✓", theme.status.success),
-        ToolStatus::Failed => ("✗", theme.status.error),
+/// Whether this call is the agent LOOKING AROUND — a read, a search, a symbol
+/// lookup. Derived from the taxonomy, never a second tool-name registry.
+fn is_exploratory(call: &ToolCallBlock) -> bool {
+    crate::tool_taxonomy::activity_class(&call.name) == crate::tool_taxonomy::ActivityClass::Explore
+}
+
+/// The glyph for one call, weighted by what its success actually PROVES.
+///
+/// `ToolStatus::Ok` is a runtime fact: the tool ran. It is not a product
+/// result. A read that succeeded proves a file was read — the task may be no
+/// closer to done — while an edit that succeeded changed the user's tree and a
+/// passing command proved something. Spending the same green ✓ on both makes
+/// the mark meaningless, so exploration gets a quiet dot and the success mark
+/// stays scarce.
+fn status_glyph(call: &ToolCallBlock, theme: &Theme) -> (&'static str, ratatui::style::Color) {
+    match call.status {
+        ToolStatus::Running => ("\u{25cc}", theme.accent.primary),
+        ToolStatus::Failed => ("\u{2717}", theme.status.error),
+        ToolStatus::Ok if is_exploratory(call) => ("\u{b7}", theme.text.muted),
+        ToolStatus::Ok => ("\u{2713}", theme.status.success),
     }
 }
 
@@ -795,7 +858,7 @@ fn edit_unit_lines(
     let Some(first) = calls.first() else {
         return Vec::new();
     };
-    let (glyph, glyph_color) = status_glyph(first.status, theme);
+    let (glyph, glyph_color) = status_glyph(first, theme);
     // Prefer apply_patch presentation even when the merge mixes replace calls.
     let action = tool_action_label_for("apply_patch", locale);
     let tail = match first.status {
@@ -1040,6 +1103,14 @@ mod tests {
         }
     }
 
+    /// Live MEMBER rows, excluding the `◌ <aggregate>` header above them.
+    fn live_member_rows(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .filter(|l| l.contains('\u{25cc}') && !l.contains("正在"))
+            .count()
+    }
+
     fn group(calls: Vec<ToolCallBlock>) -> ToolGroupBlock {
         ToolGroupBlock {
             calls,
@@ -1053,6 +1124,171 @@ mod tests {
             calls,
             open: true,
             expanded: false,
+        }
+    }
+
+    // ── Activity weight: what a success actually proves ─────────────────────
+
+    /// R1: exploration in flight reads as in flight, never as a result.
+    #[test]
+    fn running_reads_show_progress_not_success() {
+        let calls: Vec<ToolCallBlock> = (0..4)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Running,
+                )
+            })
+            .collect();
+        let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        let text = lines.join("\n");
+        assert!(text.contains('\u{25cc}'), "{text}");
+        assert!(!text.contains('\u{2713}'), "nothing succeeded yet: {text}");
+    }
+
+    /// R2: settled inside a still-open burst is "done for now", not a result.
+    /// The old green ✓ said reading four files was an achievement.
+    #[test]
+    fn settled_reads_in_an_open_burst_are_weighted_down() {
+        let calls: Vec<ToolCallBlock> = (0..4)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Ok,
+                )
+            })
+            .collect();
+        let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        let text = lines.join("\n");
+        assert!(text.contains("\u{b7} 已读取 4 个文件"), "{text}");
+        assert!(
+            !text.contains('\u{2713}'),
+            "reading is not a result: {text}"
+        );
+        assert!(
+            !text.contains('\u{25b8}'),
+            "an open burst is not history yet: {text}"
+        );
+    }
+
+    /// R3: closed exploration is history — one clickable row, bare verb.
+    #[test]
+    fn closed_reads_fold_to_one_history_row() {
+        let calls: Vec<ToolCallBlock> = (0..4)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Ok,
+                )
+            })
+            .collect();
+        let lines = render_group_text(&group(calls), 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{25b8} 读取 4 个文件", "{lines:?}");
+    }
+
+    /// R4: a failure is a failure whatever its weight — it keeps the ✗ and
+    /// the reason.
+    #[test]
+    fn a_failed_read_still_reads_as_a_failure() {
+        let mut c = call("read_file", r#"{"path":"missing.rs"}"#, ToolStatus::Failed);
+        c.preview = Some("no such file".into());
+        let lines = render_group_text(&group(vec![c]), 100, Locale::Zh);
+        let text = lines.join("\n");
+        assert!(text.contains('\u{2717}'), "{text}");
+        assert!(text.contains("no such file"), "{text}");
+    }
+
+    /// R5: searching is exploration too.
+    #[test]
+    fn a_settled_search_is_not_marked_as_a_result() {
+        let lines = render_group_text(
+            &open_group(vec![call("grep", r#"{"pattern":"owner"}"#, ToolStatus::Ok)]),
+            100,
+            Locale::Zh,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("已搜索代码库"), "{text}");
+        assert!(!text.contains('\u{2713}'), "{text}");
+    }
+
+    /// R6: an edit changed the user's tree. That IS the result, and the one
+    /// glyph helper must not weight it down with the reads around it.
+    #[test]
+    fn an_edit_keeps_the_success_mark() {
+        let lines = render_group_text(
+            &group(vec![call(
+                "apply_patch",
+                r#"{"patch":"*** Begin Patch\n*** Update File: a.rs\n-a\n+b\n*** End Patch"}"#,
+                ToolStatus::Ok,
+            )]),
+            100,
+            Locale::Zh,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains('\u{2713}'), "an edit is a result: {text}");
+    }
+
+    /// R7: hidden probes never inflate the aggregate the user is reading.
+    #[test]
+    fn the_settled_aggregate_counts_only_what_is_visible() {
+        let mut calls: Vec<ToolCallBlock> = (0..3)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Ok,
+                )
+            })
+            .collect();
+        calls.extend((0..2).map(|i| {
+            call(
+                "list_files",
+                &format!(r#"{{"path":"d{i}"}}"#),
+                ToolStatus::Ok,
+            )
+        }));
+        let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        let text = lines.join("\n");
+        assert!(text.contains("已读取 3 个文件"), "{text}");
+        assert!(!text.contains('5'), "{text}");
+    }
+
+    /// R11: a tool the taxonomy has never heard of is not silently demoted to
+    /// exploration — it may well have changed something.
+    #[test]
+    fn an_unknown_tool_keeps_the_success_mark() {
+        let lines = render_group_text(
+            &open_group(vec![call(
+                "mcp__notion__create_page",
+                r#"{"title":"x"}"#,
+                ToolStatus::Ok,
+            )]),
+            100,
+            Locale::Zh,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains('\u{2713}'), "forward compatible: {text}");
+    }
+
+    /// R12: the aggregate copy and its glyph must survive a narrow terminal.
+    #[test]
+    fn a_narrow_terminal_truncates_instead_of_panicking() {
+        let calls: Vec<ToolCallBlock> = (0..12)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Ok,
+                )
+            })
+            .collect();
+        for width in [1usize, 3, 8, 20] {
+            let lines = render_group_text(&open_group(calls.clone()), width, Locale::Zh);
+            assert!(!lines.is_empty(), "width {width}");
         }
     }
 
@@ -1231,7 +1467,9 @@ mod tests {
             "no history-style row while the burst is in flight: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains('✓') && l.contains('7')),
+            lines
+                .iter()
+                .any(|l| l.contains('\u{b7}') && l.contains('7')),
             "settled-so-far stays truthfully visible: {lines:?}"
         );
         // …and the same group, closed, becomes exactly one history row —
@@ -1302,12 +1540,12 @@ mod tests {
             "not history: {lines:?}"
         );
         assert_eq!(
-            lines.iter().filter(|l| l.contains('◌')).count(),
+            live_member_rows(&lines),
             3,
             "each running member (≤ bound) keeps one row: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains('✓')),
+            lines.iter().any(|l| l.contains('\u{b7}')),
             "the settled member is counted, not shown running: {lines:?}"
         );
     }
@@ -1363,8 +1601,11 @@ mod tests {
         }
         let g = open_group(calls);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        let live = lines.iter().filter(|l| l.contains('◌')).count();
-        assert_eq!(live, 3, "bounded running rows: {lines:?}");
+        assert_eq!(
+            live_member_rows(&lines),
+            3,
+            "bounded running rows: {lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.contains("还有 4 个")),
             "hidden members are counted, not dropped: {lines:?}"
@@ -1440,8 +1681,7 @@ mod tests {
         }
         let g = group(vec![a, b, c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        let live = lines.iter().filter(|l| l.contains('◌')).count();
-        assert_eq!(live, 2, "two still running: {lines:?}");
+        assert_eq!(live_member_rows(&lines), 2, "two still running: {lines:?}");
         assert!(
             !lines.iter().any(|l| l.contains("a.rs")),
             "finished member settled compactly: {lines:?}"
@@ -1548,7 +1788,7 @@ mod tests {
         )]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("搜索了代码库"),
+            lines[0].starts_with('▸') && lines[0].contains("搜索代码库"),
             "LSP lookups read as codebase search: {lines:?}"
         );
     }
@@ -1716,8 +1956,15 @@ mod tests {
             lines.join("\n")
         );
         assert!(
-            lines.iter().any(|l| l.contains('✓') && l.contains('3')),
-            "settled members compact to one counted line:\n{}",
+            lines
+                .iter()
+                .any(|l| l.contains('\u{b7}') && l.contains('3')),
+            "settled members compact to one counted line, unweighted:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains('\u{2713}')),
+            "reading is not a result:\n{}",
             lines.join("\n")
         );
         assert!(
@@ -1815,8 +2062,8 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains('3'),
-            "a finished parallel batch folds to its disclosure: {lines:?}"
+            lines[0].starts_with('▸') && lines[0].contains("检查代码库"),
+            "reads and searches together are one exploration: {lines:?}"
         );
         let mut open = group(vec![
             parallel_call("read_file", r#"{"path":"a.rs"}"#),
@@ -1931,7 +2178,7 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert_eq!(lines.len(), 1, "a finished batch is one row: {lines:?}");
-        assert!(lines[0].contains('4'), "{lines:?}");
+        assert!(lines[0].contains("检查代码库"), "{lines:?}");
 
         // And each call comes back intact when asked for.
         let mut open = g;
@@ -1955,7 +2202,7 @@ mod tests {
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("读取了 1 个文件"),
+            lines[0].starts_with('▸') && lines[0].contains("读取 1 个文件"),
             "collapsed disclosure with the singular read label: {lines:?}"
         );
     }

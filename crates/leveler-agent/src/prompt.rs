@@ -176,6 +176,23 @@ impl PromptBuilder {
              \"found the root cause\" without naming what was found and why it \
              matters. Keep updates concise and in the user's language.",
         );
+        // The UI already draws every tool call ("reading 4 files"). Prose that
+        // only restates the next action therefore prints the same fact twice
+        // and pushes the actual work down the screen. Silence is a legitimate
+        // answer here — the runtime narrates the action, the model narrates
+        // the reasoning.
+        prompt.push_str(
+            "\n\nDo not narrate what the tool call already shows. The interface \
+             renders every tool call as it happens, so a line that only restates \
+             the next action — \"let me read a few files\", \"searching again\", \
+             \"running the tests\" — says the same thing twice and adds nothing. \
+             Say something only when you have a purpose, an observation, what it \
+             implies, or a reason for the next step: \"the entry point already \
+             moved to the new router, so I am checking what still references the \
+             old one\". When there is nothing to add, call the tool with no prose \
+             at all — that is better than an empty line of narration. One \
+             sentence is enough; this is not a request for longer explanations.",
+        );
         if self.require_explicit_plan {
             prompt.push_str(
                 "\n\nIf this is multi-step work (several independently checkable \
@@ -565,6 +582,31 @@ mod tests {
     /// forbid whole-file reads or argue from token cost: the goal is evidence
     /// C2.3B §4 — a known location must not cost a ceremonial search. The
     /// guidance has to state the KNOWN case, or "search first" degrades into
+    /// The UI already draws every tool call, so prose that only restates the
+    /// next action prints the same fact twice. The contract has to say that
+    /// silence is allowed — otherwise the model fills every gap with
+    /// "let me read a few files" above a row that already says so.
+    #[test]
+    fn narration_guidance_forbids_echoing_the_tool_call() {
+        let prompt = PromptBuilder::new().build();
+        assert!(
+            prompt.contains("Do not narrate what the tool call already shows"),
+            "the rule must be explicit: {prompt}"
+        );
+        assert!(
+            prompt.contains("call the tool with no prose"),
+            "saying nothing has to be an allowed answer: {prompt}"
+        );
+        assert!(
+            prompt.contains("purpose") && prompt.contains("implies"),
+            "what a narration should add must be named: {prompt}"
+        );
+        assert!(
+            prompt.contains("One sentence is enough"),
+            "and it must not invite longer prose: {prompt}"
+        );
+    }
+
     /// A plan created once and never touched again is worse than no plan: the
     /// user watches "step 1/8 in progress" while the agent builds step 5. The
     /// prompt has to name WHEN to synchronize, because the runtime cannot —
