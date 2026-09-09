@@ -1,0 +1,93 @@
+{
+  "kind": "run",
+  "meta": {
+    "created_at": "2026-09-09T12:37:41Z",
+    "git_sha": "3767bb6cfed7a067d7b681bf691541739b146878",
+    "cases_dir": "/private/tmp/claude-501/-Users-mengmian-Develop-app-dengmengmian-codeleveler/ca9ad39a-fd77-48f1-bd2c-24c11e579f14/scratchpad/ab_cases/scale",
+    "mode": "direct",
+    "repetitions": 1,
+    "model_refs": [
+      "deepseek/deepseek-v4-flash"
+    ],
+    "engine_version": "0.2.0-beta.1",
+    "context": {
+      "case_count": 1,
+      "repository_cases": 1,
+      "synthetic_cases": 0
+    }
+  },
+  "report": {
+    "model": "deepseek/deepseek-v4-flash",
+    "cases": [
+      {
+        "id": "scale-s800",
+        "repetition": 1,
+        "completed": true,
+        "termination": "completed",
+        "expect_passed": false,
+        "rounds": 31,
+        "latency_ms": 260311,
+        "input_tokens": 746639,
+        "output_tokens": 7026,
+        "cost_usd_micros": 105660,
+        "failure_category": "understanding",
+        "failure_source": "auto",
+        "note": "Completed",
+        "verification_evidence": {
+          "program": "bash",
+          "args": [
+            "-c",
+            "set -euo pipefail\ngo test ./... > /dev/null\nd=\"$(mktemp -d \"${TMPDIR:-/tmp}/telemetryd-accept.XXXXXX\")\"\ntrap 'rm -rf \"$d\"' EXIT\ngo build -o \"$d/telemetryd\" ./cmd/telemetryd\ncat > \"$d/events.txt\" <<'EVENTS'\n0 hits 1\n59 hits 2\n60 hits 4\n61 hits 8\n119 misses 16\n120 misses 32\nEVENTS\nout=\"$(\"$d/telemetryd\" \"$d/events.txt\")\"\n[ \"$(sed -n '1p' <<<\"$out\")\" = \"t=0 hits 3\" ]\n[ \"$(sed -n '2p' <<<\"$out\")\" = \"t=60 hits 12\" ]\n[ \"$(sed -n '3p' <<<\"$out\")\" = \"t=60 misses 16\" ]\n[ \"$(sed -n '4p' <<<\"$out\")\" = \"t=120 misses 32\" ]\n[ \"$(wc -l <<<\"$out\")\" -eq 4 ]\n# The real implementation was found: every change is in the windowing\n# package (docs may follow). A distractor package edited instead — or as\n# well — fails here.\nchanged=\"$(git status --porcelain | awk '{print $2}')\"\n[ -n \"$changed\" ]\nwhile read -r path; do\n  case \"$path\" in\n    internal/window/*|docs/*) ;;\n    *) echo \"changed outside the windowing package: $path\" >&2; exit 1 ;;\n  esac\ndone <<<\"$changed\"\n# The boundary rule is locked by a test, not just implemented.\ngrep -q '_test.go' <<<\"$changed\"\n"
+          ],
+          "passed": false,
+          "exit_code": 1
+        },
+        "tool_calls": 31,
+        "loop_guard_trips": 0,
+        "verification_ran": true,
+        "is_recovery": false,
+        "ttff_ms": 53,
+        "silent_duration_ms": 3387,
+        "edit_attempts": 3,
+        "edit_failures": 0,
+        "read_calls": 12,
+        "search_calls": 7,
+        "apply_patch_calls": 3,
+        "replace_calls": 0,
+        "first_edit_round": 22,
+        "unique_files_read": 12,
+        "repeated_file_reads": 0,
+        "unique_search_queries": 7,
+        "repeated_search_queries": 0,
+        "first_relevant_file_round": 7,
+        "first_plan_round": 21,
+        "relevant_paths_touched": 1,
+        "relevant_paths_before_edit": 1,
+        "impact_paths_touched": 0,
+        "impact_paths_before_edit": 0,
+        "distractor_paths_read": 0,
+        "forbidden_paths_edited": 0,
+        "broad_reads": 12,
+        "narrow_reads": 0,
+        "verification_driven_impact_discovery": false
+      }
+    ]
+  },
+  "completion_rate": 0.0,
+  "passed": 0,
+  "total": 1,
+  "failed_case_ids": [
+    "scale-s800"
+  ],
+  "false_completion_rate": 1.0,
+  "false_completion_case_ids": [
+    "scale-s800"
+  ],
+  "quality_score": {
+    "task_success": 0.0,
+    "completion_accuracy": 0.0,
+    "tool_efficiency": 1.0,
+    "cost_efficiency": -0.0
+  },
+  "quality_score_100": 19
+}

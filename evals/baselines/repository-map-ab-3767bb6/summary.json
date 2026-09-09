@@ -1,0 +1,381 @@
+{
+  "per_run": {
+    "rust": {
+      "a": [
+        {
+          "rounds": 7,
+          "closeout_nudges": 1,
+          "first_tool": "list_files",
+          "wall_ms": 22764,
+          "input_tokens": 123335,
+          "output_tokens": 498,
+          "cached_input": 106496,
+          "first_request_input": 17175,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 6,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 18805,
+          "input_tokens": 105184,
+          "output_tokens": 505,
+          "cached_input": 90368,
+          "first_request_input": 17175,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 6,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 18497,
+          "input_tokens": 105223,
+          "output_tokens": 458,
+          "cached_input": 89600,
+          "first_request_input": 17175,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ],
+      "b": [
+        {
+          "rounds": 5,
+          "closeout_nudges": 0,
+          "first_tool": "read_file",
+          "wall_ms": 16077,
+          "input_tokens": 87988,
+          "output_tokens": 464,
+          "cached_input": 73216,
+          "first_request_input": 17261,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 6,
+          "closeout_nudges": 1,
+          "first_tool": "read_file",
+          "wall_ms": 18763,
+          "input_tokens": 105853,
+          "output_tokens": 458,
+          "cached_input": 90624,
+          "first_request_input": 17261,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 6,
+          "closeout_nudges": 1,
+          "first_tool": "read_file",
+          "wall_ms": 19222,
+          "input_tokens": 105910,
+          "output_tokens": 476,
+          "cached_input": 91136,
+          "first_request_input": 17261,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ]
+    },
+    "n3": {
+      "a": [
+        {
+          "rounds": 24,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 100408,
+          "input_tokens": 760348,
+          "output_tokens": 4088,
+          "cached_input": 723200,
+          "first_request_input": 17303,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 15,
+          "closeout_nudges": 1,
+          "first_tool": "list_files",
+          "wall_ms": 54215,
+          "input_tokens": 294596,
+          "output_tokens": 1728,
+          "cached_input": 271872,
+          "first_request_input": 17303,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 15,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 65842,
+          "input_tokens": 359001,
+          "output_tokens": 2580,
+          "cached_input": 325120,
+          "first_request_input": 17303,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ],
+      "b": [
+        {
+          "rounds": 20,
+          "closeout_nudges": 1,
+          "first_tool": "read_file",
+          "wall_ms": 80810,
+          "input_tokens": 628568,
+          "output_tokens": 2377,
+          "cached_input": 589568,
+          "first_request_input": 17582,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 14,
+          "closeout_nudges": 1,
+          "first_tool": "read_file",
+          "wall_ms": 61042,
+          "input_tokens": 271796,
+          "output_tokens": 2517,
+          "cached_input": 250368,
+          "first_request_input": 17582,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 17,
+          "closeout_nudges": 1,
+          "first_tool": "read_file",
+          "wall_ms": 69581,
+          "input_tokens": 345246,
+          "output_tokens": 3009,
+          "cached_input": 322816,
+          "first_request_input": 17582,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ]
+    },
+    "mf1": {
+      "a": [
+        {
+          "rounds": 13,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 50237,
+          "input_tokens": 246106,
+          "output_tokens": 2277,
+          "cached_input": 226304,
+          "first_request_input": 17316,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 18,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 70986,
+          "input_tokens": 350206,
+          "output_tokens": 2859,
+          "cached_input": 328192,
+          "first_request_input": 17316,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 19,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 98004,
+          "input_tokens": 373710,
+          "output_tokens": 6700,
+          "cached_input": 350208,
+          "first_request_input": 17316,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ],
+      "b": [
+        {
+          "rounds": 14,
+          "closeout_nudges": 0,
+          "first_tool": "read_file",
+          "wall_ms": 63945,
+          "input_tokens": 272365,
+          "output_tokens": 3320,
+          "cached_input": 252160,
+          "first_request_input": 17429,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 13,
+          "closeout_nudges": 0,
+          "first_tool": "read_file",
+          "wall_ms": 67188,
+          "input_tokens": 252001,
+          "output_tokens": 4257,
+          "cached_input": 230144,
+          "first_request_input": 17429,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 15,
+          "closeout_nudges": 0,
+          "first_tool": "read_file",
+          "wall_ms": 62181,
+          "input_tokens": 291685,
+          "output_tokens": 3397,
+          "cached_input": 270592,
+          "first_request_input": 17429,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ]
+    },
+    "scale": {
+      "a": [
+        {
+          "rounds": 31,
+          "closeout_nudges": 1,
+          "first_tool": "list_files",
+          "wall_ms": 261350,
+          "input_tokens": 944968,
+          "output_tokens": 5830,
+          "cached_input": 903424,
+          "first_request_input": 17329,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 28,
+          "closeout_nudges": 0,
+          "first_tool": "list_files",
+          "wall_ms": 255232,
+          "input_tokens": 835063,
+          "output_tokens": 6471,
+          "cached_input": 792832,
+          "first_request_input": 17329,
+          "expect_passed": false,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 26,
+          "closeout_nudges": 1,
+          "first_tool": "list_files",
+          "wall_ms": 238479,
+          "input_tokens": 745891,
+          "output_tokens": 6577,
+          "cached_input": 707328,
+          "first_request_input": 17329,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ],
+      "b": [
+        {
+          "rounds": 33,
+          "closeout_nudges": 1,
+          "first_tool": "grep",
+          "wall_ms": 307934,
+          "input_tokens": 1059442,
+          "output_tokens": 10438,
+          "cached_input": 1008384,
+          "first_request_input": 19877,
+          "expect_passed": true,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 31,
+          "closeout_nudges": 0,
+          "first_tool": "shell_command",
+          "wall_ms": 260311,
+          "input_tokens": 746639,
+          "output_tokens": 7026,
+          "cached_input": 706560,
+          "first_request_input": 19877,
+          "expect_passed": false,
+          "claimed_complete": true
+        },
+        {
+          "rounds": 23,
+          "closeout_nudges": 1,
+          "first_tool": "grep",
+          "wall_ms": 226046,
+          "input_tokens": 659538,
+          "output_tokens": 4492,
+          "cached_input": 622336,
+          "first_request_input": 19877,
+          "expect_passed": true,
+          "claimed_complete": true
+        }
+      ]
+    }
+  },
+  "aggregate": {
+    "main_3": {
+      "a": {
+        "runs": 9,
+        "passed": 9,
+        "false_success": 0,
+        "total_rounds": 123,
+        "median_rounds": 15,
+        "list_files_first": 9,
+        "closeout_nudges": 2,
+        "input_tokens": 2717709,
+        "cached_input": 2511360,
+        "output_tokens": 21693,
+        "total_wall_ms": 499758,
+        "median_wall_ms": 54215
+      },
+      "b": {
+        "runs": 9,
+        "passed": 9,
+        "false_success": 0,
+        "total_rounds": 110,
+        "median_rounds": 14,
+        "list_files_first": 0,
+        "closeout_nudges": 5,
+        "input_tokens": 2361412,
+        "cached_input": 2170624,
+        "output_tokens": 20275,
+        "total_wall_ms": 458809,
+        "median_wall_ms": 62181
+      }
+    },
+    "all_4": {
+      "a": {
+        "runs": 12,
+        "passed": 11,
+        "false_success": 1,
+        "total_rounds": 208,
+        "median_rounds": 16.5,
+        "list_files_first": 12,
+        "closeout_nudges": 4,
+        "input_tokens": 5243631,
+        "cached_input": 4914944,
+        "output_tokens": 40571,
+        "total_wall_ms": 1254819,
+        "median_wall_ms": 68414.0
+      },
+      "b": {
+        "runs": 12,
+        "passed": 11,
+        "false_success": 1,
+        "total_rounds": 197,
+        "median_rounds": 14.5,
+        "list_files_first": 0,
+        "closeout_nudges": 7,
+        "input_tokens": 4827031,
+        "cached_input": 4507904,
+        "output_tokens": 42231,
+        "total_wall_ms": 1253100,
+        "median_wall_ms": 65566.5
+      }
+    }
+  },
+  "verdict": "POSITIVE_SIGNAL",
+  "mechanism": "CONFIRMED: list_files-first 12/12 (A) -> 0/12 (B)",
+  "note": "Single-run -17.9% rounds / -14.7% wall from ROUND_TRIP_CLOSURE.md is NOT reproduced."
+}

@@ -1,0 +1,16 @@
+{
+  "machine": "Apple M4 Max, 64 GiB",
+  "os": "Darwin 25.6.0 arm64",
+  "model": "deepseek/deepseek-v4-flash",
+  "provider": "taotoken (OpenAI-compatible gateway)",
+  "endpoint": "https://taotoken.net/api/v1",
+  "reasoning_effort": "max",
+  "permission_mode": "Assisted",
+  "context_window": 1048576,
+  "reliable_context": 786432,
+  "max_output_tokens": 393216,
+  "parallel_tool_calls": false,
+  "max_parallel_tool_calls": 1,
+  "build": "cargo build --release --locked -p leveler-cli, separate CARGO_TARGET_DIR per arm",
+  "isolation": "fresh LEVELER_HOME per run; eval harness materializes a fresh worktree per case"
+}

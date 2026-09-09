@@ -9,7 +9,7 @@ implemented no lever.
 | | |
 | --- | --- |
 | P0-B closeout nudge | **NO_EFFECT** — the reword did not move the rate |
-| P0-C first-round context | **PASS** — rounds −17.9%, wall −14.7% |
+| P0-C first-round context | **PASS** — mechanism confirmed; effect since revised to 5–11% fewer rounds, wall not reproducible |
 | P0-D parallel capability | **NO CHANGE** — the profile is honest |
 | Overall | **PARTIAL** |
 
@@ -132,9 +132,13 @@ Per case, A2 is at or below A0 on rounds everywhere:
 | rust-utf8-truncate | 6 | 6 | 5 |
 | ts-deep-merge | 8 | 8 | 6 |
 
-**Verdict: PASS.** Rounds −17.9%, wall −14.7%, and the mechanism is directly
-confirmed: the round the agent used to spend on `list_files` is gone in every
-case.
+**Verdict: PASS**, with the size of the effect since revised down.
+
+> **Superseded by repeated measurement.** These figures are one run per case.
+> A 24-run interleaved A/B (`docs/evaluations/REPOSITORY_MAP_AB_VALIDATION.md`)
+> reproduces the mechanism completely — `list_files`-first went 12/12 to 0/12 —
+> but puts the round saving at 5–11%, not 17.9%, and finds no reproducible wall
+> improvement. Quote that document, not the −17.9% / −14.7% here.
 
 ## 5. P0-D — parallel tool-call capability
 

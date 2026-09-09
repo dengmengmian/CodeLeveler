@@ -1,0 +1,86 @@
+{
+  "kind": "run",
+  "meta": {
+    "created_at": "2026-09-09T12:03:16Z",
+    "git_sha": "3767bb6cfed7a067d7b681bf691541739b146878",
+    "cases_dir": "/private/tmp/claude-501/-Users-mengmian-Develop-app-dengmengmian-codeleveler/ca9ad39a-fd77-48f1-bd2c-24c11e579f14/scratchpad/ab_cases/rust",
+    "mode": "direct",
+    "repetitions": 1,
+    "model_refs": [
+      "deepseek/deepseek-v4-flash"
+    ],
+    "engine_version": "0.2.0-beta.1",
+    "context": {
+      "case_count": 1,
+      "repository_cases": 0,
+      "synthetic_cases": 1
+    }
+  },
+  "report": {
+    "model": "deepseek/deepseek-v4-flash",
+    "cases": [
+      {
+        "id": "rust-first-even",
+        "repetition": 1,
+        "completed": true,
+        "termination": "completed",
+        "expect_passed": true,
+        "rounds": 6,
+        "latency_ms": 18763,
+        "input_tokens": 105853,
+        "output_tokens": 458,
+        "cost_usd_micros": 14830,
+        "note": "Completed",
+        "verification_evidence": {
+          "program": "cargo",
+          "args": [
+            "test",
+            "--quiet"
+          ],
+          "passed": true,
+          "exit_code": 0
+        },
+        "tool_calls": 5,
+        "loop_guard_trips": 0,
+        "verification_ran": true,
+        "is_recovery": false,
+        "ttff_ms": 30,
+        "silent_duration_ms": 3072,
+        "edit_attempts": 1,
+        "edit_failures": 0,
+        "read_calls": 2,
+        "search_calls": 0,
+        "apply_patch_calls": 1,
+        "replace_calls": 0,
+        "first_edit_round": 3,
+        "unique_files_read": 2,
+        "repeated_file_reads": 0,
+        "unique_search_queries": 0,
+        "repeated_search_queries": 0,
+        "first_relevant_file_round": 1,
+        "relevant_paths_touched": 2,
+        "relevant_paths_before_edit": 2,
+        "impact_paths_touched": 0,
+        "impact_paths_before_edit": 0,
+        "distractor_paths_read": 0,
+        "forbidden_paths_edited": 0,
+        "broad_reads": 2,
+        "narrow_reads": 0,
+        "verification_driven_impact_discovery": false
+      }
+    ]
+  },
+  "completion_rate": 1.0,
+  "passed": 1,
+  "total": 1,
+  "failed_case_ids": [],
+  "false_completion_rate": 0.0,
+  "false_completion_case_ids": [],
+  "quality_score": {
+    "task_success": 1.0,
+    "completion_accuracy": 1.0,
+    "tool_efficiency": 1.0,
+    "cost_efficiency": 1.0
+  },
+  "quality_score_100": 100
+}

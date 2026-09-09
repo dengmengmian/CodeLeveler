@@ -1,0 +1,18 @@
+{
+  "question": "Does the bounded RepositoryMap in the first-round cached prefix repeatably reduce round trips?",
+  "arms": {
+    "a": {"head": "e695b82240b988f2971bb3e2f83bc9bda333c168", "tree": "9c44f61ea0d51e3bd9e7afbbb15c03d5a22d453b", "sha256": "5e083af9a570d440f47bdfe35d5149ec01a7ff2a967ab5fd13918eb13fce3b43", "build_identity": "e695b82240b9", "dirty": false},
+    "b": {"head": "3767bb6cfed7a067d7b681bf691541739b146878", "tree": "2241caa80f34cdd594110ebc7e9f18e6d71be6ed", "sha256": "c6e1a8df871480ec7e7ce3abd7f3195190154d93b33b3db9d0e0d4de68def3da", "build_identity": "3767bb6cfed7", "dirty": false}
+  },
+  "treatment_commit": "98d21bc",
+  "confound_commit": "369283e (update_goal wording; measured NO_EFFECT previously)",
+  "cases": [
+    {"id": "rust-first-even", "sha256": "0e1f83812a966e48e12e833667611759561bfe9091a896749e6816c8177f1d01"},
+    {"id": "n3-caller-propagation", "sha256": "f1126b6d3ec144e18320a1b55eaef623095816b39b4ade669fc5c42e8e7c0f2d", "fixture": "navsvc@4ce9614c701dab1450bdd989bf802a8693ddc077"},
+    {"id": "mf1-refund-propagation", "sha256": "3b0e825cc39eaf1ce5a63da6c5d1b51588dc6dcb646df6ae4d9cb1ae609fa69b"},
+    {"id": "scale-s800", "sha256": "4ac9dd2ddbc4ff97d597401d71fef2e4201e1898b1c2c954b7ea37ebebd5ff47", "escalated": true}
+  ],
+  "repetitions": 3,
+  "interleaving": {"rust": "ABBAAB", "n3": "BAABBA", "mf1": "ABBAAB", "scale": "BAABBA"},
+  "runs": 24
+}
