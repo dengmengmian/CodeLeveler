@@ -1,0 +1,17 @@
+{
+  "leveler_bin": "/Users/mengmian/Develop/app/dengmengmian/dogfood/bin/codeleveler/d53136003eea/leveler",
+  "leveler_version": "leveler 0.2.0-beta.1 (d53136003eea)",
+  "leveler_frozen_sha": "d53136003eeae7eb0be92f7e162d011a9cb22cb2",
+  "atomcode_bin": "/Users/mengmian/Develop/app/dengmengmian/dogfood/harnesses/atomcode/bin/atomcode",
+  "atomcode_version": "atomcode 5.0.9 (52ca5e6)",
+  "atomcode_frozen": "5.0.9 (52ca5e6)",
+  "atomcode_config_sha256": "433b071ab63fe04d6fbd443ae9a9e196ce898663f52826a42998ef7f1b452a31",
+  "dsh_root": "/Users/mengmian/Develop/app/dengmengmian/dogfood/harnesses/deepseek-harness",
+  "dsh_sha": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+  "dsh_version": "0.1.2-alpha.1",
+  "dsh_frozen_sha": "cd5ef8148",
+  "dsh_frozen_version": "0.1.2-alpha.1",
+  "atomcode_version_drift": "NO",
+  "dsh_version_drift": "NO",
+  "codeleveler_version_drift": "NO"
+}
