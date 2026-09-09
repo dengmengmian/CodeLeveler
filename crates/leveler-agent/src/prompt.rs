@@ -44,6 +44,15 @@ pub(crate) struct TurnContext {
     /// The language the user is writing in, when we can name it. `None` falls
     /// back to the generic "mirror the user" rule.
     pub(crate) user_language: Option<&'static str>,
+    /// A bounded listing of what is in the workspace, already rendered.
+    ///
+    /// Measured: `list_files` was the FIRST tool call on 5 of 7 baseline cases
+    /// — a whole round trip, ~3.8 s, spent asking what files exist. This
+    /// message is built once per turn and stays byte-identical for the loop,
+    /// so the listing lives in the provider's prefix cache and is paid for
+    /// once, uncached, on the first request. Trading cached prefix for a round
+    /// trip is the right direction here; the reverse is not.
+    pub(crate) repo_map: Option<String>,
 }
 
 /// Name the language of a user request, so the prompt can state it outright.
@@ -278,6 +287,14 @@ impl TurnContext {
         );
         rendered.push_str("\n\n");
         rendered.push_str(&self.operating_rules(network == "allowed"));
+        if let Some(map) = self.repo_map.as_deref().filter(|m| !m.trim().is_empty()) {
+            rendered.push_str(
+                "\n\nWorkspace files (bounded listing; do not call a directory tool just to \
+                 learn what exists here — read or search what you need):\n",
+            );
+            rendered.push_str(map.trim_end());
+            rendered.push('\n');
+        }
         if !self.project_rules.is_empty() {
             rendered.push_str("\n\nProject rules:\n");
             rendered.push_str(&render_instructions(&self.project_rules));
@@ -413,6 +430,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级工具库"),
+                repo_map: None,
             })
             .build();
 
@@ -468,6 +486,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: None,
+                repo_map: None,
             })
             .build();
 
@@ -491,6 +510,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: None,
+                repo_map: None,
             })
             .build();
         assert!(!disabled.contains("Co-Authored-By: CodeLeveler"));
@@ -507,6 +527,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/Users/example/project"),
                 project_rules: Vec::new(),
                 user_language: None,
+                repo_map: None,
             })
             .build();
 
@@ -526,6 +547,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: None,
+                repo_map: None,
             })
             .build();
 
@@ -582,6 +604,66 @@ mod tests {
     /// forbid whole-file reads or argue from token cost: the goal is evidence
     /// C2.3B §4 — a known location must not cost a ceremonial search. The
     /// guidance has to state the KNOWN case, or "search first" degrades into
+    /// `list_files` was the FIRST tool call on 5 of 7 baseline cases: a whole
+    /// round trip spent asking what exists. The listing rides in the system
+    /// prompt, which is built once per turn and stays byte-identical for the
+    /// loop, so it is paid for once and served from the prefix cache after.
+    #[test]
+    fn the_workspace_listing_reaches_the_prompt_and_says_what_it_is_for() {
+        let mut ctx = context(PermissionProfile::Assisted, false);
+        ctx.repo_map = Some("src/lib.rs\nsrc/main.rs".to_string());
+        let prompt = PromptBuilder::new().turn_context(ctx).build();
+        assert!(
+            prompt.contains("src/lib.rs") && prompt.contains("src/main.rs"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not call a directory tool just to learn what exists"),
+            "the listing has to say why it is there: {prompt}"
+        );
+    }
+
+    /// No listing means no heading. A workspace we could not read must not
+    /// produce an empty section that reads as "this repository is empty".
+    #[test]
+    fn an_absent_or_empty_listing_renders_no_section() {
+        for map in [None, Some(String::new()), Some("   \n".to_string())] {
+            let mut ctx = context(PermissionProfile::Assisted, false);
+            ctx.repo_map = map.clone();
+            let prompt = PromptBuilder::new().turn_context(ctx).build();
+            assert!(
+                !prompt.contains("Workspace files"),
+                "empty listing must not render a heading ({map:?})"
+            );
+        }
+    }
+
+    /// A goal that ends correctly but in two turns costs a whole extra round
+    /// trip — measured at ~3.8 s, and it fired on 5 of 7 baseline cases. The
+    /// closeout nudge recovers it, but recovery is not the normal path. The
+    /// prompt used to call `update_goal` "silent bookkeeping", which reads as
+    /// a formality to do afterwards rather than the act that ends the goal.
+    #[test]
+    fn the_goal_contract_puts_completion_in_the_finishing_turn() {
+        let prompt = PromptBuilder::new().build();
+        assert!(
+            prompt.contains("SAME turn as your final answer"),
+            "the ordering is the whole point: {prompt}"
+        );
+        assert!(
+            prompt.contains("Final prose does not close a goal"),
+            "what does NOT end a goal has to be said: {prompt}"
+        );
+        assert!(
+            !prompt.contains("silent bookkeeping"),
+            "that framing is what made it look optional: {prompt}"
+        );
+        assert!(
+            prompt.contains("never narrate process state"),
+            "keeping the call invisible to the user must survive: {prompt}"
+        );
+    }
+
     /// The UI already draws every tool call, so prose that only restates the
     /// next action prints the same fact twice. The contract has to say that
     /// silence is allowed — otherwise the model fills every gap with
@@ -835,6 +917,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/repo"),
             project_rules: Vec::new(),
             user_language: None,
+            repo_map: None,
         }
     }
 
@@ -1111,6 +1194,7 @@ mod tests {
                     content: "Prefer small modules.".to_string(),
                 }],
                 user_language: None,
+                repo_map: None,
             })
             .build();
 
@@ -1136,6 +1220,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级的 Go 工具库"),
+                repo_map: None,
             })
             .build();
 
@@ -1156,6 +1241,7 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 project_rules: Vec::new(),
                 user_language: user_language("make this repo production ready"),
+                repo_map: None,
             })
             .build();
 

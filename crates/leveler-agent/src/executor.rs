@@ -275,6 +275,49 @@ impl AdvisoryKind {
 }
 
 #[cfg(test)]
+mod workspace_listing_tests {
+    /// A huge repository must not turn the cached prefix into the largest
+    /// thing in the request, and a shortened listing has to SAY it is short:
+    /// silently truncated, it reads as the complete contents of the workspace.
+    #[test]
+    fn a_large_workspace_is_capped_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("leveler-listing-cap-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for i in 0..400 {
+            std::fs::write(
+                dir.join("src")
+                    .join(format!("a_rather_long_file_name_{i:04}.rs")),
+                "fn f() {}\n",
+            )
+            .unwrap();
+        }
+        let listing = super::workspace_listing(&dir).expect("a non-empty workspace lists");
+        assert!(
+            listing.len() <= 8 * 1024 + 64,
+            "capped: {} bytes",
+            listing.len()
+        );
+        assert!(listing.contains("truncated"), "a short listing must say so");
+        assert!(
+            listing.lines().all(|l| !l.is_empty()),
+            "no ragged half-path at the cut"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A workspace with nothing readable produces no listing at all, so the
+    /// prompt renders no section rather than an empty one.
+    #[test]
+    fn an_empty_workspace_produces_no_listing() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-listing-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(super::workspace_listing(&dir).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
 mod advisory_kind_tests {
     use super::AdvisoryKind;
     use super::closeout::CloseoutReason;
@@ -1045,6 +1088,30 @@ pub struct Executor {
     agent_id: Option<String>,
 }
 
+/// A bounded listing of the workspace for the system prompt.
+///
+/// Reuses `leveler_context::RepositoryMap` — the same walk, ignore list and
+/// 400-file cap that already existed — rather than growing a second one. The
+/// byte cap on top of it is what keeps a huge repository from turning the
+/// cached prefix into the largest thing in the request; a truncated listing
+/// says so, because a silently short list would read as a complete one.
+fn workspace_listing(root: &std::path::Path) -> Option<String> {
+    const MAX_BYTES: usize = 8 * 1024;
+    let rendered = leveler_context::RepositoryMap::build(root).render();
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    if rendered.len() <= MAX_BYTES {
+        return Some(rendered);
+    }
+    let cut = leveler_core::floor_char_boundary(&rendered, MAX_BYTES);
+    let kept = rendered[..cut]
+        .rsplit_once('\n')
+        .map(|(head, _)| head)
+        .unwrap_or("");
+    Some(format!("{kept}\n… [listing truncated]"))
+}
+
 impl Executor {
     pub fn new(
         runtime: Arc<dyn ModelRuntime>,
@@ -1545,6 +1612,7 @@ impl Executor {
                 cwd: self.tool_context.execution.workspace.root().to_path_buf(),
                 project_rules,
                 user_language: crate::prompt::user_language(request),
+                repo_map: workspace_listing(self.tool_context.execution.workspace.root()),
             })
             .require_explicit_plan(self.policy.require_explicit_plan)
             .memory_index(self.memory_index.clone())
