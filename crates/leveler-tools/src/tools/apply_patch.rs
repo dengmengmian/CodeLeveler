@@ -505,10 +505,7 @@ impl Tool for ApplyPatchTool {
         for rel in &modified {
             match context.execution.workspace.resolve_for_read(rel) {
                 Ok(resolved) => match tokio::fs::read(&resolved).await {
-                    Ok(bytes) => {
-                        context.execution.file_state.record(rel, &bytes);
-                        // Auto-format the edited file (best-effort; re-fingerprints).
-                    }
+                    Ok(bytes) => context.execution.file_state.record(rel, &bytes),
                     Err(_) => context.execution.file_state.forget(rel),
                 },
                 Err(_) => context.execution.file_state.forget(rel),
@@ -1174,23 +1171,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_edit_after_the_formatter_rewrites_the_file_is_not_stale() {
-        // The formatter rewrites what the patch wrote; its output — not the
-        // patch's bytes — must become the authoritative file state, or every
-        // follow-up edit against the (formatted) tree trips the stale guard.
-        if std::process::Command::new("gofmt")
-            .arg("-h")
-            .output()
-            .is_err()
-        {
-            return; // gofmt not installed — skip
-        }
+    async fn a_patch_is_committed_verbatim_the_runtime_never_reformats_it() {
+        // The runtime used to run the language formatter over every edited file
+        // and re-fingerprint the result. It no longer touches the bytes: a model
+        // that wants its code formatted runs the formatter itself, as a command
+        // it can see the result of. A hidden mutation would mean the tree on
+        // disk is not the tree the model was told it wrote.
         let (context, dir) = super::super::test_ctx(
             leveler_execution::PermissionProfile::Assisted,
             &[("main.go", "package main\n\nfunc main() {\n}\n")],
         );
 
-        // The patch writes deliberately misformatted Go; gofmt normalizes it.
+        // Deliberately misformatted Go: gofmt would rewrite `x   :=   1`.
         let first = "*** Begin Patch\n*** Update File: main.go\n func main() {\n+\tx   :=   1\n+\t_ = x\n }\n*** End Patch";
         let out = ApplyPatchTool
             .execute(
@@ -1201,15 +1193,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        let formatted = std::fs::read_to_string(dir.join("main.go")).unwrap();
+        let on_disk = std::fs::read_to_string(dir.join("main.go")).unwrap();
         assert!(
-            formatted.contains("x := 1"),
-            "gofmt should have normalized the spacing: {formatted}"
+            on_disk.contains("x   :=   1"),
+            "the patch's own bytes must survive the commit unedited: {on_disk}"
         );
 
-        // The second patch is written against the FORMATTED content.
-        let second =
-            "*** Begin Patch\n*** Update File: main.go\n-\tx := 1\n+\tx := 2\n*** End Patch";
+        // And a follow-up edit reads against exactly those bytes.
+        let second = "*** Begin Patch\n*** Update File: main.go\n-\tx   :=   1\n+\tx   :=   2\n*** End Patch";
         let out = ApplyPatchTool
             .execute(
                 serde_json::json!({ "patch": second }),
@@ -1220,13 +1211,14 @@ mod tests {
             .unwrap();
         assert!(
             !out.is_error,
-            "an edit against the formatter's output must not be stale: {}",
+            "an edit against the tree the patch actually left behind must not \
+             be stale: {}",
             out.content
         );
         assert!(
             std::fs::read_to_string(dir.join("main.go"))
                 .unwrap()
-                .contains("x := 2")
+                .contains("x   :=   2")
         );
         std::fs::remove_dir_all(&dir).ok();
     }

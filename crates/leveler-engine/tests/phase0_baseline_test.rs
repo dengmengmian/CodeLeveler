@@ -390,11 +390,12 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
 // ---------------------------------------------------------------------------
 
 /// Phase 4 contract: `update_goal(blocked)` is machine-discriminable at every
-/// durable level — the typed `stop` field on both terminal events and the
-/// session's `Blocked` status column, written by the engine as the single
-/// lifecycle writer. (`TaskOutcome::Failed` remains the coarse outcome for
-/// non-success, as before; the phase 0 version of this test proved "blocked"
-/// only survived as a Debug string.)
+/// durable level — the typed `stop` field on both terminal events, the
+/// session's `Blocked` status column, and `TaskOutcome::Blocked` itself, all
+/// written by the engine as the single lifecycle writer. (The phase 0 version
+/// of this test proved "blocked" only survived as a Debug string; it then
+/// spent a while folded into the coarse `Failed`, which said a model that
+/// honestly reported an unreachable goal had failed at it.)
 #[tokio::test]
 async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
     use leveler_engine::{ExecutionKind, TaskEngine, TaskOutcome, TaskSpec};
@@ -447,7 +448,11 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
 
     // Typed in the report, in both terminal events, and in the session row.
     assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
-    assert_eq!(report.outcome, TaskOutcome::Failed);
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Blocked,
+        "declaring a goal unreachable is not the same terminal as failing at it"
+    );
     assert_eq!(turn_stops, vec![Some(leveler_agent::StopReason::Blocked)]);
     assert_eq!(
         task_stop,

@@ -99,8 +99,6 @@ pub struct ToolPolicy {
     /// Extra env var names scrubbed from `run_command` children (the
     /// configured providers' `api_key_env` names).
     pub deny_env: Arc<Vec<String>>,
-    /// Run the language formatter (gofmt/rustfmt/…) after each edit. Off by
-    /// default so unit tests exercise edit logic in isolation; the real agent
     /// Max files a single `apply_patch` may touch (0 = unlimited).
     pub max_files_per_step: usize,
     /// Paths a command may modify. `None` means unrestricted.

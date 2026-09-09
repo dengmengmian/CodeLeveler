@@ -582,15 +582,21 @@ mod tests {
         assert!(!line.contains('0'), "{line}");
     }
 
+    /// The third reading a contribution can have, beside "nothing to flag"
+    /// and "not measured" above: a measured, non-empty result states its own
+    /// count. The three must stay distinguishable — a child that found seven
+    /// things, a child that found none, and a child nobody measured are three
+    /// different facts, and only the first is a tally.
     #[test]
-    fn a_reported_contribution_leads_with_what_the_parent_did() {
+    fn a_measured_contribution_states_the_count_it_measured() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
         finished(&mut team, "a1", true, Some(contribution(7)));
         let line = contribution_line(&team.children[0], t).expect("a result line");
-        assert!(line.contains("5 accepted"), "{line}");
-        assert!(line.contains("3 verified"), "{line}");
+        assert!(line.contains('7'), "{line}");
+        assert!(!line.contains("nothing to flag"), "{line}");
+        assert!(!line.contains("not measured"), "{line}");
     }
 
     #[test]
@@ -673,11 +679,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("src/auth.rs"), "{joined}");
-        assert!(joined.contains("[accepted]"), "{joined}");
-        assert!(
-            joined.contains("2 accepted · 1 verified · 0 rejected"),
-            "{joined}"
-        );
+        assert!(joined.contains("[correctness]"), "{joined}");
+        assert!(joined.contains("2 findings"), "{joined}");
     }
 
     #[test]
@@ -694,8 +697,9 @@ mod tests {
             .join("\n");
         assert!(joined.contains("nothing to flag"), "{joined}");
         assert!(
-            !joined.contains("0 accepted"),
-            "a clean review is not a tally: {joined}"
+            !joined.contains('0'),
+            "a clean review is a sentence, not a tally that happens to be zero: \
+             {joined}"
         );
     }
 
@@ -786,7 +790,7 @@ mod tests {
         finished(&mut team, "a1", true, Some(contribution(7)));
         let lines = team_lines(&team, t);
         assert_eq!(lines[0].glyph, "✓");
-        assert!(lines[0].detail.contains("5 accepted"), "{:?}", lines[0]);
+        assert!(lines[0].detail.contains("7 findings"), "{:?}", lines[0]);
     }
 
     #[test]

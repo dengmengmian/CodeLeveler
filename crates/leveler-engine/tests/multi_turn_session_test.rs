@@ -962,14 +962,17 @@ async fn the_checkpoint_watermark_binds_when_it_reaches_further_back() {
     );
 }
 
-/// Every engine path that hands a model prior context goes through the one
-/// assembly, so none of them can send an unbounded transcript.
+/// Every engine path that hands a model prior context goes through an
+/// assembling helper, so none of them can send an unbounded transcript.
 ///
 /// `resume_with_limits` used to be the exception: it passed the raw
 /// transcript straight to `TurnInput::Resume`, so a long session resent its
 /// entire history on every budget extension. Nothing bounded it, and no test
-/// covered it because the path only opens on budget exhaustion — which is
+/// covered it because the path only opened on budget exhaustion — which is
 /// why this is a source tripwire, in the same spirit as the ownership one.
+/// That fourth path is gone (the runtime no longer decides the model has
+/// earned another turn), so this counts the paths that exist rather than a
+/// number one deletion can make wrong.
 #[test]
 fn no_engine_path_hands_a_model_an_unassembled_transcript() {
     const MARKER: &str = "TurnInput::Resume(";
@@ -997,9 +1000,22 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
         );
     }
 
-    // chat, resume, goal continuation, budget extension.
+    // One assembly call per path that supplies prior context: chat and resume
+    // through `assembled_prior`, the goal continuation through
+    // `bounded_session_history` (the same checkpoint-else-assemble, then capped
+    // for injection). A new path added without one moves these two apart.
+    let paths = production.matches("TurnInput::Content {").count()
+        + production.matches("TurnInput::Goal {").count()
+        + production.matches("TurnInput::Resume(").count();
+    let assemblies = production.matches(".assembled_prior(").count()
+        + production.matches(".bounded_session_history(").count();
     assert!(
-        production.matches("assembled_prior(").count() >= 4,
-        "every path that supplies prior context assembles it"
+        paths >= 3,
+        "chat, resume and the goal continuation should all still exist"
+    );
+    assert_eq!(
+        assemblies, paths,
+        "every path that supplies prior context assembles it: {paths} \
+         turn-input path(s) against {assemblies} assembly call(s)"
     );
 }

@@ -818,12 +818,15 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         "sequences must be gapless"
     );
 
-    // The observer saw the same terminal event (persist-before-forward held).
+    // The observer saw the same terminal event (persist-before-forward held),
+    // carrying BOTH axes: the model declared the goal complete, and the gating
+    // check this spec configured ran and passed over the final tree. `NotRun`
+    // here would contradict the verification events asserted above.
     assert!(seen.iter().any(|e| matches!(
         e,
         EngineEvent::TaskFinished {
             outcome: TaskOutcome::Completed,
-            verification: leveler_lifecycle::VerificationStatus::NotRun,
+            verification: leveler_lifecycle::VerificationStatus::Passed,
             ..
         }
     )));
@@ -2407,7 +2410,11 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
         0,
         30,
     ));
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    // The reviewer is the child lane this reconciliation is about, and
+    // `IndependentReviewPolicy` defaults to `Off`: a run that spends in one
+    // lane only cannot prove the two authorities agree, so ask for it.
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
