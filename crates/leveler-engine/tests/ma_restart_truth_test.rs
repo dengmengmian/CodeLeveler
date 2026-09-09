@@ -670,6 +670,21 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
 /// MA_RT_RESTART_OUTSTANDING_RECONCILIATION — the same ghost truth must hold
 /// when the second window is a genuinely fresh process image: new Database
 /// handle over the same file, nothing in memory carried over.
+///
+/// The truth a restart owes is mechanical and it is about the CHILD: a worker
+/// the log says started and never reported settles as `ok: false`, attributed
+/// to the turn that started it, saying what happened — the absence of a
+/// failure is not evidence of success, and a missing terminal fact is not a
+/// successful one. Nothing is invented on its behalf either: the settlement
+/// records the loss, it does not manufacture evidence the child never
+/// reported.
+///
+/// What it does NOT owe is a verdict on the parent. `TaskOutcome::Completed`
+/// records that the model declared its own goal complete, and
+/// `VerificationStatus` records what the project's checks said; whether a lost
+/// child's work still mattered is the model's reading of its own goal, which
+/// is why the in-memory sibling above pins that a ghost is a fact to report
+/// and never a gate on the close.
 #[tokio::test]
 async fn ghost_reconciliation_survives_a_real_database_reopen() {
     let dir = workspace_dir();
@@ -678,12 +693,12 @@ async fn ghost_reconciliation_survives_a_real_database_reopen() {
     let spec = gated_spec(dir.path());
 
     // Window one: the process that created the task and started the worker.
-    let session = {
+    let (session, origin_turn) = {
         let db = Database::connect(&db_path).await.unwrap();
         let engine = engine_on(&db, dir.path(), Vec::new());
         let session = engine.create_task(&spec).await.unwrap();
-        seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
-        session
+        let origin_turn = seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
+        (session, origin_turn)
         // db dropped here — the "process" dies.
     };
 
@@ -694,32 +709,44 @@ async fn ghost_reconciliation_survives_a_real_database_reopen() {
         script.push(text("refused over the lost worker; stopping"));
     }
     let engine = engine_on(&db, dir.path(), script);
-    let report = engine
+    engine
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
 
-    assert_ne!(
-        report.outcome,
-        TaskOutcome::Completed,
-        "a restart must not launder a lost Worker into a verified closure"
-    );
     let events = event_rows(&db, &session).await;
-    assert!(
-        events.iter().any(
-            |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, ok: false, .. } if id == "agent-1")
-        ),
-        "the ghost must be durably settled after the reopen"
-    );
-    let ledger = last_ledger(&events).expect("debt must be persisted");
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .collect();
     assert_eq!(
-        ledger
-            .findings
-            .iter()
-            .filter(|f| f.source_child == "agent-1")
-            .count(),
+        terminals.len(),
         1,
-        "the durable record alone must carry what the child reported"
+        "the reopened window must settle the ghost exactly once"
+    );
+    let (attributed_turn, EngineEvent::SubAgentFinished { ok, summary, .. }) = terminals[0] else {
+        unreachable!()
+    };
+    assert!(
+        !ok,
+        "a worker that never reported across the restart cannot be recorded as \
+         ok: the process disappearing is not the child succeeding"
+    );
+    assert!(
+        summary.contains("lost"),
+        "the terminal must say what actually happened to it: {summary}"
+    );
+    assert_eq!(
+        attributed_turn.as_deref(),
+        Some(origin_turn.as_str()),
+        "the settlement is attributed to the turn that started the child — a \
+         fact only the durable record can still supply after the reopen"
+    );
+    let ledger = last_ledger(&events).unwrap_or_default();
+    assert!(
+        !ledger.findings.iter().any(|f| f.source_child == "agent-1"),
+        "settling a lost child records the loss; it must not manufacture \
+         findings the child never reported"
     );
 }
 
@@ -849,11 +876,15 @@ async fn a_normally_settled_child_is_attributed_to_its_turn() {
 /// (no turn row exists for it), so `turn_id = NULL` on both lifecycle events
 /// is the truthful attribution; the pair must agree, and the start must be
 /// durable (it is appended and awaited before the reviewer executes).
+///
+/// The review is asked for explicitly: `IndependentReviewPolicy` defaults to
+/// `Off`, so a harness that launches a reviewer nobody requested is itself the
+/// bug. This pins the attribution of the review a caller DID ask for.
 #[tokio::test]
 async fn reviewer_lifecycle_events_share_truthful_null_attribution() {
     let dir = workspace_dir();
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = engine_on(
+    let mut engine = engine_on(
         &db,
         dir.path(),
         padded(vec![
@@ -870,6 +901,7 @@ async fn reviewer_lifecycle_events_share_truthful_null_attribution() {
             text("reviewed src/auth.rs: nothing to flag"),
         ]),
     );
+    engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
     let spec = gated_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     engine
