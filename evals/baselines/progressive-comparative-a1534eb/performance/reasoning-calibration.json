@@ -1,0 +1,1115 @@
+{
+  "arms": [
+    {
+      "case": "n3-caller-propagation",
+      "arm": "atomcode-effort-unset",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        41.3,
+        68.8
+      ],
+      "wall_median_s": 55.0
+    },
+    {
+      "case": "n3-caller-propagation",
+      "arm": "codeleveler-effort-high",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        56.5,
+        53.9
+      ],
+      "wall_median_s": 55.2,
+      "rounds": [
+        10,
+        9
+      ],
+      "input_tokens": [
+        293936,
+        256560
+      ],
+      "output_tokens": [
+        2770,
+        2244
+      ],
+      "round_latencies_ms": [
+        [
+          3900,
+          3891,
+          6432,
+          4549,
+          4717,
+          5950,
+          9800,
+          4206,
+          5883,
+          3069
+        ],
+        [
+          4933,
+          3648,
+          5370,
+          7126,
+          5658,
+          8010,
+          4015,
+          6917,
+          4099
+        ]
+      ],
+      "slow_rounds_over_20s": [
+        [],
+        []
+      ],
+      "ttfb_ms": [
+        {
+          "median": 3610,
+          "n": 10
+        },
+        {
+          "median": 3918,
+          "n": 9
+        }
+      ],
+      "harness_share": [
+        0.0026,
+        0.0001
+      ]
+    },
+    {
+      "case": "n3-caller-propagation",
+      "arm": "codeleveler-effort-max",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        262.4,
+        118.9
+      ],
+      "wall_median_s": 190.6,
+      "rounds": [
+        10,
+        9
+      ],
+      "input_tokens": [
+        289469,
+        259182
+      ],
+      "output_tokens": [
+        2453,
+        2897
+      ],
+      "round_latencies_ms": [
+        [
+          4207,
+          3816,
+          5677,
+          5438,
+          6250,
+          8095,
+          3887,
+          5572,
+          4308,
+          210682
+        ],
+        [
+          3972,
+          4056,
+          4620,
+          5498,
+          6765,
+          70413,
+          8918,
+          5086,
+          5039
+        ]
+      ],
+      "slow_rounds_over_20s": [
+        [
+          {
+            "latency_ms": 210682,
+            "output_tokens": 117,
+            "cached": 32768,
+            "input": 32940,
+            "finish": "tool_calls",
+            "retries": 1
+          }
+        ],
+        [
+          {
+            "latency_ms": 70413,
+            "output_tokens": 795,
+            "cached": 30720,
+            "input": 32344,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ]
+      ],
+      "ttfb_ms": [
+        {
+          "median": 3533,
+          "n": 10
+        },
+        {
+          "median": 3803,
+          "n": 9
+        }
+      ],
+      "harness_share": [
+        0.0007,
+        0.0012
+      ]
+    },
+    {
+      "case": "yq-doc-count",
+      "arm": "atomcode-effort-unset",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        319.0,
+        186.3
+      ],
+      "wall_median_s": 252.7
+    },
+    {
+      "case": "yq-doc-count",
+      "arm": "codeleveler-effort-high",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        1759.5,
+        1800.1
+      ],
+      "wall_median_s": 1779.8,
+      "rounds": [
+        57,
+        51
+      ],
+      "input_tokens": [
+        2970855,
+        2559323
+      ],
+      "output_tokens": [
+        70403,
+        97729
+      ],
+      "round_latencies_ms": [
+        [
+          4390,
+          4349,
+          4816,
+          3362,
+          8380,
+          8741,
+          3864,
+          28793,
+          4386,
+          53138,
+          10000,
+          29306,
+          245568,
+          96760,
+          4017,
+          53433,
+          50373,
+          77614,
+          12375,
+          22537,
+          51217,
+          66727,
+          5952,
+          5113,
+          5412,
+          22717,
+          35814,
+          17187,
+          30716,
+          10865,
+          24392,
+          135548,
+          23665,
+          14314,
+          4680,
+          5353,
+          5821,
+          143173,
+          115265,
+          5446,
+          6432,
+          4478,
+          4580,
+          4378,
+          4476,
+          5044,
+          44175,
+          6127,
+          5102,
+          43701,
+          5494,
+          3896,
+          9023,
+          5324,
+          5823,
+          6999,
+          5805
+        ],
+        [
+          3591,
+          3618,
+          5564,
+          4873,
+          35769,
+          32769,
+          148135,
+          67672,
+          66170,
+          42500,
+          63084,
+          47654,
+          55124,
+          106463,
+          6008,
+          4156,
+          64880,
+          73254,
+          38317,
+          5754,
+          60008,
+          56022,
+          10724,
+          6424,
+          7299,
+          28036,
+          17723,
+          6357,
+          5603,
+          3440,
+          4148,
+          5483,
+          5853,
+          5408,
+          5886,
+          4381,
+          131863,
+          4963,
+          127772,
+          4746,
+          5163,
+          8788,
+          34601,
+          24738,
+          24687,
+          10586,
+          19532,
+          5321,
+          8181,
+          4768,
+          5389
+        ]
+      ],
+      "slow_rounds_over_20s": [
+        [
+          {
+            "latency_ms": 28793,
+            "output_tokens": 3240,
+            "cached": 33280,
+            "input": 34238,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53138,
+            "output_tokens": 6581,
+            "cached": 35072,
+            "input": 37376,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 29306,
+            "output_tokens": 2184,
+            "cached": 37632,
+            "input": 40471,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 245568,
+            "output_tokens": 5125,
+            "cached": 41472,
+            "input": 41721,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 96760,
+            "output_tokens": 4197,
+            "cached": 40960,
+            "input": 43661,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53433,
+            "output_tokens": 5308,
+            "cached": 47360,
+            "input": 48246,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 50373,
+            "output_tokens": 3915,
+            "cached": 47104,
+            "input": 49938,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 77614,
+            "output_tokens": 88,
+            "cached": 49152,
+            "input": 51500,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22537,
+            "output_tokens": 169,
+            "cached": 51200,
+            "input": 51842,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 51217,
+            "output_tokens": 6402,
+            "cached": 51456,
+            "input": 52858,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66727,
+            "output_tokens": 8556,
+            "cached": 52736,
+            "input": 54100,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22717,
+            "output_tokens": 2412,
+            "cached": 53248,
+            "input": 55061,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 35814,
+            "output_tokens": 4268,
+            "cached": 54528,
+            "input": 55388,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 30716,
+            "output_tokens": 167,
+            "cached": 55296,
+            "input": 56082,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24392,
+            "output_tokens": 164,
+            "cached": 55808,
+            "input": 56464,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 135548,
+            "output_tokens": 1411,
+            "cached": 55296,
+            "input": 56713,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 23665,
+            "output_tokens": 2742,
+            "cached": 56576,
+            "input": 56941,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 143173,
+            "output_tokens": 950,
+            "cached": 59392,
+            "input": 59829,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 115265,
+            "output_tokens": 3330,
+            "cached": 59904,
+            "input": 60092,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44175,
+            "output_tokens": 88,
+            "cached": 61440,
+            "input": 62376,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 43701,
+            "output_tokens": 47,
+            "cached": 63488,
+            "input": 64511,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        [
+          {
+            "latency_ms": 35769,
+            "output_tokens": 1277,
+            "cached": 27904,
+            "input": 32172,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 32769,
+            "output_tokens": 2267,
+            "cached": 32000,
+            "input": 34125,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 148135,
+            "output_tokens": 50,
+            "cached": 35072,
+            "input": 35151,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 67672,
+            "output_tokens": 7155,
+            "cached": 35072,
+            "input": 35842,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66170,
+            "output_tokens": 7493,
+            "cached": 34816,
+            "input": 38652,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42500,
+            "output_tokens": 4700,
+            "cached": 36864,
+            "input": 39488,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 63084,
+            "output_tokens": 7099,
+            "cached": 38912,
+            "input": 42101,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 47654,
+            "output_tokens": 5335,
+            "cached": 40960,
+            "input": 42890,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 55124,
+            "output_tokens": 6356,
+            "cached": 40960,
+            "input": 44834,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 106463,
+            "output_tokens": 4009,
+            "cached": 43008,
+            "input": 45751,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 64880,
+            "output_tokens": 7510,
+            "cached": 46336,
+            "input": 49125,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 73254,
+            "output_tokens": 8513,
+            "cached": 47104,
+            "input": 50521,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 38317,
+            "output_tokens": 4122,
+            "cached": 49152,
+            "input": 51558,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 60008,
+            "output_tokens": 7377,
+            "cached": 51968,
+            "input": 52390,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 56022,
+            "output_tokens": 6367,
+            "cached": 51200,
+            "input": 52900,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 28036,
+            "output_tokens": 122,
+            "cached": 53248,
+            "input": 54540,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 131863,
+            "output_tokens": 779,
+            "cached": 57344,
+            "input": 57847,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 127772,
+            "output_tokens": 228,
+            "cached": 57344,
+            "input": 58287,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 34601,
+            "output_tokens": 3720,
+            "cached": 58624,
+            "input": 59079,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24738,
+            "output_tokens": 2723,
+            "cached": 57344,
+            "input": 59275,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24687,
+            "output_tokens": 2321,
+            "cached": 57344,
+            "input": 59452,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ]
+      ],
+      "ttfb_ms": [
+        {
+          "median": 4534,
+          "n": 57
+        },
+        {
+          "median": 4753,
+          "n": 52
+        }
+      ],
+      "harness_share": [
+        0.0005,
+        0.0236
+      ]
+    },
+    {
+      "case": "yq-doc-count",
+      "arm": "codeleveler-effort-max",
+      "reps": 2,
+      "status": [
+        "PASS",
+        "PASS"
+      ],
+      "wall_s": [
+        1153.9,
+        1300.1
+      ],
+      "wall_median_s": 1227.0,
+      "rounds": [
+        46,
+        60
+      ],
+      "input_tokens": [
+        2321074,
+        2873469
+      ],
+      "output_tokens": [
+        67378,
+        85722
+      ],
+      "round_latencies_ms": [
+        [
+          4163,
+          4485,
+          4512,
+          6107,
+          85285,
+          4165,
+          4408,
+          44338,
+          4808,
+          33734,
+          56852,
+          62136,
+          53183,
+          102972,
+          28524,
+          83920,
+          8816,
+          42228,
+          69390,
+          13783,
+          5615,
+          42492,
+          10786,
+          4863,
+          23588,
+          33584,
+          6519,
+          4498,
+          4858,
+          3885,
+          5134,
+          4199,
+          4996,
+          6163,
+          44876,
+          29515,
+          11059,
+          21763,
+          70978,
+          4740,
+          5078,
+          4934,
+          4873,
+          4915,
+          7835,
+          5139
+        ],
+        [
+          5531,
+          5635,
+          4635,
+          4831,
+          8659,
+          21400,
+          37891,
+          22589,
+          4723,
+          38237,
+          66209,
+          51837,
+          45157,
+          50566,
+          85165,
+          4771,
+          89667,
+          85688,
+          4743,
+          4742,
+          27641,
+          12000,
+          5301,
+          13242,
+          5528,
+          27059,
+          126542,
+          3996,
+          6306,
+          12082,
+          13279,
+          3620,
+          8075,
+          15332,
+          22236,
+          8198,
+          3649,
+          5798,
+          5292,
+          4638,
+          4559,
+          65695,
+          7428,
+          4900,
+          13714,
+          16605,
+          4308,
+          5029,
+          4174,
+          5077,
+          7497,
+          9808,
+          4549,
+          5407,
+          4244,
+          4537,
+          5411,
+          5757,
+          8167,
+          5309
+        ]
+      ],
+      "slow_rounds_over_20s": [
+        [
+          {
+            "latency_ms": 85285,
+            "output_tokens": 2622,
+            "cached": 30720,
+            "input": 32367,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44338,
+            "output_tokens": 5087,
+            "cached": 35584,
+            "input": 37043,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 33734,
+            "output_tokens": 3568,
+            "cached": 36864,
+            "input": 41960,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 56852,
+            "output_tokens": 6070,
+            "cached": 41728,
+            "input": 43953,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 62136,
+            "output_tokens": 55,
+            "cached": 43008,
+            "input": 44490,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53183,
+            "output_tokens": 5856,
+            "cached": 43008,
+            "input": 45338,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 102972,
+            "output_tokens": 9195,
+            "cached": 45056,
+            "input": 45838,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 28524,
+            "output_tokens": 144,
+            "cached": 45056,
+            "input": 46268,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 83920,
+            "output_tokens": 7659,
+            "cached": 45056,
+            "input": 46490,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42228,
+            "output_tokens": 4788,
+            "cached": 45056,
+            "input": 47323,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 69390,
+            "output_tokens": 499,
+            "cached": 47104,
+            "input": 47906,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42492,
+            "output_tokens": 5130,
+            "cached": 47104,
+            "input": 52868,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 23588,
+            "output_tokens": 2656,
+            "cached": 53504,
+            "input": 56382,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 33584,
+            "output_tokens": 4083,
+            "cached": 56064,
+            "input": 57134,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44876,
+            "output_tokens": 2078,
+            "cached": 57344,
+            "input": 60600,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 29515,
+            "output_tokens": 153,
+            "cached": 59392,
+            "input": 61035,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 21763,
+            "output_tokens": 79,
+            "cached": 60928,
+            "input": 61507,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 70978,
+            "output_tokens": 595,
+            "cached": 61440,
+            "input": 62430,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        [
+          {
+            "latency_ms": 21400,
+            "output_tokens": 1355,
+            "cached": 30720,
+            "input": 32930,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 37891,
+            "output_tokens": 2874,
+            "cached": 32768,
+            "input": 34407,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22589,
+            "output_tokens": 2213,
+            "cached": 34304,
+            "input": 36538,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 38237,
+            "output_tokens": 4162,
+            "cached": 37120,
+            "input": 38184,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66209,
+            "output_tokens": 7549,
+            "cached": 36864,
+            "input": 38825,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 51837,
+            "output_tokens": 5718,
+            "cached": 36864,
+            "input": 40857,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 45157,
+            "output_tokens": 5043,
+            "cached": 38912,
+            "input": 41679,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 50566,
+            "output_tokens": 5234,
+            "cached": 40960,
+            "input": 42111,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 85165,
+            "output_tokens": 8370,
+            "cached": 40960,
+            "input": 43319,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 89667,
+            "output_tokens": 10449,
+            "cached": 43264,
+            "input": 43702,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 85688,
+            "output_tokens": 10015,
+            "cached": 43008,
+            "input": 43897,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 27641,
+            "output_tokens": 3114,
+            "cached": 44032,
+            "input": 44511,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 27059,
+            "output_tokens": 2779,
+            "cached": 45056,
+            "input": 46229,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 126542,
+            "output_tokens": 81,
+            "cached": 45056,
+            "input": 46548,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22236,
+            "output_tokens": 1809,
+            "cached": 48640,
+            "input": 48868,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 65695,
+            "output_tokens": 74,
+            "cached": 53248,
+            "input": 54486,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ]
+      ],
+      "ttfb_ms": [
+        {
+          "median": 4527,
+          "n": 46
+        },
+        {
+          "median": 4394,
+          "n": 60
+        }
+      ],
+      "harness_share": [
+        0.001,
+        0.0009
+      ]
+    }
+  ],
+  "note": "AtomCode's reasoning effort is not settable from its headless invocation, so parity is achieved by sweeping the side that is: CodeLeveler at its product default (max) against CodeLeveler at high, with AtomCode held fixed in the same interleaved window."
+}

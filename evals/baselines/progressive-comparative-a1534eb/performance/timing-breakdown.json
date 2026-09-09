@@ -1,0 +1,2342 @@
+{
+  "note": "TOTAL_WALL is the harness-measured process wall clock. MODEL_WAIT is the sum of model_requests.latency_ms, which spans a round including any retry. TOOL_EXECUTION is tool_call_started -> tool_call_finished from the event log, and verification runs as a tool call, so it is inside that figure. HARNESS_OVERHEAD is the residual.",
+  "runs": [
+    {
+      "stage": "stage1",
+      "case": "rust-first-even",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 67.6,
+      "event_log_span_s": 67.5,
+      "model_wait_s": 65.7,
+      "tool_execution_s": 1.5,
+      "verification_ms": 326,
+      "harness_overhead_s": 0.4,
+      "share": {
+        "model_wait": 0.9721,
+        "tool_execution": 0.0219,
+        "harness_overhead": 0.0059
+      },
+      "model": {
+        "requests": 5,
+        "median_ms": 4794,
+        "p95_ms": 37464,
+        "max_ms": 37464,
+        "retries": 0,
+        "input_tokens": 88420,
+        "cached_input_tokens": 71936,
+        "output_tokens": 599,
+        "latencies_ms": [
+          37464,
+          14621,
+          4794,
+          4214,
+          4624
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 37464,
+            "output_tokens": 146,
+            "cached": 4096,
+            "input": 17174,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 7,
+        "total_ms": 1481,
+        "median_ms": 9,
+        "max_ms": 1438,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 9
+          },
+          "grep": {
+            "calls": 1,
+            "total_ms": 16
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 17
+          },
+          "read_file": {
+            "calls": 2,
+            "total_ms": 1
+          },
+          "run_command": {
+            "calls": 1,
+            "total_ms": 1438
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 13.51,
+        "s_per_model_request": 13.14,
+        "tool_calls_per_round": 1.4,
+        "input_tokens_per_round": 17684,
+        "cache_hit_rate": 0.8136
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": []
+      }
+    },
+    {
+      "stage": "stage2",
+      "case": "mf1-refund-propagation",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 66.2,
+      "event_log_span_s": 66.2,
+      "model_wait_s": 61.7,
+      "tool_execution_s": 3.9,
+      "verification_ms": 560,
+      "harness_overhead_s": 0.6,
+      "share": {
+        "model_wait": 0.9325,
+        "tool_execution": 0.0588,
+        "harness_overhead": 0.0087
+      },
+      "model": {
+        "requests": 8,
+        "median_ms": 4333,
+        "p95_ms": 32416,
+        "max_ms": 32416,
+        "retries": 0,
+        "input_tokens": 159296,
+        "cached_input_tokens": 138752,
+        "output_tokens": 5545,
+        "latencies_ms": [
+          5002,
+          4045,
+          32416,
+          4409,
+          2956,
+          3848,
+          4796,
+          4257
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 32416,
+            "output_tokens": 4664,
+            "cached": 17152,
+            "input": 18989,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 13,
+        "total_ms": 3895,
+        "median_ms": 7,
+        "max_ms": 3087,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 2,
+            "total_ms": 53
+          },
+          "git_status": {
+            "calls": 1,
+            "total_ms": 23
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 25
+          },
+          "read_file": {
+            "calls": 6,
+            "total_ms": 15
+          },
+          "run_command": {
+            "calls": 2,
+            "total_ms": 3779
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 8.27,
+        "s_per_model_request": 7.72,
+        "tool_calls_per_round": 1.62,
+        "input_tokens_per_round": 19912,
+        "cache_hit_rate": 0.871
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage2",
+      "case": "n3-caller-propagation",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 149.0,
+      "event_log_span_s": 148.9,
+      "model_wait_s": 143.5,
+      "tool_execution_s": 5.5,
+      "verification_ms": 197,
+      "harness_overhead_s": -0.1,
+      "share": {
+        "model_wait": 0.9633,
+        "tool_execution": 0.0371,
+        "harness_overhead": -0.0005
+      },
+      "model": {
+        "requests": 15,
+        "median_ms": 4740,
+        "p95_ms": 11805,
+        "max_ms": 65978,
+        "retries": 0,
+        "input_tokens": 459158,
+        "cached_input_tokens": 423936,
+        "output_tokens": 3782,
+        "latencies_ms": [
+          4740,
+          3666,
+          3799,
+          4931,
+          5099,
+          8685,
+          3546,
+          4372,
+          11805,
+          4122,
+          8498,
+          4496,
+          6244,
+          65978,
+          3554
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 65978,
+            "output_tokens": 123,
+            "cached": 34816,
+            "input": 36061,
+            "finish": "stop",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 25,
+        "total_ms": 5535,
+        "median_ms": 12,
+        "max_ms": 2661,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 15
+          },
+          "git_diff": {
+            "calls": 1,
+            "total_ms": 15
+          },
+          "grep": {
+            "calls": 4,
+            "total_ms": 67
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 368
+          },
+          "read_file": {
+            "calls": 14,
+            "total_ms": 139
+          },
+          "run_command": {
+            "calls": 2,
+            "total_ms": 4568
+          },
+          "shell_command": {
+            "calls": 1,
+            "total_ms": 363
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 9.93,
+        "s_per_model_request": 9.57,
+        "tool_calls_per_round": 1.67,
+        "input_tokens_per_round": 30611,
+        "cache_hit_rate": 0.9233
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage3",
+      "case": "icg-5-long-task",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 399.5,
+      "event_log_span_s": 399.4,
+      "model_wait_s": 392.5,
+      "tool_execution_s": 6.6,
+      "verification_ms": 556,
+      "harness_overhead_s": 0.5,
+      "share": {
+        "model_wait": 0.9824,
+        "tool_execution": 0.0165,
+        "harness_overhead": 0.0012
+      },
+      "model": {
+        "requests": 23,
+        "median_ms": 4849,
+        "p95_ms": 65313,
+        "max_ms": 65937,
+        "retries": 0,
+        "input_tokens": 782277,
+        "cached_input_tokens": 737536,
+        "output_tokens": 21491,
+        "latencies_ms": [
+          29587,
+          65313,
+          4020,
+          8778,
+          4849,
+          35969,
+          47779,
+          34686,
+          37512,
+          5705,
+          65937,
+          4771,
+          4077,
+          4171,
+          6413,
+          5224,
+          3752,
+          3391,
+          4314,
+          4406,
+          3458,
+          4134,
+          4210
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 29587,
+            "output_tokens": 114,
+            "cached": 4096,
+            "input": 17427,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 65313,
+            "output_tokens": 178,
+            "cached": 16384,
+            "input": 17823,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 35969,
+            "output_tokens": 4020,
+            "cached": 32256,
+            "input": 33347,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 47779,
+            "output_tokens": 5337,
+            "cached": 32768,
+            "input": 34270,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 34686,
+            "output_tokens": 4070,
+            "cached": 32768,
+            "input": 34790,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 37512,
+            "output_tokens": 4917,
+            "cached": 34560,
+            "input": 35150,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 65937,
+            "output_tokens": 245,
+            "cached": 34816,
+            "input": 36294,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 36,
+        "total_ms": 6583,
+        "median_ms": 8,
+        "max_ms": 2362,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 4,
+            "total_ms": 35
+          },
+          "grep": {
+            "calls": 2,
+            "total_ms": 41
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 183
+          },
+          "read_file": {
+            "calls": 17,
+            "total_ms": 75
+          },
+          "run_command": {
+            "calls": 3,
+            "total_ms": 4633
+          },
+          "shell_command": {
+            "calls": 8,
+            "total_ms": 1616
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 17.37,
+        "s_per_model_request": 17.06,
+        "tool_calls_per_round": 1.57,
+        "input_tokens_per_round": 34012,
+        "cache_hit_rate": 0.9428
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": []
+      }
+    },
+    {
+      "stage": "stage3",
+      "case": "scale-s800",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 265.8,
+      "event_log_span_s": 265.7,
+      "model_wait_s": 224.4,
+      "tool_execution_s": 40.3,
+      "verification_ms": 1036,
+      "harness_overhead_s": 1.1,
+      "share": {
+        "model_wait": 0.8443,
+        "tool_execution": 0.1515,
+        "harness_overhead": 0.0042
+      },
+      "model": {
+        "requests": 19,
+        "median_ms": 5693,
+        "p95_ms": 34503,
+        "max_ms": 65232,
+        "retries": 0,
+        "input_tokens": 605368,
+        "cached_input_tokens": 564480,
+        "output_tokens": 5874,
+        "latencies_ms": [
+          34503,
+          25157,
+          7915,
+          3939,
+          4071,
+          16279,
+          11245,
+          4480,
+          6928,
+          5693,
+          4270,
+          4634,
+          6066,
+          65232,
+          4467,
+          3908,
+          4124,
+          6892,
+          4624
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 34503,
+            "output_tokens": 70,
+            "cached": 4096,
+            "input": 17329,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 25157,
+            "output_tokens": 186,
+            "cached": 17152,
+            "input": 25583,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 65232,
+            "output_tokens": 77,
+            "cached": 34816,
+            "input": 35718,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 26,
+        "total_ms": 40269,
+        "median_ms": 5,
+        "max_ms": 37310,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 4,
+            "total_ms": 42
+          },
+          "git_diff": {
+            "calls": 1,
+            "total_ms": 22
+          },
+          "git_status": {
+            "calls": 1,
+            "total_ms": 36
+          },
+          "grep": {
+            "calls": 1,
+            "total_ms": 44
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 37
+          },
+          "read_file": {
+            "calls": 12,
+            "total_ms": 52
+          },
+          "run_command": {
+            "calls": 5,
+            "total_ms": 40036
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 13.99,
+        "s_per_model_request": 11.81,
+        "tool_calls_per_round": 1.37,
+        "input_tokens_per_round": 31861,
+        "cache_hit_rate": 0.9325
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage4",
+      "case": "icg-6r-honest-failure",
+      "rep": "last",
+      "censored_by_timeout": false,
+      "total_wall_s": 642.9,
+      "event_log_span_s": 642.8,
+      "model_wait_s": 638.7,
+      "tool_execution_s": 4.4,
+      "verification_ms": 0,
+      "harness_overhead_s": -0.2,
+      "share": {
+        "model_wait": 0.9935,
+        "tool_execution": 0.0068,
+        "harness_overhead": -0.0003
+      },
+      "model": {
+        "requests": 43,
+        "median_ms": 4836,
+        "p95_ms": 61570,
+        "max_ms": 126266,
+        "retries": 0,
+        "input_tokens": 1801686,
+        "cached_input_tokens": 1749248,
+        "output_tokens": 33923,
+        "latencies_ms": [
+          5551,
+          4490,
+          7766,
+          24101,
+          76304,
+          61570,
+          19759,
+          49534,
+          28162,
+          5519,
+          5100,
+          5352,
+          4270,
+          4501,
+          6373,
+          4146,
+          9927,
+          4766,
+          4525,
+          4311,
+          3606,
+          3909,
+          8952,
+          4476,
+          19917,
+          126266,
+          4748,
+          4503,
+          4426,
+          5756,
+          3417,
+          4556,
+          4416,
+          4836,
+          4508,
+          4392,
+          4623,
+          4549,
+          5530,
+          3728,
+          49365,
+          16924,
+          5307
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 24101,
+            "output_tokens": 2727,
+            "cached": 18432,
+            "input": 19700,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 76304,
+            "output_tokens": 1720,
+            "cached": 18432,
+            "input": 31603,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 61570,
+            "output_tokens": 7054,
+            "cached": 31488,
+            "input": 32476,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 49534,
+            "output_tokens": 4913,
+            "cached": 33024,
+            "input": 36596,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 28162,
+            "output_tokens": 2953,
+            "cached": 34816,
+            "input": 37244,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 126266,
+            "output_tokens": 77,
+            "cached": 45056,
+            "input": 45803,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 49365,
+            "output_tokens": 5352,
+            "cached": 53760,
+            "input": 54537,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": "UNAVAILABLE"
+      },
+      "tools": {
+        "calls": 57,
+        "total_ms": 4378,
+        "median_ms": 92,
+        "max_ms": 182,
+        "by_tool": {
+          "grep": {
+            "calls": 1,
+            "total_ms": 31
+          },
+          "list_files": {
+            "calls": 2,
+            "total_ms": 190
+          },
+          "read_file": {
+            "calls": 17,
+            "total_ms": 331
+          },
+          "shell_command": {
+            "calls": 36,
+            "total_ms": 3826
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 14.95,
+        "s_per_model_request": 14.85,
+        "tool_calls_per_round": 1.33,
+        "input_tokens_per_round": 41900,
+        "cache_hit_rate": 0.9709
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": []
+      }
+    },
+    {
+      "stage": "stage5-cl-high",
+      "case": "n3-caller-propagation",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 56.5,
+      "event_log_span_s": 56.5,
+      "model_wait_s": 52.4,
+      "tool_execution_s": 3.9,
+      "verification_ms": 160,
+      "harness_overhead_s": 0.2,
+      "share": {
+        "model_wait": 0.9274,
+        "tool_execution": 0.0696,
+        "harness_overhead": 0.003
+      },
+      "model": {
+        "requests": 10,
+        "median_ms": 4633,
+        "p95_ms": 9800,
+        "max_ms": 9800,
+        "retries": 0,
+        "input_tokens": 293936,
+        "cached_input_tokens": 261632,
+        "output_tokens": 2770,
+        "latencies_ms": [
+          3900,
+          3891,
+          6432,
+          4549,
+          4717,
+          5950,
+          9800,
+          4206,
+          5883,
+          3069
+        ],
+        "slow_requests_over_20s": [],
+        "ttfb_ms": {
+          "median": 3610,
+          "n": 10
+        }
+      },
+      "tools": {
+        "calls": 18,
+        "total_ms": 3932,
+        "median_ms": 7,
+        "max_ms": 3756,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 20
+          },
+          "git_status": {
+            "calls": 1,
+            "total_ms": 35
+          },
+          "grep": {
+            "calls": 2,
+            "total_ms": 27
+          },
+          "list_files": {
+            "calls": 2,
+            "total_ms": 37
+          },
+          "read_file": {
+            "calls": 10,
+            "total_ms": 57
+          },
+          "shell_command": {
+            "calls": 1,
+            "total_ms": 3756
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 5.65,
+        "s_per_model_request": 5.24,
+        "tool_calls_per_round": 1.8,
+        "input_tokens_per_round": 29394,
+        "cache_hit_rate": 0.8901
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage5-cl-high",
+      "case": "n3-caller-propagation",
+      "rep": "2",
+      "censored_by_timeout": false,
+      "total_wall_s": 53.9,
+      "event_log_span_s": 53.9,
+      "model_wait_s": 49.8,
+      "tool_execution_s": 4.1,
+      "verification_ms": 148,
+      "harness_overhead_s": 0.1,
+      "share": {
+        "model_wait": 0.9235,
+        "tool_execution": 0.0755,
+        "harness_overhead": 0.001
+      },
+      "model": {
+        "requests": 9,
+        "median_ms": 5370,
+        "p95_ms": 8010,
+        "max_ms": 8010,
+        "retries": 0,
+        "input_tokens": 256560,
+        "cached_input_tokens": 223744,
+        "output_tokens": 2244,
+        "latencies_ms": [
+          4933,
+          3648,
+          5370,
+          7126,
+          5658,
+          8010,
+          4015,
+          6917,
+          4099
+        ],
+        "slow_requests_over_20s": [],
+        "ttfb_ms": {
+          "median": 3918,
+          "n": 9
+        }
+      },
+      "tools": {
+        "calls": 14,
+        "total_ms": 4072,
+        "median_ms": 10,
+        "max_ms": 3645,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 19
+          },
+          "grep": {
+            "calls": 1,
+            "total_ms": 18
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 177
+          },
+          "read_file": {
+            "calls": 8,
+            "total_ms": 37
+          },
+          "shell_command": {
+            "calls": 2,
+            "total_ms": 3821
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 5.98,
+        "s_per_model_request": 5.53,
+        "tool_calls_per_round": 1.56,
+        "input_tokens_per_round": 28507,
+        "cache_hit_rate": 0.8721
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage5-cl-high",
+      "case": "yq-doc-count",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 1759.5,
+      "event_log_span_s": 1759.5,
+      "model_wait_s": 1626.4,
+      "tool_execution_s": 132.2,
+      "verification_ms": 932,
+      "harness_overhead_s": 0.8,
+      "share": {
+        "model_wait": 0.9244,
+        "tool_execution": 0.0752,
+        "harness_overhead": 0.0005
+      },
+      "model": {
+        "requests": 57,
+        "median_ms": 8380,
+        "p95_ms": 115265,
+        "max_ms": 245568,
+        "retries": 0,
+        "input_tokens": 2970855,
+        "cached_input_tokens": 2878976,
+        "output_tokens": 70403,
+        "latencies_ms": [
+          4390,
+          4349,
+          4816,
+          3362,
+          8380,
+          8741,
+          3864,
+          28793,
+          4386,
+          53138,
+          10000,
+          29306,
+          245568,
+          96760,
+          4017,
+          53433,
+          50373,
+          77614,
+          12375,
+          22537,
+          51217,
+          66727,
+          5952,
+          5113,
+          5412,
+          22717,
+          35814,
+          17187,
+          30716,
+          10865,
+          24392,
+          135548,
+          23665,
+          14314,
+          4680,
+          5353,
+          5821,
+          143173,
+          115265,
+          5446,
+          6432,
+          4478,
+          4580,
+          4378,
+          4476,
+          5044,
+          44175,
+          6127,
+          5102,
+          43701,
+          5494,
+          3896,
+          9023,
+          5324,
+          5823,
+          6999,
+          5805
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 28793,
+            "output_tokens": 3240,
+            "cached": 33280,
+            "input": 34238,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53138,
+            "output_tokens": 6581,
+            "cached": 35072,
+            "input": 37376,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 29306,
+            "output_tokens": 2184,
+            "cached": 37632,
+            "input": 40471,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 245568,
+            "output_tokens": 5125,
+            "cached": 41472,
+            "input": 41721,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 96760,
+            "output_tokens": 4197,
+            "cached": 40960,
+            "input": 43661,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53433,
+            "output_tokens": 5308,
+            "cached": 47360,
+            "input": 48246,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 50373,
+            "output_tokens": 3915,
+            "cached": 47104,
+            "input": 49938,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 77614,
+            "output_tokens": 88,
+            "cached": 49152,
+            "input": 51500,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22537,
+            "output_tokens": 169,
+            "cached": 51200,
+            "input": 51842,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 51217,
+            "output_tokens": 6402,
+            "cached": 51456,
+            "input": 52858,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66727,
+            "output_tokens": 8556,
+            "cached": 52736,
+            "input": 54100,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22717,
+            "output_tokens": 2412,
+            "cached": 53248,
+            "input": 55061,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 35814,
+            "output_tokens": 4268,
+            "cached": 54528,
+            "input": 55388,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 30716,
+            "output_tokens": 167,
+            "cached": 55296,
+            "input": 56082,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24392,
+            "output_tokens": 164,
+            "cached": 55808,
+            "input": 56464,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 135548,
+            "output_tokens": 1411,
+            "cached": 55296,
+            "input": 56713,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 23665,
+            "output_tokens": 2742,
+            "cached": 56576,
+            "input": 56941,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 143173,
+            "output_tokens": 950,
+            "cached": 59392,
+            "input": 59829,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 115265,
+            "output_tokens": 3330,
+            "cached": 59904,
+            "input": 60092,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44175,
+            "output_tokens": 88,
+            "cached": 61440,
+            "input": 62376,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 43701,
+            "output_tokens": 47,
+            "cached": 63488,
+            "input": 64511,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": {
+          "median": 4534,
+          "n": 57
+        }
+      },
+      "tools": {
+        "calls": 77,
+        "total_ms": 132231,
+        "median_ms": 11,
+        "max_ms": 34124,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 13,
+            "total_ms": 158
+          },
+          "git_diff": {
+            "calls": 2,
+            "total_ms": 37
+          },
+          "git_status": {
+            "calls": 2,
+            "total_ms": 54
+          },
+          "grep": {
+            "calls": 7,
+            "total_ms": 194
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 33
+          },
+          "read_file": {
+            "calls": 32,
+            "total_ms": 257
+          },
+          "run_command": {
+            "calls": 6,
+            "total_ms": 6561
+          },
+          "shell_command": {
+            "calls": 11,
+            "total_ms": 124925
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          },
+          "update_plan": {
+            "calls": 2,
+            "total_ms": 12
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 30.87,
+        "s_per_model_request": 28.53,
+        "tool_calls_per_round": 1.35,
+        "input_tokens_per_round": 52120,
+        "cache_hit_rate": 0.9691
+      },
+      "plan": {
+        "updates": 2,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage5-cl-high",
+      "case": "yq-doc-count",
+      "rep": "2",
+      "censored_by_timeout": true,
+      "total_wall_s": 1800.1,
+      "event_log_span_s": 1760.6,
+      "model_wait_s": 1529.2,
+      "tool_execution_s": 189.9,
+      "verification_ms": 0,
+      "harness_overhead_s": 81.0,
+      "share": {
+        "model_wait": 0.8495,
+        "tool_execution": 0.1055,
+        "harness_overhead": 0.045
+      },
+      "model": {
+        "requests": 51,
+        "median_ms": 8788,
+        "p95_ms": 127772,
+        "max_ms": 148135,
+        "retries": 0,
+        "input_tokens": 2559323,
+        "cached_input_tokens": 2465024,
+        "output_tokens": 97729,
+        "latencies_ms": [
+          3591,
+          3618,
+          5564,
+          4873,
+          35769,
+          32769,
+          148135,
+          67672,
+          66170,
+          42500,
+          63084,
+          47654,
+          55124,
+          106463,
+          6008,
+          4156,
+          64880,
+          73254,
+          38317,
+          5754,
+          60008,
+          56022,
+          10724,
+          6424,
+          7299,
+          28036,
+          17723,
+          6357,
+          5603,
+          3440,
+          4148,
+          5483,
+          5853,
+          5408,
+          5886,
+          4381,
+          131863,
+          4963,
+          127772,
+          4746,
+          5163,
+          8788,
+          34601,
+          24738,
+          24687,
+          10586,
+          19532,
+          5321,
+          8181,
+          4768,
+          5389
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 35769,
+            "output_tokens": 1277,
+            "cached": 27904,
+            "input": 32172,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 32769,
+            "output_tokens": 2267,
+            "cached": 32000,
+            "input": 34125,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 148135,
+            "output_tokens": 50,
+            "cached": 35072,
+            "input": 35151,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 67672,
+            "output_tokens": 7155,
+            "cached": 35072,
+            "input": 35842,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66170,
+            "output_tokens": 7493,
+            "cached": 34816,
+            "input": 38652,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42500,
+            "output_tokens": 4700,
+            "cached": 36864,
+            "input": 39488,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 63084,
+            "output_tokens": 7099,
+            "cached": 38912,
+            "input": 42101,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 47654,
+            "output_tokens": 5335,
+            "cached": 40960,
+            "input": 42890,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 55124,
+            "output_tokens": 6356,
+            "cached": 40960,
+            "input": 44834,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 106463,
+            "output_tokens": 4009,
+            "cached": 43008,
+            "input": 45751,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 64880,
+            "output_tokens": 7510,
+            "cached": 46336,
+            "input": 49125,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 73254,
+            "output_tokens": 8513,
+            "cached": 47104,
+            "input": 50521,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 38317,
+            "output_tokens": 4122,
+            "cached": 49152,
+            "input": 51558,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 60008,
+            "output_tokens": 7377,
+            "cached": 51968,
+            "input": 52390,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 56022,
+            "output_tokens": 6367,
+            "cached": 51200,
+            "input": 52900,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 28036,
+            "output_tokens": 122,
+            "cached": 53248,
+            "input": 54540,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 131863,
+            "output_tokens": 779,
+            "cached": 57344,
+            "input": 57847,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 127772,
+            "output_tokens": 228,
+            "cached": 57344,
+            "input": 58287,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 34601,
+            "output_tokens": 3720,
+            "cached": 58624,
+            "input": 59079,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24738,
+            "output_tokens": 2723,
+            "cached": 57344,
+            "input": 59275,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 24687,
+            "output_tokens": 2321,
+            "cached": 57344,
+            "input": 59452,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": {
+          "median": 4753,
+          "n": 52
+        }
+      },
+      "tools": {
+        "calls": 72,
+        "total_ms": 189881,
+        "median_ms": 14,
+        "max_ms": 101609,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 9,
+            "total_ms": 120
+          },
+          "git_diff": {
+            "calls": 1,
+            "total_ms": 28
+          },
+          "grep": {
+            "calls": 6,
+            "total_ms": 110
+          },
+          "list_files": {
+            "calls": 2,
+            "total_ms": 11
+          },
+          "read_file": {
+            "calls": 29,
+            "total_ms": 176
+          },
+          "run_command": {
+            "calls": 6,
+            "total_ms": 24208
+          },
+          "shell_command": {
+            "calls": 16,
+            "total_ms": 165222
+          },
+          "update_plan": {
+            "calls": 3,
+            "total_ms": 6
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 34.52,
+        "s_per_model_request": 29.99,
+        "tool_calls_per_round": 1.41,
+        "input_tokens_per_round": 50183,
+        "cache_hit_rate": 0.9632
+      },
+      "plan": {
+        "updates": 3,
+        "advisories": []
+      }
+    },
+    {
+      "stage": "stage5-cl-max",
+      "case": "n3-caller-propagation",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 262.4,
+      "event_log_span_s": 262.4,
+      "model_wait_s": 257.9,
+      "tool_execution_s": 4.2,
+      "verification_ms": 162,
+      "harness_overhead_s": 0.2,
+      "share": {
+        "model_wait": 0.983,
+        "tool_execution": 0.0162,
+        "harness_overhead": 0.0008
+      },
+      "model": {
+        "requests": 10,
+        "median_ms": 5505,
+        "p95_ms": 210682,
+        "max_ms": 210682,
+        "retries": 1,
+        "input_tokens": 289469,
+        "cached_input_tokens": 258816,
+        "output_tokens": 2453,
+        "latencies_ms": [
+          4207,
+          3816,
+          5677,
+          5438,
+          6250,
+          8095,
+          3887,
+          5572,
+          4308,
+          210682
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 210682,
+            "output_tokens": 117,
+            "cached": 32768,
+            "input": 32940,
+            "finish": "tool_calls",
+            "retries": 1
+          }
+        ],
+        "ttfb_ms": {
+          "median": 3533,
+          "n": 10
+        }
+      },
+      "tools": {
+        "calls": 16,
+        "total_ms": 4247,
+        "median_ms": 12,
+        "max_ms": 2321,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 17
+          },
+          "git_status": {
+            "calls": 1,
+            "total_ms": 17
+          },
+          "grep": {
+            "calls": 3,
+            "total_ms": 37
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 17
+          },
+          "read_file": {
+            "calls": 7,
+            "total_ms": 58
+          },
+          "run_command": {
+            "calls": 2,
+            "total_ms": 4101
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 26.24,
+        "s_per_model_request": 25.79,
+        "tool_calls_per_round": 1.6,
+        "input_tokens_per_round": 28947,
+        "cache_hit_rate": 0.8941
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage5-cl-max",
+      "case": "n3-caller-propagation",
+      "rep": "2",
+      "censored_by_timeout": false,
+      "total_wall_s": 118.9,
+      "event_log_span_s": 118.8,
+      "model_wait_s": 114.4,
+      "tool_execution_s": 4.3,
+      "verification_ms": 144,
+      "harness_overhead_s": 0.2,
+      "share": {
+        "model_wait": 0.9619,
+        "tool_execution": 0.0364,
+        "harness_overhead": 0.0017
+      },
+      "model": {
+        "requests": 9,
+        "median_ms": 5086,
+        "p95_ms": 70413,
+        "max_ms": 70413,
+        "retries": 0,
+        "input_tokens": 259182,
+        "cached_input_tokens": 225280,
+        "output_tokens": 2897,
+        "latencies_ms": [
+          3972,
+          4056,
+          4620,
+          5498,
+          6765,
+          70413,
+          8918,
+          5086,
+          5039
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 70413,
+            "output_tokens": 795,
+            "cached": 30720,
+            "input": 32344,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": {
+          "median": 3803,
+          "n": 9
+        }
+      },
+      "tools": {
+        "calls": 19,
+        "total_ms": 4326,
+        "median_ms": 4,
+        "max_ms": 2425,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 1,
+            "total_ms": 21
+          },
+          "git_status": {
+            "calls": 1,
+            "total_ms": 27
+          },
+          "grep": {
+            "calls": 2,
+            "total_ms": 29
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 28
+          },
+          "read_file": {
+            "calls": 11,
+            "total_ms": 46
+          },
+          "run_command": {
+            "calls": 2,
+            "total_ms": 4175
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 13.2,
+        "s_per_model_request": 12.71,
+        "tool_calls_per_round": 2.11,
+        "input_tokens_per_round": 28798,
+        "cache_hit_rate": 0.8692
+      },
+      "plan": {
+        "updates": 0,
+        "advisories": []
+      }
+    },
+    {
+      "stage": "stage5-cl-max",
+      "case": "yq-doc-count",
+      "rep": "1",
+      "censored_by_timeout": false,
+      "total_wall_s": 1153.9,
+      "event_log_span_s": 1153.9,
+      "model_wait_s": 1094.7,
+      "tool_execution_s": 58.0,
+      "verification_ms": 1251,
+      "harness_overhead_s": 1.2,
+      "share": {
+        "model_wait": 0.9487,
+        "tool_execution": 0.0503,
+        "harness_overhead": 0.001
+      },
+      "model": {
+        "requests": 46,
+        "median_ms": 7177,
+        "p95_ms": 83920,
+        "max_ms": 102972,
+        "retries": 0,
+        "input_tokens": 2321074,
+        "cached_input_tokens": 2232832,
+        "output_tokens": 67378,
+        "latencies_ms": [
+          4163,
+          4485,
+          4512,
+          6107,
+          85285,
+          4165,
+          4408,
+          44338,
+          4808,
+          33734,
+          56852,
+          62136,
+          53183,
+          102972,
+          28524,
+          83920,
+          8816,
+          42228,
+          69390,
+          13783,
+          5615,
+          42492,
+          10786,
+          4863,
+          23588,
+          33584,
+          6519,
+          4498,
+          4858,
+          3885,
+          5134,
+          4199,
+          4996,
+          6163,
+          44876,
+          29515,
+          11059,
+          21763,
+          70978,
+          4740,
+          5078,
+          4934,
+          4873,
+          4915,
+          7835,
+          5139
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 85285,
+            "output_tokens": 2622,
+            "cached": 30720,
+            "input": 32367,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44338,
+            "output_tokens": 5087,
+            "cached": 35584,
+            "input": 37043,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 33734,
+            "output_tokens": 3568,
+            "cached": 36864,
+            "input": 41960,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 56852,
+            "output_tokens": 6070,
+            "cached": 41728,
+            "input": 43953,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 62136,
+            "output_tokens": 55,
+            "cached": 43008,
+            "input": 44490,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 53183,
+            "output_tokens": 5856,
+            "cached": 43008,
+            "input": 45338,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 102972,
+            "output_tokens": 9195,
+            "cached": 45056,
+            "input": 45838,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 28524,
+            "output_tokens": 144,
+            "cached": 45056,
+            "input": 46268,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 83920,
+            "output_tokens": 7659,
+            "cached": 45056,
+            "input": 46490,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42228,
+            "output_tokens": 4788,
+            "cached": 45056,
+            "input": 47323,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 69390,
+            "output_tokens": 499,
+            "cached": 47104,
+            "input": 47906,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 42492,
+            "output_tokens": 5130,
+            "cached": 47104,
+            "input": 52868,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 23588,
+            "output_tokens": 2656,
+            "cached": 53504,
+            "input": 56382,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 33584,
+            "output_tokens": 4083,
+            "cached": 56064,
+            "input": 57134,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 44876,
+            "output_tokens": 2078,
+            "cached": 57344,
+            "input": 60600,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 29515,
+            "output_tokens": 153,
+            "cached": 59392,
+            "input": 61035,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 21763,
+            "output_tokens": 79,
+            "cached": 60928,
+            "input": 61507,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 70978,
+            "output_tokens": 595,
+            "cached": 61440,
+            "input": 62430,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": {
+          "median": 4527,
+          "n": 46
+        }
+      },
+      "tools": {
+        "calls": 71,
+        "total_ms": 58017,
+        "median_ms": 10,
+        "max_ms": 32871,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 10,
+            "total_ms": 100
+          },
+          "git_diff": {
+            "calls": 2,
+            "total_ms": 36
+          },
+          "git_status": {
+            "calls": 2,
+            "total_ms": 49
+          },
+          "grep": {
+            "calls": 7,
+            "total_ms": 206
+          },
+          "list_files": {
+            "calls": 2,
+            "total_ms": 49
+          },
+          "read_file": {
+            "calls": 26,
+            "total_ms": 164
+          },
+          "run_command": {
+            "calls": 5,
+            "total_ms": 7584
+          },
+          "shell_command": {
+            "calls": 12,
+            "total_ms": 49813
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          },
+          "update_plan": {
+            "calls": 4,
+            "total_ms": 16
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 25.08,
+        "s_per_model_request": 23.8,
+        "tool_calls_per_round": 1.54,
+        "input_tokens_per_round": 50458,
+        "cache_hit_rate": 0.962
+      },
+      "plan": {
+        "updates": 4,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    },
+    {
+      "stage": "stage5-cl-max",
+      "case": "yq-doc-count",
+      "rep": "2",
+      "censored_by_timeout": false,
+      "total_wall_s": 1300.1,
+      "event_log_span_s": 1300.1,
+      "model_wait_s": 1164.7,
+      "tool_execution_s": 134.3,
+      "verification_ms": 1184,
+      "harness_overhead_s": 1.1,
+      "share": {
+        "model_wait": 0.8958,
+        "tool_execution": 0.1033,
+        "harness_overhead": 0.0009
+      },
+      "model": {
+        "requests": 60,
+        "median_ms": 6867,
+        "p95_ms": 85165,
+        "max_ms": 126542,
+        "retries": 0,
+        "input_tokens": 2873469,
+        "cached_input_tokens": 2784512,
+        "output_tokens": 85722,
+        "latencies_ms": [
+          5531,
+          5635,
+          4635,
+          4831,
+          8659,
+          21400,
+          37891,
+          22589,
+          4723,
+          38237,
+          66209,
+          51837,
+          45157,
+          50566,
+          85165,
+          4771,
+          89667,
+          85688,
+          4743,
+          4742,
+          27641,
+          12000,
+          5301,
+          13242,
+          5528,
+          27059,
+          126542,
+          3996,
+          6306,
+          12082,
+          13279,
+          3620,
+          8075,
+          15332,
+          22236,
+          8198,
+          3649,
+          5798,
+          5292,
+          4638,
+          4559,
+          65695,
+          7428,
+          4900,
+          13714,
+          16605,
+          4308,
+          5029,
+          4174,
+          5077,
+          7497,
+          9808,
+          4549,
+          5407,
+          4244,
+          4537,
+          5411,
+          5757,
+          8167,
+          5309
+        ],
+        "slow_requests_over_20s": [
+          {
+            "latency_ms": 21400,
+            "output_tokens": 1355,
+            "cached": 30720,
+            "input": 32930,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 37891,
+            "output_tokens": 2874,
+            "cached": 32768,
+            "input": 34407,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22589,
+            "output_tokens": 2213,
+            "cached": 34304,
+            "input": 36538,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 38237,
+            "output_tokens": 4162,
+            "cached": 37120,
+            "input": 38184,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 66209,
+            "output_tokens": 7549,
+            "cached": 36864,
+            "input": 38825,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 51837,
+            "output_tokens": 5718,
+            "cached": 36864,
+            "input": 40857,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 45157,
+            "output_tokens": 5043,
+            "cached": 38912,
+            "input": 41679,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 50566,
+            "output_tokens": 5234,
+            "cached": 40960,
+            "input": 42111,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 85165,
+            "output_tokens": 8370,
+            "cached": 40960,
+            "input": 43319,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 89667,
+            "output_tokens": 10449,
+            "cached": 43264,
+            "input": 43702,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 85688,
+            "output_tokens": 10015,
+            "cached": 43008,
+            "input": 43897,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 27641,
+            "output_tokens": 3114,
+            "cached": 44032,
+            "input": 44511,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 27059,
+            "output_tokens": 2779,
+            "cached": 45056,
+            "input": 46229,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 126542,
+            "output_tokens": 81,
+            "cached": 45056,
+            "input": 46548,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 22236,
+            "output_tokens": 1809,
+            "cached": 48640,
+            "input": 48868,
+            "finish": "tool_calls",
+            "retries": 0
+          },
+          {
+            "latency_ms": 65695,
+            "output_tokens": 74,
+            "cached": 53248,
+            "input": 54486,
+            "finish": "tool_calls",
+            "retries": 0
+          }
+        ],
+        "ttfb_ms": {
+          "median": 4394,
+          "n": 60
+        }
+      },
+      "tools": {
+        "calls": 81,
+        "total_ms": 134306,
+        "median_ms": 10,
+        "max_ms": 34242,
+        "by_tool": {
+          "apply_patch": {
+            "calls": 8,
+            "total_ms": 97
+          },
+          "git_diff": {
+            "calls": 2,
+            "total_ms": 29
+          },
+          "git_status": {
+            "calls": 2,
+            "total_ms": 45
+          },
+          "grep": {
+            "calls": 7,
+            "total_ms": 138
+          },
+          "list_files": {
+            "calls": 1,
+            "total_ms": 26
+          },
+          "read_file": {
+            "calls": 33,
+            "total_ms": 249
+          },
+          "run_command": {
+            "calls": 5,
+            "total_ms": 12407
+          },
+          "shell_command": {
+            "calls": 18,
+            "total_ms": 121300
+          },
+          "update_goal": {
+            "calls": 1,
+            "total_ms": 0
+          },
+          "update_plan": {
+            "calls": 4,
+            "total_ms": 15
+          }
+        }
+      },
+      "derived": {
+        "s_per_round": 21.67,
+        "s_per_model_request": 19.41,
+        "tool_calls_per_round": 1.35,
+        "input_tokens_per_round": 47891,
+        "cache_hit_rate": 0.969
+      },
+      "plan": {
+        "updates": 4,
+        "advisories": [
+          "nudge_goal_unresolved"
+        ]
+      }
+    }
+  ],
+  "aggregate_note": "The aggregate covers only runs that ended on their own. One yq run was killed at its 1800s timeout; its unattributed 81s is the round that was in flight, not runtime overhead.",
+  "aggregate": {
+    "runs": 13,
+    "runs_excluded_as_censored": 1,
+    "total_wall_s": 6296.2,
+    "model_wait_s": 5886.8,
+    "tool_execution_s": 403.2,
+    "harness_overhead_s": 6.2,
+    "share": {
+      "model_wait": 0.935,
+      "tool_execution": 0.064,
+      "harness_overhead": 0.001
+    }
+  }
+}
