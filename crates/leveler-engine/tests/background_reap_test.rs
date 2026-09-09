@@ -173,7 +173,6 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             model: ModelRef::new("mock", "m"),
             commit_co_author: false,
             overrides: None,
-            work_profile: leveler_agent::WorkProfile::Balanced,
             memory_index: String::new(),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,

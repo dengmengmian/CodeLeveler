@@ -1130,7 +1130,6 @@ mod bridge_tests {
             stop_reason,
             stop_detail: None,
             budget_exhaustion: None,
-            metrics: Default::default(),
             progress: Default::default(),
             objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
         }

@@ -5,8 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
-    ChangeImpact, DepthUseMetrics, EvidenceLedger, FindingKind, GateConfig, ObjectiveAnchor,
-    PlanState, ProgressCaps, TurnPhase, check, is_build_relevant,
+    EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, Role, ToolCall, ToolResultContent,
@@ -29,8 +28,8 @@ use super::{
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    collect_scoped_paths_from_call, is_search_tool, is_verification_program, observe_class,
-    push_unique_path, unproven_verification_note,
+    collect_scoped_paths_from_call, is_verification_program, observe_class, push_unique_path,
+    unproven_verification_note,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
@@ -151,8 +150,6 @@ pub(crate) struct Drive<'a> {
     tools: Vec<ToolDefinition>,
     modified_files: Vec<String>,
     scoped_paths: Vec<String>,
-    metrics: DepthUseMetrics,
-    original_task: String,
     progress_caps: ProgressCaps,
     progress: ProgressLedger,
     epoch_rounds_at_start: u32,
@@ -176,7 +173,6 @@ pub(crate) struct Drive<'a> {
     /// Accumulated elevations from approved request_permissions this turn.
     turn_grants: TurnPermissionGrants,
     /// Consecutive search calls with no intervening action.
-    consecutive_searches: usize,
     /// Sources of scoped AGENTS.md rules already appended to the transcript.
     injected_rule_sources: Vec<String>,
     /// The most recent non-empty assistant text.
@@ -329,10 +325,8 @@ impl Executor {
             tools,
             structured_plan_required: self.policy.require_explicit_plan
                 && task_needs_structured_plan(&original_task),
-            original_task,
             modified_files: Vec::new(),
             scoped_paths: Vec::new(),
-            metrics: DepthUseMetrics::default(),
             progress_caps: ProgressCaps::default(),
             epoch_rounds_at_start: progress.cumulative_rounds,
             epoch_tokens_at_start: progress.cumulative_model_tokens,
@@ -358,7 +352,6 @@ impl Executor {
             bg_progress_tx,
             bg_progress_rx,
             turn_grants: TurnPermissionGrants::default(),
-            consecutive_searches: 0,
             injected_rule_sources: Vec::new(),
             last_text: String::new(),
             verification_ran: false,
@@ -458,9 +451,7 @@ impl<'a> Drive<'a> {
     fn flush_epoch(&mut self, rt: &LoopContext) {
         sync_epoch_progress(
             &mut self.progress,
-            &mut self.metrics,
             self.epoch_rounds_at_start,
-            self.epoch_tokens_at_start,
             self.epoch_duration_at_start,
             rt.run_started(),
             rt.round(),
@@ -625,7 +616,6 @@ impl<'a> Drive<'a> {
             self.modified_files.clone(),
             stop,
             Some(detail.to_string()),
-            &self.metrics,
             &self.progress,
             &self.objective,
         ))
@@ -945,7 +935,6 @@ impl AgentHarness for Drive<'_> {
                 round,
                 self.modified_files.clone(),
                 exhaustion,
-                &self.metrics,
                 &self.progress,
                 &self.objective,
             )));
@@ -976,31 +965,21 @@ impl AgentHarness for Drive<'_> {
         }
 
         {
-            // Unified closeout (executor/closeout.rs): a quiet round
-            // produces AT MOST one nudge — chosen by priority
-            // (EmptyAnswer > GoalUnresolved >
-            // AnswerIncomplete) — and every mechanism draws from the same
-            // per-turn budget. Past the budget a goal-mode quiet ends as
-            // `Stalled` — never as a success, so a model that never learns
-            // to call update_goal terminates without the harness declaring
-            // completion on its behalf; a non-goal turn ends `Answered`.
+            // Unified closeout (executor/closeout.rs): a quiet round buys at
+            // most ONE protocol repair — the goal run did not call
+            // update_goal, or the model produced no text at all. Past that a
+            // goal-mode quiet ends as `Stalled` — never as a success, so a
+            // model that never learns to call update_goal terminates without
+            // the harness declaring completion on its behalf; a non-goal turn
+            // ends `Answered`.
             //
             // No-progress is counted once when this drive ends as Stalled
-            // (below), not on every quiet nudge — so one drive can still
-            // use its nudge budget, while Engine continue is capped across
-            // turns.
-            let impact = ChangeImpact {
-                has_mutation: !self.modified_files.is_empty(),
-                verified_after_last_mutation: self.verification_ran,
-                build_relevant: self.modified_files.is_empty()
-                    || self.modified_files.iter().any(|f| is_build_relevant(f)),
-                modified_files: self.modified_files.clone(),
-            };
+            // (below), not on the repair — so one drive can still use it,
+            // while Engine continue is capped across turns.
             let has_final_text = !self.last_text.trim().is_empty();
             let action = decide(&CloseoutInput {
                 goal_mode: self.executor.policy.goal_mode,
                 has_final_text,
-                impact: &impact,
                 cancelled: cancellation.is_cancelled(),
                 can_continue: has_next_round,
                 budget_remaining: self.closeout_budget.remaining(),
@@ -1014,15 +993,11 @@ impl AgentHarness for Drive<'_> {
                 ?action,
                 goal_mode = self.executor.policy.goal_mode,
                 has_final_text,
-                has_mutation = impact.has_mutation,
-                build_relevant = impact.build_relevant,
-                verified = impact.verified_after_last_mutation,
                 budget_remaining = self.closeout_budget.remaining(),
                 "closeout decided"
             );
             if let CloseoutAction::NudgeOnce(reason) = action {
                 self.closeout_budget.consume();
-                self.metrics.extra_model_calls += 1;
                 // Surface the injection: without this the user sees a
                 // "final" answer and then an unexplained extra model round.
                 (self.observer)(AgentEvent::AdvisoryStarted {
@@ -1030,7 +1005,7 @@ impl AgentHarness for Drive<'_> {
                 });
                 let nudge = match reason {
                     CloseoutReason::GoalUnresolved => {
-                        Message::text(Role::User, goal_resolve_nudge(&self.original_task))
+                        Message::text(Role::User, goal_resolve_nudge())
                     }
                     CloseoutReason::EmptyAnswer => Message::text(
                         Role::User,
@@ -1108,7 +1083,6 @@ impl AgentHarness for Drive<'_> {
                 self.modified_files.clone(),
                 stop_reason,
                 stop_detail,
-                &self.metrics,
                 &self.progress,
                 &self.objective,
             )));
@@ -1161,22 +1135,6 @@ impl AgentHarness for Drive<'_> {
         let call_snapshot: Vec<ToolCall> = calls.clone();
 
         for (index, call) in calls.into_iter().enumerate() {
-            // Cap consecutive search calls so the model acts on
-            // what they have instead of searching in circles (spec §17).
-            let tool_is_search = is_search_tool(&call.name);
-            if tool_is_search && self.executor.policy.max_search_calls_per_step > 0 {
-                self.consecutive_searches += 1;
-            }
-            if let gates::GateVerdict::Refuse(msg) = gates::search_budget_gate(
-                tool_is_search,
-                self.consecutive_searches,
-                self.executor.policy.max_search_calls_per_step,
-            ) {
-                denied_calls_this_round += 1;
-                results[index] = Some(deny_call(&mut *self.observer, call, msg));
-                continue;
-            }
-
             // A child reports one typed finding: validated at the tool
             // boundary, recorded in ITS ledger (the parent adopts on
             // join), persisted through the same EvidenceLedgerUpdated
@@ -1340,58 +1298,15 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
-                // Mechanical readiness only: the model's own open todos
-                // and the acceptance commands the USER wrote down. What a
-                // child reported is information the model already read.
+                // The model's own plan is a cognitive aid, not a completion
+                // gate: the runtime can see that a step is still `pending`,
+                // but not whether that step is still required to satisfy the
+                // user — which is the model's reading of its own goal.
                 if reason == StopReason::Completed {
-                    let gate = GateConfig {
-                        goal_todo_gate: self.executor.policy.goal_todo_gate,
-                        todo_override_allowed: true,
-                    };
                     self.ledger.plan = self.plan_state.clone();
-                    // Explicit structured flag only — never attempt-count bypass.
-                    let explicit_todo_override = call
-                        .arguments
-                        .get("override_incomplete_todos")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if let Err(fail) = check(&self.plan_state, &gate, explicit_todo_override) {
-                        self.ledger
-                            .record_intercept("update_goal", fail.to_string());
-                        self.ledger.plan = self.plan_state.clone();
-                        (self.observer)(AgentEvent::GoalIntercepted {
-                            kind: "update_goal".into(),
-                            detail: fail.to_string(),
-                        });
-                        (self.observer)(AgentEvent::EvidenceLedgerUpdated {
-                            ledger: self.ledger.clone(),
-                        });
-                        let feedback = format!(
-                            "update_goal(complete) refused: {fail}. Finish the remaining \
-                                 plan steps (or mark them with update_plan) and run any \
-                                 acceptance command the task named, then try again. \
-                                 Incomplete todos require override_incomplete_todos=true \
-                                 (only when override is allowed) — a second bare complete is not enough."
-                        );
-                        (self.observer)(AgentEvent::ToolResult {
-                            id: call.id.as_str().to_string(),
-                            name: UPDATE_GOAL_TOOL.to_string(),
-                            is_error: true,
-                            preview: preview(&feedback),
-                        });
-                        results[index] = Some(ContentPart::ToolResult {
-                            result: ToolResultContent {
-                                call_id: call.id,
-                                content: feedback,
-                                is_error: true,
-                            },
-                        });
-                        continue;
-                    }
                     // HostImplicit single-step completes atomically with the goal.
                     if self.plan_state.is_host_implicit() {
                         self.plan_state.mark_all_completed();
-                        self.metrics.plan_updated += 1;
                         (self.observer)(AgentEvent::PlanUpdated {
                             steps: self.plan_state.steps.clone(),
                         });
@@ -2098,7 +2013,6 @@ impl AgentHarness for Drive<'_> {
                         } else {
                             self.plan_state = next;
                             self.structured_plan_started = true;
-                            self.metrics.plan_updated += 1;
                             (self.observer)(AgentEvent::PlanUpdated {
                                 steps: self.plan_state.steps.clone(),
                             });
@@ -2118,10 +2032,6 @@ impl AgentHarness for Drive<'_> {
                 preview: preview(&content),
             });
 
-            // A concrete action clears the consecutive-search counter.
-            if !is_search_tool(&call.name) {
-                self.consecutive_searches = 0;
-            }
             // A passing verification-class command is completion evidence;
             // an arbitrary command (echo, ls, …) is not. What ran comes
             // from the execution layer's own report, so the SAME
@@ -2192,7 +2102,6 @@ impl AgentHarness for Drive<'_> {
                 );
                 if self.executor.registry.mutates_files(&call.name) && !self.structured_plan_started
                 {
-                    self.metrics.first_write_before_plan = true;
                 }
             }
             for path in &self.modified_files {
@@ -2291,9 +2200,6 @@ impl AgentHarness for Drive<'_> {
                 });
                 if !is_error && let Some(steps) = extract_plan(&metadata) {
                     (self.observer)(AgentEvent::PlanUpdated { steps });
-                }
-                if !is_search_tool(&job.admitted.call.name) {
-                    self.consecutive_searches = 0;
                 }
                 for path in &self.modified_files {
                     push_unique_path(&mut self.scoped_paths, path);
@@ -2881,7 +2787,6 @@ impl AgentHarness for Drive<'_> {
                 self.modified_files.clone(),
                 reason,
                 None,
-                &self.metrics,
                 &self.progress,
                 &self.objective,
             )));
@@ -2898,7 +2803,6 @@ impl AgentHarness for Drive<'_> {
                 round,
                 self.modified_files.clone(),
                 exhaustion,
-                &self.metrics,
                 &self.progress,
                 &self.objective,
             )));
@@ -3086,7 +2990,6 @@ impl AgentHarness for Drive<'_> {
                     self.modified_files.clone(),
                     StopReason::TurnLimitReached,
                     Some("round ceiling reached".to_string()),
-                    &self.metrics,
                     &self.progress,
                     &self.objective,
                 ))
@@ -3115,7 +3018,6 @@ impl AgentHarness for Drive<'_> {
                     rounds,
                     self.modified_files.clone(),
                     exhaustion,
-                    &self.metrics,
                     &self.progress,
                     &self.objective,
                 ))
@@ -3149,7 +3051,6 @@ impl AgentHarness for Drive<'_> {
                     self.modified_files.clone(),
                     StopReason::BudgetExhausted,
                     None,
-                    &self.metrics,
                     &self.progress,
                     &self.objective,
                 ))
@@ -3165,7 +3066,6 @@ impl AgentHarness for Drive<'_> {
                     self.modified_files.clone(),
                     StopReason::Answered,
                     None,
-                    &self.metrics,
                     &self.progress,
                     &self.objective,
                 ))
@@ -3490,9 +3390,7 @@ fn file_budget_refusal(
 #[allow(clippy::too_many_arguments)]
 fn sync_epoch_progress(
     progress: &mut leveler_lifecycle::ProgressLedger,
-    metrics: &mut DepthUseMetrics,
     epoch_rounds_at_start: u32,
-    epoch_tokens_at_start: u64,
     epoch_duration_at_start: std::time::Duration,
     run_started: std::time::Instant,
     round: u32,
@@ -3502,7 +3400,6 @@ fn sync_epoch_progress(
     cost_spent_micros: u64,
     modified_files: &[String],
 ) {
-    metrics.model_tokens = model_tokens_spent.saturating_sub(epoch_tokens_at_start);
     let duration_ms = epoch_duration_at_start
         .saturating_add(run_started.elapsed())
         .as_millis() as u64;

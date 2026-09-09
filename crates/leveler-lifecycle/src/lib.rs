@@ -18,7 +18,7 @@
 //!   the other Coding-phase structures. Refines the runtime lifecycle, never
 //!   redefines it. `runtime` must not reference `workflow`.
 //!
-//! The remaining modules (plan, progress, readiness, ledger, impact, axes,
+//! The remaining modules (plan, progress, ledger, impact, axes,
 //! objective) are Coding/product vocabulary and conceptually sit on
 //! the workflow side; they keep their top-level paths until a consumer needs
 //! the split to be physical.
@@ -54,11 +54,10 @@ mod ledger;
 mod objective;
 mod plan;
 mod progress;
-mod readiness;
 pub mod runtime;
 pub mod workflow;
 
-pub use axes::{CollaborationMode, DepthUseMetrics, WorkProfile};
+pub use axes::{CollaborationMode, WorkProfile};
 pub use checkpoint::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
@@ -69,7 +68,6 @@ pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
-pub use readiness::{GateConfig, ReadinessFailure, check};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
 pub use runtime::{SessionStatus, TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus};

@@ -112,10 +112,6 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "next_step": {
                     "type": "string",
                     "description": "Optional concrete follow-up for the user. Omit this field when no genuine next step remains; never copy or paraphrase the conversation merely to fill it."
-                },
-                "override_incomplete_todos": {
-                    "type": "boolean",
-                    "description": "Set true only when deliberately closing despite incomplete plan todos (override must be allowed). A second bare complete without this flag is still refused."
                 }
             },
             "required": ["status", "summary"]
@@ -841,8 +837,8 @@ mod tests {
         let properties = tool.input_schema["properties"].as_object().unwrap();
         assert!(properties.contains_key("next_step"));
         assert!(
-            properties.contains_key("override_incomplete_todos"),
-            "explicit todo override flag must be advertised"
+            !properties.contains_key("override_incomplete_todos"),
+            "the plan is not a completion gate, so there is nothing to override"
         );
         let required = tool.input_schema["required"].as_array().unwrap();
         assert!(

@@ -91,7 +91,6 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
         )
         .await
         .unwrap();
-    assert_eq!(engine.factory.work_profile, WorkProfile::Economy);
     let n = engine.factory.registry.definitions().len();
     assert_eq!(
         n,
@@ -112,7 +111,6 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
         )
         .await
         .unwrap();
-    assert_eq!(engine_full.factory.work_profile, WorkProfile::Delivery);
     assert_eq!(
         engine_full.factory.registry.definitions().len(),
         full_registry().definitions().len()
@@ -139,21 +137,8 @@ async fn resume_session_rebuilds_engine_with_persisted_delivery_profile() {
     let (wp, _) = resumer.session_product_axes(&id).await.unwrap();
     assert_eq!(wp, WorkProfile::Delivery);
 
-    // And the engine built the same way resume_session does must carry Delivery.
-    let engine = resumer
-        .engine_for_with_profile(
-            &ModelRef::new("mock", "m"),
-            PermissionProfile::Assisted,
-            false,
-            Arc::new(AutoApprove),
-            Arc::new(AutoClarify),
-            wp,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(engine.factory.work_profile, WorkProfile::Delivery);
+    // The profile the session row carries is what resume hands the engine
+    // builder; the effect it has (the tool surface) is pinned above.
 }
 
 #[test]

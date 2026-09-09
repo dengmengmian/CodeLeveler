@@ -63,7 +63,6 @@ pub enum IndependentReviewPolicy {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionOverrides {
     pub explicit_plan: Option<bool>,
-    pub max_search_calls_per_step: Option<usize>,
     pub max_parallel_tools: Option<usize>,
     pub max_files_per_step: Option<usize>,
     pub repeated_read_guard: Option<bool>,
@@ -90,7 +89,6 @@ pub struct ResolvedExecutionPolicy {
     /// held context is compacted — never how much may be read.
     pub context_budget: u32,
     pub max_parallel_tools: usize,
-    pub max_search_calls_per_step: usize,
     pub max_files_per_step: usize,
     pub explicit_plan: bool,
     pub repeated_read_guard: bool,
@@ -150,7 +148,6 @@ pub fn resolve_execution_policy(
         // past it), not a hard cap: the policy chooses to fold there.
         context_budget: profile.limits.reliable_context,
         max_parallel_tools,
-        max_search_calls_per_step: o.max_search_calls_per_step.unwrap_or(0),
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
         // Planning is task-driven, not model-tier-driven. This only shapes the
         // prompt's planning guidance and the one soft plan reminder; nothing
@@ -375,12 +372,12 @@ mod tests {
         // is actually consulted at runtime.
         let complex_task = ExecutionOverrides {
             explicit_plan: Some(false),
-            max_search_calls_per_step: Some(6),
+            max_files_per_step: Some(6),
             ..ExecutionOverrides::default()
         };
         let r =
             resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&complex_task));
         assert!(!r.explicit_plan);
-        assert_eq!(r.max_search_calls_per_step, 6);
+        assert_eq!(r.max_files_per_step, 6);
     }
 }

@@ -63,17 +63,6 @@ impl PlanState {
         matches!(self.origin(), Some(PlanOrigin::ModelExplicit))
     }
 
-    /// True when a ModelExplicit plan still has pending or in_progress work.
-    pub fn has_incomplete_model_todos(&self) -> bool {
-        if !self.is_model_explicit() {
-            return false;
-        }
-        self.steps.iter().any(|s| {
-            let st = s.status.as_str();
-            st == "pending" || st == "in_progress"
-        })
-    }
-
     /// True when every step is `completed` (empty plan is not complete).
     ///
     /// Used by the executor closeout guard: once the model has marked the whole
@@ -206,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_todos_only_for_model_explicit() {
+    fn a_plan_with_open_steps_is_not_fully_completed() {
         let explicit = PlanState::from_model_explicit(vec![PlanStep {
             step: "a".into(),
             status: "pending".into(),
@@ -214,11 +203,9 @@ mod tests {
             origin: PlanOrigin::ModelExplicit,
         }])
         .unwrap();
-        assert!(explicit.has_incomplete_model_todos());
         assert!(!explicit.is_fully_completed());
 
         let implicit = PlanState::host_implicit_single_step("fix it");
-        assert!(!implicit.has_incomplete_model_todos());
         assert!(!implicit.is_fully_completed());
     }
 
@@ -242,7 +229,6 @@ mod tests {
         assert!(!plan.is_fully_completed());
         plan.steps[1].status = "completed".into();
         assert!(plan.is_fully_completed());
-        assert!(!plan.has_incomplete_model_todos());
     }
 
     fn step(name: &str, status: &str) -> PlanStep {

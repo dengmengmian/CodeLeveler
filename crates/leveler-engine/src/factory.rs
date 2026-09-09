@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use leveler_agent::{
     ContinuationPolicy, Executor, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
-    WorkProfile,
 };
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_tools::{ToolContext, ToolRegistry};
@@ -73,8 +72,6 @@ pub struct ExecutorFactory {
     pub model: ModelRef,
     pub commit_co_author: bool,
     pub overrides: Option<ExecutionOverrides>,
-    /// Product work profile (economy/balanced/delivery).
-    pub work_profile: WorkProfile,
     /// Short memory INDEX for system injection (titles only).
     pub memory_index: String,
     /// SEC-1 permission rules (may be empty).
@@ -117,7 +114,6 @@ impl ExecutorFactory {
             let policy =
                 resolve_execution_policy(&model_profile, role, &profile, self.overrides.as_ref());
             SubAgentExecutionPolicy {
-                max_search_calls_per_step: policy.max_search_calls_per_step,
                 max_parallel_tools: policy.max_parallel_tools,
                 require_explicit_plan: policy.explicit_plan,
                 reasoning_effort: policy.reasoning_effort,
@@ -158,10 +154,7 @@ impl ExecutorFactory {
         .with_hook_runner(self.hook_runner.clone())
         .with_steering_opt(self.steering.clone())
         .with_commit_co_author(self.commit_co_author)
-        .with_execution_controls(
-            resolved.max_search_calls_per_step,
-            resolved.max_parallel_tools,
-        )
+        .with_execution_controls(resolved.max_parallel_tools)
         .with_structure(resolved.explicit_plan)
         // The mechanical loop guards share the eval ablation seam with the
         // tools-layer repeated-read guard so a single-knob flip measures the
@@ -173,9 +166,7 @@ impl ExecutorFactory {
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 
-        executor = executor
-            .with_work_profile(self.work_profile)
-            .with_memory_index(self.memory_index.clone());
+        executor = executor.with_memory_index(self.memory_index.clone());
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

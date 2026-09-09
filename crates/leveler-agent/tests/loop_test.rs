@@ -1060,25 +1060,34 @@ async fn dangerous_command_denied_is_fed_back_not_executed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A long, genuinely varied search chain is allowed to run.
+///
+/// In a repository the model has not seen, grep → glob → grep → read → grep is
+/// often exactly the right shape. The runtime cannot establish that the model
+/// "has searched enough" — that is strategy, not safety — so nothing counts
+/// consecutive searches and nothing refuses the next one. What still bounds
+/// the run is the hard round budget and cancellation.
 #[tokio::test]
-async fn consecutive_search_budget_denies_the_excess_and_feeds_it_back() {
+async fn a_long_chain_of_distinct_searches_is_never_refused() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-search-{}",
         std::process::id() as u64 * 13 + 3
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    std::fs::write(dir.join("src/other.rs"), "pub fn other() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model greps three times in a row; with a budget of 2 the third is
-    // denied without ever running the tool.
+    // Five searches in a row, every one with different arguments.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "grep", serde_json::json!({"pattern": "old"})),
         assistant_tool_call("c2", "grep", serde_json::json!({"pattern": "fn"})),
         assistant_tool_call("c3", "grep", serde_json::json!({"pattern": "pub"})),
+        assistant_tool_call("c4", "grep", serde_json::json!({"pattern": "other"})),
+        assistant_tool_call("c5", "grep", serde_json::json!({"pattern": "lib"})),
         assistant_text("done"),
     ]));
 
@@ -1088,8 +1097,7 @@ async fn consecutive_search_budget_denies_the_excess_and_feeds_it_back() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    .with_execution_controls(2, 0);
+    );
 
     let mut events = Vec::new();
     executor
@@ -1102,14 +1110,79 @@ async fn consecutive_search_budget_denies_the_excess_and_feeds_it_back() {
         .await
         .unwrap();
 
-    let denied = events.iter().any(|e| {
-        matches!(e, leveler_agent::AgentEvent::ToolResult { name, is_error, preview, .. }
-            if name == "grep" && *is_error && preview.contains("budget"))
-    });
+    let refused: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(e, leveler_agent::AgentEvent::ToolResult { name, is_error: true, .. }
+                if name == "grep")
+        })
+        .collect();
     assert!(
-        denied,
-        "third grep should be denied by the search budget: {events:?}"
+        refused.is_empty(),
+        "no search may be refused for being the nth one: {refused:?}"
     );
+    let ran = events
+        .iter()
+        .filter(|e| matches!(e, leveler_agent::AgentEvent::ToolCall { name, .. } if name == "grep"))
+        .count();
+    assert_eq!(ran, 5, "every search reached the tool: {events:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// …and the mechanical guard that DOES survive still fires. The same call with
+/// the same arguments returning the same result is a runaway loop, and bounding
+/// it needs no reading of intent.
+#[tokio::test]
+async fn the_exact_repeat_loop_guard_still_fires() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-loopguard-{}",
+        std::process::id() as u64 * 13 + 7
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // The IDENTICAL grep, over and over, returning the identical result.
+    let mut script: Vec<_> = (0..8)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "grep",
+                serde_json::json!({"pattern": "old"}),
+            )
+        })
+        .collect();
+    script.push(assistant_text("done"));
+    let runtime = Arc::new(MockRuntime::new(script));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+
+    let mut events = Vec::new();
+    executor
+        .run(
+            "search around",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let guarded = events.iter().any(|e| {
+        matches!(e, leveler_agent::AgentEvent::ToolResult { name, is_error: true, preview, .. }
+            if name == "grep" && preview.contains("same"))
+    });
+    assert!(guarded, "an exact repeat must still be bounded: {events:?}");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2339,9 +2412,9 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model goes quiet every round and never calls update_goal: two
-    // nudges (the shared closeout budget), then a third quiet round. That is
-    // a stall, not a completion.
+    // The model goes quiet every round and never calls update_goal: ONE
+    // protocol repair, then a second quiet round. That is a stall, not a
+    // completion — and the harness does not repeat itself.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("I think it's done."),
         assistant_text("Still done."),
@@ -2374,8 +2447,8 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
         "quiet-nudge exhaustion must not be reported as a successful completion"
     );
     assert_eq!(
-        outcome.rounds, 3,
-        "the shared closeout budget allows two nudges, then the third quiet round stalls"
+        outcome.rounds, 2,
+        "one protocol repair, then the next quiet round stalls"
     );
     assert_eq!(
         outcome.stop_detail.as_deref(),
@@ -3722,14 +3795,20 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
         plan_events.is_empty(),
         "simple goal must not host-seed a plan shell: {plan_events:?}"
     );
-    assert_eq!(outcome.metrics.plan_updated, 0);
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A plan step the model left open is not a completion gate.
+///
+/// The runtime can see `status == "pending"` mechanically. What it cannot see
+/// is whether that step is still required — a model that planned "add an extra
+/// test", then found the case already covered, is right to close without it.
+/// Deciding that reads the user's intent, so the plan stays a cognitive aid
+/// and the model owns the call.
 #[tokio::test]
-async fn update_goal_complete_rejects_incomplete_model_todos() {
+async fn a_pending_plan_step_does_not_block_completion() {
     let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-todo-gate-{}",
+        "leveler-agent-plan-advisory-{}",
         std::process::id() as u64 * 31 + 22
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -3741,7 +3820,7 @@ async fn update_goal_complete_rejects_incomplete_model_todos() {
             "update_plan",
             serde_json::json!({
                 "plan": [
-                    {"step": "a", "status": "in_progress"},
+                    {"step": "a", "status": "completed"},
                     {"step": "b", "status": "pending"}
                 ]
             }),
@@ -3749,32 +3828,7 @@ async fn update_goal_complete_rejects_incomplete_model_todos() {
         assistant_tool_call(
             "c2",
             "update_goal",
-            serde_json::json!({"status": "complete", "summary": "nope"}),
-        ),
-        assistant_tool_call(
-            "c3",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "a", "status": "completed"},
-                    {"step": "b", "status": "in_progress"}
-                ]
-            }),
-        ),
-        assistant_tool_call(
-            "c4",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "a", "status": "completed"},
-                    {"step": "b", "status": "completed"}
-                ]
-            }),
-        ),
-        assistant_tool_call(
-            "c5",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "yes"}),
+            serde_json::json!({"status": "complete", "summary": "b turned out unnecessary"}),
         ),
     ]));
     let executor = Executor::new(
@@ -3795,28 +3849,28 @@ async fn update_goal_complete_rejects_incomplete_model_todos() {
         )
         .await
         .unwrap();
+
     assert_eq!(outcome.stop_reason, StopReason::Completed);
     let refused = events.iter().any(|e| {
         matches!(
             e,
-            AgentEvent::ToolResult {
-                name,
-                is_error: true,
-                preview,
-                ..
-            } if name == "update_goal" && preview.contains("incomplete")
+            AgentEvent::ToolResult { name, is_error: true, .. } if name == "update_goal"
         )
     });
-    assert!(refused, "first complete must be refused; events={events:?}");
+    assert!(
+        !refused,
+        "an open plan step is not a refusal reason: {events:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Second bare `update_goal(complete)` without `override_incomplete_todos` must
-/// still refuse incomplete ModelExplicit todos (no attempt-count auto-pass).
+/// The plan keeps working as a plan: it is recorded and reported, it simply
+/// has no authority. A run that never reconciles its last step still
+/// completes, and the steps the model wrote are still there to read.
 #[tokio::test]
-async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
+async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
     let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-todo-gate2-{}",
+        "leveler-agent-plan-advisory2-{}",
         std::process::id() as u64 * 31 + 24
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -3835,23 +3889,15 @@ async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
         ),
         assistant_tool_call(
             "c2",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "first"}),
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: done.txt\n+done\n*** End Patch"
+            }),
         ),
         assistant_tool_call(
             "c3",
             "update_goal",
-            serde_json::json!({"status": "complete", "summary": "second bare"}),
-        ),
-        // Explicit override is the only bypass.
-        assistant_tool_call(
-            "c4",
-            "update_goal",
-            serde_json::json!({
-                "status": "complete",
-                "summary": "forced",
-                "override_incomplete_todos": true
-            }),
+            serde_json::json!({"status": "complete", "summary": "shipped"}),
         ),
     ]));
     let executor = Executor::new(
@@ -3872,34 +3918,114 @@ async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
         )
         .await
         .unwrap();
+
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    let refused = events
+    let plan = events
         .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                AgentEvent::ToolResult {
-                    name,
-                    is_error: true,
-                    preview,
-                    ..
-                } if name == "update_goal"
-                    && (preview.contains("incomplete") || preview.contains("override_incomplete"))
-            )
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
         })
-        .count();
+        .expect("the plan the model wrote must still be reported");
+    assert_eq!(plan.len(), 2, "the plan is preserved as written: {plan:?}");
     assert!(
-        refused >= 2,
-        "both bare completes must refuse; events={events:?}"
+        dir.join("done.txt").exists(),
+        "and the work itself still happened"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A goal that goes quiet (text only, no `update_goal`) stalls, and the stall
-/// is recorded as one no-progress tick on the ledger — a fact for the next
-/// explicit turn, not a trigger for an automatic one.
+/// A goal that goes quiet gets ONE protocol repair, and it repairs the
+/// protocol only.
+///
+/// The runtime can establish exactly one thing here: the goal-mode contract
+/// says a run resolves through `update_goal`, and this round did not. It
+/// cannot establish whether the task was conversational or an implementation,
+/// whether the workspace deserves an audit, whether tests should run now, or
+/// whether every requirement is proven — those are readings of the user's
+/// intent, and they belong to the system prompt and the model, not to a
+/// reminder the harness injects mid-turn.
 #[tokio::test]
-async fn goal_text_only_quiet_increments_no_progress_and_stalls() {
+async fn a_quiet_goal_gets_one_protocol_repair_and_no_coaching() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-protocol-repair-{}",
+        std::process::id() as u64 * 31 + 61
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("here is my answer"),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "answered"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let outcome = executor
+        .run(
+            "explain the retry policy",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+
+    let injected: Vec<String> = runtime
+        .recorded_requests()
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.text_content())
+        .collect();
+    let repair = injected
+        .iter()
+        .find(|t| t.contains("update_goal"))
+        .expect("the protocol repair must be injected");
+
+    assert!(
+        repair.contains("update_goal"),
+        "it must name the call that resolves the goal: {repair}"
+    );
+    for banned in [
+        "Conversational",
+        "Implementation",
+        "Follow-up",
+        "PROVEN",
+        "audit",
+        "run them",
+        "shrink",
+        "<objective>",
+    ] {
+        assert!(
+            !repair.contains(banned),
+            "the repair must not coach the model on semantics (`{banned}`): {repair}"
+        );
+    }
+    assert!(
+        repair.len() < 400,
+        "a protocol repair is short; this is a lecture ({} bytes): {repair}",
+        repair.len()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A model that will not resolve does not get coached repeatedly. One repair,
+/// then the run ends on an honest mechanical terminal — no hidden
+/// continuation, no second budget, no third re-prompt.
+#[tokio::test]
+async fn a_goal_that_stays_unresolved_is_repaired_once_then_stops() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-quiet-stall-{}",
         std::process::id() as u64 * 31 + 25
@@ -3907,7 +4033,6 @@ async fn goal_text_only_quiet_increments_no_progress_and_stalls() {
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    // Exhaust quiet nudges → Stalled; one drive → streak=1 (continue still allowed).
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("still thinking 1"),
         assistant_text("still thinking 2"),
@@ -3915,23 +4040,38 @@ async fn goal_text_only_quiet_increments_no_progress_and_stalls() {
         assistant_text("still thinking 4"),
     ]));
     let executor = Executor::new(
-        runtime,
+        runtime.clone(),
         Arc::new(default_registry()),
         tool_context,
         ModelRef::new("mock", "m"),
         20,
     )
     .with_goal_mode(true);
+    let mut advisories = 0usize;
     let outcome = executor
         .run(
             "do the work",
-            &mut |_| {},
+            &mut |e| {
+                if matches!(e, AgentEvent::AdvisoryStarted { .. }) {
+                    advisories += 1;
+                }
+            },
             &mut NoopSink,
             CancellationToken::new(),
         )
         .await
         .unwrap();
+
     assert_eq!(outcome.stop_reason, StopReason::Stalled);
+    assert_eq!(
+        advisories, 1,
+        "exactly one protocol repair, then a mechanical stop"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        2,
+        "the quiet round plus ONE repaired round — nothing buys a third"
+    );
     assert_eq!(
         outcome.progress.no_progress_streak, 1,
         "one stalled drive → one no-progress tick: {:?}",
@@ -4362,80 +4502,6 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn resume_seeded_plan_is_used_by_todo_gate() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-seed-plan-{}",
-        std::process::id() as u64 * 31 + 24
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let seeded = leveler_agent::PlanState::from_model_explicit(vec![leveler_agent::PlanStep {
-        step: "still open".into(),
-        status: "pending".into(),
-        id: None,
-        origin: leveler_agent::PlanOrigin::ModelExplicit,
-    }])
-    .unwrap();
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "early"}),
-        ),
-        assistant_tool_call(
-            "c2",
-            "update_plan",
-            serde_json::json!({
-                "plan": [{"step": "still open", "status": "in_progress"}]
-            }),
-        ),
-        assistant_tool_call(
-            "c3",
-            "update_plan",
-            serde_json::json!({
-                "plan": [{"step": "still open", "status": "completed"}]
-            }),
-        ),
-        assistant_tool_call(
-            "c4",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "ok"}),
-        ),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    )
-    .with_goal_mode(true)
-    .with_seeded_plan(seeded);
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "finish the leftover work",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(outcome.stop_reason, StopReason::Completed);
-    assert!(events.iter().any(|e| matches!(
-        e,
-        AgentEvent::ToolResult {
-            name,
-            is_error: true,
-            preview,
-            ..
-        } if name == "update_goal" && preview.contains("incomplete")
-    )));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// K36: AutoApprove + WorkspaceWrite must not persist consolidate_memory(auto_write).
 #[tokio::test]
 async fn auto_approve_blocks_consolidate_memory_auto_write() {
@@ -4777,80 +4843,6 @@ fn last_ledger(events: &[AgentEvent]) -> Option<leveler_lifecycle::EvidenceLedge
 }
 
 /// Gate intercepts emit GoalIntercepted + EvidenceLedgerUpdated for persistence.
-#[tokio::test]
-async fn goal_intercept_emits_ledger_events() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-intercept-events-{}",
-        std::process::id() as u64 * 31 + 52
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "edit", "status": "in_progress"},
-                    {"step": "verify", "status": "pending"}
-                ]
-            }),
-        ),
-        assistant_tool_call(
-            "g1",
-            "update_goal",
-            serde_json::json!({"status": "complete", "summary": "too early"}),
-        ),
-        assistant_tool_call(
-            "g2",
-            "update_goal",
-            serde_json::json!({"status": "blocked", "summary": "stop"}),
-        ),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        8,
-    )
-    .with_goal_mode(true)
-    .with_goal_todo_gate(true);
-    let mut events = Vec::new();
-    let _ = executor
-        .run(
-            "do multi step work",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::GoalIntercepted { .. })),
-        "expected GoalIntercepted: {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::EvidenceLedgerUpdated { .. })),
-        "expected EvidenceLedgerUpdated: {events:?}"
-    );
-    // Resume seed: last ledger intercept must be reconstructible.
-    let led = events.iter().rev().find_map(|e| match e {
-        AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
-        _ => None,
-    });
-    assert!(
-        led.is_some_and(|l| !l.intercepts.is_empty()),
-        "ledger must carry intercept records"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// The runtime no longer re-compiles the user's goal into a "## Task contract"
 /// block and injects it back. The user's own words reach the model once, as
 /// the user wrote them: a parser that split prose on `Request:` / `Constraints:`
@@ -7536,8 +7528,7 @@ async fn a_fix_bug_goal_may_complete_without_mutation_when_the_model_says_so() {
         ModelRef::new("mock", "m"),
         6,
     )
-    .with_goal_mode(true)
-    .with_work_profile(leveler_agent::WorkProfile::Delivery);
+    .with_goal_mode(true);
     let mut events = Vec::new();
     let outcome = executor
         .run(

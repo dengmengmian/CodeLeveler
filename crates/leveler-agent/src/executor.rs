@@ -17,9 +17,7 @@ use leveler_agent_core::BudgetExhaustion;
 use leveler_context::load_rules;
 use leveler_core::{ClarificationId, TurnId};
 use leveler_execution::{ApprovalPolicy, Approver, AutoApprove, AutoReviewer, NeedUserReviewer};
-use leveler_lifecycle::{
-    EvidenceLedger, GateConfig, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, WorkProfile,
-};
+use leveler_lifecycle::{EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger};
 use leveler_memory::MemoryStore;
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelPricing, ModelRef, ModelRuntime,
@@ -483,8 +481,6 @@ pub struct AgentOutcome {
     /// and spent vs cap. `None` for other stops (and for legacy bounded-round
     /// exits that reuse the BudgetExhausted label without a resource dimension).
     pub budget_exhaustion: Option<BudgetExhaustion>,
-    /// Continuous-use / latency counters for S0/S3 hard gates.
-    pub metrics: leveler_lifecycle::DepthUseMetrics,
     /// Final progress / closeout state (engine continue_active_goal reads this).
     pub progress: ProgressLedger,
     /// Active objective used for this drive (host-pinned).
@@ -493,7 +489,7 @@ pub struct AgentOutcome {
 
 impl AgentOutcome {
     /// Build a drive outcome from the fields that vary per exit plus the drive's
-    /// running state (`metrics`/`progress`/`objective`, always cloned here).
+    /// running state (`progress`/`objective`, always cloned here).
     /// Every early return in `drive` funnels through this, so a new shared field
     /// is added once here instead of at each of the ~10 return sites.
     #[allow(clippy::too_many_arguments)]
@@ -503,7 +499,6 @@ impl AgentOutcome {
         modified_files: Vec<String>,
         stop_reason: StopReason,
         stop_detail: Option<String>,
-        metrics: &leveler_lifecycle::DepthUseMetrics,
         progress: &ProgressLedger,
         objective: &ObjectiveAnchor,
     ) -> Self {
@@ -514,7 +509,6 @@ impl AgentOutcome {
             stop_reason,
             stop_detail,
             budget_exhaustion: None,
-            metrics: metrics.clone(),
             progress: progress.clone(),
             objective: objective.clone(),
         }
@@ -528,7 +522,6 @@ impl AgentOutcome {
         rounds: u32,
         modified_files: Vec<String>,
         exhaustion: BudgetExhaustion,
-        metrics: &leveler_lifecycle::DepthUseMetrics,
         progress: &ProgressLedger,
         objective: &ObjectiveAnchor,
     ) -> Self {
@@ -540,7 +533,6 @@ impl AgentOutcome {
             stop_reason: StopReason::BudgetExhausted,
             stop_detail,
             budget_exhaustion: Some(exhaustion),
-            metrics: metrics.clone(),
             progress: progress.clone(),
             objective: objective.clone(),
         }
@@ -853,7 +845,6 @@ impl TranscriptSink for SubAgentProgressSink {
 /// the agent loop only consumes the already-resolved values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubAgentExecutionPolicy {
-    pub max_search_calls_per_step: usize,
     pub max_parallel_tools: usize,
     pub require_explicit_plan: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -899,9 +890,6 @@ pub trait SteeringSource: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPolicy {
     // ── Loop shape ──────────────────────────────────────────────────────────
-    /// Max search-tool calls allowed within a single step/round (0 = off);
-    /// excess calls are denied so the model acts on what it already gathered.
-    pub max_search_calls_per_step: usize,
     /// Max read-only tools executed concurrently within one round's parallel
     /// batch (0 = unbounded).
     pub max_parallel_tools: usize,
@@ -920,12 +908,10 @@ pub struct TurnPolicy {
     /// O(rounds × context) of near-duplicate log rows.
     pub context_trace: bool,
 
-    // ── Completion gates ────────────────────────────────────────────────────
+    // ── Completion ──────────────────────────────────────────────────────────
     /// The run ends only when the model explicitly calls
     /// `update_goal(complete|blocked)`. Going quiet does not finish it.
     pub goal_mode: bool,
-    /// Refuse `update_goal(complete)` while model-declared todos are open.
-    pub goal_todo_gate: bool,
     /// Mechanical loop protection: the identical-call/identical-result loop
     /// guard and the all-calls-refused streak. OFF disables them but never
     /// the safety boundary — the absolute round ceiling, step limits, wall
@@ -944,15 +930,12 @@ pub struct TurnPolicy {
 impl Default for TurnPolicy {
     fn default() -> Self {
         Self {
-            max_search_calls_per_step: 0,
             max_parallel_tools: 0,
             require_explicit_plan: false,
             reasoning_effort: None,
             context_budget: 0,
             context_trace: false,
             goal_mode: false,
-            // Matches the historical `Executor::new` default — the gate is ON.
-            goal_todo_gate: true,
             progress_guards: true,
             allow_delegation: true,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
@@ -962,14 +945,12 @@ impl Default for TurnPolicy {
 }
 
 impl TurnPolicy {
-    /// The minimal direct policy (convergence plan phase 5): every PRODUCT
-    /// heuristic off — no search cap, no todo completion gate, no loop
-    /// guards. Safety is untouched: admission
-    /// (hooks/rules/approval), the side-effect barrier, step limits, the
-    /// absolute round ceiling, and cancellation apply exactly as always.
+    /// The minimal direct policy: the mechanical loop guards off too. Safety
+    /// is untouched — admission (hooks/rules/approval), the side-effect
+    /// barrier, step limits, the absolute round ceiling, and cancellation
+    /// apply exactly as always.
     pub fn minimal() -> Self {
         Self {
-            goal_todo_gate: false,
             progress_guards: false,
             ..Self::default()
         }
@@ -1170,19 +1151,6 @@ impl Executor {
         self
     }
 
-    /// Enable/disable the S2 goal todo gate on update_goal(complete).
-    pub fn with_goal_todo_gate(mut self, on: bool) -> Self {
-        self.policy.goal_todo_gate = on;
-        self
-    }
-
-    /// Apply the work profile. Every profile keeps the same mechanical
-    /// completion gate; the profile only selects the tool surface elsewhere.
-    pub fn with_work_profile(mut self, _profile: WorkProfile) -> Self {
-        self.policy.goal_todo_gate = GateConfig::default().goal_todo_gate;
-        self
-    }
-
     /// Short INDEX lines injected into the system prompt (bodies never go here).
     pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
         self.memory_index = index.into();
@@ -1353,7 +1321,6 @@ impl Executor {
         let write_allowlist = (!profile.read_only() && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
             SubAgentExecutionPolicy {
-                max_search_calls_per_step: self.policy.max_search_calls_per_step,
                 max_parallel_tools: if profile.serial_tools() {
                     1
                 } else {
@@ -1405,7 +1372,6 @@ impl Executor {
             steering: None,
             policy: TurnPolicy {
                 // Loop shape comes from the role's resolved policy…
-                max_search_calls_per_step: child_policy.max_search_calls_per_step,
                 max_parallel_tools: child_policy.max_parallel_tools,
                 require_explicit_plan: child_policy.require_explicit_plan,
                 reasoning_effort: child_policy.reasoning_effort,
@@ -1422,7 +1388,6 @@ impl Executor {
                 // A sub-agent finishes when it goes quiet; only the top-level
                 // run uses explicit goal resolution.
                 goal_mode: false,
-                goal_todo_gate: false,
                 // A child inherits the parent's product-guard stance.
                 progress_guards: self.policy.progress_guards,
             },
@@ -1507,15 +1472,9 @@ impl Executor {
         self
     }
 
-    /// Apply execution controls: cap search-tool calls per step to
-    /// `max_search_calls_per_step` (0 = off), and bound the round's concurrent
-    /// read-only tool batch to `max_parallel_tools` (0 = unbounded).
-    pub fn with_execution_controls(
-        mut self,
-        max_search_calls_per_step: usize,
-        max_parallel_tools: usize,
-    ) -> Self {
-        self.policy.max_search_calls_per_step = max_search_calls_per_step;
+    /// Bound the round's concurrent read-only tool batch to
+    /// `max_parallel_tools` (0 = unbounded).
+    pub fn with_execution_controls(mut self, max_parallel_tools: usize) -> Self {
         self.policy.max_parallel_tools = max_parallel_tools;
         self
     }

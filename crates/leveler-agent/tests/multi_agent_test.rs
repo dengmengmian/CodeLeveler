@@ -994,7 +994,7 @@ async fn run_gauged_round(max_parallel_tools: usize) -> usize {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_execution_controls(0, max_parallel_tools);
+    .with_execution_controls(max_parallel_tools);
 
     let outcome = executor
         .run(
@@ -1068,7 +1068,7 @@ async fn worker_sub_agent_serializes_parallel_safe_tools() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_execution_controls(0, 4)
+    .with_execution_controls(4)
     .run(
         "delegate a write task",
         &mut |_| {},

@@ -551,7 +551,6 @@ impl Application {
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
                 overrides: self.execution_overrides.clone(),
-                work_profile,
                 memory_index,
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{AutoClarify, WorkProfile};
+use leveler_agent::AutoClarify;
 use leveler_core::{RequestId, SessionId, ToolCallId, TurnId};
 use leveler_engine::{
     EngineEvent, EventLog, ExecutionKind, ExecutorFactory, TaskEngine, TaskOutcome, TaskSpec,
@@ -166,7 +166,6 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> TaskEn
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            work_profile: WorkProfile::Balanced,
             memory_index: String::new(),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,

@@ -1,20 +1,21 @@
 //! Unified closeout decision point — the single place that decides what
 //! happens when the model goes quiet (a round with no tool calls).
 //!
-//! Historically the quiet branch of `drive` chained three independent nudge
-//! mechanisms (goal resolution, completion evidence, answer-completeness
-//! repair) plus a one-shot empty-answer nudge, each with its own counter
-//! (3 + 2 + 2 + 1). Every one of them could re-invoke the model, and each
-//! re-invocation let the model repeat its "task complete" summary. This
-//! module replaces all of them with ONE decision and ONE shared per-turn
-//! budget: a quiet round produces at most one nudge, chosen by a fixed
-//! priority, and the whole turn allows at most [`CLOSEOUT_NUDGE_BUDGET`]
-//! nudges across all mechanisms combined.
+//! Historically the quiet branch of `drive` chained four nudge mechanisms with
+//! their own counters (3 + 2 + 2 + 1), each able to re-invoke the model. This
+//! module is what is left: ONE decision, and ONE repair per turn.
+//!
+//! The repair is a PROTOCOL repair. Two things can be established
+//! mechanically about a quiet round — a goal run did not call `update_goal`,
+//! and a round produced no text at all — and each buys exactly one more model
+//! round to fix the protocol. A model that still does not resolve after that
+//! is not coached again: the turn ends on an honest terminal. Nothing here
+//! reads the work for meaning, and nothing here decides the model deserves
+//! another turn.
 
-use leveler_lifecycle::ChangeImpact;
-
-/// Total nudges one turn may inject across ALL closeout mechanisms.
-pub const CLOSEOUT_NUDGE_BUDGET: u8 = 2;
+/// Repairs one turn may inject. ONE: a second attempt at the same reminder is
+/// coaching, and the harness has nothing new to say.
+pub const CLOSEOUT_NUDGE_BUDGET: u8 = 1;
 
 /// What the closeout decided for a quiet round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,14 +100,15 @@ impl CloseoutBudget {
 
 /// Everything [`decide`] needs to know about a quiet round. Pure data — the
 /// function stays unit-testable without a model, tools, or a transcript.
+///
+/// What the turn touched is deliberately absent: the decision is about the
+/// protocol, not about whether the work looks finished.
 #[derive(Debug, Clone, Copy)]
-pub struct CloseoutInput<'a> {
+pub struct CloseoutInput {
     /// Goal mode: quiet never means done; the model must call `update_goal`.
     pub goal_mode: bool,
     /// The model produced non-empty final text this turn.
     pub has_final_text: bool,
-    /// What the turn touched and whether it is evidence-backed yet.
-    pub impact: &'a ChangeImpact,
     /// The turn is being cancelled — an empty answer is not worth a nudge.
     pub cancelled: bool,
     /// The continuation policy allows at least one more model round.
@@ -157,38 +159,10 @@ pub fn decide(input: &CloseoutInput) -> CloseoutAction {
 mod tests {
     use super::*;
 
-    fn inert_impact() -> ChangeImpact {
-        ChangeImpact {
-            modified_files: vec!["README.md".to_string()],
-            has_mutation: true,
-            verified_after_last_mutation: false,
-            build_relevant: false,
-        }
-    }
-
-    fn relevant_unverified_impact() -> ChangeImpact {
-        ChangeImpact {
-            modified_files: vec!["src/lib.rs".to_string()],
-            has_mutation: true,
-            verified_after_last_mutation: false,
-            build_relevant: true,
-        }
-    }
-
-    fn quiet_impact() -> ChangeImpact {
-        ChangeImpact {
-            modified_files: Vec::new(),
-            has_mutation: false,
-            verified_after_last_mutation: false,
-            build_relevant: false,
-        }
-    }
-
-    fn input<'a>(impact: &'a ChangeImpact) -> CloseoutInput<'a> {
+    fn input() -> CloseoutInput {
         CloseoutInput {
             goal_mode: false,
             has_final_text: true,
-            impact,
             cancelled: false,
             can_continue: true,
             budget_remaining: CLOSEOUT_NUDGE_BUDGET,
@@ -198,8 +172,7 @@ mod tests {
 
     #[test]
     fn human_denial_blocks_goal_unresolved_nudge() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.goal_mode = true;
         i.human_boundary_seen = true;
         assert_eq!(
@@ -218,8 +191,7 @@ mod tests {
 
     #[test]
     fn human_denial_still_allows_empty_answer_nudge() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.human_boundary_seen = true;
         i.has_final_text = false;
         assert_eq!(
@@ -230,16 +202,14 @@ mod tests {
 
     #[test]
     fn clean_quiet_round_finishes() {
-        let impact = quiet_impact();
-        assert_eq!(decide(&input(&impact)), CloseoutAction::Finish);
+        assert_eq!(decide(&input()), CloseoutAction::Finish);
     }
 
     #[test]
     fn empty_answer_outranks_everything() {
         // Even in goal mode, an empty answer means the model said nothing —
-        // that nudge outranks everything else.
-        let impact = relevant_unverified_impact();
-        let mut i = input(&impact);
+        // that repair outranks the goal-protocol one.
+        let mut i = input();
         i.goal_mode = true;
         i.has_final_text = false;
         assert_eq!(
@@ -250,8 +220,7 @@ mod tests {
 
     #[test]
     fn cancelled_empty_answer_is_not_nudged() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.has_final_text = false;
         i.cancelled = true;
         assert_eq!(decide(&i), CloseoutAction::Finish);
@@ -259,8 +228,7 @@ mod tests {
 
     #[test]
     fn goal_mode_quiet_is_goal_unresolved() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.goal_mode = true;
         assert_eq!(
             decide(&i),
@@ -268,23 +236,27 @@ mod tests {
         );
     }
 
+    /// The budget is ONE. A second quiet round after the repair does not get a
+    /// second reminder — it ends.
     #[test]
-    fn conversational_goal_turn_only_has_goal_nudge() {
-        // GoalUnresolved is the only nudge a goal turn with a real answer can
-        // draw.
-        let impact = inert_impact();
-        let mut i = input(&impact);
+    fn the_repair_is_offered_once_per_turn() {
+        assert_eq!(CLOSEOUT_NUDGE_BUDGET, 1);
+        let mut i = input();
         i.goal_mode = true;
         assert_eq!(
             decide(&i),
             CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
+        );
+        i.budget_remaining = 0;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
         );
     }
 
     #[test]
     fn exhausted_budget_stalls_goal_and_finishes_non_goal() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.budget_remaining = 0;
 
         i.goal_mode = true;
@@ -293,19 +265,17 @@ mod tests {
             CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
         );
 
-        let impact = relevant_unverified_impact();
         let i = CloseoutInput {
             budget_remaining: 0,
             goal_mode: false,
-            ..input(&impact)
+            ..input()
         };
         assert_eq!(decide(&i), CloseoutAction::Finish);
     }
 
     #[test]
     fn no_next_round_behaves_like_exhausted_budget() {
-        let impact = quiet_impact();
-        let mut i = input(&impact);
+        let mut i = input();
         i.goal_mode = true;
         i.can_continue = false;
         assert_eq!(

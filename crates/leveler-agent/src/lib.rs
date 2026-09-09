@@ -40,9 +40,8 @@ pub use executor::{
 };
 pub use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
 pub use leveler_lifecycle::{
-    CollaborationMode, DepthUseMetrics, EvidenceLedger, GateConfig, ObjectiveAnchor,
-    ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, TurnPhase,
-    WorkProfile, check,
+    CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState,
+    PlanStep, ProgressCaps, ProgressLedger, TurnPhase, WorkProfile,
 };
 pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

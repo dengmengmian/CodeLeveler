@@ -283,7 +283,6 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         stop_reason,
         stop_detail: detail.or(report.stop_detail),
         budget_exhaustion: None,
-        metrics: Default::default(),
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
     })

@@ -5,12 +5,6 @@ use leveler_execution::{is_shell_wrapper_program, shell_c_script};
 use leveler_model::ToolCall;
 use sha2::{Digest, Sha256};
 
-/// Whether a tool is a read-only search/lookup (subject to the per-step search
-/// budget). These gather context but never change the workspace.
-pub(crate) fn is_search_tool(name: &str) -> bool {
-    leveler_model::is_search_tool(name)
-}
-
 /// Whether a program is a verification-class runner (build / test /
 /// typecheck). Heuristic by program basename over the command that ACTUALLY
 /// ran, whatever tool wrapper carried it: the real gate is the verifier — this
