@@ -300,10 +300,12 @@ impl Application {
                 let key = match resolve_api_key(cfg) {
                     Ok(key) => key,
                     Err(error) => {
-                        // Keep assembling (doctor reports the gap), but say so:
-                        // a silently key-less provider fails much later with a
-                        // confusing upstream auth error.
-                        tracing::warn!("provider `{}` has no usable API key: {error}", cfg.id);
+                        // Keep assembling: `doctor` reports the gap for every
+                        // provider, and a run refuses before its first request
+                        // with a message naming the variable and the fix. This
+                        // fires for providers the user is not even using, so it
+                        // is a diagnostic, not a warning to put above that.
+                        tracing::debug!("provider `{}` has no usable API key: {error}", cfg.id);
                         None
                     }
                 };

@@ -71,10 +71,29 @@ async fn main() -> std::process::ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{}", output::error_prefix());
-            eprintln!("  {e:#}");
+            eprintln!("  {}", render_error_chain(&e));
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Render an error and the parts of its chain that add something.
+///
+/// Most of the error types here embed their source in their own `Display`, so
+/// `{e:#}` — which appends every source again — printed one provider payload
+/// three times over. A level whose text is already inside what came before adds
+/// nothing; a level that says something new is worth a line.
+fn render_error_chain(error: &anyhow::Error) -> String {
+    let mut out = error.to_string();
+    for source in error.chain().skip(1) {
+        let text = source.to_string();
+        if text.is_empty() || out.contains(&text) {
+            continue;
+        }
+        out.push_str(": ");
+        out.push_str(&text);
+    }
+    out
 }
 
 fn init_tracing(verbose: u8, is_tui: bool) {
@@ -455,5 +474,58 @@ mod provenance_tests {
         let line = format_provenance("0.1.4", "unknown", true);
         assert!(line.contains("unknown"), "{line}");
         assert!(line.contains("UNTRUSTED"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::render_error_chain;
+
+    /// Two levels whose parent quotes its source verbatim — the shape that
+    /// printed one provider payload three times.
+    #[derive(Debug)]
+    struct Quoting(String);
+
+    impl std::fmt::Display for Quoting {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "agent error: model error: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Quoting {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct Terse;
+
+    impl std::fmt::Display for Terse {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("disk is full")
+        }
+    }
+
+    impl std::error::Error for Terse {}
+
+    #[test]
+    fn a_source_already_quoted_by_its_parent_is_not_repeated() {
+        let payload = "Incorrect API key provided.";
+        let err = anyhow::Error::new(Quoting(payload.into()))
+            .context(format!("agent error: model error: {payload}"));
+        let rendered = render_error_chain(&err);
+        assert_eq!(rendered.matches(payload).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn a_source_that_says_something_new_is_kept() {
+        let err = anyhow::Error::new(Terse).context("could not open the session store");
+        let rendered = render_error_chain(&err);
+        assert!(
+            rendered.contains("could not open the session store"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("disk is full"), "{rendered}");
     }
 }
