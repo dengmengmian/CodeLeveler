@@ -19,8 +19,8 @@ use super::closeout::{
     stalled_detail,
 };
 use super::dispatch::{
-    collect_modified, compact_json, deny_call, extract_image, extract_plan, newly_modified_paths,
-    note_tool_side_effects, preview, task_needs_structured_plan,
+    collect_modified, compact_json, deny_call, extract_applied_diff, extract_image, extract_plan,
+    newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::host::AdmitError;
 use super::{
@@ -103,13 +103,19 @@ pub(crate) const PLAN_SOFT_NUDGE_TEXT: &str = "This task may benefit from a stru
                      (one in_progress step, the rest pending) so progress is visible. A \
                      plan is not required — continue exploring or editing as you see fit.";
 
-/// Absolute per-turn round ceiling — the unconditional circuit breaker. The
-/// loop guards are mechanical and narrow (identical results, every call
-/// refused), so a busy loop that keeps issuing novel-looking calls evades them
-/// and, under `UntilTerminal`, never ends. This ceiling guarantees termination
-/// regardless of progress or continuation policy. Set well above any
-/// legitimate single turn.
-const MAX_TURN_ROUNDS: u32 = 100;
+/// Default per-turn round ceiling for BOUNDED work that did not pin its own
+/// `max_rounds` — a measured unit (an eval case, an orchestration node) is
+/// supposed to have a hard edge, so it gets one.
+///
+/// A top-level `UntilTerminal` turn deliberately does NOT get this. A round is
+/// a property of the model's tool cadence, not of the user's task: the same
+/// work costs one model wildly different round counts, so a hidden count made
+/// long tasks stop with "round ceiling reached" and forced the user to type
+/// 「继续」 to resume the very same work. Such a turn ends on a semantic
+/// terminal state or on a real mechanical guard (cancellation, the
+/// token/cost/duration budgets, the repeated-call and no-progress watchdogs),
+/// never on a round tally.
+const MAX_BOUNDED_TURN_ROUNDS: u32 = 100;
 
 /// Soft plan nudge only: after this many rounds without a plan on a task that
 /// reads as multi-step, inject one advisory. Never used to refuse a tool or
@@ -373,7 +379,10 @@ impl Executor {
         // Hard step limits (spec §27) as the kernel enforces them: the epoch's
         // prior spend is what makes them task-level rather than per-drive.
         let limits = RoundLimits {
-            round_ceiling: self.step_limits.max_rounds.unwrap_or(MAX_TURN_ROUNDS),
+            round_ceiling: self.step_limits.max_rounds.or(match self.continuation {
+                crate::ContinuationPolicy::UntilTerminal => None,
+                crate::ContinuationPolicy::Bounded { .. } => Some(MAX_BOUNDED_TURN_ROUNDS),
+            }),
             window_round_limit: self.continuation.round_limit(),
             max_model_tokens: self.step_limits.max_model_tokens,
             max_cost_usd_micros: self.step_limits.max_cost_usd_micros,
@@ -435,6 +444,7 @@ impl<'a> Drive<'a> {
             name: call.name.clone(),
             is_error: true,
             preview: preview(&reason),
+            applied_diff: None,
         });
         results[index] = Some(ContentPart::ToolResult {
             result: ToolResultContent {
@@ -1193,6 +1203,7 @@ impl AgentHarness for Drive<'_> {
                     name: REPORT_FINDING_TOOL.to_string(),
                     is_error: !ok,
                     preview: preview(&msg),
+                    applied_diff: None,
                 });
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
@@ -1260,6 +1271,7 @@ impl AgentHarness for Drive<'_> {
                         name: UPDATE_GOAL_TOOL.to_string(),
                         is_error: true,
                         preview: preview(&feedback),
+                        applied_diff: None,
                     });
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
@@ -1287,6 +1299,7 @@ impl AgentHarness for Drive<'_> {
                             name: UPDATE_GOAL_TOOL.to_string(),
                             is_error: true,
                             preview: preview(&feedback),
+                            applied_diff: None,
                         });
                         results[index] = Some(ContentPart::ToolResult {
                             result: ToolResultContent {
@@ -1317,6 +1330,7 @@ impl AgentHarness for Drive<'_> {
                     name: UPDATE_GOAL_TOOL.to_string(),
                     is_error: false,
                     preview: "Goal resolved.".to_string(),
+                    applied_diff: None,
                 });
                 let summary = call
                     .arguments
@@ -1431,6 +1445,7 @@ impl AgentHarness for Drive<'_> {
                     name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
                     is_error,
                     preview: preview(&content),
+                    applied_diff: None,
                 });
                 // Durable ownership provenance. A child's tool events reach
                 // the parent as TRANSIENT activity, so without a durable
@@ -1861,6 +1876,7 @@ impl AgentHarness for Drive<'_> {
                 newly_modified,
                 call_files,
                 executed_commands,
+                applied_diff,
                 call,
             ) = match self
                 .executor
@@ -1904,6 +1920,7 @@ impl AgentHarness for Drive<'_> {
                         plan,
                         call_files,
                         executed_commands,
+                        applied_diff,
                     ) = {
                         let started = std::time::Instant::now();
                         let dispatch_fut = self.executor.dispatch(
@@ -1947,6 +1964,7 @@ impl AgentHarness for Drive<'_> {
                         newly,
                         call_files,
                         executed_commands,
+                        applied_diff,
                         admitted.into_call(),
                     )
                 }
@@ -1962,6 +1980,7 @@ impl AgentHarness for Drive<'_> {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        None,
                         call,
                     )
                 }
@@ -2030,6 +2049,9 @@ impl AgentHarness for Drive<'_> {
                 name: call.name.clone(),
                 is_error,
                 preview: preview(&content),
+                // An edit's real landing site, straight from the tool that
+                // made it. A failed call never carries one.
+                applied_diff: (!is_error).then_some(applied_diff).flatten(),
             });
 
             // A passing verification-class command is completion evidence;
@@ -2197,6 +2219,9 @@ impl AgentHarness for Drive<'_> {
                     name: job.admitted.call.name.clone(),
                     is_error,
                     preview: preview(&content),
+                    applied_diff: (!is_error)
+                        .then(|| extract_applied_diff(&metadata))
+                        .flatten(),
                 });
                 if !is_error && let Some(steps) = extract_plan(&metadata) {
                     (self.observer)(AgentEvent::PlanUpdated { steps });
@@ -2408,6 +2433,7 @@ impl AgentHarness for Drive<'_> {
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: true,
                         preview: msg.clone(),
+                        applied_diff: None,
                     });
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
@@ -2444,6 +2470,7 @@ impl AgentHarness for Drive<'_> {
                             name: SPAWN_AGENT_TOOL.to_string(),
                             is_error: true,
                             preview: preview(&msg),
+                            applied_diff: None,
                         });
                         results[index] = Some(ContentPart::ToolResult {
                             result: ToolResultContent {
@@ -2590,6 +2617,7 @@ impl AgentHarness for Drive<'_> {
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: false,
                         preview: preview(&content),
+                        applied_diff: None,
                     });
                     self.background_children.children.push(BackgroundChild {
                         id,

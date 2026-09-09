@@ -28,6 +28,7 @@ pub mod multi_agent;
 mod observability;
 pub mod overlay;
 mod plan_cell;
+mod plan_viewport;
 mod presentation;
 pub mod reducer;
 pub mod render;

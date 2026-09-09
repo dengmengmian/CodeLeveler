@@ -1356,6 +1356,7 @@ mod tests {
                 duration_ms: None,
                 parallel: false,
                 started_elapsed_secs: 0,
+                applied_diff: None,
             }],
             open: false,
             expanded: false,
@@ -1483,6 +1484,7 @@ mod tests {
                         ok: true,
                         preview: "ok".into(),
                         duration_ms: 20,
+                        applied_diff: None,
                     },
                 ),
             );
@@ -1553,6 +1555,7 @@ mod tests {
             true,
             "README contents\nrest of the readme body".into(),
             10,
+            None,
         );
         let second = ToolCallId::new("t2");
         s.transcript.push_tool_started(
@@ -1563,7 +1566,7 @@ mod tests {
             0,
         );
         s.transcript
-            .complete_tool(&second, false, "grep failed loudly".into(), 20);
+            .complete_tool(&second, false, "grep failed loudly".into(), 20, None);
         // Close the group: only a CLOSED settled batch is history.
         s.transcript.begin_assistant(MessageId::new("m-done"));
 
@@ -1652,10 +1655,11 @@ mod tests {
     }
 
     #[test]
-    fn long_plan_panel_caps_at_six_rows_showing_leading_steps() {
-        // The workbench plan panel is chrome, not a scroll surface: it takes at
-        // most 6 rows (title + 5 steps) so a long plan never squeezes out the
-        // conversation. Leading steps stay visible; the title carries progress.
+    fn a_long_plan_shows_every_step_in_a_tall_terminal() {
+        // The panel used to be capped at six rows (title + 5 steps), so an
+        // eight-step plan lost items 6..8 with nothing on screen saying so.
+        // It is still chrome — bounded by the layout budget — but on a 40-row
+        // terminal that budget is the whole plan.
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -1673,12 +1677,41 @@ mod tests {
         });
 
         let text = render_text(&mut s, 100, 40);
-        for index in 1..=5 {
+        for index in 1..=8 {
             assert!(text.contains(&format!("计划步骤{index}")), "{text}");
         }
         assert!(
-            !text.contains("计划步骤8"),
-            "panel is capped chrome, trailing steps stay off-screen: {text}"
+            !text.contains('↑') && !text.contains('↓'),
+            "nothing is hidden, so no overflow indicator: {text}"
+        );
+    }
+
+    #[test]
+    fn a_long_plan_in_a_short_terminal_keeps_the_running_step_and_says_what_is_hidden() {
+        let mut s = test_state();
+        s.status = leveler_client_protocol::RuntimeStatus::Busy;
+        s.plan = Some(leveler_client_protocol::UiPlan {
+            steps: (0..8)
+                .map(|index| leveler_client_protocol::UiPlanStep {
+                    index,
+                    description: format!("计划步骤{}", index + 1),
+                    status: match index {
+                        0..=5 => leveler_client_protocol::PlanStepStatus::Done,
+                        6 => leveler_client_protocol::PlanStepStatus::Running,
+                        _ => leveler_client_protocol::PlanStepStatus::Pending,
+                    },
+                })
+                .collect(),
+        });
+
+        let text = render_text(&mut s, 100, 22);
+        assert!(
+            text.contains("计划步骤7"),
+            "the running step survives: {text}"
+        );
+        assert!(
+            text.contains('↑') || text.contains('↓'),
+            "what is cut must name itself: {text}"
         );
     }
 
@@ -1803,6 +1836,7 @@ mod tests {
             duration_ms: Some(ms),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         }
     }
 
@@ -1850,7 +1884,7 @@ mod tests {
         for id in ["t1", "t2"] {
             let id = ToolCallId::new(id);
             transcript.push_tool_started(id.clone(), "read_file".into(), "{}".into(), false, 0);
-            transcript.complete_tool(&id, true, "ok".into(), 1);
+            transcript.complete_tool(&id, true, "ok".into(), 1, None);
         }
         assert_eq!(transcript.items().len(), 1);
         let TranscriptItem::ToolGroup(group) = &transcript.items()[0] else {
@@ -1956,6 +1990,7 @@ mod tests {
             duration_ms: Some(1),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let lines = tool_render(&item, true);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
@@ -1976,6 +2011,7 @@ mod tests {
             duration_ms: Some(1),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let folded = tool_render(&item, false);
         let text = folded
@@ -2005,6 +2041,7 @@ mod tests {
             duration_ms: Some(1),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let lines = tool_render(&item, false);
         let text = lines
@@ -2040,6 +2077,7 @@ mod tests {
             duration_ms: Some(1),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         // Collapsed head is width-clipped (may end with …).
         let collapsed = tool_render(&item, false);

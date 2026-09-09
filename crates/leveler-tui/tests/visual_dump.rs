@@ -188,6 +188,7 @@ fn visual_inspect() {
             ok: true,
             preview: "resolver.go:120\tfunc resolveUsage(".into(),
             duration_ms: 12,
+            applied_diff: None,
         }),
     );
     reduce(
@@ -283,6 +284,7 @@ fn visual_disclosure_matrix() {
                 ok,
                 preview: preview.into(),
                 duration_ms: 1250,
+                applied_diff: None,
             }),
         );
     }

@@ -3182,6 +3182,7 @@ async fn overlapping_worker_scopes_refuse_the_second_spawn() {
                 name,
                 is_error: true,
                 preview,
+                ..
             } if name == "spawn_agent" && id == "s2" => Some(preview.clone()),
             _ => None,
         })

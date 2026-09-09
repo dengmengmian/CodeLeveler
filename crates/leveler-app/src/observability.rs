@@ -829,6 +829,7 @@ mod tests {
                 is_error: false,
                 preview: "FILE BODY MUST NOT LEAK".into(),
                 agent_id: None,
+                applied_diff: None,
             },
         )
         .await;
@@ -963,6 +964,7 @@ mod tests {
             is_error,
             preview: String::new(),
             agent_id: None,
+            applied_diff: None,
         }
     }
 
@@ -1311,6 +1313,7 @@ mod tests {
             is_error: false,
             preview: String::new(),
             agent_id: Some(agent.into()),
+            applied_diff: None,
         }
     }
 

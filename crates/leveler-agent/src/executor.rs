@@ -113,6 +113,14 @@ pub enum AgentEvent {
         name: String,
         is_error: bool,
         preview: String,
+        /// Canonical unified diff of what an edit tool ACTUALLY changed, with
+        /// the line numbers it landed on. Only the execution layer knows
+        /// these: an `apply_patch` hunk is located by content and `replace`
+        /// matches a substring, so neither position is declared in the request.
+        /// `None` for every non-edit tool, and for an edit whose location
+        /// could not be established — a presenter must then show no line
+        /// numbers rather than derive one from what the model asked for.
+        applied_diff: Option<String>,
     },
     /// A recoverable pre-command workspace snapshot, correlated to the tool
     /// call that may mutate the workspace. The engine persists this with the

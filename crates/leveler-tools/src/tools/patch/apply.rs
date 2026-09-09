@@ -7,6 +7,19 @@ use super::seek::seek_sequence;
 /// Chunks must apply in file order; on any hunk that cannot be located this
 /// returns an error and makes no partial change (the caller commits nothing).
 pub fn apply_update(original: &str, chunks: &[UpdateChunk]) -> Result<String, String> {
+    apply_update_located(original, chunks).map(|(content, _)| content)
+}
+
+/// Apply update chunks and report WHERE each one landed.
+///
+/// A hunk is located by content, so its line numbers are discovered here and
+/// nowhere else: the patch text the model wrote carries none. Callers that
+/// present the edit need this, and must never re-derive a position from the
+/// request instead.
+pub fn apply_update_located(
+    original: &str,
+    chunks: &[UpdateChunk],
+) -> Result<(String, Vec<crate::tools::applied_diff::AppliedHunk>), String> {
     // Preserve the file's byte conventions: strip a leading BOM and fold CRLF to
     // LF for matching (the model's hunks are LF), then restore both on write —
     // otherwise a CRLF file comes back with mixed endings and a BOM file's
@@ -92,6 +105,24 @@ pub fn apply_update(original: &str, chunks: &[UpdateChunk]) -> Result<String, St
     // hunk authored out of file order (e.g. an EOF append listed before an
     // edit) still splices at a valid, non-shifting index.
     ops.sort_by_key(|&(start, _, _)| start);
+    // Record each landing site against the file as it is now, and against the
+    // file as it will be once earlier hunks have shifted it.
+    let mut located = Vec::with_capacity(ops.len());
+    let mut delta: i64 = 0;
+    for (start, len, replacement) in &ops {
+        let end = (start + len).min(file.len());
+        let start = (*start).min(file.len());
+        let old_lines = file[start..end].to_vec();
+        let old_start = start + 1;
+        let new_start = (old_start as i64 + delta).max(1) as usize;
+        delta += replacement.len() as i64 - old_lines.len() as i64;
+        located.push(crate::tools::applied_diff::AppliedHunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines: replacement.clone(),
+        });
+    }
     for (start, len, replacement) in ops.into_iter().rev() {
         let end = (start + len).min(file.len());
         let start = start.min(file.len());
@@ -111,7 +142,7 @@ pub fn apply_update(original: &str, chunks: &[UpdateChunk]) -> Result<String, St
     if had_bom {
         out.insert(0, '\u{FEFF}');
     }
-    Ok(out)
+    Ok((out, located))
 }
 
 /// Whether the file predominantly uses CRLF line endings, so a rewrite should

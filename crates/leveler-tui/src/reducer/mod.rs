@@ -987,7 +987,7 @@ mod disclosure_tests {
         s.transcript
             .push_tool_started(ToolCallId::new(id), name.into(), args.into(), false, 0);
         s.transcript
-            .complete_tool(&ToolCallId::new(id), true, "done".into(), 1200);
+            .complete_tool(&ToolCallId::new(id), true, "done".into(), 1200, None);
     }
 
     /// Three finished work-tool groups separated by user rows — the layout the
@@ -1200,7 +1200,7 @@ mod disclosure_tests {
             0,
         );
         s.transcript
-            .complete_tool(&ToolCallId::new("s1"), true, "".into(), 3);
+            .complete_tool(&ToolCallId::new("s1"), true, "".into(), 3, None);
         s.transcript.push_user("between".into());
         finished_tool(&mut s, "w1", "grep", r#"{"pattern":"x"}"#);
         // Close the trailing group: an open group is live work, not history.
@@ -1409,7 +1409,7 @@ mod disclosure_tests {
             "a running group is not clickable: {hits:?}"
         );
         s.transcript
-            .complete_tool(&ToolCallId::new("r1"), true, "ok".into(), 10);
+            .complete_tool(&ToolCallId::new("r1"), true, "ok".into(), 10, None);
         // Member completion alone is NOT history: the group is still open
         // (the model may stream another call). No disclosure yet.
         let hits = s.conversation_lines_and_hits(80).1;

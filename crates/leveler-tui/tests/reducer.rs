@@ -513,6 +513,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             ok: true,
             preview: "old-line\n".into(),
             duration_ms: 5,
+            applied_diff: None,
         }),
     );
     // Assistant text closes the older tool group, then a new group starts.
@@ -550,6 +551,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             ok: true,
             preview: "new-line\n".into(),
             duration_ms: 5,
+            applied_diff: None,
         }),
     );
 
@@ -609,6 +611,7 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             ok: true,
             preview: "ok\n".into(),
             duration_ms: 1,
+            applied_diff: None,
         }),
     );
     // A live analysis block renders nothing and is not a disclosure:
@@ -1672,6 +1675,7 @@ fn tool_completed(s: &mut AppState, id: &str, ok: bool) {
             ok,
             preview: if ok { "done".into() } else { "boom".into() },
             duration_ms: 82,
+            applied_diff: None,
         }),
     );
 }
@@ -1932,6 +1936,7 @@ fn tool_preview_control_chars_are_neutralized() {
             ok: true,
             preview: "file.go:1\tfunc x(\rmore".into(),
             duration_ms: 5,
+            applied_diff: None,
         }),
     );
     let p = s.transcript.tool_calls()[0].preview.clone().unwrap();
@@ -1952,6 +1957,7 @@ fn tool_preview_ansi_color_codes_are_stripped() {
             ok: true,
             preview: "\u{1b}[32m✓\u{1b}[39m test passed \u{1b}[1m[30m leftover".into(),
             duration_ms: 12,
+            applied_diff: None,
         }),
     );
     let p = s.transcript.tool_calls()[0].preview.clone().unwrap();
@@ -3151,6 +3157,7 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
             ok: true,
             preview: "目标已完成".into(),
             duration_ms: 10,
+            applied_diff: None,
         }),
     );
 
@@ -3188,6 +3195,7 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
             ok: true,
             preview: "目标已完成".into(),
             duration_ms: 10,
+            applied_diff: None,
         }),
     );
 
@@ -3355,6 +3363,7 @@ fn activity_clears_when_the_tool_completes() {
             ok: true,
             preview: "ok".into(),
             duration_ms: 3,
+            applied_diff: None,
         }),
     );
     assert!(
@@ -3588,6 +3597,7 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
             ok: true,
             preview: "ok".into(),
             duration_ms: 5,
+            applied_diff: None,
         }),
     );
 
@@ -5204,33 +5214,86 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
     );
 }
 
-/// R004 F4: a completed turn whose plan still has open steps must carry the
-/// plan progress in the turn-end summary — never a bare full-success line.
-#[test]
-fn turn_end_summary_carries_open_plan_progress() {
-    let mut s = busy_state();
-    let step = |i: usize, d: &str, st| UiPlanStep {
+/// A plan with five done steps, one running and three pending — the shape
+/// that showed "任务已完成 … 计划 6/9" next to "▼ 计划 · 第 7/9 项进行中".
+fn stale_open_plan(s: &mut AppState) {
+    let step = |i: usize, st| UiPlanStep {
         index: i,
-        description: d.to_string(),
+        description: format!("步骤 {}", i + 1),
         status: st,
     };
+    use leveler_client_protocol::PlanStepStatus as P;
     reduce(
-        &mut s,
+        s,
         Action::Runtime(RuntimeEvent::PlanUpdated {
             plan: UiPlan {
-                steps: vec![
-                    step(1, "根因", leveler_client_protocol::PlanStepStatus::Done),
-                    step(2, "实现", leveler_client_protocol::PlanStepStatus::Done),
-                    step(3, "测试", leveler_client_protocol::PlanStepStatus::Done),
-                    step(
-                        4,
-                        "浏览器验证",
-                        leveler_client_protocol::PlanStepStatus::Running,
-                    ),
-                ],
+                steps: (0..9)
+                    .map(|i| match i {
+                        0..=4 => step(i, P::Done),
+                        5 => step(i, P::Running),
+                        _ => step(i, P::Pending),
+                    })
+                    .collect(),
             },
         }),
     );
+}
+
+/// D1: the plan is a LIVE progress surface. Once the work is finished, a
+/// sticky "第 7/9 项进行中" claims work is under way that nobody is doing.
+/// The plan is not the completion authority, so it is not asked whether the
+/// task may end — it simply stops being live chrome.
+#[test]
+fn a_completed_turn_retires_the_live_plan() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    assert!(s.plan.is_some(), "the plan is live while the turn runs");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert!(s.plan.is_none(), "no live plan after the work is finished");
+}
+
+/// D2 / D3: the same holds for the two "done, with a caveat" outcomes.
+#[test]
+fn unverified_and_checks_failed_turns_also_retire_the_live_plan() {
+    for event in [
+        RuntimeEvent::TurnCompletedUnverified {
+            reason: "无自动验证".into(),
+        },
+        RuntimeEvent::TurnCompletedChecksFailed {
+            reason: "验证未通过".into(),
+        },
+    ] {
+        let mut s = busy_state();
+        stale_open_plan(&mut s);
+        reduce(&mut s, Action::Runtime(event.clone()));
+        assert!(s.plan.is_none(), "{event:?} finishes the work");
+    }
+}
+
+/// D4 / D5: an unfinished turn keeps its plan — that is exactly the
+/// continuation context the user needs to decide what happens next.
+#[test]
+fn an_unfinished_turn_keeps_its_plan_as_continuation_context() {
+    for event in [
+        RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        },
+        RuntimeEvent::TurnCancelled,
+    ] {
+        let mut s = busy_state();
+        stale_open_plan(&mut s);
+        reduce(&mut s, Action::Runtime(event.clone()));
+        assert!(s.plan.is_some(), "{event:?} may still be continued");
+    }
+}
+
+/// D6: the terminal marker of a finished turn must not carry a stale plan
+/// fraction. "任务已完成 · 计划 6/9" uses an old plan to argue against the
+/// outcome the runtime just reported — two authorities, one line.
+#[test]
+fn a_completed_turn_marker_does_not_deny_itself_with_a_stale_plan() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::VerificationUpdated {
@@ -5242,10 +5305,36 @@ fn turn_end_summary_carries_open_plan_progress() {
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = format!("{:?}", s.transcript.items());
-    assert!(
-        text.contains("计划 3/4"),
-        "turn-end must carry plan progress: {text}"
+    assert!(!text.contains("计划 5/9"), "{text}");
+    assert!(text.contains("verify ✓"), "the real outcome stays: {text}");
+}
+
+/// D7: an incomplete turn keeps the plan fraction — there it is true progress
+/// information, not a contradiction.
+#[test]
+fn an_incomplete_turn_marker_keeps_real_plan_progress() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        }),
     );
+    let text = format!("{:?}", s.transcript.items());
+    assert!(text.contains("计划 5/9"), "{text}");
+}
+
+/// D8: retiring the presentation must never fabricate plan state. Nothing
+/// here may mark the four open steps Done — the runtime cannot prove they ran.
+#[test]
+fn retiring_the_plan_never_fabricates_completed_steps() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    let text = format!("{:?}", s.transcript.items());
+    assert!(!text.contains("9/9"), "no invented completion: {text}");
+    assert!(!text.contains("计划"), "no plan claim at all: {text}");
 }
 
 /// R004 F1 adjacent: a KNOWN slash command with a small multiline paste (below

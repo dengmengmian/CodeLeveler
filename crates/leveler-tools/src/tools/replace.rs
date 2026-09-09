@@ -189,12 +189,36 @@ impl Tool for ReplaceTool {
         } else {
             ""
         };
+        // Where the replacement landed. `replace` rewrites a substring the
+        // model matched by content, so the line numbers exist only here — the
+        // arguments carry none, which is why its inline diff used to render
+        // without a gutter.
+        //
+        // A fuzzy match reports nothing: `old` is by definition not the text
+        // that was found, so its position cannot be computed from it, and a
+        // number derived from the request would be a guess presented as a fact
+        // about the user's file. Unknown stays unknown, and the UI falls back
+        // to an unnumbered diff.
+        let hunks = if fuzzy {
+            Vec::new()
+        } else {
+            super::applied_diff::literal_replacement_hunks(
+                &existing,
+                &input.old,
+                &input.new,
+                input.replace_all,
+            )
+        };
+        let mut meta = serde_json::json!({ "modified_files": [input.path.clone()] });
+        if let Some(diff) = super::applied_diff::unified_diff(&input.path, &hunks) {
+            meta["applied_diff"] = serde_json::Value::String(diff);
+        }
         Ok(ToolOutput::ok(format!(
             "Replaced {count} occurrence{} in {}{note}",
             if count == 1 { "" } else { "s" },
             input.path
         ))
-        .with_metadata(serde_json::json!({ "modified_files": [input.path] })))
+        .with_metadata(meta))
     }
 }
 
@@ -1023,6 +1047,44 @@ mod tests {
     /// sailed past the verification gate and the run was declared
     /// CompletedUnverified with real, unverified edits on disk. (Caught by the
     /// L1 P0 smoke run: ts-t1-01.)
+    /// The UI renders an edit from WHERE it landed. `replace` matches a
+    /// substring, so nothing in the request says which line that was — the
+    /// tool has to report it, or the inline diff has no line numbers at all.
+    #[tokio::test]
+    async fn a_successful_replace_reports_where_the_change_landed() {
+        let (c, dir) = ctx("one\ntwo\nthree\nfour\n");
+        let out = run(
+            c,
+            serde_json::json!({"path": "src/lib.rs", "old": "three", "new": "THREE"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        let diff = out.metadata["applied_diff"].as_str().expect("applied diff");
+        assert!(diff.contains("@@ -3,1 +3,1 @@"), "{diff}");
+        assert!(diff.contains("-three") && diff.contains("+THREE"), "{diff}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fuzzy match found text that is not `old`, so `old` cannot say where
+    /// it was. Reporting a location derived from the request would present a
+    /// guess as a fact about the user's file.
+    #[tokio::test]
+    async fn a_fuzzy_replace_reports_no_location_rather_than_a_guess() {
+        let (c, dir) = ctx("let x = \u{201c}hi\u{201d};\n");
+        let out = run(
+            c,
+            serde_json::json!({"path": "src/lib.rs", "old": "let x = \"hi\";", "new": "let x = \"bye\";"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.metadata.get("applied_diff").is_none(),
+            "unknown stays unknown: {:?}",
+            out.metadata
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_successful_replace_reports_the_file_it_modified() {
         let (c, dir) = ctx("alpha beta gamma\n");

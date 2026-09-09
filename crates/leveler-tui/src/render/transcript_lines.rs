@@ -90,7 +90,7 @@ pub fn item_render(
             let _ = tools_expanded;
             let locale = locale_from_ui_text(t);
             // Scrollback: finished tools show their final duration, not live (0).
-            out.extend(crate::activity_stream::render_group(
+            out.extend(crate::activity_stream::render_activity(
                 group, theme, wrap_width, locale, t, 0,
             ));
         }
@@ -1167,6 +1167,7 @@ mod tests {
                 duration_ms: Some(1),
                 parallel: false,
                 started_elapsed_secs: 0,
+                applied_diff: None,
             }],
             open: false,
             expanded: false,

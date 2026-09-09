@@ -413,6 +413,7 @@ fn renders_failed_tool_inline_and_tools_screen() {
             ok: false,
             preview: "exit: 101\n--- stderr ---\ncompiler error".into(),
             duration_ms: 13000,
+            applied_diff: None,
         }),
     );
     // History begins when the group CLOSES (next conversation item), not
@@ -484,6 +485,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             ok: true,
             preview: "line-one\nline-two\nline-three".into(),
             duration_ms: 10,
+            applied_diff: None,
         }),
     );
 
@@ -568,6 +570,7 @@ fn command_result_renders_as_important_activity_not_file_list() {
             ok: true,
             preview: "exit: 0\n--- stdout ---\nraw-shell-output\nsecond-line\n".into(),
             duration_ms: 1250,
+            applied_diff: None,
         }),
     );
 
@@ -656,6 +659,7 @@ fn list_files_scan_stays_out_of_conversation() {
                 ok: true,
                 preview: format!("{path}\nPROJECT_RULES.md\nMakefile"),
                 duration_ms: 3,
+                applied_diff: None,
             }),
         );
     }
@@ -676,6 +680,7 @@ fn list_files_scan_stays_out_of_conversation() {
             ok: true,
             preview: "ok".into(),
             duration_ms: 8,
+            applied_diff: None,
         }),
     );
 
@@ -887,6 +892,7 @@ fn recap_does_not_render_raw_markdown_markers() {
             ok: true,
             preview: "目标已完成".into(),
             duration_ms: 10,
+            applied_diff: None,
         }),
     );
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -1067,6 +1073,7 @@ fn a_silent_tool_group_leaves_no_hole() {
             ok: true,
             preview: "924 entries".into(),
             duration_ms: 120,
+            applied_diff: None,
         }),
     );
     reduce(

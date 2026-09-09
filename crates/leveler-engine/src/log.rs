@@ -668,6 +668,7 @@ mod tests {
                 is_error: false,
                 preview: "ok".into(),
                 agent_id: None,
+                applied_diff: None,
             },
             &mut sink,
         )
@@ -744,6 +745,7 @@ mod tests {
                         is_error: false,
                         preview: "ok".into(),
                         agent_id: None,
+                        applied_diff: None,
                     },
                     &mut |_| {},
                 )
@@ -1051,6 +1053,7 @@ mod tests {
                 is_error: false,
                 preview: "ok".into(),
                 agent_id: Some("agent-2".into()),
+                applied_diff: None,
             },
         ];
 

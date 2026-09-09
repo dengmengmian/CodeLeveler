@@ -125,6 +125,7 @@ mod tests {
                 ok: true,
                 preview: "ok".to_string(),
                 duration_ms: 1,
+                applied_diff: None,
             },
         );
         assert!(views.view(&session_id).active_tools.is_empty());

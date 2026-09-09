@@ -84,9 +84,17 @@ pub struct SpentBefore {
 /// spend allowed); `Some(n)` = the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundLimits {
-    /// Absolute round ceiling for this run. Fires regardless of progress or
-    /// policy; the host cannot lift it mid-run.
-    pub round_ceiling: u32,
+    /// Absolute round ceiling for this run, when the host pins one. Fires
+    /// regardless of progress; the host cannot lift it mid-run.
+    ///
+    /// `None` means no ordinary round count ends this run — reserved for a
+    /// run whose lifetime is defined semantically (a top-level interactive
+    /// turn). Such a run is still bounded by every other mechanical guard:
+    /// cancellation, the token/cost/duration budgets, and the loop's own
+    /// repeated-call and no-progress watchdogs. A round count is a property
+    /// of the model's tool cadence, not of the user's task, so it cannot be
+    /// what decides that the task is over.
+    pub round_ceiling: Option<u32>,
     /// This run's own round limit, when the host pins one. Reaching it ends
     /// the run normally (`StopReason::WindowLimit`), not as a budget stop.
     pub window_round_limit: Option<u32>,
@@ -105,7 +113,7 @@ pub struct RoundLimits {
 impl Default for RoundLimits {
     fn default() -> Self {
         Self {
-            round_ceiling: DEFAULT_ROUND_CEILING,
+            round_ceiling: Some(DEFAULT_ROUND_CEILING),
             window_round_limit: None,
             max_model_tokens: None,
             max_cost_usd_micros: None,
@@ -129,8 +137,8 @@ impl RoundLimits {
 pub struct RoundAdmissionInput {
     /// Rounds completed so far in this run.
     pub round: u32,
-    /// The absolute round ceiling — the unconditional circuit breaker.
-    pub round_ceiling: u32,
+    /// The absolute round ceiling, when the host pins one.
+    pub round_ceiling: Option<u32>,
     /// The run's own round limit, when one is pinned.
     pub window_round_limit: Option<u32>,
     /// Tokens spent against the cap (prior spend included), and the cap.
@@ -155,8 +163,8 @@ pub enum RoundAdmission {
     Admit,
     /// A resource cap is spent, with the dimension that fired.
     StopBudget(BudgetExhaustion),
-    /// The absolute round ceiling. Not a budget: a circuit breaker that fires
-    /// regardless of progress or policy.
+    /// The pinned round ceiling. Not a budget: a circuit breaker that fires
+    /// regardless of progress, for runs whose host pinned one.
     StopRoundCeiling { ceiling: u32 },
     /// The run's pinned round limit is reached. The run ends normally; the
     /// host decides whether another run opens.
@@ -190,10 +198,10 @@ pub fn admit_next_round(input: &RoundAdmissionInput) -> RoundAdmission {
             max,
         ));
     }
-    if input.round >= input.round_ceiling {
-        return RoundAdmission::StopRoundCeiling {
-            ceiling: input.round_ceiling,
-        };
+    if let Some(ceiling) = input.round_ceiling
+        && input.round >= ceiling
+    {
+        return RoundAdmission::StopRoundCeiling { ceiling };
     }
     if input
         .window_round_limit
@@ -237,7 +245,7 @@ mod tests {
     fn open() -> RoundAdmissionInput {
         RoundAdmissionInput {
             round: 1,
-            round_ceiling: 100,
+            round_ceiling: Some(100),
             window_round_limit: None,
             model_tokens_spent: 0,
             max_model_tokens: None,
@@ -281,16 +289,26 @@ mod tests {
         ));
     }
 
-    /// The ceiling is unconditional: no progress signal and no policy can move
-    /// it, which is the whole reason it exists.
+    /// A pinned ceiling is unconditional: no progress signal moves it, which
+    /// is the whole reason it exists.
     #[test]
-    fn the_round_ceiling_is_unconditional() {
+    fn a_pinned_round_ceiling_is_unconditional() {
         let mut input = open();
         input.round = 100;
         assert_eq!(
             admit_next_round(&input),
             RoundAdmission::StopRoundCeiling { ceiling: 100 }
         );
+    }
+
+    /// No pinned ceiling means no round count ends the run. The other
+    /// mechanical guards still do — this only removes the count.
+    #[test]
+    fn an_unpinned_round_ceiling_never_stops_the_run() {
+        let mut input = open();
+        input.round_ceiling = None;
+        input.round = 10_000;
+        assert_eq!(admit_next_round(&input), RoundAdmission::Admit);
     }
 
     /// A window limit ends the run without claiming a budget was exhausted —

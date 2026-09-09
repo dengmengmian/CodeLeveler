@@ -209,6 +209,11 @@ pub enum EngineEvent {
         /// The delegated agent that made this call (see `ToolCallStarted`).
         #[serde(default)]
         agent_id: Option<String>,
+        /// Canonical unified diff of what an edit ACTUALLY changed, produced
+        /// by the tool that made it. Absent for every other call, and for an
+        /// edit whose location could not be established.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_diff: Option<String>,
     },
     WorkspaceSnapshotCreated {
         call_id: String,
@@ -971,12 +976,14 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 name,
                 is_error,
                 preview,
+                applied_diff,
             } => EngineEvent::ToolCallFinished {
                 call_id: id,
                 name,
                 is_error,
                 preview,
                 agent_id: None,
+                applied_diff,
             },
             A::WorkspaceSnapshot { call_id, snapshot } => {
                 EngineEvent::WorkspaceSnapshotCreated { call_id, snapshot }
@@ -1146,6 +1153,7 @@ mod contract_tests {
                 is_error: false,
                 preview: "source".into(),
                 agent_id: None,
+                applied_diff: None,
             }
             .data_class(),
             DataClass::LocalOnly

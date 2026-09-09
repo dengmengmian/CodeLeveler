@@ -1,5 +1,6 @@
 //! Built-in tools (spec §18.3).
 
+pub mod applied_diff;
 mod apply_patch;
 mod blast_radius;
 mod browser;

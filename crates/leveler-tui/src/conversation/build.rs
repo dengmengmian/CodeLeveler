@@ -153,7 +153,7 @@ pub fn build_conversation_lines_with_hits(
                 if crate::activity_stream::group_has_disclosure(group) {
                     hits.push((out.len(), idx));
                 }
-                out.extend(crate::activity_stream::render_group(
+                out.extend(crate::activity_stream::render_activity(
                     group,
                     theme,
                     width,

@@ -856,6 +856,7 @@ async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
             is_error: false,
             preview: "done".into(),
             agent_id: Some("agent-a".to_string()),
+            applied_diff: None,
         },
         &mut |_| {},
     )

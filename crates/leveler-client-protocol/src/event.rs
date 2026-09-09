@@ -132,6 +132,17 @@ pub enum RuntimeEvent {
         ok: bool,
         preview: String,
         duration_ms: u64,
+        /// Canonical unified diff of what an edit ACTUALLY changed, with the
+        /// line numbers it landed on, produced by the tool that made it.
+        ///
+        /// A UI renders an edit from THIS, not from the call's arguments: an
+        /// `apply_patch` hunk is located by content and `replace` matches a
+        /// substring, so the request never says where the change went. `None`
+        /// for every non-edit call, and for an edit whose location could not
+        /// be established — the UI must then show no line numbers rather than
+        /// invent one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_diff: Option<String>,
     },
     /// The execution plan was created or a step's status changed (spec §20).
     PlanUpdated { plan: UiPlan },
@@ -689,6 +700,7 @@ mod tests {
                 ok: true,
                 preview: "ok".to_string(),
                 duration_ms: 42,
+                applied_diff: None,
             },
             "tool_call_completed",
         );

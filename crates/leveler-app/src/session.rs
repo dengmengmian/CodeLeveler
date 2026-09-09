@@ -123,11 +123,13 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             is_error,
             preview,
             agent_id: None,
+            applied_diff,
         } => AgentEvent::ToolResult {
             id: call_id,
             name,
             is_error,
             preview,
+            applied_diff,
         },
         // A delegated agent's canonical events are durable FACTS for recovery,
         // not a second UI stream: the parent already surfaces child work as

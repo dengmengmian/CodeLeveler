@@ -404,6 +404,13 @@
         "type"
       ],
       "properties": {
+        "applied_diff": {
+          "description": "Canonical unified diff of what an edit ACTUALLY changed, with the line numbers it landed on, produced by the tool that made it.\n\nA UI renders an edit from THIS, not from the call's arguments: an `apply_patch` hunk is located by content and `replace` matches a substring, so the request never says where the change went. `None` for every non-edit call, and for an edit whose location could not be established — the UI must then show no line numbers rather than invent one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "duration_ms": {
           "type": "integer",
           "format": "uint64",

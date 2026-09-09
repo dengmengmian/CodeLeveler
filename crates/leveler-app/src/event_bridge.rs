@@ -31,13 +31,14 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
                 },
-                // Absolute round-ceiling breaker: a turn that would not end on
-                // its own was force-stopped. Not a liftable budget, so its own
-                // wording — do not point at /goal as if more work-window helps.
+                // A pinned round ceiling fired: bounded work reached its edge.
+                // The runtime's own `stop_detail` here is a machine token
+                // ("round ceiling reached") that must never reach the screen,
+                // so this outcome always speaks in product wording. Not a
+                // liftable budget, so do not point at /goal as if more
+                // work-window helps.
                 StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| {
-                        "触及单轮回合上限 · 已强制终止,请检查是否陷入循环".into()
-                    }),
+                    reason: "达到执行回合上限 · 已停止,请检查是否陷入循环".into(),
                 },
                 StopReason::Blocked => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
@@ -273,6 +274,7 @@ impl EventBridge {
                 is_error,
                 preview,
                 agent_id: None,
+                applied_diff,
             } => {
                 // Pair with the ToolCall by id, whatever order results arrive in.
                 // A denial/guard result has no prior ToolCall — synthesize a
@@ -294,6 +296,7 @@ impl EventBridge {
                     ok: !is_error,
                     preview,
                     duration_ms: start.elapsed().as_millis() as u64,
+                    applied_diff,
                 });
             }
             EngineEvent::WorkspaceSnapshotCreated { .. } => {
@@ -811,6 +814,7 @@ mod bridge_tests {
                 name: "apply_patch".into(),
                 is_error: false,
                 preview: "AP".into(),
+                applied_diff: None,
             },
         );
         forward_agent(
@@ -820,6 +824,7 @@ mod bridge_tests {
                 name: "grep".into(),
                 is_error: false,
                 preview: "GR".into(),
+                applied_diff: None,
             },
         );
 
@@ -1108,6 +1113,7 @@ mod bridge_tests {
                 name: "grep".into(),
                 is_error: true,
                 preview: "search budget reached".into(),
+                applied_diff: None,
             },
         );
         let events = drain(&mut rx);
@@ -1304,6 +1310,7 @@ mod projection_equivalence {
             is_error,
             preview: "out".into(),
             agent_id: agent.map(str::to_string),
+            applied_diff: None,
         }
     }
 

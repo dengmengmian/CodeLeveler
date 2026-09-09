@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
 
-use super::patch::{FileChange, apply_update, parse_patch};
+use super::applied_diff::{self, AppliedHunk};
+use super::patch::{FileChange, apply_update_located, parse_patch};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 /// Precise format spec + example given to the model. Weaker models must be told
@@ -280,6 +281,11 @@ impl Tool for ApplyPatchTool {
         let mut ops = Vec::new();
         let mut summary = Vec::new();
         let mut modified = Vec::new();
+        // Where each file's change actually landed. A hunk is located by
+        // content, so only the applier knows its line numbers — the patch text
+        // the model wrote carries none, and a presenter must never re-derive
+        // a position from the request.
+        let mut located: Vec<(String, Vec<AppliedHunk>)> = Vec::new();
         let scope = context.write_scope();
 
         for change in changes {
@@ -298,6 +304,9 @@ impl Tool for ApplyPatchTool {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(ToolError::Io(format!("stat {path}: {e}"))),
+                    }
+                    if let Some(hunk) = applied_diff::whole_file_hunk(&content, true) {
+                        located.push((path.clone(), vec![hunk]));
                     }
                     ops.push(Op::Create {
                         path: resolved,
@@ -325,6 +334,9 @@ impl Tool for ApplyPatchTool {
                         .await
                         .map_err(|e| ToolError::Io(format!("stat {path}: {e}")))?
                         .permissions();
+                    if let Some(hunk) = applied_diff::whole_file_hunk(&expected, false) {
+                        located.push((path.clone(), vec![hunk]));
+                    }
                     ops.push(Op::Remove {
                         path: resolved,
                         expected,
@@ -373,7 +385,7 @@ impl Tool for ApplyPatchTool {
                         )));
                     }
 
-                    let updated = match apply_update(&existing, &chunks) {
+                    let (updated, hunks) = match apply_update_located(&existing, &chunks) {
                         Ok(s) => s,
                         Err(reason) => {
                             return Ok(ToolOutput::error(format!(
@@ -381,6 +393,7 @@ impl Tool for ApplyPatchTool {
                             )));
                         }
                     };
+                    located.push((path.clone(), hunks));
 
                     match move_to {
                         Some(dest) => {
@@ -513,7 +526,17 @@ impl Tool for ApplyPatchTool {
         }
 
         let body = format!("Applied patch:\n{}\n", summary.join("\n"));
-        Ok(ToolOutput::ok(body).with_metadata(serde_json::json!({ "modified_files": modified })))
+        // The applied diff is presentation truth, not model context: it rides
+        // in metadata, never in the tool output the model reads back.
+        let applied: String = located
+            .iter()
+            .filter_map(|(path, hunks)| applied_diff::unified_diff(path, hunks))
+            .collect();
+        let mut meta = serde_json::json!({ "modified_files": modified });
+        if !applied.is_empty() {
+            meta["applied_diff"] = serde_json::Value::String(applied);
+        }
+        Ok(ToolOutput::ok(body).with_metadata(meta))
     }
 }
 
@@ -567,6 +590,50 @@ mod tests {
             leveler_execution::PermissionProfile::Assisted,
             &[("src/lib.rs", "fn a() {}\nfn b() {}\n")],
         )
+    }
+
+    /// A `*** Update File:` hunk carries no line numbers — it is located by
+    /// content — so the applier is the only layer that can say where it went.
+    /// Without this, the inline diff had no gutter at all.
+    #[tokio::test]
+    async fn a_patch_reports_the_lines_each_hunk_landed_on() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("src/lib.rs", "one\ntwo\nthree\nfour\nfive\n")],
+        );
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-three\n+THREE\n+THREE_B\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let diff = out.metadata["applied_diff"].as_str().expect("applied diff");
+        assert!(diff.contains("@@ -3,1 +3,2 @@"), "{diff}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new file's diff numbers from line 1 instead of losing its gutter
+    /// because there is no old side.
+    #[tokio::test]
+    async fn an_added_file_reports_a_diff_numbered_from_one() {
+        let (context, dir) = ctx();
+        let patch = "*** Begin Patch\n*** Add File: src/new.rs\n+pub fn a() {}\n+pub fn b() {}\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let diff = out.metadata["applied_diff"].as_str().expect("applied diff");
+        assert!(diff.contains("@@ -0,0 +1,2 @@"), "{diff}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Read a file, let something else rewrite it, then patch it. The patch must

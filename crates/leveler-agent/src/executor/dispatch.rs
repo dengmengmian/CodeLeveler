@@ -25,6 +25,17 @@ pub(crate) fn extract_image(metadata: &serde_json::Value) -> Option<ContentPart>
 ///
 /// The execution layer states this; the executor never re-derives it from tool
 /// names or arguments. A tool that runs nothing reports nothing.
+/// The canonical unified diff an edit tool reported for what it actually
+/// changed. Presentation truth, produced by the layer that owns the location:
+/// no reader may re-derive a line number from the model's request instead.
+pub(crate) fn extract_applied_diff(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("applied_diff")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn extract_executed_commands(metadata: &serde_json::Value) -> Vec<Vec<String>> {
     let Some(commands) = metadata.get("executed_commands").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -213,6 +224,7 @@ pub(crate) fn deny_call(
         name: call.name.clone(),
         is_error: true,
         preview: message.clone(),
+        applied_diff: None,
     });
     ContentPart::ToolResult {
         result: ToolResultContent {

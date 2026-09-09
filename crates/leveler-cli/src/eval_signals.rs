@@ -287,6 +287,7 @@ impl SignalCollector {
                 name,
                 is_error,
                 preview,
+                ..
             } => {
                 if matches!(name.as_str(), "apply_patch" | "replace") {
                     self.signals.edit_attempts += 1;
@@ -462,6 +463,7 @@ mod tests {
             name: name.into(),
             is_error,
             preview: preview.into(),
+            applied_diff: None,
         }
     }
 
@@ -668,6 +670,7 @@ mod tests {
             name: name.to_string(),
             is_error: false,
             preview: "ok".to_string(),
+            applied_diff: None,
         });
     }
 
@@ -777,6 +780,7 @@ mod tests {
             name: "read_file".to_string(),
             is_error: true,
             preview: "file not found: internal/dispatch/router.go".to_string(),
+            applied_diff: None,
         });
         let s = c.finish(false);
         assert_eq!(
@@ -887,6 +891,7 @@ mod tests {
             name: "run_command".to_string(),
             is_error: true,
             preview: "scan.go:12: not enough arguments".to_string(),
+            applied_diff: None,
         });
         ok_call(
             &mut c,

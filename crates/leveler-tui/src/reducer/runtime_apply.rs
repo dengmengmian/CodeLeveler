@@ -168,13 +168,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             ok,
             preview,
             duration_ms,
+            applied_diff,
         } => {
             // Strip ANSI and controls so vitest/npm color codes do not show as
             // `[32m` garbage when ESC was already dropped (cell TUI).
             let preview = leveler_core::sanitize_terminal_output(&preview);
             state
                 .transcript
-                .complete_tool(&id, ok, preview, duration_ms);
+                .complete_tool(&id, ok, preview, duration_ms, applied_diff);
             // The tool is done; leaving its label up while the model thinks
             // reads as a hung tool ("读取 x… (4m)"). Fall back to the
             // thinking indicator until the next activity arrives.
@@ -679,11 +680,19 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     state.transcript.finalize_in_flight();
     state.cancel_armed = false;
     state.force_cancel_armed = false;
-    // Answer is in the transcript; a fully-done plan chrome is pure clutter.
-    if state
-        .plan
-        .as_ref()
-        .is_some_and(|p| !crate::workbench::plan_panel_should_show(p))
+    // The plan is a LIVE progress surface, and this turn's work is over: a
+    // sticky "第 7/9 项进行中" would claim work nobody is doing. This is
+    // presentation retirement only — the plan is NOT the completion authority
+    // (it never blocks a turn from ending), and nothing here marks its open
+    // steps done, because the runtime cannot prove they ran. An unfinished
+    // turn keeps its plan: there it is the continuation context the user
+    // needs. A fully-done plan is dropped whatever the outcome — the answer
+    // is already in the transcript.
+    if work_is_finished(status)
+        || state
+            .plan
+            .as_ref()
+            .is_some_and(|p| !crate::workbench::plan_panel_should_show(p))
     {
         state.plan = None;
     }
@@ -769,6 +778,20 @@ fn estimate_text_tokens(text: &str) -> u32 {
 /// Success verify chrome (`verify ✓`) is **outcome-gated**: an Unverified turn
 /// must never show it even when gate `passed` is true (`passed` means
 /// !Failed, not Verdict::Verified).
+/// Terminal states where the WORK itself is finished. Task outcome, plan
+/// progress and verification outcome are three separate facts: a finished task
+/// with a plan last reported at 6/9 and verification at 2/3 is entirely legal,
+/// and the outcome is the runtime's to report, not the plan's to dispute.
+fn work_is_finished(status: TurnEndStatus) -> bool {
+    matches!(
+        status,
+        TurnEndStatus::Completed
+            | TurnEndStatus::Answered
+            | TurnEndStatus::Unverified
+            | TurnEndStatus::ChecksFailed
+    )
+}
+
 fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(diff) = &state.diff
@@ -778,12 +801,18 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
     }
     // Unverified / incomplete / failed / cancelled: no success verify mark.
     let allow_success_verify = matches!(status, TurnEndStatus::Completed | TurnEndStatus::Answered);
-    // Open plan steps travel with the summary: a green gate line must not read
-    // as full task success while the plan panel says work remains (R004 F4).
-    let plan_open = state.plan.as_ref().and_then(|p| {
-        let (k, n) = crate::workbench::plan_done_total(p);
-        (n > 0 && k < n).then_some((k, n))
-    });
+    // Open plan steps travel with the summary only while the turn can still be
+    // continued — there "计划 5/9" is real progress information. On a finished
+    // turn it would be a stale plan arguing against the outcome the runtime
+    // just reported, which is two authorities on one line.
+    let plan_open = state
+        .plan
+        .as_ref()
+        .filter(|_| !work_is_finished(status))
+        .and_then(|p| {
+            let (k, n) = crate::workbench::plan_done_total(p);
+            (n > 0 && k < n).then_some((k, n))
+        });
     if let Some(v) = &state.verification {
         if let Some(passed) = v.passed {
             if passed {

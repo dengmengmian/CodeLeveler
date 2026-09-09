@@ -460,6 +460,45 @@ pub fn lookup(name: &str) -> Option<&'static ToolTaxonomyEntry> {
     BUILTIN_TAXONOMY.iter().find(|e| e.name == name)
 }
 
+/// What KIND of work a call is, for grouping it into one narrative activity.
+///
+/// Thinner than [`ToolKind`] on purpose: the conversation does not care that a
+/// grep and a read are different tools, only that both are the agent looking
+/// around. It is derived from the taxonomy, never a second tool registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityClass {
+    /// Looking around: reads, searches, listings, code intelligence.
+    Explore,
+    /// Changing the tree: edits and writes.
+    Edit,
+    /// Running commands.
+    Shell,
+    /// Asking the user / plan / goal bookkeeping — keeps its own presentation.
+    Interaction,
+    /// Anything else, including tools the taxonomy has never heard of.
+    Work,
+}
+
+/// The activity class of one tool call.
+pub fn activity_class(name: &str) -> ActivityClass {
+    let Some(entry) = lookup(name) else {
+        return ActivityClass::Work;
+    };
+    match entry.kind {
+        ToolKind::Read | ToolKind::Search | ToolKind::ListDir | ToolKind::Lsp => {
+            ActivityClass::Explore
+        }
+        ToolKind::WebSearch => ActivityClass::Explore,
+        ToolKind::Edit | ToolKind::Write => ActivityClass::Edit,
+        // Task management shares the Execute kind but is not a shell command.
+        ToolKind::Execute if matches!(name, "run_command" | "shell_command") => {
+            ActivityClass::Shell
+        }
+        ToolKind::Plan | ToolKind::Goal | ToolKind::AskUser => ActivityClass::Interaction,
+        _ => ActivityClass::Work,
+    }
+}
+
 /// Resolve Conversation visibility for a tool call.
 ///
 /// Shell probes (`ls`/`tree`/`find`/`pwd`/file-exists tests) demote to

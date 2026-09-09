@@ -244,6 +244,7 @@ fn render_event_jsonl(event: AgentEvent) {
             name,
             is_error,
             preview,
+            ..
         } => serde_json::json!({
             "type": "tool_result", "id": id, "tool": name, "is_error": is_error, "preview": preview,
         }),

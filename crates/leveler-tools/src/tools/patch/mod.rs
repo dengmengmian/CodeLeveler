@@ -6,7 +6,7 @@ mod apply;
 mod parse;
 mod seek;
 
-pub use apply::apply_update;
+pub use apply::{apply_update, apply_update_located};
 pub use parse::{FileChange, UpdateChunk, parse_patch};
 
 /// Errors from parsing a patch. (Apply failures are returned as plain strings by

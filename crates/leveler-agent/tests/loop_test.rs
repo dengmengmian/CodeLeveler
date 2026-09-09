@@ -2162,6 +2162,132 @@ impl ModelRuntime for RequestRecordingRuntime {
 
 const AUDIT_MARKER: &str = "Treat completion as unproven";
 
+/// C1: a top-level interactive turn (`UntilTerminal`, no explicit
+/// `max_rounds`) must not be cut off by a hidden round count. The old code
+/// handed every such turn a 100-round ceiling, so a long task stopped with
+/// "round ceiling reached" and the user had to type 「继续」 to resume the
+/// very same work.
+#[tokio::test]
+async fn an_until_terminal_turn_is_not_cut_off_by_a_hidden_round_count() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-unbounded-{}",
+        std::process::id() as u64 * 53 + 11
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    // Distinct files so every read is novel progress: this evades the
+    // stagnation guards, leaving only the round count in question.
+    for i in 0..130 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let mut responses: Vec<_> = (0..130)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("done reading everything"));
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0, // 0 => UntilTerminal (no continuation round limit)
+    );
+
+    let outcome = executor
+        .run(
+            "read every file",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::TurnLimitReached,
+        "a top-level turn must not end on a hidden round count: {outcome:?}"
+    );
+    assert!(
+        outcome.rounds > 100,
+        "the turn ran past the old ceiling: {} rounds",
+        outcome.rounds
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C3: bounded work keeps its hard edge. A measured unit (eval case,
+/// orchestration node) must still stop exactly at its window.
+#[tokio::test]
+async fn bounded_continuation_still_stops_at_its_window() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-bounded-{}",
+        std::process::id() as u64 * 59 + 17
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..20 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let responses: Vec<_> = (0..20)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    // 3 => Bounded { max_rounds: 3 }, with no explicit StepLimits.max_rounds.
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+
+    let outcome = executor
+        .run(
+            "read forever",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.rounds, 3, "bounded work stops at its window");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C2: an explicit `StepLimits.max_rounds` is still honoured exactly, whatever
+/// the continuation policy says.
 #[tokio::test]
 async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
     // Architectural backstop: a turn that keeps issuing tool calls forever (a

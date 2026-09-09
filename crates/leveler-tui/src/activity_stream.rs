@@ -84,24 +84,32 @@ pub(crate) fn render_group(
         }
     }
     // A concurrent batch gets one quiet dim header so the user sees these
-    // calls ran together rather than one after another.
-    let parallel_n = if live_group {
-        // Live, the header answers "how many are running NOW" — settled
-        // members are already counted by the compact ✓ line above.
-        group
-            .calls
+    // calls ran together rather than one after another. Every count here is
+    // taken from the SAME visible projection the rows below are drawn from —
+    // "5 in parallel" over three visible rows is a lie the user can see.
+    if live_group {
+        // Live, the header answers "what is happening NOW" — settled members
+        // are already counted by the compact ✓ line above.
+        let running: Vec<&ToolCallBlock> = visible
             .iter()
-            .filter(|c| c.parallel && c.status == ToolStatus::Running)
-            .count()
+            .copied()
+            .filter(|c| c.status == ToolStatus::Running)
+            .collect();
+        if running.len() >= 2 {
+            out.push(Line::from(Span::styled(
+                truncate_display(&running_header_label(&running, t), width),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
     } else {
-        group.calls.iter().filter(|c| c.parallel).count()
-    };
-    if parallel_n >= 2 {
-        let label = t.parallel_header.replace("{}", &parallel_n.to_string());
-        out.push(Line::from(Span::styled(
-            truncate_display(&label, width),
-            Style::default().fg(theme.text.muted),
-        )));
+        let parallel_n = visible.iter().filter(|c| c.parallel).count();
+        if parallel_n >= 2 {
+            let label = t.parallel_header.replace("{}", &parallel_n.to_string());
+            out.push(Line::from(Span::styled(
+                truncate_display(&label, width),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
     }
     const LIVE_RUNNING_ROWS: usize = 3;
     let mut running_shown = 0usize;
@@ -343,6 +351,22 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
         (true, Work, 1) => t.disclosure_tools_one.to_string(),
         _ => t.disclosure_tools_many.replace("{}", &n.to_string()),
     }
+}
+
+/// The live header for a batch that is running NOW, in the same user language
+/// as the finished disclosure label: "正在读取 7 个文件", not "7 个工具".
+fn running_header_label(running: &[&ToolCallBlock], t: &UiText) -> String {
+    use DisclosureClass::*;
+    let n = running.len();
+    let class = disclosure_class(&running[0].name);
+    let uniform = running.iter().all(|c| disclosure_class(&c.name) == class);
+    let template = match (uniform, class) {
+        (true, Read) => t.running_read_many,
+        (true, Shell) => t.running_shell_many,
+        (true, Search) => t.running_search,
+        _ => t.running_work_many,
+    };
+    template.replace("{}", &n.to_string())
 }
 
 /// The first meaningful error line of a failed call, for the collapsed row.
@@ -951,6 +975,34 @@ fn append_call_detail(
     out.extend(detail.into_iter().skip(1));
 }
 
+/// Tool activity is the SECOND level of the conversation: the user's prompt
+/// and the agent's prose own the content baseline, and what the agent DID to
+/// answer sits one level inside them (its own details one level deeper still).
+/// The block is rendered against the narrower inner width so the indent can
+/// never push a row past the right gutter.
+pub(crate) const ACTIVITY_INDENT: &str = "  ";
+
+/// A tool group placed at the conversation's activity level.
+pub(crate) fn render_activity(
+    group: &ToolGroupBlock,
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(ACTIVITY_INDENT.len());
+    render_group(group, theme, inner, locale, t, now_elapsed_secs)
+        .into_iter()
+        .map(|line| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::raw(ACTIVITY_INDENT));
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Plain-text lines for tests (no styling).
 #[cfg(test)]
 pub(crate) fn render_group_text(
@@ -984,6 +1036,7 @@ mod tests {
             duration_ms: Some(5),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         }
     }
 
@@ -1001,6 +1054,152 @@ mod tests {
             open: true,
             expanded: false,
         }
+    }
+
+    /// CASE B: a wide parallel read burst must stay bounded — one semantic
+    /// header in user language, a few live rows, and a truthful count of the
+    /// rest. Seven equal-weight tool log lines is a trace, not a narrative.
+    #[test]
+    fn a_wide_parallel_read_burst_stays_bounded_under_one_semantic_header() {
+        let mut calls: Vec<ToolCallBlock> = (0..7)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Running,
+                )
+            })
+            .collect();
+        for c in &mut calls {
+            c.parallel = true;
+        }
+        let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        assert!(lines.len() <= 6, "bounded live area: {lines:?}");
+        let head = &lines[0];
+        assert!(head.contains('7'), "the header counts the batch: {head}");
+        assert!(head.contains("读取"), "user language, not tools: {head}");
+        assert!(!head.contains("工具"), "no runtime vocabulary: {head}");
+        let hidden: usize = lines
+            .iter()
+            .filter(|l| l.contains("还有"))
+            .map(|l| {
+                l.chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        let shown = lines.iter().filter(|l| l.contains(".rs")).count();
+        assert_eq!(
+            shown + hidden,
+            7,
+            "every member is shown or counted: {lines:?}"
+        );
+    }
+
+    /// CASE C: hidden probes must not inflate a conversation-facing count.
+    /// "5 in parallel" over three visible rows is a lie the user can see.
+    #[test]
+    fn silent_members_never_inflate_the_parallel_count() {
+        let mut calls: Vec<ToolCallBlock> = (0..3)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Running,
+                )
+            })
+            .collect();
+        calls.extend((0..2).map(|i| {
+            call(
+                "list_files",
+                &format!(r#"{{"path":"d{i}"}}"#),
+                ToolStatus::Running,
+            )
+        }));
+        for c in &mut calls {
+            c.parallel = true;
+        }
+        let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        assert!(lines[0].contains('3'), "{lines:?}");
+        assert!(
+            !lines[0].contains('5'),
+            "silent probes are not shown: {lines:?}"
+        );
+    }
+
+    /// CASE F: a tool the taxonomy has never heard of (MCP / future
+    /// extension) still folds, but in product language — the conversation
+    /// never says "tools".
+    #[test]
+    fn an_unknown_tool_folds_as_an_operation_not_a_tool() {
+        let g = group(vec![
+            call("mcp__notion__search", r#"{"q":"a"}"#, ToolStatus::Ok),
+            call("mcp__notion__fetch", r#"{"q":"b"}"#, ToolStatus::Ok),
+        ]);
+        assert!(group_has_disclosure(&g));
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].contains("2 项操作"), "{lines:?}");
+        assert!(!lines[0].contains("工具"), "{lines:?}");
+        let lines = render_group_text(&g, 100, Locale::En);
+        assert!(!lines[0].to_lowercase().contains("tool"), "{lines:?}");
+    }
+
+    /// CASE E: an edit keeps its own result visible, but it is no longer able
+    /// to hold a neighbouring read or shell group open — each finished
+    /// activity folds on its own.
+    #[test]
+    fn an_edit_group_does_not_keep_its_neighbours_expanded() {
+        let reads = group(vec![
+            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            call("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok),
+        ]);
+        let edit = group(vec![call(
+            "apply_patch",
+            r#"{"patch":"*** Begin Patch\n*** Update File: a.rs\n*** End Patch"}"#,
+            ToolStatus::Ok,
+        )]);
+        let shell = group(vec![call(
+            "run_command",
+            r#"{"command":"cargo test"}"#,
+            ToolStatus::Ok,
+        )]);
+        assert!(group_has_disclosure(&reads), "reads fold on their own");
+        assert!(!group_has_disclosure(&edit), "the diff IS the result");
+        assert!(group_has_disclosure(&shell), "commands fold on their own");
+    }
+
+    /// The conversation has three levels: prompt / prose at column 0, what
+    /// the agent DID one level in, and the details of that one level deeper.
+    #[test]
+    fn tool_activity_renders_one_level_inside_the_narrative() {
+        let g = group(vec![call(
+            "read_file",
+            r#"{"path":"a.rs"}"#,
+            ToolStatus::Ok,
+        )]);
+        let indented = render_activity(
+            &g,
+            &Theme::no_color(),
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            0,
+        );
+        let text: Vec<String> = indented
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            text.iter().all(|l| l.starts_with("  ")),
+            "activity sits inside the narrative: {text:?}"
+        );
     }
 
     /// THE regression: an OPEN group whose members are all momentarily
@@ -1315,7 +1514,7 @@ mod tests {
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("执行了 1 个工具"),
+            lines[0].starts_with('▸') && lines[0].contains("完成 1 项操作"),
             "unknown tools fall back to the generic label: {lines:?}"
         );
         let mut open = group(vec![call(
@@ -1338,7 +1537,7 @@ mod tests {
         let g = group(vec![call("web_search", r#"{"query":"x"}"#, ToolStatus::Ok)]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("执行了 1 个工具"),
+            lines[0].starts_with('▸') && lines[0].contains("完成 1 项操作"),
             "web tools are ordinary finished work: {lines:?}"
         );
         // LSP kind reads as search work.
@@ -1383,7 +1582,7 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("执行了 3 个工具"),
+            lines[0].starts_with('▸') && lines[0].contains("完成 3 项操作"),
             "a mixed sequential batch gets the generic count: {lines:?}"
         );
     }
@@ -1401,7 +1600,7 @@ mod tests {
         assert!(
             lines[0].starts_with('▸')
                 && lines[0].contains('✗')
-                && lines[0].contains("工具执行失败"),
+                && lines[0].contains("操作执行失败"),
             "an unknown failed tool must not read like success: {lines:?}"
         );
         assert!(
@@ -1627,7 +1826,7 @@ mod tests {
         open.expanded = true;
         let lines = render_group_text(&open, 100, Locale::Zh);
         assert!(
-            lines.iter().any(|l| l.contains("并行执行 3 个工具")),
+            lines.iter().any(|l| l.contains("并行处理 3 项")),
             "expanded parallel batch keeps its concurrency header: {lines:?}"
         );
     }
@@ -1641,7 +1840,7 @@ mod tests {
         g.expanded = true;
         let lines = render_group_text(&g, 100, Locale::En);
         assert!(
-            lines.iter().any(|l| l.contains("2 tools in parallel")),
+            lines.iter().any(|l| l.contains("2 tasks in parallel")),
             "{lines:?}"
         );
     }
@@ -1655,7 +1854,7 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            !lines.iter().any(|l| l.contains("并行执行")),
+            !lines.iter().any(|l| l.contains("并行处理")),
             "one parallel call is not a batch: {lines:?}"
         );
     }

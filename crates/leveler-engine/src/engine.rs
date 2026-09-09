@@ -1292,6 +1292,7 @@ impl TaskEngine {
                 is_error,
                 preview,
                 agent_id: call.agent_id.clone(),
+                applied_diff: None,
             },
             observer,
         )
@@ -1314,6 +1315,7 @@ impl TaskEngine {
                 is_error: true,
                 preview: reason.to_string(),
                 agent_id: call.agent_id.clone(),
+                applied_diff: None,
             },
             observer,
         )
@@ -2122,6 +2124,7 @@ pub async fn acknowledge_crash_window(
                           not replayed"
                     .to_string(),
                 agent_id: call.agent_id.clone(),
+                applied_diff: None,
             },
             &mut |_| {},
         )

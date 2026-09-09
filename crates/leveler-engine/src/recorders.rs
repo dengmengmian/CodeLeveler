@@ -172,6 +172,7 @@ impl leveler_agent::EventBarrier for PumpBarrier {
                 is_error,
                 preview,
                 agent_id: Some(agent_id),
+                applied_diff: None,
             },
             leveler_agent::ChildToolEvent::Ownership {
                 agent_id,
@@ -336,6 +337,7 @@ mod tests {
                 is_error: false,
                 preview: "ok".into(),
                 agent_id,
+                applied_diff: None,
             });
             emitted += 2;
         }
@@ -369,6 +371,7 @@ mod tests {
             is_error: false,
             preview: "ok".into(),
             agent_id: Some("agent-newton".into()),
+            applied_diff: None,
         });
 
         let overflow = state.take_overflow().expect("the canonical event is kept");

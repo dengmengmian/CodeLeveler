@@ -674,19 +674,11 @@ pub(crate) fn tool_lines(
     }
     out.push(Line::from(head));
 
-    if block.name == "apply_patch" && block.status != ToolStatus::Failed {
-        inline_diff_lines(&block.arguments, theme, width, tools_expanded, t, out);
-        return;
-    }
-    // `replace` is the same edit action with old/new arguments instead of a
-    // patch — synthesize the patch body so it renders the same inline diff.
-    // Failures keep the plain preview path: the error line is more useful
-    // than a diff that never landed.
-    if block.name == "replace"
-        && block.status != ToolStatus::Failed
-        && let Some(patch) = replace_patch_from_arguments(&block.arguments)
+    if block.status != ToolStatus::Failed
+        && matches!(block.name.as_str(), "apply_patch" | "replace")
+        && let Some(patch) = edit_patch_for(block)
     {
-        inline_diff_lines(&patch, theme, width, tools_expanded, t, out);
+        push_edit_diff_body(&patch, theme, width, tools_expanded, t, out, true);
         return;
     }
 
@@ -785,7 +777,7 @@ pub(crate) fn tool_lines(
 }
 
 /// Synthesize an apply_patch-style body from `replace` arguments (`path` /
-/// `old` / `new`) so replace edits share [`inline_diff_lines`]. `None` when
+/// `old` / `new`) so replace edits share the inline diff body. `None` when
 /// the arguments don't parse or carry no text on either side.
 pub(crate) fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
@@ -809,16 +801,23 @@ pub(crate) fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
     Some(patch)
 }
 
-fn inline_diff_lines(
-    arguments: &str,
-    theme: &Theme,
-    width: usize,
-    tools_expanded: bool,
-    t: &crate::i18n::UiText,
-    out: &mut Vec<Line<'static>>,
-) {
-    let patch = patch_text_from_arguments(arguments);
-    push_edit_diff_body(&patch, theme, width, tools_expanded, t, out, true);
+/// The patch text an edit call renders from.
+///
+/// The tool's own applied diff wins: it names the lines the change actually
+/// landed on, which the call's arguments cannot — an `apply_patch` hunk is
+/// located by content, and `replace` matches a substring. Without one (an
+/// older session, an edit whose location could not be established) the
+/// arguments still describe WHAT changed, and it renders with no line numbers
+/// rather than with invented ones.
+pub(crate) fn edit_patch_for(block: &ToolCallBlock) -> Option<String> {
+    if let Some(diff) = block.applied_diff.as_ref().filter(|d| !d.trim().is_empty()) {
+        return Some(diff.clone());
+    }
+    if block.name == "replace" {
+        return replace_patch_from_arguments(&block.arguments);
+    }
+    let patch = patch_text_from_arguments(&block.arguments);
+    (!patch.trim().is_empty()).then_some(patch)
 }
 
 /// One body row of a patch, ready for gutter rendering.
@@ -834,12 +833,36 @@ enum EditDiffRow {
         label: String,
     },
     Code {
-        /// New-file line number when known (from `@@ +N`).
-        line_no: Option<u32>,
+        /// Old-file line number when known — the side a removal lives on.
+        old_line: Option<u32>,
+        /// New-file line number when known — the side an addition lives on.
+        new_line: Option<u32>,
         kind: EditLineKind,
         /// Code without the leading `+`/`-`/` ` marker.
         text: String,
     },
+}
+
+impl EditDiffRow {
+    /// The one number the single-column gutter shows: a removal lives in the
+    /// old file, an addition in the new one, and context is the same line in
+    /// both. `None` when the patch carried no numeric hunk header — an unknown
+    /// location stays unknown rather than becoming a plausible-looking guess.
+    fn gutter_line(&self) -> Option<u32> {
+        match self {
+            EditDiffRow::Code {
+                old_line,
+                new_line,
+                kind,
+                ..
+            } => match kind {
+                EditLineKind::Remove => *old_line,
+                EditLineKind::Add => *new_line,
+                EditLineKind::Context => new_line.or(*old_line),
+            },
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,8 +873,19 @@ enum EditLineKind {
 }
 
 /// Parse apply_patch / unified-diff text into display rows with line numbers.
+///
+/// Both sides are tracked. A removal belongs to the old file and an addition
+/// to the new one, so a single cursor made a two-line replacement print the
+/// same number twice ("59 -", "59 -"). Each hunk header re-seeds BOTH cursors,
+/// so a second hunk never inherits the first one's count.
+///
+/// A patch with no numeric hunk header leaves both cursors `None`, and every
+/// row it produces is unnumbered. Nothing here invents a starting line: a line
+/// number is a fact about where the runtime actually changed the file, and a
+/// wrong one shown as fact is worse than none.
 fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
     let mut rows = Vec::new();
+    let mut old_ln: Option<u32> = None;
     let mut new_ln: Option<u32> = None;
     for raw in patch.lines() {
         let trimmed = raw.trim_end();
@@ -872,6 +906,7 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             rows.push(EditDiffRow::FileHeader {
                 path: path.to_string(),
             });
+            old_ln = None;
             new_ln = None;
             continue;
         }
@@ -879,16 +914,14 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             continue;
         }
         if trimmed.starts_with("@@") {
-            // `@@ -a,b +c,d @@` or bare `@@` / `@@ label`.
-            if let Some(plus) = trimmed.find('+') {
-                let after = &trimmed[plus + 1..];
-                let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = num.parse::<u32>() {
-                    new_ln = Some(n);
-                }
-            }
-            let label = trimmed.trim().to_string();
-            if label != "@@" {
+            // `@@ -a,b +c,d @@` or bare `@@` / `@@ label`. A bare header
+            // carries no location, so both cursors go unknown rather than
+            // carrying the previous hunk's count into this one.
+            old_ln = hunk_start(trimmed, '-');
+            new_ln = hunk_start(trimmed, '+');
+            // Only a human-readable locator earns a row. `@@ -56,5 +56,6 @@`
+            // is machine metadata, and the gutter already says all of it.
+            if let Some(label) = hunk_label(trimmed) {
                 rows.push(EditDiffRow::Hunk { label });
             }
             continue;
@@ -903,12 +936,15 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             .strip_prefix('+')
             .filter(|_| !trimmed.starts_with("+++"))
         {
+            // An addition exists only in the new file: it advances that
+            // cursor and leaves the old one where it was.
             let ln = new_ln;
             if let Some(n) = new_ln.as_mut() {
                 *n = n.saturating_add(1);
             }
             rows.push(EditDiffRow::Code {
-                line_no: ln,
+                old_line: None,
+                new_line: ln,
                 kind: EditLineKind::Add,
                 text: rest.to_string(),
             });
@@ -918,27 +954,62 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             .strip_prefix('-')
             .filter(|_| !trimmed.starts_with("---"))
         {
-            // Removals do not advance the new-file line counter.
+            // A removal exists only in the old file: it advances that cursor
+            // and leaves the new one where it was.
+            let ln = old_ln;
+            if let Some(n) = old_ln.as_mut() {
+                *n = n.saturating_add(1);
+            }
             rows.push(EditDiffRow::Code {
-                line_no: new_ln,
+                old_line: ln,
+                new_line: None,
                 kind: EditLineKind::Remove,
                 text: rest.to_string(),
             });
             continue;
         }
-        // Context: leading space optional.
+        // Context: leading space optional. It exists on both sides, so both
+        // cursors advance.
         let text = trimmed.strip_prefix(' ').unwrap_or(trimmed);
-        let ln = new_ln;
+        let (old_at, new_at) = (old_ln, new_ln);
+        if let Some(n) = old_ln.as_mut() {
+            *n = n.saturating_add(1);
+        }
         if let Some(n) = new_ln.as_mut() {
             *n = n.saturating_add(1);
         }
         rows.push(EditDiffRow::Code {
-            line_no: ln,
+            old_line: old_at,
+            new_line: new_at,
             kind: EditLineKind::Context,
             text: text.to_string(),
         });
     }
     rows
+}
+
+/// The human-readable part of a hunk header, if any: the text after the
+/// closing `@@` of a unified header, or the whole locator of an apply_patch
+/// `@@ <label>` line. Pure numeric ranges return `None`.
+fn hunk_label(header: &str) -> Option<String> {
+    let rest = header.strip_prefix("@@")?;
+    let label = match rest.find("@@") {
+        Some(i) => &rest[i + 2..],
+        None => rest,
+    };
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+/// The start line on one side of a unified hunk header (`@@ -56,5 +56,6 @@`).
+/// `None` for a bare `@@` or any header without a number on that side.
+fn hunk_start(header: &str, side: char) -> Option<u32> {
+    let at = header.find(side)?;
+    let digits: String = header[at + side.len_utf8()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Shared edit body for Tools screen / Conversation: file header, line gutter,
@@ -959,17 +1030,14 @@ fn push_edit_diff_body(
     }
     let cap = if tools_expanded { 48 } else { DIFF_FOLD_ROWS };
     let shown = rows.len().min(cap);
-    // Gutter: "  1234 │ " ≈ up to 4 digits when numbered.
-    let has_numbers = rows.iter().any(|r| {
-        matches!(
-            r,
-            EditDiffRow::Code {
-                line_no: Some(_),
-                ..
-            }
-        )
-    });
-    let gutter_w = if has_numbers { 6 } else { 2 };
+    // The gutter is sized from the largest real line number in the WHOLE
+    // patch, not from the rows that happen to be on screen: folding and
+    // expanding must not shift the code column sideways. A file with 100k
+    // lines gets six digits; a short one gets two.
+    let widest = rows.iter().filter_map(EditDiffRow::gutter_line).max();
+    let digits = widest.map(|n| n.to_string().len()).unwrap_or(0);
+    // "<digits> │ " when numbered, a plain two-space indent when not.
+    let gutter_w = if digits > 0 { digits + 3 } else { 2 };
     let mark_w = 2; // "+ " / "- " / "  "
     let inner = width.saturating_sub(4 + gutter_w + mark_w).max(12);
 
@@ -997,11 +1065,7 @@ fn push_edit_diff_body(
                     ),
                 ]));
             }
-            EditDiffRow::Code {
-                line_no,
-                kind,
-                text,
-            } => {
+            EditDiffRow::Code { kind, text, .. } => {
                 let (mark, style) = match kind {
                     EditLineKind::Add => (
                         "+ ",
@@ -1012,10 +1076,12 @@ fn push_edit_diff_body(
                     EditLineKind::Remove => ("- ", Style::default().fg(theme.diff.removed)),
                     EditLineKind::Context => ("  ", Style::default().fg(theme.text.secondary)),
                 };
-                let gutter = if has_numbers {
-                    match line_no {
-                        Some(n) => format!("{n:>4} │ "),
-                        None => "     │ ".to_string(),
+                // The number itself stays muted: red/green belongs to the
+                // change, and a coloured line number reads as part of it.
+                let gutter = if digits > 0 {
+                    match row.gutter_line() {
+                        Some(n) => format!("{n:>digits$} │ "),
+                        None => format!("{:>digits$} │ ", ""),
                     }
                 } else {
                     "  ".to_string()
@@ -1030,11 +1096,17 @@ fn push_edit_diff_body(
         }
     }
     if rows.len() > shown {
+        // Count only the SOURCE lines that were cut. File headers and hunk
+        // markers are chrome, and counting them would tell the reader there
+        // are more changed lines hidden than the patch actually has.
+        let hidden_code = rows[shown..]
+            .iter()
+            .filter(|r| matches!(r, EditDiffRow::Code { .. }))
+            .count();
         let hint = if tools_expanded {
             format!(
                 "    {}",
-                t.fold_more_lines
-                    .replace("{}", &(rows.len() - shown).to_string())
+                t.fold_more_lines.replace("{}", &hidden_code.to_string())
             )
         } else {
             format!("    {}", t.fold_full_diff)
@@ -1092,12 +1164,12 @@ pub(crate) fn merged_diff_rows(
 ) {
     let mut combined = String::new();
     for call in calls {
-        let patch = if call.name == "replace" {
-            replace_patch_from_arguments(&call.arguments)
-                .unwrap_or_else(|| patch_text_from_arguments(&call.arguments))
-        } else {
-            patch_text_from_arguments(&call.arguments)
-        };
+        // Each merged edit carries its own location truth; they are never
+        // renumbered against each other.
+        let patch = edit_patch_for(call).unwrap_or_default();
+        if patch.trim().is_empty() {
+            continue;
+        }
         if !combined.is_empty() && !combined.ends_with('\n') {
             combined.push('\n');
         }
@@ -1162,6 +1234,338 @@ mod m1_tests {
         assert_eq!(tool_action_label_for("apply_patch", Locale::Zh), "编辑文件");
     }
 
+    /// The gutter number carried by each row, in order, for one patch.
+    fn gutter_numbers(patch: &str) -> Vec<Option<u32>> {
+        parse_edit_diff_rows(patch)
+            .iter()
+            .filter(|r| matches!(r, EditDiffRow::Code { .. }))
+            .map(EditDiffRow::gutter_line)
+            .collect()
+    }
+
+    fn diff_text(patch: &str, width: usize, expanded: bool) -> String {
+        let mut out = Vec::new();
+        push_edit_diff_body(
+            patch,
+            &Theme::no_color(),
+            width,
+            expanded,
+            Locale::Zh.text(),
+            &mut out,
+            true,
+        );
+        out.iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// E1: a standard unified hunk numbers context, removals and additions
+    /// from the two sides its header declares.
+    #[test]
+    fn a_unified_hunk_numbers_both_sides_from_its_header() {
+        let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -56,4 +56,5 @@
+ keep one
+ keep two
+-old three
++new three
++new four
+";
+        assert_eq!(
+            gutter_numbers(patch),
+            vec![Some(56), Some(57), Some(58), Some(58), Some(59)]
+        );
+    }
+
+    /// E2: THE bug — a two-line removal used one cursor for both sides, so
+    /// both removed lines printed the same number.
+    #[test]
+    fn a_multi_line_replacement_numbers_removals_off_the_old_file() {
+        let patch = "\
++++ b/src/a.rs
+@@ -59,2 +59,3 @@
+-old A
+-old B
++new A
++new B
++new C
+";
+        assert_eq!(
+            gutter_numbers(patch),
+            vec![Some(59), Some(60), Some(59), Some(60), Some(61)]
+        );
+    }
+
+    /// E3: a second hunk re-seeds both cursors instead of continuing the first.
+    #[test]
+    fn a_second_hunk_restarts_from_its_own_header() {
+        let patch = "\
++++ b/src/a.rs
+@@ -20,1 +20,2 @@
+ near the top
++inserted
+@@ -150,1 +151,1 @@
+ far below
+";
+        assert_eq!(gutter_numbers(patch), vec![Some(20), Some(21), Some(151)]);
+    }
+
+    /// E4: a new file numbers from 1 and keeps its gutter.
+    #[test]
+    fn an_added_file_numbers_from_one() {
+        let patch = "\
++++ b/src/new.rs
+@@ -0,0 +1,3 @@
++use std::fmt;
++
++pub struct A;
+";
+        assert_eq!(gutter_numbers(patch), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    /// E5: a deleted file numbers off the old side rather than losing the
+    /// gutter because the new side does not exist.
+    #[test]
+    fn a_deleted_file_numbers_off_the_old_side() {
+        let patch = "\
+--- a/src/gone.rs
+@@ -1,2 +0,0 @@
+-pub fn a() {}
+-pub fn b() {}
+";
+        assert_eq!(gutter_numbers(patch), vec![Some(1), Some(2)]);
+    }
+
+    /// E9: no numeric header means no location. Showing a plausible-looking
+    /// number would present a guess as a fact about the user's file.
+    #[test]
+    fn a_patch_without_a_numeric_header_stays_unnumbered() {
+        let patch = "\
+*** Update File: src/a.rs
+-old line
++new line
+";
+        assert_eq!(gutter_numbers(patch), vec![None, None]);
+        let text = diff_text(patch, 80, true);
+        assert!(!text.contains('│'), "no gutter at all: {text}");
+        assert!(text.contains("new line"), "the code still renders: {text}");
+    }
+
+    /// E7: adding a gutter must not underflow the code column on a narrow
+    /// terminal — the code truncates, the line number survives.
+    #[test]
+    fn a_narrow_terminal_keeps_the_gutter_and_truncates_the_code() {
+        let patch = "\
++++ b/a.rs
+@@ -123456,1 +123456,1 @@
+-a very long line of source code that cannot possibly fit
++another very long line of source code that cannot possibly fit
+";
+        for width in [1usize, 4, 12, 30] {
+            let text = diff_text(patch, width, true);
+            assert!(text.contains("123456"), "width {width}: {text}");
+        }
+    }
+
+    /// E8: the gutter is sized from the whole patch, so folding and expanding
+    /// do not shift the code column sideways.
+    #[test]
+    fn folded_and_expanded_diffs_share_one_gutter_width() {
+        let mut patch = String::from("+++ b/a.rs\n@@ -998,40 +998,40 @@\n");
+        for i in 0..40 {
+            patch.push_str(&format!(" line {i}\n"));
+        }
+        let folded = diff_text(&patch, 100, false);
+        let expanded = diff_text(&patch, 100, true);
+        let column = |text: &str| {
+            text.lines()
+                .find(|l| l.contains('│'))
+                .map(|l| l.find('│').unwrap())
+        };
+        assert_eq!(
+            column(&folded),
+            column(&expanded),
+            "{folded}\n---\n{expanded}"
+        );
+        assert!(folded.contains("998") && expanded.contains("998"));
+    }
+
+    fn edit_block(name: &str, args: serde_json::Value, applied: Option<&str>) -> ToolCallBlock {
+        ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("e1"),
+            name: name.into(),
+            arguments: args.to_string(),
+            status: ToolStatus::Ok,
+            preview: Some("ok".into()),
+            duration_ms: Some(3),
+            parallel: false,
+            started_elapsed_secs: 0,
+            applied_diff: applied.map(str::to_string),
+        }
+    }
+
+    /// Visual acceptance for the whole gutter: right-aligned muted numbers, a
+    /// `│` rule, then the change mark and the code.
+    #[test]
+    fn an_applied_edit_renders_a_right_aligned_line_gutter() {
+        let block = edit_block(
+            "apply_patch",
+            serde_json::json!({"patch": "x"}),
+            Some(concat!(
+                "--- a/page.tsx\n+++ b/page.tsx\n@@ -56,5 +56,6 @@\n",
+                " }: ButtonProps) {\n",
+                "-  old code\n",
+                "-  more old\n",
+                "+  new code\n",
+                "+  more new\n",
+                "+  and new\n",
+                " }\n",
+            )),
+        );
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            70,
+            true,
+            Locale::Zh.text(),
+            &mut out,
+        );
+        let text: Vec<String> = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let body: Vec<&String> = text.iter().filter(|l| l.contains('│')).collect();
+        let shown: Vec<String> = body.iter().map(|l| l.trim_end().to_string()).collect();
+        assert_eq!(
+            shown,
+            vec![
+                "    56 │   }: ButtonProps) {",
+                "    57 │ -   old code",
+                "    58 │ -   more old",
+                "    57 │ +   new code",
+                "    58 │ +   more new",
+                "    59 │ +   and new",
+                "    60 │   }",
+            ],
+            "{text:#?}"
+        );
+    }
+
+    /// E10: the model asked to change one thing; the runtime found it
+    /// somewhere else. What the user is shown is where the change LANDED.
+    #[test]
+    fn an_edit_renders_from_where_the_change_landed_not_from_the_request() {
+        let block = edit_block(
+            "replace",
+            serde_json::json!({"path": "a.rs", "old": "alpha", "new": "beta"}),
+            Some("--- a/a.rs\n+++ b/a.rs\n@@ -412,1 +412,1 @@\n-alpha\n+beta\n"),
+        );
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            90,
+            true,
+            Locale::Zh.text(),
+            &mut out,
+        );
+        let text: String = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("412"), "the applied line number: {text}");
+        assert!(text.contains("beta"), "{text}");
+    }
+
+    /// E9 at the call level: a `replace` with no reported location renders
+    /// its content with no gutter rather than a made-up line 1.
+    #[test]
+    fn a_replace_without_a_reported_location_renders_no_line_numbers() {
+        let block = edit_block(
+            "replace",
+            serde_json::json!({"path": "a.rs", "old": "alpha", "new": "beta"}),
+            None,
+        );
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            90,
+            true,
+            Locale::Zh.text(),
+            &mut out,
+        );
+        let text: String = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("beta"), "{text}");
+        assert!(!text.contains('│'), "no invented gutter: {text}");
+    }
+
+    /// E6: two merged same-file edits each keep their own reported range;
+    /// neither is renumbered against the other.
+    #[test]
+    fn merged_same_file_edits_keep_their_own_reported_ranges() {
+        let a = edit_block(
+            "replace",
+            serde_json::json!({"path": "a.rs", "old": "one", "new": "1"}),
+            Some("--- a/a.rs\n+++ b/a.rs\n@@ -10,1 +10,1 @@\n-one\n+1\n"),
+        );
+        let b = edit_block(
+            "replace",
+            serde_json::json!({"path": "a.rs", "old": "two", "new": "2"}),
+            Some("--- a/a.rs\n+++ b/a.rs\n@@ -200,1 +200,1 @@\n-two\n+2\n"),
+        );
+        let mut out = Vec::new();
+        merged_diff_rows(
+            &[&a, &b],
+            &Theme::no_color(),
+            90,
+            true,
+            Locale::Zh.text(),
+            &mut out,
+        );
+        let text: String = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("10"), "{text}");
+        assert!(text.contains("200"), "{text}");
+    }
+
     #[test]
     fn edit_diff_shows_line_numbers_and_clean_add_rows() {
         let theme = Theme::no_color();
@@ -1177,7 +1581,15 @@ mod m1_tests {
 *** End Patch"#;
         let args = serde_json::json!({ "patch": patch }).to_string();
         let mut out = Vec::new();
-        inline_diff_lines(&args, &theme, 100, true, t, &mut out);
+        push_edit_diff_body(
+            &patch_text_from_arguments(&args),
+            &theme,
+            100,
+            true,
+            t,
+            &mut out,
+            true,
+        );
         let text: String = out
             .iter()
             .map(|line| {
@@ -1224,6 +1636,7 @@ mod m1_tests {
             duration_ms: Some(12),
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         tool_lines(&block, &theme, 80, true, t, &mut out);
         let text: String = out
@@ -1399,6 +1812,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         }
     }
 
@@ -1448,6 +1862,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1491,6 +1906,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1529,6 +1945,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1572,6 +1989,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1661,6 +2079,7 @@ mod tests {
             duration_ms: None,
             parallel: false,
             started_elapsed_secs: 0,
+            applied_diff: None,
         };
         let mut out = Vec::new();
         tool_lines(

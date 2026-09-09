@@ -294,6 +294,7 @@ fn tui_session_commands_ui_and_logic() {
             ok: true,
             preview: "\u{1b}[32m✓\u{1b}[39m all tests passed".into(),
             duration_ms: 1200,
+            applied_diff: None,
         }),
     );
     let preview = s

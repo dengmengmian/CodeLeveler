@@ -14,6 +14,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::i18n::UiText;
+use crate::plan_viewport::PlanViewportRow;
 use crate::render::{
     COMPOSER_MAX_ROWS, btw_card_lines, composer_box_lines, composer_visible_rows,
     render_attachments, render_slash_popup,
@@ -22,6 +23,9 @@ use crate::screen::Screen;
 use crate::state::AppState;
 use crate::status_line::status_lines;
 use crate::transcript::TranscriptItem;
+
+/// The conversation never shrinks below this, whatever the plan dock wants.
+const MIN_CONVERSATION_ROWS: u16 = 3;
 
 /// Done-count / total for a multi-step plan (`k/n`).
 ///
@@ -55,43 +59,43 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     !all_success
 }
 
-/// Summary after `计划`/`plan`: active item when one is actually Running,
-/// otherwise the completed count. Never claims item #1 is in progress just
-/// because nothing is done yet.
+/// Summary after `计划`/`plan`: how much is finished, plus which item is
+/// actually Running when one is. The two facts are not exclusive — showing
+/// only "当前 6/9" hid that five steps were already done. Never claims item
+/// #1 is in progress just because nothing is done yet.
 pub(crate) fn plan_summary_label(plan: &UiPlan, t: &UiText) -> String {
     let (done, total) = plan_done_total(plan);
     if total == 0 {
         return t.active_plan.to_string();
     }
-    if let Some(step) = plan
+    let progress = t
+        .plan_n_done
+        .replace("{done}", &done.to_string())
+        .replace("{total}", &total.to_string());
+    match plan
         .steps
         .iter()
         .find(|s| s.status == PlanStepStatus::Running)
     {
-        t.plan_item_in_progress
-            .replace("{current}", &(step.index + 1).to_string())
-            .replace("{total}", &total.to_string())
-    } else {
-        t.plan_n_done
-            .replace("{done}", &done.to_string())
-            .replace("{total}", &total.to_string())
+        Some(step) => {
+            let current = t
+                .plan_current_item
+                .replace("{current}", &(step.index + 1).to_string())
+                .replace("{total}", &total.to_string());
+            format!("{progress} · {current}")
+        }
+        None => progress,
     }
 }
 
-/// One-line plan chrome title. A Running step reads as "第 n/N 项进行中"
-/// rather than "0/N", which looked like zero progress while work was underway.
+/// One-line plan chrome title: `▼ 计划 · 5/9 已完成 · 当前 6/9`.
 pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, t: &UiText) -> String {
     let disclosure = if collapsed { "▶" } else { "▼" };
-    let summary = plan_summary_label(plan, t);
-    if plan
-        .steps
-        .iter()
-        .any(|s| s.status == PlanStepStatus::Running)
-    {
-        format!("{disclosure} {} · {summary}", t.active_plan)
-    } else {
-        format!("{disclosure} {} {summary}", t.active_plan)
-    }
+    format!(
+        "{disclosure} {} · {}",
+        t.active_plan,
+        plan_summary_label(plan, t)
+    )
 }
 
 /// Paint the conversation workbench into `frame`.
@@ -107,7 +111,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     } else {
         1
     };
-    let plan_rows = plan_panel_height(state);
     let team_rows = team_panel_height(state);
     // An open overlay takes the composer's slot rather than floating over the
     // transcript, so the conversation shrinks by exactly what the decision box
@@ -147,8 +150,11 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Breathing room around the input box: blank above only when live chrome
     // (status / plan / attachments) sits on top of it; blank below always so
     // Context footer is not flush on the composer border.
+    // The plan dock's own height is not known yet (it depends on this gap via
+    // the row budget), but its VISIBILITY is — and that is all the gap needs.
+    let plan_visible = state.plan.as_ref().is_some_and(plan_panel_should_show);
     let chrome_above = status_rows
-        .saturating_add(plan_rows)
+        .saturating_add(u16::from(plan_visible))
         .saturating_add(attach_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
     // The hint row replaces the blank below the composer rather than adding to
@@ -159,9 +165,27 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // One breathing row between the Context footer and the roster, so the
     // process list reads as its own surface rather than a second footer.
     let team_gap: u16 = if team_rows > 0 { 1 } else { 0 };
+
+    // Everything the plan dock does NOT get: the fixed chrome plus the
+    // conversation's own floor. What is left is the dock's row budget, so a
+    // long plan grows into real space instead of being cut at a constant.
+    let reserved = header_rows
+        .saturating_add(MIN_CONVERSATION_ROWS)
+        .saturating_add(gap_rows)
+        .saturating_add(status_rows)
+        .saturating_add(attach_rows)
+        .saturating_add(pre_composer_gap)
+        .saturating_add(composer_rows)
+        .saturating_add(post_composer_gap)
+        .saturating_add(footer_rows)
+        .saturating_add(team_gap)
+        .saturating_add(team_rows)
+        .saturating_add(footer_bottom);
+    let plan_rows = plan_panel_height(state, area.height.saturating_sub(reserved));
+
     let chunks = Layout::vertical([
         Constraint::Length(header_rows),
-        Constraint::Min(3), // conversation viewport
+        Constraint::Min(MIN_CONVERSATION_ROWS), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(status_rows),
         Constraint::Length(plan_rows),
@@ -368,13 +392,19 @@ fn repo_basename(repo: &str) -> String {
 
 /// Plan chrome only while the plan has open work (or failures). Empty /
 /// fully-succeeded plans (including 1/1 ✓) take no rows.
-fn plan_panel_height(state: &AppState) -> u16 {
+/// `budget` is the rows the layout can actually spare for the dock (after the
+/// header, composer, footer and the conversation's own minimum). The plan asks
+/// for one row per step and takes what it can get — never a fixed five, which
+/// is what silently dropped items 6..9 of a nine-step plan.
+fn plan_panel_height(state: &AppState, budget: u16) -> u16 {
     match &state.plan {
         Some(p) if plan_panel_should_show(p) => {
             if state.plan_collapsed {
                 1
             } else {
-                (p.steps.len() + 1).min(6) as u16
+                let desired = 1 + crate::plan_viewport::plan_desired_body_rows(p) as u16;
+                // The header always survives, exactly like a collapsed dock.
+                desired.min(budget.max(1))
             }
         }
         _ => 0,
@@ -588,32 +618,69 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     ))];
 
     if !state.plan_collapsed {
-        for step in plan.steps.iter().take(area.height as usize - 1) {
-            let (g, c) = match step.status {
-                PlanStepStatus::Done => ("✓", theme.status.success),
-                PlanStepStatus::Running => ("→", theme.accent.primary),
-                PlanStepStatus::Failed => ("✗", theme.status.error),
-                PlanStepStatus::Skipped => ("–", theme.text.secondary),
-                PlanStepStatus::Pending => ("○", theme.text.secondary),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{STEP_INDENT}{g} "), Style::default().fg(c)),
-                Span::styled(
-                    truncate(
-                        format!("{}. {}", step.index + 1, step.description),
-                        area.width.saturating_sub(3 + STEP_INDENT.len() as u16) as usize,
-                    ),
-                    Style::default().fg(if step.status == PlanStepStatus::Running {
-                        theme.text.primary
-                    } else {
-                        theme.text.secondary
-                    }),
-                ),
-            ]));
+        let body_width = area.width.saturating_sub(3 + STEP_INDENT.len() as u16) as usize;
+        for row in crate::plan_viewport::plan_viewport_rows(plan, area.height as usize - 1) {
+            match row {
+                PlanViewportRow::Step(step) => {
+                    let c = match step.status {
+                        PlanStepStatus::Done => theme.status.success,
+                        PlanStepStatus::Running => theme.accent.primary,
+                        PlanStepStatus::Failed => theme.status.error,
+                        PlanStepStatus::Skipped | PlanStepStatus::Pending => theme.text.secondary,
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "{STEP_INDENT}{} ",
+                                crate::plan_cell::plan_glyph(step.status)
+                            ),
+                            Style::default().fg(c),
+                        ),
+                        Span::styled(
+                            truncate(
+                                format!("{}. {}", step.index + 1, step.description),
+                                body_width,
+                            ),
+                            Style::default().fg(if step.status == PlanStepStatus::Running {
+                                theme.text.primary
+                            } else {
+                                theme.text.secondary
+                            }),
+                        ),
+                    ]));
+                }
+                // Overflow is never silent: the exact count of what sits off
+                // screen rides on its own row.
+                PlanViewportRow::HiddenBefore(n) => lines.push(overflow_line(
+                    &t.plan_hidden_before.replace("{}", &n.to_string()),
+                    theme,
+                    area.width as usize,
+                )),
+                PlanViewportRow::HiddenAfter(n) => lines.push(overflow_line(
+                    &t.plan_hidden_after.replace("{}", &n.to_string()),
+                    theme,
+                    area.width as usize,
+                )),
+                PlanViewportRow::HiddenBoth { before, after } => lines.push(overflow_line(
+                    &t.plan_hidden_both
+                        .replace("{before}", &before.to_string())
+                        .replace("{after}", &after.to_string()),
+                    theme,
+                    area.width as usize,
+                )),
+            }
         }
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// One quiet `↑ / ↓ 还有 N 项` row under the plan dock's step indent.
+fn overflow_line(text: &str, theme: &crate::theme::Theme, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate(format!("  {text}"), width),
+        Style::default().fg(theme.text.muted),
+    ))
 }
 
 // ── Floating notification toast (over Conversation bottom) ──────────────────
@@ -1656,8 +1723,8 @@ mod tests {
         let title = plan_chrome_title(&sample_plan(), false, t);
         assert!(title.starts_with('▼'), "{title}");
         assert!(
-            title.contains("第 2/3 项进行中"),
-            "running item, not a zero-progress fraction: {title}"
+            title.contains("1/3 已完成 · 当前 2/3"),
+            "progress and current item, not one or the other: {title}"
         );
         assert!(
             !title.contains("edit module"),
@@ -2065,7 +2132,7 @@ mod tests {
         let t = crate::i18n::Locale::Zh.text();
         let title = plan_chrome_title(&sample_plan(), true, t);
         assert!(title.starts_with('▶'), "{title}");
-        assert!(title.contains("第 2/3 项进行中"), "{title}");
+        assert!(title.contains("1/3 已完成 · 当前 2/3"), "{title}");
     }
 
     #[test]
@@ -2096,9 +2163,9 @@ mod tests {
             ],
         };
         let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("0/4 完成"), "{title}");
+        assert!(title.contains("0/4 已完成"), "{title}");
         assert!(
-            !title.contains("进行中"),
+            !title.contains("当前"),
             "pending is not in-progress: {title}"
         );
     }
@@ -2121,9 +2188,9 @@ mod tests {
             ],
         };
         let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("1/2 done"), "{title}");
+        assert!(title.contains("1/2 completed"), "{title}");
         assert!(
-            !title.contains("in progress"),
+            !title.contains("current"),
             "a pending step is not claimed as active: {title}"
         );
         assert!(
@@ -2153,17 +2220,17 @@ mod tests {
         state.goal_mode_active = true;
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.plan = None;
-        assert_eq!(plan_panel_height(&state), 0);
+        assert_eq!(plan_panel_height(&state, 40), 0);
 
         state.plan = Some(UiPlan { steps: vec![] });
-        assert_eq!(plan_panel_height(&state), 0);
+        assert_eq!(plan_panel_height(&state, 40), 0);
 
         state.plan = Some(sample_plan());
         state.plan_collapsed = true;
-        assert_eq!(plan_panel_height(&state), 1);
+        assert_eq!(plan_panel_height(&state, 40), 1);
 
         state.plan_collapsed = false;
-        assert_eq!(plan_panel_height(&state), 4); // title + 3 steps
+        assert_eq!(plan_panel_height(&state, 40), 4); // title + 3 steps
     }
 
     #[test]
@@ -2256,7 +2323,8 @@ mod tests {
             false,
             0,
         );
-        s.transcript.complete_tool(&call, true, "ok".into(), 1);
+        s.transcript
+            .complete_tool(&call, true, "ok".into(), 1, None);
         let id = leveler_client_protocol::MessageId::new("m1");
         s.transcript.begin_assistant(id.clone());
         s.transcript.append_assistant(&id, "最终回答");
@@ -2273,5 +2341,227 @@ mod tests {
             plain[answer - 1].trim().is_empty(),
             "a blank line must separate the final answer from the tool group: {plain:?}"
         );
+    }
+
+    // ── Plan viewport (adaptive height, no silent truncation) ───────────────
+
+    fn plan_panel_rows(state: &AppState, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+        terminal
+            .draw(|f| {
+                render_plan_panel(
+                    f,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 70,
+                        height,
+                    },
+                    state,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..70)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A plan with `total` steps: `current` running, everything before it done.
+    fn running_plan(total: usize, current: usize) -> UiPlan {
+        UiPlan {
+            steps: (0..total)
+                .map(|i| UiPlanStep {
+                    index: i,
+                    description: format!("步骤 {}", i + 1),
+                    status: match i.cmp(&current) {
+                        std::cmp::Ordering::Less => PlanStepStatus::Done,
+                        std::cmp::Ordering::Equal => PlanStepStatus::Running,
+                        std::cmp::Ordering::Greater => PlanStepStatus::Pending,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// P1: nine steps and room for all of them — the dock used to stop at five
+    /// because its height was `min(6)`, dropping items 6..9 with no indicator.
+    #[test]
+    fn a_nine_step_plan_shows_every_step_when_there_is_room() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(9, 5));
+        let rows = plan_panel_rows(&state, 10);
+        for i in 1..=9 {
+            assert!(
+                rows.iter()
+                    .any(|r| squash(r).contains(&format!("{i}.步骤{i}"))),
+                "step {i} must be on screen:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// P2: not enough room — the running step must survive the cut and the
+    /// hidden remainder must name its own count.
+    #[test]
+    fn a_short_plan_dock_keeps_the_running_step_and_names_the_overflow() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(9, 5));
+        let rows = plan_panel_rows(&state, 6);
+        let body = rows.join("\n");
+        assert!(squash(&body).contains("6.步骤6"), "{body}");
+        assert!(
+            body.contains('↓') || body.contains('↑'),
+            "overflow must be explicit: {body}"
+        );
+        let shown = (1..=9)
+            .filter(|i| squash(&body).contains(&format!("{i}.步骤{i}")))
+            .count();
+        let hidden: usize = body
+            .lines()
+            .filter(|l| l.contains('↑') || l.contains('↓'))
+            .map(|l| {
+                l.chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(shown + hidden, 9, "every step is shown or counted: {body}");
+    }
+
+    /// P3: a 30-step plan with the current item deep inside it.
+    #[test]
+    fn a_deep_plan_windows_around_the_current_step_with_exact_hidden_counts() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(30, 17));
+        let rows = plan_panel_rows(&state, 7);
+        let body = squash(&rows.join("\n"));
+        assert!(body.contains("18.步骤18"), "{body}");
+        assert!(!body.contains("1.步骤1\n"), "{body}");
+        // 6 body rows: ↑ n, four steps, ↓ m — counts must add up to 30.
+        let before: usize = body
+            .split('↑')
+            .nth(1)
+            .and_then(|s| s.matches(char::is_numeric).count().checked_sub(0))
+            .map(|_| ())
+            .and_then(|_| {
+                body.split('↑')
+                    .nth(1)?
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no top overflow count: {body}"));
+        let after: usize = body
+            .split('↓')
+            .nth(1)
+            .and_then(|s| {
+                s.chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no bottom overflow count: {body}"));
+        let shown = rows
+            .iter()
+            .filter(|r| {
+                let s = squash(r);
+                s.contains("步骤") && !s.contains('↑') && !s.contains('↓')
+            })
+            .count();
+        assert_eq!(before + shown + after, 30, "{body}");
+    }
+
+    /// P6: a plan that fits shows no overflow chrome at all.
+    #[test]
+    fn a_plan_that_fits_shows_no_overflow_indicator() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(4, 1));
+        let rows = plan_panel_rows(&state, 8);
+        let body = rows.join("\n");
+        assert!(!body.contains('↑') && !body.contains('↓'), "{body}");
+    }
+
+    /// P7: a one-row body must not panic and must spend that row on the
+    /// current step rather than on step 1.
+    #[test]
+    fn a_single_body_row_shows_the_current_step() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(30, 17));
+        let rows = plan_panel_rows(&state, 2);
+        assert!(squash(&rows[1]).contains("18.步骤18"), "{rows:?}");
+    }
+
+    /// P8: the header carries progress AND the current item, not one or the
+    /// other — "当前 6/9" alone hid that five steps were already done.
+    #[test]
+    fn the_plan_header_carries_both_progress_and_the_current_item() {
+        let t = crate::i18n::Locale::Zh.text();
+        let title = plan_chrome_title(&running_plan(9, 5), false, t);
+        assert!(title.contains("5/9 已完成"), "{title}");
+        assert!(title.contains("当前 6/9"), "{title}");
+        let t = crate::i18n::Locale::En.text();
+        let title = plan_chrome_title(&running_plan(9, 5), false, t);
+        assert!(title.contains("5/9 completed"), "{title}");
+        assert!(title.contains("current 6/9"), "{title}");
+    }
+
+    /// P9: one running glyph for both plan surfaces (`/plan` used ●, the dock
+    /// used →, so the same state read as two different things).
+    #[test]
+    fn both_plan_surfaces_use_the_same_running_glyph() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(3, 1));
+        let rows = plan_panel_rows(&state, 5);
+        assert!(
+            rows.iter().any(|r| r.trim_start().starts_with('●')),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.trim_start().starts_with('→')),
+            "{rows:?}"
+        );
+    }
+
+    /// P10: a fully finished plan still leaves the dock entirely.
+    #[test]
+    fn a_finished_plan_takes_no_rows_even_with_an_adaptive_viewport() {
+        let mut state = test_state();
+        state.plan = Some(UiPlan {
+            steps: (0..9)
+                .map(|i| UiPlanStep {
+                    index: i,
+                    description: format!("步骤 {}", i + 1),
+                    status: PlanStepStatus::Done,
+                })
+                .collect(),
+        });
+        assert_eq!(plan_panel_height(&state, 40), 0);
+    }
+
+    /// The dock grows with the plan instead of stopping at the old `min(6)`,
+    /// but never past the rows the layout can spare.
+    #[test]
+    fn plan_dock_height_follows_the_plan_and_the_layout_budget() {
+        let mut state = test_state();
+        state.plan = Some(running_plan(9, 5));
+        assert_eq!(plan_panel_height(&state, 40), 10, "header + nine steps");
+        assert_eq!(plan_panel_height(&state, 6), 6, "capped by the budget");
+        assert_eq!(plan_panel_height(&state, 0), 1, "the header survives");
+        state.plan_collapsed = true;
+        assert_eq!(plan_panel_height(&state, 40), 1);
     }
 }

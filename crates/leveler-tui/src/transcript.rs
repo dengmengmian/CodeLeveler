@@ -43,6 +43,12 @@ pub struct ToolCallBlock {
     /// The turn's `elapsed_secs` when this call started, so a running command
     /// can show a live elapsed (`now - started`) instead of a static block.
     pub started_elapsed_secs: u64,
+    /// Canonical unified diff of what this edit ACTUALLY changed, reported by
+    /// the tool that made it. The inline diff renders from THIS when it is
+    /// present: `arguments` say what the model wanted, and only execution
+    /// knows where the change landed. `None` for every non-edit call, and for
+    /// an edit whose location could not be established.
+    pub applied_diff: Option<String>,
 }
 
 /// A consecutive burst of tool calls between two assistant messages.
@@ -522,7 +528,14 @@ impl TranscriptState {
             duration_ms: None,
             parallel,
             started_elapsed_secs,
+            applied_diff: None,
         };
+        if let Some(TranscriptItem::ToolGroup(group)) = self.items.last()
+            && group.open
+            && starts_new_activity(group, &call)
+        {
+            self.close_tool_group();
+        }
         match self.items.last_mut() {
             Some(TranscriptItem::ToolGroup(group)) if group.open => group.calls.push(call),
             _ => self.items.push(TranscriptItem::ToolGroup(ToolGroupBlock {
@@ -533,8 +546,16 @@ impl TranscriptState {
         }
     }
 
-    /// Complete a tool call, updating its status, preview, and duration.
-    pub fn complete_tool(&mut self, id: &ToolCallId, ok: bool, preview: String, duration_ms: u64) {
+    /// Complete a tool call, updating its status, preview, duration, and the
+    /// applied diff an edit reported.
+    pub fn complete_tool(
+        &mut self,
+        id: &ToolCallId,
+        ok: bool,
+        preview: String,
+        duration_ms: u64,
+        applied_diff: Option<String>,
+    ) {
         self.bump();
         for item in self.items.iter_mut().rev() {
             let TranscriptItem::ToolGroup(group) = item else {
@@ -548,6 +569,7 @@ impl TranscriptState {
                 };
                 block.preview = Some(preview);
                 block.duration_ms = Some(duration_ms);
+                block.applied_diff = applied_diff;
                 return;
             }
         }
@@ -882,6 +904,37 @@ fn compact_summary(text: String, max_chars: usize) -> Option<String> {
     Some(summary)
 }
 
+/// Whether `call` begins a new semantic activity instead of continuing `group`.
+///
+/// A transcript burst ("everything between two assistant messages") is a
+/// runtime fact; an activity is what the reader sees. Welding reads, an edit
+/// and a shell run into one block let the edit hold the whole burst open and
+/// left the conversation with no narrative shape — so a fully settled group
+/// yields to the next KIND of work.
+fn starts_new_activity(group: &ToolGroupBlock, call: &ToolCallBlock) -> bool {
+    // Still in flight: this is a real concurrent batch, never split it.
+    if group.calls.iter().any(|c| c.status == ToolStatus::Running) {
+        return false;
+    }
+    // Silent probes are not part of the visible narrative: they neither open a
+    // boundary nor change what the current group is about.
+    if !is_grouping_visible(call) {
+        return false;
+    }
+    let Some(prev) = group.calls.iter().rev().find(|c| is_grouping_visible(c)) else {
+        return false;
+    };
+    crate::tool_taxonomy::activity_class(&prev.name)
+        != crate::tool_taxonomy::activity_class(&call.name)
+}
+
+/// Grouping reads the tool's declared visibility only — never its status,
+/// which changes long after the grouping decision was made.
+fn is_grouping_visible(call: &ToolCallBlock) -> bool {
+    crate::tool_taxonomy::activity_visibility(&call.name, &call.arguments)
+        != crate::tool_taxonomy::ActivityVisibility::Silent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,13 +966,122 @@ mod tests {
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
 
-        t.complete_tool(&ToolCallId::new("t1"), true, "ok".into(), 1);
+        t.complete_tool(&ToolCallId::new("t1"), true, "ok".into(), 1, None);
         let v3 = t.version();
         assert!(v3 > v2, "complete_tool must bump");
 
         // In-place mutation via the slice escape hatch must also invalidate.
         let _ = t.items_mut();
         assert!(t.version() > v3, "items_mut must bump");
+    }
+
+    // ── Semantic activity boundaries ────────────────────────────────────────
+
+    /// Push one call and settle it, so the next push sees a fully settled
+    /// (but still open) group — the shape a sequential model turn produces.
+    fn settled(t: &mut TranscriptState, id: &str, name: &str, args: &str) {
+        t.push_tool_started(ToolCallId::new(id), name.into(), args.into(), false, 0);
+        t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
+    }
+
+    fn group_shapes(t: &TranscriptState) -> Vec<Vec<String>> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::ToolGroup(g) => {
+                    Some(g.calls.iter().map(|c| c.name.clone()).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// CASE A: read × 5 → edit → shell × 2 → read × 3, each phase settled
+    /// before the next begins. One burst between two assistant messages is a
+    /// runtime fact, not a unit of narrative: these are four separate pieces
+    /// of work and must not be welded into one un-foldable group.
+    #[test]
+    fn settled_phases_of_different_kinds_start_their_own_activity_group() {
+        let mut t = TranscriptState::new();
+        for i in 0..5 {
+            settled(&mut t, &format!("r{i}"), "read_file", r#"{"path":"a"}"#);
+        }
+        settled(&mut t, "e1", "apply_patch", r#"{"patch":"x"}"#);
+        for i in 0..2 {
+            settled(
+                &mut t,
+                &format!("s{i}"),
+                "run_command",
+                r#"{"command":"cargo test"}"#,
+            );
+        }
+        for i in 0..3 {
+            settled(&mut t, &format!("r2{i}"), "read_file", r#"{"path":"b"}"#);
+        }
+        let shapes = group_shapes(&t);
+        assert_eq!(
+            shapes.len(),
+            4,
+            "read / edit / shell / read are four activities: {shapes:?}"
+        );
+        assert_eq!(shapes[0].len(), 5);
+        assert_eq!(shapes[1], vec!["apply_patch".to_string()]);
+        assert_eq!(shapes[2].len(), 2);
+        assert_eq!(shapes[3].len(), 3);
+    }
+
+    /// Reads and searches are one activity ("exploring"), not two.
+    #[test]
+    fn reads_and_searches_stay_in_one_exploration_group() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        settled(&mut t, "g1", "grep", r#"{"pattern":"x"}"#);
+        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
+        assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
+    }
+
+    /// A group with work still in flight is a real parallel batch. The model
+    /// streams the next call's arguments while earlier ones run; splitting
+    /// there would shatter one concurrent burst into unrelated rows.
+    #[test]
+    fn a_group_with_running_work_never_splits() {
+        let mut t = TranscriptState::new();
+        t.push_tool_started(
+            ToolCallId::new("r1"),
+            "read_file".into(),
+            r#"{"path":"a"}"#.into(),
+            true,
+            0,
+        );
+        t.push_tool_started(
+            ToolCallId::new("e1"),
+            "apply_patch".into(),
+            r#"{"patch":"x"}"#.into(),
+            true,
+            0,
+        );
+        assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
+    }
+
+    /// Silent probes (list_files, goal bookkeeping) are invisible in the
+    /// conversation, so they must not chop the visible activity into pieces
+    /// nor redefine what kind of work the group is doing.
+    #[test]
+    fn silent_calls_never_form_an_activity_boundary() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        settled(&mut t, "l1", "list_files", r#"{"path":"."}"#);
+        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
+        assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
+    }
+
+    /// Consecutive edits are one activity and keep the same-file merge.
+    #[test]
+    fn consecutive_edits_stay_in_one_group() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "e1", "apply_patch", r#"{"patch":"a"}"#);
+        settled(&mut t, "e2", "apply_patch", r#"{"patch":"b"}"#);
+        assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
     }
 
     fn group(expanded: bool) -> ToolGroupBlock {
@@ -933,6 +1095,7 @@ mod tests {
                 duration_ms: Some(1),
                 parallel: false,
                 started_elapsed_secs: 0,
+                applied_diff: None,
             }],
             open: false,
             expanded,

@@ -26,7 +26,9 @@ use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
 use leveler_tools::{ToolContext, ToolError, ToolRegistry};
 
-use super::dispatch::{collect_modified, extract_executed_commands, extract_image, extract_plan};
+use super::dispatch::{
+    collect_modified, extract_applied_diff, extract_executed_commands, extract_image, extract_plan,
+};
 use super::{AgentError, Executor};
 use crate::authorization::{
     action_fingerprint, approval_signature, call_needs_host_escape, command_line_for_match,
@@ -607,7 +609,8 @@ impl Executor {
     }
 
     /// Execute one admitted call, returning `(content, is_error, image,
-    /// workspace_snapshot, plan, modified paths, executed commands)` to feed
+    /// workspace_snapshot, plan, modified paths, executed commands, applied
+    /// diff)` to feed
     /// back to the model. Infrastructure errors are converted to model-visible
     /// text so the model can react rather than the loop aborting. Also records
     /// any files the tool modified and the commands it actually ran.
@@ -624,6 +627,7 @@ impl Executor {
         Option<Vec<PlanStep>>,
         Vec<String>,
         Vec<Vec<String>>,
+        Option<String>,
     ) {
         let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation).await;
         // The call's own modified paths, BEFORE merging into the epoch set:
@@ -643,8 +647,16 @@ impl Executor {
             .map(ToOwned::to_owned);
         let plan = extract_plan(&metadata);
         let executed = extract_executed_commands(&metadata);
+        let applied_diff = extract_applied_diff(&metadata);
         (
-            content, is_error, image, snapshot, plan, call_files, executed,
+            content,
+            is_error,
+            image,
+            snapshot,
+            plan,
+            call_files,
+            executed,
+            applied_diff,
         )
     }
 
