@@ -2162,6 +2162,274 @@ impl ModelRuntime for RequestRecordingRuntime {
 
 const AUDIT_MARKER: &str = "Treat completion as unproven";
 
+// ── Plan freshness: the plan must track the work ────────────────────────────
+
+const FRESHNESS_MARKER: &str = "active plan has not been updated";
+
+/// A workspace with `n` distinct files to edit, one per work round.
+fn plan_freshness_dir(tag: &str, files: usize) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-fresh-{tag}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..files {
+        std::fs::write(dir.join(format!("f{i}.txt")), format!("old {i}\n")).unwrap();
+    }
+    dir
+}
+
+fn plan_call(id: &str, steps: &[(&str, &str)]) -> ModelResponse {
+    let plan: Vec<serde_json::Value> = steps
+        .iter()
+        .map(|(step, status)| serde_json::json!({"step": step, "status": status}))
+        .collect();
+    assistant_tool_call(id, "update_plan", serde_json::json!({ "plan": plan }))
+}
+
+fn edit_call(id: &str, file: usize) -> ModelResponse {
+    assistant_tool_call(
+        id,
+        "replace",
+        serde_json::json!({
+            "path": format!("f{file}.txt"),
+            "old": format!("old {file}"),
+            "new": format!("new {file}"),
+        }),
+    )
+}
+
+/// How many times the freshness advisory reached the model.
+fn freshness_hits(runtime: &Arc<MockRuntime>) -> usize {
+    runtime
+        .recorded_requests()
+        .last()
+        .map(|req| {
+            req.messages
+                .iter()
+                .filter(|m| {
+                    m.role == leveler_model::Role::User
+                        && m.text_content().contains(FRESHNESS_MARKER)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> Arc<MockRuntime> {
+    let workspace = Workspace::new(dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(script));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_structure(true);
+    executor
+        .run(
+            "rewrite every file, one step per group",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    runtime
+}
+
+/// F2: a plan that says "step 1 in progress" while the agent edits file after
+/// file has stopped describing the work. The runtime cannot know whether step
+/// 1 is done, so it asks once and changes nothing.
+#[tokio::test]
+async fn a_plan_that_stops_tracking_the_work_earns_one_reminder() {
+    let dir = plan_freshness_dir("stale", 8);
+    let mut script = vec![plan_call(
+        "p1",
+        &[("build", "in_progress"), ("verify", "pending")],
+    )];
+    script.extend((0..8).map(|i| edit_call(&format!("e{i}"), i)));
+    script.push(assistant_text("done"));
+    let runtime = run_plan_script(&dir, script).await;
+    assert_eq!(
+        freshness_hits(&runtime),
+        1,
+        "a stale plan is asked about once"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F3: the model ignoring the advisory is allowed. Repeating it every round
+/// would turn a reminder into spam and burn the rounds it is trying to save.
+#[tokio::test]
+async fn an_ignored_reminder_is_not_repeated_every_round() {
+    let dir = plan_freshness_dir("nospam", 14);
+    let mut script = vec![plan_call(
+        "p1",
+        &[("build", "in_progress"), ("verify", "pending")],
+    )];
+    script.extend((0..14).map(|i| edit_call(&format!("e{i}"), i)));
+    script.push(assistant_text("done"));
+    let runtime = run_plan_script(&dir, script).await;
+    assert_eq!(freshness_hits(&runtime), 1, "still exactly one");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F4: synchronizing the plan starts the interval over, and a later stale
+/// stretch earns its own single reminder.
+#[tokio::test]
+async fn synchronizing_the_plan_resets_the_interval() {
+    let dir = plan_freshness_dir("reset", 16);
+    let mut script = vec![plan_call(
+        "p1",
+        &[("build", "in_progress"), ("verify", "pending")],
+    )];
+    script.extend((0..7).map(|i| edit_call(&format!("a{i}"), i)));
+    script.push(plan_call(
+        "p2",
+        &[("build", "completed"), ("verify", "in_progress")],
+    ));
+    script.extend((7..15).map(|i| edit_call(&format!("b{i}"), i)));
+    script.push(assistant_text("done"));
+    let runtime = run_plan_script(&dir, script).await;
+    assert_eq!(
+        freshness_hits(&runtime),
+        2,
+        "one per stale interval, not one per run"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F5: reading and searching are work INSIDE a step. A plan that stands still
+/// through them is not stale, and the reminder must not fire.
+#[tokio::test]
+async fn reading_within_one_step_never_ages_the_plan() {
+    let dir = plan_freshness_dir("reads", 2);
+    let mut script = vec![plan_call(
+        "p1",
+        &[("build", "in_progress"), ("verify", "pending")],
+    )];
+    script.extend((0..12).map(|i| {
+        assistant_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({"path": format!("f{}.txt", i % 2)}),
+        )
+    }));
+    script.push(assistant_text("done"));
+    let runtime = run_plan_script(&dir, script).await;
+    assert_eq!(
+        freshness_hits(&runtime),
+        0,
+        "no workspace change, no staleness"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F5b: the reminder is advisory. It never edits the plan, so the only plan
+/// the UI ever sees is the one the model sent.
+#[tokio::test]
+async fn the_reminder_never_changes_a_single_plan_status() {
+    let dir = plan_freshness_dir("readonly", 8);
+    let mut script = vec![plan_call(
+        "p1",
+        &[("build", "in_progress"), ("verify", "pending")],
+    )];
+    script.extend((0..8).map(|i| edit_call(&format!("e{i}"), i)));
+    script.push(assistant_text("done"));
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(script));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_structure(true);
+    let mut plans = Vec::new();
+    executor
+        .run(
+            "rewrite every file",
+            &mut |e| {
+                if let AgentEvent::PlanUpdated { steps } = e {
+                    plans.push(steps);
+                }
+            },
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1, "only the model's own update: {plans:?}");
+    assert_eq!(plans[0][0].status, "in_progress", "{plans:?}");
+    assert_eq!(plans[0][1].status, "pending", "{plans:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F10: a resumed turn continues from the last plan the MODEL published, and
+/// the runtime republishes nothing. A host-side guess would put a second,
+/// competing plan on screen.
+#[tokio::test]
+async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
+    let dir = plan_freshness_dir("resume", 2);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let seeded = leveler_agent::PlanState {
+        steps: vec![
+            leveler_agent::PlanStep {
+                step: "build".into(),
+                status: "completed".into(),
+                id: None,
+                origin: Default::default(),
+            },
+            leveler_agent::PlanStep {
+                step: "verify".into(),
+                status: "in_progress".into(),
+                id: None,
+                origin: Default::default(),
+            },
+        ],
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "f0.txt"})),
+        assistant_text("picked up where I left off"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0,
+    )
+    .with_structure(true)
+    .with_seeded_plan(seeded);
+
+    let mut plans = Vec::new();
+    executor
+        .run(
+            "continue",
+            &mut |e| {
+                if let AgentEvent::PlanUpdated { steps } = e {
+                    plans.push(steps);
+                }
+            },
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plans.is_empty(),
+        "resume republishes nothing of its own: {plans:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// C1: a top-level interactive turn (`UntilTerminal`, no explicit
 /// `max_rounds`) must not be cut off by a hidden round count. The old code
 /// handed every such turn a 100-round ceiling, so a long task stopped with

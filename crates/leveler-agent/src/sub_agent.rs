@@ -71,7 +71,9 @@ pub(crate) fn settlement_notice(
          {nickname} ({id}, role={}) has finished and will do no further work.\n\
          {scope_line}{result_for_parent}\n\
          Inspect and integrate this result where it matters; do not redo work \
-         it completed.",
+         it completed. If this completes or changes your active plan step, \
+         synchronize the plan with update_plan before moving on — a child \
+         finishing does not advance the plan on its own.",
         role.label()
     )
 }

@@ -95,6 +95,13 @@ impl Drop for BackgroundChildren {
     }
 }
 
+/// Whether a plan is claiming that some step is underway right now. Only such
+/// a plan can go stale: one with nothing in progress asserts nothing about
+/// the current work.
+fn plan_has_active_step(plan: &PlanState) -> bool {
+    plan.steps.iter().any(|s| s.status == "in_progress")
+}
+
 /// The one soft reminder a multi-step task gets when the model has worked
 /// for a few rounds without registering a plan. Advisory only: no tool is
 /// refused for a missing plan, and the model may keep working without one.
@@ -122,6 +129,24 @@ const MAX_BOUNDED_TURN_ROUNDS: u32 = 100;
 /// force ToolChoice — the plan is the model's cognitive aid, not a mutation
 /// license.
 const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
+
+/// The one advisory an ACTIVE plan gets when it has stopped tracking the
+/// work. Advisory only: no tool is refused, no status is changed, and a model
+/// that is genuinely still on the same step is told to leave it alone.
+pub(crate) const PLAN_FRESHNESS_TEXT: &str = "Your active plan has not been updated for a while. If your work has \
+     moved on to another plan step, synchronize it with update_plan: mark the \
+     finished step completed and the one you are on now in_progress. If the \
+     current step is genuinely still active, leave the plan unchanged and \
+     continue.";
+
+/// Rounds of REAL work (a workspace mutation or an executed command) that may
+/// pass after a plan update before the model is reminded once. Counted in work
+/// rounds, not raw rounds: thinking and reading are part of a step, so a plan
+/// that stands still through them is not stale.
+///
+/// This detects a stale plan. It never decides that a step is DONE — that is a
+/// semantic judgement the runtime has no authority to make.
+const PLAN_FRESHNESS_AFTER_WORK_ROUNDS: u32 = 6;
 
 /// Bounded recovery from a malformed tool call: a weak model sometimes emits
 /// tool arguments that aren't valid JSON (an unescaped backslash from a regex,
@@ -165,6 +190,15 @@ pub(crate) struct Drive<'a> {
     structured_plan_required: bool,
     plan_rounds_without_plan: u32,
     plan_soft_nudge_sent: bool,
+    /// Work rounds since the plan was last synchronized. Reset by every
+    /// successful `update_plan`, so a model that keeps its plan current is
+    /// never reminded.
+    plan_stale_work_rounds: u32,
+    /// One advisory per stale interval — a per-round reminder would be spam.
+    plan_freshness_notice_sent: bool,
+    /// Baselines for "did this round do real work", compared per round.
+    plan_work_files_seen: usize,
+    plan_work_commands_seen: u32,
     budget_note_sent: bool,
     plan_state: PlanState,
     structured_plan_started: bool,
@@ -343,6 +377,10 @@ impl Executor {
             commands_run: progress.cumulative_commands,
             plan_rounds_without_plan: 0,
             plan_soft_nudge_sent: false,
+            plan_stale_work_rounds: 0,
+            plan_freshness_notice_sent: false,
+            plan_work_files_seen: 0,
+            plan_work_commands_seen: progress.cumulative_commands,
             budget_note_sent: false,
             structured_plan_started: !self.seeded_plan.is_empty(),
             plan_state: self.seeded_plan.clone(),
@@ -714,6 +752,22 @@ impl AgentHarness for Drive<'_> {
             self.sink.append(std::slice::from_ref(&nudge)).await?;
             messages.push(nudge);
             self.plan_soft_nudge_sent = true;
+        }
+
+        // One advisory when an ACTIVE plan has stopped tracking the work.
+        // The runtime can see that the plan has not moved while real work
+        // happened; it cannot see whether the current step is done, so it
+        // asks and changes nothing. A plan with no in-progress step is not
+        // claiming anything is underway, so it is not stale.
+        if self.structured_plan_started
+            && !self.plan_freshness_notice_sent
+            && self.plan_stale_work_rounds >= PLAN_FRESHNESS_AFTER_WORK_ROUNDS
+            && plan_has_active_step(&self.plan_state)
+        {
+            let note = Message::text(Role::User, PLAN_FRESHNESS_TEXT);
+            self.sink.append(std::slice::from_ref(&note)).await?;
+            messages.push(note);
+            self.plan_freshness_notice_sent = true;
         }
 
         // A pinned task budget is the model's to spend: at 80% it is told
@@ -2032,6 +2086,11 @@ impl AgentHarness for Drive<'_> {
                         } else {
                             self.plan_state = next;
                             self.structured_plan_started = true;
+                            // The plan now describes the work again: the
+                            // stale interval starts over, and a future one
+                            // may earn its own single reminder.
+                            self.plan_stale_work_rounds = 0;
+                            self.plan_freshness_notice_sent = false;
                             (self.observer)(AgentEvent::PlanUpdated {
                                 steps: self.plan_state.steps.clone(),
                             });
@@ -2788,6 +2847,20 @@ impl AgentHarness for Drive<'_> {
         // later. Never caps anything; not a budget.
         if self.structured_plan_required && !self.structured_plan_started {
             self.plan_rounds_without_plan = self.plan_rounds_without_plan.saturating_add(1);
+        }
+
+        // Did this round move the workspace? Reuses the signals the ledger
+        // already keeps — a file the tools reported modifying, a command
+        // they reported running — rather than counting tool calls, so a
+        // step spent reading and thinking never ages the plan.
+        let files_now = self.modified_files.len();
+        let commands_now = self.commands_run;
+        let did_work =
+            files_now > self.plan_work_files_seen || commands_now > self.plan_work_commands_seen;
+        self.plan_work_files_seen = files_now;
+        self.plan_work_commands_seen = commands_now;
+        if did_work && self.structured_plan_started {
+            self.plan_stale_work_rounds = self.plan_stale_work_rounds.saturating_add(1);
         }
 
         // Goal mode: an explicit update_goal this round ends the run now that

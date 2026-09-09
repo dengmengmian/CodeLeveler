@@ -49,8 +49,21 @@ impl Tool for UpdatePlanTool {
         "Record or update your task plan as a checklist. Provide an optional \
          explanation and a list of plan items, each with a `step` and a `status` \
          (pending | in_progress | completed). At most one step may be in_progress \
-         at a time. Use this on multi-step tasks to track progress; it has no side \
-         effects on the workspace."
+         at a time. It has no side effects on the workspace.\n\n\
+         Call this again whenever your work moves from one step to another: mark \
+         the finished step completed and the next one in_progress, at the \
+         transition — not several steps later, and not in one batch at the end. \
+         Also call it when the plan itself changes: a step is no longer needed, \
+         the work splits differently, or a new fact adds a step. Send the whole \
+         list every time.\n\n\
+         Do NOT call this between the tool calls inside one step: a step that \
+         needs a read, two edits and a test run stays in_progress for all of \
+         them. One call per real step transition is right; one per tool call is \
+         waste.\n\n\
+         Statuses reflect your own judgement of the work, nothing else. If you \
+         finished several steps in one stretch, mark them all completed in one \
+         call. If you are unsure whether a step is done, leave it as it is — \
+         never mark a step completed to make the checklist look current."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -178,6 +191,24 @@ mod tests {
         assert!(out.content.contains("[x] read code"));
         assert!(out.content.contains("[~] fix bug"));
         assert!(out.content.contains("[ ] run tests"));
+    }
+
+    /// The tool description is the model's only always-present copy of the
+    /// contract. "Use this to track progress" produced plans that were created
+    /// once and never updated again.
+    #[test]
+    fn the_description_says_when_to_call_again() {
+        let d = UpdatePlanTool.description();
+        assert!(d.contains("Call this again"), "{d}");
+        assert!(
+            d.contains("at the \n         transition") || d.contains("transition"),
+            "{d}"
+        );
+        assert!(d.contains("Do NOT call this between the tool calls"), "{d}");
+        assert!(
+            d.contains("never mark a step completed to make the checklist look current"),
+            "{d}"
+        );
     }
 
     #[tokio::test]

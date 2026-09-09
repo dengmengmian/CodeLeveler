@@ -699,6 +699,50 @@ fn list_files_scan_stays_out_of_conversation() {
     );
 }
 
+/// F1 at the surface: the frame drawn right after a plan transition already
+/// shows it. The dock stuck on "step 1/8 in progress" while the agent worked
+/// on step 5 was a missing update, not a deferred repaint — but the repaint
+/// has to be immediate for the fix to be visible at all.
+#[test]
+fn a_plan_transition_repaints_on_the_same_frame() {
+    use leveler_client_protocol::{PlanStepStatus as P, UiPlan, UiPlanStep};
+    let mut state = opened_state();
+    let plan = |a, b, c| {
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "骨架".into(),
+                        status: a,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "首页".into(),
+                        status: b,
+                    },
+                    UiPlanStep {
+                        index: 2,
+                        description: "验证".into(),
+                        status: c,
+                    },
+                ],
+            },
+        })
+    };
+    reduce(&mut state, plan(P::Running, P::Pending, P::Pending));
+    let before = render_at(100, 30, &mut state);
+    assert!(before.contains("当前 1/3"), "{before}");
+
+    reduce(&mut state, plan(P::Done, P::Running, P::Pending));
+    let after = render_at(100, 30, &mut state);
+    assert!(
+        after.contains("1/3 已完成") && after.contains("当前 2/3"),
+        "the header follows the transition: {after}"
+    );
+    assert!(after.contains("骨架") && after.contains("首页"), "{after}");
+}
+
 #[test]
 fn renders_plan_chrome_and_diff_screen() {
     use leveler_client_protocol::{PlanStepStatus, UiDiff, UiDiffFile, UiPlan, UiPlanStep};

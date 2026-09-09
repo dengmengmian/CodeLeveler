@@ -182,12 +182,30 @@ impl PromptBuilder {
                  pieces, multi-file changes, or migrate/architecture work), call \
                  update_plan with one in_progress step and the rest pending \
                  (statuses: pending/in_progress/completed) — not a prose checklist \
-                 alone — before you start changing files, then follow and revise \
-                 it via update_plan. Locating and reading code needs no plan: \
+                 alone — before you start changing files. Locating and reading \
+                 code needs no plan: \
                  investigate as long as the evidence still changes your \
                  understanding, and write the plan once you know what the work \
                  actually is. If a single action covers the request, skip \
                  update_plan and just do the task.",
+            );
+            // A plan is only worth showing if it tracks the work. Created once
+            // and never touched again, it leaves the user watching "step 1/8 in
+            // progress" while the agent is building step 5 — and the runtime
+            // cannot fix that for them: whether a step is done is a judgement
+            // only the model can make.
+            prompt.push_str(
+                "\n\nWhen an active plan exists, keep it synchronized with your actual \
+                 work. At most one step is in_progress. When you finish the current \
+                 step and move on to another, call update_plan at that transition to \
+                 mark the finished step completed and the next one in_progress — not \
+                 several steps later, and not as one batch at the end. Do not call it \
+                 between the tool calls inside a single step: a step that needs a \
+                 read, two edits and a test run stays in_progress for all of them. If \
+                 you finished several steps in one stretch, mark them all completed in \
+                 one call. Never mark a step completed just to make the checklist look \
+                 current — update it only when you believe that step's work is \
+                 actually done, and if you are unsure, leave it as it is.",
             );
             // Zero-cost guidance, unlike the removed MissingEvidence nudge: it
             // costs no extra round, and a model that verifies inside the turn
@@ -547,6 +565,35 @@ mod tests {
     /// forbid whole-file reads or argue from token cost: the goal is evidence
     /// C2.3B §4 — a known location must not cost a ceremonial search. The
     /// guidance has to state the KNOWN case, or "search first" degrades into
+    /// A plan created once and never touched again is worse than no plan: the
+    /// user watches "step 1/8 in progress" while the agent builds step 5. The
+    /// prompt has to name WHEN to synchronize, because the runtime cannot —
+    /// whether a step is done is a judgement only the model can make.
+    #[test]
+    fn plan_guidance_says_when_to_synchronize_not_just_to_revise() {
+        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
+        assert!(
+            prompt.contains("keep it synchronized"),
+            "the standing obligation must be explicit: {prompt}"
+        );
+        assert!(
+            prompt.contains("at that transition"),
+            "the moment matters, not just the act: {prompt}"
+        );
+        assert!(
+            prompt.contains("At most one step is in_progress"),
+            "the structural rule travels with the timing rule: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not call it") && prompt.contains("inside a single step"),
+            "one call per tool call would burn rounds for nothing: {prompt}"
+        );
+        assert!(
+            prompt.contains("Never mark a step completed just to make the checklist look"),
+            "a checklist that lies to look current is worse than a stale one: {prompt}"
+        );
+    }
+
     /// C2.3B §30 D/F — C2.3A's contract is untouched: the plan block may ask
     /// for a plan before *mutations*, but nothing in the prompt may frame
     /// navigation as optional or as a lesser action, and no guidance may force

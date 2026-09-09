@@ -5214,6 +5214,150 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
     );
 }
 
+/// F1: a plan transition must be on screen in the very next frame. Waiting
+/// for the next assistant message, the next turn, or a session refresh is what
+/// leaves the dock claiming step 1 while the agent is on step 2.
+#[test]
+fn a_plan_transition_is_on_screen_in_the_next_frame() {
+    use leveler_client_protocol::PlanStepStatus as P;
+    let mut s = busy_state();
+    let plan = |a, b, c| {
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "骨架".into(),
+                        status: a,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "首页".into(),
+                        status: b,
+                    },
+                    UiPlanStep {
+                        index: 2,
+                        description: "验证".into(),
+                        status: c,
+                    },
+                ],
+            },
+        })
+    };
+    reduce(&mut s, plan(P::Running, P::Pending, P::Pending));
+    assert_eq!(s.plan.as_ref().unwrap().steps[0].status, P::Running);
+
+    reduce(&mut s, plan(P::Done, P::Running, P::Pending));
+    let statuses: Vec<char> = s
+        .plan
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .map(|step| match step.status {
+            P::Done => '✓',
+            P::Running => '●',
+            _ => '○',
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!['✓', '●', '○'],
+        "the transition is state, not a deferred repaint"
+    );
+}
+
+/// F6: a child settling is not a plan transition. Only the parent can say
+/// whether the step that delegated the work is finished — one step may span
+/// several children plus its own integration and verification.
+#[test]
+fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
+    use leveler_client_protocol::PlanStepStatus as P;
+    let mut s = busy_state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "委派页面".into(),
+                        status: P::Running,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "整合".into(),
+                        status: P::Pending,
+                    },
+                ],
+            },
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "s1".into(),
+            nickname: "Newton".into(),
+            role: "worker".into(),
+            done: true,
+            ok: true,
+            detail: "页面完成".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            contribution: None,
+        }),
+    );
+    let steps = &s.plan.as_ref().unwrap().steps;
+    assert_eq!(steps[0].status, P::Running, "the parent has not said so");
+    assert_eq!(steps[1].status, P::Pending);
+}
+
+/// F7: once the parent DOES decide, the transition lands like any other.
+#[test]
+fn the_parent_advancing_after_a_child_settles_projects_normally() {
+    use leveler_client_protocol::PlanStepStatus as P;
+    let mut s = busy_state();
+    let plan = |a, b| {
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "委派页面".into(),
+                        status: a,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "整合".into(),
+                        status: b,
+                    },
+                ],
+            },
+        })
+    };
+    reduce(&mut s, plan(P::Running, P::Pending));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "s1".into(),
+            nickname: "Newton".into(),
+            role: "worker".into(),
+            done: true,
+            ok: true,
+            detail: "页面完成".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            contribution: None,
+        }),
+    );
+    reduce(&mut s, plan(P::Done, P::Running));
+    let steps = &s.plan.as_ref().unwrap().steps;
+    assert_eq!(steps[0].status, P::Done);
+    assert_eq!(steps[1].status, P::Running);
+}
+
 /// A plan with five done steps, one running and three pending — the shape
 /// that showed "任务已完成 … 计划 6/9" next to "▼ 计划 · 第 7/9 项进行中".
 fn stale_open_plan(s: &mut AppState) {
