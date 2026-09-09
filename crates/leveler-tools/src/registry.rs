@@ -965,3 +965,40 @@ mod dynamic_metadata_tests {
         assert!(out.content.contains("dynamic-ok"));
     }
 }
+
+#[cfg(test)]
+mod schema_budget {
+    /// The advertised tool schema is a FIXED cost on every model request of a
+    /// session — it sits in the cached prefix, so it is cheap per request, but
+    /// it is paid uncached once per session and it is pure prefix growth.
+    /// Measured 2026-09-09: core 13.1 KB / 14 tools, full 28.8 KB / 43 tools.
+    ///
+    /// These bounds are a tripwire, not a target: a tool whose schema doubles
+    /// the surface should be a decision, not a surprise.
+    #[test]
+    fn the_advertised_tool_surface_stays_within_its_measured_budget() {
+        let bytes = |reg: &super::ToolRegistry| {
+            reg.definitions()
+                .iter()
+                .map(|d| serde_json::to_string(d).expect("schema serializes").len())
+                .sum::<usize>()
+        };
+        let core = super::core_registry();
+        let full = super::full_registry();
+        let (core_bytes, full_bytes) = (bytes(&core), bytes(&full));
+        assert!(
+            core_bytes < 20_000,
+            "core tool schema grew to {core_bytes} bytes over {} tools",
+            core.definitions().len()
+        );
+        assert!(
+            full_bytes < 40_000,
+            "full tool schema grew to {full_bytes} bytes over {} tools",
+            full.definitions().len()
+        );
+        assert!(
+            core_bytes < full_bytes,
+            "core must stay a subset of full: {core_bytes} vs {full_bytes}"
+        );
+    }
+}

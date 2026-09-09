@@ -1265,3 +1265,26 @@ mod tests {
         assert!(!a.contains("PermissionProfile")); // body text must not appear
     }
 }
+
+#[cfg(test)]
+mod prompt_budget {
+    use super::PromptBuilder;
+
+    /// The system prompt is paid on every request of every session. It lives in
+    /// the provider's cached prefix, so its per-request cost is small, but it
+    /// is the largest single uncached block of the first request of a session.
+    /// Measured 2026-09-09: 21.2 KB, 22.8 KB with the plan block.
+    ///
+    /// A tripwire, not a target. Rules earn their bytes; this only makes a
+    /// large addition visible instead of silent.
+    #[test]
+    fn the_system_prompt_stays_within_its_measured_budget() {
+        let plain = PromptBuilder::new().build().len();
+        let planned = PromptBuilder::new()
+            .require_explicit_plan(true)
+            .build()
+            .len();
+        assert!(plain < 30_000, "system prompt grew to {plain} bytes");
+        assert!(planned < 32_000, "with the plan block: {planned} bytes");
+    }
+}
