@@ -1,0 +1,86 @@
+{
+  "kind": "run",
+  "meta": {
+    "created_at": "2026-09-09T03:53:14Z",
+    "git_sha": "2c50188f096ff89cb9aad4ab85ca17bb78cd5637",
+    "cases_dir": "/private/tmp/claude-501/-Users-mengmian-Develop-app-dengmengmian-codeleveler/d60f7db0-a23b-4630-9410-ae25221d921b/scratchpad/cases/n3",
+    "mode": "direct",
+    "repetitions": 1,
+    "model_refs": [
+      "deepseek/deepseek-v4-flash"
+    ],
+    "engine_version": "0.2.0-beta.1",
+    "context": {
+      "case_count": 1,
+      "repository_cases": 1,
+      "synthetic_cases": 0
+    }
+  },
+  "report": {
+    "model": "deepseek/deepseek-v4-flash",
+    "cases": [
+      {
+        "id": "n3-caller-propagation",
+        "repetition": 1,
+        "completed": true,
+        "termination": "completed",
+        "expect_passed": true,
+        "rounds": 26,
+        "latency_ms": 100259,
+        "input_tokens": 820167,
+        "output_tokens": 2964,
+        "cost_usd_micros": 114745,
+        "note": "Completed",
+        "verification_evidence": {
+          "program": "bash",
+          "args": [
+            "-c",
+            "set -euo pipefail\nd=\"$(mktemp -d \"${TMPDIR:-/tmp}/n3.XXXXXX\")\"\ntrap 'rm -rf \"$d\"' EXIT\ncat > \"$d/n3_test.go\" <<'GO'\npackage report\n\nimport (\n\t\"strings\"\n\t\"testing\"\n\n\t\"navsvc/pkg/api\"\n)\n\nfunc batches() []api.Batch {\n\treturn []api.Batch{{Records: []api.Record{\n\t\t{Name: \"a\", Value: 1, Valid: true},\n\t\t{Name: \"a\", Value: 99, Valid: false},\n\t\t{Name: \"ghost\", Value: 5, Valid: false},\n\t}}}\n}\n\nfunc TestSummarySkipsInvalid(t *testing.T) {\n\tout := Aggregate(batches())\n\tif !strings.Contains(out, \"a count=1 total=1\") {\n\t\tt.Fatalf(\"invalid record still counted: %q\", out)\n\t}\n\tif strings.Contains(out, \"ghost\") {\n\t\tt.Fatalf(\"an entirely invalid name reached the report: %q\", out)\n\t}\n}\n\nfunc TestDistinctSkipsInvalid(t *testing.T) {\n\tif got := Distinct(batches()); got != 1 {\n\t\tt.Fatalf(\"Distinct counted invalid records: want 1, got %d\", got)\n\t}\n}\nGO\ncp \"$d/n3_test.go\" internal/report/zz_hidden_n3_test.go\ntrap 'rm -f internal/report/zz_hidden_n3_test.go; rm -rf \"$d\"' EXIT\ngo build ./... > /dev/null\ngo test ./internal/report/ > /dev/null\ngit diff --quiet -- legacy/\ngo test ./internal/pipeline/ ./internal/config/ > /dev/null\n"
+          ],
+          "passed": true,
+          "exit_code": 0
+        },
+        "tool_calls": 25,
+        "loop_guard_trips": 0,
+        "verification_ran": true,
+        "is_recovery": false,
+        "ttff_ms": 49,
+        "silent_duration_ms": 3858,
+        "edit_attempts": 1,
+        "edit_failures": 0,
+        "read_calls": 18,
+        "search_calls": 2,
+        "apply_patch_calls": 1,
+        "replace_calls": 0,
+        "first_edit_round": 20,
+        "unique_files_read": 17,
+        "repeated_file_reads": 1,
+        "unique_search_queries": 2,
+        "repeated_search_queries": 0,
+        "first_relevant_file_round": 3,
+        "relevant_paths_touched": 3,
+        "relevant_paths_before_edit": 3,
+        "impact_paths_touched": 2,
+        "impact_paths_before_edit": 2,
+        "distractor_paths_read": 1,
+        "forbidden_paths_edited": 0,
+        "broad_reads": 18,
+        "narrow_reads": 0,
+        "verification_driven_impact_discovery": false
+      }
+    ]
+  },
+  "completion_rate": 1.0,
+  "passed": 1,
+  "total": 1,
+  "failed_case_ids": [],
+  "false_completion_rate": 0.0,
+  "false_completion_case_ids": [],
+  "quality_score": {
+    "task_success": 1.0,
+    "completion_accuracy": 1.0,
+    "tool_efficiency": 1.0,
+    "cost_efficiency": 1.0
+  },
+  "quality_score_100": 100
+}

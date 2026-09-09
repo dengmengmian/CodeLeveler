@@ -1,0 +1,87 @@
+{
+  "kind": "run",
+  "meta": {
+    "created_at": "2026-09-09T04:04:33Z",
+    "git_sha": "2c50188f096ff89cb9aad4ab85ca17bb78cd5637",
+    "cases_dir": "/private/tmp/claude-501/-Users-mengmian-Develop-app-dengmengmian-codeleveler/d60f7db0-a23b-4630-9410-ae25221d921b/scratchpad/cases/icg5",
+    "mode": "direct",
+    "repetitions": 1,
+    "model_refs": [
+      "deepseek/deepseek-v4-flash"
+    ],
+    "engine_version": "0.2.0-beta.1",
+    "context": {
+      "case_count": 1,
+      "repository_cases": 1,
+      "synthetic_cases": 0
+    }
+  },
+  "report": {
+    "model": "deepseek/deepseek-v4-flash",
+    "cases": [
+      {
+        "id": "icg-5-long-task",
+        "repetition": 1,
+        "completed": true,
+        "termination": "completed",
+        "expect_passed": true,
+        "rounds": 36,
+        "latency_ms": 285010,
+        "input_tokens": 1177746,
+        "output_tokens": 22392,
+        "cost_usd_micros": 169809,
+        "note": "Completed",
+        "verification_evidence": {
+          "program": "bash",
+          "args": [
+            "-c",
+            "set -euo pipefail\nd=\"$(mktemp -d \"${TMPDIR:-/tmp}/icg5.XXXXXX\")\"\ntrap 'rm -rf \"$d\"' EXIT\ngo build -o \"$d/navsvc\" ./cmd/navsvc\nprintf 'input.format = jsonl\\noutput.sink = stdout\\n' > \"$d/c.conf\"\nprintf '{\"name\":\"req\",\"value\":1,\"env\":\"prod\"}\\n{\"name\":\"req\",\"value\":4,\"env\":\"dev\"}\\n{\"name\":\"plain\",\"value\":9}\\n{\"name\":\"g\",\"value\":\"zz\"}\\n' > \"$d/in.jsonl\"\nout=\"$(< \"$d/in.jsonl\" \"$d/navsvc\" \"$d/c.conf\" --summary --stats)\"\nprintf '%s\\n' \"$out\" | grep -qx 'plain count=1 total=9'\nprintf '%s\\n' \"$out\" | grep -qx 'req{env=dev} count=1 total=4'\nprintf '%s\\n' \"$out\" | grep -qx 'req{env=prod} count=1 total=1'\n# the invalid record is not a row and not in TOTAL\nprintf '%s\\n' \"$out\" | grep -q '^g ' && exit 1\nprintf '%s\\n' \"$out\" | grep -qx 'TOTAL count=3 total=14'\n# stats: N counts everything incl. the invalid record; K = distinct\n# incoming valid names (req, plain) — grouping does not change it\nprintf '%s\\n' \"$out\" | tail -1 | grep -qx 'records=4 invalid=1 distinct=2'\n# ordering: TOTAL after rows, stats line last\n[ \"$(printf '%s\\n' \"$out\" | tail -2 | head -1)\" = \"TOTAL count=3 total=14\" ]\n# without --stats: no stats line\n< \"$d/in.jsonl\" \"$d/navsvc\" \"$d/c.conf\" --summary | grep -q 'records=' && exit 1\ngit diff --quiet -- legacy/\ngo test ./... > /dev/null\n"
+          ],
+          "passed": true,
+          "exit_code": 0
+        },
+        "tool_calls": 36,
+        "loop_guard_trips": 0,
+        "verification_ran": true,
+        "is_recovery": false,
+        "ttff_ms": 49,
+        "silent_duration_ms": 9862,
+        "edit_attempts": 2,
+        "edit_failures": 0,
+        "read_calls": 23,
+        "search_calls": 2,
+        "apply_patch_calls": 2,
+        "replace_calls": 0,
+        "first_edit_round": 26,
+        "unique_files_read": 23,
+        "repeated_file_reads": 0,
+        "unique_search_queries": 2,
+        "repeated_search_queries": 0,
+        "first_relevant_file_round": 2,
+        "first_plan_round": 25,
+        "relevant_paths_touched": 1,
+        "relevant_paths_before_edit": 1,
+        "impact_paths_touched": 2,
+        "impact_paths_before_edit": 2,
+        "distractor_paths_read": 1,
+        "forbidden_paths_edited": 0,
+        "broad_reads": 23,
+        "narrow_reads": 0,
+        "verification_driven_impact_discovery": false
+      }
+    ]
+  },
+  "completion_rate": 1.0,
+  "passed": 1,
+  "total": 1,
+  "failed_case_ids": [],
+  "false_completion_rate": 0.0,
+  "false_completion_case_ids": [],
+  "quality_score": {
+    "task_success": 1.0,
+    "completion_accuracy": 1.0,
+    "tool_efficiency": 1.0,
+    "cost_efficiency": 1.0
+  },
+  "quality_score_100": 100
+}

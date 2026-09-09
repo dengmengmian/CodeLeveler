@@ -1,0 +1,37 @@
+Unified Dogfood Acceptance V1 — run 3
+Result: docs/evaluations/UNIFIED_DOGFOOD_ACCEPTANCE_V1_RESULT.md
+
+HEAD            2c50188f096ff89cb9aad4ab85ca17bb78cd5637
+TREE            7c7cfe7cd28460e0f301c1d57dac539ea2917dbf
+branch          main (clean at start)
+binary          target/release/leveler — 0.2.0-beta.1 (2c50188f096f)
+binary sha256   f3cd01d38f03ff6a1ea29a35e5d149129e44a16d0596ef196986ba3e7cbcdfe9
+model           deepseek/deepseek-v4-flash
+provider        deepseek -> https://taotoken.net/api/v1
+permission mode assisted (product default), sandbox: false
+OS / ARCH       macOS 26.6.2 (25G83) / arm64, Apple M4 Max
+toolchain       rustc 1.90.0, cargo 1.90.0, go1.26.0 darwin/arm64
+fixture repo    evals/fixtures/repos/navsvc @ 4ce9614c701dab1450bdd989bf802a8693ddc077
+window (UTC)    2026-09-09T03:49:47Z -> 04:04:33Z
+repetitions     1 per case; no retry taken (INFRA_FAILURES = 0)
+
+Workspaces were not kept. Session evidence lives in
+$LEVELER_HOME/state/projects/*leveler-eval-<case>-<pid>-exec1-r1/sessions.db
+under these pids:
+
+  rust-mul                42270   session 08744e34-842f-4fb5-9efc-66f8850c2372
+  wv1-runbook-repo        43025   session 793377a1-fe15-40e8-954d-e4fd77e9085b
+  mf1-refund-propagation  43598   session d9f5ada0-f26c-4ec0-88bd-82e44fc38691
+  n3-caller-propagation   45601   session 7c340045-3890-424c-8a57-41342a99a234
+  mf3-key-invariant       48672   session abe88f44-b7a0-458d-8caa-9b7699cfda2e
+  icg-6r-honest-failure   51605   session 8e89414c-18ab-4239-bc10-d021fa0a133a
+  icg-5-long-task         60009   session 8fcc32b0-7aad-4f24-91cd-46802d9d9bf8
+
+Case YAML sha256 at HEAD:
+  f1126b6d3ec144e18320a1b55eaef623095816b39b4ade669fc5c42e8e7c0f2d  evals/cases/navigation/n3-caller-propagation.yaml
+  0c044ca573fcf7d511ab4b83755f8d94cbabc6f61e7a058e2f74217d2ac217ee  evals/cases/icg/icg-5-long-task.yaml
+  e7d946f064b657768ab68973de165e17beff5d8088b980a27996fa9d49351515  evals/cases/icg/icg-6r-honest-failure.yaml
+  3b0e825cc39eaf1ce5a63da6c5d1b51588dc6dcb646df6ae4d9cb1ae609fa69b  evals/cases/realtask/multifile/mf1-refund-propagation.yaml
+  3054edfab756a431a9c65b1b0688530f12959686382fdd680c9049aedc352563  evals/cases/realtask/verification/wv1-runbook-repo.yaml
+  162a3fbeb603ec650bcc352c4bae420680463a3bbc76de5ca10a680aca7bd3ad  evals/cases/realtask/multifile/mf3-key-invariant.yaml
+  726b44bd9a4c6cfb429ca989d4870651f059576db2b937bf9fa6255505c756ed  evals/cases/smoke/rust-mul.yaml
