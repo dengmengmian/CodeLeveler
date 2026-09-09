@@ -419,6 +419,39 @@ impl<'a> Drive<'a> {
         (self.observer)(projected);
     }
 
+    /// Answer a call the host refused BEFORE admission, closing it on both
+    /// channels at once.
+    ///
+    /// The model needs the reason in its transcript; every other reader needs
+    /// the announced call to reach a terminal. `ToolCall` is emitted before
+    /// admission (and persisted as `ToolCallStarted`), so a refusal that only
+    /// wrote the transcript left the durable log claiming the call was still
+    /// running — which the engine's crash-window reconciliation reads as "this
+    /// may have run and left a side effect", about a command that provably
+    /// never ran. A refusal is a fact the runtime holds; it does not get to
+    /// decay into an unknown.
+    fn settle_refused_call(
+        &mut self,
+        call: &ToolCall,
+        reason: String,
+        results: &mut [Option<ContentPart>],
+        index: usize,
+    ) {
+        (self.observer)(AgentEvent::ToolResult {
+            id: call.id.as_str().to_string(),
+            name: call.name.clone(),
+            is_error: true,
+            preview: preview(&reason),
+        });
+        results[index] = Some(ContentPart::ToolResult {
+            result: ToolResultContent {
+                call_id: call.id.clone(),
+                content: reason,
+                is_error: true,
+            },
+        });
+    }
+
     /// Write absolute epoch spend into the ledger so continue/resume seeds the
     /// same totals (including tool-phase command/file increments after the
     /// last model stream), and publish it.
@@ -1800,26 +1833,24 @@ impl AgentHarness for Drive<'_> {
                 if requested.is_empty() {
                     // Malformed: no axis named. Refuse without interrupting
                     // the user — there is nothing to put in a prompt.
-                    results[index] = Some(ContentPart::ToolResult {
-                        result: ToolResultContent {
-                            call_id: call.id,
-                            content: escalation_missing_axis_message(),
-                            is_error: true,
-                        },
-                    });
+                    self.settle_refused_call(
+                        &call,
+                        escalation_missing_axis_message(),
+                        &mut results,
+                        index,
+                    );
                     continue;
                 }
                 if self
                     .progress
                     .covers_denied_request(requested.network, requested.unrestricted_fs)
                 {
-                    results[index] = Some(ContentPart::ToolResult {
-                        result: ToolResultContent {
-                            call_id: call.id,
-                            content: permission_already_denied_message(),
-                            is_error: true,
-                        },
-                    });
+                    self.settle_refused_call(
+                        &call,
+                        permission_already_denied_message(),
+                        &mut results,
+                        index,
+                    );
                     continue;
                 }
                 let action = escalation_action(&call);
@@ -1853,13 +1884,12 @@ impl AgentHarness for Drive<'_> {
                 // unelevated would hand the model the same denial it was
                 // already answering.
                 if outcome.is_error() {
-                    results[index] = Some(ContentPart::ToolResult {
-                        result: ToolResultContent {
-                            call_id: call.id,
-                            content: outcome.message().to_string(),
-                            is_error: true,
-                        },
-                    });
+                    self.settle_refused_call(
+                        &call,
+                        outcome.message().to_string(),
+                        &mut results,
+                        index,
+                    );
                     continue;
                 }
             }

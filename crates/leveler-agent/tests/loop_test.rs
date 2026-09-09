@@ -7275,6 +7275,88 @@ async fn a_denied_escalation_does_not_run_the_command() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Every announced tool call gets a terminal, refusals included.
+///
+/// `ToolCall` is announced before admission and is what the engine persists as
+/// `ToolCallStarted`; the pair with `ToolResult` is how every reader — the UI,
+/// the observer, and the engine's own crash-window reconciliation — decides
+/// whether a call is still running. The escalation settlement sits BEFORE
+/// admission and used to answer its three refusals into the model's transcript
+/// alone: correct for the model, invisible to the log, which was then left
+/// asserting forever that a command nobody ever ran might still be mid-flight
+/// and might have left a side effect. A denial is a fact the runtime knows;
+/// it must not decay into "unknown".
+#[tokio::test]
+async fn a_refused_escalation_closes_the_call_it_announced() {
+    async fn call_lifecycle(
+        tag: &str,
+        args: serde_json::Value,
+        approver: Arc<dyn Approver>,
+    ) -> (Vec<String>, Vec<String>) {
+        let dir = escalate_dir(tag);
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let runtime = Arc::new(MockRuntime::new(vec![
+            assistant_tool_call("c1", "shell_command", args),
+            assistant_text("stopped"),
+        ]));
+        let executor = Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver);
+
+        let (mut announced, mut finished) = (Vec::new(), Vec::new());
+        executor
+            .run(
+                "go",
+                &mut |event| match event {
+                    AgentEvent::ToolCall { id, .. } => announced.push(id),
+                    AgentEvent::ToolResult { id, .. } => finished.push(id),
+                    _ => {}
+                },
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (announced, finished)
+    }
+
+    // 1. The user refuses the elevation this call asked for.
+    let (announced, finished) = call_lifecycle(
+        "closes-denied",
+        serde_json::json!({
+            "cmd": "echo ran > marker.txt",
+            "escalate": { "reason": "needs the network", "network": true }
+        }),
+        Arc::new(AutoDeny),
+    )
+    .await;
+    assert_eq!(
+        announced, finished,
+        "a user-denied escalation must close its own call: announced {announced:?}, \
+         finished {finished:?}"
+    );
+
+    // 2. The escalation names no axis, so nobody is asked and it is refused.
+    let (announced, finished) = call_lifecycle(
+        "closes-noaxis",
+        serde_json::json!({ "cmd": "echo hi", "escalate": { "reason": "please" } }),
+        Arc::new(AutoDeny),
+    )
+    .await;
+    assert_eq!(
+        announced, finished,
+        "a malformed escalation must close its own call: announced {announced:?}, \
+         finished {finished:?}"
+    );
+}
+
 /// Denial is final — the second attempt must be refused without re-prompting,
 /// the same rule `request_permissions` already follows.
 #[tokio::test]

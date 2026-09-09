@@ -955,3 +955,60 @@ async fn current_owner_can_acknowledge_crash_window() {
     let log = EventLog::new(&db, session.clone());
     assert!(log.dangling_tool_calls().await.unwrap().is_empty());
 }
+
+/// A refused escalation leaves NO crash window behind.
+///
+/// This is the other half of the same rule the tests above enforce: a call
+/// that started and never finished is treated as "may have run, may have left
+/// a side effect", and that reading is correct — for a call that actually
+/// crashed mid-flight. A command whose elevation the user denied never ran,
+/// and the runtime knows it: the denial is right there in the log. Answering
+/// only the model and leaving the announced call open turned that certainty
+/// into an unknown, and every later window blocked on
+/// `RecoveryConfirmationRequired` for a side effect that does not exist.
+///
+/// Found by the Unified Dogfood V1 gate (`LOST_TOOL_RESULTS`), on a run where
+/// the model asked to write outside the workspace and was refused.
+#[tokio::test]
+async fn a_denied_escalation_leaves_no_dangling_call_behind() {
+    let mut script = vec![tool_call(
+        "c1",
+        "run_command",
+        serde_json::json!({
+            "cmd": "echo ran > /tmp/outside.txt",
+            "escalate": { "reason": "needs to write outside", "unrestricted_fs": true }
+        }),
+    )];
+    // The drive keeps its round loop going after the refusal; honest stop
+    // replies fill it out without adding a second call to reconcile.
+    for _ in 0..10 {
+        script.push(text("the elevation was refused; stopping"));
+    }
+    let (engine, db, dir) = harness(Arc::new(AutoDeny), script).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let log = EventLog::new(&db, session.clone());
+    assert!(
+        log.dangling_tool_calls().await.unwrap().is_empty(),
+        "a refusal is a terminal fact: it must close the call it refused, not \
+         leave a crash window the next resume has to reconcile"
+    );
+    let events = recorded_events(&db, &session).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished {
+                call_id,
+                is_error: true,
+                ..
+            } if call_id == "c1"
+        )),
+        "the refusal must be durable as the call's terminal, not only in the \
+         model's transcript"
+    );
+}
