@@ -1,0 +1,299 @@
+[
+  {
+    "stage": "evidence",
+    "case": "yq-doc-count",
+    "rep": "1",
+    "arm": "leveler",
+    "wall_ms": 1520341,
+    "rounds": 63,
+    "model": {
+      "requests": 63,
+      "total_ms": 1332330,
+      "median_ms": 6268,
+      "p95_ms": 81689,
+      "max_ms": 128299,
+      "latencies_ms": [
+        29358,
+        65818,
+        4597,
+        3881,
+        12554,
+        4860,
+        19704,
+        5047,
+        12957,
+        4764,
+        40903,
+        18259,
+        50405,
+        66583,
+        9406,
+        56259,
+        6268,
+        54230,
+        81689,
+        66145,
+        5632,
+        4418,
+        5379,
+        5316,
+        26087,
+        15592,
+        31723,
+        9521,
+        12481,
+        44339,
+        67787,
+        6268,
+        4809,
+        5199,
+        4919,
+        7380,
+        7006,
+        4104,
+        4987,
+        4206,
+        84440,
+        26952,
+        88458,
+        16007,
+        4754,
+        4464,
+        5388,
+        5360,
+        5585,
+        128299,
+        5511,
+        5020,
+        5919,
+        5233,
+        4786,
+        6322,
+        5766,
+        4901,
+        4596,
+        5007,
+        6705,
+        5719,
+        6298
+      ],
+      "retries": 0,
+      "input_tokens": 3242659,
+      "cached_input_tokens": 3151360,
+      "output_tokens": 57141,
+      "slow_requests_over_20s": [
+        {
+          "latency_ms": 29358,
+          "output_tokens": 215,
+          "cached": 4096,
+          "input": 20223,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 65818,
+          "output_tokens": 137,
+          "cached": 18432,
+          "input": 25217,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 40903,
+          "output_tokens": 4682,
+          "cached": 37376,
+          "input": 42042,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 50405,
+          "output_tokens": 5295,
+          "cached": 40960,
+          "input": 42841,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 66583,
+          "output_tokens": 7933,
+          "cached": 40960,
+          "input": 44469,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 56259,
+          "output_tokens": 5285,
+          "cached": 45056,
+          "input": 47997,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 54230,
+          "output_tokens": 6571,
+          "cached": 49152,
+          "input": 49523,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 81689,
+          "output_tokens": 9520,
+          "cached": 49152,
+          "input": 49872,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 66145,
+          "output_tokens": 143,
+          "cached": 49152,
+          "input": 50388,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 26087,
+          "output_tokens": 2674,
+          "cached": 51200,
+          "input": 51416,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 31723,
+          "output_tokens": 183,
+          "cached": 51200,
+          "input": 52254,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 44339,
+          "output_tokens": 70,
+          "cached": 53248,
+          "input": 53631,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 67787,
+          "output_tokens": 202,
+          "cached": 53248,
+          "input": 54228,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 84440,
+          "output_tokens": 328,
+          "cached": 57344,
+          "input": 57500,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 26952,
+          "output_tokens": 367,
+          "cached": 57344,
+          "input": 57680,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 88458,
+          "output_tokens": 100,
+          "cached": 57600,
+          "input": 57873,
+          "finish": "tool_calls",
+          "retries": 0
+        },
+        {
+          "latency_ms": 128299,
+          "output_tokens": 236,
+          "cached": 57344,
+          "input": 59376,
+          "finish": "tool_calls",
+          "retries": 0
+        }
+      ],
+      "ttfb_ms": {
+        "median": 4519,
+        "n": 63
+      }
+    },
+    "tools": {
+      "calls": 81,
+      "total_ms": 186609,
+      "median_ms": 24,
+      "max_ms": 49383,
+      "by_tool": {
+        "apply_patch": {
+          "calls": 11,
+          "total_ms": 143
+        },
+        "find_files": {
+          "calls": 2,
+          "total_ms": 52
+        },
+        "git_diff": {
+          "calls": 1,
+          "total_ms": 22
+        },
+        "git_status": {
+          "calls": 1,
+          "total_ms": 16
+        },
+        "grep": {
+          "calls": 5,
+          "total_ms": 169
+        },
+        "list_files": {
+          "calls": 1,
+          "total_ms": 1
+        },
+        "read_file": {
+          "calls": 24,
+          "total_ms": 358
+        },
+        "run_command": {
+          "calls": 9,
+          "total_ms": 9780
+        },
+        "shell_command": {
+          "calls": 21,
+          "total_ms": 176050
+        },
+        "update_goal": {
+          "calls": 1,
+          "total_ms": 0
+        },
+        "update_plan": {
+          "calls": 5,
+          "total_ms": 18
+        }
+      }
+    },
+    "verification_ms": 1412,
+    "harness_ms": 1402,
+    "share": {
+      "model": 0.8763,
+      "tool": 0.1227,
+      "verification_within_tool": 0.0009,
+      "harness": 0.0009
+    },
+    "derived": {
+      "s_per_round": 24.13,
+      "s_per_model_request": 21.15,
+      "tool_calls_per_round": 1.29,
+      "input_tokens_per_round": 51471,
+      "cache_hit_rate": 0.9718
+    },
+    "plan": {
+      "updates": 5,
+      "advisories": []
+    }
+  }
+]

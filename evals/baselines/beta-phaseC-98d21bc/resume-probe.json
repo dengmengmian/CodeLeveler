@@ -1,0 +1,71 @@
+{
+  "probe": "interrupt then run --resume",
+  "case": "n3-caller-propagation",
+  "kill_after_s": 18,
+  "phases": [
+    {
+      "phase": "interrupted",
+      "killed_by_us": true,
+      "wall_s": 18.1,
+      "sessions": [
+        [
+          "492d41a3-c5c4-4e59-85d2-72cb7658288a",
+          "A decoder marks a record `Valid = false` when it could read the record's\nshape but not its contents — a metric line whose value column is garbage,\nfor example. Those records currently reach the report and are counted as if\nthey were real observations, which inflates every number we publish.\n\nReporting must ignore records that are not valid. This applies to everything\nthe report package answers about a set of batches, not only the per-metric\nsummary lines.\n\nNote that the pipeline's `filter` stage is opt-in configuration and users\nroutinely run without it; reporting must be correct regardless.\n\nDo not change existing tests. `go build ./...` and `go test ./...` must pass.\n",
+          "running"
+        ]
+      ],
+      "requests": 3,
+      "tools_started": 7,
+      "tools_finished": 7,
+      "dangling": [],
+      "event_counts": {
+        "context_snapshot": 1,
+        "progress_updated": 6,
+        "task_started": 1,
+        "tool_call_finished": 7,
+        "tool_call_started": 7,
+        "turn_started": 1
+      },
+      "diff_stat": []
+    },
+    {
+      "phase": "resumed",
+      "rc": 0,
+      "sessions": [
+        [
+          "492d41a3-c5c4-4e59-85d2-72cb7658288a",
+          "A decoder marks a record `Valid = false` when it could read the record's\nshape but not its contents — a metric line whose value column is garbage,\nfor example. Those records currently reach the report and are counted as if\nthey were real observations, which inflates every number we publish.\n\nReporting must ignore records that are not valid. This applies to everything\nthe report package answers about a set of batches, not only the per-metric\nsummary lines.\n\nNote that the pipeline's `filter` stage is opt-in configuration and users\nroutinely run without it; reporting must be correct regardless.\n\nDo not change existing tests. `go build ./...` and `go test ./...` must pass.\n",
+          "completed"
+        ]
+      ],
+      "requests": 6,
+      "tools_started": 10,
+      "tools_finished": 10,
+      "dangling": [],
+      "event_counts": {
+        "assistant_message": 2,
+        "command_progress": 1,
+        "context_snapshot": 2,
+        "evidence_ledger_updated": 3,
+        "progress_updated": 14,
+        "review_stage": 1,
+        "task_finished": 1,
+        "task_started": 1,
+        "tool_call_finished": 10,
+        "tool_call_started": 10,
+        "turn_finished": 2,
+        "turn_started": 2,
+        "verification_check": 3,
+        "verification_finished": 1,
+        "verification_started": 1,
+        "workspace_snapshot_created": 1
+      },
+      "same_session_id": true,
+      "session_count": 1,
+      "acceptance_passed": true,
+      "diff_stat": [
+        " 2 files changed, 6 insertions(+)"
+      ]
+    }
+  ]
+}
