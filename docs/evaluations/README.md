@@ -9,6 +9,13 @@ One tree ([`evals/`](../../evals/README.md)), two entry points, one rule: **eval
 
 Gate map and the adoption micro protocol: [`E004-multi-agent-adoption.md`](E004-multi-agent-adoption.md).
 
+The release gate itself is separate from all of this and much smaller: a fixed
+seven-case set, product defaults, and a list of counters that must be zero
+before a baseline is frozen —
+[`UNIFIED_DOGFOOD_ACCEPTANCE_V1.md`](UNIFIED_DOGFOOD_ACCEPTANCE_V1.md), with
+the run it was accepted on in
+[`UNIFIED_DOGFOOD_ACCEPTANCE_V1_RESULT.md`](UNIFIED_DOGFOOD_ACCEPTANCE_V1_RESULT.md).
+
 Real-usage rounds run the product against third-party repositories. Batches #1
 (`R001–R010`) and #2 are closed and live in the dogfood-control repo; what they
 concluded is folded into [`../ROADMAP.md`](../ROADMAP.md). The
