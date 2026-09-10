@@ -111,8 +111,93 @@ pub(crate) fn text_of(content: &[ContentPart]) -> String {
         .join("\n")
 }
 
+/// A tool call's arguments, bounded but still parseable.
+///
+/// Cutting the serialized text left invalid JSON, and the interface reads
+/// these arguments to learn which file an edit touched — so the largest edits,
+/// the ones a reader most wants named, arrived as an unparseable blob and lost
+/// their filename. Bound the long string VALUES instead and re-serialize: the
+/// envelope stays valid and a patch keeps its `*** Update File:` header.
 pub(crate) fn compact_json(value: &serde_json::Value) -> String {
-    preview(&value.to_string())
+    let whole = value.to_string();
+    if whole.chars().count() <= ARGUMENTS_MAX {
+        return whole;
+    }
+    let mut bounded = value.clone();
+    bound_strings(&mut bounded, ARGUMENTS_MAX);
+    let out = bounded.to_string();
+    // A single enormous key, or a shape with no strings to bound, still has to
+    // be capped; that case keeps the old behaviour rather than growing.
+    if out.chars().count() <= ARGUMENTS_MAX {
+        out
+    } else {
+        preview(&out)
+    }
+}
+
+/// Budget for one call's arguments. Matches [`preview`]'s cap so the two
+/// bounds do not drift apart.
+const ARGUMENTS_MAX: usize = 1200;
+
+/// Shorten every string in `value` so the whole serializes within `budget`,
+/// longest first. Each cut keeps its head — a patch's header lines — and marks
+/// itself with an ellipsis.
+fn bound_strings(value: &mut serde_json::Value, budget: usize) {
+    // Leave room for the JSON scaffolding around the strings.
+    let overhead = value.to_string().chars().count() - total_string_len(value);
+    let allowance = budget.saturating_sub(overhead).max(1);
+    let total = total_string_len(value);
+    if total <= allowance {
+        return;
+    }
+    let mut strings: Vec<&mut String> = Vec::new();
+    collect_strings(value, &mut strings);
+    // Give every string an equal share, then hand back what the short ones do
+    // not use — one long patch beside a short path keeps almost all of it.
+    let mut share = allowance / strings.len().max(1);
+    let mut settled = 0usize;
+    loop {
+        let (small, large): (Vec<usize>, Vec<usize>) =
+            (0..strings.len()).partition(|i| strings[*i].chars().count() <= share);
+        if small.len() == settled || large.is_empty() {
+            break;
+        }
+        settled = small.len();
+        let used: usize = small.iter().map(|i| strings[*i].chars().count()).sum();
+        share = allowance.saturating_sub(used) / large.len().max(1);
+    }
+    for s in strings {
+        if s.chars().count() > share {
+            let head: String = s.chars().take(share.saturating_sub(1).max(1)).collect();
+            *s = format!("{head}…");
+        }
+    }
+}
+
+fn total_string_len(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.chars().count(),
+        serde_json::Value::Array(a) => a.iter().map(total_string_len).sum(),
+        serde_json::Value::Object(o) => o.values().map(total_string_len).sum(),
+        _ => 0,
+    }
+}
+
+fn collect_strings<'a>(value: &'a mut serde_json::Value, out: &mut Vec<&'a mut String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(a) => {
+            for v in a {
+                collect_strings(v, out);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for v in o.values_mut() {
+                collect_strings(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Read-only tools permitted during plan explore rounds (before first plan).
@@ -305,5 +390,46 @@ mod mutation_ledger_tests {
         assert_eq!(ledger.mutations[0].tool, "run_command");
         assert_eq!(ledger.mutations[0].paths, vec!["generated.rs".to_string()]);
         assert_eq!(events, 1);
+    }
+}
+
+#[cfg(test)]
+mod compact_json_tests {
+    use super::compact_json;
+
+    /// A tool call's arguments are the only place the interface learns which
+    /// file an edit touched. Truncating the SERIALIZED form leaves invalid
+    /// JSON, so a large edit arrives unparseable and its row loses the
+    /// filename — measured on a real 25-minute session, where 3 of 81 calls
+    /// were cut this way and every one of them was an `apply_patch`.
+    #[test]
+    fn a_patch_too_large_to_carry_whole_still_arrives_as_json() {
+        let body: String =
+            std::iter::repeat_n("+// a line of a very large new file\n", 200).collect();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: pkg/yqlib/count_documents_test.go\n{body}*** End Patch"
+        );
+        let value = serde_json::json!({ "patch": patch });
+        let compacted = compact_json(&value);
+
+        let parsed: serde_json::Value = serde_json::from_str(&compacted)
+            .expect("a truncated argument must still parse as JSON");
+        let carried = parsed["patch"]
+            .as_str()
+            .expect("the patch survives as a string");
+        assert!(
+            carried.contains("*** Add File: pkg/yqlib/count_documents_test.go"),
+            "the header names the file and must survive: {carried:.120}"
+        );
+        assert!(
+            compacted.len() < value.to_string().len(),
+            "a large patch is still bounded"
+        );
+    }
+
+    #[test]
+    fn arguments_that_fit_are_passed_through_untouched() {
+        let value = serde_json::json!({ "path": "src/lib.rs", "max_depth": 3 });
+        assert_eq!(compact_json(&value), value.to_string());
     }
 }

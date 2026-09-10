@@ -522,7 +522,7 @@ pub fn activity_visibility(name: &str, arguments: &str) -> ActivityVisibility {
         .unwrap_or(ActivityVisibility::Normal)
 }
 
-fn update_goal_is_blocked(arguments: &str) -> bool {
+pub(crate) fn update_goal_is_blocked(arguments: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
         .and_then(|v| {

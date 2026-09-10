@@ -75,7 +75,7 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
 /// (NOT arrival order — read-only tools run in parallel, so results can arrive
 /// out of order or after an interleaved serial tool). `tool_starts` records each
 /// call's start time by id for the client-side duration.
-pub(crate) struct EventBridge {
+pub struct EventBridge {
     events: broadcast::Sender<RuntimeEvent>,
     tool_starts: HashMap<String, Instant>,
     /// The in-flight assistant message id, open while deltas stream (spec §16).
@@ -149,7 +149,7 @@ fn is_near_duplicate(prev: &str, new: &str) -> bool {
 }
 
 impl EventBridge {
-    pub(crate) fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
+    pub fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
         Self {
             events,
             tool_starts: HashMap::new(),
@@ -160,7 +160,7 @@ impl EventBridge {
         }
     }
 
-    pub(crate) fn forward(&mut self, event: EngineEvent) {
+    pub fn forward(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::StreamAttemptStarted => {
                 let message_id = self.open_assistant.take();

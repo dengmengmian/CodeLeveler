@@ -703,6 +703,16 @@ fn status_glyph(call: &ToolCallBlock, theme: &Theme) -> (&'static str, ratatui::
     match call.status {
         ToolStatus::Running => ("\u{25cc}", theme.accent.primary),
         ToolStatus::Failed => ("\u{2717}", theme.status.error),
+        // A goal update that reports `blocked` is a call that RAN and an
+        // outcome that did not. Ok is the runtime fact; ✓ would be a claim the
+        // row's own text contradicts. Read from the taxonomy, not a second
+        // tool-name table.
+        ToolStatus::Ok
+            if call.name == "update_goal"
+                && crate::tool_taxonomy::update_goal_is_blocked(&call.arguments) =>
+        {
+            ("\u{26a0}", theme.status.warning)
+        }
         ToolStatus::Ok if is_exploratory(call) => ("\u{b7}", theme.text.muted),
         ToolStatus::Ok => ("\u{2713}", theme.status.success),
     }
@@ -1088,6 +1098,30 @@ pub(crate) fn render_group_text(
 mod tests {
     use super::*;
     use leveler_client_protocol::ToolCallId;
+
+    /// Found by replaying a real blocked session: `update_goal(blocked)` is a
+    /// call that RAN, so its status is Ok, and the row rendered
+    /// `✓ 目标收尾 受阻：…` — the success mark on the announcement that the
+    /// work could not be done. Same mistake exploration used to make.
+    #[test]
+    fn a_goal_that_reports_blocked_does_not_wear_the_success_mark() {
+        let theme = Theme::no_color();
+        let blocked = call(
+            "update_goal",
+            r#"{"status":"blocked","summary":"conflicts with zero_test.go"}"#,
+            ToolStatus::Ok,
+        );
+        let (glyph, _) = status_glyph(&blocked, &theme);
+        assert_ne!(glyph, "\u{2713}", "a blocked goal is not a success");
+
+        let complete = call(
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#,
+            ToolStatus::Ok,
+        );
+        let (glyph, _) = status_glyph(&complete, &theme);
+        assert_eq!(glyph, "\u{2713}", "a completed goal still earns it");
+    }
 
     fn call(name: &str, args: &str, status: ToolStatus) -> ToolCallBlock {
         ToolCallBlock {

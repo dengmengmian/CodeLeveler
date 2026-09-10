@@ -10,7 +10,10 @@ mod active_turns;
 mod checkpoints;
 pub mod contribution_query;
 pub mod doctor;
-mod event_bridge;
+/// Engine events -> client events. Public so a recorded session can be replayed
+/// through the same projection a live client received, instead of a second
+/// hand-written dialect that drifts from it.
+pub mod event_bridge;
 pub mod global_config;
 pub mod goal_discovery;
 mod goal_recap;
