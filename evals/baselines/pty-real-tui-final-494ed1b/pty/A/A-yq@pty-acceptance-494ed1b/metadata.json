@@ -1,0 +1,76 @@
+{
+  "run_id": "A-yq",
+  "project": "yq",
+  "type": "go-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/A-yq",
+  "base_ref": "bbdd97482f2d439126582a59689eb1c855944955",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/A-yq",
+  "session_id": "889c16f2-8f89-44f8-b20e-21d399e71355",
+  "session_facts": {
+    "messages": 34,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/A-yq/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789005035.6020749,
+  "ended": 1789005133.788679,
+  "wall_seconds": 98.2,
+  "metrics": {
+    "samples": 20,
+    "rss_start_kb": 1360,
+    "rss_peak_kb": 50432,
+    "rss_end_kb": 50432,
+    "rss_growth_kb": 49072,
+    "cpu_max_pct": 1.0,
+    "cpu_median_pct": 0.4,
+    "cpu_by_phase_max": {
+      "turn": 1.0,
+      "diff": 0.8
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.4,
+      "diff": 0.8
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/A-yq.raw",
+  "shape": "test-heavy",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2205
+    },
+    {
+      "round": 2,
+      "label": "task",
+      "state": "idle",
+      "prompt": "在 cmd 包里加一个内部函数，统计一个 YAML 输入流里有多少个文档，并为它写一个 Go 单元测试。用 go test ./cmd/... 跑一遍确认通过。",
+      "seconds": 93.1
+    },
+    {
+      "round": 3,
+      "label": "diff-screen",
+      "state": "ok",
+      "chars": 3023
+    },
+    {
+      "round": 4,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 2,
+      "shape": "test-heavy"
+    }
+  ]
+}

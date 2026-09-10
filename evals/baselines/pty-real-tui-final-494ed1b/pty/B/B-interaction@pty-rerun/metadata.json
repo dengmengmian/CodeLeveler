@@ -1,0 +1,203 @@
+{
+  "run_id": "B-interaction",
+  "project": "ripgrep",
+  "type": "rust-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-rerun/ws/B-interaction",
+  "base_ref": "4649aa9700619f94cf9c66876e9549d83420e16c",
+  "home": "/Users/mengmian/Develop/lab/pty-rerun/home/B-interaction",
+  "session_id": "221c4fe2-1604-4068-bc4f-d4abd90cf57f",
+  "session_facts": {
+    "messages": 29,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-rerun/sessions/B-interaction/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789007510.59833,
+  "ended": 1789007595.302083,
+  "wall_seconds": 84.7,
+  "metrics": {
+    "samples": 17,
+    "rss_start_kb": 1360,
+    "rss_peak_kb": 45792,
+    "rss_end_kb": 45792,
+    "rss_growth_kb": 44432,
+    "cpu_max_pct": 1.0,
+    "cpu_median_pct": 0.4,
+    "cpu_by_phase_max": {
+      "turn": 1.0,
+      "resize": 0.4,
+      "idle": 0.2,
+      "cancel": 0.4
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.4,
+      "resize": 0.4,
+      "idle": 0.2,
+      "cancel": 0.4
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-rerun/logs/B-interaction.raw",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2200
+    },
+    {
+      "round": 2,
+      "label": "transcript-turn",
+      "state": "idle",
+      "prompt": "列出这个仓库里 crates/ 下每个 crate 的职责，每个一句话。",
+      "seconds": 53.7
+    },
+    {
+      "round": 3,
+      "label": "resize-120x36-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1724
+    },
+    {
+      "round": 4,
+      "label": "resize-80x24-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 930
+    },
+    {
+      "round": 5,
+      "label": "resize-160x48-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1960
+    },
+    {
+      "round": 6,
+      "label": "resize-100x30-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1388
+    },
+    {
+      "round": 7,
+      "label": "resize-140x40-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1843
+    },
+    {
+      "round": 8,
+      "label": "resize-80x24-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 930
+    },
+    {
+      "round": 9,
+      "label": "resize-120x36-p1",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1724
+    },
+    {
+      "round": 10,
+      "label": "resize-120x36-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1724
+    },
+    {
+      "round": 11,
+      "label": "resize-80x24-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 930
+    },
+    {
+      "round": 12,
+      "label": "resize-160x48-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1960
+    },
+    {
+      "round": 13,
+      "label": "resize-100x30-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1388
+    },
+    {
+      "round": 14,
+      "label": "resize-140x40-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1843
+    },
+    {
+      "round": 15,
+      "label": "resize-80x24-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 930
+    },
+    {
+      "round": 16,
+      "label": "resize-120x36-p2",
+      "state": "idle",
+      "missing_regions": [],
+      "chars": 1724
+    },
+    {
+      "round": 17,
+      "label": "composer-alive-after-resize",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 18,
+      "label": "scroll-precondition",
+      "state": "ok",
+      "transcript_overflows": true
+    },
+    {
+      "round": 19,
+      "label": "scroll",
+      "state": "ok",
+      "pageup_changed": true,
+      "pageup_again_changed": true,
+      "pagedown_changed": true
+    },
+    {
+      "round": 20,
+      "label": "history-up",
+      "state": "ok",
+      "recalled_previous_prompt": true
+    },
+    {
+      "round": 21,
+      "label": "esc-cancel",
+      "state": "idle",
+      "went_busy": true,
+      "still_busy": false
+    },
+    {
+      "round": 22,
+      "label": "composer-alive-after-cancel",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 23,
+      "label": "single-ctrl-c",
+      "state": "ok",
+      "still_running": true
+    }
+  ]
+}

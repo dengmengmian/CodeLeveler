@@ -26,6 +26,7 @@ import re
 import select
 import signal
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -495,6 +496,86 @@ def run_metadata(binary):
         ).stdout.strip(),
         "command": " ".join(sys.argv),
     }
+
+
+# ── the engine's own store ────────────────────────────────────────────────
+# The screen is the thing under test, so an assertion that only reads the
+# screen cannot contradict it. These read the durable store instead.
+#
+# They live here, in the module both drivers import, because there used to be
+# two copies: one was corrected and the other was not, and the stale copy went
+# on reading a directory the engine has never written.
+
+
+def state_dir_for(repo):
+    """The engine's per-project state dir for `repo`, or None.
+
+    `$LEVELER_HOME/state/projects/<slug>-<hash>` (LEVELER_HOME defaults to
+    `~/.leveler`). Honouring LEVELER_HOME is what lets a driven run keep its
+    own store instead of writing into the one a person is using.
+    """
+    home = os.path.join(
+        os.environ.get("LEVELER_HOME") or os.path.expanduser("~/.leveler"),
+        "state",
+        "projects",
+    )
+    if not os.path.isdir(home):
+        return None
+    # `<path with / replaced by ->-<16 hex>`. Matching on the prefix alone
+    # also matches every project NESTED under this one, so a driver asking
+    # about /tmp could be handed /tmp/something-else's store.
+    slug = os.path.realpath(repo).replace("/", "-")
+    exact = re.compile(re.escape(slug) + r"-[0-9a-f]{8,}$")
+    best = None
+    for entry in os.listdir(home):
+        full = os.path.join(home, entry)
+        if exact.match(entry) and os.path.exists(os.path.join(full, "sessions.db")):
+            if best is None or os.path.getmtime(full) > os.path.getmtime(best):
+                best = full
+    return best
+
+
+def _query(repo, sql, params=()):
+    d = state_dir_for(repo)
+    if not d:
+        return []
+    try:
+        con = sqlite3.connect(f"file:{os.path.join(d, 'sessions.db')}?mode=ro", uri=True)
+        try:
+            return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def newest_session_id(repo):
+    rows = _query(repo, "SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1")
+    return rows[0][0] if rows else None
+
+
+def session_facts(repo, session_id, marker=None):
+    """What the ENGINE says about a session — the authority, not the screen."""
+    msgs = _query(
+        repo, "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1", (session_id,)
+    )
+    running = _query(
+        repo,
+        "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND status = 'running'",
+        (session_id,),
+    )
+    facts = {
+        "messages": msgs[0][0] if msgs else 0,
+        "running_turns": running[0][0] if running else 0,
+    }
+    if marker is not None:
+        hit = _query(
+            repo,
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND payload LIKE ?2",
+            (session_id, f"%{marker}%"),
+        )
+        facts["marker_present"] = bool(hit and hit[0][0] > 0)
+    return facts
 
 
 def repo_root():

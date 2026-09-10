@@ -1,0 +1,61 @@
+{
+  "lifecycle": {
+    "projects": [
+      "rust-semver",
+      "mux",
+      "ripgrep"
+    ],
+    "launches_each": 3,
+    "wall_seconds": [
+      7.1,
+      7.4,
+      6.6,
+      7.3,
+      9.7,
+      7.1,
+      7.6,
+      6.9,
+      7.3
+    ],
+    "every_launch_reached_idle": true,
+    "findings": 0,
+    "each_turn_real": "1 round, 1 model request, completed/answered in the store",
+    "leftover_processes": 0
+  },
+  "resize": {
+    "sizes": [
+      [
+        36,
+        120
+      ],
+      [
+        24,
+        80
+      ],
+      [
+        48,
+        160
+      ],
+      [
+        30,
+        100
+      ],
+      [
+        40,
+        140
+      ],
+      [
+        24,
+        80
+      ],
+      [
+        36,
+        120
+      ]
+    ],
+    "passes": 2,
+    "cycles": 14,
+    "lost_critical_region": 0,
+    "composer_usable_after": true
+  }
+}

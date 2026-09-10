@@ -1,0 +1,76 @@
+{
+  "run_id": "L1-implementation",
+  "project": "yq",
+  "type": "go-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/L1-implementation",
+  "base_ref": "bbdd97482f2d439126582a59689eb1c855944955",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/L1-implementation",
+  "session_id": "8f4baf2d-795d-4ce4-b340-4cbe566c77a4",
+  "session_facts": {
+    "messages": 148,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/L1-implementation/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008905.357646,
+  "ended": 1789009569.936818,
+  "wall_seconds": 664.6,
+  "metrics": {
+    "samples": 67,
+    "rss_start_kb": 1904,
+    "rss_peak_kb": 64096,
+    "rss_end_kb": 64096,
+    "rss_growth_kb": 62192,
+    "cpu_max_pct": 2.0,
+    "cpu_median_pct": 0.7,
+    "cpu_by_phase_max": {
+      "turn": 1.9,
+      "idle": 2.0
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6,
+      "idle": 2.0
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/L1-implementation.raw",
+  "label": "L1-implementation",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "long-task",
+      "state": "idle",
+      "prompt": "给 yq 加一个全局 flag `--doc-count`：传了它就只打印输入流里 YAML 文档的数量，一行一个整数，然后正常退出；不传时行为完全不变。std",
+      "seconds": 657.8
+    },
+    {
+      "round": 3,
+      "label": "composer-alive-after-long",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 4,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 7
+    },
+    {
+      "round": 5,
+      "label": "mid-turn-screens",
+      "state": "ok",
+      "samples": 10,
+      "blank_screens": 0,
+      "always_showed_activity": true
+    }
+  ]
+}

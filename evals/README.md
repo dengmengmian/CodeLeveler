@@ -123,6 +123,21 @@ leveler eval adoption-micro run --model deepseek/deepseek-v4-flash --shape paral
 
 Reports land at `evals/reports/<suite>/<experiment>/report.md`.
 
+## Tool surface baseline
+
+`evals/scripts/tool_surface_baseline.py` parses the registry and every
+`impl Tool for` block to say what the model can see, then reads the persisted
+`tool_call_started` / `tool_call_finished` events in each `LEVELER_HOME`
+session database to say what it actually called. It adds no instrumentation
+and emits aggregates only.
+
+```sh
+python3 evals/scripts/tool_surface_baseline.py --repo . --json out.json
+```
+
+The T0 run and the A/B contracts it freezes are in
+[`evals/baselines/tool-surface-t0-e623f53/`](baselines/tool-surface-t0-e623f53/README.md).
+
 ## Result handling
 
 Files under `evals/baselines/`, `evals/reports/`, and `evals/runs/` are

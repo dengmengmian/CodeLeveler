@@ -1,0 +1,82 @@
+[
+  {
+    "gate": "PTY launch",
+    "verdict": "PASS",
+    "detail": "27/27 launches reached an idle screen"
+  },
+  {
+    "gate": "PTY input",
+    "verdict": "PASS",
+    "detail": "17/17 composer probes echoed"
+  },
+  {
+    "gate": "Resize",
+    "verdict": "PASS",
+    "detail": "14 resizes, 0 lost a critical region"
+  },
+  {
+    "gate": "Scroll",
+    "verdict": "PASS",
+    "detail": "1/1 scroll rounds moved the transcript"
+  },
+  {
+    "gate": "Permission approve",
+    "verdict": "PASS",
+    "detail": "1/1 approvals ran the command and closed"
+  },
+  {
+    "gate": "Permission deny",
+    "verdict": "PASS",
+    "detail": "1/1 refusals blocked the command and closed"
+  },
+  {
+    "gate": "Cancel",
+    "verdict": "PASS",
+    "detail": "1/1 cancels ended a genuinely busy turn"
+  },
+  {
+    "gate": "Resume",
+    "verdict": "PASS",
+    "detail": "2 reopens; 1/1 left no running turn"
+  },
+  {
+    "gate": "Terminal restore / no crash",
+    "verdict": "PASS",
+    "detail": "0 panic / dead-process / dead-composer findings"
+  },
+  {
+    "gate": "Args parseable",
+    "verdict": "PASS",
+    "detail": "0 unparseable blobs over 35 sessions recorded by this binary (296 in pre-fix legacy sessions, exempt)"
+  },
+  {
+    "gate": "Edit filename retained",
+    "verdict": "PASS",
+    "detail": "517 patches, 0 lost their file"
+  },
+  {
+    "gate": "Diff truth",
+    "verdict": "PASS",
+    "detail": "143 applied diffs; 0 failed edits carrying a diff, 0 without a file header"
+  },
+  {
+    "gate": "Outcome glyph truth",
+    "verdict": "PASS",
+    "detail": "0 success marks on work that did not succeed, over 15223 frames"
+  },
+  {
+    "gate": "No internal identifiers on screen",
+    "verdict": "PASS",
+    "detail": "0 leaks"
+  },
+  {
+    "gate": "Cross-session isolation",
+    "verdict": "PASS",
+    "detail": "0 carried-over screens across 242 sessions in one AppState"
+  },
+  {
+    "gate": "Event decoding",
+    "verdict": "PASS",
+    "detail": "0 of 59216 events failed to decode"
+  }
+]

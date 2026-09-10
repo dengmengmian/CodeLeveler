@@ -1,0 +1,84 @@
+===== final =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-rerun/ws/PLAN-long ·  detached@db9d1d0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+        607 │   // count for the named route, incremented once per matched request
+        608 │   fmt.Println(counter.Value(r.Get("article")))
+        609 │   ```
+
+    ▸ 执行了 4 个命令
+
+    ✓ 更新计划 · 5 行
+
+  ● 完成。逐条对照七点：
+
+    1. metrics.go ✅ — 定义了 Counter 类型（metrics.go:15），内部用 *Route 作 key、sync.RWMutex 保护计数。除
+       Value(route) 外还提供 NameValue(name) 按路由名直接查（通过 UseMetrics 时记录的路由器查找），Add/Inc
+       按路由累加，Values() 返回快照副本。中间件实现 Middleware 方法，配合 CurrentRoute 在请求命中时计数。
+    2. 便捷方法 ✅ — Router.UseMetrics() *Counter（middleware.go:45）：内部走 useInterface 把计数器挂进中间件链（
+       Middleware 接口实现，保证能被 Router 匹配时调用），返回计数器供查询。
+    3. 并发安全 ✅ — 所有读写经 mu.Lock/RLock；Values() 返回拷贝不会泄漏内部 map；Value(nil) 返回 0。
+    4. metrics_test.go ✅ — TestCounterSingleRoute（单路由 ×3 次，含按名查询）、TestCounterMultipleRoutes
+       （两条路由各自计数，并验证 Values() 是副本）、TestCounterConcurrent（32 goroutine × 100 请求，精确校验 3200）。
+    5. README ✅ — 目录新增 "Request Counting" 条目，README.md:590 起新增小节，示例覆盖 UseMetrics、NameValue/Value、
+       Values() 遍历。
+    6. go vet ./... ✅ — exit 0。
+    7. go test ./... ✅ — ok github.com/gorilla/mux（0.500s）；另外跑了 go test -race -run TestCounter
+       （1.510s）验证并发场景无数据竞争。
+
+    一个设计说明：key 用路由指针而非路由名，这样无名路由也能独立计数；按名查询通过 NameValue 提供。改动文件：
+    metrics.go（新增）、metrics_test.go（新增）、middleware.go、README.md。
+
+  ── ✓ 任务已完成 · 45 次工具 · 4m 25s · 验证 ✓ ──────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 49k/1M · 缓存 99%
+
+
+===== diff =====
+⑂ detached@db9d1d0 · ~/Develop/lab/pty-rerun/ws/PLAN-long
+ 文件                                          │diff --git a/README.md b/README.md
+› README.md  +32 -0                            │index 382513d..059d246 100644
+  middleware.go  +14 -0                        │--- a/README.md
+  metrics.go  +90 -0                           │+++ b/README.md
+  metrics_test.go  +94 -0                      │@@ -30,6 +30,7 @@ The name mux stands for "HTTP request multiplexer".
+                                               │Like the standard `http.Serv
+                                               │ * [Walking Routes](#walking-routes)
+                                               │ * [Graceful Shutdown](#graceful-shutdown)
+                                               │ * [Middleware](#middleware)
+                                               │+* [Request Counting](#request-counting)
+                                               │ * [Handling CORS Requests](#handling-cors-requests)
+                                               │ * [Testing Handlers](#testing-handlers)
+                                               │ * [Full Example](#full-example)
+                                               │@@ -586,6 +587,37 @@ r.Use(amw.Middleware)
+                                               │
+                                               │ Note: The handler chain will be stopped if your middleware doesn't
+                                               │call `next.ServeHTTP()` with the corresponding parameters. This can be
+                                               │used to abort a request if the middleware writer wants to. Middlewares
+                                               │_should_ write to `ResponseWriter` if they _are_ going to terminate the
+                                               │request, and they _should not_ write to `ResponseWriter` if they _are
+                                               │not_ going to terminate it.
+                                               │
+                                               │+### Request Counting
+                                               │+
+                                               │+`Router.UseMetrics()` attaches a concurrency-safe request counter
+                                               │to the router and returns it. Each request handled by a matched route
+                                               │increments the counter for that route, so you can track traffic per
+                                               │endpoint.
+                                               │+
+                                               │+```go
+                                               │+r := mux.NewRouter()
+                                               │+r.HandleFunc("/articles/{id}", ArticleHandler).Name("article")
+                                               │+
+                                               │+counter := r.UseMetrics()
+                                               │+```
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

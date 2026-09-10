@@ -1,0 +1,74 @@
+{
+  "summary": {
+    "samples": 9,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 49664,
+    "rss_end_kb": 49664,
+    "rss_growth_kb": 48320,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.8,
+    "cpu_by_phase_max": {
+      "turn": 0.8
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.8
+    }
+  },
+  "samples": [
+    {
+      "t": 1789008938.13,
+      "rss_kb": 1344,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789008943.14,
+      "rss_kb": 28672,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008948.15,
+      "rss_kb": 44368,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008953.16,
+      "rss_kb": 44848,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008958.16,
+      "rss_kb": 44944,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008963.17,
+      "rss_kb": 44944,
+      "cpu_pct": 0.4,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008968.18,
+      "rss_kb": 45312,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008973.19,
+      "rss_kb": 49344,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789008978.19,
+      "rss_kb": 49664,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    }
+  ],
+  "mid_turn": []
+}

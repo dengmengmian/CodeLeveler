@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-commander ·  detached@ba6d13d
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-commander ·  detached@ba6d13d
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+  ● 6 个用例全部通过。再跑一下类型检查（tsc 用仓库本地依赖，不需要网络），确认 d.ts 改动没问题:
+
+    ▸ ✗ 命令执行失败
+      └ exit: 127
+
+  ● 依赖没安装（tsc 找不到），这是环境问题。测试用的是 Node 内置的 node --test，不受影响。
+
+    确认最终改动:
+
+    ▸ 搜索代码库
+
+  ● 完成。改动如下:
+
+    • lib/option.js:247 — 给 Option 类加了 isRequired() 方法，返回 this.mandatory（即 makeOptionMandatory()
+      设置的值，解析时必须有值/必须指定的选项）。
+    • typings/index.d.ts — 补充了对应的类型声明。
+    • tests/option.isRequired.test.js（新建）— 6 个用例：默认非必填、makeOptionMandatory() 及显式 true/false
+      、布尔选项设为必填，以及区分「参数必须填（required）≠ 选项必须填」的场景。
+
+    验证: node --test tests/option.isRequired.test.js 全过（6 pass）。npm run check:type 因 node_modules 未安装、tsc
+    不在 PATH 而无法运行，属于环境问题，与本次改动无关。
+
+    一个语义说明: 这个库已有 required 属性，但它表示"选项被指定时参数必须提供"（<value>），和"选项必须被指定"（
+    mandatory）是两回事，所以用了新方法 isRequired() 而没直接暴露 required。如果你更想要别的名字（如 isMandatory()
+    ）或想要 getter 属性，说一声我改。
+
+  ── ⚠ 已完成 · 验证未通过 · 20 次工具 · 3m 21s · 验证 ✗ · test ──────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 30k/1M · 缓存 96%
+
+
+===== diff =====
+⑂ detached@ba6d13d · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-commander
+ 文件                                          │diff --git a/lib/option.js b/lib/option.js
+› lib/option.js  +14 -0                        │index 4b4daaf..a448000 100644
+  typings/index.d.ts  +9 -0                    │--- a/lib/option.js
+  tests/option.isRequired.test.js  +36 -0      │+++ b/lib/option.js
+                                               │@@ -244,6 +244,20 @@ export class Option {
+                                               │     return this.short === arg || this.long === arg;
+                                               │   }
+                                               │
+                                               │+  /**
+                                               │+   * Return whether the option is required.
+                                               │+   *
+                                               │+   * A required option must have a value after parsing, which usually
+                                               │means it
+                                               │+   * must be specified on the command line. Compare with `required`,
+                                               │which is
+                                               │+   * whether the option-argument is required when the option is
+                                               │specified.
+                                               │+   *
+                                               │+   * @return {boolean}
+                                               │+   */
+                                               │+
+                                               │+  isRequired() {
+                                               │+    return this.mandatory;
+                                               │+  }
+                                               │+
+                                               │   /**
+                                               │    * Return whether a boolean option.
+                                               │    *
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

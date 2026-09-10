@@ -44,11 +44,36 @@ The resolved base ref is recorded per case, and the result file carries the
 leveler commit, whether the tree was dirty, the binary version, and the exact
 command.
 
+## The acceptance layer
+
+Five more files sit on top of the three drivers, for a pre-release round that
+has to keep what it drove:
+
+| File | What it adds |
+|---|---|
+| `pty_acceptance.py` | per-run isolation (its own `LEVELER_HOME`, its own detached worktree at a pinned ref), RSS and interval-CPU sampling, and copying each run's `sessions.db` out so the same trajectory can be replayed afterwards |
+| `pty_rounds.py` | the rounds: breadth, interaction, permission, resume, honesty, session switching, long plans, long tasks, lifecycle soak |
+| `pty_metrics.py` | where a run's wall clock went, from its own store: model wait, tool execution, verification, waiting for a person, and the residue |
+| `pty_assemble.py` | the committed evidence tree and the coverage table |
+| `pty_gate.py` | the release gates, decided from the evidence rather than asserted |
+
+Isolation is the point of the first one. A person can be using the product on
+the same machine while these run, and nothing may be shared: not a session
+store, not a runtime lock, not a socket.
+
+CPU is sampled as a difference of cumulative CPU time, never `ps`'s `%cpu` —
+that is an average over the process's whole life and cannot see a busy loop that
+starts in minute nine, which is the only kind worth looking for.
+
 ## What is and is not committed
 
-Tracked: the three drivers, `matrix.json`, `setup.sh`, this file.
-Ignored: everything they produce — the generated projects, the cloned
-`fixtures/repos/*` corpus, result JSON, and raw PTY logs.
+Tracked: the three drivers, the five acceptance files above, `matrix.json`,
+`setup.sh`, this file. Ignored: everything they produce — the generated
+projects, the cloned `fixtures/repos/*` corpus, result JSON, and raw PTY logs.
+
+The exclusion in `.gitignore` is wholesale, so a new driver is ignored by
+default and disappears without a word. Add it to the allowlist there when you
+add one; the harness has to be runnable from a fresh clone.
 
 Entries under `fixtures/repos/` are real upstream libraries, cloned at pinned
 refs by `evals/scripts/fetch_eval_repos.sh` — every project the matrix names is in

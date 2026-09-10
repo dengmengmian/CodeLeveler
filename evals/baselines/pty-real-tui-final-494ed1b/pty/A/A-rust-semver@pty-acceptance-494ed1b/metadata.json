@@ -1,0 +1,76 @@
+{
+  "run_id": "A-rust-semver",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/A-rust-semver",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/A-rust-semver",
+  "session_id": "88f262ae-f573-4734-922e-1df3ef5d6e66",
+  "session_facts": {
+    "messages": 32,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/A-rust-semver/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789004855.1543539,
+  "ended": 1789004948.3331258,
+  "wall_seconds": 93.2,
+  "metrics": {
+    "samples": 19,
+    "rss_start_kb": 1360,
+    "rss_peak_kb": 49808,
+    "rss_end_kb": 49808,
+    "rss_growth_kb": 48448,
+    "cpu_max_pct": 1.0,
+    "cpu_median_pct": 0.4,
+    "cpu_by_phase_max": {
+      "turn": 1.0,
+      "idle": 0.4
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.4,
+      "idle": 0.4
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/A-rust-semver.raw",
+  "shape": "small-edit",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2213
+    },
+    {
+      "round": 2,
+      "label": "task",
+      "state": "idle",
+      "prompt": "给 Version 的解析加一个便捷方法 `Version::is_prerelease`，返回这个版本是否带预发布标签，并为它写一个单元测试。改完跑 carg",
+      "seconds": 88.1
+    },
+    {
+      "round": 3,
+      "label": "diff-screen",
+      "state": "ok",
+      "chars": 3020
+    },
+    {
+      "round": 4,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 2,
+      "shape": "small-edit"
+    }
+  ]
+}

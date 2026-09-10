@@ -1,0 +1,126 @@
+# Tool surface inventory
+
+core_registry()      14
+full_registry()      43   (the default registry)
+control tools        7   injected by the executor
+expand categories    handled ['browser', 'checkpoint', 'git', 'lsp', 'media', 'search', 'skills', 'web']
+                     advertised ['checkpoint', 'git', 'lsp', 'mcp', 'media', 'search', 'skills', 'subagent', 'web']
+                     advertised but registers nothing: ['mcp', 'subagent']
+
+tool                 core            risk  par  rply  mut  cmd  source
+apply_patch           YES  WorkspaceWrite    -     -    Y    -  crates/leveler-tools/src/tools/apply_patch.rs
+blast_radius            -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/blast_radius.rs
+browser_click           -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_console         -            Safe    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_dialog          -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_drag            -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_navigate        -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_press           -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_screenshot      -            Safe    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_select          -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_snapshot        -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_tabs            -            Safe    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_type            -         Network    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+browser_wait            -            Safe    -     -    -    -  crates/leveler-tools/src/tools/browser.rs
+consolidate_memory      -  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/memory.rs
+create_checkpoint       -            Safe    -     -    -    -  crates/leveler-tools/src/tools/checkpoint.rs
+create_skill            -  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/skills.rs
+diagnostics             -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/diagnostics.rs
+expand_tools          YES            Safe    -     -    -    -  crates/leveler-tools/src/tools/expand_tools.rs
+find_files              -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/find_files.rs
+find_references         -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/find_references.rs
+find_symbol             -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/find_symbol.rs
+forget                  -  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/memory.rs
+get_task              YES            Safe    -     -    -    -  crates/leveler-tools/src/tools/task_control.rs
+git_diff                -            Safe    -     -    -    -  crates/leveler-tools/src/tools/git.rs
+git_status              -            Safe    -     -    -    -  crates/leveler-tools/src/tools/git.rs
+grep                  YES            Safe    Y     -    -    -  crates/leveler-tools/src/tools/grep.rs
+kill_task             YES  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/task_control.rs
+list_files            YES            Safe    Y     Y    -    -  crates/leveler-tools/src/tools/list_files.rs
+load_skill            YES            Safe    -     -    -    -  crates/leveler-tools/src/tools/skills.rs
+memory                YES            Safe    -     -    -    -  crates/leveler-tools/src/tools/memory.rs
+read_file             YES            Safe    Y     Y    -    -  crates/leveler-tools/src/tools/read_file.rs
+read_symbol             -            Safe    Y     -    -    -  crates/leveler-tools/src/tools/read_symbol.rs
+remember                -  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/memory.rs
+replace               YES  WorkspaceWrite    -     -    Y    -  crates/leveler-tools/src/tools/replace.rs
+restore_checkpoint      -  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/checkpoint.rs
+run_command           YES  WorkspaceWrite    -     -    -    Y  crates/leveler-tools/src/tools/run_command.rs
+shell_command         YES  WorkspaceWrite    -     -    -    Y  crates/leveler-tools/src/tools/shell_command.rs
+update_plan           YES            Safe    -     -    -    -  crates/leveler-tools/src/tools/update_plan.rs
+view_image              -            Safe    -     Y    -    -  crates/leveler-tools/src/tools/view_image.rs
+wait_task             YES  WorkspaceWrite    -     -    -    -  crates/leveler-tools/src/tools/task_control.rs
+web_fetch               -         Network    -     -    -    -  crates/leveler-tools/src/tools/web_fetch.rs
+web_search              -         Network    -     -    -    -  crates/leveler-tools/src/tools/web_search.rs
+
+
+# Usage — REAL + DOGFOOD
+
+sessions 8 (7 with tool calls)   calls 587   distinct tools 16
+models {'deepseek/deepseek-v4-flash': 8}
+profiles {'balanced': 8}
+
+tool                 calls  sess    per  err   err%  child   p50ms    p95ms  surface
+read_file              188     5   37.6    0   0.0%     94       2       14  core
+shell_command          145     7   20.7   10   6.9%     83     351   117561  core
+wait_task               57     5   11.4   26  45.6%      0  120006   600056  core
+grep                    51     4   12.8    0   0.0%     33      18       58  core
+get_task                45     5    9.0    4   8.9%      0       3        6  core
+list_files              30     5    6.0    0   0.0%     19       3       45  core
+update_plan             28     4    7.0    0   0.0%     24       2       19  core
+run_command             20     5    4.0    9  45.0%      2    1597   120328  core
+git_diff                 8     2    4.0    0   0.0%      2      30       58  optional
+git_status               3     2    1.5    0   0.0%      1      35       56  optional
+apply_patch              3     2    1.5    0   0.0%      2      11       29  core
+update_goal              3     3    1.0    0   0.0%      0       0        0  control
+find_files               2     1    2.0    0   0.0%      2      28       67  optional
+resolve_finding          2     1    2.0    0   0.0%      0       -        -  UNKNOWN
+kill_task                1     1    1.0    0   0.0%      0       5      106  core
+expand_tools             1     1    1.0    1 100.0%      1       -        -  core
+
+never called, but visible by default: 29 of 43
+  blast_radius, browser_click, browser_console, browser_dialog, browser_drag
+  browser_navigate, browser_press, browser_screenshot, browser_select, browser_snapshot
+  browser_tabs, browser_type, browser_wait, consolidate_memory, create_checkpoint
+  create_skill, diagnostics, find_references, find_symbol, forget
+  load_skill, memory, read_symbol, remember, replace
+  restore_checkpoint, view_image, web_fetch, web_search
+called but not in the registry (hallucinated or since removed): ['resolve_finding']
+
+model requests 290   input tokens 20983185   output tokens 88580   latency p50 2671ms
+
+
+# Usage — EVAL
+
+sessions 91 (91 with tool calls)   calls 1138   distinct tools 14
+models {'deepseek/deepseek-v4-flash': 91}
+profiles {'balanced': 91}
+
+tool                 calls  sess    per  err   err%  child   p50ms    p95ms  surface
+read_file              602    91    6.6   21   3.5%      0       2       14  core
+apply_patch            134    86    1.6    6   4.5%      0      11       29  core
+run_command            107    54    2.0   14  13.1%      0    1597   120328  core
+update_goal             91    91    1.0    0   0.0%      0       0        0  control
+list_files              73    72    1.0    0   0.0%      0       3       45  core
+grep                    50    26    1.9    0   0.0%      0      18       58  core
+shell_command           48    19    2.5    3   6.2%      0     351   117561  core
+update_plan             14     5    2.8    0   0.0%      0       2       19  core
+git_status               7     6    1.2    0   0.0%      0      35       56  optional
+find_files               5     5    1.0    0   0.0%      0      28       67  optional
+git_diff                 3     3    1.0    0   0.0%      0      30       58  optional
+kill_task                2     2    1.0    0   0.0%      0       5      106  core
+git_log                  1     1    1.0    1 100.0%      0       -        -  UNKNOWN
+git log                  1     1    1.0    1 100.0%      0       -        -  UNKNOWN
+
+never called, but visible by default: 32 of 43
+  blast_radius, browser_click, browser_console, browser_dialog, browser_drag
+  browser_navigate, browser_press, browser_screenshot, browser_select, browser_snapshot
+  browser_tabs, browser_type, browser_wait, consolidate_memory, create_checkpoint
+  create_skill, diagnostics, expand_tools, find_references, find_symbol
+  forget, get_task, load_skill, memory, read_symbol
+  remember, replace, restore_checkpoint, view_image, wait_task
+  web_fetch, web_search
+called but not in the registry (hallucinated or since removed): ['git log', 'git_log']
+
+model requests 1191   input tokens 29462537   output tokens 271845   latency p50 3156ms
+
+wrote evals/baselines/tool-surface-t0-e623f53/raw.json

@@ -29,7 +29,6 @@ import argparse
 import json
 import os
 import shutil
-import sqlite3
 import sys
 import tempfile
 import time
@@ -43,9 +42,11 @@ from tui_drive import (
     Tui,
     assert_disposable,
     load_matrix,
+    newest_session_id,
     prepare_workspace,
     report,
     run_metadata,
+    session_facts,
 )
 
 def composer_text(tui):
@@ -109,64 +110,6 @@ SLASH_SCREENS = [
     "/theme",
     "/doctor",
 ]
-
-
-def state_dir_for(repo):
-    home = os.path.expanduser("~/.leveler/projects")
-    if not os.path.isdir(home):
-        return None
-    prefix = os.path.realpath(repo).replace("/", "-")
-    best = None
-    for entry in os.listdir(home):
-        if entry.startswith(prefix) and os.path.exists(
-            os.path.join(home, entry, "sessions.db")
-        ):
-            full = os.path.join(home, entry)
-            if best is None or os.path.getmtime(full) > os.path.getmtime(best):
-                best = full
-    return best
-
-
-def _query(repo, sql, params=()):
-    d = state_dir_for(repo)
-    if not d:
-        return []
-    try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'sessions.db')}?mode=ro", uri=True)
-        try:
-            return con.execute(sql, params).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return []
-
-
-def newest_session_id(repo):
-    rows = _query(repo, "SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1")
-    return rows[0][0] if rows else None
-
-
-def session_facts(repo, session_id, marker=None):
-    msgs = _query(
-        repo, "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1", (session_id,)
-    )
-    running = _query(
-        repo,
-        "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND status = 'running'",
-        (session_id,),
-    )
-    facts = {
-        "messages": msgs[0][0] if msgs else 0,
-        "running_turns": running[0][0] if running else 0,
-    }
-    if marker is not None:
-        hit = _query(
-            repo,
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND payload LIKE ?2",
-            (session_id, f"%{marker}%"),
-        )
-        facts["marker_present"] = bool(hit and hit[0][0] > 0)
-    return facts
 
 
 def run_project(spec, binary, log_dir):

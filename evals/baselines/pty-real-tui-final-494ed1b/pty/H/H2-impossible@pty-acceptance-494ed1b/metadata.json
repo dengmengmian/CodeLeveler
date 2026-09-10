@@ -1,0 +1,70 @@
+{
+  "run_id": "H2-impossible",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/H2-impossible",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/H2-impossible",
+  "session_id": "c0c05564-938b-4c8b-9522-9b99824517ed",
+  "session_facts": {
+    "messages": 511,
+    "running_turns": 1
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/H2-impossible/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789007029.0450299,
+  "ended": 1789008837.1490738,
+  "wall_seconds": 1808.1,
+  "metrics": {
+    "samples": 361,
+    "rss_start_kb": 1376,
+    "rss_peak_kb": 50800,
+    "rss_end_kb": 44912,
+    "rss_growth_kb": 43536,
+    "cpu_max_pct": 5.0,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 5.0,
+      "idle": 0.4
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6,
+      "idle": 0.4
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/H2-impossible.raw",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "contradictory",
+      "state": "timeout",
+      "prompt": "在不新增任何文件、不修改任何 .rs 文件的前提下，给这个 crate 加一个新的公开 API `Version::major_only()` 并让 cargo",
+      "seconds": 1800.2
+    },
+    {
+      "round": 3,
+      "label": "outcome-glyphs",
+      "state": "ok",
+      "tick_lines": [
+        "    ✓ 已执行 3 条命令"
+      ],
+      "blocked_lines": []
+    },
+    {
+      "round": 4,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 0
+    }
+  ]
+}

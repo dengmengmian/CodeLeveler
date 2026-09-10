@@ -1,0 +1,53 @@
+{
+  "run_id": "S-ripgrep-2",
+  "project": "ripgrep",
+  "type": "rust-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/S-ripgrep-2",
+  "base_ref": "4649aa9700619f94cf9c66876e9549d83420e16c",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/S-ripgrep-2",
+  "session_id": "c6bec9ab-6369-4736-9c36-cfdeb172c974",
+  "session_facts": {
+    "messages": 2,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/S-ripgrep-2/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008890.835534,
+  "ended": 1789008897.702141,
+  "wall_seconds": 6.9,
+  "metrics": {
+    "samples": 2,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 29376,
+    "rss_end_kb": 29376,
+    "rss_growth_kb": 28032,
+    "cpu_max_pct": 1.0,
+    "cpu_median_pct": 1.0,
+    "cpu_by_phase_max": {
+      "turn": 1.0
+    },
+    "cpu_by_phase_median": {
+      "turn": 1.0
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/S-ripgrep-2.raw",
+  "iteration": 2,
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2211
+    },
+    {
+      "round": 2,
+      "label": "short-turn",
+      "state": "ok"
+    }
+  ]
+}

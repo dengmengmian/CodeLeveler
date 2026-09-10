@@ -1,0 +1,76 @@
+{
+  "run_id": "A-ripgrep",
+  "project": "ripgrep",
+  "type": "rust-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/A-ripgrep",
+  "base_ref": "4649aa9700619f94cf9c66876e9549d83420e16c",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/A-ripgrep",
+  "session_id": "eed40e68-eab8-4e87-b38c-02e2117f3a31",
+  "session_facts": {
+    "messages": 36,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/A-ripgrep/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789004948.4956439,
+  "ended": 1789005035.497002,
+  "wall_seconds": 87.0,
+  "metrics": {
+    "samples": 18,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 46000,
+    "rss_end_kb": 46000,
+    "rss_growth_kb": 44656,
+    "cpu_max_pct": 4.2,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 4.2,
+      "idle": 0.6
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6,
+      "idle": 0.6
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/A-ripgrep.raw",
+  "shape": "search-heavy",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2209
+    },
+    {
+      "round": 2,
+      "label": "task",
+      "state": "idle",
+      "prompt": "这个仓库里，一个文件被 .gitignore 排除的判定最终落在哪个函数？从命令行入口一路指出经过的 crate 和关键函数名，不要改代码。",
+      "seconds": 81.9
+    },
+    {
+      "round": 3,
+      "label": "diff-screen",
+      "state": "ok",
+      "chars": 2175
+    },
+    {
+      "round": 4,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 0,
+      "shape": "search-heavy"
+    }
+  ]
+}

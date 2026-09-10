@@ -1,0 +1,54 @@
+{
+  "summary": {
+    "samples": 5,
+    "rss_start_kb": 2720,
+    "rss_peak_kb": 30896,
+    "rss_end_kb": 30896,
+    "rss_growth_kb": 28176,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 0.8,
+      "switch": 0.2,
+      "idle": 0.2
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.8,
+      "switch": 0.2,
+      "idle": 0.2
+    }
+  },
+  "samples": [
+    {
+      "t": 1789007770.64,
+      "rss_kb": 2720,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789007775.65,
+      "rss_kb": 28640,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789007780.66,
+      "rss_kb": 30592,
+      "cpu_pct": 0.2,
+      "phase": "switch"
+    },
+    {
+      "t": 1789007785.66,
+      "rss_kb": 30800,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789007790.67,
+      "rss_kb": 30896,
+      "cpu_pct": 0.2,
+      "phase": "idle"
+    }
+  ],
+  "mid_turn": []
+}

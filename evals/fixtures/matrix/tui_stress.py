@@ -20,7 +20,6 @@ The current driver records 12 rounds per project; all 12 are required.
 import argparse
 import json
 import os
-import sqlite3
 import shutil
 import sys
 import tempfile
@@ -37,74 +36,10 @@ from tui_drive import (
     load_matrix,
     prepare_workspace,
     report,
+    newest_session_id,
     run_metadata,
+    session_facts,
 )
-
-
-def state_dir_for(repo):
-    """The engine's per-project state dir (`~/.leveler/projects/<hash>`)."""
-    home = os.path.expanduser("~/.leveler/projects")
-    if not os.path.isdir(home):
-        return None
-    real = os.path.realpath(repo)
-    prefix = real.replace("/", "-")
-    best = None
-    for entry in os.listdir(home):
-        if entry.startswith(prefix):
-            full = os.path.join(home, entry)
-            if os.path.exists(os.path.join(full, "sessions.db")):
-                if best is None or os.path.getmtime(full) > os.path.getmtime(best):
-                    best = full
-    return best
-
-
-def _query(repo, sql, params=()):
-    d = state_dir_for(repo)
-    if not d:
-        return []
-    try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'sessions.db')}?mode=ro", uri=True)
-        try:
-            return con.execute(sql, params).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return []
-
-
-def newest_session_id(repo):
-    rows = _query(repo, "SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1")
-    return rows[0][0] if rows else None
-
-
-def session_facts(repo, session_id, marker=None):
-    """What the ENGINE says about a session — the authority, not the screen."""
-    msgs = _query(
-        repo,
-        "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
-        (session_id,),
-    )
-    present = None
-    if marker is not None:
-        hit = _query(
-            repo,
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 "
-            "AND payload LIKE ?2",
-            (session_id, f"%{marker}%"),
-        )
-        present = bool(hit and hit[0][0] > 0)
-    running = _query(
-        repo,
-        "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND status = 'running'",
-        (session_id,),
-    )
-    facts = {
-        "messages": msgs[0][0] if msgs else 0,
-        "running_turns": running[0][0] if running else 0,
-    }
-    if present is not None:
-        facts["marker_present"] = present
-    return facts
 
 
 def run_project(spec, binary, log_dir):

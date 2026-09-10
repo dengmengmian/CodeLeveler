@@ -1,0 +1,45 @@
+{
+  "determinism": {
+    "corpus": "the five largest recorded sessions",
+    "repetitions": 5,
+    "engine_events_each_pass": 6175,
+    "runtime_events_each_pass": 5679,
+    "frames_each_pass": 318,
+    "tool_calls_each_pass": 977,
+    "wall_ms": [
+      2902,
+      2695,
+      2780,
+      2683,
+      2685
+    ],
+    "events_per_sec": [
+      2127,
+      2291,
+      2221,
+      2301,
+      2299
+    ],
+    "verdict": "identical counts on every pass"
+  },
+  "memory": {
+    "corpus": "the single largest recorded session, replayed into one accumulating AppState",
+    "cycles": [
+      1,
+      5,
+      20
+    ],
+    "engine_events": [
+      1411,
+      7055,
+      28220
+    ],
+    "peak_rss_bytes": [
+      69042176,
+      73695232,
+      73416704
+    ],
+    "verdict": "four times the work between the last two rows and no more memory"
+  },
+  "how": "REPLAY_CORPUS=<list> REPLAY_REPEAT=<n> cargo test -p leveler-cli --test real_session_corpus -- --ignored"
+}

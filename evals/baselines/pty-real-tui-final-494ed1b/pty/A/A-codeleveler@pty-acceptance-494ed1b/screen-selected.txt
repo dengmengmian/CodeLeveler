@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-codeleveler ·  detached@494ed1b
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-codeleveler ·  detached@494ed1b
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+         2 │ +
+         3 │ + 终端界面的 ratatui 实现：会话视图、markdown 渲染、输入与选择、权限审批等。
+         4 │ +
+         5 │ + ## 终端宽度
+         6 │ +
+         7 │ + 渲染 markdown 时，宽度计算集中在 `src/markdown.rs` 的 `disp_width` / `grapheme_width`（`crates/leveler…
+         8 │ +
+         9 │ + 处理方式是：先按字素簇（grapheme）切分文本，每个字素若包含 emoji 呈现字符（VS16 或常见的 pictographic …
+        10 │ +
+        11 │ + 这么做的原因是 `unicode-width` 把多数 emoji（尤其是 🔴🟡🟢 这类彩色图形符号和 ⚠  这类被 VS16 强制为 emo
+        12 │ +
+        13 │ + 注意：输入框、选择、状态栏等其它路径（如 `overlay/mod.rs`、`selection.rs`、`workbench.rs`）直接使用 `u…
+
+  ● 已找到并记录。
+
+    处理方式（三句话）：
+
+    1. 宽度计算集中在 crates/leveler-tui/src/markdown.rs 的 disp_width / grapheme_width（markdown.rs:582、:586
+       ）：先把文本按字素簇（grapheme）切分，再对每个字素求和宽度。
+    2. 每个字素若含 emoji 呈现字符（VS16 或 pictographic / dingbats / misc-symbols 等区块，见 is_emoji_presentation，
+       :596）固定计为 2 格，否则回退到 unicode-width crate 的 UnicodeWidthStr::width 计算。
+    3. 原因是 unicode-width 把彩色 emoji（🔴🟡🟢）和 VS16 强制 emoji 呈现的符号（⚠ ）按 1 格算，而终端实际画 2
+       格，单格漂移会沿行累积导致换行、表格列宽、选择高亮错位；因此按"布局预留 = 终端实际绘制"的原则修正。
+
+    已新建 crates/leveler-tui/README.md，加了 ## 终端宽度 一节记录上述结论，并注明仅 markdown 渲染做了该修正（overlay
+    、selection、workbench 等路径直接使用 unicode-width）。
+
+  ── ✓ 完成 · 未自动验证 · 7 次工具 · 6m 57s ─────────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 25k/1M · 缓存 97%
+
+
+===== diff =====
+⑂ detached@494ed1b · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-codeleveler
+ 文件                                          │diff --git a/crates/leveler-tui/README.md b/crates/leveler-tui/README.md
+› crates/leveler-tui/README.md  +13 -0         │new file mode 100644
+                                               │index 0000000..83b806b
+                                               │--- /dev/null
+                                               │+++ b/crates/leveler-tui/README.md
+                                               │@@ -0,0 +1,13 @@
+                                               │+# leveler-tui
+                                               │+
+                                               │+终端界面的 ratatui 实现：会话视图、markdown 渲染、输入与选择、权限审
+                                               │批等。
+                                               │+
+                                               │+## 终端宽度
+                                               │+
+                                               │+渲染 markdown 时，宽度计算集中在 `src/markdown.rs` 的 `disp_width` /
+                                               │`grapheme_width`（`crates/leveler-tui/src/markdown.rs:582`、`:586`）。
+                                               │+
+                                               │+处理方式是：先按字素簇（grapheme）切分文本，每个字素若包含 emoji 呈
+                                               │现字符（VS16 或常见的 pictographic / dingbats / misc-symbols 区块，见
+                                               │`is_emoji_presentation`，`:596`）则固定计为 2 格，否则回退到 `unicode-
+                                               │width` crate 的 `UnicodeWidthStr` 计算。
+                                               │+
+                                               │+这么做的原因是 `unicode-width` 把多数 emoji（尤其是 🔴🟡🟢 这
+                                               │类彩色图形符号和 ⚠  这类被 VS16 强制为 emoji 呈现的字素）按 1 格
+                                               │计算，而终端实际绘制 2 格；单字符的一格漂移会随行内多个 emoji 累
+                                               │积，导致换行、表格列宽与选择高亮全部错位。布局按字素簇求和
+                                               │（`s.graphemes(true).map(grapheme_width).sum()`），保证"布局预留的宽度 =
+                                               │终端实际画出的宽度"。
+                                               │+
+                                               │+注意：输入框、选择、状态栏等其它路径（如 `overlay/mod.rs`、
+                                               │`selection.rs`、`workbench.rs`）直接使用 `unicode-width`，仅 markdown 渲
+                                               │染做了 emoji 双宽修正。
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

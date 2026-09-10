@@ -1,0 +1,75 @@
+{
+  "run_id": "R-resume-b",
+  "project": "mux",
+  "type": "go-medium",
+  "repo": "/Users/mengmian/Develop/lab/pty-fix/ws/R-resume-a",
+  "base_ref": null,
+  "home": "/Users/mengmian/Develop/lab/pty-fix/home/R-resume",
+  "session_id": "c815e3d2-faa4-4f20-bead-8a97dd051bc1",
+  "session_facts": {
+    "messages": 43,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-fix/sessions/R-resume-b/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008679.2821481,
+  "ended": 1789008788.761285,
+  "wall_seconds": 109.5,
+  "metrics": {
+    "samples": 22,
+    "rss_start_kb": 1216,
+    "rss_peak_kb": 47840,
+    "rss_end_kb": 47840,
+    "rss_growth_kb": 46624,
+    "cpu_max_pct": 3.8,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 3.8
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-fix/logs/R-resume-b.raw",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "reopen",
+      "state": "idle",
+      "chars": 715,
+      "session": "c815e3d2-faa4-4f20-bead-8a97dd051bc1"
+    },
+    {
+      "round": 2,
+      "label": "workspace-retained",
+      "state": "ok",
+      "notes_md": true
+    },
+    {
+      "round": 3,
+      "label": "session-facts",
+      "state": "ok",
+      "messages": 3,
+      "running_turns": 0,
+      "marker_present": true
+    },
+    {
+      "round": 4,
+      "label": "composer-alive-after-resume",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "post-resume-turn",
+      "state": "idle",
+      "prompt": "接着上面的工作，用一句话说明你上一轮做到哪里了。",
+      "seconds": 105.9
+    }
+  ]
+}

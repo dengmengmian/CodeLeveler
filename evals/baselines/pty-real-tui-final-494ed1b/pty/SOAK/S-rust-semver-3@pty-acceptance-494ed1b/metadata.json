@@ -1,0 +1,53 @@
+{
+  "run_id": "S-rust-semver-3",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/S-rust-semver-3",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/S-rust-semver-3",
+  "session_id": "61ad724c-3b4b-40bf-a930-5171eb05a700",
+  "session_facts": {
+    "messages": 2,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/S-rust-semver-3/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008852.1253529,
+  "ended": 1789008858.712437,
+  "wall_seconds": 6.6,
+  "metrics": {
+    "samples": 2,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 29312,
+    "rss_end_kb": 29312,
+    "rss_growth_kb": 27968,
+    "cpu_max_pct": 1.0,
+    "cpu_median_pct": 1.0,
+    "cpu_by_phase_max": {
+      "turn": 1.0
+    },
+    "cpu_by_phase_median": {
+      "turn": 1.0
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/S-rust-semver-3.raw",
+  "iteration": 3,
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2215
+    },
+    {
+      "round": 2,
+      "label": "short-turn",
+      "state": "ok"
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "run_id": "P-approve",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-rerun/ws/P-approve",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-rerun/home/P-approve",
+  "session_id": "4ae1267c-132d-470d-811e-0cf17ad6a499",
+  "session_facts": {
+    "messages": 4,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-rerun/sessions/P-approve/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": false,
+  "permission_mode": "request-approval",
+  "started": 1789007595.4764569,
+  "ended": 1789007656.987481,
+  "wall_seconds": 61.5,
+  "metrics": {
+    "samples": 13,
+    "rss_start_kb": 2304,
+    "rss_peak_kb": 45136,
+    "rss_end_kb": 45136,
+    "rss_growth_kb": 42832,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.2,
+    "cpu_by_phase_max": {
+      "idle": 0.8,
+      "resize": 0.6,
+      "answer": 0.6
+    },
+    "cpu_by_phase_median": {
+      "idle": 0.2,
+      "resize": 0.6,
+      "answer": 0.2
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-rerun/logs/P-approve.raw",
+  "answer": "approve",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "overlay",
+      "state": "ok",
+      "appeared": true
+    },
+    {
+      "round": 3,
+      "label": "overlay-narrow",
+      "state": "ok",
+      "reachable_at_80x24": true
+    },
+    {
+      "round": 4,
+      "label": "approve-outcome",
+      "state": "idle",
+      "overlay_dismissed": true,
+      "canary_deleted": true
+    },
+    {
+      "round": 5,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    }
+  ]
+}

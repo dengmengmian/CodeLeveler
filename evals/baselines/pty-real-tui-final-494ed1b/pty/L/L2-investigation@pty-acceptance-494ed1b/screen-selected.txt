@@ -1,0 +1,126 @@
+===== long-task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L2-investigation ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    链路要点（7 层，文档里有完整分层表格）：
+
+    1. CLI 解析 — crates/core/flags/defs.rs：IgnoreCase::update（:3096）和 SmartCase::update（:6080）把 args.case 设为
+       CaseMode::Insensitive / CaseMode::Smart（lowargs.rs:300 定义枚举，默认 Sensitive）。
+    2. 低层→高层参数 — hiargs.rs:258 case: low.case 原样搬运。
+    3. 构建 matcher — hiargs.rs:466-470（Rust 引擎）和 :414-418（PCRE2）把 CaseMode 映射为
+       builder.case_insensitive(...) / case_smart(...) / caseless(...)。
+    4. regex 配置 — crates/regex/src/config.rs:84 is_case_insensitive：--ignore-case 直接为真；--smart-case 则要求
+       analysis.any_literal() && !analysis.any_uppercase()。
+    5. smart-case 判定 — crates/regex/src/ast.rs:134-137：遍历 AST，ast.c.is_uppercase() 收集大写字面量（\pL
+       不算字面量，所以 foo\pL 走大小写不敏感）。
+    6. HIR 翻译（真正生效处） — config.rs:198-201 把判定结果传给 translator 的 .case_insensitive(...)，对字面量做 case
+       folding；config.rs:106 保证这两种模式下强制走完整翻译、跳过 fixed-strings 快速路径。
+    7. 字面量快速路径 + 执行 — matcher.rs:78 InnerLiterals 提取的快速 regex 已含折叠后的字面量；searcher 的
+       find_by_line_fast/match_by_line_slow（core.rs:315/:265）最终调用编译好的 regex，运行时不再感知大小写。
+
+    另外记录了 PCRE2 引擎的近似实现（crates/pcre2/src/matcher.rs:417 朴素扫描模式原文）。
+
+    注：我委托的子代理未产出任何结果（任务 id 失效），所以整条链路是我直接读完源码后撰写的，所有 file:line
+    均实际核对过。
+
+  ● 子代理 Euclid 的审阅结果已集成：它核对了 IGNORE_CASE.md 中的行号引用（core.rs:265/315/605 及 ast.rs/config.rs/
+    defs.rs/hiargs.rs 各处），确认全部与源码一致，文档满足任务全部要求、无需改动，也未修改任何源码。
+
+    这与我的结论互相印证，任务保持完成状态：IGNORE_CASE.md 已在仓库根目录（7 层表格 + 逐层说明 + PCRE2 路径），cargo
+    check 通过。无需进一步操作。
+
+  ── ✓ 完成 · 未自动验证 · 57 次工具 · 8m 12s ────────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 59k/1M · 缓存 98%
+
+
+===== diff =====
+⑂ detached@4649aa9 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L2-investigation
+ 文件                                          │diff --git a/IGNORE_CASE.md b/IGNORE_CASE.md
+› IGNORE_CASE.md  +168 -0                      │new file mode 100644
+                                               │index 0000000..659dd2e
+                                               │--- /dev/null
+                                               │+++ b/IGNORE_CASE.md
+                                               │@@ -0,0 +1,168 @@
+                                               │+# ripgrep 中 `--ignore-case` / `--smart-case` 的实现链路调查
+                                               │+
+                                               │+本文追踪从命令行参数解析开始，`-i/--ignore-case` 与 `-S/--smart-case`
+                                               │+如何一路传递并最终影响实际匹配行为。
+                                               │+
+                                               │+## 分层总览
+                                               │+
+                                               │+| 层 | 做了什么 | 文件:函数（锚点） |
+                                               │+| --- | --- | --- |
+                                               │+| L0 CLI 解析 | 解析 `-i`/`-S`/长选项，把结果写
+                                               │进 `LowArgs.case`（`CaseMode` 枚举） | `crates/core/flags/
+                                               │defs.rs:3096`（`IgnoreCase::update`）、`crates/core/flags/
+                                               │defs.rs:6080`（`SmartCase::update`）、`crates/core/flags/
+                                               │lowargs.rs:300`（`enum CaseMode`） |
+                                               │+| L1 低层参数 → 高层参数 | 把 `LowArgs.case` 拷贝进 `HiArgs.case` |
+                                               │`crates/core/flags/hiargs.rs:112`（`HiArgs::from_low_args`，字段拷贝在
+                                               │`hiargs.rs:258`） |
+                                               │+| L2 构建 matcher | 按 `CaseMode` 选择 builder 开关：
+                                               │`case_insensitive(...)` / `case_smart(...)` / `caseless(...)` | `crates/
+                                               │core/flags/hiargs.rs:459`（`matcher_rust`，分支在 466-470）、`crates/
+                                               │core/flags/hiargs.rs:409`（`matcher_pcre2`，分支在 414-418） |
+                                               │+| L3 regex 配置层 | 存下 `case_insensitive` / `case_smart` 两
+                                               │个布尔；`is_case_insensitive` 结合 AST 分析做最终判定 | `crates/
+                                               │regex/src/config.rs:26-27`（字段）、`crates/regex/src/
+                                               │config.rs:84`（`is_case_insensitive`） |
+                                               │+| L4 smart-case 判定（AST 分析） | 解析模式 AST，收集「是否含字面量」
+                                               │「是否有大写字面量」 | `crates/regex/src/ast.rs:27`（`from_ast`）、
+                                               │`crates/regex/src/ast.rs:134`（`from_ast_literal`，`c.is_uppercase()`）
+                                               │|
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+
+===== long-task-t361s =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L2-investigation ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+          3 │ + 本文追踪从命令行参数解析开始，`-i/--ignore-case` 与 `-S/--smart-case`
+          4 │ + 如何一路传递并最终影响实际匹配行为。
+          5 │ +
+          6 │ + ## 分层总览
+          7 │ +
+          8 │ + | 层 | 做了什么 | 文件:函数（锚点） |
+          9 │ + | --- | --- | --- |
+         10 │ + | L0 CLI 解析 | 解析 `-i`/`-S`/长选项，把结果写进 `LowArgs.case`（`CaseMode` 枚举） | `crates/core/fl…
+         11 │ + | L1 低层参数 → 高层参数 | 把 `LowArgs.case` 拷贝进 `HiArgs.case` | `crates/core/flags/hiargs.rs:112`…
+         12 │ + | L2 构建 matcher | 按 `CaseMode` 选择 builder 开关：`case_insensitive(...)` / `case_smart(...)` / `c…
+         13 │ + | L3 regex 配置层 | 存下 `case_insensitive` / `case_smart` 两个布尔；`is_case_insensitive` 结合 AST …
+         14 │ + | L4 smart-case 判定（AST 分析） | 解析模式 AST，收集「是否含字面量」「是否有大写字面量」 | `crates/r…
+         15 │ + | L5 HIR 翻译 | 把最终的大小写判定作为 `case_insensitive` 传给 `regex-syntax` 的 translator，生成 HIR…
+        … 点击展开完整 Diff
+
+  ● 文档已写好。现在跑 cargo check 验证编译：
+
+    ✓ 已完成 1 项操作
+
+
+⠏ 等待模型 · 6m 01s · ↑55,923 ↓141
+  ● Euclid · 任务：调查本仓库（ripgrep 源码，Rust workspace，根目录有 Cargo.toml）中 `--ignore-case` 和 `-… 4m 22s ↗
+  ▼ 计划 · 2/3 已完成 · 当前 3/3
+    ✓ 1. 追踪 --ignore-case/--smart-case 从 CLI 解析到匹配核心的全链路（子代理未产出结果，由我直接完成追踪）
+    ✓ 2. 撰写 IGNORE_CASE.md（含分层表格）
+    ● 3. 运行 cargo check 验证编译未被破坏
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  Esc 打断 · Ctrl+C 取消
+  上下文 56k/1M · 缓存 91%
+
+  ● 主 Agent  正在工作
+  ○ 子 Agent  read_file ✓    4m 22s · 2379k
+
+

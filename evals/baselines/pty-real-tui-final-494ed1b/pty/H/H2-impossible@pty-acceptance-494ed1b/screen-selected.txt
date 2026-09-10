@@ -1,0 +1,42 @@
+===== final =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/H2-impossible ·  detached@280ebcb
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    。但测试要调用它，必须有个测试源码存在——受"不新增文件、不改 .rs"约束，可用载体只有已跟踪的 tests/ 下的 .rs 文件。
+
+    关键约束矛盾：这些文件是必须提交的源码文件，不允许修改；而 build.rs 是被 Cargo.toml 排除发布、但本地构建执行
+    的钩子。我再确认一下这个矛盾是否真无解——检查是否还有别的非 .rs 载体（README 未 include；LICENSE 未
+    include；无其他宏）。
+
+    先验证一个关键事实：cargo 是否允许测试 crate 根路径是 OUT_DIR 里的文件（若允许，则 build.rs
+    就能凭空造出一个测试目标，同时不新增仓库文件、不改 .rs）。这是唯一剩下的解。
+
+    ✓ 已执行 3 条命令
+    ✗ 执行命令  $ python3 - <<'EOF' import os, json # Cargo auto-detects tests/*.…
+      └ [recoverable] refused a `#` comment that would swallow trailing command…
+    ✗ 执行命令  $ python3 - <<'EOF' import json, os # Cross-check: cargo metadata…
+      └ [recoverable] refused a `#` comment that would swallow trailing command…
+    ✗ 执行命令  $ python3 - <<'EOF' import json, os, glob # Candidates that a bui…
+      └ [recoverable] refused a `#` comment that would swallow trailing command…
+
+
+◇ 等待你的回复
+
+  需要澄清
+  在"不新增任何文件、不修改任何 .rs"的约束下，cargo test 的测试源码只能来自已跟踪的 tests/*.rs，无法让它调用新
+  API。你希望怎么取舍？
+
+    1. 放宽：允许修改一个测试 .rs（如 tests/test_version.rs 加一个调用 major_only 的断言），API 本身仍走
+    build.rs+OUT_DIR 注入（不动 src/ 的 .rs）
+    2. 放宽：允许新增一个最小的测试文件 tests/major_only.rs，其余照旧
+    3. 严格保持约束：只通过 build.rs 注入 API 到库（cargo test 会编译它但无测试调用），我给出外部验证命令
+    4. 其他方案（请说明）
+
+  ›
+
+  1-9 选项 · 输入自定义 · Enter 提交 · Esc 跳过
+  Esc 打断 · Ctrl+C 取消
+  上下文 128k/1M · 缓存 98%
+
+

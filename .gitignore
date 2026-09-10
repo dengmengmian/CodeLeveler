@@ -83,6 +83,15 @@ evals/fixtures/matrix/*
 !evals/fixtures/matrix/matrix.json
 !evals/fixtures/matrix/setup.sh
 !evals/fixtures/matrix/README.md
+# The acceptance layer on top of those drivers: per-run isolation and sampling,
+# the rounds, the attribution, the evidence tree and the release gates. These
+# were nearly lost — the wholesale exclusion above swallowed them silently, and
+# an unfetchable harness is the failure this file's own comment warns about.
+!evals/fixtures/matrix/pty_acceptance.py
+!evals/fixtures/matrix/pty_rounds.py
+!evals/fixtures/matrix/pty_metrics.py
+!evals/fixtures/matrix/pty_assemble.py
+!evals/fixtures/matrix/pty_gate.py
 # Per-obligation navigation oracles: tracked source, not generated output.
 !evals/fixtures/navigation-obligations/
 

@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-fix/ws/A-rust-semver ·  detached@280ebcb
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-fix/ws/A-rust-semver ·  detached@280ebcb
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+        175 │   fn test_display() {
+        176 │       assert_to_string(version("1.2.3"), "1.2.3");
+        177 │       assert_to_string(version("1.2.3-alpha1"), "1.2.3-alpha1");
+        178 │       assert_to_string(version("1.2.3+build.42"), "1.2.3+build.42");
+        179 │       assert_to_string(version("1.2.3-alpha1+42"), "1.2.3-alpha1+42");
+        180 │   }
+        181 │
+        182 │   #[test]
+        183 │ + fn test_is_prerelease() {
+        184 │ +     assert!(!version("1.2.3").is_prerelease());
+        185 │ +     assert!(!version("1.2.3+build.42").is_prerelease());
+        186 │ +     assert!(version("1.2.3-alpha1").is_prerelease());
+        187 │ +     assert!(version("1.2.3-alpha1+42").is_prerelease());
+        188 │ +     assert!(version("1.2.3-0").is_prerelease());
+        … 点击展开完整 Diff
+
+    ▸ 执行了 1 个命令 · 15.4s
+
+  ● 完成，cargo test 全部通过（test_is_prerelease 在内，共 35 个集成测试 + doc-test 0 失败）。
+
+    改动：
+
+    • src/lib.rs:426 新增 Version::is_prerelease()，通过 !self.pre.is_empty() 判断（Version::pre 是 Prerelease，
+      Prerelease::is_empty 已存在）。
+    • tests/test_version.rs 新增 test_is_prerelease，覆盖无预发布、仅有 build metadata（1.2.3+build.42 应为
+      false）、带预发布、预发布+build 混合、数字预发布（1.2.3-0）。
+
+  ── ✓ 任务已完成 · 20 次工具 · 1m 46s · 验证 ✓ ──────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 28k/1M · 缓存 91%
+
+
+===== diff =====
+⑂ detached@280ebcb · ~/Develop/lab/pty-fix/ws/A-rust-semver
+ 文件                                          │diff --git a/src/lib.rs b/src/lib.rs
+› src/lib.rs  +6 -0                            │index e5fff35..74d6f81 100644
+  tests/test_version.rs  +9 -0                 │--- a/src/lib.rs
+                                               │+++ b/src/lib.rs
+                                               │@@ -423,6 +423,12 @@ impl Version {
+                                               │         Version::from_str(text)
+                                               │     }
+                                               │
+                                               │+    /// Returns `true` if this version has a pre-release identifier,
+                                               │for
+                                               │+    /// example `1.0.0-alpha` has one but `1.0.0` and `1.0.0+build.5`
+                                               │do not.
+                                               │+    pub fn is_prerelease(&self) -> bool {
+                                               │+        !self.pre.is_empty()
+                                               │+    }
+                                               │+
+                                               │     /// Compare the major, minor, patch, and pre-release value of two
+                                               │versions,
+                                               │     /// disregarding build metadata. Versions that differ only in build
+                                               │metadata
+                                               │     /// are considered equal. This comparison is what the SemVer spec
+                                               │refers to
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

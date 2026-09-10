@@ -1,0 +1,130 @@
+{
+  "summary": {
+    "samples": 18,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 46000,
+    "rss_end_kb": 46000,
+    "rss_growth_kb": 44656,
+    "cpu_max_pct": 4.2,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 4.2,
+      "idle": 0.6
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6,
+      "idle": 0.6
+    }
+  },
+  "samples": [
+    {
+      "t": 1789004948.5,
+      "rss_kb": 1344,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789004953.5,
+      "rss_kb": 28960,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004958.51,
+      "rss_kb": 28976,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004963.52,
+      "rss_kb": 44112,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004968.53,
+      "rss_kb": 44672,
+      "cpu_pct": 0.4,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004973.54,
+      "rss_kb": 44768,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004978.54,
+      "rss_kb": 44832,
+      "cpu_pct": 0.4,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004983.55,
+      "rss_kb": 44976,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004988.56,
+      "rss_kb": 45296,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004993.58,
+      "rss_kb": 45344,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789004998.58,
+      "rss_kb": 45360,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005003.59,
+      "rss_kb": 45504,
+      "cpu_pct": 0.4,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005008.6,
+      "rss_kb": 45552,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005013.61,
+      "rss_kb": 45584,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005018.63,
+      "rss_kb": 45632,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005023.63,
+      "rss_kb": 45648,
+      "cpu_pct": 0.2,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005028.65,
+      "rss_kb": 45712,
+      "cpu_pct": 4.2,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005033.66,
+      "rss_kb": 46000,
+      "cpu_pct": 0.6,
+      "phase": "idle"
+    }
+  ],
+  "mid_turn": []
+}

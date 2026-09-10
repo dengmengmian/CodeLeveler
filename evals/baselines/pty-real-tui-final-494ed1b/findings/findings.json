@@ -1,0 +1,150 @@
+{
+  "frozen_head": "494ed1bfe333fbea4d0752cad9a7497446072545",
+  "lanes": {
+    "pty": "a real terminal drives the release binary; assertions read the screen and the durable store",
+    "replay": "recorded EngineEvent logs through the real bridge, reducer and renderer",
+    "synthetic": "product_scenarios.rs — known contracts, unchanged"
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "P1",
+      "kind": "product",
+      "area": "session lifecycle / durability",
+      "found_by": "PTY stage R (interrupt and resume across two processes)",
+      "title": "A session reopened after its process was killed still holds a running turn, and the screen paints a live clock over it",
+      "what_happened": "Process A wrote NOTES.md and was SIGKILLed mid-turn. Process B reopened the same session with `--session <id>` in the same repository and isolated home. The store still reported running_turns = 1, and the reopened screen showed `⠋ 等待模型 · 1m 29s` — a live wait, with an elapsed clock, for a turn whose owning process had been dead for a minute and a half. Nothing had been submitted in the new process.",
+      "root_cause": "Two halves, and the first fix only closed one of them.\n(a) The zombie reaper (`leveler_engine::reap_after_restart`) ran only inside `Application::create_session`. Reopening an existing session creates nothing, so the resume path never reaped and the turns table still said `running`.\n(b) The screen does not read the turns table. It reads `sessions.status`, which `Engine::mark_running` sets before the first turn and which nothing settles on a crash — the reaper closes turns, never the session row. So after (a) was fixed the store was clean and the screen was still wrong: `⠙ 等待模型 · 1m 30s`, with `running_turns = 0` in the same run. Fixing half of this would have looked like fixing it.",
+      "why_it_was_not_caught": "tui_forty.py already asserted exactly this ('a turn is still marked running after the crash'), but its `state_dir_for()` read `~/.leveler/projects`, a path the engine has never written. The lookup always returned None, the session id was never found, and the whole verification block was skipped by an `elif session_id:`. Fixing the harness (F3) is what made the defect visible.",
+      "fix": "(a) `Application::reap_zombie_turns(db, session)` is an explicit entry; `create_session` calls it unscoped as before, and the in-process TUI resume path calls it scoped to the session being reopened. The reaper's ownership check still refuses a task another runtime owns.\n(b) `InProcessRuntimeClient::snapshot` no longer takes `sessions.status` at face value: a row that says `running` while every one of that session's turns has settled is reported as `Interrupted`, and the interface opens idle. The turns table is the finer truth and (a) is what keeps it honest, so the two halves hold each other up.",
+      "files": [
+        "crates/leveler-app/src/session.rs",
+        "crates/leveler-app/src/interactive.rs",
+        "crates/leveler-cli/src/run_cmds.rs"
+      ],
+      "regression": "PTY stage R on the rebuilt binary (sha256 c0cda52f…): reopen state idle (was busy), running_turns 0 (was 1), workspace retained, pre-kill message present, composer usable, and a fresh turn ran normally. 0 findings.",
+      "core_freeze": "No exception taken, and one question raised rather than decided. Both changes are in leveler-app and leveler-cli: an existing ownership-fenced recovery function called on one more startup path, and a client deriving liveness from the finer of two records it already reads. Nothing in the engine, the ownership model or the agent loop moved. The question left open: should the reaper also settle `sessions.status` to `Interrupted` through `finish_task_owned`, which it already holds the ownership token for? That would make the durable record self-consistent instead of leaving the client to compensate, but it writes a terminal task event for a session that is still resumable, and that is a Core decision, not a presentation one."
+    },
+    {
+      "id": "F2",
+      "severity": "P2",
+      "kind": "product",
+      "area": "renderer / outcome semantics",
+      "found_by": "replay corpus (207 real sessions, 13733 frames)",
+      "title": "A settled agent team that lost a child wore the success mark",
+      "what_happened": "Eight frames across seven real sessions rendered `✓ 2 个 Agent 已结束 · 1 项未完成` — the success glyph on the line that announces work which did not finish. Colour already went red; the glyph, which is what a reader takes as the verdict, did not.",
+      "root_cause": "`render_team_panel` chose the glyph from `terminal` alone (has the team settled?) and computed `bad` only afterwards, for the colour.",
+      "fix": "`multi_agent::collaboration_glyph(team, terminal)` returns ⚠ for a settled team that lost a child, ✓ for one that did not, ◉ while working — the same rule the blocked-goal row follows since 3ccbe94.",
+      "files": [
+        "crates/leveler-tui/src/multi_agent.rs",
+        "crates/leveler-tui/src/workbench.rs"
+      ],
+      "regression": "unit test `a_team_that_lost_a_child_does_not_wear_the_success_mark`, plus the corpus invariant `wrong success glyph = 0`, which went 8 → 0."
+    },
+    {
+      "id": "F3",
+      "severity": "P1",
+      "kind": "harness",
+      "area": "existing PTY drivers",
+      "found_by": "auditing the drivers before reusing them",
+      "title": "Every engine-truth cross-check in the existing PTY drivers was silently answering nothing",
+      "what_happened": "`state_dir_for()` in tui_stress.py and tui_forty.py looked under `~/.leveler/projects`. The engine writes `$LEVELER_HOME/state/projects`. The directory has never existed, so the function always returned None, `newest_session_id` always returned None, and `session_facts` always returned zeros. tui_forty.py's crash-recovery verification sat behind `elif session_id:` and was therefore skipped in every run that ever passed.",
+      "root_cause": "Two copies of the same four helpers; the path was wrong in both, and nothing read the result loudly enough to notice.",
+      "fix": "The helpers moved into `tui_drive.py`, the module both drivers already import, so there is one copy. The path now honours LEVELER_HOME, and the project-directory match is exact rather than a prefix — a prefix match also matched every project nested under the one being asked about.",
+      "files": [
+        "evals/fixtures/matrix/tui_drive.py",
+        "evals/fixtures/matrix/tui_stress.py",
+        "evals/fixtures/matrix/tui_forty.py"
+      ],
+      "consequence": "F1 was found within one run of the corrected check."
+    },
+    {
+      "id": "F4",
+      "severity": "P2",
+      "kind": "harness",
+      "area": "replay lane",
+      "found_by": "comparing a PTY screen with the replay of the same session",
+      "title": "Replay could not reach terminal state, so it could not tell blocked from done",
+      "what_happened": "The PTY screen for a finished task ended with `── ✓ 任务已完成 · 验证 ✓ ──` and an idle composer. Replaying the same session left the screen on `⠋ 等待模型 · 0s`. The turn-end event is deliberately not on the client event stream (`event_bridge.rs` marks TaskFinished engine-only); the live client learns the outcome from the call's return value. A replay has only the log, so it never reached the row where blocked is told apart from done — the single most important thing to check.",
+      "fix": "`turn_runtime_event`'s Ok arm is extracted as `pub fn turn_end_event(stop, detail)`. The replay rebuilds the terminal event from the durable `TaskFinished { stop, reason }` through that same mapping, rather than a second copy of it. Product behaviour is unchanged.",
+      "files": [
+        "crates/leveler-app/src/event_bridge.rs",
+        "crates/leveler-cli/tests/real_session_corpus.rs"
+      ],
+      "consequence": "F2 became findable; 177 of 207 sessions now replay to a terminal row."
+    },
+    {
+      "id": "F5",
+      "severity": "P2",
+      "kind": "harness",
+      "area": "this round's driver",
+      "found_by": "reading the screens behind the first stage B and P failures",
+      "title": "Six driver assertions reported a healthy product as broken",
+      "what_happened": "Stage B reported fourteen `resize-lost-region` findings and one `scroll-inert`; stage P reported one `overlay-stuck`; stage H reported one `turn-hung` and had a check that could never fire. Every one of them was the driver's fault.\n· The resize check looked for the composer PLACEHOLDER, which the product paints only while the composer is empty and the session has no transcript.\n· The scroll check called PageUp inert on a transcript that fit the viewport, where doing nothing is the correct answer.\n· The approval check matched the word 批准 and caught the model's own refusal sentence 未获批准, not any overlay.\n· The honesty check's vocabulary of \"did not succeed\" words omitted 验证未通过, which is exactly what a contradictory task ends as — so it passed vacuously on the very case it existed for.\n· `turn-hung` on the impossible task was a coincidence of clocks: the turn wrote its terminal row at 1800.0 s and the driver's own cap expired at 1800.2 s. Nothing hung.",
+      "fix": "Resize asserts the composer prompt row and the key-hint line. Scroll shrinks the terminal until the transcript overflows and records `precondition-unmet` when it still fits. The approval check anchors on the overlay's own title 等待审批. The honesty vocabulary now matches the product's terminal wording and is kept beside the same list in `real_session_corpus.rs`. And the honesty stage now reads the durable `task_finished` row instead of only the screen: a task that wrote a terminal record ended, whatever the driver's cap did, and the dishonest combination it looks for is completed AND verified, not completed alone — finishing an edit and letting the project's checks report the contradiction is honest, and is what the first honesty task actually did.",
+      "files": [
+        "evals/fixtures/matrix/pty_rounds.py"
+      ],
+      "note": "This is the trap the matrix README already names — an assistant answer may legitimately contain the word you are matching on. It caught the driver twice more here. Every corrected assertion was then exercised against real stores before being trusted, because an assertion that has never run is F3 all over again."
+    },
+    {
+      "id": "N1",
+      "severity": "none",
+      "kind": "not a defect",
+      "title": "A wrapped added line in the diff screen looked like it lost its + marker",
+      "resolution": "The colour carries add/remove in `render_diff_line`, and it is applied per wrapped row. The ambiguity was in the capture, which strips colour, not on screen. No change."
+    },
+    {
+      "id": "N2",
+      "severity": "none",
+      "kind": "not a defect",
+      "title": "compact_json terminology",
+      "resolution": "`compact_json` is an internal function name and reaches no frame — 0 hits across 13733 replayed frames. What a person sees is `/compact` and `上下文已压缩 {from} → {to} 条`, product wording chosen on purpose. No change."
+    },
+    {
+      "id": "L1",
+      "severity": "none",
+      "kind": "limit of a lane",
+      "title": "Two things the replay lane structurally cannot see",
+      "detail": "The workspace diff panel comes from `RuntimeEvent::DiffUpdated`, which the runtime host computes from the working tree and never persists, so a replay always shows an empty /diff. The turn-end marker had the same shape until F4. Per-edit applied diffs ARE persisted and are checked. The /diff screen is therefore proven in the PTY lane only, and this report says so rather than claiming replay coverage it does not have."
+    },
+    {
+      "id": "L2",
+      "severity": "none",
+      "kind": "pre-existing property, not introduced here",
+      "title": "The in-process reaper is not fenced against a daemon in the same repository",
+      "detail": "RuntimeId is durable per project directory, so an in-process TUI and a `leveler serve` daemon in the same repository share it and the reaper's ownership check does not separate them. This is not new: `create_session` has always called the reaper unscoped on that path. F1's fix is scoped to the single session being reopened, which is strictly narrower. Worth a look if `--in-process` beside a live daemon ever becomes a supported combination."
+    },
+    {
+      "id": "O1",
+      "severity": "P3",
+      "kind": "observation, not fixed",
+      "area": "verification wording",
+      "found_by": "PTY stage A, the self-dogfood run",
+      "title": "Six minutes of checks that ran and passed were reported as \"未自动验证\"",
+      "what_happened": "The self-dogfood run spent 375 seconds in verification. The durable record shows `cargo fmt` passed, `cargo check` passed, and a third check failed on an environment fault (the npm cache on this machine is root-owned, so `npm` exits EPERM). `task_finished` recorded `verification: \"unavailable\"`. The terminal marker read `✓ 完成 · 未自动验证 · 7 次工具 · 6m 57s`.",
+      "why_it_matters": "`VerificationStatus` separates NotRun (\"nothing was modified, no checks are configured\") from Unavailable (\"checks were configured but could not produce a verdict\") on purpose, and the durable record keeps that distinction. The one-line marker collapses them, so a reader cannot tell \"this project has no checks\" from \"your environment broke the checks\" — and only the second is something they can act on.",
+      "not_fixed_because": "The calm wording is a deliberate, commented choice in `turn_end_lines` (\"a calm finish, not a warning about THIS task\"), the distinction survives in the store, and the exact path that produced the generic token here was not pinned down within this round. Raising it rather than guessing at a fix.",
+      "evidence": "evals/baselines/pty-real-tui-final-494ed1b/pty/A/A-codeleveler/",
+      "side_note": "The npm cache being root-owned is this machine's problem, not the product's: `sudo chown -R 501:20 ~/.npm` clears it. It is also why the commander run could not run the project's own test command."
+    },
+    {
+      "id": "O2",
+      "severity": "none",
+      "kind": "coverage boundary",
+      "title": "No real session in the corpus carries a plan of seven steps or more",
+      "detail": "Across 207 recorded sessions the longest plan is 5 steps. A task written with eight explicit, numbered obligations (stage PLAN, on mux: new file, wire-up, concurrency, tests, README, go vet, go test, report) was answered with a 5-step plan — the model consolidated the obligations rather than transcribing them. This is the model's planning behaviour on this provider, not something the driver can force, and the brief forbids fabricating a long plan to fill the gap.",
+      "consequence": "Plan-viewport overflow — active step kept visible, viewport following, overflow indicator, and its degradation to one compact line — is SYNTHETIC_ONLY. It is covered by `product_scenarios.rs` scenario 05 (9 steps, step 6 running) and by the unit tests in `plan_viewport.rs`. What real traffic does prove is the ordinary case: a plan appears, its steps advance, and the live plan retires at the terminal boundary.",
+      "evidence": "evals/baselines/pty-real-tui-final-494ed1b/pty/PLAN/PLAN-long/"
+    },
+    {
+      "id": "O3",
+      "severity": "none",
+      "kind": "measurement correction + product note",
+      "title": "The longest run's 300 seconds of \"harness overhead\" was a clarifying question nobody answered",
+      "what_happened": "The contradictory-task run showed 300.1 s inside its turn windows that was neither model wait nor tool execution — 37% of an 803 s turn. Walking the event timeline for gaps over 3 s located all of it in a single span: `clarification_requested` → `clarification_answered`, exactly 300.0 s. The agent asked a trade-off question, the unattended driver never answered, and the interactive five-minute timeout fired.",
+      "resolution": "Not overhead, and not a defect. The assistant's own closing message says so plainly: 「你之前没有回应取舍问题，所以我按…执行了」. `pty_metrics.py` now buckets clarification wait separately, the same way it already buckets verification. With that correction the harness residue is 0.0 s on 17 of 19 sessions; the two that are not zero are the cancel window (3.3 s) and the resume interruption window (110.9 s, which is F1's dead time, not overhead either).",
+      "product_note": "Worth knowing rather than fixing: an interactive session that asks a clarifying question blocks for five minutes when no one is there. That is the right behaviour for a person at a terminal — headless runs auto-answer through `AutoClarify` — but it is five minutes of a PTY- or CI-driven session doing nothing, and any future unattended driving of the interactive UI should expect it."
+    }
+  ]
+}

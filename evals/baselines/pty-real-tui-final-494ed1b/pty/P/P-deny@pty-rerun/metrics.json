@@ -1,0 +1,72 @@
+{
+  "summary": {
+    "samples": 8,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 30528,
+    "rss_end_kb": 30528,
+    "rss_growth_kb": 29184,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.2,
+    "cpu_by_phase_max": {
+      "idle": 0.8,
+      "resize": 0.2,
+      "answer": 0.4
+    },
+    "cpu_by_phase_median": {
+      "idle": 0.2,
+      "resize": 0.2,
+      "answer": 0.4
+    }
+  },
+  "samples": [
+    {
+      "t": 1789007657.12,
+      "rss_kb": 1344,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789007662.12,
+      "rss_kb": 28736,
+      "cpu_pct": 0.8,
+      "phase": "idle"
+    },
+    {
+      "t": 1789007667.13,
+      "rss_kb": 29616,
+      "cpu_pct": 0.2,
+      "phase": "resize"
+    },
+    {
+      "t": 1789007672.14,
+      "rss_kb": 29616,
+      "cpu_pct": 0.2,
+      "phase": "resize"
+    },
+    {
+      "t": 1789007677.15,
+      "rss_kb": 29616,
+      "cpu_pct": 0.2,
+      "phase": "idle"
+    },
+    {
+      "t": 1789007682.18,
+      "rss_kb": 29616,
+      "cpu_pct": 0.2,
+      "phase": "idle"
+    },
+    {
+      "t": 1789007687.18,
+      "rss_kb": 30144,
+      "cpu_pct": 0.4,
+      "phase": "answer"
+    },
+    {
+      "t": 1789007692.2,
+      "rss_kb": 30528,
+      "cpu_pct": 0.2,
+      "phase": "idle"
+    }
+  ],
+  "mid_turn": []
+}

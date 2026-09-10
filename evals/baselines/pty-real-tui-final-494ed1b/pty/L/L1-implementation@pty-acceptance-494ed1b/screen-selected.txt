@@ -1,0 +1,126 @@
+===== long-task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L1-implementation ·  detached@bbdd9748
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ● yq 二进制是构建产物，检查它是否被 gitignore：
+
+    ▸ 执行了 1 个命令
+
+    ✓ 更新计划 · 4 行
+
+  ● 完成。--doc-count 已实现并通过全部验证。
+
+    改动
+
+    • pkg/yqlib/stream_evaluator.go：StreamEvaluator 接口新增 CountDocuments(filenames, decoder)，逐文件复用
+      readDocuments 统计文档数并累加，不打印任何内容。
+    • cmd/root.go：注册全局持久 flag --doc-count（cmd/constant.go 加 docCount 变量），出现在 yq --help。
+    • cmd/evaluate_sequence_command.go：新增 evaluateDocCount —— 通过 initCommand 处理参数（stdin 自动加 -
+      、文件检测都走原有逻辑），打印一行总数后退出；evaluateSequence 和 evaluateAll 入口在最前面拦截该 flag，所以 yq
+      --doc-count、yq e --doc-count、yq ea --doc-count 三种形态都生效。
+    • 测试：cmd/doc_count_test.go（help 包含 flag、stdin/文件/多文件/eval-all 计数、不传时行为不变）和
+      pkg/yqlib/stream_evaluator_count_test.go（单/多文档、多文件累加、仅注释文件、缺失文件报错）。
+
+    验证结果
+
+    • go build -o yq . 成功；go test ./... 全绿。
+    • 端到端：printf 'a:1\n---\nb:2\n' | ./yq --doc-count → 2；文件场景 3；空输入 → 0；仅注释 → 1；退出码均为 0。
+    • bash scripts/acceptance.sh 全部 OK，未削弱任何已有测试。
+
+    一个细节：yq ea --doc-count 最初没被拦截（eval-all 有自己的 RunE），已补上并加了对应测试。
+
+  ── ✓ 任务已完成 · 72 次工具 · 10m 53s · 验证 ✓ ─────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 58k/1M · 缓存 99%
+
+
+===== diff =====
+⑂ detached@bbdd9748 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L1-implementation
+ 文件                                          │diff --git a/cmd/constant.go b/cmd/constant.go
+› cmd/constant.go  +1 -0                       │index afc69123..cd24a79b 100644
+  cmd/evaluate_all_command.go  +4 -0           │--- a/cmd/constant.go
+  cmd/evaluate_sequence_command.go  +38 -0     │+++ b/cmd/constant.go
+  cmd/root.go  +1 -0                           │@@ -15,6 +15,7 @@ var exitStatus = false
+  pkg/yqlib/stream_evaluator.go  +31 -0        │ var forceColor = false
+  cmd/doc_count_test.go  +151 -0               │ var forceNoColor = false
+  pkg/yqlib/stream_evaluator_count_tes…  +77 -0│ var colorsEnabled = false
+                                               │+var docCount = false
+                                               │ var indent = 2
+                                               │ var noDocSeparators = false
+                                               │ var nullInput = false
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+
+===== long-task-t420s =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/L1-implementation ·  detached@bbdd9748
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+          8 │ +  "testing"
+          9 │ + )
+         10 │ +
+         11 │ + func runDocCount(t *testing.T, stdin string, args ...string) (string, error) {
+         12 │ +  t.Helper()
+         13 │ +
+         14 │ +  // yq reads stdin through os.Stdin, so swap it for the test input.
+         15 │ +  oldStdin := os.Stdin
+        … 点击展开完整 Diff
+
+  ● 跑 cmd 和 yqlib 的测试：
+
+    ▸ ✗ 命令执行失败 · 1.8s
+      └ exit: 1
+
+  ● 文件参数被 cobra 当成未知子命令了。先看 module cache 里 cobra 的实际行为，再对比真实 yq 二进制为什么能 yq file.yml
+    ：
+
+    · 已搜索代码库
+    ✗ 读取文件  cobra.args.go
+      └ file not found: `/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/…
+
+
+⠸ 等待模型 · 7m 00s · ↑49,122 ↓83
+  ▼ 计划 · 2/4 已完成 · 当前 3/4
+    ✓ 1. yqlib 层：新增 CountDocuments 能力（接口 + 实现）
+    ✓ 2. cmd 层：注册 --doc-count 全局 flag 并接入入口逻辑
+    ● 3. 补单元测试（yqlib 计数 + cmd flag/help/stdin/文件）
+    ○ 4. go build 编译并跑相关测试验证
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  Esc 打断 · Ctrl+C 取消
+  上下文 49k/1M · 缓存 95%
+
+

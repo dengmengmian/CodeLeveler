@@ -1,0 +1,53 @@
+{
+  "run_id": "S-mux-2",
+  "project": "mux",
+  "type": "go-medium",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/S-mux-2",
+  "base_ref": "db9d1d0073d27a0a2d9a8c1bc52aa0af4374d265",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/S-mux-2",
+  "session_id": "3639b263-7421-4985-98a9-0efc78e7591a",
+  "session_facts": {
+    "messages": 2,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/S-mux-2/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008866.1977,
+  "ended": 1789008875.85358,
+  "wall_seconds": 9.7,
+  "metrics": {
+    "samples": 2,
+    "rss_start_kb": 1904,
+    "rss_peak_kb": 28576,
+    "rss_end_kb": 28576,
+    "rss_growth_kb": 26672,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.8,
+    "cpu_by_phase_max": {
+      "turn": 0.8
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.8
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/S-mux-2.raw",
+  "iteration": 2,
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2207
+    },
+    {
+      "round": 2,
+      "label": "short-turn",
+      "state": "ok"
+    }
+  ]
+}

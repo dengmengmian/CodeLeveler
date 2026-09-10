@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-yq ·  detached@bbdd9748
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-yq ·  detached@bbdd9748
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+        11 │ + // how many documents it contains.
+        12 │ + func countYamlDocuments(reader io.Reader) (int, error) {
+        13 │ +  decoder := yqlib.NewYamlDecoder(yqlib.ConfiguredYamlPreferences)
+        14 │ +  if err := decoder.Init(reader); err != nil {
+        15 │ +   return 0, err
+        … 点击展开完整 Diff
+
+  ● 跑测试验证：
+
+    ▸ 执行了 1 个命令 · 11.0s
+
+  ● 测试通过。再单独跑一遍新测试的 verbose 模式确认每个用例：
+
+    ▸ 执行了 1 个命令 · 1.4s
+
+  ● 完成。
+
+    改动：
+
+    • cmd/count_documents.go — 新增内部函数 countYamlDocuments(reader io.Reader) (int, error)：用 yqlib.NewYamlDecoder
+      逐个 Decode() 文档，遇到 io.EOF 返回计数，遇到解析错误返回错误。
+    • cmd/count_documents_test.go — 表驱动测试，覆盖空输入、单文档、多文档（--- 分隔）、前导分隔符、纯注释、非法 YAML
+      六种情况。
+
+    go test ./cmd/... 通过（ok github.com/mikefarah/yq/v4/cmd），-v 单独跑 TestCountYamlDocuments 六个子用例全部
+    PASS。
+
+  ── ✓ 任务已完成 · 16 次工具 · 1m 30s · 验证 ✓ ──────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 33k/1M · 缓存 95%
+
+
+===== diff =====
+⑂ detached@bbdd9748 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-yq
+ 文件                                          │diff --git a/cmd/count_documents.go b/cmd/count_documents.go
+› cmd/count_documents.go  +29 -0               │new file mode 100644
+  cmd/count_documents_test.go  +64 -0          │index 00000000..565ec88d
+                                               │--- /dev/null
+                                               │+++ b/cmd/count_documents.go
+                                               │@@ -0,0 +1,29 @@
+                                               │+package cmd
+                                               │+
+                                               │+import (
+                                               │+       "errors"
+                                               │+       "io"
+                                               │+
+                                               │+       "github.com/mikefarah/yq/v4/pkg/yqlib"
+                                               │+)
+                                               │+
+                                               │+// countYamlDocuments reads the whole YAML stream from reader and
+                                               │returns
+                                               │+// how many documents it contains.
+                                               │+func countYamlDocuments(reader io.Reader) (int, error) {
+                                               │+       decoder := yqlib.NewYamlDecoder(yqlib.ConfiguredYamlPreferences)
+                                               │+       if err := decoder.Init(reader); err != nil {
+                                               │+               return 0, err
+                                               │+       }
+                                               │+
+                                               │+       count := 0
+                                               │+       for {
+                                               │+               _, err := decoder.Decode()
+                                               │+               if errors.Is(err, io.EOF) {
+                                               │+                       return count, nil
+                                               │+               }
+                                               │+               if err != nil {
+                                               │+                       return 0, err
+                                               │+               }
+                                               │+               count++
+                                               │+       }
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

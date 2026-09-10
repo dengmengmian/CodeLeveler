@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-mux ·  detached@db9d1d0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-mux ·  detached@db9d1d0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+         2 │ +
+         3 │ + import (
+         4 │ +  "net/http"
+         5 │ +  "testing"
+         6 │ + )
+         7 │ +
+         8 │ + func TestRouteCountEmpty(t *testing.T) {
+         9 │ +  r := NewRouter()
+        10 │ +  if got := r.RouteCount(); got != 0 {
+        11 │ +   t.Errorf("RouteCount() on a new router = %d, want 0", got)
+        12 │ +  }
+        13 │ + }
+        14 │ +
+        15 │ + func TestRouteCountAfterRegistration(t *testing.T) {
+        … 点击展开完整 Diff
+
+    ▸ 执行了 1 个命令 · 4.9s
+
+  ● 完成，go test ./... 全部通过（ok github.com/gorilla/mux）。
+
+    改动：
+
+    • mux.go:321 — 在 NewRoute() 旁新增 Router.RouteCount()，返回 len(r.routes)，即直接注册在本 router
+      上的路由数（子路由器的路由不计入）。
+    • routecount_test.go（新文件）— 三个用例：空 router 为 0、注册 3 条路由后为 3、以及父 router 与 subrouter
+      计数互不影响（Subrouter() 挂载的路由只计入子 router）。
+
+  ── ✓ 任务已完成 · 5 次工具 · 32s · 验证 ✓ ──────────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 25k/1M · 缓存 97%
+
+
+===== diff =====
+⑂ detached@db9d1d0 · ~/Develop/lab/pty-acceptance-494ed1b/ws/A-mux
+ 文件                                          │diff --git a/mux.go b/mux.go
+› mux.go  +6 -0                                │index eaff897..0912c5f 100644
+  routecount_test.go  +39 -0                   │--- a/mux.go
+                                               │+++ b/mux.go
+                                               │@@ -318,6 +318,12 @@ func (r *Router) NewRoute() *Route {
+                                               │        return route
+                                               │ }
+                                               │
+                                               │+// RouteCount returns the number of routes registered directly on this
+                                               │router.
+                                               │+// Routes registered on sub-routers are not counted.
+                                               │+func (r *Router) RouteCount() int {
+                                               │+       return len(r.routes)
+                                               │+}
+                                               │+
+                                               │ // Name registers a new route with a name.
+                                               │ // See Route.Name().
+                                               │ func (r *Router) Name(name string) *Route {
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

@@ -1,0 +1,54 @@
+{
+  "run_id": "R-resume-a",
+  "project": "mux",
+  "type": "go-medium",
+  "repo": "/Users/mengmian/Develop/lab/pty-fix/ws/R-resume-a",
+  "base_ref": "db9d1d0073d27a0a2d9a8c1bc52aa0af4374d265",
+  "home": "/Users/mengmian/Develop/lab/pty-fix/home/R-resume",
+  "session_id": "c815e3d2-faa4-4f20-bead-8a97dd051bc1",
+  "session_facts": {
+    "messages": 3,
+    "running_turns": 1
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-fix/sessions/R-resume-a/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008669.2756338,
+  "ended": 1789008679.279818,
+  "wall_seconds": 10.0,
+  "metrics": {
+    "samples": 2,
+    "rss_start_kb": 8352,
+    "rss_peak_kb": 28720,
+    "rss_end_kb": 28720,
+    "rss_growth_kb": 20368,
+    "cpu_max_pct": 0.6,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "idle": 0.6
+    },
+    "cpu_by_phase_median": {
+      "idle": 0.6
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-fix/logs/R-resume-a.raw",
+  "killed": true,
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "pre-interrupt",
+      "state": "ok",
+      "went_busy": true,
+      "file_written": true
+    }
+  ]
+}

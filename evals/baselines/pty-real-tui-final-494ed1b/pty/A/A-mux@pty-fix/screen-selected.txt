@@ -1,0 +1,126 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-fix/ws/A-mux ·  detached@db9d1d0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== task =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-fix/ws/A-mux ·  detached@db9d1d0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+    ✓ 编辑文件  mux.go, routecount_test.go
+      └ 1 处修改 · +25 −0
+        236 │   // GetRoute returns a route registered with the given name. This method
+        237 │   // was renamed to Get() and remains here for backwards compatibility.
+        238 │   func (r *Router) GetRoute(name string) *Route {
+        239 │    return r.namedRoutes[name]
+        240 │   }
+        241 │
+        242 │ + // RouteCount returns the number of routes registered with the router.
+        243 │ + // Routes registered with sub-routers are not counted.
+        244 │ + func (r *Router) RouteCount() int {
+        245 │ +  return len(r.routes)
+        246 │ + }
+        247 │ +
+        248 │   // StrictSlash defines the trailing slash behavior for new routes. The initial
+        249 │   // value is false.
+        … 点击展开完整 Diff
+
+    ▸ 执行了 1 个命令 · 4.2s
+
+  ● 完成，go test ./... 通过。
+
+    • mux.go:242 新增 RouteCount()，直接返回 len(r.routes)（本 router 上注册的路由数，不含子路由）。
+    • 新增 routecount_test.go：覆盖空路由为 0、逐个注册递增、以及子路由不计数（父 router 与子 router
+      各自的计数）两种情况。
+
+  ── ✓ 任务已完成 · 5 次工具 · 37s · 验证 ✓ ──────────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 24k/1M · 缓存 98%
+
+
+===== diff =====
+⑂ detached@db9d1d0 · ~/Develop/lab/pty-fix/ws/A-mux
+ 文件                                          │diff --git a/mux.go b/mux.go
+› mux.go  +6 -0                                │index eaff897..74ff019 100644
+  routecount_test.go  +39 -0                   │--- a/mux.go
+                                               │+++ b/mux.go
+                                               │@@ -239,6 +239,12 @@ func (r *Router) GetRoute(name string) *Route {
+                                               │        return r.namedRoutes[name]
+                                               │ }
+                                               │
+                                               │+// RouteCount returns the number of routes registered with the router.
+                                               │+// Routes registered with sub-routers are not counted.
+                                               │+func (r *Router) RouteCount() int {
+                                               │+       return len(r.routes)
+                                               │+}
+                                               │+
+                                               │ // StrictSlash defines the trailing slash behavior for new routes.
+                                               │The initial
+                                               │ // value is false.
+                                               │ //
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+

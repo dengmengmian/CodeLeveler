@@ -1,0 +1,74 @@
+{
+  "run_id": "A-rust-semver",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-fix/ws/A-rust-semver",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-fix/home/A-rust-semver",
+  "session_id": "58028580-0ca0-4337-a576-b8f7ab1911e6",
+  "session_facts": {
+    "messages": 42,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-fix/sessions/A-rust-semver/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789008823.597562,
+  "ended": 1789008937.985048,
+  "wall_seconds": 114.4,
+  "metrics": {
+    "samples": 23,
+    "rss_start_kb": 1360,
+    "rss_peak_kb": 49248,
+    "rss_end_kb": 49248,
+    "rss_growth_kb": 47888,
+    "cpu_max_pct": 1.2,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 1.2
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-fix/logs/A-rust-semver.raw",
+  "shape": "small-edit",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2198
+    },
+    {
+      "round": 2,
+      "label": "task",
+      "state": "idle",
+      "prompt": "给 Version 的解析加一个便捷方法 `Version::is_prerelease`，返回这个版本是否带预发布标签，并为它写一个单元测试。改完跑 carg",
+      "seconds": 109.3
+    },
+    {
+      "round": 3,
+      "label": "diff-screen",
+      "state": "ok",
+      "chars": 2802
+    },
+    {
+      "round": 4,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 2,
+      "shape": "small-edit"
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "run_id": "L2-investigation",
+  "project": "ripgrep",
+  "type": "rust-large",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/L2-investigation",
+  "base_ref": "4649aa9700619f94cf9c66876e9549d83420e16c",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/L2-investigation",
+  "session_id": "aa133b54-037a-4a49-abd4-cf894ca90927",
+  "session_facts": {
+    "messages": 118,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/L2-investigation/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789009570.082222,
+  "ended": 1789010073.7831109,
+  "wall_seconds": 503.7,
+  "metrics": {
+    "samples": 51,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 68288,
+    "rss_end_kb": 68288,
+    "rss_growth_kb": 66944,
+    "cpu_max_pct": 2.1,
+    "cpu_median_pct": 0.7,
+    "cpu_by_phase_max": {
+      "turn": 2.1,
+      "scroll": 0.9
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.7,
+      "scroll": 0.9
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/L2-investigation.raw",
+  "label": "L2-investigation",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "long-task",
+      "state": "idle",
+      "prompt": "调查这个仓库里 --ignore-case 和 --smart-case 的实现：从命令行参数解析开始，一路追到真正影响匹配的地方，说明每一层做了什么、在哪个文",
+      "seconds": 496.9
+    },
+    {
+      "round": 3,
+      "label": "composer-alive-after-long",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 4,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 1
+    },
+    {
+      "round": 5,
+      "label": "mid-turn-screens",
+      "state": "ok",
+      "samples": 8,
+      "blank_screens": 0,
+      "always_showed_activity": true
+    }
+  ]
+}

@@ -1,0 +1,136 @@
+===== startup =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-rerun/ws/B-interaction ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                              │
+                    │                                                                              │
+                    │                 ██        CodeLeveler  v0.2.0-beta.1                         │
+                    │               ████        让模型真正可靠地完成任务                           │
+                    │             ██████                                                           │
+                    │           ████  ██        › 输入任务，直接开始                               │
+                    │         ██      █████                                                        │
+                    │                           /feature-dev   功能实现                            │
+                    │                           /model         切换模型                            │
+                    │                           /help          查看帮助                            │
+                    │                                                                              │
+                    │                           输入 / 查看更多命令                                │
+                    │                                                                              │
+                    │                                                                              │
+                    ╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ › 输入消息，/ 查看命令                                                                                           │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+
+
+
+===== after-resize-soak =====
+
+ CodeLeveler v0.2.0-beta.1 · ~/Develop/lab/pty-rerun/ws/B-interaction ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+  ▌ 列出这个仓库里 crates/ 下每个 crate 的职责，每个一句话。
+
+    ▸ ✗ 检查代码库 · 1 个失败
+      └ file not found: `crates/core/Cargo.toml`. Check the path with `list_files` or `grep`, then `read_file` a conc…
+
+  ● 这是 ripgrep 的 workspace，crates/ 下共 9 个库 crate，加上 core/（根 crate 的 rg 二进制入口）。各职责如下：
+
+    • globset — 跨平台的 glob 与 glob 集合匹配（一次同时匹配多个模式、返回所有命中的模式）。
+    • ignore — 快速匹配 .gitignore 等忽略文件规则，决定哪些路径应被跳过（gitignore、ignore、whitelist 规则）。
+    • matcher — 定义面向行导向搜索的正则匹配 Matcher trait 接口。
+    • regex — 用 Rust 自带的 regex 库实现 Matcher trait。
+    • pcre2 — 用 PCRE2（可选 feature）实现 Matcher trait，支持回溯引用、look-around 等高级语法。
+    • searcher — 核心搜索库：按行快速执行正则搜索，支持多行模式、大文件 mmap、编码检测等。
+    • printer — 实现 Sink trait，把搜索结果格式化成类似 grep 的标准输出（颜色、JSON、上下文行等）。
+    • grep — 把 matcher/searcher/printer 打包成统一的库 API（grep::Matcher、grep::Searcher、grep::Sink 等）。
+    • cli（grep-cli）— 命令行工具用的小工具集（hostname 处理、转义、解压支持、宽度测量等）。
+    • core（crates/core，属于根 ripgrep crate 的 bin）— rg
+      主程序：解析命令行参数、配置全局状态、驱动目录遍历与搜索的顶层逻辑。
+
+  ── ✓ 任务已完成 · 13 次工具 · 50s ──────────────────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 22k/1M · 缓存 97%
+
+
+===== scroll-pageup-1 =====
+
+ CodeLeveler v0.2.0-beta.1 · B-interaction ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────
+
+  ● 这是 ripgrep 的 workspace，crates/ 下共 9 个库 crate，加上 core/（根 crate
+    的 rg 二进制入口）。各职责如下：
+
+    • globset — 跨平台的 glob 与 glob
+      集合匹配（一次同时匹配多个模式、返回所有命中的模式）。
+    • ignore — 快速匹配 .gitignore
+      等忽略文件规则，决定哪些路径应被跳过（gitignore、ignore、whitelist
+      规则）。
+    • matcher — 定义面向行导向搜索的正则匹配 Matcher trait 接口。
+    • regex — 用 Rust 自带的 regex 库实现 Matcher trait。
+    • pcre2 — 用 PCRE2（可选 feature）实现 Matcher
+      trait，支持回溯引用、look-around 等高级语法。
+                                                                            ▼12
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                        │
+  ╰─────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 22k/1M · 缓存 97%
+
+
+===== after-cancel =====
+
+ CodeLeveler v0.2.0-beta.1 · B-interaction ·  detached@4649aa9
+────────────────────────────────────────────────────────────────────────────────
+
+      规则）。
+    • matcher — 定义面向行导向搜索的正则匹配 Matcher trait 接口。
+    • regex — 用 Rust 自带的 regex 库实现 Matcher trait。
+    • pcre2 — 用 PCRE2（可选 feature）实现 Matcher
+      trait，支持回溯引用、look-around 等高级语法。
+    • searcher — 核心搜索库：按行快速执行正则搜索，支持多行模式、大文件
+      mmap、编码检测等。
+    • printer — 实现 Sink trait，把搜索结果格式化成类似 grep
+      的标准输出（颜色、JSON、上下文行等）。
+    • grep — 把 matcher/searcher/printer 打包成统一的库 API（grep::Matcher、
+      grep::Searcher、grep::Sink 等）。
+    • cli（grep-cli）— 命令行工具用的小工具集（hostname
+                                                            已取消，可继续输入
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                        │
+  ╰─────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 22k/1M · 缓存 97%
+
+

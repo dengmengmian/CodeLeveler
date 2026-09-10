@@ -1,0 +1,32 @@
+{
+  "summary": {
+    "samples": 2,
+    "rss_start_kb": 8352,
+    "rss_peak_kb": 28720,
+    "rss_end_kb": 28720,
+    "rss_growth_kb": 20368,
+    "cpu_max_pct": 0.6,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "idle": 0.6
+    },
+    "cpu_by_phase_median": {
+      "idle": 0.6
+    }
+  },
+  "samples": [
+    {
+      "t": 1789008669.28,
+      "rss_kb": 8352,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789008674.29,
+      "rss_kb": 28720,
+      "cpu_pct": 0.6,
+      "phase": "idle"
+    }
+  ],
+  "mid_turn": []
+}

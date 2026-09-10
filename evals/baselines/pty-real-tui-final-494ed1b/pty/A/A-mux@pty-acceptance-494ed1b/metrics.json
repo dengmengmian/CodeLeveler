@@ -1,0 +1,76 @@
+{
+  "summary": {
+    "samples": 9,
+    "rss_start_kb": 1728,
+    "rss_peak_kb": 46160,
+    "rss_end_kb": 46160,
+    "rss_growth_kb": 44432,
+    "cpu_max_pct": 0.8,
+    "cpu_median_pct": 0.6,
+    "cpu_by_phase_max": {
+      "turn": 0.8,
+      "idle": 0.2
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.6,
+      "idle": 0.2
+    }
+  },
+  "samples": [
+    {
+      "t": 1789005133.88,
+      "rss_kb": 1728,
+      "cpu_pct": null,
+      "phase": "startup"
+    },
+    {
+      "t": 1789005138.89,
+      "rss_kb": 28640,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005143.9,
+      "rss_kb": 44208,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005148.91,
+      "rss_kb": 44784,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005153.91,
+      "rss_kb": 45024,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005158.93,
+      "rss_kb": 45664,
+      "cpu_pct": 0.6,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005163.94,
+      "rss_kb": 45664,
+      "cpu_pct": 0.2,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005168.94,
+      "rss_kb": 45984,
+      "cpu_pct": 0.8,
+      "phase": "turn"
+    },
+    {
+      "t": 1789005173.95,
+      "rss_kb": 46160,
+      "cpu_pct": 0.2,
+      "phase": "idle"
+    }
+  ],
+  "mid_turn": []
+}

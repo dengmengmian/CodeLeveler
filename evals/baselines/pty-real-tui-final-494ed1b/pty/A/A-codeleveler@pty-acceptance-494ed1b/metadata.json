@@ -1,0 +1,76 @@
+{
+  "run_id": "A-codeleveler",
+  "project": "codeleveler",
+  "type": "rust-workspace",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/A-codeleveler",
+  "base_ref": "494ed1bfe333fbea4d0752cad9a7497446072545",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/A-codeleveler",
+  "session_id": "3a655d34-3be2-4dd8-939a-f777fbd9dea4",
+  "session_facts": {
+    "messages": 16,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/A-codeleveler/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789005384.184038,
+  "ended": 1789005810.258632,
+  "wall_seconds": 426.1,
+  "metrics": {
+    "samples": 86,
+    "rss_start_kb": 1360,
+    "rss_peak_kb": 47088,
+    "rss_end_kb": 47088,
+    "rss_growth_kb": 45728,
+    "cpu_max_pct": 3.8,
+    "cpu_median_pct": 0.2,
+    "cpu_by_phase_max": {
+      "turn": 3.8,
+      "idle": 0.2
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.2,
+      "idle": 0.2
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/A-codeleveler.raw",
+  "shape": "self-dogfood",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle",
+      "chars": 2213
+    },
+    {
+      "round": 2,
+      "label": "task",
+      "state": "idle",
+      "prompt": "在 crates/leveler-tui/src/ 里找到判断终端宽字符宽度的地方，用三句话说明它的处理方式；然后在 crates/leveler-tui/RE",
+      "seconds": 420.7
+    },
+    {
+      "round": 3,
+      "label": "diff-screen",
+      "state": "ok",
+      "chars": 3088
+    },
+    {
+      "round": 4,
+      "label": "composer-alive",
+      "state": "ok",
+      "usable": true
+    },
+    {
+      "round": 5,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 1,
+      "shape": "self-dogfood"
+    }
+  ]
+}

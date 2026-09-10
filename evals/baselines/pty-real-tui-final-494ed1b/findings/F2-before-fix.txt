@@ -1,0 +1,27 @@
+F2, as the corpus replay reported it BEFORE the fix.
+
+Captured from `real_session_corpus` over 207 recorded sessions and 13,733
+frames, replayed through the renderer as it stood at 494ed1b. Eight hits across
+seven sessions, every one of them the success mark on a line that says work did
+not finish:
+
+  [eval/phase-c/l1conf-C3-3-C]            ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/phase-c/formal-20260905-121433/08] ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/phase-c/reoffer-52e3398c6bd6-C3-r2] ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/phase-c/l1conf-C3-1-C]            ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/phase-c/reoffer-52e3398c6bd6-C3-r3] ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/state/prune-ab-670329b08742 (yq)]  ✓ 2 个 Agent 已结束 · 1 项未完成
+  [eval/phase-c/batching-f438664f42c6-C3-r2] ✓ 3 个 Agent 已结束 · 2 项未完成
+  [eval/phase-c/batching-f438664f42c6-C3-r2] ✓ 4 个 Agent 已结束 · 2 项未完成
+
+The assertion that produced it:
+
+    assert!(totals.wrong_success_glyph.is_empty(),
+            "the success mark sits on work that did not succeed: {:?}", ...)
+
+After the fix, the same corpus and the same assertion report zero. The other two
+counters in that run — 296 unparseable argument blobs and 144 bare 补丁 rows —
+are pre-fix LOG CONTENT from sessions recorded before 3ccbe94 bounded arguments
+by value. No later change can alter what is already written in a log, so those
+sessions are labelled `legacy:` and exempt from the log-content checks; they
+still carry every screen check, which is what found this.

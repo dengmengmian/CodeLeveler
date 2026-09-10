@@ -1,0 +1,38 @@
+{
+  "recorded": "2026-09-10T10:01:11+08:00",
+  "host": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpus": 16,
+    "memory_gb": 64.0
+  },
+  "toolchain": {
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+    "cargo": "cargo 1.90.0 (840b83a10 2025-07-30)",
+    "go": "go version go1.26.0 darwin/arm64",
+    "node": "v25.2.1",
+    "python": "3.9.6",
+    "pyte": "installed",
+    "wcwidth": "installed"
+  },
+  "frozen_product": {
+    "PTY_ACCEPTANCE_HEAD": "494ed1bfe333fbea4d0752cad9a7497446072545",
+    "PTY_ACCEPTANCE_TREE": "a1c3f26f8b2202d2d23494befd45955d67efb335",
+    "origin_main": "494ed1bfe333fbea4d0752cad9a7497446072545",
+    "binary_version": "leveler 0.2.0-beta.1 (494ed1bfe333)",
+    "binary_sha256_asbuilt": "a3ba5cba2cb6fb27acb15aa90bedf2c939f26a035ffbe49e196a01e129bdff6b",
+    "binary_sha256_lab": "21f358cce316f9c423ae4c0dbc132d8dcc28c4022bf97224c1b2ed20f97dcc51",
+    "note": "the lab copy is ad-hoc re-signed for macOS, which changes the hash; both are recorded so either can be matched"
+  },
+  "isolation": {
+    "leveler_home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/<run-id>",
+    "workspaces": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/<run-id> (detached git worktree at a pinned ref)",
+    "kept_stores": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/<run-id>/sessions.db",
+    "why": "a person was dogfooding the same product at the same time; nothing is shared"
+  },
+  "model": {
+    "default": "deepseek/deepseek-v4-flash",
+    "reasoning_effort": "max",
+    "provider_base": "taotoken OpenAI-compatible gateway"
+  }
+}

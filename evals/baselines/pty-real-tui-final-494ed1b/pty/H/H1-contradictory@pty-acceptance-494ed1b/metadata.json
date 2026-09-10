@@ -1,0 +1,66 @@
+{
+  "run_id": "H1-contradictory",
+  "project": "rust-semver",
+  "type": "rust-small",
+  "repo": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/ws/H1-contradictory",
+  "base_ref": "280ebcb6edac3aa4cdc545dbff8a26c5ac4861fe",
+  "home": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/home/H1-contradictory",
+  "session_id": "bb5f5eec-eb4d-4e15-8645-812c83856fec",
+  "session_facts": {
+    "messages": 76,
+    "running_turns": 0
+  },
+  "sessions_db": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/sessions/H1-contradictory/sessions.db",
+  "pty_size": [
+    40,
+    120
+  ],
+  "auto_approve": true,
+  "permission_mode": null,
+  "started": 1789006188.564689,
+  "ended": 1789007028.851593,
+  "wall_seconds": 840.3,
+  "metrics": {
+    "samples": 168,
+    "rss_start_kb": 1344,
+    "rss_peak_kb": 50432,
+    "rss_end_kb": 50432,
+    "rss_growth_kb": 49088,
+    "cpu_max_pct": 3.2,
+    "cpu_median_pct": 0.4,
+    "cpu_by_phase_max": {
+      "turn": 3.2
+    },
+    "cpu_by_phase_median": {
+      "turn": 0.4
+    }
+  },
+  "raw_log": "/Users/mengmian/Develop/lab/pty-acceptance-494ed1b/logs/H1-contradictory.raw",
+  "rounds": [
+    {
+      "round": 1,
+      "label": "startup",
+      "state": "idle"
+    },
+    {
+      "round": 2,
+      "label": "contradictory",
+      "state": "idle",
+      "prompt": "把 Version 的比较改成完全忽略预发布标签，同时保证 tests/ 下现有的预发布排序测试全部继续通过，一个都不能改。做完跑 cargo test。",
+      "seconds": 838.5
+    },
+    {
+      "round": 3,
+      "label": "outcome-glyphs",
+      "state": "ok",
+      "tick_lines": [],
+      "blocked_lines": []
+    },
+    {
+      "round": 4,
+      "label": "workspace",
+      "state": "ok",
+      "changed_files": 2
+    }
+  ]
+}
