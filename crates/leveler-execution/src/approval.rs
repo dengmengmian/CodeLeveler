@@ -129,15 +129,12 @@ impl Approver for EvalApprove {
 
 /// Tools that write durable project memory and always need human confirmation.
 ///
-/// Includes `consolidate_memory`: with `auto_write=true` it persists entries and
-/// must not slip past K36 under WorkspaceWrite / FullAccess / AutoApprove.
-///
 /// Pending-candidate **accept** is deliberately **not** an agent tool: durable
 /// promotion goes through user-authoritative CLI (`leveler memory accept`) or a
 /// future UI consent surface that calls `MemoryStore::accept` after a human
 /// click. AutoApprove therefore cannot silently activate candidates.
 pub fn is_memory_write_tool(tool: &str) -> bool {
-    matches!(tool, "remember" | "forget" | "consolidate_memory")
+    matches!(tool, "remember" | "forget")
 }
 
 /// Always denies.
@@ -851,15 +848,6 @@ mod tests {
             ),
             Requirement::Auto
         );
-        assert_eq!(
-            policy.evaluate(
-                PermissionProfile::FullAccess,
-                "consolidate_memory",
-                RiskLevel::WorkspaceWrite,
-                None
-            ),
-            Requirement::Auto,
-        );
         // Assisted / request-approval still confirm memory writes (K36).
         assert_eq!(
             policy.evaluate(
@@ -892,24 +880,15 @@ mod tests {
         };
         assert_eq!(AutoApprove.decide(&req).await, ApprovalDecision::Deny);
 
-        let consolidate = ApprovalRequest {
-            id: leveler_core::ApprovalId::generate(),
-            turn_id: None,
-            call_id: "c2".into(),
-            agent_id: None,
-            action_fingerprint: "fp2".into(),
-            tool: "consolidate_memory".into(),
-            risk: RiskLevel::WorkspaceWrite,
-            description: "auto_write candidates".into(),
-            command: None,
-            paths: Vec::new(),
+        let forget = ApprovalRequest {
+            tool: "forget".into(),
+            ..req
         };
         assert_eq!(
-            AutoApprove.decide(&consolidate).await,
+            AutoApprove.decide(&forget).await,
             ApprovalDecision::Deny,
-            "K36: --auto-approve must not persist consolidate_memory writes"
+            "K36: --auto-approve must not persist memory writes"
         );
-        assert!(is_memory_write_tool("consolidate_memory"));
     }
 
     #[test]

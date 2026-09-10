@@ -331,6 +331,47 @@ impl Executor {
             .map(|t| t.risk())
             .unwrap_or(RiskLevel::Safe);
 
+        // An MCP server is a separate process CodeLeveler launches with no OS
+        // sandbox, so a network denial cannot be applied to it. Refuse rather
+        // than run it under an authority this runtime cannot enforce — the
+        // same reasoning that keeps MCP away from a delegated agent, whose
+        // claimed write scope it also could not honour.
+        if !network_allowed && call.name.starts_with("mcp__") {
+            return deny(format!(
+                "{} is unavailable while network access is denied for this run: an \
+                 MCP server is a separate process outside the sandbox, so the \
+                 denial cannot be enforced on it.",
+                call.name
+            ));
+        }
+        // The read-only overlay (`leveler plan` / plan collaboration) admits
+        // Safe tools only, whatever the profile would otherwise allow. It is
+        // orthogonal to the three-tier profile, so it is its own gate.
+        if ctx.policy.read_only && risk != RiskLevel::Safe {
+            return deny(format!(
+                "tool `{}` is not permitted in a read-only (plan) turn (risk {risk:?}): \
+                 only observation tools run here",
+                call.name
+            ));
+        }
+        // A confined profile FORBIDS a Privileged/Destructive tool rather than
+        // offering it for approval. Deliberately on the tool's DECLARED risk,
+        // before the per-command bump below: a destructive shell command is
+        // still a prompt (the user may well want that `rm`), while a tool that
+        // is destructive by nature is not available at all under a confined
+        // profile.
+        //
+        // Both of these gates used to live in `ToolRegistry::execute`, which
+        // made the registry a third authorization owner alongside the host and
+        // the rules. Same answers, one owner.
+        let profile = ctx.policy.mode();
+        if !profile.permits(risk) {
+            return deny(format!(
+                "tool `{}` is not permitted in {profile:?} mode (risk {risk:?})",
+                call.name
+            ));
+        }
+
         // Extract command for run_command / shell_command so the policy can
         // classify it. shell_command uses a platform wrapper for classification
         // but permission rules match the raw `cmd` string.
@@ -372,7 +413,6 @@ impl Executor {
             leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
         }
 
-        let profile = ctx.policy.mode();
         match self
             .approval_policy
             .evaluate(profile, &call.name, risk, command_view)
@@ -534,7 +574,7 @@ impl Executor {
         if call.name != "remember" {
             return format!("{UNATTENDED}; re-run with --permission full-access to allow it");
         }
-        let Some(root) = self.tool_context.services.memory_root.as_ref() else {
+        let Some(root) = self.memory_root.as_ref() else {
             return format!("{UNATTENDED}; memory is not configured, so it could not be parked");
         };
         let title = call.arguments.get("title").and_then(|v| v.as_str());
@@ -840,6 +880,100 @@ mod authorize_tests {
             10,
         )
         .with_approver(approver)
+    }
+
+    /// An executor under the read-only overlay (`leveler plan` / plan
+    /// collaboration): Safe tools only, whatever the profile allows.
+    fn read_only_executor(dir: &std::path::Path, approver: Arc<FixedApprover>) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context =
+            ToolContext::new(workspace, PermissionProfile::Assisted).with_read_only(true);
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
+    /// The read-only overlay is a DENIAL, decided at the host, not a question
+    /// for the user and not a second check inside the registry.
+    ///
+    /// The registry used to enforce this too, so a build had two owners for
+    /// the answer. It moved here with the rest of the authorization; this
+    /// pins that the answer did not move with it.
+    #[tokio::test]
+    async fn the_read_only_overlay_denies_a_write_tool_at_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = read_only_executor(dir.path(), approver.clone());
+
+        let reason = executor
+            .authorize(&grep_call(), &mut HashSet::new())
+            .await
+            .expect_err("run_command is WorkspaceWrite; a read-only turn refuses it");
+        assert!(
+            reason.contains("read-only"),
+            "the refusal must name the overlay, not a profile: {reason}"
+        );
+        assert_eq!(
+            approver.asks(),
+            0,
+            "a structural denial must never become an approval prompt"
+        );
+
+        // An observation tool is unaffected: the overlay filters by risk, and
+        // `read_file` is Safe.
+        executor
+            .authorize(&read_file_call(), &mut HashSet::new())
+            .await
+            .expect("a read-only turn still observes");
+    }
+
+    /// A network denial that cannot be enforced is not a denial. An MCP
+    /// server runs outside the sandbox, so the call is refused rather than
+    /// run under an authority this runtime cannot apply to it.
+    #[tokio::test]
+    async fn a_network_denied_run_refuses_an_mcp_tool_instead_of_pretending() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let workspace = Workspace::new(dir.path()).unwrap();
+        // 完全访问 would otherwise auto-approve it; the denial is what refuses.
+        let tool_context =
+            ToolContext::new(workspace, PermissionProfile::FullAccess).with_sandbox(true);
+        let executor = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver.clone());
+
+        let call = ToolCall {
+            id: ToolCallId::new("m"),
+            name: "mcp__fs__read".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let reason = executor
+            .authorize(&call, &mut HashSet::new())
+            .await
+            .expect_err("a denial this runtime cannot enforce must refuse the call");
+        assert!(
+            reason.contains("network access is denied"),
+            "the refusal must name the unenforceable denial: {reason}"
+        );
+        assert_eq!(approver.asks(), 0, "not a question for the user");
+    }
+
+    fn read_file_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("r"),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "Cargo.toml"}),
+        }
     }
 
     /// An ordinary read-only repository search — the exact shape the user saw
@@ -1149,8 +1283,7 @@ mod authorize_tests {
     async fn a_headless_denial_is_not_reported_as_the_user_refusing() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(dir.path()).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
-            .with_memory_root(dir.path().join("memory"));
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
         let executor = Executor::new(
             Arc::new(StubRuntime),
             Arc::new(default_registry()),
@@ -1158,6 +1291,7 @@ mod authorize_tests {
             ModelRef::new("mock", "m"),
             10,
         )
+        .with_memory_root(Some(dir.path().join("memory")))
         .with_approver(Arc::new(HeadlessDeny));
         let mut session = HashSet::new();
 
@@ -1178,8 +1312,7 @@ mod authorize_tests {
         let dir = tempfile::tempdir().unwrap();
         let memory_root = dir.path().join("memory");
         let workspace = Workspace::new(dir.path()).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
-            .with_memory_root(memory_root.clone());
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
         let executor = Executor::new(
             Arc::new(StubRuntime),
             Arc::new(default_registry()),
@@ -1187,6 +1320,7 @@ mod authorize_tests {
             ModelRef::new("mock", "m"),
             10,
         )
+        .with_memory_root(Some(memory_root.clone()))
         .with_approver(Arc::new(HeadlessDeny));
         let mut session = HashSet::new();
 

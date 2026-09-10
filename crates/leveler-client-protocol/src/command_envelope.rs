@@ -67,31 +67,6 @@ impl CommandReceipts {
     }
 }
 
-/// How an action interrupted between "started" and "its completion event" may
-/// be recovered on resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recovery {
-    /// The action is idempotent (a read/search): re-running it has no external
-    /// effect, so a resume may replay it automatically.
-    SafeReplay,
-    /// The action has a side effect that cannot be proven un-done (a shell
-    /// command, an external API, a file write): a resume must NOT auto-replay —
-    /// it surfaces for human confirmation.
-    RequiresConfirmation,
-}
-
-/// Classify a tool by whether re-running it after an unconfirmed crash is safe.
-/// Read-only tools are replayable; anything that mutates the workspace or runs
-/// a process requires confirmation. Unknown tools default to the safe (for the
-/// user) side: confirmation.
-pub fn recovery_for_tool(tool_name: &str) -> Recovery {
-    if leveler_model::is_safe_replay_tool(tool_name) {
-        Recovery::SafeReplay
-    } else {
-        Recovery::RequiresConfirmation
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,25 +78,6 @@ mod tests {
         assert_eq!(receipts.admit(&id), Receipt::Accepted);
         assert_eq!(receipts.admit(&id), Receipt::Duplicate);
         assert_eq!(receipts.admit(&CommandId::new("cmd-2")), Receipt::Accepted);
-    }
-
-    #[test]
-    fn non_idempotent_actions_require_confirmation_on_recovery() {
-        assert_eq!(recovery_for_tool("read_file"), Recovery::SafeReplay);
-        assert_eq!(recovery_for_tool("grep"), Recovery::SafeReplay);
-        assert_eq!(
-            recovery_for_tool("run_command"),
-            Recovery::RequiresConfirmation
-        );
-        assert_eq!(
-            recovery_for_tool("apply_patch"),
-            Recovery::RequiresConfirmation
-        );
-        // An unknown tool is treated conservatively.
-        assert_eq!(
-            recovery_for_tool("mcp__x__y"),
-            Recovery::RequiresConfirmation
-        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! `git_status`, `git_diff`.
 #![forbid(unsafe_code)]
 
+pub mod capabilities;
 pub mod mcp;
 pub mod recoverable;
 pub mod registry;
@@ -13,6 +14,7 @@ pub mod tool;
 pub mod tools;
 pub(crate) mod workspace;
 
+pub use capabilities::Capabilities;
 pub use registry::{
     CapabilityPacks, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface, default_registry,
     is_observe_class_tool, model_surface,

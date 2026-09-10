@@ -471,30 +471,24 @@ impl Application {
         .await
     }
 
-    /// Which optional capability packs this host can put on the model's
-    /// surface.
+    /// AVAILABLE: which optional capabilities this MACHINE can provide.
     ///
-    /// Every answer is a mechanical fact: is a browser runtime installed, is a
-    /// search provider configured, does this model accept an image. The work
-    /// profile is the one product choice in the list, and `Economy` means "the
-    /// primitives and the protocol, nothing else" — it is a user's decision
-    /// about cost, not an inference about the task.
-    ///
-    /// Nothing here consults the model's ability. A surface that grew because
-    /// a task looked hard, or shrank because a model looked weak, would be the
-    /// harness deciding for the model (`docs/ARCHITECTURE.md` §1.1).
-    async fn capability_packs(
-        &self,
-        work_profile: WorkProfile,
-        model: &leveler_model::ModelRef,
-    ) -> CapabilityPacks {
-        if work_profile == WorkProfile::Economy {
-            return CapabilityPacks::NONE;
-        }
+    /// Every answer is a mechanical fact — is a browser runtime installed, is
+    /// a search provider configured, is `git` on PATH, does this model accept
+    /// an image. Nothing here is a product choice, and nothing here consults
+    /// the model's ability: a surface that grew because a task looked hard, or
+    /// shrank because a model looked weak, would be the harness deciding for
+    /// the model (`docs/ARCHITECTURE.md` §1.1).
+    async fn capability_availability(&self, model: &leveler_model::ModelRef) -> CapabilityPacks {
         let environment = self.environment.as_ref();
         CapabilityPacks {
+            // The symbol tools ask a language server when one is installed and
+            // otherwise answer from a scan that needs nothing, so the
+            // capability itself is always providable here.
             code_intelligence: true,
-            vcs: true,
+            // Both git tools shell out to `git`; without the binary each one
+            // can only report that it could not start.
+            vcs: leveler_browser::which(environment, "git").is_some(),
             web_fetch: true,
             // The tool refuses without a key; advertising it anyway spends
             // schema on a call that can only fail.
@@ -506,12 +500,40 @@ impl Application {
                 .await
                 .map(|profile| profile.capabilities.vision)
                 .unwrap_or(false),
+            // The app always hands the tools a memory root and a workspace to
+            // read skills from.
             memory: true,
             skills: true,
             // The browser driver runs under Node; without it every one of the
             // twelve browser tools fails on its first call.
             browser: leveler_browser::which(environment, "node").is_some(),
         }
+    }
+
+    /// ENABLED: which optional capabilities this product mode ASKS for.
+    ///
+    /// A user's decision about cost and scope, never an inference about the
+    /// task. `Economy` asks for none of them — the primitives and the protocol
+    /// only — which is why a machine with a browser runtime installed still
+    /// shows an Economy turn zero browser tools.
+    fn capability_selection(work_profile: WorkProfile) -> CapabilityPacks {
+        match work_profile {
+            WorkProfile::Economy => CapabilityPacks::NONE,
+            WorkProfile::Balanced | WorkProfile::Delivery => CapabilityPacks::ALL,
+        }
+    }
+
+    /// EXPOSED: the packs that actually reach the model's surface.
+    ///
+    /// Enabled ∩ available. Being available buys nothing on its own, and
+    /// asking for something this machine cannot do buys nothing either.
+    async fn exposed_capabilities(
+        &self,
+        work_profile: WorkProfile,
+        model: &leveler_model::ModelRef,
+    ) -> CapabilityPacks {
+        Self::capability_selection(work_profile)
+            .intersect(self.capability_availability(model).await)
     }
 
     /// Like [`Self::engine_for`], but force a work profile (resume / axes reload).
@@ -543,15 +565,19 @@ impl Application {
         // background process (and the next turn's registry no longer knew the
         // task id) — the "服务活不过一个回合" bug.
         let bg = self.background_tasks.clone();
+        // The capability handles this host owns. They reach the TOOLS at
+        // construction (below) and the RUNTIME through its own fields — never
+        // through the tool context, which carries authority and nothing else.
+        let capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
+            .with_background_tasks(bg.clone())
+            .with_artifact_store(artifact_store)
+            .with_memory_root(self.layout.memory_dir())
+            .with_browser(self.browser.clone());
         let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
             .with_policy_limits(max_files)
             .with_sandbox(sandbox)
             .with_deny_env(provider_secret_env_names(&self.config.providers))
-            .with_artifact_store(artifact_store)
-            .with_memory_root(self.layout.memory_dir())
-            .with_read_only(read_only)
-            .with_background_tasks(bg)
-            .with_browser(self.browser.clone());
+            .with_read_only(read_only);
         // The permission profile this turn authorizes under is the SESSION's
         // live cell, not the value captured here: a user who switches profile
         // while this turn runs must be obeyed by it and by every agent it has
@@ -564,7 +590,13 @@ impl Application {
         };
         // The model-visible surface is composed here, from what this host can
         // actually do — never from a guess about the task or the model.
-        let mut registry = model_surface(self.capability_packs(work_profile, model).await);
+        let mut registry = model_surface(
+            self.exposed_capabilities(work_profile, model).await,
+            &capabilities,
+        );
+        // Harness controls are not a capability the host can turn off: they
+        // steer the harness, so the harness registers them.
+        leveler_agent::register_harness_controls(&mut registry);
         // Attach external MCP tools (connect once, cached across turns).
         for tool in self.mcp_tools().await {
             registry.register(tool);
@@ -597,6 +629,8 @@ impl Application {
                 commit_co_author: self.config.vcs_co_author,
                 overrides: self.execution_overrides.clone(),
                 memory_index,
+                memory_root: Some(self.layout.memory_dir()),
+                background_tasks: bg,
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,

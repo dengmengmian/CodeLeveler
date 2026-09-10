@@ -6,6 +6,14 @@
 
 use leveler_tools::{CapabilityPacks, core_surface, default_registry, model_surface};
 
+/// In-process capability handles: the composition under test is about which
+/// tools exist, not about which host services back them.
+fn caps() -> leveler_tools::Capabilities {
+    leveler_tools::Capabilities::in_process(std::sync::Arc::new(
+        leveler_core::environment().clone(),
+    ))
+}
+
 fn names(registry: &leveler_tools::ToolRegistry) -> Vec<String> {
     registry.definitions().into_iter().map(|d| d.name).collect()
 }
@@ -15,7 +23,7 @@ fn names(registry: &leveler_tools::ToolRegistry) -> Vec<String> {
 #[test]
 fn every_core_primitive_is_present_in_every_composition() {
     for packs in [CapabilityPacks::NONE, CapabilityPacks::ALL] {
-        let got = names(&model_surface(packs));
+        let got = names(&model_surface(packs, &caps()));
         for primitive in [
             "read_file",     // read
             "list_files",    // ls
@@ -38,7 +46,7 @@ fn every_core_primitive_is_present_in_every_composition() {
 /// stop one travel with it. A task the caller cannot see or kill is an orphan.
 #[test]
 fn the_background_lifecycle_travels_with_the_command_primitive() {
-    let got = names(&core_surface());
+    let got = names(&core_surface(&caps()));
     assert!(got.iter().any(|n| n == "run_command"));
     for lifecycle in ["get_task", "wait_task", "kill_task"] {
         assert!(
@@ -53,10 +61,13 @@ fn the_background_lifecycle_travels_with_the_command_primitive() {
 #[test]
 fn a_pack_is_independent_of_every_other_pack() {
     let all = names(&default_registry());
-    let without_browser = names(&model_surface(CapabilityPacks {
-        browser: false,
-        ..CapabilityPacks::ALL
-    }));
+    let without_browser = names(&model_surface(
+        CapabilityPacks {
+            browser: false,
+            ..CapabilityPacks::ALL
+        },
+        &caps(),
+    ));
     let dropped: Vec<&String> = all
         .iter()
         .filter(|n| !without_browser.contains(n))
@@ -92,12 +103,11 @@ fn the_removed_and_demoted_tools_stay_off_the_surface() {
     }
 }
 
-/// A removed tool name must fail closed, not silently. An old session that
-/// recorded one is still loadable and still classifiable, but the name is not
-/// executable and is not replay-safe — so crash recovery stops for a human
+/// A removed tool name must fail closed, not silently: the name is not
+/// executable and is not replay-safe, so crash recovery stops for a human
 /// instead of skipping a call it cannot re-run.
 #[test]
-fn a_removed_tool_name_fails_closed_and_still_classifies() {
+fn a_removed_tool_name_fails_closed() {
     let registry = default_registry();
     for gone in ["replace", "expand_tools"] {
         assert!(registry.get(gone).is_none(), "{gone} must not dispatch");
@@ -106,11 +116,6 @@ fn a_removed_tool_name_fails_closed_and_still_classifies() {
             "an unknown name must never be auto-replayed: {gone}"
         );
     }
-    // The durable event log keeps its meaning: an old `replace` row is still
-    // read as a write, so history renders and classifies as it always did.
-    let metadata = leveler_model::builtin_tool_metadata("replace").expect("historical metadata");
-    assert_eq!(metadata.class, leveler_model::BuiltinToolClass::Write);
-    assert!(!leveler_model::is_safe_replay_tool("replace"));
 }
 
 /// The read-only subset a read-capable child receives is an allowlist, and it

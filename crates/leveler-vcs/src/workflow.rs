@@ -1,11 +1,16 @@
 //! The git/GitHub workflow driver.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{CommandRunner, ProcessRequest};
+use leveler_execution::{CommandRunner, ProcessOutput, ProcessRequest};
+
+/// Read-only inspection is interactive: a status or diff that has not answered
+/// in 30 seconds is a repository problem, not something to keep waiting on.
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors from the VCS workflow.
 #[derive(Debug, thiserror::Error)]
@@ -80,9 +85,9 @@ pub struct WorkflowOutcome {
 
 /// Runs git/GitHub operations for a repository.
 pub struct GitWorkflow {
-    runner: CommandRunner,
+    runner: Arc<CommandRunner>,
     repo_root: PathBuf,
-    environment: std::sync::Arc<leveler_core::EnvSnapshot>,
+    environment: Arc<leveler_core::EnvSnapshot>,
 }
 
 impl GitWorkflow {
@@ -95,13 +100,52 @@ impl GitWorkflow {
 
     pub fn with_environment(
         repo_root: impl Into<PathBuf>,
-        environment: std::sync::Arc<leveler_core::EnvSnapshot>,
+        environment: Arc<leveler_core::EnvSnapshot>,
+    ) -> Self {
+        let runner = Arc::new(CommandRunner::with_environment(environment.clone()));
+        Self::with_runner(repo_root, runner, environment)
+    }
+
+    /// Reuse a [`CommandRunner`] the caller already owns.
+    ///
+    /// The agent's runner is the sandboxed, env-scrubbed one every tool call
+    /// goes through, and the read-only git tools run under it. This exists so
+    /// there is ONE place that knows how this product invokes `git`: those
+    /// tools used to build their own `ProcessRequest`, which meant a second
+    /// git invocation with its own timeout and its own error shape.
+    pub fn with_runner(
+        repo_root: impl Into<PathBuf>,
+        runner: Arc<CommandRunner>,
+        environment: Arc<leveler_core::EnvSnapshot>,
     ) -> Self {
         Self {
-            runner: CommandRunner::with_environment(environment.clone()),
+            runner,
             repo_root: repo_root.into(),
             environment,
         }
+    }
+
+    /// Run a READ-ONLY git command and hand back the raw process result.
+    ///
+    /// Unlike [`Self::git`], nothing is trimmed and a non-zero exit is not an
+    /// error: an inspection tool has to show the model the exit code, the
+    /// stderr and whether the runner truncated the output, so it needs the
+    /// whole result rather than a success-or-error summary.
+    pub async fn inspect(
+        &self,
+        args: &[&str],
+        cancellation: CancellationToken,
+    ) -> Result<ProcessOutput, VcsError> {
+        let mut request = ProcessRequest::new(
+            "git",
+            args.iter().map(|s| s.to_string()).collect(),
+            self.repo_root.clone(),
+        );
+        request.timeout = INSPECT_TIMEOUT;
+        self.runner
+            .run(request, cancellation)
+            .await
+            .map_err(|e| VcsError::Spawn(e.to_string()))
     }
 
     /// The repository root this workflow operates in.

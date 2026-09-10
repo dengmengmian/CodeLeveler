@@ -74,6 +74,15 @@ pub struct ExecutorFactory {
     pub overrides: Option<ExecutionOverrides>,
     /// Short memory INDEX for system injection (titles only).
     pub memory_index: String,
+    /// Durable project memory root. The RUNTIME reads it for per-turn recall
+    /// injection, for parking an unapproved `remember`, and — at terminal
+    /// settlement — nothing else; the memory TOOLS get their own handle at
+    /// construction. `None` = memory unconfigured.
+    pub memory_root: Option<std::path::PathBuf>,
+    /// The process-lived background task registry, so terminal settlement can
+    /// reap this session's detached processes. Held here rather than fished
+    /// out of the tool context: reaping is the engine's job, not a tool's.
+    pub background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
     /// SEC-1 permission rules (may be empty).
     pub permission_rules: leveler_execution::PermissionRuleSet,
     /// Project permission-rules file; `ApproveAlways` persists new rules here.
@@ -159,7 +168,9 @@ impl ExecutorFactory {
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 
-        executor = executor.with_memory_index(self.memory_index.clone());
+        executor = executor
+            .with_memory_index(self.memory_index.clone())
+            .with_memory_root(self.memory_root.clone());
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

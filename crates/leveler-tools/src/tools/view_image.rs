@@ -1,7 +1,13 @@
 //! `view_image` — load an image file from the workspace into the conversation
-//! so a vision-capable model can see it. The tool base64-encodes the file and
-//! hands it back through `metadata.image`; the executor turns that into an
-//! `ContentPart::Image` in the next request.
+//! so a vision-capable model can see it.
+//!
+//! The bytes go through [`leveler_media::process_image`], the same pipeline
+//! that backs the attachment store: the real type comes from the CONTENT (a
+//! JPEG named `.png` is a JPEG), the pixel count and byte size are bounded
+//! before the decoder allocates, and the re-encode to PNG is what strips EXIF.
+//! This tool used to answer all three questions itself — MIME from the
+//! extension, a byte cap and nothing else — which meant the model could be
+//! shown a mislabelled image and the provider could be handed its GPS tags.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -13,8 +19,9 @@ use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// Refuse images larger than this (base64 inflates ~33%, and providers cap the
-/// request size).
+/// Refuse source files larger than this before reading them. Base64 inflates
+/// ~33% and providers cap the request size, so this is tighter than the
+/// attachment store's own ceiling.
 const MAX_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -58,11 +65,6 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let Some(media_type) = media_type_for(&input.path) else {
-            return Ok(ToolOutput::error(
-                "不支持的图片格式(支持 png/jpg/jpeg/gif/webp)。",
-            ));
-        };
         let path = context.execution.workspace.resolve_for_read(&input.path)?;
         // Check the size before reading, so a huge file is rejected instead of
         // pulled fully into memory first.
@@ -81,27 +83,29 @@ impl Tool for ViewImageTool {
             Ok(b) => b,
             Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
         };
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let processed = match leveler_media::process_image(&bytes) {
+            Ok(processed) => processed,
+            Err(leveler_media::MediaError::Unsupported(kind)) => {
+                return Ok(ToolOutput::error(format!(
+                    "不支持的图片格式({kind};支持 png/jpg/jpeg/gif/webp)。"
+                )));
+            }
+            Err(error) => return Ok(ToolOutput::error(format!("读取图片失败:{error}"))),
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(&processed.png);
         Ok(ToolOutput::ok(format!(
-            "已加载图片 {} ({} KB)。",
+            "已加载图片 {} ({}×{}, {} KB)。",
             input.path,
-            bytes.len() / 1024
+            processed.width,
+            processed.height,
+            processed.png.len() / 1024
         ))
         .with_metadata(serde_json::json!({
-            "image": { "media_type": media_type, "data": data }
+            "image": {
+                "media_type": leveler_media::PROCESSED_MIME,
+                "data": data,
+            }
         })))
-    }
-}
-
-/// The MIME type for a supported image extension, or `None` if unsupported.
-fn media_type_for(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
     }
 }
 
@@ -109,46 +113,79 @@ fn media_type_for(path: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn maps_known_extensions() {
-        assert_eq!(media_type_for("a/b.png"), Some("image/png"));
-        assert_eq!(media_type_for("shot.JPG"), Some("image/jpeg"));
-        assert_eq!(media_type_for("x.webp"), Some("image/webp"));
-        assert_eq!(media_type_for("notes.txt"), None);
-        assert_eq!(media_type_for("noext"), None);
+    fn ctx_in(dir: &std::path::Path) -> ToolContext {
+        let ws = leveler_execution::Workspace::new(dir).unwrap();
+        ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval)
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-view-img-{tag}-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A one-pixel PNG, produced by the same encoder the tool normalizes with.
+    fn tiny_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
     }
 
     #[tokio::test]
-    async fn rejects_unsupported_extension() {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-view-img-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+    async fn rejects_a_file_that_is_not_an_image() {
+        let dir = scratch("unsupported");
+        std::fs::write(dir.join("diagram.svg"), "<svg/>").unwrap();
         let out = ViewImageTool
             .execute(
                 serde_json::json!({"path": "diagram.svg"}),
-                ctx,
+                ctx_in(&dir),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(out.is_error);
-        assert!(out.content.contains("不支持的图片格式"));
+        assert!(out.content.contains("不支持的图片格式"), "{}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The media type the model is told comes from the bytes, not the name: a
+    /// PNG saved as `.jpg` is still declared as what it actually is.
+    #[tokio::test]
+    async fn the_media_type_comes_from_the_content_not_the_extension() {
+        let dir = scratch("sniff");
+        std::fs::write(dir.join("mislabelled.jpg"), tiny_png()).unwrap();
+        let out = ViewImageTool
+            .execute(
+                serde_json::json!({"path": "mislabelled.jpg"}),
+                ctx_in(&dir),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.metadata
+                .pointer("/image/media_type")
+                .and_then(|v| v.as_str()),
+            Some("image/png"),
+            "the extension said jpeg; the bytes say png: {:?}",
+            out.metadata
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn reports_missing_file() {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-view-img-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let dir = scratch("missing");
         let out = ViewImageTool
             .execute(
                 serde_json::json!({"path": "missing.png"}),
-                ctx,
+                ctx_in(&dir),
                 CancellationToken::new(),
             )
             .await
@@ -160,16 +197,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_image() {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-view-img-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("oversized");
         std::fs::write(dir.join("huge.png"), vec![0u8; MAX_BYTES + 1]).unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
         let out = ViewImageTool
             .execute(
                 serde_json::json!({"path": "huge.png"}),
-                ctx,
+                ctx_in(&dir),
                 CancellationToken::new(),
             )
             .await

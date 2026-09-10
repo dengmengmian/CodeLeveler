@@ -17,9 +17,16 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall, ToolChoice,
 };
-use leveler_tools::{
-    RiskLevel, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, default_registry,
-};
+use leveler_tools::{RiskLevel, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
 
 /// A model runtime that replays scripted responses in order.
 struct MockRuntime {
@@ -4653,25 +4660,29 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// K36: AutoApprove + WorkspaceWrite must not persist consolidate_memory(auto_write).
+/// K36: AutoApprove must not persist a durable memory write.
+///
+/// Guarded at the EXECUTOR, not only in the approval policy: the policy's own
+/// test proves `AutoApprove` denies the request, and this proves the loop
+/// honours that denial, tells the model the truth about why, and leaves
+/// `active/` empty.
 #[tokio::test]
-async fn auto_approve_blocks_consolidate_memory_auto_write() {
+async fn auto_approve_blocks_a_durable_memory_write() {
     let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-k36-consolidate-{}",
+        "leveler-agent-k36-remember-{}",
         std::process::id() as u64 * 31 + 50
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let mem = dir.join("memory");
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context =
-        ToolContext::new(workspace, PermissionProfile::Assisted).with_memory_root(&mem);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
-            "consolidate_memory",
+            "remember",
             serde_json::json!({
-                "transcript": "User preference: always use WorkspaceWrite for edits.",
-                "auto_write": true
+                "title": "Prefer workspace-write",
+                "body": "Always use WorkspaceWrite for edits."
             }),
         ),
         assistant_text("done"),
@@ -4683,6 +4694,7 @@ async fn auto_approve_blocks_consolidate_memory_auto_write() {
         ModelRef::new("mock", "m"),
         6,
     )
+    .with_memory_root(Some(mem.clone()))
     .with_approver(Arc::new(leveler_execution::AutoApprove));
     let mut events = Vec::new();
     let _ = executor
@@ -4702,16 +4714,18 @@ async fn auto_approve_blocks_consolidate_memory_auto_write() {
                 is_error: true,
                 preview,
                 ..
-            } if name == "consolidate_memory"
+            } if name == "remember"
                 // Blocked, and the reason names the real cause: AutoApprove is
                 // a headless context, so nobody was asked. It must NOT claim
                 // the user refused (see `park_unattended_denial`).
-                && preview.contains("not permitted")
+                && preview.contains("nobody declined it")
                 && !preview.contains("denied by user")
         )),
         "expected an honest headless denial: {events:?}"
     );
-    // No durable write under AutoApprove.
+    // No durable write under AutoApprove. The proposal may be PARKED as a
+    // pending candidate — that is consent deferred, and `accept` is a separate
+    // user-authoritative step.
     if mem.join("active").exists() {
         let count = std::fs::read_dir(mem.join("active"))
             .map(|d| d.filter_map(|e| e.ok()).count())

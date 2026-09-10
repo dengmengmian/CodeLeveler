@@ -153,7 +153,7 @@ CodeLeveler 不试图拉平模型智能。
 | `leveler-provider` | provider 配置、模型目录、带重试的 HTTP transport、实现 `ModelRuntime` 的 `ProviderRegistry`。 |
 | `leveler-lifecycle` | 执行生命周期词汇：`SessionStatus`、`TaskOutcome`、`VerificationStatus`、`TurnOutcome`，以及 Coding workflow 类型。无内部依赖。 |
 
-这几个 crate 不得知道 coding、review、finding、仓库工作流、TUI、Web、CLI 或任何产品概念。`leveler-model` 目前知道——见 §18.6。
+这几个 crate 不得知道 coding、review、finding、仓库工作流、TUI、Web、CLI 或任何产品概念。`leveler-model` 以前知道——它带着一份 Coding 工具名表——现在不知道了（§18.6）；`crates/leveler-tools/tests/ownership_boundaries.rs` 是那根绊线。
 
 `leveler-lifecycle` 内部已经做好了切分：`runtime` 模块领域中立，`workflow` 模块放 Coding 词汇，且禁止 `runtime` 引用 `workflow`。
 
@@ -256,11 +256,17 @@ ReadFileTool      → WorkspaceReader
 GrepTool          → WorkspaceSearch
 ApplyPatchTool    → WorkspaceEditor
 RunCommandTool    → CommandExecution
-FindSymbolTool    → CodeIntelligence
+ShellCommandTool  → CommandExecution
+FindSymbolTool    → LspSessions
+GitStatusTool     → GitWorkflow
 BrowserClickTool  → BrowserRuntime
-ViewImageTool     → Media
-WebSearchTool     → Search provider
+ViewImageTool     → leveler_media::process_image
+MemoryTool        → MemoryStore
+McpTool           → McpClient
+WebSearchTool     → Search provider（仍在工具里；§18.3 G）
 ```
+
+箭头是**构造函数**，不是查找。每个工具只持有自己箭头左边那一个句柄，别的都拿不到——见 §5.5。
 
 ### 5.3 Capability 是职责边界，不一定是 crate
 
@@ -272,7 +278,20 @@ Capability != crate
 
 不要为了让图对称就去建 `leveler-workspace-search`、`leveler-workspace-editor`、`leveler-code-intelligence`。拆 crate 需要：两个真实消费者、真实的依赖倒置、独立的安全/运行时/协议边界，或者观察到的耦合缺陷。在第二个实现出现之前，优先用具体 struct 而不是 trait。
 
-五个里已经有三个是真的，而且就是字面意义上的三个具体 struct：`crates/leveler-tools/src/workspace/` 下的 `reader.rs`、`search.rs`、`editor.rs`，crate 私有，没有 trait、没有 registry、没有新 crate。`CommandExecution` 和 `CodeIntelligence` 仍然长在各自的工具里，见 §18.3 D 和 E。
+五个全部落地，而且就是字面意义上的具体 struct——没有 trait、没有 registry、没有新 crate：
+
+| 职责 | 落在哪 |
+| --- | --- |
+| `WorkspaceReader`、`WorkspaceSearch`、`WorkspaceEditor` | `crates/leveler-tools/src/workspace/`（crate 私有） |
+| `CommandExecution` | `crates/leveler-tools/src/tools/command_execution.rs` |
+| `CodeIntelligence` | `leveler_lsp::LspSessions`——拥有 `LspClient` 的那个 crate |
+| VCS | `leveler_vcs::GitWorkflow` |
+| Media | `leveler_media::process_image` |
+| Browser | `leveler_browser::BrowserRuntime` |
+| Memory | `leveler_memory::MemoryStore` |
+| MCP | `leveler_tools::mcp::McpClient` |
+
+`CommandExecution` 留在 `leveler-tools` 而没有下沉到 `leveler-execution`：它要从 `ToolContext` 上读这次调用的授权，并返回 `ToolOutput`，而位于工具层之下的 `leveler-execution` 不能依赖这两个类型。它是一个两个命令工具都被注入的模块，谁也不拥有谁——以前 `shell_command` 是 import `run_command` 的内部实现来跑自己的运行时的。
 
 ### 5.4 ToolHost 准入，Host Execution 执行
 
@@ -292,57 +311,68 @@ Coding 的 tool host 是 `crates/leveler-agent/src/executor/host.rs`。它是「
 
 `leveler-execution` 负责执行：文件系统强制、进程执行、沙箱、路径安全、宿主进程机制。
 
-`ToolRegistry`、`Tool` 实现、Capability 实现，都不得再开第三条权限或审批路径。今天 `ToolRegistry` 开了——见 §5.6。
+`ToolRegistry`、`Tool` 实现、Capability 实现，都不得再开第二条权限或审批路径。`ToolRegistry` 以前开了一条——read-only 覆盖层、zero-write-authority 拒绝、profile 硬禁止都在那里被重新判断了一遍，于是一个构建里有三个必须互相同意的授权 owner。三条现在都在 `resolve_policy` 里，`crates/leveler-tools/tests/ownership_boundaries.rs` 会在任何一条重新出现在 registry 时失败。
 
-### 5.5 ToolContext：现状与目标
+有一种宿主根本无法强制的授权，现在是明确拒绝而不是假装执行：MCP 工具是一个不受沙箱约束的独立进程，所以一次「禁网」的运行会拒绝它，而不是让它在一条到不了它的禁令下跑。同样的理由早就让 MCP 对被委派的子 agent 不可用——它也无法遵守子 agent 声明的写入范围。
 
-当前形状：
-
-```text
-ToolContext = ExecutionResources + ToolPolicy + ToolServices + session_scope
-```
-
-`ToolServices` 把 `lsp_sessions`、`lsp_start_locks`、`artifact_store`、`memory_root`、`background_tasks`、`browser` 写成结构体字段。每个工具都会收到全部，无论用不用。
-
-这让 `ToolContext` 同时是 service locator、策略容器、执行容器和会话能力容器。作为债务记录在 §18.2。
-
-目标：
+### 5.5 ToolContext
 
 ```text
-Tool 依赖显式注入。
-一个 Tool 只收到它需要的那个能力。
-每次调用的 context 只携带真正动态的调用状态，或宿主为这次调用签发的授权。
+ToolContext = ExecutionResources + ToolPolicy + session_scope
 ```
 
-**现在不要设计替代品。** 不要 `BetterToolContext`，不要 `ToolExecutionContextV2`，不要 `CapabilityContext`。目标是 `ToolContext` 作为能力抽离的**结果**自然缩小或消失，而不是先发明一个新容器。
+- `ExecutionResources`——这次调用所锚定的执行底座：写入范围要以其 root 解析的 workspace、进程 runner、回滚 checkpoint、读取指纹、工作区级命令闸门。进程级 `Arc`，整个 run（含子 agent）只有一份。
+- `ToolPolicy`——这次调用的授权：实时权限 profile、只读覆盖层、写入白名单与预算，以及 ToolHost 在准入时冻结的 `ResolvedExecutionPolicy`。
+- `session_scope`——这次调用属于哪个会话。
 
-### 5.6 ToolRegistry：现状与目标
+**它不携带任何 Capability 句柄。** 以前有第三个 facet `ToolServices`，装着语言服务器池、浏览器运行时、memory root、artifact store、后台任务注册表。每个工具都会拿到这六个：`read_file` 被递上了浏览器，`grep` 可以启动语言服务器。那就是 service locator，而 locator 对谁都会应答。
 
-今天 `ToolRegistry::execute` 依次做了：read-only 强制、zero-write-authority 强制、权限模式强制、参数归一化、JSON schema 校验、dispatch、以及集中的输出预算截断。模块还持有 observe-class 名单、read-only 子集、MCP 过滤、`core`/`full` 组合和 `expand_tool_category`。
+现在每个工具在构造时只拿它真正使用的句柄：
 
-这是一个挂着 registry 名字的策略引擎。
+| Tool | 构造时注入 |
+| --- | --- |
+| `find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` | `leveler_lsp::LspSessions` |
+| `run_command`、`shell_command` | 共享的 `CommandExecution` |
+| `get_task`、`wait_task`、`kill_task` | `BackgroundTaskRegistry` |
+| `memory`、`remember`、`forget` | memory store root |
+| `browser_*` | `leveler_browser::BrowserRuntime` |
+| 核心读/搜/编辑工具、`git_*`、`view_image`、`load_skill`、`web_*` | 除 context 外什么都不要 |
 
-目标：
+这些句柄以 `leveler_tools::Capabilities` 的形式交给组装方，由组装根持有、被 `model_surface` 消费一次。一个与某能力无关的工具，没有任何途径能拿到它；`crates/leveler-tools/tests/ownership_boundaries.rs` 会在句柄重新出现在 context 上时失败。
+
+有两个 **Runtime 自己需要**的事实也搬回了 Runtime，而不是搭在某个工具的句柄上：executor 自己持有它用于每轮记忆召回、以及在无人审批时寄存 `remember` 的 memory root；`ExecutorFactory` 自己持有 engine 在终态清算时回收后台进程用的注册表。
+
+**反增长规则。** 不允许新增顶层字段，而且一个新能力根本不是候选——它去构造那些使用它的工具。能住在这里的只有「本次调用的授权」或「本次调用的身份」，并且必须在评审里说出它的 owner。
+
+### 5.6 ToolRegistry
 
 ```text
 ToolRegistry
     register
     lookup
     definitions
+    normalize_input
     schema 校验
-    适配器 dispatch
+    dispatch
+    唯一的结果上限
 ```
 
-其余各归其位：
+`ToolRegistry::execute` 做四件事：归一化参数、按工具的 JSON Schema 校验、dispatch、截断结果。它不判断这次调用是否可以发生——那由「持有 `AdmittedCall`」来证明，而只有 ToolHost 能产出它。
 
-| 关注点 | 目标 Owner |
+参数处理留在这里，而这不是 policy：JSON 与 schema 校验、字段别名、路径语法归一化、历史兼容别名、精确的非法参数报错，都是机械处理。Registry 永远不许做的是：猜一个畸形调用的意图、替换成另一个工具、改变调用的语义。
+
+结果上限是机械的运行时保证，不是调用方可以谈判的预算：每一次 dispatch 都被截到该模型的结果预算，工具不能豁免，而且这样的上限只有一个。某个 Capability 仍可以有自己的**内在**上限——`run_command` 会把超长输出溢写到 artifact store 并回传一个恢复定位串——这两者是不同的东西：内在上限说的是这个能力能产出什么，中央上限说的是模型上下文装得下什么。
+
+搬走了什么，搬去了哪：
+
+| 关注点 | 现在的 Owner |
 | --- | --- |
-| 工具选择、work profile、只读集合、动态能力选择 | Harness |
-| 权限、审批 | ToolHost |
-| ownership、写入范围 | ToolHost / runtime |
-| 结果预算 | Harness / runtime 结果处理 |
+| 只读覆盖层、profile 硬禁止、zero-write-authority 拒绝 | ToolHost（`resolve_policy`） |
+| 到底有哪些工具存在 | Harness 组装根 |
+| Capability 句柄 | 每个工具，在构造时 |
+| Harness 控制 | `leveler_agent::register_harness_controls` |
 
-不要让 Registry 再变回策略引擎。
+不要让 Registry 再变回策略引擎。`crates/leveler-tools/tests/ownership_boundaries.rs` 是那根绊线。
 
 ### 5.7 工具分层图
 
@@ -392,7 +422,7 @@ ToolRegistry
 └──────────────────────────────────────────────────┘
 ```
 
-右边那一列 Harness 控制工具**在代码里已经是分开的**：它们住在 `crates/leveler-agent/src/injected_tools.rs`，不在 registry 里。`update_plan` 是例外，它和能力适配器一起待在 `leveler-tools`。见 §18.5。
+右边那一列 Harness 控制工具在代码里是分开的：它们住在 `crates/leveler-agent`，不在 tool crate 里。其中七个在循环内部由注入的 `ToolDefinition` 回答（`injected_tools.rs`）；`update_plan` 是一个注册的 `Tool`（`update_plan.rs`），因为它有真实结果要渲染，由 `register_harness_controls` 在能力 pack 之后放上工具面。它复用 registry 那唯一一条机械接缝——归一化、schema 校验、dispatch、结果封顶——而不是重新实现一遍。
 
 ---
 
@@ -443,27 +473,27 @@ EXTENSIONS           已配置 MCP server 的工具
 
 | 集合 | 数量 |
 | --- | --- |
-| `core_surface()` | 12 |
-| `model_surface(CapabilityPacks::ALL)` = core + 26 | 38 |
-| 执行器注入的 Harness 控制工具 | 1–7，按条件 |
+| `core_surface(&capabilities)` | 11 |
+| `model_surface(CapabilityPacks::ALL, &capabilities)` = core + 26 | 37 |
+| Harness 控制（`update_plan` + 1–7 个注入，按条件） | 2–8 |
 | MCP 扩展 | 按配置 |
 
-每个 pack 的开关都是一个**机械事实**，绝不是对任务或模型的判断：
+一个 pack 只有在「产品模式启用了它」**且**「这台宿主能提供它」时才到模型面前（§6.4）。两个答案都绝不关于任务或模型：
 
-| Pack | 工具 | 条件 |
-| --- | --- | --- |
-| Code Intelligence | `find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` | 非 Economy 时开 |
-| VCS | `git_status`、`git_diff` | 非 Economy 时开 |
-| Web fetch | `web_fetch` | 非 Economy 时开 |
-| Web search | `web_search` | 设置了 `LEVELER_SEARCH_API_KEY`——没有这个 key 工具必然拒绝 |
-| Media | `view_image` | 模型 profile 声明了 `vision` |
-| Memory | `memory`、`remember`、`forget` | 非 Economy 时开 |
-| Skills | `load_skill` | 非 Economy 时开 |
-| Browser | `browser_*`（12 个） | `PATH` 上有 Node——没有它 driver 根本起不来 |
+| Pack | 工具 | AVAILABLE 条件 | ENABLED 条件 |
+| --- | --- | --- | --- |
+| Code Intelligence | `find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` | 恒真——扫描 fallback 不需要装任何东西 | 非 Economy |
+| VCS | `git_status`、`git_diff` | `PATH` 上有 `git` | 非 Economy |
+| Web fetch | `web_fetch` | 恒真 | 非 Economy |
+| Web search | `web_search` | 设置了 `LEVELER_SEARCH_API_KEY`——没有 key 工具必然拒绝 | 非 Economy |
+| Media | `view_image` | 模型 profile 声明了 `vision` | 非 Economy |
+| Memory | `memory`、`remember`、`forget` | 恒真——app 会把 store root 交给工具 | 非 Economy |
+| Skills | `load_skill` | 恒真 | 非 Economy |
+| Browser | `browser_*`（12 个） | `PATH` 上有 Node——没有它 driver 根本起不来 | 非 Economy |
 
-`WorkProfile::Economy` 组合出 `CapabilityPacks::NONE`：只有原语和协议。这是用户对成本的决定，不是对任务难度的推断。
+`WorkProfile::Economy` 启用 `CapabilityPacks::NONE`：只有原语和协议。这是用户对成本的决定，不是对任务难度的推断——而且**无论这台机器多强都成立**。一台装了浏览器运行时、配了搜索 key、用着视觉模型的笔记本，Economy 回合看到的仍然是 11 个原语加控制。
 
-**一个值得点名的缺陷。** 交互回合读的是 `Application` 的默认 work profile，而不是 session 行（`crates/leveler-app/src/session.rs` 的 `run_in_session_with_content`），所以在 TUI 里 `/work-mode economy` 并不会缩小下一个交互回合的工具面——eval 和 resume 会，因为它们读的是行。一个持久事实两个读取方，权威在行。这次没修。
+**「机器支持」不再等于「暴露给模型」。** 两个答案是两个输入不同的函数，交集是它们唯一能到达模型的方式：`Application::capability_availability`（机械事实）、`Application::capability_selection`（产品选择）、`CapabilityPacks::intersect`。
 
 ### 6.3 核心原语基座（Core Primitive Foundation）
 
@@ -487,7 +517,9 @@ read    ls    find    grep    edit    write    bash
 
 「整文件写入」和「局部编辑」是两个不同的模型意图——新建或有意替换整个文件，对改动文件的一部分——所以两个都是原语。这个区分是稳定的，与「模型能不能造出 patch」无关。
 
-`core_registry()` 和 `full_registry()` 曾经是这个问题的历史答案，而且两者并不是同一个集合。它们已经没了：现在的组合是 `core_surface()` 加显式的 `CapabilityPacks`（§6.2），所以「原语基线」和「模型可见工具面」是分开陈述的，谁也不从谁推导。
+`core_registry()` 和 `full_registry()` 曾经是这个问题的历史答案，而且两者并不是同一个集合。它们已经没了：现在的组合是 `core_surface(&capabilities)` 加显式的 `CapabilityPacks`（§6.2），所以「原语基线」和「模型可见工具面」是分开陈述的，谁也不从谁推导。
+
+`get_task` / `wait_task` / `kill_task` 也在 core surface 里，但不是第八个原语：`run_command` 能起后台任务，而一个调用方既看不见也停不掉的任务就是孤儿——它们是那个原语的生命周期。core surface 里没有任何 Harness 控制——控制不是宿主可以关掉的能力，所以由 `leveler_agent::register_harness_controls` 单独加上（§18.5）。
 
 ### 6.3.1 五个类别
 
@@ -516,11 +548,13 @@ report_finding                        子 Agent 回合
 update_goal                           goal 模式
 ```
 
-`update_plan` 属于这一类，但仍注册在 `leveler-tools` 里，见 §18.5。
+`update_plan` 属于这一类，也注册在这一类（`leveler-agent`），见 §18.5。
 
-**EXTENSIONS**——MCP 发现的工具，从已配置的 server 注册，并对被委派的子 Agent 过滤掉。
+**EXTENSIONS**——MCP 发现的工具，从已配置的 server 注册。这是**唯一**的扩展边界，而且刻意是一条进程边界：MCP server 跑在自己的进程里、用 stdio 上的 JSON-RPC 说话，只以 `McpTool` 适配器的形式到模型面前，并且像任何其他调用一样要过 ToolHost 准入。没有原生插件 SDK，也不打算有——第三方进程内插件就是「跑在 runtime 里、拥有 runtime 权限的代码」，那正是准入机制存在的理由。
 
-**RUNTIME OR USER ONLY**——实现保留，但刻意不作为普通 coding 顺手工具暴露：
+这条边界的代价，直说：MCP server 在 OS 沙箱之外、在任何 claimed write scope 之外，所以有两种授权无法对它强制，而这两种情况下调用都是**拒绝**而不是在一条到不了它的授权下执行——被委派的 agent 完全不能用 MCP，禁网的运行也不能。在受限 profile 下每次 MCP 调用都需要审批；长期信任只能来自权限规则，绝不来自配置默认值。
+
+**根本不是模型工具**——这些实现过、W1 把它们从工具面移除、这一轮删掉了。一个没被注册的 `Tool` 实现就是一个等着被重新注册的第二答案：
 
 ```text
 create_checkpoint / restore_checkpoint   运行时本来就在每次写入前 checkpoint，
@@ -537,9 +571,24 @@ create_skill                             系统定制：技能由用户创建，
 Harness 决定这个产品有哪些工具。
 ```
 
-它根据 work profile、任务类型、已配置的能力和模型 profile 来决定。Kernel 对此一无所知。
+三个必须分开的问题：
 
-`expand_tools` 把这个 ownership 反了过来，现在已删除。架构上的反对本来就站得住；而实现层面它其实从来没有真正工作过（§6.5）。
+```text
+AVAILABLE   这台机器到底能不能提供这个能力？
+            装了浏览器运行时、配了搜索 key、PATH 上有 git、模型能读图
+
+ENABLED     当前产品模式 / session 是不是要它？
+
+EXPOSED     模型真正看到什么 = ENABLED ∩ AVAILABLE
+```
+
+「可用」本身什么也不买。`Economy` 不启用任何可选 pack，所以一台装了浏览器运行时的机器，在普通 Economy 回合里看到的浏览器工具是零个。反过来也一样：要一个这台机器做不到的能力也什么都不买——没有搜索 key 的宿主不会暴露 `web_search`，无论产品模式多想要。
+
+两边都不能放大另一边，这才让交集是一条**边界**而不是一句建议（`crates/leveler-tools/tests/capability_composition.rs`）。
+
+代码里：`Application::capability_availability` 只用机械事实回答第一个问题，`Application::capability_selection` 用 work profile 回答第二个，`CapabilityPacks::intersect` 产出第三个，`model_surface(packs, &capabilities)` 在回合开始前组合一次。之后 `register_harness_controls` 加上控制——控制不是宿主可以关掉的能力。
+
+三者都不查模型能力，也不查任务难度（§1.1）。`expand_tools` 把这个 ownership 反了过来，现在已删除；架构上的反对本来就站得住，而实现层面它其实从来没有真正工作过（§6.5）。
 
 ### 6.5 工具面价值是 Eval 决策，不是审美决策
 
@@ -936,12 +985,18 @@ Foundation 不要求所有 Harness 使用同一套工具管路。
 
 Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `leveler-model`，不带产品词汇，`ToolRuntime` 只有两个方法，Review harness 可以用自己的方式实现。`AgentHarness` 已经被真实 harness 实现过。
 
+现在过了、以前没过的：
+
+- `leveler-model` 已经不知道任何 Coding 工具名（§18.6），Review 的工具集除了协议什么都不继承。
+- 组装一个工具面不再需要 Coding 的任何工具管路：想要自己工具的 harness 就注册自己的，而 `register_harness_controls` 展示了形状——harness 在宿主组合出的能力之上，加上「操纵自己」的那部分。
+
 还没过的：
 
-- Review harness 若想要持久化、resume、事件顺序和恢复，就得走 `leveler-engine`，而它依赖 `leveler-agent`，公开 API 里还有 `CodingTaskSpec`（§18.1）。
-- `leveler-model` 知道 Coding 内置工具的名字和执行分类，所以 Review 的工具集会继承一套为 Coding 写的词汇（§18.6）。
+- Review harness 若想要持久化、resume、事件顺序和恢复，就得走 `leveler-engine`，而它依赖 `leveler-agent`，公开 API 里还有 `CodingTaskSpec`（§18.1）。这就是剩下的全部，也就是 W3。
 
-这两条都不强制 kernel 变更，所以结论是「尚未强制成立」，不是「失败」。
+它不强制 kernel 变更，所以结论是「尚未强制成立」，不是「失败」。
+
+**没有写第二个 Harness。** 这里没有任何一条是靠真的建一个来证明的；为了验证设计而造一个 demo harness 会是假消费者（§5.3）。这里主张的只是「Foundation 不再要求 Coding 的工具管路」，不是「第二个 harness 已经存在」。
 
 **不要为了把这个结论改成 PASS，在一次文档变更里去动代码。**
 
@@ -963,21 +1018,17 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 **风险。** 中。`ExecutorFactory` 被刻意设计成执行配置的唯一推导入口；拆得不好会把它当初要消除的「多份推导」bug 放回来。
 
-### 18.2 ToolContext 是通用 service locator
+### 18.2 ToolContext 曾是通用 service locator（已关闭）
 
-**当前。** 每个工具都收到 `ExecutionResources + ToolPolicy + ToolServices + session_scope`，其中 `ToolServices` 把 `lsp_sessions`、`lsp_start_locks`、`artifact_store`、`memory_root`、`background_tasks`、`browser` 列为字段。
+**曾经。** 每个工具都收到 `ExecutionResources + ToolPolicy + ToolServices + session_scope`，`ToolServices` 把 `lsp_sessions`、`lsp_start_locks`、`artifact_store`、`memory_root`、`background_tasks`、`browser` 写成字段。
 
-**期望。** 显式依赖注入；工具只收到它需要的能力；每次调用的 context 只带动态调用状态或宿主签发的授权。
+**现在。** `ToolServices` 已删除。每个工具在构造时拿到它使用的句柄；`ToolContext` 只携带执行底座、这次调用的授权和会话身份。形状与逐工具对照表见 §5.5，绊线见 `crates/leveler-tools/tests/ownership_boundaries.rs`。
 
-**为什么违宪。** 工具拥有了本不该有的服务发现能力，而一个完全用不上这些的 Review 专属工具仍然得接下整个形状。
-
-**最小修正。** 让它作为能力抽离的结果自然缩小。不要先设计替代容器。
-
-**风险。** 跟在抽离之后做，低；抢在抽离之前发明一个 `V2` 容器，高。
+**仍然开放。** `ExecutionResources` 还是一个共享 facet——workspace、runner、environment、checkpoint、读取指纹、命令闸门。它们是「一次调用所锚定的底座」而不是「工具去发现的服务」，而且写入范围要以 workspace root 解析，所以原地保留。runner 和命令闸门是否应该只到命令工具手里，是一个真实但更小的问题；无论怎么答，它都不是 service locator。
 
 ### 18.3 具体工具实现债务
 
-以下每一条，都是工具在自己实现本应调用的能力行为。A–C 和 H 已由核心原语基座这轮工作关闭，条目保留下来写明实际做了什么、以及各自还剩什么；D–G 仍然开着。
+以下每一条，都是工具在自己实现本应调用的能力行为。A–C 和 H 由核心原语基座那轮关闭；D、E、F 这一轮关闭；G 是**主动决定**不做，不是漏了。每条都保留，写明实际做了什么以及各自还剩什么。
 
 #### A. `read_file` 仍然承担 stale-write 观测（大部分已关闭）
 
@@ -1013,39 +1064,37 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 代码本身没变——它本来就是共享提交路径，只是住在 `replace` 工具里，于是共享 runtime 被以它的一个调用方命名。这次只搬了 Owner。
 
-#### D. `run_command` 拥有了命令执行的大部分
+#### D. 命令执行只有一个 Owner（已关闭）
 
-`run_command` 目前承担沙箱、环境、网络策略、后台进程、快照、mutation 记账、写入范围、回滚、命令闸门、进程生命周期，以及自 `6724268` 起，把 HEAD 移动所解释的路径从「这次运行写了什么」里减去。
+`run_command` 曾经承担沙箱、环境、网络策略、后台进程、快照、mutation 记账、写入范围、回滚、命令闸门、进程生命周期——而 `shell_command` 是 import `run_command::execute_program` 来跑自己的运行时的，于是一个工具看起来像另一个工具的 owner。
 
-**目标。** `RunCommandTool` 和 `ShellCommandTool` 是 `CommandExecution` 能力之上的适配器，该能力再调用 `leveler-execution`。
+那个运行时现在是 `crates/leveler-tools/src/tools/command_execution.rs`。两个工具都被注入它，谁也不拥有它。各自只留自己的模型接口：`run_command` 解码 argv 并说出那两句「你要的其实是另一个工具」的拒绝，`shell_command` 把 shell 行映射到平台 shell 并跑 hang 守卫。
 
-**风险。** 中。取消与进程树终止语义不得改变。
+**仍然开放。** 这个模块住在 `leveler-tools` 而不是 `leveler-execution`：它要从 `ToolContext` 读这次调用的授权、并返回 `ToolOutput`——工具层之下的那一层不能依赖这两个类型。要再往下搬，授权和结果形状得跟着搬，那是比这一条大得多的问题。
 
-#### E. Code Intelligence 的生命周期住在工具里
+**`shell_command` 没有 `background=true`，这是主动决定。** 机械上它可以有：shell 行就是 `program + args`，而 `proven_executed_commands` 早就能归因一段 shell 脚本。坏掉的是生命周期保证。`run_command(background=true)` 注册的是**那个长期进程本身**，所以 `kill_task` 和会话回收真的杀得掉。而一个 detach 的 shell 可以在 spawn 完自己的子进程后立刻退出——`shell_command(cmd="python app.py &")`——注册表手上就剩一个报告 `Exited` 的任务，真进程还在跑，且无法回收。这个不对称不是外观问题；现有守卫已经把模型指向生命周期诚实的那个工具。
 
-`find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` 各自包含 LSP 发现、会话生命周期、启动和回退扫描。
+#### E. Code Intelligence 只有一个 Owner（已关闭）
 
-**目标。** 一个 `CodeIntelligence` 能力统一拥有 LSP 生命周期、符号查询、引用、诊断和确定性回退。工具只做面向模型的调用。
+`find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` 各自包含 LSP 发现、会话生命周期和启动——而 `find_symbol` 还带着一份 `symbols.rs` 里已经有的 locate 逻辑的副本。其中三个还各带一份**不同的**源码遍历：一个按 `repo_map::is_source`，两个按一份更短的硬编码扩展名列表，于是同一个仓库有两种「什么算源码」。
 
-**风险。** 低到中。
+现在 `leveler_lsp::LspSessions` 拥有会话池、启动、死服务驱逐和 `locate`，五个工具全部在构造时被注入它。源码遍历是 `tools/symbols.rs` 里的一个函数。
 
-#### F. `view_image` 重复实现了 `leveler-media`，而且更弱
+**无依赖回退保留，并且保持标注。** 没装语言服务器时，`find_symbol` 和 `read_symbol` 用扫描回答，结果写 `(via scan)`，而精确答案写 `(via rust-analyzer)`。它们回答的是一个**更弱**的问题——哪些文件定义了这个名字，而不是定义在哪一行——把这一点说出来正是重点。错的是「把回退伪装成服务器的答案」；`LspSessions::locate` 返回 `None` 的意思只是「没有语言服务器的答案」，不多也不少。
 
-`view_image` 根据扩展名判断 MIME，读字节，base64 编码。`leveler-media` 从内容判定真实 MIME，对解码分配和像素数设上限以防解压炸弹，通过重新编码剥离 EXIF，对超大图降采样，并做内容寻址存储。
+#### F. `view_image` 重复实现且弱化了 `leveler-media`（已关闭）
 
-`leveler-tools` 根本不依赖 `leveler-media`，而 `leveler-media` 唯一的消费者是 `leveler-app`。也就是说：用户附件路径是加固的，面向模型的工具路径不是。
+`view_image` 过去根据文件**扩展名**判断 MIME，读字节，base64 编码：没有内容嗅探、没有像素上限、没有剥 EXIF。于是一个叫 `.png` 的 JPEG 会被当成 `image/png` 报给 provider，一枚解压炸弹只被 5 MB 的字节上限挡着，一张照片的 GPS 标签就跟着发出去了。而 `leveler-media`——当时唯一的消费者是用户附件路径——三件事全做。
 
-**目标。** `ViewImageTool → Media 能力`。
+现在这条流水线是一个函数 `leveler_media::process_image`：内容判定真实类型、解码器分配之前先设字节与像素上限、按最长边降采样、重编码为 PNG。`MediaStore::import_bytes` 调它然后哈希入库；`view_image` 调它然后 base64。为此 `leveler-tools` 新增了对 `leveler-media` 的依赖，方向是对的：工具层调用能力。
 
-**风险。** 低。这一条已经接近纯缺陷。
+#### G. `web_search` 拥有 provider 配置（开放，主动决定）
 
-#### G. `web_search` 拥有 provider 配置
+工具自己从环境快照读 `LEVELER_SEARCH_API_KEY`、`LEVELER_SEARCH_PROVIDER`、`LEVELER_SEARCH_CX`，自己建 HTTP 客户端，并且自己实现了 Bing 和 Google Custom Search 两套请求与响应形状。
 
-工具自己从环境读 `LEVELER_SEARCH_API_KEY`、`LEVELER_SEARCH_PROVIDER`、`LEVELER_SEARCH_CX`，自己建 HTTP 客户端，并且自己实现了 Bing 和 Google Custom Search 两套请求与响应形状。
+**故意留着。** 只有一个调用方、两套 provider 形状只写在一处、也没有第二个搜索能力的消费者。现在抽一个 `SearchProvider` 出来，就是一个只有一个实现、一个使用者的 wrapper——正是 §5.3 存在的目的所要拦的东西。这次审计在这里没有发现重复运行时，也没有发现 Host Authority 绕过：工具和其他调用一样过准入，SSRF 闸门与 `web_fetch` 共用。
 
-**目标。** `WebSearchTool → Search 能力 / provider`。工具不知道 provider 凭据和配置。
-
-**风险。** 低。
+等出现第二个消费者、或者必须加第二套 provider 形状时再抽。
 
 #### H. 后台结算归运行时（已关闭）
 
@@ -1067,27 +1116,29 @@ dev-server 安全不变：恢复仍然只在显式白名单下发生，所以默
 
 **风险。** 低到中。Sidecar 存活期已经和 daemon 关停时的 reaping 缠在一起。
 
-### 18.5 `update_plan` 和能力适配器待在一起
+### 18.5 `update_plan` 曾和能力适配器待在一起（已关闭）
 
-`update_plan` 是一个 Harness 控制——它不携带任何能力，不碰 `ToolContext` 的任何字段，存在的唯一理由是 Coding harness 有一套计划协议。另外七个控制工具住在 `crates/leveler-agent/src/injected_tools.rs`，只有这一个注册在 `leveler-tools` 里。
+`update_plan` 是一个 Harness 控制：它不携带任何能力，不碰任何能力句柄，存在的唯一理由是 Coding harness 有一套计划协议。另外七个控制住在 `leveler-agent`，而它当时和能力适配器一起注册在 `leveler-tools`。
 
-**W1 为什么没搬。** 注入路径完全绕开 registry，所以搬它意味着为一个工具手写重实现四项 registry 服务：`normalize_input`（它修复模型会发出的嵌套信封形状）、JSON-Schema 校验、`schemars` 生成的 schema、输出封顶。还得重接 metadata→`PlanUpdated` 这条路，因为注入分支直接构造工具结果，从不产出给 `extract_plan` 读的 metadata。
+**W1 为什么没搬。** 注入路径完全绕开 registry，所以当时搬它意味着为一个工具手写重实现四项 registry 服务：`normalize_input`（它修复模型会发出的嵌套信封形状）、JSON-Schema 校验、`schemars` 生成的 schema、输出封顶。
 
-这不是「保留错误 Owner」的理由，而是「这次搬家应该排在 registry 不再拥有策略之后」的信号。**W2 blocker。**
+**搬了什么。** 它现在是 `crates/leveler-agent/src/update_plan.rs`，由 `register_harness_controls` 在能力 pack 之后放到工具面上。它仍然是一个注册的 `Tool`，没有变成第八个注入定义——因为 registry 现在是机械接缝而不是策略引擎，复用它一分钱不花，而重实现要花四份重复服务。校验、生成的 schema、dispatch、结果封顶都是 registry 的；`metadata.plan` → `PlanUpdated` 那条路没有变。
 
-### 18.6 `leveler-model` 知道 Coding 工具名
+`core_surface` 不再注册任何控制，harness 也不注册任何能力。`leveler-tools` 组合「宿主能做什么」，`leveler-agent` 组合「什么在操纵 harness」。
 
-**当前。** `crates/leveler-model/src/tool_catalog.rs` 硬编码了 `grep`、`find_files`、`find_symbol`、`read_symbol`、`find_references`、`list_files`、`read_file`、`git_status`、`git_diff`、`view_image`、`web_search`、`web_fetch`、`apply_patch`、`replace`、`run_command`、`shell_command`，并由此推导执行分类（`Search` / `Read` / `Write`）、replay 安全性、主参数和 observe key。
+### 18.6 `leveler-model` 曾知道 Coding 工具名（靠删除关闭）
 
-它的真实消费者是 `leveler-agent`（observe key）、`leveler-client-protocol`（safe-replay 判定）和 `leveler-tui`（展示）。crate 注释把动机说得很清楚：「执行策略不应在多个 crate 之间重复名单和参数字段猜测。」动机成立，位置不成立。
+**曾经。** `crates/leveler-model/src/tool_catalog.rs` 硬编码了 `grep`、`find_files`、`find_symbol`、`read_symbol`、`find_references`、`list_files`、`read_file`、`git_status`、`git_diff`、`view_image`、`web_search`、`web_fetch`、`apply_patch`、`replace`、`run_command`、`shell_command`，并由此推导执行分类、replay 安全性、主参数和 observe key。它里面还留着 `replace`——那个工具早就被删了——正是「一份名单的第二副本」必然的失效方式。
 
-**期望。** `leveler-model` 只知道 `ToolDefinition`、`ToolCall`、`ToolResult`、`ToolChoice`。内置 Coding 工具的元数据属于 harness，或属于拥有这些工具的 tool composition。
+**怎么关的。** 靠删，不是靠搬。审计发现这份 catalog 几乎没有活着的消费者：
 
-**为什么违宪。** 直接违反规则 1。一个 Foundation 原语在枚举产品工具，于是每一个建在 `leveler-model` 上的 harness 都继承了一套 Coding 词汇。
+| 导出 | 消费者 | 处置 |
+| --- | --- | --- |
+| `is_safe_replay_tool` | `leveler_client_protocol::recovery_for_tool` | `recovery_for_tool` 和它的 `Recovery` enum 本身就是死代码——只被 re-export，从未被调用。两个一起删。活着的答案是 `Tool::replay_is_side_effect_free`，registry 去问它，未知名字答 `false`。 |
+| `builtin_tool_metadata(…).primary_argument` | `leveler-tui` 的 `find_files` 标签 | 内联成 `s("pattern")`，就放在同一个 match 里另外四十个工具标签旁边。展示元数据属于客户端（§5.2）。 |
+| `is_search_tool`、`builtin_observe_key`、`BuiltinToolClass` | 无 | 删除。 |
 
-**最小修正。** 把 catalog 移到拥有该工具集的那一层，并给三个消费者一条不经 Foundation 原语的取用路径。另外注意，导出的 `is_search_tool` 在 crate 之外没有调用者。
-
-**风险。** 中。三个跨层消费者目前共享这一份；替代方案不能变成三份同样的名单。
+所以任何地方都不存在第二份名单——也不存在一份「搬过去的」。`crates/leveler-tools/tests/ownership_boundaries.rs` 会在 Coding 工具名重新出现在 `leveler-model` 的生产代码里时失败。
 
 ### 18.7 `ToolOutput.metadata` 是无类型内部侧信道
 
@@ -1198,17 +1249,24 @@ MODEL_CAPABILITY_POLICY_DEFINED   YES
 WEAK_MODEL_COMPENSATION_GOAL      REMOVED
 CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
-TOOL_IMPLEMENTATION_ALIGNED       NO
+TOOL_IMPLEMENTATION_ALIGNED       YES
 ENGINE_IMPLEMENTATION_ALIGNED     NO
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
 TOOL_SURFACE_CLOSED               YES
+CAPABILITY_MODEL_CLOSED           YES
+AVAILABLE_ENABLED_EXPOSED         SEPARATED
 PLAN_ENFORCEMENT                  REMOVED
 EDIT_MATCHING                     EXACT
-TOOLREGISTRY_CLOSED               NO
-TOOLCONTEXT_CLOSED                NO
+TOOLREGISTRY_CLOSED               YES
+TOOLCONTEXT_CLOSED                YES
+FOUNDATION_TOOL_NAME_LEAKAGE      NONE
+WORK_PROFILE_AUTHORITY            SESSION_ROW
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
+SECOND_HARNESS_WRITTEN            NO
 FOUNDATION_FROZEN                 NO
 ```
 
-架构、工具边界和模型可见的工具面都已经定了，七个核心原语也按它实现了。`ToolContext`、`ToolRegistry` 和 Engine 还没对齐，§18 写明了差在哪里。没有为了让这张表里任何一行好看而修改源码。
+架构、工具边界和模型可见的工具面都已经定了；七个核心原语、能力 ownership 和组合方式也按它实现了。剩下的是 Engine：它仍然点名 `leveler_agent` 和 `CodingTaskSpec`（§18.1），而这也是 `SECOND_HARNESS_TEST` 还没强制成立的唯一原因。
+
+有四行从 NO 变成 YES，是因为代码变了而不是措辞变了：`ToolServices` 已删除、registry 不再做任何授权判断、`leveler-model` 不含任何工具名、一个回合的 work profile 来自 session 行。每一条都在自己那节里点了绊线的名字。没有为了让这张表里任何一行好看而修改源码。

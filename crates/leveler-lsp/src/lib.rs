@@ -8,7 +8,9 @@
 pub mod client;
 pub mod codec;
 pub mod registry;
+pub mod sessions;
 
 pub use client::{Diagnostic, LspClient, LspError, SymbolInfo, SymbolLocation, SymbolSpan};
 pub use codec::{FrameReader, encode};
 pub use registry::{ServerSpec, server_available, server_available_with_environment, server_for};
+pub use sessions::{Located, LspSessions};

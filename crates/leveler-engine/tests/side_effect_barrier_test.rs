@@ -29,7 +29,16 @@ use leveler_model::{
 use leveler_storage::{
     Database, EventRecord, EventStore, SessionRecord, SessionRepository, StorageError,
 };
-use leveler_tools::{ToolContext, default_registry};
+use leveler_tools::ToolContext;
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
 
 // ---------------------------------------------------------------------------
 // Scripted model runtime (same shape as direct_test.rs).
@@ -155,6 +164,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         commit_co_author: true,
         overrides: None,
         memory_index: String::new(),
+        memory_root: None,
+        background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
         permission_rules: leveler_execution::PermissionRuleSet::default(),
         permission_rules_path: None,
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),

@@ -668,7 +668,7 @@ rules:
 
     #[test]
     fn always_rules_memory_writes_never_get_standing_permission() {
-        for tool in ["remember", "forget", "consolidate_memory"] {
+        for tool in ["remember", "forget"] {
             assert!(
                 always_rules_for(tool, None, &["notes.md".to_string()]).is_empty(),
                 "K36: {tool} must not derive durable rules"

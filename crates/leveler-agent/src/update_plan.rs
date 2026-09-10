@@ -1,7 +1,19 @@
 //! `update_plan` — a lightweight TODO/checklist the model maintains across a
-//! long task. No side effects: it only
-//! records the plan and echoes it back, so the plan is durable, visible to the
-//! user, and part of the run's evidence rather than only of the transcript.
+//! long task. No side effects: it only records the plan and echoes it back, so
+//! the plan is durable, visible to the user, and part of the run's evidence
+//! rather than only of the transcript.
+//!
+//! A HARNESS CONTROL, not a capability: it touches nothing outside the harness
+//! that renders and persists the plan, which is why it lives here with
+//! `update_goal`, `request_user_input`, `request_permissions`, `spawn_agent`,
+//! `claim_write_scope` and `report_finding` rather than in the tool crate.
+//!
+//! It is still a `Tool`, registered by [`register_harness_controls`], so it
+//! reuses the registry's ONE mechanical seam — argument normalization, JSON
+//! Schema validation, the derived schema, dispatch, the result cap. The other
+//! controls are answered inside the loop from an injected `ToolDefinition`;
+//! this one has a real result to render, and duplicating the validation
+//! machinery to inject it would be the worse trade.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -10,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use leveler_tools::tools::{parse_input, schema_of};
+use leveler_tools::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +48,14 @@ struct Args {
     explanation: Option<String>,
     /// The ordered plan items. At most one may be `in_progress`.
     plan: Vec<PlanItem>,
+}
+
+/// Register the harness controls that are dispatched as tools.
+///
+/// Called by the composition root AFTER [`leveler_tools::model_surface`], so a
+/// control is never mistaken for a capability the host could turn off.
+pub fn register_harness_controls(registry: &mut ToolRegistry) {
+    registry.register(std::sync::Arc::new(UpdatePlanTool));
 }
 
 pub struct UpdatePlanTool;
@@ -67,7 +88,7 @@ impl Tool for UpdatePlanTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<Args>()
+        schema_of::<Args>()
     }
 
     fn normalize_input(&self, input: serde_json::Value) -> serde_json::Value {
@@ -84,7 +105,7 @@ impl Tool for UpdatePlanTool {
         _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let args: Args = super::parse_input(self.name(), input)?;
+        let args: Args = parse_input(self.name(), input)?;
 
         let in_progress = args
             .plan
@@ -166,8 +187,16 @@ fn normalize_nested_envelope(input: serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    /// A context over a scratch workspace. `update_plan` reads and writes no
+    /// file, so the workspace only has to have EXISTED: the directory is
+    /// removed as this returns, and nothing in the tool notices.
     fn ctx() -> ToolContext {
-        super::super::test_ctx(leveler_execution::PermissionProfile::RequestApproval, &[]).0
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = leveler_execution::Workspace::new(dir.path()).unwrap();
+        ToolContext::new(
+            workspace,
+            leveler_execution::PermissionProfile::RequestApproval,
+        )
     }
 
     #[tokio::test]
@@ -228,5 +257,72 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("in_progress"));
+    }
+}
+
+/// The control still goes through the registry's ONE mechanical seam:
+/// normalization, then schema validation, then dispatch. These used to live
+/// in the tool crate's registry tests; they moved with the tool, and they
+/// prove the seam is reused rather than reimplemented here.
+#[cfg(test)]
+mod registry_dispatch_tests {
+    use super::*;
+
+    /// Same scratch workspace as the tool tests above.
+    fn ctx() -> ToolContext {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = leveler_execution::Workspace::new(dir.path()).unwrap();
+        ToolContext::new(
+            workspace,
+            leveler_execution::PermissionProfile::RequestApproval,
+        )
+    }
+
+    #[tokio::test]
+    async fn update_plan_accepts_one_accidentally_nested_argument_envelope() {
+        let mut reg = ToolRegistry::new();
+        register_harness_controls(&mut reg);
+        let out = reg
+            .execute(
+                "update_plan",
+                serde_json::json!({
+                    "plan": [{
+                        "explanation": "开始处理",
+                        "plan": [
+                            {"step": "定位根因", "status": "in_progress"},
+                            {"step": "验证修复", "status": "pending"}
+                        ]
+                    }]
+                }),
+                ctx(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a single nested update_plan envelope should be normalized");
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.starts_with("开始处理\n\n"), "{}", out.content);
+        assert_eq!(out.metadata["plan"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn normalized_update_plan_still_enforces_the_canonical_schema() {
+        let mut reg = ToolRegistry::new();
+        register_harness_controls(&mut reg);
+        let err = reg
+            .execute(
+                "update_plan",
+                serde_json::json!({
+                    "plan": [{
+                        "plan": [{"step": "定位根因", "status": "done"}]
+                    }]
+                }),
+                ctx(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("normalization must not permit a non-canonical status");
+
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
     }
 }

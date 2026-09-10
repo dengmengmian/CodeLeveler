@@ -1,48 +1,59 @@
 //! `git_status` and `git_diff` — read-only git inspection (spec §18.3).
-
-use std::time::Duration;
+//!
+//! Thin adapters. `leveler-vcs` owns how this product invokes `git` — the
+//! request, the timeout, the runner — and these two tools own only the model
+//! interface: which arguments an intent maps to, and how the result reads.
+//! They used to build their own `ProcessRequest`, which was a second git
+//! invocation alongside `GitWorkflow`'s with its own timeout and error shape.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{ProcessRequest, RiskLevel};
+use leveler_execution::RiskLevel;
+use leveler_vcs::GitWorkflow;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-async fn run_git(
+/// The VCS capability for this call: the workspace it inspects and the shared,
+/// sandboxed runner every other tool call goes through.
+fn vcs(context: &ToolContext) -> GitWorkflow {
+    GitWorkflow::with_runner(
+        context.execution.workspace.root(),
+        context.execution.runner.clone(),
+        context.execution.environment.clone(),
+    )
+}
+
+async fn inspect(
     context: &ToolContext,
     args: &[&str],
     cancellation: CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    let mut request = ProcessRequest::new(
-        "git",
-        args.iter().map(|s| s.to_string()).collect(),
-        context.execution.workspace.root().to_path_buf(),
-    );
-    request.timeout = Duration::from_secs(30);
-    let output = context.execution.runner.run(request, cancellation).await?;
-    if output.success() {
-        let mut body = if output.stdout.trim().is_empty() {
-            "(clean)\n".to_string()
-        } else {
-            output.stdout
-        };
-        // The runner caps output; a silently-cut diff reads as complete. Say so.
-        if output.truncated {
-            body.push_str(
-                "\n[note] output was truncated (too large); narrow with a `path`, \
-                 or read specific files, for the full diff.\n",
-            );
-        }
-        Ok(ToolOutput::ok(body))
-    } else {
-        Ok(ToolOutput::error(format!(
+    let output = match vcs(context).inspect(args, cancellation).await {
+        Ok(output) => output,
+        Err(error) => return Ok(ToolOutput::error(error.to_string())),
+    };
+    if !output.success() {
+        return Ok(ToolOutput::error(format!(
             "git failed (exit {:?}):\n{}",
             output.exit_code, output.stderr
-        )))
+        )));
     }
+    let mut body = if output.stdout.trim().is_empty() {
+        "(clean)\n".to_string()
+    } else {
+        output.stdout
+    };
+    // The runner caps output; a silently-cut diff reads as complete. Say so.
+    if output.truncated {
+        body.push_str(
+            "\n[note] output was truncated (too large); narrow with a `path`, \
+             or read specific files, for the full diff.\n",
+        );
+    }
+    Ok(ToolOutput::ok(body))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -71,7 +82,7 @@ impl Tool for GitStatusTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        run_git(
+        inspect(
             &context,
             &["status", "--porcelain=v1", "--branch"],
             cancellation,
@@ -126,7 +137,7 @@ impl Tool for GitDiffTool {
             path_owned = p.clone();
             args.push(&path_owned);
         }
-        run_git(&context, &args, cancellation).await
+        inspect(&context, &args, cancellation).await
     }
 }
 
@@ -147,5 +158,27 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("new.txt"), "got: {}", out.content);
+    }
+
+    /// The tool builds no process of its own: the VCS capability is what runs
+    /// `git`, so the two callers cannot drift on timeout or error shape.
+    #[tokio::test]
+    async fn a_diff_is_answered_through_the_vcs_capability() {
+        let repo = leveler_test_support::git::scratch_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "before\n").unwrap();
+        leveler_test_support::git::run(repo.path(), &["add", "-A"]);
+        leveler_test_support::git::run(repo.path(), &["commit", "-qm", "init"]);
+        std::fs::write(repo.path().join("tracked.txt"), "after\n").unwrap();
+        let ctx = super::super::test_ctx_in(
+            repo.path(),
+            leveler_execution::PermissionProfile::RequestApproval,
+        );
+        let out = GitDiffTool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("-before"), "got: {}", out.content);
+        assert!(out.content.contains("+after"), "got: {}", out.content);
     }
 }

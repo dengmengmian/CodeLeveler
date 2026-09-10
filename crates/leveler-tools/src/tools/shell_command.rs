@@ -8,6 +8,8 @@
 //! [`super::shell_guard`]) so a bad agent command becomes a recoverable tool
 //! error instead of trapping the turn for minutes.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -15,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
 
-use super::run_command::execute_program;
+use super::command_execution::CommandExecution;
 use super::shell_guard::refuse_shell_script;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -32,7 +34,15 @@ struct Input {
     timeout_seconds: Option<u64>,
 }
 
-pub struct ShellCommandTool;
+pub struct ShellCommandTool {
+    commands: Arc<CommandExecution>,
+}
+
+impl ShellCommandTool {
+    pub fn new(commands: Arc<CommandExecution>) -> Self {
+        Self { commands }
+    }
+}
 
 #[async_trait]
 impl Tool for ShellCommandTool {
@@ -81,15 +91,16 @@ impl Tool for ShellCommandTool {
             return Ok(ToolOutput::error(reason));
         }
         let (program, args) = leveler_execution::shell_invocation(cmd);
-        execute_program(
-            &program,
-            args,
-            input.cwd.as_deref(),
-            input.timeout_seconds,
-            context,
-            cancellation,
-        )
-        .await
+        self.commands
+            .run_foreground(
+                &program,
+                args,
+                input.cwd.as_deref(),
+                input.timeout_seconds,
+                context,
+                cancellation,
+            )
+            .await
     }
 }
 
@@ -121,7 +132,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        let out = ShellCommandTool
+        let out = ShellCommandTool::new(crate::tools::test_commands())
             .execute(
                 serde_json::json!({"cmd": "echo shell-ok"}),
                 ctx,
@@ -142,7 +153,7 @@ mod tests {
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
         let start = Instant::now();
-        let out = ShellCommandTool
+        let out = ShellCommandTool::new(crate::tools::test_commands())
             .execute(
                 serde_json::json!({ "cmd": HANG_ANTI_PATTERN }),
                 ctx,

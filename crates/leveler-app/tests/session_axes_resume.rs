@@ -13,6 +13,24 @@ use leveler_project::Layout;
 use leveler_storage::SessionRepository;
 use leveler_tools::core_surface;
 
+/// In-process capability handles: the composition under test is about which
+/// tools exist, not about which host services back them.
+fn caps() -> leveler_tools::Capabilities {
+    leveler_tools::Capabilities::in_process(std::sync::Arc::new(
+        leveler_core::environment().clone(),
+    ))
+}
+
+/// What an Economy turn must look like: the core primitives plus the harness
+/// controls, and nothing optional. Composed here from the same two halves the
+/// application composes, so the assertion cannot drift from the production
+/// composition by counting a hardcoded number.
+fn economy_surface_size() -> usize {
+    let mut registry = core_surface(&caps());
+    leveler_agent::register_harness_controls(&mut registry);
+    registry.definitions().len()
+}
+
 fn isolate_global_config() {
     use std::sync::OnceLock;
     static EMPTY_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
@@ -94,7 +112,7 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
     let n = engine.factory.registry.definitions().len();
     assert_eq!(
         n,
-        core_surface().definitions().len(),
+        economy_surface_size(),
         "economy composes no optional pack: the primitives and the protocol; got {n}"
     );
 
@@ -116,7 +134,8 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
     // invariant that does not depend on the machine is that it is a superset
     // of the core surface.
     assert!(
-        engine_full.factory.registry.definitions().len() >= core_surface().definitions().len(),
+        engine_full.factory.registry.definitions().len()
+            >= core_surface(&caps()).definitions().len(),
         "a full profile is never smaller than the core surface"
     );
 }

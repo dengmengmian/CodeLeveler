@@ -498,12 +498,9 @@ impl TaskEngine {
             if terminal_status_for(report).1 == AgentState::Execute);
         if !interrupted
             && !goal_continues
-            && let (Some(scope), Some(registry)) = (
-                self.factory.tool_context.session_scope.as_deref(),
-                self.factory.tool_context.services.background_tasks.as_ref(),
-            )
+            && let Some(scope) = self.factory.tool_context.session_scope.as_deref()
         {
-            let reaped = registry.kill_scope(scope).await;
+            let reaped = self.factory.background_tasks.kill_scope(scope).await;
             if reaped > 0 {
                 tracing::info!(
                     session = scope,

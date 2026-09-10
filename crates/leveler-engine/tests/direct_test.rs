@@ -21,8 +21,17 @@ use leveler_model::{
 use leveler_storage::{
     Database, EventRepository, MessageRepository, SessionRepository, TurnRepository,
 };
-use leveler_tools::{ToolContext, default_registry};
+use leveler_tools::ToolContext;
 use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
 
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
@@ -195,6 +204,8 @@ async fn harness_with(
             commit_co_author: true,
             overrides: None,
             memory_index: String::new(),
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
@@ -1339,6 +1350,8 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             commit_co_author: true,
             overrides: None,
             memory_index: String::new(),
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
@@ -1765,6 +1778,8 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             commit_co_author: true,
             overrides: None,
             memory_index: String::new(),
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),

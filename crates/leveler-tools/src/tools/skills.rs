@@ -54,102 +54,9 @@ impl Tool for LoadSkillTool {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CreateInput {
-    /// Skill name: letters, digits, '-' or '_'. Becomes the folder name.
-    name: String,
-    /// One line describing what the skill does and WHEN to use it — this is the
-    /// only text loaded into context to decide relevance, so be specific.
-    description: String,
-    /// The skill body (Markdown): the procedure/instructions to follow.
-    body: String,
-}
-
-pub struct CreateSkillTool;
-
-#[async_trait]
-impl Tool for CreateSkillTool {
-    fn name(&self) -> &'static str {
-        "create_skill"
-    }
-    fn description(&self) -> &'static str {
-        "Author a reusable skill, saved to .leveler/skills/<name>/SKILL.md. Use \
-         this to capture a multi-step procedure or domain knowledge worth reusing \
-         later. Keep the description precise about WHEN the skill applies."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<CreateInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::WorkspaceWrite
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancellation: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: CreateInput = super::parse_input(self.name(), input)?;
-        match leveler_skills::create(
-            context.execution.workspace.root(),
-            &input.name,
-            &input.description,
-            &input.body,
-        ) {
-            Ok(dir) => Ok(ToolOutput::ok(format!(
-                "Created skill `{}` at {}/SKILL.md. It will appear in the skills index.\n",
-                input.name,
-                dir.display()
-            ))),
-            Err(e) => Ok(ToolOutput::error(format!("could not create skill: {e}"))),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn create_then_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-skilltool-{}",
-            super::super::test_ordinal()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-
-        let created = CreateSkillTool
-            .execute(
-                serde_json::json!({
-                    "name": "release",
-                    "description": "Cut a release. Use when asked to publish a new version.",
-                    "body": "# Release\n\n1. Bump version\n2. Tag\n3. Push",
-                }),
-                ctx.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!created.is_error, "{}", created.content);
-
-        let loaded = LoadSkillTool
-            .execute(
-                serde_json::json!({ "name": "release" }),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            loaded.content.contains("Bump version"),
-            "{}",
-            loaded.content
-        );
-        assert!(loaded.content.contains("Skill: release"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     #[tokio::test]
     async fn load_skill_surfaces_structured_scripts_and_dir() {
@@ -160,18 +67,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        CreateSkillTool
-            .execute(
-                serde_json::json!({
-                    "name": "pack",
-                    "description": "Pack things",
-                    "body": "UNIQUE_PACK_BODY_99",
-                }),
-                ctx.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        // Authoring a skill is user administration, not an agent tool: write
+        // it through the store owner, exactly as the CLI does.
+        leveler_skills::create(
+            ctx.execution.workspace.root(),
+            "pack",
+            "Pack things",
+            "UNIQUE_PACK_BODY_99",
+        )
+        .unwrap();
         // Derive the expected dir exactly as the tool does: `Workspace::new`
         // canonicalizes the root, and the tool renders the skill dir under that
         // canonical root. Mirroring `canonicalize` (per-component join) matches

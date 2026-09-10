@@ -1,125 +1,57 @@
-//! Shared LSP-backed symbol location for the code-intelligence tools
-//! (`read_symbol`, `find_references`). Precise where a language server is
-//! available; the individual tools carry their own dependency-free fallbacks.
+//! Presentation helpers shared by the code-intelligence tools.
+//!
+//! The language-server sessions themselves belong to
+//! [`leveler_lsp::LspSessions`], which every one of these tools is constructed
+//! with. What is left here is the part that is genuinely about rendering an
+//! answer to the model: which files a scan may look at, how a definition block
+//! is clipped, and how a path is shortened for display.
+//!
+//! `find_symbol` used to carry its own copy of the session start + locate
+//! logic, and three of these tools carried three drifting copies of the source
+//! walk — one keyed on `repo_map::is_source`, two on a shorter hardcoded
+//! extension list, so the same repository had two different ideas of what
+//! counts as source. There is one of each now.
 
 use std::path::Path;
 
-use leveler_lsp::SymbolLocation;
-use leveler_project::Language;
+/// Cap on the files a dependency-free scan will walk.
+pub(crate) const MAX_SCAN_FILES: usize = 2000;
 
-use crate::tool::ToolContext;
+/// Directories no source scan enters.
+const IGNORED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "dist",
+    "vendor",
+    ".leveler",
+];
 
-pub(crate) fn remove_if_same<T>(
-    sessions: &mut std::collections::HashMap<String, std::sync::Arc<T>>,
-    key: &str,
-    expected: &std::sync::Arc<T>,
-) {
-    if sessions
-        .get(key)
-        .is_some_and(|current| std::sync::Arc::ptr_eq(current, expected))
-    {
-        sessions.remove(key);
+/// Workspace-relative source files under `dir`, bounded by [`MAX_SCAN_FILES`].
+///
+/// "Source" means whatever [`leveler_context::repo_map::is_source`] says, so
+/// the scan and the repository map agree about the same tree.
+pub(crate) fn collect_source_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    if out.len() >= MAX_SCAN_FILES {
+        return;
     }
-}
-
-pub(crate) async fn get_or_start_lsp(
-    context: &ToolContext,
-    key: &str,
-    program: &str,
-    args: &[String],
-    root: &Path,
-) -> Result<std::sync::Arc<leveler_lsp::LspClient>, String> {
-    if let Some(client) = context.services.lsp_sessions.lock().await.get(key).cloned() {
-        return Ok(client);
-    }
-    let start_lock = {
-        let mut locks = context.services.lsp_start_locks.lock().await;
-        locks
-            .entry(key.to_string())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
     };
-    let _starting = start_lock.lock().await;
-    if let Some(client) = context.services.lsp_sessions.lock().await.get(key).cloned() {
-        return Ok(client);
-    }
-
-    // Only this language's startup lock is held across process launch. Other
-    // languages and already-running sessions remain available concurrently.
-    let client = std::sync::Arc::new(
-        leveler_lsp::LspClient::start(program, args, root)
-            .await
-            .map_err(|error| error.to_string())?,
-    );
-    context
-        .services
-        .lsp_sessions
-        .lock()
-        .await
-        .insert(key.to_string(), client.clone());
-    Ok(client)
-}
-
-/// Locate a symbol's definitions via a language server, returning the language
-/// whose server answered and the matching locations. `None` if no server is
-/// available or the symbol is not found.
-pub(crate) async fn lsp_locate(
-    context: &ToolContext,
-    root: &Path,
-    symbol: &str,
-) -> Option<(Language, Vec<SymbolLocation>)> {
-    for language in leveler_project::detect_languages(root) {
-        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
-        {
-            continue;
-        }
-        let Some(spec) = leveler_lsp::server_for(language) else {
-            continue;
-        };
-
-        let key = language.as_str().to_string();
-        // Clone the session's Arc out under the lock, then release it before the
-        // request/retry loop — holding the global lock across `sleep` would
-        // serialize every LSP tool and stall them for seconds.
-        let client = match get_or_start_lsp(context, &key, &spec.program, &spec.args, root).await {
-            Ok(client) => client,
-            Err(_) => continue,
-        };
-
-        // The server may still be indexing on first use; retry briefly.
-        let mut located = Vec::new();
-        let mut server_died = false;
-        for _ in 0..6 {
-            match client.workspace_symbols(symbol).await {
-                Ok(found) if !found.is_empty() => {
-                    located = found;
-                    break;
-                }
-                Ok(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                // The server crashed or timed out. Evict the dead client so the
-                // NEXT call restarts it — otherwise a single crash/timeout pins a
-                // corpse in the map and this language degrades to scan forever.
-                Err(_) => {
-                    server_died = true;
-                    break;
-                }
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if path.is_dir() {
+            if !IGNORED_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                collect_source_files(root, &path, out);
+            }
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if leveler_context::repo_map::is_source(&rel) {
+                out.push(rel);
             }
         }
-        if server_died {
-            // Re-acquire only to evict, and only if it's still the same dead
-            // client (a concurrent call may have already restarted it).
-            let mut sessions = context.services.lsp_sessions.lock().await;
-            remove_if_same(&mut sessions, &key, &client);
-        }
-        let matches: Vec<_> = located
-            .into_iter()
-            .filter(|s| s.name.eq_ignore_ascii_case(symbol))
-            .collect();
-        if !matches.is_empty() {
-            return Some((language, matches));
-        }
     }
-    None
 }
 
 /// Make an absolute path relative to `root` for display, if possible.
@@ -195,23 +127,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn eviction_never_removes_a_concurrently_restarted_session() {
-        let stale = std::sync::Arc::new(1_u8);
-        let restarted = std::sync::Arc::new(2_u8);
-        let mut sessions = std::collections::HashMap::new();
-        sessions.insert("rust".to_string(), restarted.clone());
-
-        remove_if_same(&mut sessions, "rust", &stale);
-
-        assert!(std::sync::Arc::ptr_eq(
-            sessions.get("rust").unwrap(),
-            &restarted
-        ));
-        remove_if_same(&mut sessions, "rust", &restarted);
-        assert!(!sessions.contains_key("rust"));
-    }
-
-    #[test]
     fn extract_block_marks_an_unclosed_clip() {
         // A body longer than max_lines is clipped mid-function; without a
         // marker the model may treat the clip point as the end of the symbol.
@@ -250,5 +165,23 @@ mod tests {
         // Leading full-width chars must be counted as chars.
         assert_eq!(column_of("    fn foo", "foo"), 7);
         assert_eq!(column_of("你好 foo", "foo"), 3);
+    }
+
+    /// One source walk for every symbol tool, so `find_symbol` and
+    /// `read_symbol` cannot disagree about which files exist.
+    #[test]
+    fn the_source_walk_skips_ignored_trees_and_non_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        std::fs::write(root.join("src/notes.md"), "").unwrap();
+        std::fs::write(root.join("target/debug/b.rs"), "").unwrap();
+
+        let mut found = Vec::new();
+        collect_source_files(root, root, &mut found);
+        found.sort();
+        assert_eq!(found, vec!["src/a.rs".to_string()]);
     }
 }

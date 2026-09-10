@@ -1,7 +1,13 @@
 //! Memory tools: `memory` (search/list/read), `remember`, `forget`.
 //!
-//! Store root comes from [`ToolContext::memory_root`] (app sets
-//! `Layout::memory_dir`). Writes require human approval (K36).
+//! Each tool is CONSTRUCTED with the store root (the app passes
+//! `Layout::memory_dir`); it used to read one out of `ToolContext.services`,
+//! where every unrelated tool could reach it too. `None` means memory is not
+//! configured for this run, and the tool says so rather than inventing a
+//! location. Writes require human approval (K36).
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -13,14 +19,24 @@ use leveler_memory::{MemoryStore, new_entry};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-fn open_store(context: &ToolContext) -> Result<MemoryStore, ToolError> {
-    let root = context.services.memory_root.as_ref().ok_or_else(|| {
-        ToolError::Io(
-            "memory store is not configured for this session (app must set Layout::memory_dir)"
-                .to_string(),
-        )
-    })?;
-    MemoryStore::open(root).map_err(|e| ToolError::Io(e.to_string()))
+/// The memory-store root a memory tool is built with, shared by the three.
+#[derive(Clone)]
+pub struct MemoryRoot(Option<Arc<PathBuf>>);
+
+impl MemoryRoot {
+    pub fn new(root: Option<PathBuf>) -> Self {
+        Self(root.map(Arc::new))
+    }
+
+    fn open(&self) -> Result<MemoryStore, ToolError> {
+        let root = self.0.as_ref().ok_or_else(|| {
+            ToolError::Io(
+                "memory store is not configured for this session (app must set Layout::memory_dir)"
+                    .to_string(),
+            )
+        })?;
+        MemoryStore::open(root.as_path()).map_err(|e| ToolError::Io(e.to_string()))
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -40,7 +56,15 @@ fn default_limit() -> usize {
     5
 }
 
-pub struct MemoryTool;
+pub struct MemoryTool {
+    root: MemoryRoot,
+}
+
+impl MemoryTool {
+    pub fn new(root: MemoryRoot) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl Tool for MemoryTool {
@@ -66,11 +90,11 @@ impl Tool for MemoryTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: MemoryArgs = super::parse_input(self.name(), input)?;
-        let store = open_store(&context)?;
+        let store = self.root.open()?;
         match args.action.as_str() {
             "list" => {
                 let entries = store
@@ -144,7 +168,15 @@ struct RememberArgs {
     tags: Vec<String>,
 }
 
-pub struct RememberTool;
+pub struct RememberTool {
+    root: MemoryRoot,
+}
+
+impl RememberTool {
+    pub fn new(root: MemoryRoot) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl Tool for RememberTool {
@@ -176,14 +208,14 @@ impl Tool for RememberTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: RememberArgs = super::parse_input(self.name(), input)?;
         if args.title.trim().is_empty() || args.body.trim().is_empty() {
             return Ok(ToolOutput::error("title and body are required"));
         }
-        let store = open_store(&context)?;
+        let store = self.root.open()?;
         let entry = new_entry(&args.title, &args.body, args.tags);
         let saved = store
             .remember_deduplicated(entry)
@@ -200,7 +232,15 @@ struct ForgetArgs {
     id: String,
 }
 
-pub struct ForgetTool;
+pub struct ForgetTool {
+    root: MemoryRoot,
+}
+
+impl ForgetTool {
+    pub fn new(root: MemoryRoot) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl Tool for ForgetTool {
@@ -227,11 +267,11 @@ impl Tool for ForgetTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: ForgetArgs = super::parse_input(self.name(), input)?;
-        let store = open_store(&context)?;
+        let store = self.root.open()?;
         let entry = store
             .forget(&args.id)
             .map_err(|e| ToolError::Io(e.to_string()))?;
@@ -242,105 +282,26 @@ impl Tool for ForgetTool {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ConsolidateArgs {
-    /// Transcript or notes to extract durable preferences from.
-    transcript: String,
-    /// When true, write candidates immediately (still Dangerous risk / approval).
-    #[serde(default)]
-    auto_write: bool,
-    #[serde(default = "default_max")]
-    max_candidates: usize,
-}
-
-fn default_max() -> usize {
-    5
-}
-
-pub struct ConsolidateMemoryTool;
-
-#[async_trait]
-impl Tool for ConsolidateMemoryTool {
-    fn name(&self) -> &'static str {
-        "consolidate_memory"
-    }
-
-    fn description(&self) -> &'static str {
-        "Extract durable preference/decision candidates from a transcript.          With auto_write=false (default), returns candidates for the user to          approve via remember. With auto_write=true, writes after host approval          (tool is Dangerous-class / WorkspaceWrite + approval policy)."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<ConsolidateArgs>()
-    }
-
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::WorkspaceWrite
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancellation: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let args: ConsolidateArgs = super::parse_input(self.name(), input)?;
-        let candidates =
-            leveler_memory::extract_memory_candidates(&args.transcript, args.max_candidates.max(1));
-        if candidates.is_empty() {
-            return Ok(ToolOutput::ok("No durable candidates found."));
-        }
-        // Default path: candidates only. auto_write still requires host K36
-        // approval (`is_memory_write_tool("consolidate_memory")`) before this
-        // tool runs; after approval we may persist.
-        if !args.auto_write {
-            let mut body = String::from("Candidates (not written; call remember to store):\n");
-            for e in &candidates {
-                body.push_str(&format!(
-                    "- {} — {}\n",
-                    e.title,
-                    e.body.chars().take(120).collect::<String>()
-                ));
-            }
-            return Ok(ToolOutput::ok(body).with_metadata(serde_json::json!({
-                "candidates": candidates
-            })));
-        }
-        // Defense in depth: refuse auto_write when approval policy would treat
-        // this as a free WorkspaceWrite (should never reach here under AutoApprove).
-        if !leveler_execution::is_memory_write_tool(self.name()) {
-            return Ok(ToolOutput::error(
-                "consolidate_memory auto_write blocked: tool is not classified as a memory write",
-            ));
-        }
-        let store = open_store(&context)?;
-        let mut written = Vec::new();
-        for e in candidates {
-            let saved = store
-                .remember_deduplicated(e)
-                .map_err(|err| ToolError::Io(err.to_string()))?;
-            written.push(saved.id);
-        }
-        Ok(ToolOutput::ok(format!(
-            "Wrote {} memories: {}",
-            written.len(),
-            written.join(", ")
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn ctx_in(root: &std::path::Path) -> ToolContext {
+        let ws = leveler_execution::Workspace::new(root).unwrap();
+        ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+    }
+
+    /// The root a memory tool writes to is the one it was CONSTRUCTED with —
+    /// never an ambient environment variable, and never a location invented at
+    /// call time.
     #[tokio::test]
-    async fn uses_context_memory_root_not_env() {
+    async fn writes_to_the_root_it_was_constructed_with() {
         let dir = tempdir().unwrap();
         let mem = dir.path().join("memory");
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_memory_root(&mem);
-        let out = RememberTool
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let out = RememberTool::new(root.clone())
             .execute(
                 serde_json::json!({
                     "title": "Prefer workspace-write",
@@ -353,7 +314,7 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(mem.join("active").exists());
-        let listed = MemoryTool
+        let listed = MemoryTool::new(root)
             .execute(
                 serde_json::json!({"action": "list"}),
                 ctx,
@@ -368,13 +329,13 @@ mod tests {
     async fn two_different_facts_with_the_same_title_do_not_clobber_each_other() {
         let dir = tempdir().unwrap();
         let mem = dir.path().join("memory");
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_memory_root(&mem);
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
         let remember = |body: &'static str| {
             let ctx = ctx.clone();
+            let root = root.clone();
             async move {
-                RememberTool
+                RememberTool::new(root)
                     .execute(
                         serde_json::json!({ "title": "Deploy notes", "body": body }),
                         ctx,
@@ -390,7 +351,7 @@ mod tests {
 
         // Both facts must be retrievable — the second must not have overwritten
         // the first just because their titles slug to the same id.
-        let listed = MemoryTool
+        let listed = MemoryTool::new(MemoryRoot::new(Some(mem.clone())))
             .execute(
                 serde_json::json!({"action": "search", "query": "deploy", "limit": 10}),
                 ctx.clone(),
@@ -416,12 +377,13 @@ mod tests {
         );
     }
 
+    /// A run with memory unconfigured says so. Nothing invents a store
+    /// location, and nothing silently succeeds against one.
     #[tokio::test]
-    async fn missing_memory_root_errors_clearly() {
+    async fn an_unconfigured_memory_root_errors_clearly() {
         let dir = tempdir().unwrap();
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
-        let err = MemoryTool
+        let ctx = ctx_in(dir.path());
+        let err = MemoryTool::new(MemoryRoot::new(None))
             .execute(
                 serde_json::json!({"action": "list"}),
                 ctx,
@@ -436,10 +398,9 @@ mod tests {
     async fn vector_search_returns_ranked_hits() {
         let dir = tempdir().unwrap();
         let mem = dir.path().join("memory");
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_memory_root(&mem);
-        RememberTool
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        RememberTool::new(root.clone())
             .execute(
                 serde_json::json!({
                     "title": "Workspace write",
@@ -450,7 +411,7 @@ mod tests {
             )
             .await
             .unwrap();
-        RememberTool
+        RememberTool::new(root.clone())
             .execute(
                 serde_json::json!({
                     "title": "Unrelated",
@@ -461,7 +422,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let out = MemoryTool
+        let out = MemoryTool::new(root)
             .execute(
                 serde_json::json!({
                     "action": "vector_search",
@@ -480,86 +441,5 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("score"), "{}", out.content);
-    }
-
-    #[tokio::test]
-    async fn consolidate_memory_returns_candidates_without_auto_write() {
-        let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_memory_root(&mem);
-        let out = ConsolidateMemoryTool
-            .execute(
-                serde_json::json!({
-                    "transcript": "User preference: always use WorkspaceWrite for edits.\nDecision: never store API keys in memory.",
-                    "auto_write": false
-                }),
-                ctx.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{}", out.content);
-        assert!(
-            out.content.contains("Candidates") || out.content.contains("preference"),
-            "{}",
-            out.content
-        );
-        // Default auto_write=false must not create active memories.
-        let listed = MemoryTool
-            .execute(
-                serde_json::json!({"action": "list"}),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            listed.content.contains("No active memories") || !listed.content.contains("["),
-            "auto_write=false must not persist: {}",
-            listed.content
-        );
-    }
-
-    #[tokio::test]
-    async fn consolidate_memory_auto_write_persists() {
-        let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_memory_root(&mem);
-        let out = ConsolidateMemoryTool
-            .execute(
-                serde_json::json!({
-                    "transcript": "User preference: always use WorkspaceWrite for edits.",
-                    "auto_write": true
-                }),
-                ctx.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{}", out.content);
-        assert!(
-            out.content.contains("Wrote") || out.content.contains("No durable"),
-            "{}",
-            out.content
-        );
-        if out.content.contains("Wrote") {
-            let listed = MemoryTool
-                .execute(
-                    serde_json::json!({"action": "list"}),
-                    ctx,
-                    CancellationToken::new(),
-                )
-                .await
-                .unwrap();
-            assert!(
-                !listed.content.contains("No active memories"),
-                "{}",
-                listed.content
-            );
-        }
     }
 }

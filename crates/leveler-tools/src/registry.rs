@@ -9,6 +9,7 @@ use leveler_core::{ceil_char_boundary, floor_char_boundary};
 use leveler_execution::RiskLevel;
 use leveler_model::ToolDefinition;
 
+use crate::capabilities::Capabilities;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 /// The canonical observe-class (read-only) tool list. This is THE single
@@ -135,7 +136,6 @@ impl ToolRegistry {
     }
 
     pub fn read_only_subset(&self) -> ToolRegistry {
-        use leveler_execution::RiskLevel;
         const READ_ONLY_TOOLS: &[&str] = OBSERVE_CLASS_TOOLS;
         let mut subset = ToolRegistry::new();
         for tool in self.tools.values() {
@@ -160,8 +160,16 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Validate arguments against the tool's schema, enforce the execution-mode
-    /// permission, then execute. Invalid JSON is never guessed (spec §10.4).
+    /// Normalize and schema-validate the arguments, then dispatch. Invalid
+    /// JSON is never guessed (spec §10.4).
+    ///
+    /// NO POLICY LIVES HERE. Whether this call may happen at all — the
+    /// permission profile, the read-only overlay, an owned write scope, the
+    /// permission rules, approval — is decided ONCE by the ToolHost, which is
+    /// the only thing that can produce the admitted call that reaches this
+    /// method. The registry used to re-decide three of those, so a build had
+    /// three authorization owners that had to agree; when they disagreed the
+    /// one nobody was looking at won.
     pub async fn execute(
         &self,
         name: &str,
@@ -173,27 +181,6 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?
             .clone();
-
-        if context.policy.read_only && tool.risk() != RiskLevel::Safe {
-            return Err(ToolError::NotPermitted {
-                tool: name.to_string(),
-                mode: context.policy.mode(),
-                risk: tool.risk(),
-            });
-        }
-        if tool.mutates_files() && context.policy.has_zero_write_authority() {
-            return Ok(ToolOutput::error(
-                "Edit rejected: no write scope is currently owned. Read the relevant \
-                 code, then use claim_write_scope(paths) before modifying files.",
-            ));
-        }
-        if !context.policy.mode().permits(tool.risk()) {
-            return Err(ToolError::NotPermitted {
-                tool: name.to_string(),
-                mode: context.policy.mode(),
-                risk: tool.risk(),
-            });
-        }
 
         let input = tool.normalize_input(input);
         // A structural rejection is final either way; the tool may only
@@ -209,9 +196,14 @@ impl ToolRegistry {
 
         let budget = context.policy.tool_output_budget;
         let mut output = tool.execute(input, context, cancellation).await?;
-        // Central guard: no single tool result may flood the context window,
-        // whatever the tool's own limits are (some search tools have none). Keep
-        // the head and the tail — errors and test failures often land at the end.
+        // The ONE model-facing result bound: no single tool result may flood
+        // the context window, whatever the tool's own intrinsic limits are
+        // (some search tools have none). Keep the head and the tail — errors
+        // and test failures often land at the end.
+        //
+        // This is a mechanical runtime guarantee about what the MODEL sees,
+        // not a policy: it is applied to every dispatch, it cannot be granted
+        // away, and a tool cannot opt out of it.
         output.content = cap_output_with(&output.content, budget);
         Ok(output)
     }
@@ -309,14 +301,25 @@ fn validate_schema(
     }
 }
 
-/// The optional capability packs a host can put on the model's surface.
+/// A set of optional capability packs.
 ///
-/// Every field is a mechanical fact about this machine or an explicit product
-/// choice — is a browser runtime installed, is a search provider configured,
-/// does this model accept images. None of them is a judgement about the task
-/// or about the model's ability (`docs/ARCHITECTURE.md` §1.1): the surface
-/// never grows because a task looks hard or shrinks because a model looks
-/// weak.
+/// The same shape answers three DIFFERENT questions, and keeping them apart is
+/// the point:
+///
+/// - **AVAILABLE** — can this machine provide the capability at all? A browser
+///   runtime installed, a search key configured, `git` on PATH, a model that
+///   accepts an image. Mechanical facts, nothing else.
+/// - **ENABLED** — does the current product mode / session ask for it?
+/// - **EXPOSED** — what the model actually sees, which is
+///   [`Self::intersect`] of the two.
+///
+/// A capability being AVAILABLE is not a reason to advertise it. `Economy`
+/// enables no optional pack, so a machine with a browser runtime still shows a
+/// plain coding turn zero browser tools.
+///
+/// None of the three is ever a judgement about the task or about the model's
+/// ability (`docs/ARCHITECTURE.md` §1.1): the surface never grows because a
+/// task looks hard or shrinks because a model looks weak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CapabilityPacks {
     /// Symbol navigation over a language server.
@@ -350,9 +353,9 @@ impl CapabilityPacks {
         browser: false,
     };
 
-    /// Every pack. The composition a host reaches when each capability's own
-    /// precondition holds; also what tests use so a tool is never missing for
-    /// an environmental reason.
+    /// Every pack. The composition a host reaches when each capability is both
+    /// enabled and available; also what tests use so a tool is never missing
+    /// for an environmental reason.
     pub const ALL: Self = Self {
         code_intelligence: true,
         vcs: true,
@@ -363,19 +366,47 @@ impl CapabilityPacks {
         skills: true,
         browser: true,
     };
+
+    /// EXPOSED = ENABLED ∩ AVAILABLE.
+    ///
+    /// The one operator that turns the two independent answers into a surface.
+    /// Neither side can widen the other: a capability the product did not ask
+    /// for stays off however capable the machine is, and one the machine
+    /// cannot provide stays off however much the product wants it.
+    pub const fn intersect(self, other: Self) -> Self {
+        Self {
+            code_intelligence: self.code_intelligence && other.code_intelligence,
+            vcs: self.vcs && other.vcs,
+            web_fetch: self.web_fetch && other.web_fetch,
+            web_search: self.web_search && other.web_search,
+            media: self.media && other.media,
+            memory: self.memory && other.memory,
+            skills: self.skills && other.skills,
+            browser: self.browser && other.browser,
+        }
+    }
 }
 
 /// The Core Primitive Foundation, plus the lifecycle the command primitive
-/// entails and the one harness control that still lives in this crate.
+/// entails.
 ///
 /// `read`, `ls`, `find`, `grep`, `edit`, `write` and `bash` are here because
 /// they express fundamental coding operations (§6.3). `get_task` / `wait_task`
 /// / `kill_task` are here because `run_command` can start a background task,
 /// and a task the caller cannot observe or stop is an orphan — they are that
-/// primitive's lifecycle, not an optional capability. `update_plan` is a
-/// harness control that has not moved yet; see §18.5.
-pub fn core_surface() -> ToolRegistry {
+/// primitive's lifecycle, not an optional capability.
+///
+/// Harness CONTROLS (`update_plan`, `update_goal`, `request_user_input`,
+/// `request_permissions`, `spawn_agent`, `claim_write_scope`,
+/// `report_finding`) are not here and never were a capability: they steer the
+/// harness rather than touch the world, and the coding harness registers them
+/// (`leveler_agent::register_harness_controls`).
+pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
     use crate::tools;
+    let commands = Arc::new(tools::CommandExecution::new(
+        capabilities.background_tasks.clone(),
+        capabilities.artifact_store.clone(),
+    ));
     let mut registry = ToolRegistry::new();
     // read / ls / find / grep
     registry.register(Arc::new(tools::ReadFileTool));
@@ -386,31 +417,33 @@ pub fn core_surface() -> ToolRegistry {
     registry.register(Arc::new(tools::ApplyPatchTool));
     registry.register(Arc::new(tools::WriteFileTool));
     // bash, and the background lifecycle it creates
-    registry.register(Arc::new(tools::RunCommandTool));
-    registry.register(Arc::new(tools::ShellCommandTool));
-    registry.register(Arc::new(tools::GetTaskTool));
-    registry.register(Arc::new(tools::WaitTaskTool));
-    registry.register(Arc::new(tools::KillTaskTool));
-    // Harness control (§18.5 debt: it belongs with the injected controls).
-    registry.register(Arc::new(tools::UpdatePlanTool));
+    registry.register(Arc::new(tools::RunCommandTool::new(commands.clone())));
+    registry.register(Arc::new(tools::ShellCommandTool::new(commands)));
+    let tasks = &capabilities.background_tasks;
+    registry.register(Arc::new(tools::GetTaskTool::new(tasks.clone())));
+    registry.register(Arc::new(tools::WaitTaskTool::new(tasks.clone())));
+    registry.register(Arc::new(tools::KillTaskTool::new(tasks.clone())));
     registry
 }
 
-/// The model-visible surface: the core primitives plus the packs this host can
-/// actually offer.
+/// The model-visible surface: the core primitives plus the packs this host has
+/// been asked for AND can provide.
 ///
 /// This is the whole composition. There is no dynamic expansion and no
 /// model-controlled discovery: the harness decides what exists, once, before
-/// the turn starts.
-pub fn model_surface(packs: CapabilityPacks) -> ToolRegistry {
+/// the turn starts. `packs` is the EXPOSED set — see
+/// [`CapabilityPacks::intersect`] — and `capabilities` carries the handles the
+/// tools of each exposed pack are constructed from.
+pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> ToolRegistry {
     use crate::tools;
-    let mut registry = core_surface();
+    let mut registry = core_surface(capabilities);
     if packs.code_intelligence {
-        registry.register(Arc::new(tools::FindSymbolTool));
-        registry.register(Arc::new(tools::ReadSymbolTool));
-        registry.register(Arc::new(tools::FindReferencesTool));
-        registry.register(Arc::new(tools::DiagnosticsTool));
-        registry.register(Arc::new(tools::BlastRadiusTool));
+        let lsp = &capabilities.lsp;
+        registry.register(Arc::new(tools::FindSymbolTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::ReadSymbolTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::FindReferencesTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::DiagnosticsTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::BlastRadiusTool::new(lsp.clone())));
     }
     if packs.vcs {
         registry.register(Arc::new(tools::GitStatusTool));
@@ -426,40 +459,48 @@ pub fn model_surface(packs: CapabilityPacks) -> ToolRegistry {
         registry.register(Arc::new(tools::ViewImageTool));
     }
     if packs.memory {
-        registry.register(Arc::new(tools::MemoryTool));
-        registry.register(Arc::new(tools::RememberTool));
-        registry.register(Arc::new(tools::ForgetTool));
+        let root = tools::MemoryRoot::new(capabilities.memory_root.clone());
+        registry.register(Arc::new(tools::MemoryTool::new(root.clone())));
+        registry.register(Arc::new(tools::RememberTool::new(root.clone())));
+        registry.register(Arc::new(tools::ForgetTool::new(root)));
     }
     if packs.skills {
         registry.register(Arc::new(tools::LoadSkillTool));
     }
     if packs.browser {
-        register_browser(&mut registry);
+        register_browser(&mut registry, capabilities.browser.clone());
     }
     registry
 }
 
-/// Every pack on. The entry point tests use; production composes packs from
-/// what the host actually has (see `leveler-app`).
+/// Every pack on, over in-process capability handles. The entry point tests
+/// use; production composes packs from what the host was asked for and can
+/// actually do, and hands over the services it owns (see `leveler-app`).
 pub fn default_registry() -> ToolRegistry {
-    model_surface(CapabilityPacks::ALL)
+    model_surface(
+        CapabilityPacks::ALL,
+        &Capabilities::in_process(Arc::new(leveler_core::environment().clone())),
+    )
 }
 
 /// The structured browser tools (§19), grouped so the pack registers one set.
-fn register_browser(registry: &mut ToolRegistry) {
+fn register_browser(
+    registry: &mut ToolRegistry,
+    browser: Option<Arc<leveler_browser::BrowserRuntime>>,
+) {
     use crate::tools;
-    registry.register(Arc::new(tools::BrowserNavigateTool));
-    registry.register(Arc::new(tools::BrowserSnapshotTool));
-    registry.register(Arc::new(tools::BrowserClickTool));
-    registry.register(Arc::new(tools::BrowserDragTool));
-    registry.register(Arc::new(tools::BrowserTypeTool));
-    registry.register(Arc::new(tools::BrowserSelectTool));
-    registry.register(Arc::new(tools::BrowserPressTool));
-    registry.register(Arc::new(tools::BrowserWaitTool));
-    registry.register(Arc::new(tools::BrowserTabsTool));
-    registry.register(Arc::new(tools::BrowserDialogTool));
-    registry.register(Arc::new(tools::BrowserConsoleTool));
-    registry.register(Arc::new(tools::BrowserScreenshotTool));
+    registry.register(Arc::new(tools::BrowserNavigateTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserSnapshotTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserClickTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserDragTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserTypeTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserSelectTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserPressTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserWaitTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserTabsTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserDialogTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserConsoleTool::new(browser.clone())));
+    registry.register(Arc::new(tools::BrowserScreenshotTool::new(browser)));
 }
 
 #[cfg(test)]
@@ -538,7 +579,7 @@ mod tests {
     /// primitives plus the packs this host can actually offer.
     #[test]
     fn the_core_surface_is_the_primitives_and_what_they_entail() {
-        let names: Vec<String> = core_surface()
+        let names: Vec<String> = core_surface(&crate::tools::test_capabilities())
             .definitions()
             .into_iter()
             .map(|d| d.name)
@@ -558,8 +599,6 @@ mod tests {
             "get_task",
             "wait_task",
             "kill_task",
-            // harness control that still lives in this crate (§18.5)
-            "update_plan",
         ];
         expected.sort_unstable();
         let mut got: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -570,7 +609,9 @@ mod tests {
     /// A pack is all-or-nothing and adds only its own tools.
     #[test]
     fn each_pack_adds_exactly_its_own_tools() {
-        let core = core_surface().definitions().len();
+        let core = core_surface(&crate::tools::test_capabilities())
+            .definitions()
+            .len();
         for (packs, added) in [
             (
                 CapabilityPacks {
@@ -616,7 +657,9 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                model_surface(packs).definitions().len(),
+                model_surface(packs, &crate::tools::test_capabilities())
+                    .definitions()
+                    .len(),
                 core + added,
                 "{packs:?}"
             );
@@ -627,8 +670,12 @@ mod tests {
     #[test]
     fn no_packs_is_the_core_surface() {
         assert_eq!(
-            model_surface(CapabilityPacks::NONE).definitions().len(),
-            core_surface().definitions().len()
+            model_surface(CapabilityPacks::NONE, &crate::tools::test_capabilities())
+                .definitions()
+                .len(),
+            core_surface(&crate::tools::test_capabilities())
+                .definitions()
+                .len()
         );
     }
 
@@ -659,9 +706,12 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
-        // core (12) + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
-        // + browser 12 = 38
-        assert_eq!(names.len(), 38);
+        // core 11 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
+        // + browser 12 = 37. The harness controls (`update_plan` and the
+        // injected ones) are not in this count: they are not a capability the
+        // host composes, so `leveler_agent::register_harness_controls` adds
+        // them on top.
+        assert_eq!(names.len(), 37);
     }
 
     /// Tools the model no longer chooses. Each left for its own reason, and
@@ -837,25 +887,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_tool_not_permitted_in_read_only_overlay() {
-        let reg = default_registry();
-        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
-        // run_command is WorkspaceWrite; collaboration-plan / read_only blocks it.
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
-            .with_read_only(true);
-        let err = reg
-            .execute(
-                "run_command",
-                serde_json::json!({"program": "echo", "args": ["hi"]}),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::NotPermitted { .. }));
-    }
-
-    #[tokio::test]
     async fn validates_schema_errors() {
         let reg = default_registry();
         let dir =
@@ -940,56 +971,6 @@ mod tests {
             out.content
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn update_plan_accepts_one_accidentally_nested_argument_envelope() {
-        let reg = default_registry();
-        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        let out = reg
-            .execute(
-                "update_plan",
-                serde_json::json!({
-                    "plan": [{
-                        "explanation": "开始处理",
-                        "plan": [
-                            {"step": "定位根因", "status": "in_progress"},
-                            {"step": "验证修复", "status": "pending"}
-                        ]
-                    }]
-                }),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("a single nested update_plan envelope should be normalized");
-
-        assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.starts_with("开始处理\n\n"), "{}", out.content);
-        assert_eq!(out.metadata["plan"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn normalized_update_plan_still_enforces_the_canonical_schema() {
-        let reg = default_registry();
-        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        let err = reg
-            .execute(
-                "update_plan",
-                serde_json::json!({
-                    "plan": [{
-                        "plan": [{"step": "定位根因", "status": "done"}]
-                    }]
-                }),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("normalization must not permit a non-canonical status");
-
-        assert!(matches!(err, ToolError::InvalidArguments { .. }));
     }
 
     #[test]
@@ -1141,7 +1122,7 @@ mod schema_budget {
                 .map(|d| serde_json::to_string(d).expect("schema serializes").len())
                 .sum::<usize>()
         };
-        let core = super::core_surface();
+        let core = super::core_surface(&crate::tools::test_capabilities());
         let full = super::default_registry();
         let (core_bytes, full_bytes) = (bytes(&core), bytes(&full));
         assert!(

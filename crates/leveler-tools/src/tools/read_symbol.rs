@@ -1,14 +1,17 @@
 //! `read_symbol` — read a symbol's definition body by name, without loading the
 //! whole file. Precise via a language server; falls back to a definition scan.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
+use leveler_lsp::LspSessions;
 
-use super::symbols::{extract_block, lsp_locate, relativize};
+use super::symbols::{collect_source_files, extract_block, relativize};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_BLOCK_LINES: usize = 200;
@@ -19,7 +22,16 @@ struct Input {
     symbol: String,
 }
 
-pub struct ReadSymbolTool;
+/// Constructed with the language-server sessions it uses, and nothing else.
+pub struct ReadSymbolTool {
+    lsp: Arc<LspSessions>,
+}
+
+impl ReadSymbolTool {
+    pub fn new(lsp: Arc<LspSessions>) -> Self {
+        Self { lsp }
+    }
+}
 
 #[async_trait]
 impl Tool for ReadSymbolTool {
@@ -55,9 +67,9 @@ impl Tool for ReadSymbolTool {
         let root = context.execution.workspace.root().to_path_buf();
 
         // Precise: language-server location, then read the block from the file.
-        if let Some((_, matches)) = lsp_locate(&context, &root, &input.symbol).await {
+        if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
             let mut body = String::new();
-            for m in matches.iter().take(3) {
+            for m in located.definitions.iter().take(3) {
                 if let Ok(text) = std::fs::read_to_string(&m.path) {
                     let block = extract_block(&text, m.line as usize, MAX_BLOCK_LINES);
                     body.push_str(&format!(
@@ -112,45 +124,6 @@ fn definition_line(text: &str, symbol: &str) -> Option<usize> {
         line.split(|c: char| !c.is_alphanumeric() && c != '_')
             .any(|w| w == symbol)
     })
-}
-
-const MAX_FILES: usize = 2000;
-
-fn collect_source_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
-    const IGNORED: &[&str] = &[
-        "target",
-        "node_modules",
-        ".git",
-        "dist",
-        "vendor",
-        ".leveler",
-    ];
-    const EXTS: &[&str] = &[
-        "rs", "go", "ts", "tsx", "js", "jsx", "py", "java", "c", "h", "cpp",
-    ];
-    if out.len() >= MAX_FILES {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if path.is_dir() {
-            if !IGNORED.contains(&name.as_str()) && !name.starts_with('.') {
-                collect_source_files(root, &path, out);
-            }
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| EXTS.contains(&e))
-            .unwrap_or(false)
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            out.push(rel.to_string_lossy().into_owned());
-        }
-    }
 }
 
 #[cfg(test)]

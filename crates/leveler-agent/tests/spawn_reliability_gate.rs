@@ -32,7 +32,16 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelRef, ModelRequest,
     ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
-use leveler_tools::{ToolContext, default_registry};
+use leveler_tools::ToolContext;
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
 
 /// A scripted model: hands back one prepared response per request.
 struct ScriptedRuntime {

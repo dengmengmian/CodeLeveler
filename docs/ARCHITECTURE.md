@@ -216,8 +216,9 @@ Everything else in the diagram is the real dependency shape.
 | `leveler-lifecycle` | The execution lifecycle vocabulary: `SessionStatus`, `TaskOutcome`, `VerificationStatus`, `TurnOutcome`, plus the Coding workflow types. No internal dependencies. |
 
 These crates must not learn coding, review, finding, repository-workflow, TUI,
-web, CLI or any other product concept. `leveler-model` currently does — see
-§18.6.
+web, CLI or any other product concept. `leveler-model` used to — it carried a
+table of Coding tool names — and no longer does (§18.6);
+`crates/leveler-tools/tests/ownership_boundaries.rs` is the tripwire.
 
 `leveler-lifecycle` already carries the split internally: its `runtime` module
 is domain-neutral and its `workflow` module holds Coding vocabulary, with
@@ -346,11 +347,18 @@ ReadFileTool      → WorkspaceReader
 GrepTool          → WorkspaceSearch
 ApplyPatchTool    → WorkspaceEditor
 RunCommandTool    → CommandExecution
-FindSymbolTool    → CodeIntelligence
+ShellCommandTool  → CommandExecution
+FindSymbolTool    → LspSessions
+GitStatusTool     → GitWorkflow
 BrowserClickTool  → BrowserRuntime
-ViewImageTool     → Media
-WebSearchTool     → Search provider
+ViewImageTool     → leveler_media::process_image
+MemoryTool        → MemoryStore
+McpTool           → McpClient
+WebSearchTool     → Search provider  (still the tool; §18.3 G)
 ```
+
+The arrow is a CONSTRUCTOR, not a lookup. Each tool holds the handle on the
+left of its own arrow and nothing else — see §5.5.
 
 ### 5.3 Capability is a responsibility, not necessarily a crate
 
@@ -369,11 +377,26 @@ two real consumers, a real dependency inversion, an independent
 security/runtime/protocol boundary, or an observed coupling defect. Prefer a
 concrete struct over a trait until a second implementation exists.
 
-Three of the five are now real, and they are exactly that: three concrete
-crate-private structs in `crates/leveler-tools/src/workspace/`
-(`reader.rs`, `search.rs`, `editor.rs`), with no trait, no registry and no new
-crate. `CommandExecution` and `CodeIntelligence` are still owned by their
-tools; see §18.3 D and E.
+All five are now real, and they are exactly that — concrete structs, no
+trait, no registry, no new crate:
+
+| Responsibility | Where it lives |
+| --- | --- |
+| `WorkspaceReader`, `WorkspaceSearch`, `WorkspaceEditor` | `crates/leveler-tools/src/workspace/` (crate-private) |
+| `CommandExecution` | `crates/leveler-tools/src/tools/command_execution.rs` |
+| `CodeIntelligence` | `leveler_lsp::LspSessions` — the crate that owns `LspClient` |
+| VCS | `leveler_vcs::GitWorkflow` |
+| Media | `leveler_media::process_image` |
+| Browser | `leveler_browser::BrowserRuntime` |
+| Memory | `leveler_memory::MemoryStore` |
+| MCP | `leveler_tools::mcp::McpClient` |
+
+`CommandExecution` stays inside `leveler-tools` rather than moving down to
+`leveler-execution`, because it reads the per-call authority off `ToolContext`
+and returns a `ToolOutput` — and `leveler-execution`, which sits below the
+tool layer, must not depend on either. It is a module both command tools are
+constructed with, and neither owns the other: `shell_command` used to import
+`run_command`'s internals for its own runtime.
 
 ### 5.4 ToolHost admits; Host Execution performs
 
@@ -402,69 +425,112 @@ effect it authorizes.
 sandbox, path safety, host process mechanics.
 
 Neither `ToolRegistry`, nor a `Tool` implementation, nor a capability may open
-a third permission or approval path. Today `ToolRegistry` does — see §5.6.
+a second permission or approval path. `ToolRegistry` used to open one — the
+read-only overlay, the zero-write-authority refusal and the profile's hard
+forbid were all re-decided there — so a build had three authorization owners
+that had to agree. All three now live in `resolve_policy`, and
+`crates/leveler-tools/tests/ownership_boundaries.rs` fails if any of them
+reappears in the registry.
 
-### 5.5 ToolContext: current state and target
+One authority the host cannot enforce is now refused instead of pretended: an
+MCP tool is a separate, unsandboxed process, so a run with network access
+denied refuses it rather than running it under a denial that cannot reach it.
+The same reasoning already kept MCP away from a delegated agent, whose claimed
+write scope it also could not honour.
 
-Current shape:
-
-```text
-ToolContext = ExecutionResources + ToolPolicy + ToolServices + session_scope
-```
-
-`ToolServices` names `lsp_sessions`, `lsp_start_locks`, `artifact_store`,
-`memory_root`, `background_tasks` and `browser` as struct fields. Every tool
-receives all of them, whether or not it uses any.
-
-That makes `ToolContext` a service locator, a policy container, an execution
-container and a session capability container at once. It is recorded as debt
-in §18.2.
-
-Target:
+### 5.5 ToolContext
 
 ```text
-Tool dependencies are explicitly injected.
-A tool receives only the capability it needs.
-Per-call context carries only genuinely dynamic invocation state, or
-authority the host minted for this call.
+ToolContext = ExecutionResources + ToolPolicy + session_scope
 ```
 
-**Do not design a replacement now.** No `BetterToolContext`, no
-`ToolExecutionContextV2`, no `CapabilityContext`. The target is that
-`ToolContext` shrinks or disappears as a *consequence* of capability
-extraction, not that a new container is invented ahead of it.
+- `ExecutionResources` — the execution substrate this call is anchored to: the
+  workspace whose root the write scope resolves against, the process runner,
+  the rollback checkpoint, the read fingerprints, the workspace-wide command
+  gate. Process-wide `Arc`s, one instance for the whole run including
+  sub-agents.
+- `ToolPolicy` — the per-call authority: the live permission profile, the
+  read-only overlay, the write allowlist and budgets, and the
+  `ResolvedExecutionPolicy` the ToolHost froze at admission.
+- `session_scope` — which session this call belongs to.
 
-### 5.6 ToolRegistry: current state and target
+**It carries no capability handles.** There used to be a third facet,
+`ToolServices`, holding the language-server pool, the browser runtime, the
+memory root, the artifact store and the background task registry. Every tool
+received all six: `read_file` was handed the browser, and `grep` could start a
+language server. That is a service locator, and a locator answers everyone.
 
-`ToolRegistry::execute` today performs, in order: read-only enforcement,
-zero-write-authority enforcement, permission-mode enforcement, input
-normalization, JSON-schema validation, dispatch, and a central output-budget
-cap. The module also owns the observe-class name list, the read-only subset,
-MCP filtering, the `core`/`full` compositions and `expand_tool_category`.
+Every tool is now constructed with the handles it uses and no others:
 
-That is a policy engine wearing a registry's name.
+| Tool | Constructed with |
+| --- | --- |
+| `find_symbol`, `read_symbol`, `find_references`, `diagnostics`, `blast_radius` | `leveler_lsp::LspSessions` |
+| `run_command`, `shell_command` | the shared `CommandExecution` |
+| `get_task`, `wait_task`, `kill_task` | `BackgroundTaskRegistry` |
+| `memory`, `remember`, `forget` | the memory store root |
+| `browser_*` | `leveler_browser::BrowserRuntime` |
+| the core read/search/edit tools, `git_*`, `view_image`, `load_skill`, `web_*` | nothing but the context |
 
-Target:
+The handles reach the composer as `leveler_tools::Capabilities`, which the
+composition root holds and `model_surface` consumes ONCE. A tool that has no
+business with a capability has no way to reach it, and
+`crates/leveler-tools/tests/ownership_boundaries.rs` fails if a handle
+reappears on the context.
+
+Two facts the RUNTIME needs in its own right moved to the runtime rather than
+riding on a tool's handle: the executor holds the memory root it reads for
+per-turn recall and for parking an unapproved `remember`, and
+`ExecutorFactory` holds the background task registry the engine reaps at
+terminal settlement.
+
+**ANTI-GROWTH RULE.** A new top-level field is not allowed, and a new
+capability is not a candidate for one — it goes to the tools that use it, at
+construction. What may live here is per-call authority or per-call identity,
+and it must name its owner in review.
+
+### 5.6 ToolRegistry
 
 ```text
 ToolRegistry
     register
     lookup
     definitions
+    normalize_input
     schema validation
-    adapter dispatch
+    dispatch
+    one bounded result
 ```
 
-Everything else moves to its owner:
+`ToolRegistry::execute` normalizes the arguments, validates them against the
+tool's JSON Schema, dispatches, and caps the result. It decides nothing about
+whether the call may happen: possession of an `AdmittedCall` is what proves
+that, and only the ToolHost can produce one.
 
-| Concern | Target owner |
+Argument handling stays here, and that is not a policy: JSON and schema
+validation, field aliases, path-syntax normalization, legacy compatibility
+aliases, and a precise invalid-argument error are mechanical. What the
+registry may never do is guess a malformed intent, substitute a different
+tool, or change a call's meaning.
+
+The bounded result is a mechanical runtime guarantee, not a budget a caller
+negotiates: every dispatch is capped to the model's result budget, no tool can
+opt out, and there is one such cap. A capability may still have an
+INTRINSIC bound of its own — `run_command` spills oversized output to the
+artifact store and hands back a recovery locator — and the two are different
+things: an intrinsic bound is about what the capability can produce, the
+central cap is about what the model's context can hold.
+
+What left, and where it went:
+
+| Concern | Owner now |
 | --- | --- |
-| tool selection, work profile, read-only set, dynamic capability choice | Harness |
-| permission, approval | ToolHost |
-| ownership, write scope | ToolHost / runtime |
-| result budget | Harness / runtime result handling |
+| read-only overlay, profile forbid, zero-write-authority refusal | ToolHost (`resolve_policy`) |
+| which tools exist at all | the harness composition root |
+| capability handles | each tool, at construction |
+| harness controls | `leveler_agent::register_harness_controls` |
 
 The registry must not become a policy engine again.
+`crates/leveler-tools/tests/ownership_boundaries.rs` is the tripwire.
 
 ### 5.7 The tool layering, drawn
 
@@ -514,10 +580,13 @@ The registry must not become a policy engine again.
 └──────────────────────────────────────────────────┘
 ```
 
-The harness-control column is **already separate in the code**: those tools
-live in `crates/leveler-agent/src/injected_tools.rs`, not in the registry.
-`update_plan` is the exception — it sits in `leveler-tools` with the capability
-adapters. See §18.5.
+The harness-control column is separate in the code: those tools live in
+`crates/leveler-agent`, not in the tool crate. Seven are answered inside the
+loop from an injected `ToolDefinition` (`injected_tools.rs`); `update_plan` is
+a registered `Tool` (`update_plan.rs`) because it has a real result to render,
+and `register_harness_controls` puts it on the surface after the capability
+packs. It reuses the registry's one mechanical seam — normalization, schema
+validation, dispatch, the result cap — rather than reimplementing it.
 
 ---
 
@@ -575,34 +644,36 @@ EXTENSIONS           MCP tools from configured servers
 
 | Set | Count |
 | --- | --- |
-| `core_surface()` | 12 |
-| `model_surface(CapabilityPacks::ALL)` = core + 26 | 38 |
-| Harness control tools injected by the executor | 1–7, by condition |
+| `core_surface(&capabilities)` | 11 |
+| `model_surface(CapabilityPacks::ALL, &capabilities)` = core + 26 | 37 |
+| Harness controls (`update_plan` + 1–7 injected, by condition) | 2–8 |
 | MCP extensions | as configured |
 
-A pack is gated on a mechanical fact, never on the task or the model:
+A pack reaches the model only when the product mode ENABLED it and this host
+can provide it (§6.4). Neither answer is ever about the task or the model:
 
-| Pack | Tools | Condition |
-| --- | --- | --- |
-| Code Intelligence | `find_symbol`, `read_symbol`, `find_references`, `diagnostics`, `blast_radius` | on outside Economy |
-| VCS | `git_status`, `git_diff` | on outside Economy |
-| Web fetch | `web_fetch` | on outside Economy |
-| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` is set — the tool refuses without it |
-| Media | `view_image` | the model's profile declares `vision` |
-| Memory | `memory`, `remember`, `forget` | on outside Economy |
-| Skills | `load_skill` | on outside Economy |
-| Browser | `browser_*` (12) | Node is on `PATH` — the driver cannot start without it |
+| Pack | Tools | Available when | Enabled when |
+| --- | --- | --- | --- |
+| Code Intelligence | `find_symbol`, `read_symbol`, `find_references`, `diagnostics`, `blast_radius` | always — the scan fallback needs nothing installed | outside Economy |
+| VCS | `git_status`, `git_diff` | `git` is on `PATH` | outside Economy |
+| Web fetch | `web_fetch` | always | outside Economy |
+| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` is set — the tool refuses without it | outside Economy |
+| Media | `view_image` | the model's profile declares `vision` | outside Economy |
+| Memory | `memory`, `remember`, `forget` | always — the app hands the tools a store root | outside Economy |
+| Skills | `load_skill` | always | outside Economy |
+| Browser | `browser_*` (12) | Node is on `PATH` — the driver cannot start without it | outside Economy |
 
-`WorkProfile::Economy` composes `CapabilityPacks::NONE`: the primitives and the
+`WorkProfile::Economy` enables `CapabilityPacks::NONE`: the primitives and the
 protocol, nothing else. That is a user's decision about cost, not an inference
-about the task.
+about the task — and it holds however capable the machine is. An Economy turn
+on a laptop with a browser runtime, a search key and a vision model still sees
+eleven primitives plus the controls.
 
-**A defect worth naming.** An interactive turn reads the work profile from the
-`Application` default rather than from the session row
-(`crates/leveler-app/src/session.rs`, `run_in_session_with_content`), so
-`/work-mode economy` in the TUI does not shrink the next interactive turn's
-surface — it does for eval and resume, which read the row. One durable fact,
-two readers; the row is the owner. Not fixed here.
+**Availability no longer implies exposure.** The two answers are separate
+functions over separate inputs, and the intersection is the only way either
+reaches the model:
+`Application::capability_availability` (mechanical),
+`Application::capability_selection` (product), `CapabilityPacks::intersect`.
 
 ### 6.3 The Core Primitive Foundation
 
@@ -633,9 +704,16 @@ model can construct a patch.
 
 `core_registry()` and `full_registry()` were the historical answer to this
 question and were not the same set. They are gone: the composition is now
-`core_surface()` plus explicit `CapabilityPacks` (§6.2), so the primitive
-baseline and the model-visible surface are stated separately and neither is
-inferred from the other.
+`core_surface(&capabilities)` plus explicit `CapabilityPacks` (§6.2), so the
+primitive baseline and the model-visible surface are stated separately and
+neither is inferred from the other.
+
+`get_task` / `wait_task` / `kill_task` are in the core surface too, and not as
+a ninth primitive: `run_command` can start a background task, and a task the
+caller can neither observe nor stop is an orphan. They are that primitive's
+lifecycle. No harness control is in the core surface — a control is not a
+capability a host could turn off, so `leveler_agent::register_harness_controls`
+adds those separately (§18.5).
 
 ### 6.3.1 The five categories
 
@@ -671,14 +749,27 @@ report_finding                        child turn
 update_goal                           goal mode
 ```
 
-`update_plan` belongs here and is still registered in `leveler-tools`; see
-§18.5.
+`update_plan` belongs here and is registered here (`leveler-agent`); §18.5.
 
-**EXTENSIONS** — MCP-discovered tools, registered from configured servers and
-filtered out of delegated children.
+**EXTENSIONS** — MCP-discovered tools, registered from configured servers.
+This is the ONE extension boundary, and it is a process boundary on purpose:
+an MCP server runs in its own process, speaks JSON-RPC over stdio, and reaches
+the model only as an `McpTool` adapter that the ToolHost admits like any other
+call. There is no native plugin SDK and none is planned — a third-party
+in-process plugin would be code inside the runtime with the runtime's
+authority, which is exactly what admission exists to prevent.
 
-**RUNTIME OR USER ONLY** — implemented, and deliberately not advertised as an
-ordinary coding affordance:
+What the boundary costs, stated plainly: an MCP server is outside the OS
+sandbox and outside any claimed write scope, so two authorities cannot be
+enforced on it, and in both cases the call is REFUSED rather than run under an
+authority that does not reach it — a delegated agent may not use MCP at all,
+and a run with network access denied may not either. Under a confined profile
+every MCP call needs approval; standing trust is a permission rule, never a
+configuration default.
+
+**NOT A MODEL TOOL AT ALL** — these were implemented, taken off the surface in
+W1, and deleted here. An unregistered `Tool` implementation is a second answer
+waiting to be re-registered:
 
 ```text
 create_checkpoint / restore_checkpoint   the runtime checkpoints before every
@@ -697,12 +788,39 @@ about distinct intent and analysability (§6.5), decided in favour of both.
 The Harness decides what tools exist for the product.
 ```
 
-It decides from the work profile, the task type, the capabilities configured
-and the model profile. The kernel knows none of this.
+Three different questions, kept apart:
 
-`expand_tools` inverted that ownership, and is deleted. The architectural
-objection stood on its own; the implementation turned out never to have worked
-(§6.5).
+```text
+AVAILABLE   can this MACHINE provide the capability at all?
+            a browser runtime installed, a search key configured, git on
+            PATH, a model that accepts an image
+
+ENABLED     does the current product mode / session ASK for it?
+
+EXPOSED     what the model actually sees = ENABLED ∩ AVAILABLE
+```
+
+Being available buys nothing on its own. `Economy` enables no optional pack,
+so a machine with a browser runtime installed still shows a plain Economy turn
+zero browser tools. And asking for something the machine cannot do buys
+nothing either: a host with no search key exposes no `web_search` however much
+the product mode wants one.
+
+Neither side can widen the other, which is what makes the intersection a
+boundary rather than a suggestion
+(`crates/leveler-tools/tests/capability_composition.rs`).
+
+In the code: `Application::capability_availability` answers the first question
+from mechanical facts alone, `Application::capability_selection` answers the
+second from the work profile, `CapabilityPacks::intersect` produces the third,
+and `model_surface(packs, &capabilities)` composes it once, before the turn
+starts. `register_harness_controls` then adds the controls, which are not a
+capability a host could turn off.
+
+None of the three consults the model's ability or the task's difficulty
+(§1.1). `expand_tools` inverted this ownership and is deleted; the
+architectural objection stood on its own, and the implementation turned out
+never to have worked (§6.5).
 
 ### 6.5 Surface value is an evaluation decision, not an aesthetic one
 
@@ -732,12 +850,12 @@ one.
 | `replace` | **DELETED** | Zero calls in 1725, including through six `apply_patch` context-matching failures — the exact case it was built to absorb, where the model retried `apply_patch` every time. Its weak-model rationale is withdrawn (§1.1), and `edit` + `write` cover the intent. |
 | `read_symbol` | **OPTIONAL + EVAL_LOCKED** | Zero calls, but so are `find_symbol` and `find_references`, which suggests the language server never came up rather than that this tool is redundant. Off the default surface as part of the Code Intelligence pack; A/B-READ-SYMBOL is still owed. |
 | `blast_radius` | **OPTIONAL + EVAL_LOCKED** | An advanced derived operation, not a primitive. Same evidence problem as `read_symbol`; same disposition. |
-| `create_checkpoint` / `restore_checkpoint` | **RUNTIME OR USER ONLY** | Ownership, not usage: the runtime already checkpoints before every write and owns rollback and crash recovery. Asking the model when to checkpoint duplicates a runtime facility. Zero calls agrees. |
-| `consolidate_memory` | **RUNTIME OR USER ONLY** | Subsystem maintenance. It can run in the background, at session close, or on a user command. |
-| `create_skill` | **RUNTIME OR USER ONLY** | System customization. `load_skill` stays; creating one is the user's act. |
+| `create_checkpoint` / `restore_checkpoint` | **DELETED** | Ownership, not usage: the runtime already checkpoints before every write and owns rollback and crash recovery. Asking the model when to checkpoint duplicates a runtime facility. Zero calls agrees. W1 took them off the surface and left the code; the code is gone now — an unregistered `Tool` implementation is a second answer waiting to be re-registered. |
+| `consolidate_memory` | **DELETED** | Subsystem maintenance, not an agent tool. Off the surface in W1, deleted here, along with the `extract_memory_candidates` heuristic whose only caller it was. `remember` / `forget` remain the model-facing memory writes, and both stay consent-gated. |
+| `create_skill` | **DELETED** | System customization. `load_skill` stays; authoring a skill is the user's act, through the CLI. |
 | `forget` | **OPTIONAL (Memory pack)** | Destructive, but consent-gated: it raises an approval prompt, and correcting a memory the repository has outgrown is part of the work. Classified per operation, not per crate (§25). |
-| `shell_command` vs `run_command` | **BOTH STAY** | Distinct model intents, not two spellings of one. `run_command` is program+args — cross-platform, no shell quoting, trivially analysable for approval, and the only one that can background. `shell_command` is a shell line, which is what a pipeline or an `&&` chain actually is. The remaining asymmetry — `shell_command` cannot background — is recorded, not fixed. |
-| `git_status` / `git_diff` | **OPTIONAL (VCS pack)** | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell and replays cleanly. Keep the interface; move the implementation to `leveler-vcs`. |
+| `shell_command` vs `run_command` | **BOTH STAY** | Distinct model intents, not two spellings of one. `run_command` is program+args — cross-platform, no shell quoting, trivially analysable for approval, and the only one that can background. `shell_command` is a shell line, which is what a pipeline or an `&&` chain actually is. Both now run on one `CommandExecution`; the background asymmetry is deliberate and §18.3 D says why. |
+| `git_status` / `git_diff` | **OPTIONAL (VCS pack)** | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell and replays cleanly. The interface stayed; the implementation moved to `leveler_vcs::GitWorkflow::inspect`, so there is one place that knows how this product invokes `git`. |
 
 `list_files` and `find_files` are deliberately **not** merge candidates. They
 express different model intents — "what is in this directory" versus "where in
@@ -802,10 +920,10 @@ Counting production (non-test) call sites of `fs::write`, `fs::remove`,
 | `leveler-agent` | 0 | The Coding harness performs no side effect directly. |
 | `leveler-context` | 0 | Read-only assembly. |
 | `leveler-vcs` | 0 | Every git invocation goes through the execution runner. |
-| `leveler-tools` | 13 | `replace.rs` writes through `context.execution.workspace` (root fd, symlink-safe). `mcp.rs` spawns configured MCP servers directly. |
+| `leveler-tools` | 13 | `workspace/editor.rs` writes through the workspace root fd (symlink-safe). `mcp.rs` spawns configured MCP servers directly. |
 | `leveler-browser` | 15 | Driver install writes under the Leveler home; the driver process is spawned directly. |
 | `leveler-memory` | 11 | Writes the memory store under the Leveler home. |
-| `leveler-lsp` | 4 | Spawns language servers directly. |
+| `leveler-lsp` | 4 | Spawns language servers directly, from the session pool that owns their lifetime. |
 | `leveler-engine` | 3 | `git rev-parse` for the baseline commit. |
 | `leveler-skills` / `leveler-project` | 2 / 1 | Create state directories under the Leveler home. |
 
@@ -833,8 +951,8 @@ outside `CommandRunner`'s process-tree termination and sandbox semantics. See
 | `leveler-project` | Project language detection and filesystem layout. |
 | `leveler-memory` | Durable project memory store and its promotion pipeline. |
 | `leveler-skills` | Skill discovery and loading. |
-| `leveler-vcs` | Git operations, performed through the execution authority. |
-| `leveler-lsp` | Language-server sessions, reused across tool calls. |
+| `leveler-vcs` | Git operations, performed through the execution authority; `GitWorkflow::inspect` is how the read-only git tools invoke `git`, on the caller's runner. |
+| `leveler-lsp` | Language-server sessions (`LspSessions`), reused across tool calls; the one owner of client lifetime, startup and dead-server eviction. |
 | `leveler-browser` | Browser runtime, driver install, isolated per-project profile. |
 | `leveler-media` | Content-typed image import: real MIME from content, decode and pixel limits, EXIF stripping, downscaling, content-addressed storage. |
 
@@ -1201,17 +1319,29 @@ The kernel and the tool boundary pass. `leveler-agent-core` depends only on
 methods a Review harness can implement its own way. `AgentHarness` is already
 implemented by a real harness.
 
+What now passes that did not before:
+
+- `leveler-model` no longer knows any Coding tool name (§18.6), so a Review
+  tool set inherits nothing but the protocol.
+- Nothing about the Coding tool plumbing is required to compose a surface: a
+  harness that wants its own tools registers its own, and
+  `register_harness_controls` shows the shape — a harness adds what steers it,
+  on top of whatever capabilities the host composed.
+
 What does not pass yet:
 
 - A Review harness that wants persistence, resume, event ordering and recovery
   goes through `leveler-engine`, which depends on `leveler-agent` and whose
-  public API names `CodingTaskSpec` (§18.1).
-- `leveler-model` knows the names and execution classes of Coding built-in
-  tools, so a Review tool set inherits a vocabulary written for Coding
-  (§18.6).
+  public API names `CodingTaskSpec` (§18.1). This is the whole of what is
+  left, and it is W3.
 
-Neither forces a kernel change, which is why this is "not yet enforced" rather
-than "fail". They are the inputs to Foundation Hardening.
+That does not force a kernel change, which is why this is "not yet enforced"
+rather than "fail". It is the input to Foundation Hardening.
+
+**No second harness has been written.** Nothing here was proven by building
+one, and a demo harness invented to validate the design would be a fake
+consumer (§5.3). The claim is only that the foundation no longer requires the
+Coding tool plumbing — not that a second harness exists.
 
 **Do not modify code to convert this verdict to PASS as part of a
 documentation change.**
@@ -1245,32 +1375,32 @@ drive without naming `leveler_agent`, with `ExecutorFactory` moving above it.
 execution configuration; splitting it badly reintroduces the multiple-
 derivation bug it was built to remove.
 
-### 18.2 ToolContext is a universal service locator
+### 18.2 ToolContext was a universal service locator (closed)
 
-**Current.** Every tool receives `ExecutionResources + ToolPolicy +
-ToolServices + session_scope`, with `ToolServices` naming `lsp_sessions`,
-`lsp_start_locks`, `artifact_store`, `memory_root`, `background_tasks` and
-`browser` as fields.
+**Was.** Every tool received `ExecutionResources + ToolPolicy + ToolServices +
+session_scope`, with `ToolServices` naming `lsp_sessions`, `lsp_start_locks`,
+`artifact_store`, `memory_root`, `background_tasks` and `browser` as fields.
 
-**Desired.** Explicit dependency injection; a tool receives only the
-capability it needs; per-call context carries only dynamic invocation state or
-host-minted authority.
+**Now.** `ToolServices` is deleted. Every tool is constructed with the handles
+it uses; `ToolContext` carries the execution substrate, the per-call authority
+and the session identity, and nothing else. See §5.5 for the shape and the
+per-tool table, and `crates/leveler-tools/tests/ownership_boundaries.rs` for
+the tripwire.
 
-**Why it violates the constitution.** Tools own service discovery they should
-not have, and a Review-specific tool needing none of it still takes the shape.
-
-**Minimal correction.** Let it shrink as a consequence of capability
-extraction. Do not design a replacement container first.
-
-**Risk.** Low if it follows extraction; high if a `V2` container is invented
-ahead of the extraction it is supposed to serve.
+**Still open.** `ExecutionResources` remains a shared facet — workspace,
+runner, environment, checkpoint, file fingerprints, command gate. Those are
+the substrate a call is anchored to rather than services a tool discovers, and
+the write scope resolves against the workspace root, so they were left where
+they are. Whether the runner and the command gate should reach only the
+command tools is a real question and a smaller one; it is not a service
+locator either way.
 
 ### 18.3 Concrete tool implementation debts
 
 Each of these is a tool implementing capability behavior it should be calling.
-A–C and H are closed by the Core Primitive Foundation work and are kept here
-with what was actually done, and with what is still open inside each; D–G are
-open.
+A–C and H were closed by the Core Primitive Foundation work; D, E and F are
+closed now; G is open by decision, not by omission. Each is kept with what was
+actually done and with what is still open inside it.
 
 #### A. `read_file` still carries the stale-write observation (mostly closed)
 
@@ -1350,58 +1480,89 @@ The code did not change — it was already the shared commit path, but it lived
 inside the `replace` tool, so the shared runtime was named after one of its
 callers. Only the owner moved.
 
-#### D. `run_command` owns most of command execution
+#### D. Command execution has one owner (closed)
 
-`run_command` currently carries sandbox setup, environment, network policy,
+`run_command` used to carry sandbox setup, environment, network policy,
 background processes, snapshots, mutation accounting, write scope, rollback,
-the command gate, process lifecycle, and — since `6724268` — subtracting the
-paths a HEAD move explains from what the run reports as authored.
+the command gate and process lifecycle — and `shell_command` imported
+`run_command::execute_program` for its own runtime, so one tool looked like
+the owner of the other.
 
-**Target.** `RunCommandTool` and `ShellCommandTool` are adapters over a
-`CommandExecution` capability, which calls `leveler-execution`.
+That runtime is now `crates/leveler-tools/src/tools/command_execution.rs`.
+Both tools are constructed with it; neither owns it. Each keeps exactly its
+own model interface: `run_command` decodes argv and phrases the two refusals
+that mean "you wanted the other tool", `shell_command` maps a shell line onto
+the platform shell and runs the hang guards.
 
-**Risk.** Medium. Cancellation and process-tree termination semantics must not
-change.
+**Still open.** The module lives in `leveler-tools`, not in
+`leveler-execution`, because it reads the per-call authority off `ToolContext`
+and returns a `ToolOutput` — types the layer below the tools must not depend
+on. Moving it further down would need the authority and the result shape to
+move with it, which is a larger question than this one.
 
-#### E. Code intelligence lifecycle lives in the tools
+**`shell_command` has no `background=true`, deliberately.** Mechanically it
+could: a shell line IS `program + args`, and `proven_executed_commands`
+already attributes a shell script. What breaks is the lifecycle guarantee.
+`run_command(background=true)` registers the long-lived process ITSELF, so
+`kill_task` and the session reaper actually kill it. A detached shell can exit
+immediately after spawning its own child — `shell_command(cmd="python app.py
+&")` — leaving the registry holding a task that reports `Exited` while the
+real process runs on, unreapable. The asymmetry is not cosmetic, and the
+existing guard already points the model at the tool whose lifecycle is honest.
+
+#### E. Code intelligence has one owner (closed)
 
 `find_symbol`, `read_symbol`, `find_references`, `diagnostics` and
-`blast_radius` each contain LSP discovery, session lifecycle, startup and
-fallback scanning.
+`blast_radius` each contained LSP discovery, session lifecycle and startup —
+and `find_symbol` carried a second copy of the locate logic that
+`symbols.rs` already had. Three of them also carried three DIFFERENT source
+walks: one keyed on `repo_map::is_source`, two on a shorter hardcoded
+extension list, so the same repository had two ideas of what counts as source.
 
-**Target.** One `CodeIntelligence` capability owning LSP lifecycle, symbol
-queries, references, diagnostics and a deterministic fallback. Tools do
-model-facing invocation only.
+`leveler_lsp::LspSessions` now owns the session pool, startup, dead-server
+eviction and `locate`; every one of the five tools is constructed with it. The
+source walk is one function in `tools/symbols.rs`.
 
-**Risk.** Low-medium.
+**The dependency-free fallbacks stay, and stay labelled.** `find_symbol` and
+`read_symbol` answer from a scan when no language server is installed, and the
+result says `(via scan)` where the precise answer says `(via rust-analyzer)`.
+They answer a WEAKER question — which files define the name, not where — and
+saying so is the point. What would be wrong is a fallback that presented
+itself as the server's answer; `LspSessions::locate` returning `None` means
+"no language server answer" and nothing more.
 
-#### F. `view_image` duplicates — and weakens — `leveler-media`
+#### F. `view_image` duplicated — and weakened — `leveler-media` (closed)
 
-`view_image` decides the MIME type from the file extension, reads the bytes
-and base64-encodes them. `leveler-media` detects the real MIME from content,
-bounds decode allocation and pixel count against decompression bombs, strips
-EXIF by re-encoding, downscales oversized images and stores them
-content-addressed.
+`view_image` used to decide the MIME type from the file EXTENSION, read the
+bytes and base64-encode them: no content sniffing, no pixel bound, no EXIF
+strip. So a JPEG named `.png` was declared `image/png` to the provider, a
+decompression bomb was only bounded by a 5 MB byte cap, and a photo's GPS tags
+went out with it. Meanwhile `leveler-media` — whose only consumer was the user
+attachment path — did all three.
 
-`leveler-tools` does not depend on `leveler-media` at all, and
-`leveler-media`'s only consumer is `leveler-app`. So the user-attachment path
-is hardened and the model-facing tool path is not.
+The pipeline is now one function, `leveler_media::process_image`: real type
+from content, byte and pixel bounds before the decoder allocates, downscale to
+the longest-edge cap, re-encode to PNG. `MediaStore::import_bytes` calls it
+and then hashes and stores; `view_image` calls it and then base64-encodes.
+`leveler-tools` gained a dependency on `leveler-media` to do it, which is the
+right direction: the tool layer calls the capability.
 
-**Target.** `ViewImageTool → Media capability`.
-
-**Risk.** Low. This one is close to a straight defect.
-
-#### G. `web_search` owns provider configuration
+#### G. `web_search` owns provider configuration (open, by decision)
 
 The tool reads `LEVELER_SEARCH_API_KEY`, `LEVELER_SEARCH_PROVIDER` and
-`LEVELER_SEARCH_CX` from the environment, builds its own HTTP client, and
-implements both the Bing and Google Custom Search request and response
+`LEVELER_SEARCH_CX` from the environment snapshot, builds its own HTTP client,
+and implements both the Bing and Google Custom Search request and response
 shapes.
 
-**Target.** `WebSearchTool → Search capability / provider`. The tool does not
-know provider credentials or configuration.
+**Left open on purpose.** There is one caller, one place the two provider
+shapes are written down, and no second consumer of a search capability. A
+`SearchProvider` extracted now would be a wrapper with one implementation and
+one user — the abstraction §5.3 exists to prevent. The audit found no
+duplicate runtime and no Host Authority bypass here: the tool goes through
+admission like any other, and `web_fetch` shares its SSRF gate.
 
-**Risk.** Low.
+Extract it when a second consumer appears, or when a second provider shape has
+to be added.
 
 #### H. Background settlement belongs to the runtime (closed)
 
@@ -1444,55 +1605,54 @@ still host processes outside the authority that owns host processes.
 **Risk.** Low to medium. Sidecar lifetime is entangled with daemon shutdown
 reaping.
 
-### 18.5 `update_plan` sits with the capability adapters
+### 18.5 `update_plan` sat with the capability adapters (closed)
 
-`update_plan` is a harness control — it carries no capability, touches no
-`ToolContext` field, and exists only because the Coding harness has a plan
-protocol. The other seven controls live in
-`crates/leveler-agent/src/injected_tools.rs`; this one is registered in
-`leveler-tools`.
+`update_plan` is a harness control: it carries no capability, touches no
+capability handle, and exists only because the Coding harness has a plan
+protocol. It was registered in `leveler-tools` alongside the capability
+adapters while the other seven controls lived in `leveler-agent`.
 
 **Why it did not move in W1.** The injected path bypasses the registry
-entirely, so moving it would mean hand-reimplementing four registry services
-for one tool: `normalize_input` (it repairs a nested-envelope shape models
-emit), JSON-Schema validation, the `schemars`-derived schema, and output
-capping. It would also need the metadata→`PlanUpdated` path rewired, because
-the injected interception arms build a tool result directly and never produce
-metadata for `extract_plan` to read.
+entirely, so moving it then would have meant hand-reimplementing four registry
+services for one tool: `normalize_input` (it repairs a nested-envelope shape
+models emit), JSON-Schema validation, the `schemars`-derived schema, and
+output capping.
 
-That is not a reason to keep the wrong owner; it is a sign the move belongs
-after the registry stops owning policy. **W2 blocker.**
+**What moved.** It is now `crates/leveler-agent/src/update_plan.rs`, and
+`register_harness_controls` puts it on the surface after the capability packs.
+It stayed a registered `Tool` rather than becoming an eighth injected
+definition, because the registry is now a mechanical seam and not a policy
+engine — so reusing it costs nothing and reimplementing it would have cost
+four duplicated services. Validation, the derived schema, dispatch and the
+result cap are the registry's; the `metadata.plan` → `PlanUpdated` path is
+unchanged.
 
-### 18.6 `leveler-model` knows the Coding tool names
+The `core_surface` no longer registers any control, and the harness registers
+no capability. `leveler-tools` composes what the host can do;
+`leveler-agent` composes what steers the harness.
 
-**Current.** `crates/leveler-model/src/tool_catalog.rs` hard-codes `grep`,
+### 18.6 `leveler-model` knew the Coding tool names (closed by deletion)
+
+**Was.** `crates/leveler-model/src/tool_catalog.rs` hard-coded `grep`,
 `find_files`, `find_symbol`, `read_symbol`, `find_references`, `list_files`,
 `read_file`, `git_status`, `git_diff`, `view_image`, `web_search`,
 `web_fetch`, `apply_patch`, `replace`, `run_command` and `shell_command`, and
-derives from them an execution class (`Search` / `Read` / `Write`), a
-replay-safety answer, a primary argument and an observe key.
+derived from them an execution class, a replay-safety answer, a primary
+argument and an observe key. It still listed `replace`, which had already been
+deleted — the exact failure mode a second copy of a name list has.
 
-Its real consumers are `leveler-agent` (observe key),
-`leveler-client-protocol` (safe-replay decision) and `leveler-tui` (display).
-The crate comment states the motive plainly: "execution policy must not
-duplicate name lists and argument-field guesses across crates". The motive is
-sound; the location is not.
+**How it closed.** By deleting it, not by moving it. The audit found the
+catalog had almost no live consumers:
 
-**Desired.** `leveler-model` knows only `ToolDefinition`, `ToolCall`,
-`ToolResult` and `ToolChoice`. Built-in Coding tool metadata belongs to the
-harness or to the tool composition that owns those tools.
+| Export | Consumer | Outcome |
+| --- | --- | --- |
+| `is_safe_replay_tool` | `leveler_client_protocol::recovery_for_tool` | `recovery_for_tool` and its `Recovery` enum were themselves dead — re-exported, never called. Both deleted. The live answer is `Tool::replay_is_side_effect_free`, which the registry asks and which an unknown name answers `false`. |
+| `builtin_tool_metadata(…).primary_argument` | `leveler-tui`'s `find_files` label | Inlined as `s("pattern")`, next to the forty other tool labels in the same match. Presentation metadata belongs to the client (§5.2). |
+| `is_search_tool`, `builtin_observe_key`, `BuiltinToolClass` | nothing | Deleted. |
 
-**Why it violates the constitution.** Rule 1, directly. A foundation primitive
-enumerates product tools, and every harness built on `leveler-model` inherits
-a Coding vocabulary.
-
-**Minimal correction.** Move the catalog to the layer that owns the tool set,
-and give the three consumers a way to reach it that does not run through a
-foundation primitive. Note that one exported function, `is_search_tool`, has
-no callers outside the crate.
-
-**Risk.** Medium. Three consumers across three layers currently share this;
-the replacement must not become three copies of the same list.
+So there is no second name table anywhere — not a moved one either.
+`crates/leveler-tools/tests/ownership_boundaries.rs` fails if a coding tool
+name reappears in `leveler-model`'s production code.
 
 ### 18.7 `ToolOutput.metadata` is an untyped internal side channel
 
@@ -1649,20 +1809,32 @@ MODEL_CAPABILITY_POLICY_DEFINED   YES
 WEAK_MODEL_COMPENSATION_GOAL      REMOVED
 CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
-TOOL_IMPLEMENTATION_ALIGNED       NO
+TOOL_IMPLEMENTATION_ALIGNED       YES
 ENGINE_IMPLEMENTATION_ALIGNED     NO
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
 TOOL_SURFACE_CLOSED               YES
+CAPABILITY_MODEL_CLOSED           YES
+AVAILABLE_ENABLED_EXPOSED         SEPARATED
 PLAN_ENFORCEMENT                  REMOVED
 EDIT_MATCHING                     EXACT
-TOOLREGISTRY_CLOSED               NO
-TOOLCONTEXT_CLOSED                NO
+TOOLREGISTRY_CLOSED               YES
+TOOLCONTEXT_CLOSED                YES
+FOUNDATION_TOOL_NAME_LEAKAGE      NONE
+WORK_PROFILE_AUTHORITY            SESSION_ROW
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
+SECOND_HARNESS_WRITTEN            NO
 FOUNDATION_FROZEN                 NO
 ```
 
-The architecture, the tool boundary and the model-visible surface are decided,
-and the seven core primitives are implemented against them. `ToolContext`,
-`ToolRegistry` and the engine are not, and §18 says where. No source was changed
-to improve any line of this table.
+The architecture, the tool boundary and the model-visible surface are decided;
+the seven core primitives, the capability ownership and the composition are
+implemented against them. What is left is the engine: it still names
+`leveler_agent` and `CodingTaskSpec` (§18.1), which is the only reason
+`SECOND_HARNESS_TEST` is not enforced.
+
+Four lines went from NO to YES because the code changed, not the prose:
+`ToolServices` is deleted, the registry decides no authorization,
+`leveler-model` holds no tool name, and a turn's work profile comes from the
+session row. Each has a tripwire named in its section. Nothing here was
+changed to improve a line of this table.

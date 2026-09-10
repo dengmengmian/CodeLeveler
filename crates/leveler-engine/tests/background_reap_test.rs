@@ -22,7 +22,7 @@ use leveler_model::{
     ModelRef, ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
 use leveler_storage::Database;
-use leveler_tools::{ToolContext, default_registry};
+use leveler_tools::ToolContext;
 use leveler_verifier::VerificationPlan;
 
 const SESSION_SCOPE: &str = "sess-under-test";
@@ -158,9 +158,15 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         environment.clone(),
     ));
     let tool_context =
-        ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment)
-            .with_background_tasks(registry.clone())
+        ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment.clone())
             .with_session_scope(SESSION_SCOPE);
+    // ONE registry: the tools that start and manage background tasks, and the
+    // engine that reaps them at terminal settlement, must be looking at the
+    // same one — that is the whole subject of this file.
+    let capabilities = leveler_tools::Capabilities::in_process(environment)
+        .with_background_tasks(registry.clone());
+    let tool_registry =
+        leveler_tools::model_surface(leveler_tools::CapabilityPacks::ALL, &capabilities);
     let runtime = Arc::new(MockRuntime::new(responses));
     let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
@@ -168,12 +174,14 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime,
-            registry: Arc::new(default_registry()),
+            registry: Arc::new(tool_registry),
             tool_context,
             model: ModelRef::new("mock", "m"),
             commit_co_author: false,
             overrides: None,
             memory_index: String::new(),
+            memory_root: None,
+            background_tasks: registry.clone(),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),

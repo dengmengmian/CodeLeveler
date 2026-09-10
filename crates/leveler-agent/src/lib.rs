@@ -21,6 +21,7 @@ mod nudges;
 pub mod ownership;
 mod prompt;
 mod sub_agent;
+mod update_plan;
 
 // The kernel owns these: one definition of what a spent budget is, shared by
 // the loop that enforces it and the outcome that reports it.
@@ -45,3 +46,4 @@ pub use leveler_lifecycle::{
 };
 pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};
+pub use update_plan::{UpdatePlanTool, register_harness_controls};

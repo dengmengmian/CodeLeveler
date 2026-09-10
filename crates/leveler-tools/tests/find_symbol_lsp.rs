@@ -56,15 +56,18 @@ async fn find_symbol_with_rust_analyzer() -> String {
     )
     .unwrap();
 
-    // Build ONE context and reuse it: `ToolContext` caches the language-server
-    // session, so the same rust-analyzer keeps indexing between polls instead of
-    // a fresh server racing the indexer on every call (the source of the earlier
+    // Build ONE tool and reuse it: the language-server session pool it holds
+    // keeps the same rust-analyzer indexing between polls instead of a fresh
+    // server racing the indexer on every call (the source of the earlier
     // flakiness). Poll until indexing settles and the precise location resolves.
     let ws = Workspace::new(&dir).unwrap();
     let ctx = ToolContext::new(ws, PermissionProfile::RequestApproval);
+    let tool = FindSymbolTool::new(std::sync::Arc::new(leveler_lsp::LspSessions::new(
+        std::sync::Arc::new(leveler_core::environment().clone()),
+    )));
     let mut out = String::new();
     for _ in 0..20 {
-        out = FindSymbolTool
+        out = tool
             .execute(
                 serde_json::json!({ "symbol": "special_marker_fn" }),
                 ctx.clone(),

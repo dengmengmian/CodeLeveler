@@ -2,6 +2,7 @@
 //! server (`textDocument/references`); falls back to a whole-word scan.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -9,8 +10,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
+use leveler_lsp::{Located, LspSessions};
 
-use super::symbols::{column_of, lsp_locate, relativize};
+use super::symbols::{collect_source_files, column_of, relativize};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 200;
@@ -21,7 +23,16 @@ struct Input {
     symbol: String,
 }
 
-pub struct FindReferencesTool;
+/// Constructed with the language-server sessions it uses, and nothing else.
+pub struct FindReferencesTool {
+    lsp: Arc<LspSessions>,
+}
+
+impl FindReferencesTool {
+    pub fn new(lsp: Arc<LspSessions>) -> Self {
+        Self { lsp }
+    }
+}
 
 #[async_trait]
 impl Tool for FindReferencesTool {
@@ -57,9 +68,8 @@ impl Tool for FindReferencesTool {
         let root = context.execution.workspace.root().to_path_buf();
 
         // Precise: locate the definition, then ask the server for references.
-        if let Some((language, matches)) = lsp_locate(&context, &root, &input.symbol).await
-            && let Some(m) = matches.first()
-            && let Some(body) = lsp_references(&context, language, m, &input.symbol, &root).await
+        if let Some(located) = self.lsp.locate(&root, &input.symbol).await
+            && let Some(body) = lsp_references(&located, &input.symbol, &root).await
         {
             return Ok(ToolOutput::ok(body));
         }
@@ -109,14 +119,11 @@ impl Tool for FindReferencesTool {
 }
 
 /// Query the language server for references to the located symbol.
-async fn lsp_references(
-    context: &ToolContext,
-    language: leveler_project::Language,
-    def: &leveler_lsp::SymbolLocation,
-    symbol: &str,
-    root: &Path,
-) -> Option<String> {
-    let spec = leveler_lsp::server_for(language)?;
+///
+/// Reuses the session that answered the definition query — a second lookup
+/// could race a restart and answer about a different generation of the index.
+async fn lsp_references(located: &Located, symbol: &str, root: &Path) -> Option<String> {
+    let def = located.definitions.first()?;
     let def_path = Path::new(&def.path);
     let line_text = std::fs::read_to_string(def_path)
         .ok()?
@@ -126,22 +133,20 @@ async fn lsp_references(
         .to_string();
     let character = column_of(&line_text, symbol);
 
-    // Clone the session Arc out, then drop the lock before the LSP requests so
-    // concurrent LSP tools don't serialize on the global sessions mutex.
-    let client = {
-        let sessions = context.services.lsp_sessions.lock().await;
-        sessions.get(language.as_str())?.clone()
-    };
     // References need the document open.
-    let _ = client.open(def_path, &spec.language_id).await;
-    let refs = client
+    let _ = located
+        .client
+        .open(def_path, &located.spec.language_id)
+        .await;
+    let refs = located
+        .client
         .references(def_path, def.line, character, false)
         .await
         .ok()?;
     if refs.is_empty() {
         return None;
     }
-    let mut body = format!("References to `{symbol}` (via {}):\n", spec.program);
+    let mut body = format!("References to `{symbol}` (via {}):\n", located.spec.program);
     for r in refs.iter().take(MAX_HITS) {
         body.push_str(&format!("- {}:{}\n", relativize(&r.path, root), r.line + 1));
     }
@@ -153,45 +158,6 @@ async fn lsp_references(
         ));
     }
     Some(body)
-}
-
-const MAX_FILES: usize = 2000;
-
-fn collect_source_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    const IGNORED: &[&str] = &[
-        "target",
-        "node_modules",
-        ".git",
-        "dist",
-        "vendor",
-        ".leveler",
-    ];
-    const EXTS: &[&str] = &[
-        "rs", "go", "ts", "tsx", "js", "jsx", "py", "java", "c", "h", "cpp",
-    ];
-    if out.len() >= MAX_FILES {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if path.is_dir() {
-            if !IGNORED.contains(&name.as_str()) && !name.starts_with('.') {
-                collect_source_files(root, &path, out);
-            }
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| EXTS.contains(&e))
-            .unwrap_or(false)
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            out.push(rel.to_string_lossy().into_owned());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -210,7 +176,7 @@ mod tests {
         .unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
-        let out = FindReferencesTool
+        let out = FindReferencesTool::new(crate::tools::test_capabilities().lsp)
             .execute(
                 serde_json::json!({"symbol": "target"}),
                 ctx,
@@ -235,7 +201,7 @@ mod tests {
         std::fs::write(dir.join("lib.rs"), body).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
-        let out = FindReferencesTool
+        let out = FindReferencesTool::new(crate::tools::test_capabilities().lsp)
             .execute(
                 serde_json::json!({"symbol": "target"}),
                 ctx,
@@ -261,7 +227,7 @@ mod tests {
         std::fs::write(dir.join("lib.rs"), "fn other() {}\n").unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
-        let out = FindReferencesTool
+        let out = FindReferencesTool::new(crate::tools::test_capabilities().lsp)
             .execute(
                 serde_json::json!({"symbol": "missing"}),
                 ctx,

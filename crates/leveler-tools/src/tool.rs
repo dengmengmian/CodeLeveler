@@ -11,28 +11,34 @@ use leveler_execution::{
     SharedPermissionProfile, Workspace, WorkspaceError, WriteScope,
 };
 
-/// Shared, cheaply-cloneable context handed to every tool invocation,
-/// organized by ownership:
+/// Shared, cheaply-cloneable context handed to every tool invocation:
 ///
-/// - [`ExecutionResources`] — process-wide execution and write-safety
-///   infrastructure (shared `Arc`s, one instance for the whole run including
-///   sub-agents).
-/// - [`ToolPolicy`] — gates and budgets: the part that varies per engine,
-///   per turn, or per invocation. The only security-loosening switches live
-///   here behind named grant methods.
-/// - [`ToolServices`] — optional long-lived capabilities specific tools use
-///   (LSP, artifacts, memory, background tasks).
+/// - [`ExecutionResources`] — the execution substrate this call is anchored
+///   to: the workspace whose root the write scope is resolved against, the
+///   process runner, the rollback checkpoint, the read fingerprints, the
+///   workspace-wide command gate. Process-wide `Arc`s, one instance for the
+///   whole run including sub-agents.
+/// - [`ToolPolicy`] — the per-call authority: gates and budgets, and the
+///   frozen policy the ToolHost minted at admission. The only
+///   security-loosening switches live here behind named grant methods.
+/// - `session_scope` — which session this call belongs to.
 ///
-/// ANTI-GROWTH RULE: a new top-level field is not allowed. A new need must
-/// name its lifecycle and owner and join the matching facet — or justify, in
-/// review, why none of the three fits. Future extension-provided services and
-/// secret providers belong in [`ToolServices`]; a future remote executor is
-/// an [`ExecutionResources`] resource.
+/// It carries NO capability handles. There used to be a third facet,
+/// `ToolServices`, holding the language-server pool, the browser runtime, the
+/// memory root, the artifact store and the background task registry — so
+/// `read_file` was handed the browser and `grep` could start a language
+/// server. Every tool is now CONSTRUCTED with the handles it uses
+/// ([`crate::Capabilities`]), and a tool that has no business with a
+/// capability has no way to reach it.
+///
+/// ANTI-GROWTH RULE: a new top-level field is not allowed, and a new
+/// capability is not a candidate for one — it goes to the tools that use it at
+/// construction. What may live here is per-call authority or per-call
+/// identity, and it must name its owner in review.
 #[derive(Clone)]
 pub struct ToolContext {
     pub execution: ExecutionResources,
     pub policy: ToolPolicy,
-    pub services: ToolServices,
     /// Stable identity of the session this context serves, used to isolate
     /// per-session capability state (e.g. browser pages/refs — §18). `None` for
     /// non-session contexts (eval, one-shot CLI); those share a default scope.
@@ -223,33 +229,6 @@ impl ToolPolicy {
     }
 }
 
-/// Optional long-lived capabilities specific tools use. A future
-/// extension-provided service registers here, not as a new ToolContext field.
-#[derive(Clone)]
-pub struct ToolServices {
-    /// Long-lived language-server sessions, keyed by language, reused across
-    /// tool calls so servers index the workspace once (spec §26 LSP platform).
-    pub lsp_sessions:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<leveler_lsp::LspClient>>>>,
-    /// Per-language startup locks. Starting a server may take seconds; these
-    /// prevent duplicate starts without holding the global sessions mutex.
-    pub lsp_start_locks:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Where oversized command output is spilled (content-addressed) instead of
-    /// being silently truncated. `None` disables spilling (output is truncated
-    /// with a marker, the pre-artifact behavior).
-    pub artifact_store: Option<Arc<leveler_execution::ArtifactStore>>,
-    /// Durable project memory root (`Layout::memory_dir`). When set, memory
-    /// tools read/write here; when None, tools error clearly (no silent env).
-    pub memory_root: Option<std::path::PathBuf>,
-    /// Background process task registry (run_command background=true).
-    pub background_tasks: Option<std::sync::Arc<leveler_execution::BackgroundTaskRegistry>>,
-    /// Daemon-owned browser runtime, shared across turns so the browser (and its
-    /// isolated project profile) survives client disconnect. `None` disables the
-    /// browser tools (they error clearly). See `leveler_browser::BrowserRuntime`.
-    pub browser: Option<std::sync::Arc<leveler_browser::BrowserRuntime>>,
-}
-
 impl ToolContext {
     pub fn new(workspace: Workspace, mode: PermissionProfile) -> Self {
         let env = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
@@ -288,16 +267,6 @@ impl ToolContext {
                 command_foreign_paths: Arc::new(Vec::new()),
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
-            services: ToolServices {
-                lsp_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-                lsp_start_locks: Arc::new(
-                    tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                ),
-                artifact_store: None,
-                memory_root: None,
-                background_tasks: None,
-                browser: None,
-            },
             session_scope: None,
         }
     }
@@ -334,40 +303,9 @@ impl ToolContext {
         self.session_scope.as_deref().unwrap_or("default")
     }
 
-    /// Share a background task registry across tool calls.
-    pub fn with_background_tasks(
-        mut self,
-        registry: std::sync::Arc<leveler_execution::BackgroundTaskRegistry>,
-    ) -> Self {
-        self.services.background_tasks = Some(registry);
-        self
-    }
-
-    /// Share the daemon-owned browser runtime across tool calls.
-    pub fn with_browser(
-        mut self,
-        runtime: std::sync::Arc<leveler_browser::BrowserRuntime>,
-    ) -> Self {
-        self.services.browser = Some(runtime);
-        self
-    }
-
     /// Force Safe-only tools (collaboration plan / read-only planning).
     pub fn with_read_only(mut self, on: bool) -> Self {
         self.policy.read_only = on;
-        self
-    }
-
-    /// Project memory store directory (active/ + archive/).
-    pub fn with_memory_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.services.memory_root = Some(root.into());
-        self
-    }
-
-    /// Spill oversized command output to `store` (content-addressed) instead of
-    /// truncating it, so the full output stays retrievable.
-    pub fn with_artifact_store(mut self, store: Arc<leveler_execution::ArtifactStore>) -> Self {
-        self.services.artifact_store = Some(store);
         self
     }
 

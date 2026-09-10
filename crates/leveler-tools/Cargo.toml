@@ -18,6 +18,8 @@ leveler-lsp = { workspace = true }
 leveler-browser = { workspace = true }
 leveler-skills = { workspace = true }
 leveler-memory = { workspace = true }
+leveler-media = { workspace = true }
+leveler-vcs = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
 regex = { workspace = true }
@@ -43,5 +45,6 @@ cap-tempfile = { workspace = true }
 
 [dev-dependencies]
 leveler-test-support = { workspace = true }
+image = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }

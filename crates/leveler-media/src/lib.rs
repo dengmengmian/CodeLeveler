@@ -90,6 +90,88 @@ pub struct StoredImage {
     pub size_bytes: u64,
 }
 
+/// The MIME type every processed image carries. Processing always re-encodes,
+/// so a stored or request-bound image is always a PNG whatever came in.
+pub const PROCESSED_MIME: &str = "image/png";
+
+/// An image that has been through the import pipeline: bounded, decoded,
+/// downscaled if needed, and re-encoded to PNG (which is what strips EXIF).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessedImage {
+    /// The normalized PNG bytes.
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Validate and normalize source image bytes.
+///
+/// The ONE image pipeline: the real type comes from the CONTENT and never from
+/// a filename (spec §45), the byte size and pixel count are bounded before the
+/// decoder allocates anything, an oversized image is downscaled to
+/// [`MAX_DIMENSION`], and the result is re-encoded to PNG — which is how EXIF
+/// (camera model, GPS) stops reaching a provider.
+///
+/// Both callers go through here: [`MediaStore::import_bytes`], which then
+/// hashes and stores the result, and the `view_image` tool, which base64-encodes
+/// it for the next model request. `view_image` used to carry its own path —
+/// extension-derived MIME, a byte cap and nothing else — so an image the model
+/// was shown could be mislabelled, unbounded in pixels, and still carrying its
+/// EXIF.
+pub fn process_image(bytes: &[u8]) -> Result<ProcessedImage, MediaError> {
+    let len = bytes.len() as u64;
+    if len > MAX_IMAGE_BYTES {
+        return Err(MediaError::TooLarge(len));
+    }
+
+    // Real type from content, not the extension (spec §45).
+    let mime = infer::get(bytes).map(|t| t.mime_type().to_string());
+    let Some(kind) = mime.as_deref().and_then(ImageKind::from_mime) else {
+        return Err(MediaError::Unsupported(
+            mime.unwrap_or_else(|| "unknown".to_string()),
+        ));
+    };
+    let format = kind.image_format();
+
+    // Read dimensions without materializing the pixel buffer. This must
+    // happen before decode so the pixel cap actually prevents image bombs.
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+    validate_pixel_count(width, height)?;
+
+    // Re-open the immutable byte slice for the full decode and enforce both
+    // the dimensions observed above and a bounded decoder allocation budget.
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+
+    // Downscale if the longest edge exceeds the cap.
+    let processed = if decoded.width().max(decoded.height()) > MAX_DIMENSION {
+        decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+
+    // Re-encode to PNG: deterministic and EXIF-free.
+    let mut png = Vec::new();
+    processed
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+
+    Ok(ProcessedImage {
+        png,
+        width: processed.width(),
+        height: processed.height(),
+    })
+}
+
 /// A content-addressed image store, rooted at a directory (`.leveler/media`).
 pub struct MediaStore {
     root: PathBuf,
@@ -119,69 +201,24 @@ impl MediaStore {
         self.import_bytes(&bytes)
     }
 
-    /// Import an image from raw bytes: validate, decode, bound, strip EXIF,
-    /// downscale, hash, and store (deduplicating by hash).
+    /// Import an image from raw bytes: process it through [`process_image`],
+    /// then hash and store the result (deduplicating by hash).
     pub fn import_bytes(&self, bytes: &[u8]) -> Result<StoredImage, MediaError> {
-        let len = bytes.len() as u64;
-        if len > MAX_IMAGE_BYTES {
-            return Err(MediaError::TooLarge(len));
-        }
-
-        // Real type from content, not the extension (spec §45).
-        let mime = infer::get(bytes).map(|t| t.mime_type().to_string());
-        let Some(kind) = mime.as_deref().and_then(ImageKind::from_mime) else {
-            return Err(MediaError::Unsupported(
-                mime.unwrap_or_else(|| "unknown".to_string()),
-            ));
-        };
-        let format = kind.image_format();
-
-        // Read dimensions without materializing the pixel buffer. This must
-        // happen before decode so the pixel cap actually prevents image bombs.
-        let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
-            .into_dimensions()
-            .map_err(|e| MediaError::Decode(e.to_string()))?;
-        validate_pixel_count(width, height)?;
-
-        // Re-open the immutable byte slice for the full decode and enforce both
-        // the dimensions observed above and a bounded decoder allocation budget.
-        let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(width);
-        limits.max_image_height = Some(height);
-        limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
-        reader.limits(limits);
-        let decoded = reader
-            .decode()
-            .map_err(|e| MediaError::Decode(e.to_string()))?;
-
-        // Downscale if the longest edge exceeds the cap.
-        let processed = if decoded.width().max(decoded.height()) > MAX_DIMENSION {
-            decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Lanczos3)
-        } else {
-            decoded
-        };
-
-        // Re-encode to PNG: deterministic and EXIF-free.
-        let mut out = Vec::new();
-        processed
-            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-            .map_err(|e| MediaError::Decode(e.to_string()))?;
-
-        let sha256 = hex(&Sha256::digest(&out));
+        let processed = process_image(bytes)?;
+        let sha256 = hex(&Sha256::digest(&processed.png));
         fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
         let path = self.root.join(format!("{sha256}.png"));
         if !path.exists() {
-            fs::write(&path, &out).map_err(|e| MediaError::Io(e.to_string()))?;
+            fs::write(&path, &processed.png).map_err(|e| MediaError::Io(e.to_string()))?;
         }
 
         Ok(StoredImage {
             sha256,
             path,
-            mime_type: "image/png".to_string(),
-            width: processed.width(),
-            height: processed.height(),
-            size_bytes: out.len() as u64,
+            mime_type: PROCESSED_MIME.to_string(),
+            width: processed.width,
+            height: processed.height,
+            size_bytes: processed.png.len() as u64,
         })
     }
 

@@ -3,6 +3,7 @@
 //! them; this tool opens the file, waits briefly for the server to publish, and
 //! renders them. Complements a full build: faster, file-scoped.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_lsp::Diagnostic;
+use leveler_lsp::{Diagnostic, LspSessions};
 use leveler_project::Language;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -25,7 +26,16 @@ struct Input {
     path: String,
 }
 
-pub struct DiagnosticsTool;
+/// Constructed with the language-server sessions it uses, and nothing else.
+pub struct DiagnosticsTool {
+    lsp: Arc<LspSessions>,
+}
+
+impl DiagnosticsTool {
+    pub fn new(lsp: Arc<LspSessions>) -> Self {
+        Self { lsp }
+    }
+}
 
 #[async_trait]
 impl Tool for DiagnosticsTool {
@@ -68,8 +78,7 @@ impl Tool for DiagnosticsTool {
                 input.path
             )));
         };
-        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
-        {
+        if !self.lsp.server_available(language) {
             return Ok(ToolOutput::ok(format!(
                 "(no language server available for {}; diagnostics unavailable — a full \
                  build via run_command still works)\n",
@@ -83,19 +92,10 @@ impl Tool for DiagnosticsTool {
             )));
         };
 
-        // Ensure a session, mirroring the code-intelligence tools. Clone the Arc
-        // out and drop the lock before `wait_for_diagnostics` (up to WAIT
-        // seconds) so a diagnostics call doesn't block every other LSP tool.
-        let key = language.as_str().to_string();
-        let client = match super::symbols::get_or_start_lsp(
-            &context,
-            &key,
-            &spec.program,
-            &spec.args,
-            &root,
-        )
-        .await
-        {
+        // Ensure a session, mirroring the code-intelligence tools. The pool
+        // holds no lock across `wait_for_diagnostics` (up to WAIT seconds), so
+        // a diagnostics call does not block every other LSP tool.
+        let client = match self.lsp.get_or_start(language, &spec, &root).await {
             Ok(client) => client,
             Err(error) => {
                 return Ok(ToolOutput::ok(format!(

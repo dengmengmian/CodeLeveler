@@ -292,10 +292,7 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
             }
         }
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
-        "find_files" => leveler_model::builtin_tool_metadata(name)
-            .and_then(|metadata| metadata.primary_argument)
-            .map(s)
-            .unwrap_or_default(),
+        "find_files" => s("pattern"),
         "update_plan" => s("explanation"),
         "update_goal" => update_goal_summary_text(&v, t),
         "task" => {

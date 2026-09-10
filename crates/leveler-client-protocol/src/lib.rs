@@ -56,9 +56,7 @@ mod wire_types;
 pub use approval::{UiApprovalRequest, UiClarificationRequest, UiPendingInteraction};
 pub use client::{ClientError, InteractiveRuntimeClient};
 pub use command::{ClientCommand, RestartReason};
-pub use command_envelope::{
-    CommandEnvelope, CommandReceipts, Receipt, Recovery, recovery_for_tool,
-};
+pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
 pub use event::{
     ChildContribution, NotificationLevel, REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES,

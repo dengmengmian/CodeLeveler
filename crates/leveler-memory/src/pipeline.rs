@@ -2,8 +2,8 @@
 //!
 //! Accept is the **user-consent** write path (same trust level as CLI
 //! `leveler memory remember`). Agent tools must not call [`MemoryStore::accept`]
-//! under auto-approve; K36 keeps model-facing `remember` / `forget` /
-//! `consolidate_memory` denied by [`leveler_execution::AutoApprove`].
+//! under auto-approve; K36 keeps model-facing `remember` / `forget` denied by
+//! [`leveler_execution::AutoApprove`].
 
 use std::fs;
 

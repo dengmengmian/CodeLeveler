@@ -4,7 +4,8 @@ pub mod applied_diff;
 mod apply_patch;
 mod blast_radius;
 mod browser;
-mod checkpoint;
+pub(crate) mod command_execution;
+pub(crate) use command_execution::CommandExecution;
 mod diagnostics;
 mod find_files;
 mod find_references;
@@ -24,7 +25,6 @@ pub use shell_guard::refuse_shell_script;
 mod skills;
 mod symbols;
 mod task_control;
-mod update_plan;
 mod view_image;
 mod web_fetch;
 mod web_search;
@@ -37,7 +37,6 @@ pub use browser::{
     BrowserPressTool, BrowserScreenshotTool, BrowserSelectTool, BrowserSnapshotTool,
     BrowserTabsTool, BrowserTypeTool, BrowserWaitTool,
 };
-pub use checkpoint::{CreateCheckpointTool, RestoreCheckpointTool};
 pub use diagnostics::DiagnosticsTool;
 pub use find_files::FindFilesTool;
 pub use find_references::FindReferencesTool;
@@ -45,14 +44,13 @@ pub use find_symbol::FindSymbolTool;
 pub use git::{GitDiffTool, GitStatusTool};
 pub use grep::GrepTool;
 pub use list_files::ListFilesTool;
-pub use memory::{ConsolidateMemoryTool, ForgetTool, MemoryTool, RememberTool};
+pub use memory::{ForgetTool, MemoryRoot, MemoryTool, RememberTool};
 pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
 pub use run_command::RunCommandTool;
 pub use shell_command::ShellCommandTool;
-pub use skills::{CreateSkillTool, LoadSkillTool};
+pub use skills::LoadSkillTool;
 pub use task_control::{GetTaskTool, KillTaskTool, WaitTaskTool};
-pub use update_plan::UpdatePlanTool;
 pub use view_image::ViewImageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
@@ -62,7 +60,7 @@ use crate::tool::ToolError;
 
 /// Deserialize schema-validated arguments into a typed input, mapping failure to
 /// [`ToolError::InvalidArguments`].
-fn parse_input<T: serde::de::DeserializeOwned>(
+pub fn parse_input<T: serde::de::DeserializeOwned>(
     tool: &str,
     input: serde_json::Value,
 ) -> Result<T, ToolError> {
@@ -83,7 +81,7 @@ fn parse_input<T: serde::de::DeserializeOwned>(
 ///
 /// The `$schema` key is dropped rather than bumped: a tool schema has no use for
 /// it, and leaving a draft-07 declaration next to `$defs` would be self-contradictory.
-fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
+pub fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
     let mut schema =
         serde_json::to_value(schemars::schema_for!(T)).unwrap_or(serde_json::Value::Null);
     normalize_to_draft_2020_12(&mut schema);
@@ -169,6 +167,25 @@ pub(crate) fn test_ctx(
         std::fs::write(&path, content).unwrap();
     }
     (test_ctx_in(&dir, profile), dir)
+}
+
+/// In-process capability handles for tool tests: a fresh language-server pool
+/// and background registry, no store, no memory root, no browser.
+#[cfg(test)]
+pub(crate) fn test_capabilities() -> crate::capabilities::Capabilities {
+    crate::capabilities::Capabilities::in_process(std::sync::Arc::new(
+        leveler_core::environment().clone(),
+    ))
+}
+
+/// The shared command runtime for tool tests.
+#[cfg(test)]
+pub(crate) fn test_commands() -> std::sync::Arc<CommandExecution> {
+    let capabilities = test_capabilities();
+    std::sync::Arc::new(CommandExecution::new(
+        capabilities.background_tasks,
+        capabilities.artifact_store,
+    ))
 }
 
 #[cfg(test)]

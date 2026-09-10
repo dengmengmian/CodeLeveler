@@ -20,7 +20,6 @@ pub mod protocol;
 pub mod request;
 pub mod response;
 pub mod runtime;
-pub mod tool_catalog;
 
 pub use error::{ModelError, ModelErrorKind};
 pub use event::{FinishReason, ModelEvent, TokenUsage};
@@ -39,7 +38,3 @@ pub use protocol::{
 pub use request::{ModelRef, ModelRequest, RequestMetadata, TransportPolicy};
 pub use response::ModelResponse;
 pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
-pub use tool_catalog::{
-    BuiltinToolClass, BuiltinToolMetadata, builtin_observe_key, builtin_tool_metadata,
-    is_safe_replay_tool, is_search_tool,
-};

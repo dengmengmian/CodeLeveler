@@ -17,8 +17,17 @@ use leveler_model::{
     ModelRef, ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
 use leveler_storage::{Database, MessageRepository, SessionRepository};
-use leveler_tools::{ToolContext, default_registry};
+use leveler_tools::ToolContext;
 use leveler_verifier::VerificationPlan;
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
 
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
@@ -145,6 +154,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             commit_co_author: false,
             overrides: None,
             memory_index: String::new(),
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),

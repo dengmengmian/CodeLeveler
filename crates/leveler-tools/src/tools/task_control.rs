@@ -1,5 +1,11 @@
 //! get_task / wait_task / kill_task — manage background process tasks.
+//!
+//! Each tool is CONSTRUCTED with the registry it manages. It is not optional:
+//! a background task nobody can observe or stop is an orphan, so the lifecycle
+//! tools and the primitive that starts them share one registry by
+//! construction rather than by hoping a context field was populated.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{BackgroundTaskStatus, RiskLevel};
+use leveler_execution::{BackgroundTaskRegistry, BackgroundTaskStatus, RiskLevel};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -55,7 +61,15 @@ fn format_snap(snap: &leveler_execution::BackgroundTaskSnapshot) -> String {
     )
 }
 
-pub struct GetTaskTool;
+pub struct GetTaskTool {
+    tasks: Arc<BackgroundTaskRegistry>,
+}
+
+impl GetTaskTool {
+    pub fn new(tasks: Arc<BackgroundTaskRegistry>) -> Self {
+        Self { tasks }
+    }
+}
 
 #[async_trait]
 impl Tool for GetTaskTool {
@@ -79,13 +93,11 @@ impl Tool for GetTaskTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.services.background_tasks else {
-            return Ok(ToolOutput::error("no background task registry"));
-        };
+        let reg = &self.tasks;
         match reg.get(input.task_id.trim()).await {
             Some(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
             None => Ok(ToolOutput::error(format!(
@@ -96,7 +108,15 @@ impl Tool for GetTaskTool {
     }
 }
 
-pub struct WaitTaskTool;
+pub struct WaitTaskTool {
+    tasks: Arc<BackgroundTaskRegistry>,
+}
+
+impl WaitTaskTool {
+    pub fn new(tasks: Arc<BackgroundTaskRegistry>) -> Self {
+        Self { tasks }
+    }
+}
 
 #[async_trait]
 impl Tool for WaitTaskTool {
@@ -125,13 +145,11 @@ impl Tool for WaitTaskTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: WaitInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.services.background_tasks else {
-            return Ok(ToolOutput::error("no background task registry"));
-        };
+        let reg = &self.tasks;
         let task_id = input.task_id.trim().to_string();
         let timeout = wait_interval(input.timeout_seconds);
         match reg.wait(&task_id, Some(timeout), &cancellation).await {
@@ -197,7 +215,15 @@ impl Tool for WaitTaskTool {
     }
 }
 
-pub struct KillTaskTool;
+pub struct KillTaskTool {
+    tasks: Arc<BackgroundTaskRegistry>,
+}
+
+impl KillTaskTool {
+    pub fn new(tasks: Arc<BackgroundTaskRegistry>) -> Self {
+        Self { tasks }
+    }
+}
 
 #[async_trait]
 impl Tool for KillTaskTool {
@@ -220,13 +246,11 @@ impl Tool for KillTaskTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: ToolContext,
+        _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.services.background_tasks else {
-            return Ok(ToolOutput::error("no background task registry"));
-        };
+        let reg = &self.tasks;
         match reg.kill(input.task_id.trim()).await {
             Ok(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
             Err(e) => Ok(ToolOutput::error(e)),
@@ -252,9 +276,13 @@ mod tests {
         // wait_task can roll the whole workspace back to a snapshot when a
         // background task violates its write allowlist — that is a mutation,
         // not a Safe read (and Safe implies auto-replay on crash recovery).
-        assert_eq!(WaitTaskTool.risk(), RiskLevel::WorkspaceWrite);
+        let reg = Arc::new(BackgroundTaskRegistry::new());
+        assert_eq!(
+            WaitTaskTool::new(reg.clone()).risk(),
+            RiskLevel::WorkspaceWrite
+        );
         // get_task stays a pure status read.
-        assert_eq!(GetTaskTool.risk(), RiskLevel::Safe);
+        assert_eq!(GetTaskTool::new(reg).risk(), RiskLevel::Safe);
     }
 
     #[test]
@@ -267,8 +295,8 @@ mod tests {
     #[tokio::test]
     async fn wait_interval_returns_running_as_ok_without_killing() {
         let dir = scratch_repo();
-        let (ctx, reg) = ctx_with_reg(dir.path());
-        let start = RunCommandTool
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let start = RunCommandTool::new(commands.clone())
             .execute(
                 serde_json::json!({
                     "program": "sleep",
@@ -288,7 +316,7 @@ mod tests {
             .expect("task_id")
             .to_string();
 
-        let wait = WaitTaskTool
+        let wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 1}),
                 ctx,
@@ -311,7 +339,18 @@ mod tests {
         let _ = reg.kill(&task_id).await;
     }
 
-    fn ctx_with_reg(dir: &std::path::Path) -> (ToolContext, Arc<BackgroundTaskRegistry>) {
+    /// The context, the ONE background registry, and the command runtime built
+    /// over it. `run_command(background)` and the lifecycle tools share the
+    /// registry by construction — a task started into one registry and waited
+    /// on through another is exactly the orphan this ownership makes
+    /// impossible.
+    fn ctx_with_reg(
+        dir: &std::path::Path,
+    ) -> (
+        ToolContext,
+        Arc<BackgroundTaskRegistry>,
+        Arc<crate::tools::CommandExecution>,
+    ) {
         let ws = Workspace::new(dir).unwrap();
         // Library tests do not install the application's global environment
         // capability. Give both the tool context and its background registry
@@ -325,9 +364,9 @@ mod tests {
         let reg = Arc::new(BackgroundTaskRegistry::with_environment(
             environment.clone(),
         ));
-        let ctx = ToolContext::with_environment(ws, PermissionProfile::Assisted, environment)
-            .with_background_tasks(reg.clone());
-        (ctx, reg)
+        let commands = Arc::new(crate::tools::CommandExecution::new(reg.clone(), None));
+        let ctx = ToolContext::with_environment(ws, PermissionProfile::Assisted, environment);
+        (ctx, reg, commands)
     }
 
     /// A background command that exits non-zero must surface as a tool ERROR
@@ -341,9 +380,9 @@ mod tests {
     #[tokio::test]
     async fn a_failing_background_command_is_reported_as_an_error_with_its_exit_code() {
         let dir = scratch_repo();
-        let (ctx, _reg) = ctx_with_reg(dir.path());
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
 
-        let start = RunCommandTool
+        let start = RunCommandTool::new(commands.clone())
             .execute(
                 serde_json::json!({
                     "program": "sh",
@@ -363,7 +402,7 @@ mod tests {
             .expect("task_id in spawn output")
             .to_string();
 
-        let wait = WaitTaskTool
+        let wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
                 ctx,
@@ -394,8 +433,8 @@ mod tests {
         run(dir.path(), &["add", "-A"]);
         run(dir.path(), &["commit", "-qm", "init"]);
 
-        let (ctx, _reg) = ctx_with_reg(dir.path());
-        let start = RunCommandTool
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let start = RunCommandTool::new(commands.clone())
             .execute(
                 serde_json::json!({
                     "program": "sh",
@@ -415,7 +454,7 @@ mod tests {
             .expect("task_id in spawn output")
             .to_string();
 
-        let wait = WaitTaskTool
+        let wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
                 ctx,
@@ -461,11 +500,11 @@ mod tests {
         run(dir.path(), &["add", "-A"]);
         run(dir.path(), &["commit", "-qm", "init"]);
 
-        let (ctx, _reg) = ctx_with_reg(dir.path());
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
         let constrained =
             ctx.with_command_write_constraints(Some(vec!["src".to_string()]), None, Vec::new());
 
-        let start = RunCommandTool
+        let start = RunCommandTool::new(commands.clone())
             .execute(
                 serde_json::json!({
                     "program": "sh",
@@ -485,7 +524,7 @@ mod tests {
             .expect("task_id")
             .to_string();
 
-        let wait = WaitTaskTool
+        let wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
                 constrained,
@@ -531,11 +570,11 @@ mod tests {
         run(dir.path(), &["add", "-A"]);
         run(dir.path(), &["commit", "-qm", "init"]);
 
-        let (ctx, _reg) = ctx_with_reg(dir.path());
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
         let constrained =
             ctx.with_command_write_constraints(Some(vec!["src".to_string()]), None, Vec::new());
 
-        let start = RunCommandTool
+        let start = RunCommandTool::new(commands.clone())
             .execute(
                 serde_json::json!({
                     "program": "sh",
@@ -554,7 +593,7 @@ mod tests {
             .expect("task_id")
             .to_string();
 
-        let wait = WaitTaskTool
+        let wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
                 constrained,

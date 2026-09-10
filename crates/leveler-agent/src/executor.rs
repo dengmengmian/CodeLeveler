@@ -1036,6 +1036,15 @@ pub struct Executor {
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
     memory_index: String,
+    /// Where durable project memory lives, for the RUNTIME's own reads: the
+    /// per-turn recall injection, and parking a `remember` proposal that no
+    /// human was there to approve. `None` = memory unconfigured.
+    ///
+    /// The harness needs this in its own right, so it holds it in its own
+    /// right. It used to read the memory tools' root out of
+    /// `ToolContext.services`, which made a tool's capability handle do double
+    /// duty as runtime state.
+    memory_root: Option<std::path::PathBuf>,
     /// Hard per-run limits on commands / modified files / wall-clock time,
     /// checked before each tool call (spec §27).
     step_limits: StepLimits,
@@ -1137,6 +1146,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
+            memory_root: None,
             step_limits: StepLimits::default(),
             permission_rules: std::sync::RwLock::new(
                 leveler_execution::PermissionRuleSet::default(),
@@ -1210,6 +1220,13 @@ impl Executor {
     /// Short INDEX lines injected into the system prompt (bodies never go here).
     pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
         self.memory_index = index.into();
+        self
+    }
+
+    /// Where the runtime reads durable memory for recall injection, and parks
+    /// a `remember` proposal nobody was available to approve.
+    pub fn with_memory_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.memory_root = root;
         self
     }
 
@@ -1455,6 +1472,9 @@ impl Executor {
             restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
+            // A child inherits the parent's memory location: recall and
+            // parking mean the same thing at any depth.
+            memory_root: self.memory_root.clone(),
             step_limits: StepLimits {
                 max_duration: Some(crate::sub_agent::SUB_AGENT_MAX_DURATION),
                 ..StepLimits::default()
@@ -1807,7 +1827,7 @@ impl Executor {
     /// result as a `Role::System` message immediately before the user message so
     /// the cached prefix is preserved and the block is stripped next turn.
     fn relevant_memory_injection(&self, request: &str) -> Option<String> {
-        let root = self.tool_context.services.memory_root.as_ref()?;
+        let root = self.memory_root.as_ref()?;
         let store = MemoryStore::open(root).ok()?;
         let hits = store.search(request, RECALL_K).ok()?;
         render_recall_block(hits.into_iter().filter(|(_, score)| *score >= RECALL_FLOOR))

@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -13,9 +14,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_lsp::SymbolSpan;
+use leveler_lsp::{LspSessions, SymbolSpan};
 
-use super::symbols::{column_of, lsp_locate, relativize};
+use super::symbols::{column_of, relativize};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const DEFAULT_DEPTH: usize = 2;
@@ -30,7 +31,16 @@ struct Input {
     max_depth: Option<usize>,
 }
 
-pub struct BlastRadiusTool;
+/// Constructed with the language-server sessions it uses, and nothing else.
+pub struct BlastRadiusTool {
+    lsp: Arc<LspSessions>,
+}
+
+impl BlastRadiusTool {
+    pub fn new(lsp: Arc<LspSessions>) -> Self {
+        Self { lsp }
+    }
+}
 
 #[async_trait]
 impl Tool for BlastRadiusTool {
@@ -68,7 +78,7 @@ impl Tool for BlastRadiusTool {
         let root = context.execution.workspace.root().to_path_buf();
 
         let resolver = LspResolver {
-            context: &context,
+            lsp: &self.lsp,
             root: &root,
         };
         let by_depth = compute_blast_radius(&input.symbol, max_depth, &resolver).await;
@@ -178,31 +188,23 @@ fn innermost_enclosing(spans: &[SymbolSpan], line: u64) -> Option<String> {
 
 /// The production resolver: LSP `references` mapped to enclosing symbols.
 struct LspResolver<'a> {
-    context: &'a ToolContext,
+    lsp: &'a Arc<LspSessions>,
     root: &'a Path,
 }
 
 #[async_trait]
 impl ImpactResolver for LspResolver<'_> {
     async fn referrers(&self, symbol: &str) -> Vec<Referrer> {
-        let Some((language, matches)) = lsp_locate(self.context, self.root, symbol).await else {
+        let Some(located) = self.lsp.locate(self.root, symbol).await else {
             return Vec::new();
         };
-        let Some(def) = matches.first() else {
+        let Some(def) = located.definitions.first() else {
             return Vec::new();
         };
-        let Some(spec) = leveler_lsp::server_for(language) else {
-            return Vec::new();
-        };
-        // Clone the session Arc out and drop the lock before the LSP requests so
-        // this BFS doesn't hold the global sessions mutex across many round-trips.
-        let client = {
-            let sessions = self.context.services.lsp_sessions.lock().await;
-            let Some(client) = sessions.get(language.as_str()) else {
-                return Vec::new();
-            };
-            client.clone()
-        };
+        // The session that answered the definition query IS the one this BFS
+        // queries: the pool holds no lock across these round-trips.
+        let spec = &located.spec;
+        let client = &located.client;
 
         let def_path = Path::new(&def.path);
         let line_text = std::fs::read_to_string(def_path)

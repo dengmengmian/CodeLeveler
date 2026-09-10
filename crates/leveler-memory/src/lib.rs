@@ -625,42 +625,6 @@ impl MemoryStore {
     }
 }
 
-/// Extract durable-looking candidate memories from a session transcript text.
-/// Does **not** write — caller must approve (or use auto_consolidate after user opt-in).
-pub fn extract_memory_candidates(transcript: &str, max: usize) -> Vec<MemoryEntry> {
-    let mut out = Vec::new();
-    // Heuristic lines: "prefer …", "always …", "约定：", "决策：", bullet conclusions.
-    for line in transcript.lines() {
-        let t = line.trim();
-        if t.len() < 12 || t.len() > 400 {
-            continue;
-        }
-        let lower = t.to_lowercase();
-        let hit = [
-            "prefer ",
-            "always ",
-            "never ",
-            "use ",
-            "约定",
-            "决策",
-            "preference",
-            "we decided",
-            "must ",
-        ]
-        .iter()
-        .any(|k| lower.contains(k));
-        if !hit {
-            continue;
-        }
-        let title: String = t.chars().take(80).collect();
-        out.push(new_entry(&title, t, vec!["session-extract".into()]));
-        if out.len() >= max {
-            break;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod vector_tests {
     use super::*;
@@ -691,13 +655,5 @@ mod vector_tests {
             "{:?}",
             hits[0].0.title
         );
-    }
-
-    #[test]
-    fn extract_candidates_finds_preference_lines() {
-        let t = "hello\nWe decided to prefer workspace-write for agent edits.\nother\n";
-        let c = extract_memory_candidates(t, 5);
-        assert!(!c.is_empty());
-        assert!(c[0].body.contains("prefer"));
     }
 }

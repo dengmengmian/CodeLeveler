@@ -1,6 +1,8 @@
-//! `find_symbol` — locate where a symbol is defined (spec §26). Uses the
-//! dependency-free symbol scan; complements `grep` by matching *definitions*,
-//! not every mention.
+//! `find_symbol` — locate where a symbol is defined (spec §26). Precise
+//! through a language server; otherwise a dependency-free definition scan that
+//! says which files define the name and labels itself as a scan.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -8,10 +10,11 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
+use leveler_lsp::LspSessions;
 
+use super::symbols::collect_source_files;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-const MAX_FILES: usize = 2000;
 const MAX_SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -20,7 +23,16 @@ struct Input {
     symbol: String,
 }
 
-pub struct FindSymbolTool;
+/// Constructed with the language-server sessions it uses, and nothing else.
+pub struct FindSymbolTool {
+    lsp: Arc<LspSessions>,
+}
+
+impl FindSymbolTool {
+    pub fn new(lsp: Arc<LspSessions>) -> Self {
+        Self { lsp }
+    }
+}
 
 #[async_trait]
 impl Tool for FindSymbolTool {
@@ -56,12 +68,25 @@ impl Tool for FindSymbolTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let root = context.execution.workspace.root().to_path_buf();
 
-        // Precise path: ask a language server (reused across calls).
-        if let Some(body) = lsp_lookup(&context, &root, &input.symbol).await {
+        // Precise path: ask a language server (session reused across calls).
+        if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
+            let mut body = format!(
+                "`{}` is defined at (via {}):\n",
+                input.symbol, located.spec.program
+            );
+            for definition in &located.definitions {
+                body.push_str(&format!(
+                    "- {}:{}\n",
+                    super::symbols::relativize(&definition.path, &root),
+                    definition.line + 1
+                ));
+            }
             return Ok(ToolOutput::ok(body));
         }
 
-        // Fallback: dependency-free definition scan (files only).
+        // Fallback: dependency-free definition scan (files only). Labelled as a
+        // scan in the result, because it answers a weaker question than the
+        // server does — which files define the name, not where.
         let mut files = Vec::new();
         collect_source_files(&root, &root, &mut files);
         let mut hits = Vec::new();
@@ -91,109 +116,15 @@ impl Tool for FindSymbolTool {
     }
 }
 
-/// Try each detected language's server (starting/caching it), query
-/// `workspace/symbol`, and return `path:line` for exact-name definitions.
-/// Returns `None` on any failure so the caller falls back to the scan.
-async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str) -> Option<String> {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    for language in leveler_project::detect_languages(root) {
-        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
-        {
-            continue;
-        }
-        let Some(spec) = leveler_lsp::server_for(language) else {
-            continue;
-        };
-
-        let key = language.as_str().to_string();
-        // Clone the session Arc out under the lock, then drop it before the
-        // request/retry loop so LSP tools don't serialize on the global lock.
-        let client =
-            match super::symbols::get_or_start_lsp(context, &key, &spec.program, &spec.args, root)
-                .await
-            {
-                Ok(client) => client,
-                Err(_) => continue,
-            };
-
-        // The server may still be indexing on first use; retry briefly.
-        let mut located = Vec::new();
-        let mut server_died = false;
-        for _ in 0..6 {
-            match client.workspace_symbols(symbol).await {
-                Ok(found) if !found.is_empty() => {
-                    located = found;
-                    break;
-                }
-                Ok(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                // Evict a crashed/timed-out server so the next call restarts it
-                // instead of reusing a corpse and degrading to scan forever.
-                Err(_) => {
-                    server_died = true;
-                    break;
-                }
-            }
-        }
-        if server_died {
-            let mut sessions = context.services.lsp_sessions.lock().await;
-            super::symbols::remove_if_same(&mut sessions, &key, &client);
-        }
-
-        let matches: Vec<_> = located
-            .into_iter()
-            .filter(|s| s.name.eq_ignore_ascii_case(symbol))
-            .collect();
-        if matches.is_empty() {
-            continue;
-        }
-        let mut body = format!("`{symbol}` is defined at (via {}):\n", spec.program);
-        for m in matches {
-            let rel = std::path::Path::new(&m.path)
-                .strip_prefix(&canonical_root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| m.path.clone());
-            body.push_str(&format!("- {rel}:{}\n", m.line + 1));
-        }
-        return Some(body);
-    }
-    None
-}
-
-fn collect_source_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
-    const IGNORED: &[&str] = &[
-        "target",
-        "node_modules",
-        ".git",
-        "dist",
-        "vendor",
-        ".leveler",
-    ];
-    if out.len() >= MAX_FILES {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if IGNORED.contains(&name.as_str()) {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            collect_source_files(root, &path, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            if leveler_context::repo_map::is_source(&rel) {
-                out.push(rel);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool() -> FindSymbolTool {
+        FindSymbolTool::new(Arc::new(LspSessions::new(Arc::new(
+            leveler_core::environment().clone(),
+        ))))
+    }
 
     #[tokio::test]
     async fn finds_definition_site() {
@@ -204,7 +135,7 @@ mod tests {
         std::fs::write(dir.join("src/b.rs"), "fn caller() { cancel_order(); }\n").unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
-        let out = FindSymbolTool
+        let out = tool()
             .execute(
                 serde_json::json!({ "symbol": "cancel_order" }),
                 ctx,

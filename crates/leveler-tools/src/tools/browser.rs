@@ -1,6 +1,7 @@
-//! Structured browser tools (§19). Thin, stateless wrappers over the
-//! daemon-owned [`leveler_browser::BrowserRuntime`] held in
-//! `ToolContext.services.browser`. All page/ref/generation safety lives in the
+//! Structured browser tools (§19). Thin wrappers over the daemon-owned
+//! [`leveler_browser::BrowserRuntime`], which each tool is CONSTRUCTED with —
+//! it used to be fished out of `ToolContext.services.browser`, where every
+//! other tool could reach it too. All page/ref/generation safety lives in the
 //! runtime; these tools add the tool-boundary concerns: the network/SSRF gate
 //! on navigation, session scoping, and structured `ToolOutput`.
 
@@ -21,16 +22,55 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 // ── shared helpers ───────────────────────────────────────────────────────────
 
-/// The runtime and this context's session scope, or a clear model-visible error
-/// when the browser capability is disabled.
-fn runtime(context: &ToolContext) -> Result<(&Arc<BrowserRuntime>, BrowserSessionId), ToolOutput> {
-    match &context.services.browser {
-        Some(rt) => Ok((rt, BrowserSessionId::new(context.session_scope()))),
-        None => Err(ToolOutput::error(
-            "the browser capability is not enabled in this runtime",
-        )),
-    }
+/// Declare the browser tools. Each one holds the runtime it was constructed
+/// with and nothing else; a `None` runtime means this host has no browser, and
+/// the tool says exactly that instead of guessing.
+///
+/// A macro because twelve tools need the identical handle and the identical
+/// "not enabled" refusal, and twelve copies of both would be twelve places for
+/// them to drift.
+macro_rules! browser_tools {
+    ($($name:ident),* $(,)?) => { $(
+        pub struct $name {
+            browser: Option<Arc<BrowserRuntime>>,
+        }
+
+        impl $name {
+            pub fn new(browser: Option<Arc<BrowserRuntime>>) -> Self {
+                Self { browser }
+            }
+
+            /// The runtime and this call's session scope, or a clear
+            /// model-visible error when there is no browser on this host.
+            fn runtime(
+                &self,
+                scope: &str,
+            ) -> Result<(&Arc<BrowserRuntime>, BrowserSessionId), ToolOutput> {
+                match &self.browser {
+                    Some(rt) => Ok((rt, BrowserSessionId::new(scope))),
+                    None => Err(ToolOutput::error(
+                        "the browser capability is not enabled in this runtime",
+                    )),
+                }
+            }
+        }
+    )* };
 }
+
+browser_tools!(
+    BrowserNavigateTool,
+    BrowserSnapshotTool,
+    BrowserClickTool,
+    BrowserDragTool,
+    BrowserTypeTool,
+    BrowserSelectTool,
+    BrowserPressTool,
+    BrowserWaitTool,
+    BrowserTabsTool,
+    BrowserDialogTool,
+    BrowserConsoleTool,
+    BrowserScreenshotTool,
+);
 
 fn err_out(e: BrowserError) -> ToolOutput {
     ToolOutput::error(e.to_string())
@@ -138,8 +178,6 @@ struct NavigateInput {
     url: String,
 }
 
-pub struct BrowserNavigateTool;
-
 #[async_trait]
 impl Tool for BrowserNavigateTool {
     fn name(&self) -> &'static str {
@@ -162,7 +200,7 @@ impl Tool for BrowserNavigateTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: NavigateInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -184,8 +222,6 @@ struct PageInput {
     #[serde(default)]
     page: Option<String>,
 }
-
-pub struct BrowserSnapshotTool;
 
 #[async_trait]
 impl Tool for BrowserSnapshotTool {
@@ -212,7 +248,7 @@ impl Tool for BrowserSnapshotTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: PageInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -288,16 +324,15 @@ ref_input!(DragInput {
     steps: Option<u32>,
 });
 
+/// The shared body of every ref-driven interaction. Takes the runtime the
+/// calling tool was constructed with, so it cannot reach for one of its own.
 async fn run_interaction(
-    context: &ToolContext,
+    rt: &BrowserRuntime,
+    session: BrowserSessionId,
     page: Option<String>,
     r#ref: &str,
     action: Interaction,
 ) -> ToolOutput {
-    let (rt, session) = match runtime(context) {
-        Ok(v) => v,
-        Err(o) => return o,
-    };
     let page = match resolve_page(rt, &session, page).await {
         Ok(p) => p,
         Err(o) => return o,
@@ -308,7 +343,6 @@ async fn run_interaction(
     }
 }
 
-pub struct BrowserClickTool;
 #[async_trait]
 impl Tool for BrowserClickTool {
     fn name(&self) -> &'static str {
@@ -330,11 +364,14 @@ impl Tool for BrowserClickTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: ClickInput = super::parse_input(self.name(), input)?;
-        Ok(run_interaction(&context, input.page, &input.r#ref, Interaction::Click).await)
+        let (rt, session) = match self.runtime(context.session_scope()) {
+            Ok(v) => v,
+            Err(o) => return Ok(o),
+        };
+        Ok(run_interaction(rt, session, input.page, &input.r#ref, Interaction::Click).await)
     }
 }
 
-pub struct BrowserDragTool;
 #[async_trait]
 impl Tool for BrowserDragTool {
     fn name(&self) -> &'static str {
@@ -371,11 +408,14 @@ impl Tool for BrowserDragTool {
             dy: input.dy.unwrap_or(0.0),
             steps: input.steps.unwrap_or(12).clamp(1, 100),
         };
-        Ok(run_interaction(&context, input.page, &input.r#ref, action).await)
+        let (rt, session) = match self.runtime(context.session_scope()) {
+            Ok(v) => v,
+            Err(o) => return Ok(o),
+        };
+        Ok(run_interaction(rt, session, input.page, &input.r#ref, action).await)
     }
 }
 
-pub struct BrowserTypeTool;
 #[async_trait]
 impl Tool for BrowserTypeTool {
     fn name(&self) -> &'static str {
@@ -397,8 +437,13 @@ impl Tool for BrowserTypeTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TypeInput = super::parse_input(self.name(), input)?;
+        let (rt, session) = match self.runtime(context.session_scope()) {
+            Ok(v) => v,
+            Err(o) => return Ok(o),
+        };
         Ok(run_interaction(
-            &context,
+            rt,
+            session,
             input.page,
             &input.r#ref,
             Interaction::Type {
@@ -410,7 +455,6 @@ impl Tool for BrowserTypeTool {
     }
 }
 
-pub struct BrowserSelectTool;
 #[async_trait]
 impl Tool for BrowserSelectTool {
     fn name(&self) -> &'static str {
@@ -432,8 +476,13 @@ impl Tool for BrowserSelectTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: SelectInput = super::parse_input(self.name(), input)?;
+        let (rt, session) = match self.runtime(context.session_scope()) {
+            Ok(v) => v,
+            Err(o) => return Ok(o),
+        };
         Ok(run_interaction(
-            &context,
+            rt,
+            session,
             input.page,
             &input.r#ref,
             Interaction::Select {
@@ -445,7 +494,6 @@ impl Tool for BrowserSelectTool {
     }
 }
 
-pub struct BrowserPressTool;
 #[async_trait]
 impl Tool for BrowserPressTool {
     fn name(&self) -> &'static str {
@@ -467,8 +515,13 @@ impl Tool for BrowserPressTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: PressInput = super::parse_input(self.name(), input)?;
+        let (rt, session) = match self.runtime(context.session_scope()) {
+            Ok(v) => v,
+            Err(o) => return Ok(o),
+        };
         Ok(run_interaction(
-            &context,
+            rt,
+            session,
             input.page,
             &input.r#ref,
             Interaction::Press { key: input.key },
@@ -506,7 +559,6 @@ struct WaitInput {
     timeout_seconds: Option<u64>,
 }
 
-pub struct BrowserWaitTool;
 #[async_trait]
 impl Tool for BrowserWaitTool {
     fn name(&self) -> &'static str {
@@ -529,7 +581,7 @@ impl Tool for BrowserWaitTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: WaitInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -565,7 +617,6 @@ impl Tool for BrowserWaitTool {
 
 // ── tabs / dialog / console / screenshot ─────────────────────────────────────
 
-pub struct BrowserTabsTool;
 #[async_trait]
 impl Tool for BrowserTabsTool {
     fn name(&self) -> &'static str {
@@ -586,7 +637,7 @@ impl Tool for BrowserTabsTool {
         context: ToolContext,
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -628,7 +679,6 @@ struct DialogInput {
     prompt_text: Option<String>,
 }
 
-pub struct BrowserDialogTool;
 #[async_trait]
 impl Tool for BrowserDialogTool {
     fn name(&self) -> &'static str {
@@ -651,7 +701,7 @@ impl Tool for BrowserDialogTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: DialogInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -676,7 +726,6 @@ impl Tool for BrowserDialogTool {
     }
 }
 
-pub struct BrowserConsoleTool;
 #[async_trait]
 impl Tool for BrowserConsoleTool {
     fn name(&self) -> &'static str {
@@ -698,7 +747,7 @@ impl Tool for BrowserConsoleTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: PageInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
@@ -731,7 +780,6 @@ struct ScreenshotInput {
     full_page: bool,
 }
 
-pub struct BrowserScreenshotTool;
 #[async_trait]
 impl Tool for BrowserScreenshotTool {
     fn name(&self) -> &'static str {
@@ -754,7 +802,7 @@ impl Tool for BrowserScreenshotTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: ScreenshotInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match runtime(&context) {
+        let (rt, session) = match self.runtime(context.session_scope()) {
             Ok(v) => v,
             Err(o) => return Ok(o),
         };
