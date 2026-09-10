@@ -28,11 +28,12 @@ Harness defines domain semantics.
 Product defines experience, composition and delivery.
 ```
 
-Six sentences carry the whole model:
+Seven sentences carry the whole model:
 
 ```text
 The Kernel does not know the product.
 The Harness defines domain semantics.
+The Harness exposes capability; it does not emulate intelligence.
 The Engine owns lifecycle, not agent intelligence.
 The Host Authority exclusively owns controlled side effects.
 Every durable fact has one authoritative owner.
@@ -43,6 +44,108 @@ Simplification means moving complexity to its correct owner. It never means
 deleting reliability. `persist-before-forward`, the ownership fence,
 compare-and-swap edits, stale-write protection, sandboxing, approval and crash
 recovery all stay exactly as strong as they are.
+
+### 1.1 Model capability policy
+
+CodeLeveler used to carry a second goal alongside the architecture: flatten
+model capability differences, and carry a weaker model with extra harness and
+tool behaviour. **That goal is withdrawn.** It is not deferred and not
+conditional.
+
+```text
+The model owns reasoning.
+The Harness owns domain semantics and capability exposure.
+The Runtime owns mechanical correctness.
+
+CodeLeveler does not attempt to normalize model intelligence.
+```
+
+```text
+                  Model
+                    │
+                    │ reasoning / planning / tool choice
+                    ▼
+                 Harness
+                    │
+                    │ domain semantics / tool surface
+                    ▼
+                 Runtime
+                    │
+                    │ deterministic execution / authority
+                    ▼
+                   Host
+```
+
+```text
+Model intelligence is an input to the system, not a runtime invariant.
+```
+
+**What the system therefore owes the model.** Clear primitives, small
+schemas, deterministic semantics, precise errors, bounded output, real
+repository state, typed mechanical evidence, fast and reliable execution. Then
+the model plans, navigates, chooses tools, edits, debugs and recovers from its
+own mistakes.
+
+**What it does not owe.** Guessing what a malformed argument meant, quietly
+changing a tool's semantics after a failure, selecting a different tool because
+the model chose badly, hidden task-solving retries, a duplicate tool whose only
+purpose is to be easier for a weaker model, or a planning/review framework that
+exists because the model cannot plan or judge its own next step. Mechanical
+validation — JSON and schema checking, path normalization, a compatibility
+alias, provider protocol adaptation — is not on this list and stays required.
+
+**The line is ownership, not effort.**
+
+```text
+ENGINEERING FAILURE     → the Runtime handles it.
+MODEL CAPABILITY LIMIT  → the model owns it.
+```
+
+Machine failure, concurrency, filesystem races, process death, protocol and
+network failure, security risk and invalid host state are engineering failures.
+Every reliability property in this document exists for them and none of it is
+weakened here: `persist-before-forward`, F7 Grounded Authority, ToolHost
+admission, permission, approval, the ownership fence, sandboxing, path safety,
+CAS, stale-write protection, atomic mutation, rollback and its conflict
+protection, crash recovery, cancellation, durability, process lifecycle, the
+EvidenceLedger and multi-agent write safety.
+
+**Provider capability is not model intelligence.** Tool-calling support,
+streaming, reasoning transport, vision, structured output, forced tool choice,
+context and output limits and wire format are protocol facts. They belong to
+`leveler-model`, `leveler-protocol`, `leveler-provider` and capability
+negotiation. Negotiate and report them honestly; if a required mechanical
+capability is absent, disable the dependent capability and say so. Do not grow
+a second behavioural path from a protocol gap — a provider without forced tool
+choice is reported as such, not compensated for with an alternate reasoning
+strategy.
+
+**Errors are precise, not prescriptive.** Say what failed, why, which
+mechanical constraint was violated, and what is actually available: *file is
+not valid UTF-8*, *path does not exist*, *pattern is invalid regex*, *write
+rejected because the observed version is stale*, *result exceeded the
+configured limit*. Do not hand the model a multi-step recovery strategy unless
+that strategy is the mechanical contract.
+
+**Fallback is still allowed; semantic compensation is not.** A second
+implementation that produces exactly the same contract, with equivalence
+mechanically established, is ordinary engineering. A fallback that changes what
+the call *means* — regex search degrading to a literal scan, a failed patch
+becoming a different edit, a structured operation becoming a different solution
+— is the thing that is forbidden.
+
+**Do not encode intelligence classes.** `weak`, `strong`, `small`, `large` are
+not foundation concepts. A configured model either has a required mechanical
+capability or does not.
+
+**The decision test.** A feature must justify itself by at least one of: it is
+a canonical coding capability; it materially improves the interaction for
+supported models; it provides deterministic runtime correctness; it provides
+security or authority; it materially improves efficiency without changing
+semantics; it answers a demonstrated product requirement. "Weaker models need
+this", "this makes different models behave the same" and "this compensates for
+model weakness" are not on the list, and are not admissible as a reason to keep
+existing architecture either.
 
 ---
 
@@ -430,6 +533,28 @@ round.
 Many capabilities  ≠  many tools visible to the model each round
 ```
 
+A tool belongs on the surface when it answers yes to enough of these:
+
+```text
+Does it express a distinct model intent?
+Does it expose a distinct capability?
+Does it have deterministic semantics?
+Does it remove round trips a competent model would otherwise pay?
+Does it materially improve task success or efficiency?
+```
+
+and no to these:
+
+```text
+Does it overlap another tool and add tool-choice entropy?
+Could an existing primitive express the same operation cleanly?
+Does this belong to model control at all, or to the runtime or the user?
+```
+
+The objective is to **maximize useful model agency while minimizing harness
+and tool complexity** (§1.1). "Does this help a weaker model?" is not a
+criterion and is no longer asked.
+
 ### 6.2 What the model sees today
 
 Measured from `crates/leveler-tools/src/registry.rs` at this commit:
@@ -456,18 +581,50 @@ Two facts worth naming, because they cut against the obvious reading:
   and `memory` *are* in core.** The economy surface is not the primitive set;
   it is a historical selection.
 
-### 6.3 The four categories
+### 6.3 The Core Primitive Foundation
 
-**Core capability tools** — the minimum a coding agent needs:
+Seven operations are the architectural baseline. They are primitives because
+they express fundamental coding operations, not because any model needs help
+with them:
 
 ```text
-read_file    list_files    find_files    grep
-apply_patch (canonical edit)             run_command
+read    ls    find    grep    edit    write    bash
 ```
 
-`shell_command` is a candidate seventh. Whether the canonical edit tool is
-`apply_patch` alone or `apply_patch` plus `replace` is an evaluation question,
-not an architecture one (§6.5).
+Current CodeLeveler mapping:
+
+| Primitive | Tool |
+| --- | --- |
+| `read` | `read_file` |
+| `ls` | `list_files` |
+| `find` | `find_files` |
+| `grep` | `grep` |
+| `edit` | `apply_patch` — the canonical structured edit |
+| `write` | `write_file` — complete-file materialization |
+| `bash` | `run_command` / `shell_command` |
+
+`write_file` and partial edit are distinct model intents — create or
+deliberately replace a whole file, versus change part of one — so both are
+primitives. That distinction is stable and has nothing to do with whether a
+model can construct a patch.
+
+Explicitly:
+
+```text
+core_registry()  !=  Core Primitive Foundation
+```
+
+`core_registry()` is an implementation and history artifact — the set the
+economy work profile happens to select — until a separate Tool Surface Closure
+aligns it. Do not read one as a definition of the other.
+
+### 6.3.1 The four categories
+
+**Core capability tools** — the Core Primitive Foundation above.
+
+Whether both `run_command` and `shell_command` stay on the model surface is a
+semantic question about distinct intent and analysability (§6.5), not a
+question about model strength.
 
 **Optional capability packs** — real capabilities that need not be visible
 every round:
@@ -516,7 +673,7 @@ control semantics. Unless evaluation shows the schema-token saving beats the
 extra round on both success and cost, harness-side selection is the pattern
 and `expand_tools` is not.
 
-### 6.5 Removal is an evaluation decision, not an aesthetic one
+### 6.5 Surface value is an evaluation decision, not an aesthetic one
 
 ```text
 No tool is removed merely because another tool could theoretically
@@ -527,6 +684,11 @@ Remove or demote a tool when evidence shows: no measurable success
 improvement, significant semantic overlap, extra routing errors, unnecessary
 complexity, or that the capability belongs to the runtime or the user rather
 than to the model.
+
+This is about *product surface*, not about implementation correctness. A tool
+whose implementation is mechanically wrong — non-deterministic semantics, a
+second path to the filesystem, environment-dependent meaning — is fixed
+directly; see §6.6.
 
 Candidates for evaluation, with the reason each is on the list:
 
@@ -539,7 +701,7 @@ Candidates for evaluation, with the reason each is on the list:
 | `create_skill` | System customization / metaprogramming. `load_skill` can stay optional; creation should not be a default coding-task affordance. |
 | `blast_radius` | An advanced Code Intelligence operation (references → enclosing symbols → BFS), not a primitive. Move to the optional pack, then evaluate whether it reduces rounds or improves refactor recall. |
 | `read_symbol` | `find_symbol` + `read_file` reproduces it. It survives only if it measurably cuts tokens or rounds. Pure evaluation question. |
-| `replace` | **Not an architecture decision.** Its source states its purpose: exact find/replace for weaker models that fail repeatedly on patch context matching. Flattening model capability differences is a product goal, so this needs an A/B (`apply_patch` alone vs `apply_patch` + `replace`) measuring edit retries, invalid patches, rounds, tokens and weak-model success. Do not delete it on architectural taste. |
+| `replace` | **REMOVE / SURFACE-EVAL CANDIDATE.** Its original rationale — exact find/replace for weaker models that fail on patch context matching — is withdrawn (§1.1) and is no longer a reason to keep it. The remaining question is the ordinary one: does `replace` express a distinct, generally useful coding primitive that `edit` + `write` do not already cover? Judge the overlap; a weak-model A/B is not a precondition for removing it. |
 | `shell_command` vs `run_command` | `run_command` is program+args: cross-platform, no shell quoting, simple to analyse. `shell_command` is the string form models know best. `shell_command` already reuses `run_command`'s `execute_program`, so two adapters over one capability is architecturally fine. Whether both stay on the model surface is an evaluation question. |
 | `git_status` / `git_diff` | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell, has stable output and replays cleanly. Keep the interface for now; move the implementation to `leveler-vcs`. |
 
@@ -548,14 +710,29 @@ express different model intents — "what is in this directory" versus "where in
 the repository does this pattern exist". What should be unified is the
 filesystem traversal and ignore semantics beneath them.
 
-### 6.6 The first code step is measurement, not refactoring
+### 6.6 Two different questions, two different burdens of proof
 
-Before any tool is removed or rewritten, take a usage baseline from real
-dogfood sessions: which tools are actually called, at what success and retry
-rate, and whether their presence improves task success. `replace`,
-`read_symbol`, `blast_radius`, `expand_tools` and the checkpoint tools are the
-priority. Removing a tool should rest on mechanical evidence, not on judgement
-about what looks unnecessary.
+The earlier rule — measure before touching anything — was too broad. It forced
+a usage-baseline ceremony onto refactors that are settled by reading the code.
+
+```text
+Architecture correctness is established from mechanical evidence.
+Product-surface value is established with Eval, when the value is
+genuinely uncertain.
+```
+
+**Fix directly, no A/B required.** A defect proven by inspection is a defect:
+wrong ownership, non-deterministic or environment-dependent semantics, a
+duplicate runtime implementation, cross-platform divergence, service-locator
+coupling, a runtime capability living inside a tool adapter. Refactoring these
+changes what the code *is*, not what the product *offers*.
+
+**Measure first.** When two legitimate primitives overlap, when an optional
+capability's value is unclear, or when removing a tool could materially change
+product behaviour, take a usage baseline from real sessions: which tools are
+called, at what success and retry rate, and whether their presence improves
+task success. `replace`, `read_symbol`, `blast_radius`, `expand_tools` and the
+checkpoint tools are the priority list for that measurement.
 
 ---
 
@@ -1321,10 +1498,12 @@ use case proves the metadata path insufficient.
 
 ### 19.2 Is the canonical edit tool one tool or two?
 
-`apply_patch` and `replace` overlap. `replace` exists to give weaker models an
-exact find/replace path when patch context matching fails repeatedly.
-Flattening model capability differences is a product goal, so this is decided
-by measurement (§6.5), not by architecture.
+`apply_patch` is the canonical structured edit and `write_file` is the
+canonical whole-file write. `replace` overlaps both. The rationale it was built
+on — an exact find/replace path for models that fail repeatedly at patch
+context matching — is withdrawn (§1.1). What is left is a plain surface
+question: does `replace` express a distinct model intent that `edit` and
+`write` do not already cover? The default answer is now no.
 
 ### 19.3 Does dynamic model-controlled tool expansion pay for itself?
 
@@ -1365,9 +1544,13 @@ promise a feature.
 ```text
 FOUNDATION_ARCHITECTURE_DEFINED   YES
 TOOL_ARCHITECTURE_DEFINED         YES
+MODEL_CAPABILITY_POLICY_DEFINED   YES
+WEAK_MODEL_COMPENSATION_GOAL      REMOVED
+CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
+CORE_PRIMITIVE_FOUNDATION_ALIGNED NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO

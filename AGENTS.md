@@ -46,12 +46,14 @@ foundation, with the coding agent as its first product on top:
 The Foundation provides reusable agent-runtime capability. A Harness defines
 domain semantics. A Product defines experience, composition and delivery.
 
-## The six sentences
+## The seven sentences
 
 ```text
 The Kernel does not know the product.
 
 The Harness defines domain semantics.
+
+The Harness exposes capability; it does not emulate intelligence.
 
 The Engine owns lifecycle, not agent intelligence.
 
@@ -100,6 +102,39 @@ Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
     reusing the Coding tool plumbing is not required. This is the *Second
     Harness Test*, defined in `docs/ARCHITECTURE.md`.
 
+## Model capability policy
+
+```text
+Model intelligence is not a Harness responsibility.
+```
+
+The Harness exposes deterministic capability and product semantics. It does
+not emulate reasoning, compensate for a weak model, or grow a second behaviour
+whose purpose is to normalize model intelligence across models. CodeLeveler
+accepts model intelligence as an input, not a deficiency the runtime must
+correct.
+
+The line is ownership, not effort:
+
+```text
+ENGINEERING FAILURE   → the Runtime handles it.
+MODEL CAPABILITY LIMIT → the model owns it.
+```
+
+Runtime reliability and provider compatibility are separate concerns and stay
+fully mandatory. `persist-before-forward`, F7 Grounded Authority, ToolHost
+admission, permission, approval, the ownership fence, sandboxing, path safety,
+CAS, stale-write protection, atomic mutation, rollback, crash recovery,
+cancellation and the EvidenceLedger compensate for machines, concurrency and
+attackers — never for reasoning. Provider capability differences (tool calling,
+streaming, reasoning transport, structured output, context and output limits,
+wire format) are protocol facts owned by `leveler-model` / `leveler-protocol` /
+`leveler-provider`; negotiate and report them, do not grow a second behavioural
+path from them.
+
+"a weaker model needs this" is not a reason to add or keep anything.
+`docs/ARCHITECTURE.md` §1.1 carries the detail and the decision test.
+
 ## The tool rules
 
 ```text
@@ -122,14 +157,19 @@ Authoritative runtime facts do not hide in arbitrary JSON metadata.
 Do not introduce a generic Tool Core without demonstrated need.
 ```
 
-Two more, on what the model sees:
+Three more, on what the model sees:
 
 - **The harness decides the tool surface.** Expose the smallest surface that
   preserves capability. Many capabilities is not many tools per round.
-- **Removing a tool is an evaluation decision.** Never remove one because
-  another tool could theoretically reproduce it; remove it when measurement
-  shows no gain, real overlap, or that the capability belongs to the runtime
-  or the user.
+- **A tool earns its place by expressing a distinct model intent**, exposing a
+  distinct capability, having deterministic semantics, or removing round trips
+  a competent model would otherwise pay. Not by rescuing a weak one.
+- **Architecture correctness is settled by mechanical evidence; product-surface
+  value is settled by evaluation.** A proven implementation defect — wrong
+  ownership, non-deterministic semantics, a duplicate runtime path, platform
+  divergence, runtime capability living in a tool adapter — is fixed directly.
+  Removing a *capability* the product may depend on is where measurement is
+  owed.
 
 `docs/ARCHITECTURE.md` §5 and §6 carry the detail. Do not copy it here.
 

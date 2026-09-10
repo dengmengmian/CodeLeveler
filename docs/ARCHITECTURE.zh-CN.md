@@ -20,11 +20,12 @@ Harness 定义领域语义。
 Product 定义体验、组合与交付。
 ```
 
-六句话就是全部模型：
+七句话就是全部模型：
 
 ```text
 Kernel 不懂产品。
 Harness 定义领域语义。
+Harness 暴露能力，不模拟智能。
 Engine 管生命周期，不当 Agent Brain。
 Host Authority 独占受控真实副作用。
 每一个持久事实只有一个权威 Owner。
@@ -32,6 +33,61 @@ Host Authority 独占受控真实副作用。
 ```
 
 简化的含义是把复杂度搬到正确的 Owner，绝不是删掉可靠性。`persist-before-forward`、ownership fence、CAS 写入、stale-write 保护、沙箱、审批、崩溃恢复，一个都不削弱。
+
+### 1.1 模型能力策略
+
+CodeLeveler 过去在架构之外还背着第二个目标：拉平模型能力差距，用额外的 Harness / 工具行为去托住较弱的模型。**这个目标现在撤销。** 不是推迟，也不是有条件保留。
+
+```text
+模型拥有推理。
+Harness 拥有领域语义与能力暴露。
+Runtime 拥有机械正确性。
+
+CodeLeveler 不试图拉平模型智能。
+```
+
+```text
+                  Model
+                    │
+                    │ 推理 / 规划 / 工具选择
+                    ▼
+                 Harness
+                    │
+                    │ 领域语义 / 工具面
+                    ▼
+                 Runtime
+                    │
+                    │ 确定性执行 / 权威
+                    ▼
+                   Host
+```
+
+```text
+模型智能是系统的输入，不是运行时不变量。
+```
+
+**因此系统欠模型什么。** 清晰的原语、小而好懂的 schema、确定性语义、精确的错误、有界的输出、真实的仓库状态、类型化的机械证据、快而可靠的执行。剩下的交给模型：规划、导航、选工具、编辑、调试、从自己的错误里恢复。
+
+**不欠什么。** 猜一个畸形参数原本想表达什么、失败后悄悄改变工具语义、因为模型选错就替它换一个工具、隐藏的任务级重试、只为让较弱模型更好用而复制出来的第二个工具、因为模型不会规划或不会判断下一步而搭起来的规划 / 评审框架。机械校验不在此列，仍然必须做：JSON 与 schema 校验、路径规范化、真实兼容需要的别名、provider 协议适配。
+
+**分界线是归属，不是难度。**
+
+```text
+工程失败     → Runtime 负责。
+模型能力上限  → 模型自己负责。
+```
+
+机器故障、并发、文件系统竞争、进程死亡、协议与网络失败、安全风险、宿主状态非法，这些是工程失败。本文档里所有可靠性属性都是为它们存在的，这次一个都不削弱：`persist-before-forward`、F7 Grounded Authority、ToolHost 准入、permission、审批、ownership fence、沙箱、路径安全、CAS、stale-write 保护、原子变更、rollback 及其冲突保护、崩溃恢复、取消、持久化、进程生命周期、EvidenceLedger、多 Agent 写安全。
+
+**Provider 能力不是模型智能。** 是否支持 tool calling、streaming、reasoning 传输、vision、结构化输出、强制 tool choice，以及上下文/输出上限和 wire format，这些是协议事实，属于 `leveler-model`、`leveler-protocol`、`leveler-provider` 和能力协商。诚实地协商并上报；缺少某个必需的机械能力，就关掉依赖它的能力并说明。不要从协议差异里长出第二条行为路径——provider 不支持强制 tool choice，就如实上报，而不是发明另一套推理策略去假装它支持。
+
+**错误要精确，不要替模型做计划。** 说清楚什么失败了、为什么、违反了哪条机械约束、现在实际可用的是什么：*文件不是合法 UTF-8*、*路径不存在*、*pattern 不是合法正则*、*写入被拒绝，因为观察到的版本已过期*、*结果超过配置上限*。除非那套步骤本身就是机械契约，否则不要给模型一份多步恢复方案。
+
+**Fallback 仍然允许，语义补偿不允许。** 第二套实现产出**完全相同**的契约、且等价性被机械证明，这是正常工程。改变这次调用**含义**的 fallback 才是被禁止的：正则搜索退化成字面量扫描、patch 失败后变成另一种编辑、结构化操作失败后换一个解法。
+
+**不要把智能分级写进架构。** `weak` / `strong` / `small` / `large` 不是 Foundation 概念。一个已配置的模型，要么具备所需的机械能力，要么不具备。
+
+**判定标准。** 一个特性必须至少满足其一才能加入或保留：它是 canonical 的 coding 能力；它实质改善受支持模型的交互；它提供确定性的运行时正确性；它提供安全或权威；它在不改变语义的前提下实质提升效率；它回应一个被证明的产品需求。「较弱模型需要它」「这样不同模型行为才一致」「这是为了补偿模型弱点」都不在列表里，也不再是保留既有架构的正当理由。
 
 ---
 
@@ -352,6 +408,26 @@ ToolRegistry
 能力很多  ≠  模型每轮看到很多 Tool
 ```
 
+一个工具值得上工具面，要在下面这几问上够得着「是」：
+
+```text
+它是否表达了一个独立的模型意图？
+它是否暴露了一个独立的能力？
+它的语义是否确定？
+它是否替称职的模型省掉了本来要付的 round trip？
+它是否实质提升任务成功率或效率？
+```
+
+同时在下面这几问上是「否」：
+
+```text
+它是否和别的工具重叠、增加 tool-choice 熵？
+现有原语能否干净地表达同一个操作？
+这件事到底该不该归模型控制，还是归运行时或用户？
+```
+
+目标是**最大化有用的模型自主性，同时最小化 Harness / 工具复杂度**（§1.1）。「这对较弱模型有帮助吗」不是标准，也不再被问。
+
 ### 6.2 模型今天看到什么
 
 从本次 commit 的 `crates/leveler-tools/src/registry.rs` 实测：
@@ -370,16 +446,41 @@ ToolRegistry
 - **`find_files` 不在 `core_registry()` 里。** economy 工具面有 `grep` 和 `list_files`，但要通过 `expand_tools("search")` 才拿得到 `find_files`。如果 `find_files` 是核心原语——从模型意图的角度看它是——那这是一个工具面组合的错误，不是能力缺失。
 - **`replace`、`shell_command`、`update_plan`、`load_skill`、`expand_tools`、`memory` 都在 core 里。** economy 工具面不是「原语集合」，它是一份历史选择。
 
-### 6.3 四个类别
+### 6.3 核心原语基座（Core Primitive Foundation）
 
-**核心能力工具**——一个 coding agent 最少需要的：
+七个操作是架构基线。它们之所以是原语，是因为它们表达了最基本的编码操作，而不是因为某个模型需要人扶：
 
 ```text
-read_file    list_files    find_files    grep
-apply_patch（canonical edit）             run_command
+read    ls    find    grep    edit    write    bash
 ```
 
-`shell_command` 是候选的第七个。canonical 编辑工具到底是 `apply_patch` 一个还是 `apply_patch` 加 `replace`，这是 Eval 问题，不是架构问题（§6.5）。
+当前 CodeLeveler 的映射：
+
+| 原语 | 工具 |
+| --- | --- |
+| `read` | `read_file` |
+| `ls` | `list_files` |
+| `find` | `find_files` |
+| `grep` | `grep` |
+| `edit` | `apply_patch`——canonical 结构化编辑 |
+| `write` | `write_file`——整文件落地 |
+| `bash` | `run_command` / `shell_command` |
+
+「整文件写入」和「局部编辑」是两个不同的模型意图——新建或有意替换整个文件，对改动文件的一部分——所以两个都是原语。这个区分是稳定的，与「模型能不能造出 patch」无关。
+
+明确一句：
+
+```text
+core_registry()  !=  核心原语基座
+```
+
+`core_registry()` 是实现与历史的产物——economy work profile 恰好选中的那一组——在单独的 Tool Surface Closure 把它对齐之前，不要拿其中一个当另一个的定义。
+
+### 6.3.1 四个类别
+
+**核心能力工具**——上面的核心原语基座。
+
+`run_command` 和 `shell_command` 是否都留在模型面上，是关于「意图是否独立」和「是否好做安全分析」的语义问题（§6.5），不是关于模型强弱的问题。
 
 **可选能力包**——真实能力，但不必每轮都可见：
 
@@ -419,13 +520,15 @@ Harness 决定这个产品有哪些工具。
 
 这就是 `expand_tools` 在架构上可疑的原因：它把 ownership 反过来了，让模型请求运行时给它更多工具。代价是一次额外工具调用、一个额外 round、动态 registry 状态、更多 replay 与控制语义。除非 Eval 证明省下的 schema token 在成功率和成本两边都盖过那个额外 round，否则 harness 侧选择才是模式，`expand_tools` 不是。
 
-### 6.5 删除是 Eval 决策，不是审美决策
+### 6.5 工具面价值是 Eval 决策，不是审美决策
 
 ```text
 不能仅因为「另一个工具理论上能做同样的事」就删掉一个工具。
 ```
 
 只有当证据显示以下之一时才删除或降级：成功率没有可测量的提升、语义显著重叠、带来额外路由错误、造成不必要的复杂度，或者这个能力本就属于运行时/用户而不属于模型。
+
+这说的是**产品工具面**，不是实现正确性。实现本身机械上就是错的——语义不确定、第二条通往文件系统的路径、含义随环境改变——那是直接修的，见 §6.6。
 
 Eval 候选，以及各自上榜的理由：
 
@@ -438,15 +541,24 @@ Eval 候选，以及各自上榜的理由：
 | `create_skill` | 系统定制 / 元编程能力。`load_skill` 可以留作可选；「创建」不该是默认 coding 任务里的顺手选项。 |
 | `blast_radius` | 高级 Code Intelligence 操作（references → 外层符号 → BFS），不是原语。先移入可选包，再 Eval 它是否真的减少 round 或提升重构召回。 |
 | `read_symbol` | `find_symbol` + `read_file` 可复现。只有当它可测量地省 token 或省 round 时才该留。纯 Eval 问题。 |
-| `replace` | **不是架构决策。** 源码写明了它的目的：给较弱模型一条精确 find/replace 路径，避免在 patch 上下文匹配上反复失败。拉平模型能力差距是产品目标，所以这需要 A/B（只有 `apply_patch` vs `apply_patch` + `replace`），测编辑重试、无效 patch、round、token、弱模型成功率。不要凭架构洁癖删它。 |
+| `replace` | **REMOVE / SURFACE-EVAL 候选。** 它原本的理由——给较弱模型一条精确 find/replace 路径，避免在 patch 上下文匹配上反复失败——已经撤销（§1.1），不再是保留它的理由。剩下的是一个普通问题：`replace` 是否表达了 `edit` + `write` 覆盖不到的、独立且普遍有用的编码原语？就按重叠度判断；删除它不以「弱模型 A/B」为前提。 |
 | `shell_command` vs `run_command` | `run_command` 是 program+args：跨平台、无 shell 引号问题、安全分析简单。`shell_command` 是模型最熟悉的字符串形式。`shell_command` 已经复用 `run_command` 的 `execute_program`，所以「两个适配器、一个能力」在架构上完全没问题。模型面是否只留一个，是 Eval 问题。 |
 | `git_status` / `git_diff` | 用 `run_command` 也能做，但 git 检视是高频动作，不需要 shell，输出稳定，可 replay。接口暂时保留；实现迁到 `leveler-vcs`。 |
 
 `list_files` 和 `find_files` **不是**合并候选。它们表达不同的模型意图——「这个目录里有什么」对「仓库里哪里有符合这个模式的文件」。真正该统一的是它们底下的文件系统遍历和 ignore 语义。
 
-### 6.6 第一步代码工作是测量，不是重构
+### 6.6 两个不同的问题，两种不同的举证责任
 
-在删除或重写任何工具之前，先从真实 dogfood 会话取一次使用基线：哪些工具真的被调用、成功率与重试率如何、它们的存在是否提升任务成功。`replace`、`read_symbol`、`blast_radius`、`expand_tools` 和 checkpoint 工具是重点。删工具应该建立在机械证据上，而不是「看起来没必要」的判断上。
+原来那条规则——动任何工具之前先测量——太宽了。它把「读代码就能定论」的重构也拖进了「先做使用基线」的仪式。
+
+```text
+架构正确性由机械证据确立。
+产品工具面价值在价值确实不确定时由 Eval 确立。
+```
+
+**直接修，不需要 A/B。** 靠检查就能证明的缺陷就是缺陷：归属错误、语义不确定或随环境改变、运行时实现重复、跨平台行为分叉、service-locator 耦合、运行时能力长在 Tool 适配器里。修这些改变的是代码**是什么**，不是产品**提供什么**。
+
+**先测量。** 当两个都合理的原语发生重叠、当某个可选能力的价值不清楚、当删掉一个工具可能实质改变产品行为时，先从真实会话取一次使用基线：哪些工具真的被调用、成功率与重试率如何、它们的存在是否提升任务成功。`replace`、`read_symbol`、`blast_radius`、`expand_tools` 和 checkpoint 工具是这份测量的优先名单。
 
 ---
 
@@ -1020,7 +1132,7 @@ pub struct ToolOutcome { pub content: String, pub is_error: bool }
 
 ### 19.2 canonical 编辑工具是一个还是两个？
 
-`apply_patch` 和 `replace` 重叠。`replace` 的存在是为了在 patch 上下文匹配反复失败时，给较弱模型一条精确 find/replace 路径。拉平模型能力差距是产品目标，所以这由测量决定（§6.5），不由架构决定。
+`apply_patch` 是 canonical 结构化编辑，`write_file` 是 canonical 整文件写入，`replace` 与两者都重叠。它当初成立的理由——在 patch 上下文匹配反复失败时给模型一条精确 find/replace 路径——已经撤销（§1.1）。剩下的是一个普通的工具面问题：`replace` 是否表达了 `edit` 和 `write` 覆盖不到的独立模型意图？现在的默认答案是「否」。
 
 ### 19.3 模型控制的动态工具扩展划得来吗？
 
@@ -1047,9 +1159,13 @@ Roadmap 类内容——多 agent 方向、浏览器方向、Review 产品、云�
 ```text
 FOUNDATION_ARCHITECTURE_DEFINED   YES
 TOOL_ARCHITECTURE_DEFINED         YES
+MODEL_CAPABILITY_POLICY_DEFINED   YES
+WEAK_MODEL_COMPENSATION_GOAL      REMOVED
+CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
+CORE_PRIMITIVE_FOUNDATION_ALIGNED NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO
