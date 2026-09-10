@@ -155,13 +155,26 @@ struct Harness {
 }
 
 async fn harness(responses: Vec<ModelResponse>) -> Harness {
+    harness_with(responses, PermissionProfile::Assisted, |_| {}).await
+}
+
+/// [`harness`], with the workspace profile and an extra setup pass over the
+/// fresh workspace directory. Repository-operation fixtures need both: a real
+/// git repo to move HEAD in, and the unrestricted profile that a `.git` write
+/// only ever runs under.
+async fn harness_with(
+    responses: Vec<ModelResponse>,
+    profile: PermissionProfile,
+    setup: impl FnOnce(&std::path::Path),
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    setup(dir.path());
     let workspace = Workspace::new(dir.path()).unwrap();
     let tool_context = ToolContext::with_environment(
         workspace,
-        PermissionProfile::Assisted,
+        profile,
         Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
             std::env::current_dir().unwrap_or_default(),
@@ -882,6 +895,75 @@ async fn pure_qa_with_green_gates_is_completed_with_verification_not_run() {
     assert_eq!(
         report.verification_status,
         leveler_lifecycle::VerificationStatus::NotRun
+    );
+}
+
+/// The reported defect, end to end: a branch switch succeeds, the project has
+/// a RED test gate, and the run must still finish with no verdict — because a
+/// repository operation authors nothing, so the project's source checks were
+/// never owed.
+///
+/// Before the fix the tree diff around `git switch` reported every file that
+/// differs between the branches, the engine read that as a source change, ran
+/// the plan, and the turn ended `⚠ 已完成 · 验证未通过 · test` on a task that
+/// had written nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_branch_switch_does_not_inherit_the_projects_test_gate() {
+    let h = harness_with(
+        vec![
+            tool_call(
+                "c1",
+                "run_command",
+                serde_json::json!({"program": "git", "args": ["switch", "feat"]}),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "switched to feat"}),
+            ),
+        ],
+        PermissionProfile::FullAccess,
+        |dir| {
+            use leveler_test_support::git::{init_repo, run};
+            init_repo(dir);
+            run(dir, &["add", "-A"]);
+            run(dir, &["commit", "-qm", "init"]);
+            run(dir, &["switch", "-qc", "feat"]);
+            std::fs::write(dir.join("src/lib.rs"), "pub fn new() {}\n").unwrap();
+            std::fs::write(dir.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+            run(dir, &["add", "-A"]);
+            run(dir, &["commit", "-qm", "feat"]);
+            run(dir, &["switch", "-q", "main"]);
+        },
+    )
+    .await;
+    let mut s = spec(&h, gate("test", "false"));
+    s.coding.mode = PermissionProfile::FullAccess;
+    s.runtime.goal = "切换到 feat 分支".to_string();
+
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn new() {}\n",
+        "the switch must actually have happened"
+    );
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        report.modified_files.is_empty(),
+        "a branch switch authors nothing: {:?}",
+        report.modified_files
+    );
+    assert_eq!(
+        report.verification_status,
+        leveler_lifecycle::VerificationStatus::NotRun,
+        "a red source gate is not owed by a repository operation"
     );
 }
 

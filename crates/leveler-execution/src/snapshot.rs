@@ -108,6 +108,94 @@ impl WorkspaceSnapshot {
         result
     }
 
+    /// The commit HEAD points at, or `None` when `root` is not a git
+    /// repository (or has no commit yet, or git is unavailable).
+    ///
+    /// A command changes the working tree two ways that a tree diff cannot
+    /// tell apart: by writing files, or by moving HEAD (`pull`, `switch`,
+    /// `reset`). Only the first is something the run authored, so the position
+    /// has to be observable on both sides of a command.
+    pub async fn head_commit(root: &Path) -> Option<String> {
+        git_dir(root).await?;
+        let head = git(root, &["rev-parse", "HEAD"], None).await.ok()?;
+        Some(head.trim().to_string())
+    }
+
+    /// Whether the HEAD moves recorded since `before` include one that CREATED
+    /// a commit.
+    ///
+    /// Tree state cannot tell content that arrived from the object store
+    /// (`pull`, `switch`) from content a command wrote and then committed:
+    /// both end with the working tree matching HEAD exactly. Git's own reflog
+    /// can, because it records what each move WAS. Anything it cannot answer
+    /// reads as `true`, so an unreadable or too-short reflog keeps every path
+    /// attributed to the command that ran.
+    pub async fn head_moves_since_include_a_commit(root: &Path, before: &str) -> bool {
+        const WINDOW: &str = "-50";
+        let Ok(out) = git(
+            root,
+            &["reflog", "show", "HEAD", "--format=%H %gs", WINDOW],
+            None,
+        )
+        .await
+        else {
+            return true;
+        };
+        for line in out.lines() {
+            let (sha, subject) = line.split_once(' ').unwrap_or((line, ""));
+            // Walked back to where the command started: every move it made has
+            // been seen, and none of them created a commit.
+            if sha == before {
+                return false;
+            }
+            // "commit", "commit (amend)", "commit (initial)", "commit (merge)".
+            if subject.starts_with("commit") {
+                return true;
+            }
+        }
+        true
+    }
+
+    /// The paths whose current content a move of HEAD from `before` to `after`
+    /// fully accounts for.
+    ///
+    /// A path qualifies only when the move changed it AND the working tree now
+    /// holds exactly what `after` records. A path the move touched but that is
+    /// still dirty was written by whoever ran the command, so it is deliberately
+    /// left out: the caller must keep treating it as an authored change.
+    pub async fn paths_explained_by_head_move(
+        root: &Path,
+        before: &str,
+        after: &str,
+    ) -> Result<Vec<String>, SnapshotError> {
+        let moved = nul_paths(
+            git(
+                root,
+                &["diff-tree", "-r", "-z", "--name-only", before, after],
+                None,
+            )
+            .await?,
+        );
+        if moved.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Tracked paths differing from HEAD, plus paths git does not track at
+        // all: together, everything the working tree holds that HEAD does not.
+        let mut dirty = nul_paths(git(root, &["diff", "-z", "--name-only", "HEAD"], None).await?);
+        dirty.extend(nul_paths(
+            git(
+                root,
+                &["ls-files", "-z", "--others", "--exclude-standard"],
+                None,
+            )
+            .await?,
+        ));
+        Ok(moved
+            .into_iter()
+            .filter(|path| !dirty.contains(path))
+            .collect())
+    }
+
     /// The paths that changed between `id` and the current working tree.
     pub async fn changed_since(root: &Path, id: &SnapshotId) -> Result<Vec<String>, SnapshotError> {
         let Some(now) = Self::capture(root).await? else {
@@ -214,6 +302,14 @@ async fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<String,
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Split git's `-z` output (NUL-terminated paths) into owned strings.
+fn nul_paths(out: String) -> Vec<String> {
+    out.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn scrub_credentials(command: &mut tokio::process::Command) {
     command.env_clear();
     command.envs(leveler_core::scrubbed_environment());
@@ -275,6 +371,49 @@ mod tests {
             "script failed: {script}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A HEAD move explains the paths whose content it brought in — and only
+    /// those. A file the same command left dirty afterwards was written by the
+    /// command, not by the move, so it is NOT explained.
+    #[tokio::test]
+    async fn a_head_move_explains_only_the_paths_it_left_clean() {
+        let dir = leveler_test_support::git::scratch_repo();
+        sh(
+            dir.path(),
+            "echo one > a.txt && echo keep > b.txt && git add -A && git commit -qm init",
+        )
+        .await;
+        sh(
+            dir.path(),
+            "git switch -qc feat && echo two > a.txt && echo new > c.txt \
+             && git add -A && git commit -qm feat && git switch -q -",
+        )
+        .await;
+
+        let before = WorkspaceSnapshot::head_commit(dir.path())
+            .await
+            .expect("a repository with a commit has a HEAD");
+        sh(dir.path(), "git switch -q feat").await;
+        let after = WorkspaceSnapshot::head_commit(dir.path()).await.unwrap();
+
+        assert_ne!(before, after, "the switch must move HEAD");
+
+        let mut explained =
+            WorkspaceSnapshot::paths_explained_by_head_move(dir.path(), &before, &after)
+                .await
+                .unwrap();
+        explained.sort();
+        assert_eq!(explained, vec!["a.txt".to_string(), "c.txt".to_string()]);
+
+        // The same paths, but one of them dirtied afterwards: that one is the
+        // command's own writing and must stop being explained by the move.
+        sh(dir.path(), "echo dirty > a.txt").await;
+        let explained =
+            WorkspaceSnapshot::paths_explained_by_head_move(dir.path(), &before, &after)
+                .await
+                .unwrap();
+        assert_eq!(explained, vec!["c.txt".to_string()]);
     }
 
     #[tokio::test]

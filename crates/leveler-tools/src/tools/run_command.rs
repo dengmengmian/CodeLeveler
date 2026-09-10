@@ -343,6 +343,15 @@ pub(crate) async fn execute_program(
         ));
     }
 
+    // Where HEAD sits before the command. A command that moves it (`pull`,
+    // `switch`, `reset`) rewrites files this run did not author, and the tree
+    // diff below cannot tell the two apart on its own.
+    let head_before = if snapshot.is_some() {
+        WorkspaceSnapshot::head_commit(&root).await
+    } else {
+        None
+    };
+
     let sandboxed = request.write_scope.confines();
     // Hold the workspace-wide gate for the command AND the mutation detection
     // that follows: concurrent sub-agents share one working tree, so a command
@@ -435,6 +444,34 @@ pub(crate) async fn execute_program(
                         "{violation}; automatic workspace restore failed: {error}"
                     ));
                 }
+            }
+        }
+    }
+
+    // Two different things change the working tree: writing files, and moving
+    // HEAD. Only the first is authored by this run, and only the first carries
+    // a source-change verification obligation — a plain `git switch` that
+    // reported every file differing between the branches used to hang the
+    // project's whole `cargo test` gate on a task that wrote nothing.
+    //
+    // Deliberately AFTER the write-allowlist, file-budget and rollback checks
+    // above: those still see every path the command touched, however it
+    // touched it, so a repository operation can never walk past a write scope.
+    if !command_modified.is_empty()
+        && let Some(before) = &head_before
+        && let Some(after) = WorkspaceSnapshot::head_commit(&root).await
+        && &after != before
+        // A command that wrote a file and then committed it also moves HEAD and
+        // also leaves the tree matching it. That content IS this run's, so
+        // nothing is attributed away from a command that made a commit.
+        && !WorkspaceSnapshot::head_moves_since_include_a_commit(&root, before).await
+    {
+        match WorkspaceSnapshot::paths_explained_by_head_move(&root, before, &after).await {
+            Ok(explained) => command_modified.retain(|path| !explained.contains(path)),
+            // Unattributable: keep every path. Over-reporting costs a
+            // verification run; under-reporting would skip one that was owed.
+            Err(error) => {
+                tracing::warn!("could not attribute a HEAD move to the repository: {error}")
             }
         }
     }
@@ -1471,6 +1508,14 @@ mod snapshot_tests {
         super::super::test_ctx_in(dir, PermissionProfile::Assisted)
     }
 
+    /// A context whose commands may write `.git`. Workspace confinement
+    /// write-protects the `.git` tree, so every repository operation
+    /// (`switch`, `pull`, `reset`) runs only after the user approves an
+    /// unrestricted elevation — which is the shape these tests reproduce.
+    fn git_ctx(dir: &std::path::Path) -> ToolContext {
+        super::super::test_ctx_in(dir, PermissionProfile::FullAccess)
+    }
+
     // The git/coreutils rollback assertions below exercise Unix-shell-driven
     // mutations; Windows rollback is not driven through `sh -c` here.
     #[cfg(unix)]
@@ -1517,6 +1562,168 @@ mod snapshot_tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some(),
             "tool metadata must identify the snapshot for turn/tool-call persistence"
+        );
+    }
+
+    fn modified_of(out: &crate::tool::ToolOutput) -> Vec<String> {
+        let mut v: Vec<String> = out
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Two branches, then switch: every file that differs between them changes
+    /// on disk, but the run wrote none of them. Reporting them as modified is
+    /// what hung a `cargo test` obligation on a plain `git switch`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_head_move_is_not_an_authored_modification() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        run(dir.path(), &["switch", "-qc", "feat"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "feat"]);
+        run(dir.path(), &["switch", "-q", "main"]);
+
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "git", "args": ["switch", "feat"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            modified_of(&out).is_empty(),
+            "a branch switch authored nothing: {:?}",
+            modified_of(&out)
+        );
+    }
+
+    /// …but a command that moves HEAD *and* writes still reports the write.
+    /// The move explains only what it left matching the new HEAD.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_alongside_a_head_move_is_still_reported() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        run(dir.path(), &["switch", "-qc", "feat"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "feat"]);
+        run(dir.path(), &["switch", "-q", "main"]);
+
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c",
+                    "git switch -q feat && echo edited > a.txt && echo x > d.txt"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            modified_of(&out),
+            vec!["a.txt".to_string(), "d.txt".to_string()],
+            "the move explains c.txt only; a.txt was rewritten and d.txt created"
+        );
+    }
+
+    /// The reported case: `git pull` fast-forwards, every pulled file changes
+    /// on disk, and the run authored none of them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fast_forward_pull_authors_nothing() {
+        let upstream = scratch_repo();
+        std::fs::write(upstream.path().join("a.txt"), "one\n").unwrap();
+        run(upstream.path(), &["add", "-A"]);
+        run(upstream.path(), &["commit", "-qm", "init"]);
+
+        let dir = scratch_repo();
+        run(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &upstream.path().display().to_string(),
+            ],
+        );
+        run(dir.path(), &["fetch", "-q", "origin"]);
+        run(dir.path(), &["reset", "-q", "--hard", "origin/HEAD"]);
+
+        std::fs::write(upstream.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(upstream.path().join("b.txt"), "added\n").unwrap();
+        run(upstream.path(), &["add", "-A"]);
+        run(upstream.path(), &["commit", "-qm", "more"]);
+
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "git", "args": ["pull", "--ff-only", "origin", "HEAD"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.is_error,
+            "the pull itself must succeed: {}",
+            out.content
+        );
+        assert!(
+            modified_of(&out).is_empty(),
+            "a fast-forward pull authored nothing: {:?}",
+            modified_of(&out)
+        );
+    }
+
+    /// A command that WRITES a file and commits it in the same invocation also
+    /// moves HEAD, and the new content then matches the new HEAD exactly — the
+    /// same shape a pull leaves behind. Tree state alone cannot tell the two
+    /// apart, so the write must not disappear: a source change that skipped the
+    /// project's gate is the false-verified case this whole change exists to
+    /// avoid creating.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_committed_by_the_same_command_is_still_reported() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c",
+                    "echo written > x.rs && git add -A && git commit -qm mine"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            modified_of(&out),
+            vec!["x.rs".to_string()],
+            "committing a write does not make it someone else's: {}",
+            out.content
         );
     }
 

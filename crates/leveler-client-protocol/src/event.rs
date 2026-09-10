@@ -14,9 +14,12 @@ use super::media::AttachmentRef;
 use super::progress::{UiCompletionReport, UiDiff, UiPlan, UiVerification};
 use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
 
-/// Stable `TurnCompletedUnverified.reason` when the turn finished without any
-/// VCS-tracked source edits — so clients can show a calm "ended · repo unchanged"
-/// marker (analysis/Q&A closeout) instead of an "unverified" delivery warning.
+/// Stable `TurnCompletedUnverified.reason` when the turn AUTHORED no source
+/// edits — so clients can show a calm "ended · no source edits" marker
+/// (analysis/Q&A closeout, and repository operations like `pull`/`switch` that
+/// move HEAD without writing anything) instead of an "unverified" delivery
+/// warning. It says what this run wrote, never that the repository stands
+/// where it did.
 pub const REASON_NO_CODE_CHANGES: &str = "no_code_changes";
 /// Stable UI token: work changed files, but the project supplied no applicable
 /// automatic verification command. Clients localize the explanatory detail.

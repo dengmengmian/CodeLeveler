@@ -1197,7 +1197,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let text = line_text(&lines[0]);
         assert!(
-            text.contains("◇ 结束 · 未改仓库 · 20 次工具 · 1m 28s"),
+            text.contains("◇ 结束 · 未改源码 · 20 次工具 · 1m 28s"),
             "unexpected marker: {text}"
         );
         assert!(!text.contains("未验证"), "{text}");
