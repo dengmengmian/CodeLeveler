@@ -2547,6 +2547,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             });
         }
 
+        // A durable `running` outlives the process that wrote it. Kill a TUI
+        // mid-turn and the column still says a turn is in flight, so reopening
+        // the session painted a live "waiting for the model" clock, elapsed
+        // time and all, over work that had ended with the process. The turns
+        // table is the finer truth and the startup reaper keeps it honest, so
+        // ask it: a session whose row says running while every one of its turns
+        // has settled is interrupted, and opens idle.
+        let status = if record.status == leveler_lifecycle::SessionStatus::Running
+            && leveler_storage::TurnRepository::new(&db)
+                .list(session_id)
+                .await
+                .map(|turns| turns.iter().all(|t| t.status != "running"))
+                .unwrap_or(false)
+        {
+            leveler_lifecycle::SessionStatus::Interrupted
+        } else {
+            record.status
+        };
+
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
             repository: record.repository,
@@ -2554,7 +2573,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             model: Some(model),
             mode: protocol_mode(config.mode),
             branch: detect_branch_label(&self.app.layout.repo_root),
-            status: record.status.as_str().to_string(),
+            status: status.as_str().to_string(),
             messages,
             pending_interactions,
             available_models,

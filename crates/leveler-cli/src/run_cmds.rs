@@ -741,6 +741,13 @@ pub(crate) async fn cmd_tui(
                      list sessions: leveler resume"
                 )
             })?;
+        // A starting process reaps the zombie turns its own runtime left
+        // behind. Creating a session did that; reopening one did not — so a
+        // session resumed after the previous process was killed opened with the
+        // killed turn still marked `running`, and the interface painted a live
+        // "waiting for the model" clock over work that had been dead since the
+        // kill. Scoped to this session: reopening one must not disturb another.
+        app.reap_zombie_turns(&db, Some(&session_id)).await?;
         session_id
     } else {
         app.create_session(&model_ref, "interactive session")

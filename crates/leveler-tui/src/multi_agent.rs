@@ -302,6 +302,30 @@ fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
 mod tests {
     use super::*;
 
+    /// A settled team that lost a child must not wear the success mark.
+    /// The corpus replay caught eight real frames saying `✓ … 1 项未完成`.
+    #[test]
+    fn a_team_that_lost_a_child_does_not_wear_the_success_mark() {
+        let lost = team_with(&[ChildStatus::Completed, ChildStatus::Failed]);
+        assert_eq!(
+            collaboration_glyph(&lost, true),
+            "\u{26a0}",
+            "settled with a loss"
+        );
+        let clean = team_with(&[ChildStatus::Completed, ChildStatus::Completed]);
+        assert_eq!(
+            collaboration_glyph(&clean, true),
+            "\u{2713}",
+            "settled, nothing lost"
+        );
+        let working = team_with(&[ChildStatus::Running, ChildStatus::Failed]);
+        assert_eq!(
+            collaboration_glyph(&working, false),
+            "\u{25c9}",
+            "still working"
+        );
+    }
+
     fn team_with(statuses: &[ChildStatus]) -> TaskTeamView {
         let mut team = TaskTeamView::default();
         for (i, st) in statuses.iter().enumerate() {
@@ -1185,6 +1209,28 @@ pub fn collaboration_compact_line(team: &TaskTeamView, t: &crate::i18n::UiText) 
         row.push_str(&format!(" · {} {}", c.role, state));
     }
     row
+}
+
+/// The glyph on the compact collaboration row.
+///
+/// Found by replaying real sessions: a settled team that lost a child rendered
+/// `✓ 2 个 Agent 已结束 · 1 项未完成` — the success mark on the line that
+/// announces work which did not finish. The colour already went red; the glyph
+/// did not, and the glyph is what a reader takes as the verdict. Same rule the
+/// blocked goal row follows (`status_glyph`): a call that ran is not an outcome
+/// that succeeded.
+///
+/// `terminal` is the caller's own settled test, so WHEN the glyph appears does
+/// not change — only what it says when the team lost someone.
+pub fn collaboration_glyph(team: &TaskTeamView, terminal: bool) -> &'static str {
+    if !terminal {
+        return "\u{25c9}";
+    }
+    let lost_one = team
+        .children
+        .iter()
+        .any(|c| c.status == ChildStatus::Failed);
+    if lost_one { "\u{26a0}" } else { "\u{2713}" }
 }
 
 /// Compact team summary for the header.

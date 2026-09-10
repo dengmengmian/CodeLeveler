@@ -16,46 +16,7 @@ use crate::AppError;
 
 pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> RuntimeEvent {
     match result {
-        Ok(outcome) => {
-            let detail = outcome.stop_detail.filter(|s| !s.trim().is_empty());
-            match outcome.stop_reason {
-                StopReason::Completed => RuntimeEvent::TurnCompleted,
-                StopReason::Answered => RuntimeEvent::TurnAnswered,
-                StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
-                },
-                // The work so far is real and still on disk. A bare "budget
-                // exhausted" reads as a dead end, so name the way forward:
-                // /goal is the profile that grants further work-windows instead
-                // of stopping at one round budget.
-                StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
-                },
-                // A pinned round ceiling fired: bounded work reached its edge.
-                // The runtime's own `stop_detail` here is a machine token
-                // ("round ceiling reached") that must never reach the screen,
-                // so this outcome always speaks in product wording. Not a
-                // liftable budget, so do not point at /goal as if more
-                // work-window helps.
-                StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
-                    reason: "达到执行回合上限 · 已停止,请检查是否陷入循环".into(),
-                },
-                StopReason::Blocked => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
-                },
-                StopReason::Stalled => RuntimeEvent::TurnIncomplete {
-                    reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
-                },
-                StopReason::CompletedUnverified => RuntimeEvent::TurnCompletedUnverified {
-                    reason: detail.unwrap_or_else(|| {
-                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
-                    }),
-                },
-                StopReason::CompletedChecksFailed => RuntimeEvent::TurnCompletedChecksFailed {
-                    reason: detail.unwrap_or_else(|| "验证未通过".to_string()),
-                },
-            }
-        }
+        Ok(outcome) => turn_end_event(outcome.stop_reason, outcome.stop_detail),
         Err(AppError::Agent(AgentError::Cancelled)) => RuntimeEvent::TurnCancelled,
         Err(AppError::Agent(AgentError::Model(error)))
             if error.kind == leveler_model::ModelErrorKind::Truncated =>
@@ -66,6 +27,56 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
         }
         Err(error) => RuntimeEvent::TurnFailed {
             error: error.to_string(),
+        },
+    }
+}
+
+/// The turn-end event for a typed stop reason — the terminal marker a person
+/// reads at the bottom of a finished turn.
+///
+/// Split out of [`turn_runtime_event`] so a consumer that holds only the
+/// durable `TaskFinished { stop, reason }` — a replay of a recorded session, an
+/// audit of one — reaches the same terminal state the live client reached,
+/// through this code rather than a second copy of the mapping. Terminal state
+/// is where "blocked" is told apart from "done", so a replay that cannot reach
+/// it cannot check the one thing that matters most.
+pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeEvent {
+    let detail = stop_detail.filter(|s| !s.trim().is_empty());
+    match stop {
+        StopReason::Completed => RuntimeEvent::TurnCompleted,
+        StopReason::Answered => RuntimeEvent::TurnAnswered,
+        StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
+        },
+        // The work so far is real and still on disk. A bare "budget
+        // exhausted" reads as a dead end, so name the way forward:
+        // /goal is the profile that grants further work-windows instead
+        // of stopping at one round budget.
+        StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
+        },
+        // A pinned round ceiling fired: bounded work reached its edge.
+        // The runtime's own `stop_detail` here is a machine token
+        // ("round ceiling reached") that must never reach the screen,
+        // so this outcome always speaks in product wording. Not a
+        // liftable budget, so do not point at /goal as if more
+        // work-window helps.
+        StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
+            reason: "达到执行回合上限 · 已停止,请检查是否陷入循环".into(),
+        },
+        StopReason::Blocked => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
+        },
+        StopReason::Stalled => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
+        },
+        StopReason::CompletedUnverified => RuntimeEvent::TurnCompletedUnverified {
+            reason: detail.unwrap_or_else(|| {
+                leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+            }),
+        },
+        StopReason::CompletedChecksFailed => RuntimeEvent::TurnCompletedChecksFailed {
+            reason: detail.unwrap_or_else(|| "验证未通过".to_string()),
         },
     }
 }

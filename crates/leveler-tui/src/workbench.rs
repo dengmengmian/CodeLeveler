@@ -459,8 +459,10 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     const MEMBER_INDENT: &str = "  ";
     let terminal = state.team.surface_is_terminal(state.elapsed_secs);
     if area.height == 1 || terminal {
-        // Compact / terminal: one truthful row, nothing else.
-        let glyph = if terminal { "✓" } else { "◉" };
+        // Compact / terminal: one truthful row, nothing else. The glyph is
+        // part of that truth, so it comes from the same place the row's words
+        // do — a settled team that lost a child says so in both.
+        let glyph = crate::multi_agent::collaboration_glyph(&state.team, terminal);
         let row = format!(
             "{glyph} {}",
             crate::multi_agent::collaboration_compact_line(&state.team, t)

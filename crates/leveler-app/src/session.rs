@@ -294,7 +294,7 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
 /// the verifier's own reason.
 fn unverified_detail(report: &TaskReport) -> String {
     if report.modified_files.is_empty() {
-        // Stable token for TUI: "◇ 结束 · 未改仓库" (not "未验证" delivery).
+        // Stable token for TUI: "◇ 结束 · 未改源码" (not "未验证" delivery).
         return leveler_client_protocol::REASON_NO_CODE_CHANGES.to_string();
     }
     match &report.verification {
@@ -350,14 +350,29 @@ impl Application {
         goal: &str,
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
-        // Local single-user CLI: clear zombie `running` turns left by a prior
-        // process kill before starting a fresh interactive session. Foreign-
-        // owned tasks are reported, never touched.
+        self.reap_zombie_turns(&db, None).await?;
+        self.insert_session(&db, model, goal).await
+    }
+
+    /// Clear the zombie `running` turns this runtime left behind, optionally
+    /// scoped to one session. Returns how many were reaped.
+    ///
+    /// A process that is starting up does this once: a turn whose owning
+    /// process was killed is not running any more, and a row that still says it
+    /// is becomes a live spinner over dead work the next time anyone opens the
+    /// session. Foreign-owned tasks are reported and never touched — the
+    /// ownership check inside the reaper is what makes it safe to call from a
+    /// repository where a daemon may be alive.
+    pub async fn reap_zombie_turns(
+        &self,
+        db: &leveler_storage::Database,
+        session: Option<&leveler_core::SessionId>,
+    ) -> Result<usize, AppError> {
         let runtime_id = self.runtime_id()?;
         let outcome = leveler_engine::reap_after_restart(
-            &leveler_storage::EngineStores::from_database(&db),
+            &leveler_storage::EngineStores::from_database(db),
             &runtime_id,
-            None,
+            session,
         )
         .await
         .map_err(app_error_from_engine)?;
@@ -371,10 +386,11 @@ impl Application {
         if !outcome.events.is_empty() {
             tracing::warn!(
                 reaped = outcome.events.len(),
-                "reaped zombie running turns on session create"
+                session = session.map(|s| s.as_str()),
+                "reaped zombie running turns at startup"
             );
         }
-        self.insert_session(&db, model, goal).await
+        Ok(outcome.events.len())
     }
 
     /// Create a session inside a long-lived daemon. Startup performs the zombie
