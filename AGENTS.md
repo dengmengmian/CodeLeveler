@@ -70,10 +70,9 @@ Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
    persistence or UI concept.
 2. **Harnesses are siblings.** A future `leveler-review` sits beside
    `leveler-agent`, not under it. A harness never depends on another harness.
-3. **Tool contracts are separate from concrete capabilities.** The trait,
-   schema, registry and dispatch contract are one concern; `read_file`, `grep`,
-   `run_command`, browser and LSP are another. Today one crate holds both — see
-   the debt register in `docs/ARCHITECTURE.md`.
+3. **Tools are adapters; capabilities are implementations.** A tool renders a
+   capability to the model. It does not implement the capability, and it does
+   not own policy. See the tool rules below.
 4. **Host side effects have one authority.** `leveler-execution` owns workspace
    path enforcement, permission, approval, process execution, sandboxing and
    cancellation. An agent *requests* a side effect; the host authority
@@ -97,7 +96,42 @@ Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
 11. **Foundation changes carry a higher bar than product changes.** Extend
     above the foundation before you modify it.
 12. **A second product harness must not require modifying the agent kernel.**
-    This is the *Second Harness Test*, defined in `docs/ARCHITECTURE.md`.
+    It builds its own tool host and its own tool surface over the same kernel;
+    reusing the Coding tool plumbing is not required. This is the *Second
+    Harness Test*, defined in `docs/ARCHITECTURE.md`.
+
+## The tool rules
+
+```text
+Tools are adapters, not runtimes.
+
+The Foundation tool boundary is leveler-agent-core::ToolRuntime.
+
+Tool dependencies are explicit; tools do not receive a universal service
+locator.
+
+ToolHost admits; Host Execution performs.
+
+Policy belongs to the Harness and the ToolHost, not to ToolRegistry or to
+individual tools.
+
+Capability complexity belongs to the capability owner.
+
+Authoritative runtime facts do not hide in arbitrary JSON metadata.
+
+Do not introduce a generic Tool Core without demonstrated need.
+```
+
+Two more, on what the model sees:
+
+- **The harness decides the tool surface.** Expose the smallest surface that
+  preserves capability. Many capabilities is not many tools per round.
+- **Removing a tool is an evaluation decision.** Never remove one because
+  another tool could theoretically reproduce it; remove it when measurement
+  shows no gain, real overlap, or that the capability belongs to the runtime
+  or the user.
+
+`docs/ARCHITECTURE.md` §5 and §6 carry the detail. Do not copy it here.
 
 ## Anti-overengineering rule
 
@@ -116,6 +150,17 @@ Otherwise prefer the concrete implementation. In particular: do **not**
 pre-build interfaces for a Review or multi-agent product that does not exist
 yet. The architecture must *allow* them to appear. That is not the same as
 implementing them now.
+
+Two proposals are already rejected, not deferred. Do not revive either without
+new evidence: a generic `leveler-tool-core` crate (the foundation tool
+boundary already exists, `docs/ARCHITECTURE.md` §5.1), and a replacement
+container for `ToolContext` designed before the capability extraction it is
+meant to serve (§5.5).
+
+Simplify by moving complexity to its correct owner. Never by deleting
+reliability: `persist-before-forward`, the ownership fence, compare-and-swap
+edits, stale-write protection, sandboxing, approval and crash recovery all
+survive every move intact.
 
 ## Architecture decision test
 

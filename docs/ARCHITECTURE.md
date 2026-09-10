@@ -7,7 +7,7 @@ recorded honestly.
 
 Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md).
 
-Everything below was verified against the workspace at commit `494ed1b`
+Everything below was verified against the workspace at commit `6724268`
 (31 crates) using `cargo metadata` and the crate sources. Where the code does
 not yet match the target boundary, it says so rather than describing the
 target as if it were already true.
@@ -39,6 +39,11 @@ Every durable fact has one authoritative owner.
 Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
 ```
 
+Simplification means moving complexity to its correct owner. It never means
+deleting reliability. `persist-before-forward`, the ownership fence,
+compare-and-swap edits, stale-write protection, sandboxing, approval and crash
+recovery all stay exactly as strong as they are.
+
 ---
 
 ## 2. Layer model
@@ -55,13 +60,16 @@ Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
 │                        HARNESSES                            │
 │   Coding Harness                 Review Harness             │
 │   leveler-agent                  (future) leveler-review    │
+│   ├─ tool host (admission)       ├─ its own tool host       │
+│   └─ tool surface selection      └─ its own tool surface    │
 └──────────┬──────────────────────────┬───────────────────────┘
            │                          │
            └────────────┬─────────────┘
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      AGENT RUNTIME                          │
-│   leveler-agent-core          Tool runtime contracts        │
+│   leveler-agent-core                                        │
+│   ToolRuntime { definitions, execute }  ← tool boundary     │
 └─────────────┬──────────────────────┬────────────────────────┘
               │                      │
               ▼                      ▼
@@ -85,10 +93,10 @@ Two places where the running code does not match this picture yet:
 
 - **The engine sits above the harness, not beside it.** `leveler-engine`
   depends on `leveler-agent` and its public API names Coding concepts. See
-  §17.1.
-- **Tool contracts and concrete capabilities are one crate.** The box labelled
-  "Tool runtime contracts" and most of the "Reusable capabilities" row are both
-  reached through `leveler-tools`. See §17.2.
+  §18.1.
+- **Tool adapters and capability implementations are one crate.**
+  `leveler-tools` holds both, and several tools implement capability behavior
+  themselves. See §5 and §18.
 
 Everything else in the diagram is the real dependency shape.
 
@@ -105,7 +113,8 @@ Everything else in the diagram is the real dependency shape.
 | `leveler-lifecycle` | The execution lifecycle vocabulary: `SessionStatus`, `TaskOutcome`, `VerificationStatus`, `TurnOutcome`, plus the Coding workflow types. No internal dependencies. |
 
 These crates must not learn coding, review, finding, repository-workflow, TUI,
-web, CLI or any other product concept.
+web, CLI or any other product concept. `leveler-model` currently does — see
+§18.6.
 
 `leveler-lifecycle` already carries the split internally: its `runtime` module
 is domain-neutral and its `workflow` module holds Coding vocabulary, with
@@ -156,66 +165,401 @@ saying that concern belongs to somebody else. **The kernel is clean today.**
 
 ---
 
-## 5. Tool runtime
+## 5. Tool architecture
 
-Two different concerns are worth separating in the reader's mind, because the
-code does not separate them yet.
+### 5.1 The Foundation tool boundary already exists
 
-**Tool runtime contracts** — what a tool *is*:
+An earlier version of this document named `leveler-tool-core` as the target: a
+new crate holding the tool trait, schema, registry and dispatch contract,
+extracted from `leveler-tools`.
 
-```text
-Tool trait          ToolSchema          ToolRegistry
-ToolCall            ToolResult          ToolContext contract
-ToolHost contract   admission           dispatch contract
+**That target is withdrawn.** Re-reading the source shows the foundation tool
+boundary is already there, and it is smaller than the proposed crate would
+have been:
+
+```rust
+// leveler-agent-core::tool_runtime
+pub trait ToolRuntime: Send + Sync {
+    fn definitions(&self) -> Vec<ToolDefinition>;
+    async fn execute(&self, call: ToolCall, cancellation: CancellationToken)
+        -> Result<ToolOutcome, ToolRuntimeError>;
+}
 ```
 
-**Concrete agent capabilities** — what tools there *are*: `read_file`,
-`list_files`, `grep`, `apply_patch`, `replace`, `run_command`,
-`shell_command`, `find_symbol`, `find_references`, `diagnostics`,
-`blast_radius`, `git_status`, `git_diff`, browser, memory, skills, web fetch
-and search, image viewing, task control, and MCP-discovered tools.
+Two methods. The crate's own comment states the rest of the contract: "the
+kernel knows nothing about how a tool is authorized, sandboxed, or run …
+admission, permission, workspace, side-effect durability — belongs to the
+host."
 
-### Current state
-
-`leveler-tools` holds both. `src/tool.rs` and `src/registry.rs` are the
-contract; `src/tools/` is 29 concrete capabilities. The crate depends on
-`leveler-browser`, `leveler-context`, `leveler-execution`, `leveler-lsp`,
-`leveler-memory`, `leveler-project` and `leveler-skills` — those edges belong
-to the concrete tools, not to the contract.
-
-The concrete coupling shows in `ToolContext`: `ToolServices` names
-`lsp_sessions`, `artifact_store`, `memory_root`, `background_tasks` and
-`browser` as struct fields. Any implementer of the `Tool` trait — including a
-future Review-specific tool that needs none of them — takes that whole shape.
-The fields are `Option`, so a caller *can* pass `None`; the type still carries
-every capability into every tool.
-
-`ToolRegistry` itself composes freely: `ToolRegistry::new()` plus `register`,
-with `core_registry()` and `full_registry()` as two prebuilt selections. A
-different harness can build a different registry today.
-
-### Target state
+So:
 
 ```text
-leveler-tool-core   → Tool, ToolSchema, ToolRegistry, ToolCall, ToolResult,
-                      ToolContext contract, ToolHost contract, admission,
-                      dispatch contract
-leveler-tools       → the concrete built-in capabilities
+leveler-agent-core::ToolRuntime  =  the Foundation Tool Boundary
 ```
 
-**This split is a stated target, not scheduled work.** Do not create
-`leveler-tool-core` to make this document look finished. The split earns its
-place when a second harness actually needs the contract without the
-capabilities — see §16.
+A second harness implements those two methods and owns everything behind
+them. It does not need `leveler-tools`, the `Tool` trait, or `ToolRegistry`.
 
-Note that the kernel already has its own narrower seam: `ToolRuntime` in
-`leveler-agent-core` needs only the tool definitions the model may see plus a
-way to turn a `ToolCall` into text. `leveler-tools` sits behind that seam, not
-inside the kernel.
+> **Do not introduce a second generic tool core for architectural symmetry.**
+> `leveler-tool-core` is a rejected proposal, not deferred work. Revisit it
+> only if a real second consumer appears *and* `ToolRuntime` is demonstrably
+> insufficient for it.
+
+### 5.2 What a tool is
+
+```text
+A Tool is a model-facing adapter to a capability.
+A Tool is not the runtime that implements the capability.
+```
+
+A tool owns:
+
+```text
+model-facing name, schema, description
+argument decoding and compatibility repair
+capability invocation
+model-facing result rendering
+the small intrinsic execution metadata mechanical correctness requires
+```
+
+A tool does not own:
+
+```text
+service discovery            permission resolution
+global policy                approval orchestration
+ownership management         durability
+persistent state ownership   process lifecycle
+workspace transaction runtime LSP lifecycle
+browser lifecycle            provider configuration
+runtime evidence storage     UI state
+```
+
+The rule in one line: **tool thin, capability thick.** "Thick" does not mean a
+single large service. It means the domain implementation has a named owner
+that is not the model-facing adapter.
+
+```text
+ReadFileTool      → WorkspaceReader
+GrepTool          → WorkspaceSearch
+ApplyPatchTool    → WorkspaceEditor
+RunCommandTool    → CommandExecution
+FindSymbolTool    → CodeIntelligence
+BrowserClickTool  → BrowserRuntime
+ViewImageTool     → Media
+WebSearchTool     → Search provider
+```
+
+### 5.3 Capability is a responsibility, not necessarily a crate
+
+```text
+Capability != crate
+```
+
+`WorkspaceReader`, `WorkspaceSearch`, `WorkspaceEditor`, `CommandExecution`
+and `CodeIntelligence` are architecture responsibilities. They may be
+implemented as a module, a struct, a subsystem of an existing crate, or a
+service — whatever the code makes natural.
+
+Do not create `leveler-workspace-search`, `leveler-workspace-editor` or
+`leveler-code-intelligence` to make the diagram symmetric. A crate split needs
+two real consumers, a real dependency inversion, an independent
+security/runtime/protocol boundary, or an observed coupling defect. Prefer a
+concrete struct over a trait until a second implementation exists.
+
+### 5.4 ToolHost admits; Host Execution performs
+
+```text
+ToolHost admits.
+Host Execution performs.
+```
+
+The Coding tool host is `crates/leveler-agent/src/executor/host.rs`. It is the
+one path from a model-proposed call to an execution, and the code enforces
+that rather than documenting it:
+
+```text
+side-effect barrier → pre-hooks → permission rules → profile policy
+→ auto-review / approval → barrier again → execution
+```
+
+Admission produces an `AdmittedCall`, the only value `dispatch` accepts —
+executing without admission does not typecheck, and
+`crates/leveler-agent/tests/tool_host_boundary.rs` fails if any other file in
+the crate reaches `registry.execute` or the hook gate directly. The barrier
+runs twice on purpose: the approval outcome must be durable before the side
+effect it authorizes.
+
+`leveler-execution` performs: filesystem enforcement, process execution,
+sandbox, path safety, host process mechanics.
+
+Neither `ToolRegistry`, nor a `Tool` implementation, nor a capability may open
+a third permission or approval path. Today `ToolRegistry` does — see §5.6.
+
+### 5.5 ToolContext: current state and target
+
+Current shape:
+
+```text
+ToolContext = ExecutionResources + ToolPolicy + ToolServices + session_scope
+```
+
+`ToolServices` names `lsp_sessions`, `lsp_start_locks`, `artifact_store`,
+`memory_root`, `background_tasks` and `browser` as struct fields. Every tool
+receives all of them, whether or not it uses any.
+
+That makes `ToolContext` a service locator, a policy container, an execution
+container and a session capability container at once. It is recorded as debt
+in §18.2.
+
+Target:
+
+```text
+Tool dependencies are explicitly injected.
+A tool receives only the capability it needs.
+Per-call context carries only genuinely dynamic invocation state, or
+authority the host minted for this call.
+```
+
+**Do not design a replacement now.** No `BetterToolContext`, no
+`ToolExecutionContextV2`, no `CapabilityContext`. The target is that
+`ToolContext` shrinks or disappears as a *consequence* of capability
+extraction, not that a new container is invented ahead of it.
+
+### 5.6 ToolRegistry: current state and target
+
+`ToolRegistry::execute` today performs, in order: read-only enforcement,
+zero-write-authority enforcement, permission-mode enforcement, input
+normalization, JSON-schema validation, dispatch, and a central output-budget
+cap. The module also owns the observe-class name list, the read-only subset,
+MCP filtering, the `core`/`full` compositions and `expand_tool_category`.
+
+That is a policy engine wearing a registry's name.
+
+Target:
+
+```text
+ToolRegistry
+    register
+    lookup
+    definitions
+    schema validation
+    adapter dispatch
+```
+
+Everything else moves to its owner:
+
+| Concern | Target owner |
+| --- | --- |
+| tool selection, work profile, read-only set, dynamic capability choice | Harness |
+| permission, approval | ToolHost |
+| ownership, write scope | ToolHost / runtime |
+| result budget | Harness / runtime result handling |
+
+The registry must not become a policy engine again.
+
+### 5.7 The tool layering, drawn
+
+```text
+                         MODEL
+                           │
+                           ▼
+┌──────────────────────────────────────────────────┐
+│                AGENT KERNEL                      │
+│              leveler-agent-core                  │
+│ model loop / retry / budget / cancel             │
+│ ToolRuntime { definitions, execute }             │
+└───────────────────────┬──────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────┐
+│               HARNESS TOOL HOST                  │
+│ admission / authorization / approval             │
+│ ownership / durability barrier                   │
+│ execution scheduling / runtime evidence          │
+└───────────────────────┬──────────────────────────┘
+              ┌─────────┴──────────────┐
+              ▼                        ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│ Capability Tool Adapters │  │ Harness Control Tools    │
+│ read_file  grep          │  │ update_goal              │
+│ apply_patch run_command  │  │ update_plan              │
+│ browser_*  git_*         │  │ request_user_input       │
+│ …                        │  │ request_permissions      │
+│                          │  │ spawn_agent              │
+│                          │  │ claim_write_scope        │
+│                          │  │ report_finding           │
+└─────────────┬────────────┘  └──────────────────────────┘
+              ▼
+┌──────────────────────────────────────────────────┐
+│                  CAPABILITIES                    │
+│ Workspace Read/Search   Workspace Edit           │
+│ Command Execution       Code Intelligence        │
+│ Browser Runtime         VCS      Memory          │
+│ Skills   Media   Web/Search   MCP Runtime        │
+└───────────────────────┬──────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────┐
+│               HOST EXECUTION                     │
+│              leveler-execution                   │
+│ filesystem / process / sandbox / path safety     │
+│ process lifecycle / controlled host effects      │
+└──────────────────────────────────────────────────┘
+```
+
+The harness-control column is **already separate in the code**: those tools
+live in `crates/leveler-agent/src/injected_tools.rs`, not in the registry.
+`update_plan` is the exception — it sits in `leveler-tools` with the capability
+adapters. See §18.5.
 
 ---
 
-## 6. Host execution authority
+## 6. Tool surface policy
+
+### 6.1 The principle
+
+```text
+Expose the smallest tool surface that preserves capability.
+```
+
+Every model-facing tool costs schema tokens, tool-choice entropy, overlapping
+semantics the model must disambiguate, routing mistakes, policy branches,
+replay semantics and test surface. Capability count and model-facing tool
+count are different numbers, and only the second one is a cost paid on every
+round.
+
+```text
+Many capabilities  ≠  many tools visible to the model each round
+```
+
+### 6.2 What the model sees today
+
+Measured from `crates/leveler-tools/src/registry.rs` at this commit:
+
+| Set | Count |
+| --- | --- |
+| `core_registry()` | 14 |
+| `full_registry()` = core + 17 + 12 browser | 43 |
+| Harness control tools injected by the executor | 7 |
+| `default_registry()` | `full_registry()` |
+
+So the default surface is on the order of fifty tools. `core_registry()` is
+selected by the economy work profile, and `expand_tools` lets the model ask
+for more mid-session.
+
+Two facts worth naming, because they cut against the obvious reading:
+
+- **`find_files` is not in `core_registry()`.** The economy surface has
+  `grep` and `list_files` but reaches `find_files` only through
+  `expand_tools("search")`. If `find_files` is a core primitive — and the
+  distinct model intent argues it is — that is a surface-composition bug, not
+  a capability gap.
+- **`replace`, `shell_command`, `update_plan`, `load_skill`, `expand_tools`
+  and `memory` *are* in core.** The economy surface is not the primitive set;
+  it is a historical selection.
+
+### 6.3 The four categories
+
+**Core capability tools** — the minimum a coding agent needs:
+
+```text
+read_file    list_files    find_files    grep
+apply_patch (canonical edit)             run_command
+```
+
+`shell_command` is a candidate seventh. Whether the canonical edit tool is
+`apply_patch` alone or `apply_patch` plus `replace` is an evaluation question,
+not an architecture one (§6.5).
+
+**Optional capability packs** — real capabilities that need not be visible
+every round:
+
+```text
+Code Intelligence   find_symbol, read_symbol, find_references,
+                    diagnostics, blast_radius
+VCS                 git_status, git_diff
+Browser / Web       browser_* (12), web_fetch, web_search
+Media               view_image
+Memory              memory, remember
+Skills              load_skill
+Background process  get_task, wait_task, kill_task
+```
+
+An implementation existing is not a reason to expose it by default.
+
+**Harness control tools** — the Coding harness's control protocol, not
+reusable capability:
+
+```text
+request_user_input (alias ask_user)    update_goal
+update_plan                            request_permissions
+spawn_agent                            claim_write_scope
+report_finding
+```
+
+A Review harness would have a different set here. That is the point.
+
+**Extension tools** — MCP-discovered tools. The MCP protocol and runtime stay
+conceptually separate from the `McpTool` adapter.
+
+### 6.4 Who decides the surface
+
+```text
+The Harness decides what tools exist for the product.
+```
+
+It decides from the work profile, the task type, the capabilities configured
+and the model profile. The kernel knows none of this.
+
+This is why `expand_tools` is architecturally suspect: it inverts the
+ownership, letting the model ask the runtime to reveal more tools. That costs
+an extra tool call, an extra round, dynamic registry state, more replay and
+control semantics. Unless evaluation shows the schema-token saving beats the
+extra round on both success and cost, harness-side selection is the pattern
+and `expand_tools` is not.
+
+### 6.5 Removal is an evaluation decision, not an aesthetic one
+
+```text
+No tool is removed merely because another tool could theoretically
+reproduce it.
+```
+
+Remove or demote a tool when evidence shows: no measurable success
+improvement, significant semantic overlap, extra routing errors, unnecessary
+complexity, or that the capability belongs to the runtime or the user rather
+than to the model.
+
+Candidates for evaluation, with the reason each is on the list:
+
+| Tool | Why it is a candidate |
+| --- | --- |
+| `expand_tools` | Inverts surface ownership; costs a round to buy schema tokens. Strong removal candidate. |
+| `create_checkpoint` / `restore_checkpoint` | The runtime already maintains checkpoints and recovery. Asking the model to know when to checkpoint adds cognitive load and turns a runtime facility into tool semantics. Should leave the default model surface absent a specific product requirement. |
+| `consolidate_memory` | Memory subsystem maintenance, not a coding capability. Can run in the background, at session close, periodically, or on an explicit user command. |
+| `forget` | Destructive mutation of durable state on a semantic judgement the model is not positioned to make. Deleting durable memory is closer to a user action. |
+| `create_skill` | System customization / metaprogramming. `load_skill` can stay optional; creation should not be a default coding-task affordance. |
+| `blast_radius` | An advanced Code Intelligence operation (references → enclosing symbols → BFS), not a primitive. Move to the optional pack, then evaluate whether it reduces rounds or improves refactor recall. |
+| `read_symbol` | `find_symbol` + `read_file` reproduces it. It survives only if it measurably cuts tokens or rounds. Pure evaluation question. |
+| `replace` | **Not an architecture decision.** Its source states its purpose: exact find/replace for weaker models that fail repeatedly on patch context matching. Flattening model capability differences is a product goal, so this needs an A/B (`apply_patch` alone vs `apply_patch` + `replace`) measuring edit retries, invalid patches, rounds, tokens and weak-model success. Do not delete it on architectural taste. |
+| `shell_command` vs `run_command` | `run_command` is program+args: cross-platform, no shell quoting, simple to analyse. `shell_command` is the string form models know best. `shell_command` already reuses `run_command`'s `execute_program`, so two adapters over one capability is architecturally fine. Whether both stay on the model surface is an evaluation question. |
+| `git_status` / `git_diff` | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell, has stable output and replays cleanly. Keep the interface for now; move the implementation to `leveler-vcs`. |
+
+`list_files` and `find_files` are deliberately **not** merge candidates. They
+express different model intents — "what is in this directory" versus "where in
+the repository does this pattern exist". What should be unified is the
+filesystem traversal and ignore semantics beneath them.
+
+### 6.6 The first code step is measurement, not refactoring
+
+Before any tool is removed or rewritten, take a usage baseline from real
+dogfood sessions: which tools are actually called, at what success and retry
+rate, and whether their presence improves task success. `replace`,
+`read_symbol`, `blast_radius`, `expand_tools` and the checkpoint tools are the
+priority. Removing a tool should rest on mechanical evidence, not on judgement
+about what looks unnecessary.
+
+---
+
+## 7. Host execution authority
 
 `leveler-execution` is the host side-effect authority. It owns:
 
@@ -235,10 +579,6 @@ An agent requests a side effect.
 The host authority performs it.
 ```
 
-There must not be a second path from a harness or a tool to the filesystem or
-to a process. Do not duplicate security policy between the tool layer and the
-execution layer.
-
 ### Verified state
 
 Counting production (non-test) call sites of `fs::write`, `fs::remove`,
@@ -257,48 +597,46 @@ Counting production (non-test) call sites of `fs::write`, `fs::remove`,
 | `leveler-engine` | 3 | `git rev-parse` for the baseline commit. |
 | `leveler-skills` / `leveler-project` | 2 / 1 | Create state directories under the Leveler home. |
 
-Two distinct things sit in that table, and conflating them would misstate the
-boundary:
+Two distinct things sit in that table:
 
 1. **Model-requested effects on the user's repository.** These all go through
    `Workspace` and `CommandRunner`. `leveler-agent` reaching zero is the
    meaningful number.
-2. **The runtime's own state and sidecars.** Writes under the Leveler home
-   (memory, skills, project state, browser driver) and long-lived sidecar
-   processes (MCP servers, language servers, the browser driver) do not pass
-   through the permission/approval path, because they are not something the
-   model asked for.
+2. **The runtime's own state and sidecars.** Writes under the Leveler home and
+   long-lived sidecar processes (MCP servers, language servers, the browser
+   driver) do not pass through the permission/approval path, because they are
+   not something the model asked for.
 
 That second category is a real, deliberate boundary — but the sidecars are
 outside `CommandRunner`'s process-tree termination and sandbox semantics. See
-§17.4.
+§18.4.
 
 ---
 
-## 7. Reusable capabilities
-
-These are capabilities a harness may select, not parts of the kernel:
+## 8. Reusable capabilities
 
 | Crate | Capability |
 | --- | --- |
 | `leveler-context` | Bounded repository context assembly: map, candidate files, related tests, merged project rules, token estimate, repeated-read guard. |
-| `leveler-project` | Project language detection and filesystem layout (config and state locations). |
+| `leveler-project` | Project language detection and filesystem layout. |
 | `leveler-memory` | Durable project memory store and its promotion pipeline. |
 | `leveler-skills` | Skill discovery and loading. |
 | `leveler-vcs` | Git operations, performed through the execution authority. |
 | `leveler-lsp` | Language-server sessions, reused across tool calls. |
 | `leveler-browser` | Browser runtime, driver install, isolated per-project profile. |
-| `leveler-media` | Media handling. No internal dependencies. |
+| `leveler-media` | Content-typed image import: real MIME from content, decode and pixel limits, EXIF stripping, downscaling, content-addressed storage. |
 
 A Coding harness selects context, project, VCS, LSP, browser, memory,
 filesystem mutation and process execution. A Review harness would plausibly
 select context, project, VCS, LSP, read-only filesystem and memory, and skip
-the rest. Do not bind the full capability set into the kernel to save a
-harness the trouble of choosing.
+the rest.
+
+`leveler-media` currently has exactly one consumer, `leveler-app`. The
+`view_image` tool does not use it. See §18.3.F.
 
 ---
 
-## 8. Persistent runtime
+## 9. Persistent runtime
 
 `leveler-engine` is the persistent runtime. It owns:
 
@@ -329,12 +667,11 @@ pub struct TaskSpec {
 ```
 
 The crate's own comment calls this "the migration seam toward a domain-neutral
-engine". The split makes each code path declare which half it reads. It does
-not yet remove the Coding dependency — see §17.1.
+engine". It does not yet remove the Coding dependency — see §18.1.
 
 ---
 
-## 9. Storage and durable truth
+## 10. Storage and durable truth
 
 `leveler-storage` is the durable truth boundary: SQLite, embedded migrations,
 the connection pool, and one repository per concern. Business logic never
@@ -347,22 +684,18 @@ A persistent fact
 ```
 
 This applies with no exceptions to task status, turn status, evidence,
-ownership, usage, artifacts and completion state. There must be no parallel
-source of truth.
+ownership, usage, artifacts and completion state.
 
 `leveler-storage` depends only on `leveler-core` and `leveler-lifecycle`. That
 is what lets the low-level persistence crate speak the lifecycle vocabulary
-without a back edge to a high-level crate — the reason the vocabulary lives in
-its own crate at all.
+without a back edge to a high-level crate.
 
 ---
 
-## 10. Verification and evidence
+## 11. Verification and evidence
 
 `leveler-verifier` runs the project's declared checks — format, build, test —
 captures evidence, checks scope, and classifies failures.
-
-The precise statement of its authority:
 
 ```text
 The verifier is the authority for VERIFICATION VERDICTS.
@@ -373,21 +706,19 @@ It can prove that the configured checks passed, failed, or were blocked. It
 cannot, alone, prove that the user's intent was satisfied.
 
 A verification command a user declared explicitly is authority, not a
-heuristic input — the discovery layer marks it as such and the harness may not
-substitute its own guess for it.
+heuristic input.
 
 This is why `TaskOutcome` and `VerificationStatus` are separate axes in
 `leveler-lifecycle`. `TaskOutcome::Completed` means the model declared the goal
-complete; `VerificationStatus` says what the project's own checks reported
-about the final tree. The runtime reports both and never folds them into one
-word.
+complete; `VerificationStatus` says what the project's own checks reported.
+The runtime reports both and never folds them into one word.
 
 The crate-level doc comment in `leveler-verifier/src/lib.rs` still says
-otherwise. See §17.3.
+otherwise. See §18.7.
 
 ---
 
-## 11. Harness layer
+## 12. Harness layer
 
 `leveler-agent` is the **Coding Harness**. The crate name has not changed and
 this document does not propose changing it; the concept is what matters.
@@ -398,16 +729,16 @@ It owns Coding domain semantics:
 coding prompt                     compaction strategy
 repository context strategy       goal semantics
 coding tool selection             coding verification policy
-write workflow                    delegation policy and sub-agent profiles
-ownership of paths across agents  coding completion contract
+tool admission (the ToolHost)     delegation policy and sub-agent profiles
+write workflow                    coding completion contract
+ownership of paths across agents  the harness control tool surface
 ```
 
 It reaches the kernel through one seam: `Drive` in
-`src/executor/drive.rs` implements `leveler_agent_core::AgentHarness`. The
-seams it fills are `tool_definitions`, `on_round_start`, `on_round_admitted`,
-`on_response`, `on_model_error`, `on_quiet`, `execute_calls`, `on_stop` and
-`on_event`. That is the entire kernel contract, and it is already exercised by
-a real harness rather than being a hypothetical extension point.
+`src/executor/drive.rs` implements `leveler_agent_core::AgentHarness`, filling
+`tool_definitions`, `on_round_start`, `on_round_admitted`, `on_response`,
+`on_model_error`, `on_quiet`, `execute_calls`, `on_stop` and `on_event`. That
+is the entire kernel contract, already exercised by a real harness.
 
 A future Review harness is a **sibling**:
 
@@ -417,10 +748,12 @@ A future Review harness is a **sibling**:
                ▼              ▼
         leveler-agent    leveler-review
         Coding Harness   Review Harness
+        own ToolHost     own ToolHost
+        own tool surface own tool surface
 ```
 
-The edge `leveler-review → leveler-agent` is forbidden. Review reuses the
-foundation, not the Coding product.
+The edge `leveler-review → leveler-agent` is forbidden, and reusing the Coding
+tool plumbing is not required — Review implements `ToolRuntime` its own way.
 
 Review would own its own vocabulary — `ReviewTarget`, `ReviewScope`,
 `ReviewPolicy`, `Finding`, `FindingSeverity`, `FindingEvidence`,
@@ -432,7 +765,7 @@ what the foundation is allowed to assume.
 
 ---
 
-## 12. Product layer
+## 13. Product layer
 
 | Crate | Role |
 | --- | --- |
@@ -447,16 +780,11 @@ what the foundation is allowed to assume.
 
 These layers project authoritative runtime state. They do not derive new
 runtime truth. A tool call returning `Ok` does not let a client conclude that
-a task is complete; that word has one owner, and clients read it.
-
-The client protocol is what keeps this honest: UI code depends on
-`leveler-client-protocol` and never on the concrete runtime, providers, tools
-or storage. `leveler-tui` proves it — its dependencies are the client
-protocol, core, model and skills, and nothing else.
+a task is complete.
 
 ---
 
-## 13. Dependency direction
+## 14. Dependency direction
 
 Target rule:
 
@@ -470,10 +798,7 @@ Harnesses
 Products
 ```
 
-No lower layer may depend on a user-facing one.
-
-Current graph, by topological level (normal dependencies only, dev-dependencies
-excluded):
+Current graph, by topological level (normal dependencies only):
 
 | Level | Crates | Internal dependencies |
 | --- | --- | --- |
@@ -498,43 +823,42 @@ excluded):
 Findings:
 
 - **No reverse dependency exists.** Nothing depends on `leveler-app`,
-  `leveler-cli`, `leveler-tui` or `leveler-web`. The direction rule holds.
-- `leveler-agent-core` depends on exactly one internal crate. The kernel is as
-  narrow as the constitution asks.
-- `leveler-agent → leveler-execution` is a **vocabulary** edge, not an
-  execution edge: the harness uses `PermissionProfile`, `RiskLevel`,
-  `WriteScope` and `HookRunner` as types. Its direct side-effect count is zero.
+  `leveler-cli`, `leveler-tui` or `leveler-web`.
+- `leveler-agent-core` depends on exactly one internal crate.
+- `leveler-agent → leveler-execution` is a **vocabulary** edge: the harness
+  uses `PermissionProfile`, `RiskLevel`, `WriteScope` and `HookRunner` as
+  types. Its direct side-effect count is zero.
+- `leveler-tools` does **not** depend on `leveler-media`, which is why
+  `view_image` reimplements image handling (§18.3.F).
 - `leveler-engine → leveler-agent` is the one edge that contradicts the layer
-  model. It is the debt in §17.1.
+  model (§18.1).
 
 ---
 
-## 14. Runtime turn flow
-
-One turn, end to end:
+## 15. Runtime turn flow
 
 ```text
 client command
     │
     ▼
-leveler-app                  composition; maps config to a running Application
+leveler-app                  composition; config to a running Application
     │
     ▼
-leveler-engine               opens a turns row, stamps messages with the turn
-    │                        id, wires the persist-before-forward EventLog,
-    │                        wraps the approver and clarifier as recorders
-    │
+leveler-engine               turns row, turn-id stamping, the
+    │                        persist-before-forward EventLog, approver and
+    │                        clarifier wrapped as recorders
     ├─ ExecutorFactory       one derivation of the execution configuration
-    │                        from the resolved policy and turn profile
     ▼
-leveler-agent (Drive)        the Coding harness: prompt, context, tool
-    │                        selection, delegation, compaction, goal semantics
+leveler-agent (Drive)        Coding harness: prompt, context, tool surface,
+    │                        delegation, compaction, goal semantics
     ▼
 leveler-agent-core           the loop: admit round → assemble model round →
-    │                        stream → parse → dispatch tools → next round,
-    │                        under budgets, deadline and cancellation
+    │                        stream → parse → ToolRuntime::execute → repeat
     ▼
-leveler-tools                the concrete tool runs
+leveler-agent (ToolHost)     barrier → hooks → rules → policy → approval →
+    │                        barrier → AdmittedCall
+    ▼
+leveler-tools                the adapter runs
     │
     ▼
 leveler-execution            workspace resolution, permission, approval,
@@ -550,37 +874,28 @@ events → EventLog (persisted first) → engine events → leveler-app
        → client events → leveler-client-protocol → TUI / web / remote
 ```
 
-Facts flow out only after they are durable. That ordering is the reason a
-client can never show a state the runtime cannot reproduce after a restart.
+Facts flow out only after they are durable.
 
 ---
 
-## 15. Truth and authority model
+## 16. Truth and authority model
 
 ```text
 Mechanical Truth  ≠  Semantic Satisfaction  ≠  User Acceptance
 ```
 
-**The runtime authoritatively proves:**
-
-```text
-a command executed        a file was mutated
-its exit code             a test result
-a build result            an artifact exists
-an event was persisted    a tool returned this result
-observed runtime state
-```
+**The runtime authoritatively proves:** a command executed, its exit code, a
+file was mutated, a test result, a build result, an artifact exists, an event
+was persisted, a tool returned this result, observed runtime state.
 
 **The verifier authoritatively decides:** the configured verification verdict.
 
-**Neither of these implies the next step.**
+**Neither implies the next step.**
 
 ```text
 "the tool succeeded"  does not prove  "the goal is semantically satisfied"
 "the tests passed"    does not prove  "the user's request is fulfilled"
 ```
-
-The model performs semantic judgement. The user holds final acceptance.
 
 ```text
 Runtime owns mechanical truth.
@@ -589,16 +904,17 @@ User owns acceptance.
 ```
 
 Do not reintroduce a mechanical shortcut that stands in for semantic
-completion — an `observed_the_changed_tree()` style predicate that reads "the
-tree changed" as "the work is done". No such predicate exists in the codebase
-today, and `TaskOutcome` / `VerificationStatus` being orthogonal axes is what
-keeps it out.
+completion. No such predicate exists in the codebase today, and `TaskOutcome`
+/ `VerificationStatus` being orthogonal axes is what keeps it out.
+
+A corollary for tools: what the model reads and what the runtime records are
+different things, and neither may silently become the other. A tool that
+rewrites bytes into different text before showing them to the model has
+changed the fact, not just the presentation (§18.3.A).
 
 ---
 
-## 16. The Second Harness Test
-
-The foundation's architecture acceptance test.
+## 17. The Second Harness Test
 
 > Can a semantically different agent product — Review, for instance — be built
 > on this foundation **without modifying the agent kernel**?
@@ -608,109 +924,254 @@ Target answers:
 | Question | Required answer |
 | --- | --- |
 | Modify `leveler-agent-core` | NO |
-| Reuse the model and runtime vocabulary | YES |
-| Reuse the tool contracts | YES |
+| Reuse `ToolRuntime` | YES |
+| Reuse the model contracts | YES |
+| Reuse the persistent runtime | YES |
 | Reuse selected capabilities | YES |
-| Add Review-specific semantics | YES |
-| Add Review-specific tools | ALLOWED |
-| Depend on the Coding harness | NO |
+| Reuse the Coding `ToolRegistry` | NOT REQUIRED |
+| Reuse the Coding `Tool` trait | NOT REQUIRED |
+| Depend on `leveler-tools` | NOT REQUIRED |
+| Depend on `leveler-agent` | NO |
 
-If a future Review harness turns out to require a change to
-`leveler-agent-core`, that is a **foundation leak**. The response is to
-analyse why, not to add the new business concept to the kernel.
+The core requirement:
+
+```text
+Review must be able to build its own harness tool host and its own tool
+surface over the same agent kernel.
+```
+
+The foundation does not require every harness to use the same tool plumbing.
 
 ### Current verdict: NOT YET ENFORCED
 
-The kernel side passes. `leveler-agent-core` depends only on `leveler-model`,
-carries no product vocabulary, and its `AgentHarness` seam is already
-implemented by a real harness. A Review harness could implement the same trait
-without touching it.
+The kernel and the tool boundary pass. `leveler-agent-core` depends only on
+`leveler-model`, carries no product vocabulary, and `ToolRuntime` is two
+methods a Review harness can implement its own way. `AgentHarness` is already
+implemented by a real harness.
 
-The foundation around it does not pass yet:
+What does not pass yet:
 
 - A Review harness that wants persistence, resume, event ordering and recovery
-  has to go through `leveler-engine`, which depends on `leveler-agent` and
-  whose public API names `CodingTaskSpec` (§17.1).
-- A Review harness that wants tool contracts also takes the concrete
-  capability set and the `ToolServices` shape (§17.2).
+  goes through `leveler-engine`, which depends on `leveler-agent` and whose
+  public API names `CodingTaskSpec` (§18.1).
+- `leveler-model` knows the names and execution classes of Coding built-in
+  tools, so a Review tool set inherits a vocabulary written for Coding
+  (§18.6).
 
-Neither of these forces a kernel change, which is why this is "not yet
-enforced" rather than "fail". They are the inputs to Foundation Hardening.
+Neither forces a kernel change, which is why this is "not yet enforced" rather
+than "fail". They are the inputs to Foundation Hardening.
 
 **Do not modify code to convert this verdict to PASS as part of a
 documentation change.**
 
 ---
 
-## 17. Known boundary debt
+## 18. Known boundary debt
 
 Recorded, not hidden. Each item states the current behaviour, the desired
 boundary, why it violates the constitution, the minimal correction, and the
-risk of making it.
+risk.
 
-### 17.1 The engine depends on the Coding harness
+### 18.1 The engine depends on the Coding harness
 
 **Current.** `leveler-engine → leveler-agent`. The engine's public API exports
-`CodingTaskSpec`, and `ExecutorFactory` constructs a
-`leveler_agent::Executor` directly. `recorders.rs`, `recovery.rs`, `turn.rs`
-and `policy_resolver.rs` all name `leveler_agent` types.
+`CodingTaskSpec`, and `ExecutorFactory` constructs a `leveler_agent::Executor`
+directly. `recorders.rs`, `recovery.rs`, `turn.rs` and `policy_resolver.rs`
+all name `leveler_agent` types.
 
 **Desired.** The engine runs a harness executor behind an abstraction; it does
-not name a domain. `TaskSpec` carries a runtime half and a domain half, and the
-engine reads only the runtime half.
+not name a domain.
 
-**Why it violates the constitution.** Rule 5 (the engine owns runtime
-mechanics, not product semantics) and rule 2 (harnesses are siblings): a
-second harness inherits the Coding harness through the engine.
+**Why it violates the constitution.** Rules 5 and 2: a second harness inherits
+the Coding harness through the engine.
 
 **Minimal correction.** The `RuntimeTaskSpec` / `CodingTaskSpec` split already
-exists and is described in the source as the migration seam. The next step is
-an executor abstraction the engine can drive without naming `leveler_agent`,
-with `ExecutorFactory` moving above the engine.
+exists as the migration seam. Next is an executor abstraction the engine can
+drive without naming `leveler_agent`, with `ExecutorFactory` moving above it.
 
 **Risk.** Medium. `ExecutorFactory` is deliberately the single derivation of
 execution configuration; splitting it badly reintroduces the multiple-
 derivation bug it was built to remove.
 
-### 17.2 Tool contracts and concrete capabilities share a crate
+### 18.2 ToolContext is a universal service locator
 
-**Current.** `leveler-tools` holds the `Tool` trait, `ToolRegistry` and
-dispatch alongside 29 concrete tools, and depends on browser, context,
-execution, LSP, memory, project and skills. `ToolServices` names
-`lsp_sessions`, `artifact_store`, `memory_root`, `background_tasks` and
-`browser` as fields of the context every tool receives.
+**Current.** Every tool receives `ExecutionResources + ToolPolicy +
+ToolServices + session_scope`, with `ToolServices` naming `lsp_sessions`,
+`lsp_start_locks`, `artifact_store`, `memory_root`, `background_tasks` and
+`browser` as fields.
 
-**Desired.** `leveler-tool-core` holds the contract; `leveler-tools` holds the
-capabilities. A harness takes the contract without the capability graph.
+**Desired.** Explicit dependency injection; a tool receives only the
+capability it needs; per-call context carries only dynamic invocation state or
+host-minted authority.
 
-**Why it violates the constitution.** Rule 3. A Review-specific tool needing
-none of those services still takes the whole shape.
+**Why it violates the constitution.** Tools own service discovery they should
+not have, and a Review-specific tool needing none of it still takes the shape.
 
-**Minimal correction.** Extract the contract when a second harness needs it —
-not before. The registry already composes freely, so the practical cost today
-is the `ToolContext` shape rather than the tool set.
+**Minimal correction.** Let it shrink as a consequence of capability
+extraction. Do not design a replacement container first.
 
-**Risk.** Low if deferred, medium if done speculatively: a contract crate
-designed against one consumer usually has to be redesigned for the second.
+**Risk.** Low if it follows extraction; high if a `V2` container is invented
+ahead of the extraction it is supposed to serve.
 
-### 17.3 The verifier's doc comment claims completion authority
+### 18.3 Concrete tool implementation debts
 
-**Current.** `crates/leveler-verifier/src/lib.rs` opens with "Only the
-verifier can mark a task complete".
+Each of these is a tool implementing capability behavior it should be calling.
 
-**Desired.** The verifier is the authority for verification verdicts. Task
-outcome and verification status are orthogonal, which is what
-`leveler-lifecycle` implements.
+#### A. `read_file` does too much, and two of its policies are wrong
 
-**Why it violates the constitution.** Rule 6. This is the one place in the
-tree where a document still asserts that a green check is completion.
+`crates/leveler-tools/src/tools/read_file.rs` currently owns: file reading,
+paging, binary detection, full-file fingerprinting, repeated-read policy,
+stale-write state preparation, output budgeting and model guidance.
 
-**Minimal correction.** Rewrite the doc comment. No behaviour change — the
-code already separates the axes; the comment predates the split.
+Verified consequences:
 
-**Risk.** None. It is a comment.
+- **A narrow range read still scans the whole file.** The source says so:
+  "Stream the complete file once … while still producing the full-file
+  fingerprint needed by stale-write protection and the total line count used
+  in paging copy." Memory stays bounded; time is O(file).
+- **Files over 10 MB are refused outright**, before any range is considered,
+  and the model is told to "use `grep` … or `run_command` with sed/head/tail".
+  A bounded 50-line read of a 100 MB file is a reasonable request that the
+  tool cannot serve, and the suggested workaround is not cross-platform — a
+  problem the project's Windows support makes concrete.
+- **Invalid UTF-8 is silently rewritten.** Lines are rendered with
+  `String::from_utf8_lossy`, so invalid bytes reach the model as `U+FFFD`.
+  The binary guard only scans the first 8 KB for NUL, so a file that is
+  non-UTF-8 but NUL-free in its opening bytes takes the lossy path. The bytes
+  on disk and the text shown to the model differ, and nothing says so.
+- **Repeated-read policy lives in the read tool.** Whether the model is
+  wasting rounds re-reading the same range is harness behavior policy, not
+  filesystem read semantics.
+- **Stale-write tracking lives in the read tool.** `read_file` records a
+  fingerprint into `FileStateTracker` so `apply_patch` can later refuse a
+  stale write. That is why a narrow read must scan everything: reading carries
+  the precondition state for a future edit.
 
-### 17.4 Sidecar processes bypass the command runner
+**Target contract** (behavior, not an API):
+
+```text
+Read is bounded.
+Read semantics are deterministic.
+A narrow range read does not require unrelated full-file work unless
+  mechanical correctness proves it necessary.
+Reading does not own edit policy.
+Reading does not own repeated-read policy.
+Reading does not own result-budget policy.
+Invalid text or binary data is reported honestly rather than silently
+  rewritten into different text.
+Large files are inspectable through bounded reads rather than requiring
+  a shell command merely because of file size.
+```
+
+**Target ownership.** `ReadFileTool → WorkspaceReader`, returning a bounded
+structured read result. Stale-write protection becomes an explicit mechanism
+between workspace read observation and `WorkspaceEditor`, not a side effect
+hidden in a read tool. Repeated-read nudging moves to the harness, which
+already sees tool history.
+
+**Risk of correcting.** Medium. Stale-write protection is a real safety
+property; it must survive the move intact. It must not be weakened to make a
+read faster.
+
+#### B. Workspace search has environment-dependent semantics
+
+`list_files`, `find_files`, `grep` and the symbol fallback scans each carry
+their own directory traversal, ignore rules and result caps.
+
+Worse, `grep` changes query semantics with the machine: with `rg` installed
+the pattern is a regex; without it, the built-in fallback matches it as a
+literal substring. The tool does append a `[note] ripgrep unavailable …` line
+when the pattern looks regex-shaped, so it is not silent — but the same tool
+call still means different things on different machines.
+
+**Target.** One deterministic workspace-search semantics across macOS, Linux
+and Windows, with one traversal and one ignore rule set beneath `list_files`,
+`find_files` and `grep`.
+
+**Risk.** Medium. A bundled regex engine changes match results for existing
+users; the change needs to be deliberate and announced.
+
+#### C. Workspace edit logic is duplicated across two tools
+
+`apply_patch` and `replace` each carry stale protection, compare-and-swap,
+atomic mutation, rollback and diff/evidence.
+
+**Target.** `ApplyPatchTool` and `ReplaceTool` both call one
+`WorkspaceEditor`. Compare-and-swap, stale protection, rollback and
+all-or-nothing behavior are preserved exactly; only the owner changes.
+
+**Risk.** Medium-high. This is the code path where a bug corrupts a user's
+file. It moves only under the existing tests, with no behavior change in the
+same step.
+
+#### D. `run_command` owns most of command execution
+
+`run_command` currently carries sandbox setup, environment, network policy,
+background processes, snapshots, mutation accounting, write scope, rollback,
+the command gate, process lifecycle, and — since `6724268` — subtracting the
+paths a HEAD move explains from what the run reports as authored.
+
+**Target.** `RunCommandTool` and `ShellCommandTool` are adapters over a
+`CommandExecution` capability, which calls `leveler-execution`.
+
+**Risk.** Medium. Cancellation and process-tree termination semantics must not
+change.
+
+#### E. Code intelligence lifecycle lives in the tools
+
+`find_symbol`, `read_symbol`, `find_references`, `diagnostics` and
+`blast_radius` each contain LSP discovery, session lifecycle, startup and
+fallback scanning.
+
+**Target.** One `CodeIntelligence` capability owning LSP lifecycle, symbol
+queries, references, diagnostics and a deterministic fallback. Tools do
+model-facing invocation only.
+
+**Risk.** Low-medium.
+
+#### F. `view_image` duplicates — and weakens — `leveler-media`
+
+`view_image` decides the MIME type from the file extension, reads the bytes
+and base64-encodes them. `leveler-media` detects the real MIME from content,
+bounds decode allocation and pixel count against decompression bombs, strips
+EXIF by re-encoding, downscales oversized images and stores them
+content-addressed.
+
+`leveler-tools` does not depend on `leveler-media` at all, and
+`leveler-media`'s only consumer is `leveler-app`. So the user-attachment path
+is hardened and the model-facing tool path is not.
+
+**Target.** `ViewImageTool → Media capability`.
+
+**Risk.** Low. This one is close to a straight defect.
+
+#### G. `web_search` owns provider configuration
+
+The tool reads `LEVELER_SEARCH_API_KEY`, `LEVELER_SEARCH_PROVIDER` and
+`LEVELER_SEARCH_CX` from the environment, builds its own HTTP client, and
+implements both the Bing and Google Custom Search request and response
+shapes.
+
+**Target.** `WebSearchTool → Search capability / provider`. The tool does not
+know provider credentials or configuration.
+
+**Risk.** Low.
+
+#### H. `wait_task` owns workspace settlement
+
+`WaitTaskTool` is deliberately not `RiskLevel::Safe`, because at wait-end it
+runs `account_background_mutations`, which can restore the whole workspace to
+a snapshot. Its own source comment says so.
+
+A model-facing tool named "wait" should not own workspace rollback semantics.
+
+**Target.** A `BackgroundTaskRuntime` owns settlement. `get_task` and
+`wait_task` read or await state.
+
+**Risk.** Medium. Background-task settlement interacts with dev-server safety
+rules that exist for a reason.
+
+### 18.4 Sidecar processes bypass the command runner
 
 **Current.** MCP servers (`leveler-tools/src/mcp.rs`), the browser driver
 (`leveler-browser/src/driver.rs`) and language servers
@@ -719,56 +1180,199 @@ directly rather than through `leveler_execution::CommandRunner`.
 
 **Desired.** Either these run under the host authority's process-tree
 termination and sandbox semantics, or the exemption is an explicit, named
-policy rather than an accident of implementation.
+policy — "runtime sidecar" — with a defined lifecycle owner.
 
-**Why it partially violates the constitution.** Rule 4. These are not
-model-requested commands, so the permission and approval path does not apply.
-They are still host processes outside the authority that is supposed to own
-every host process.
+**Why it partially violates the constitution.** Rule 4. They are not
+model-requested commands, so permission and approval do not apply; they are
+still host processes outside the authority that owns host processes.
 
-**Minimal correction.** Name the category — "runtime sidecar" — and give it a
-defined lifecycle owner, rather than three independent spawn sites.
+**Risk.** Low to medium. Sidecar lifetime is entangled with daemon shutdown
+reaping.
 
-**Risk.** Low to medium. Sidecar lifetime is already entangled with daemon
-shutdown reaping; changing the spawn path touches that.
+### 18.5 `update_plan` sits with the capability adapters
 
-### 17.5 The engine shells out to git for the baseline
+**Current.** Six of the seven harness control tools live in
+`crates/leveler-agent/src/injected_tools.rs`. `update_plan` is registered in
+`leveler-tools`' `core_registry()` alongside `read_file` and `grep`.
+
+**Desired.** Harness control tools are the harness's control protocol and
+belong with the harness.
+
+**Why it violates the constitution.** A future Review harness taking the
+Coding capability adapters would inherit the Coding plan protocol with them.
+
+**Minimal correction.** Move it next to the other injected tools.
+
+**Risk.** Low.
+
+### 18.6 `leveler-model` knows the Coding tool names
+
+**Current.** `crates/leveler-model/src/tool_catalog.rs` hard-codes `grep`,
+`find_files`, `find_symbol`, `read_symbol`, `find_references`, `list_files`,
+`read_file`, `git_status`, `git_diff`, `view_image`, `web_search`,
+`web_fetch`, `apply_patch`, `replace`, `run_command` and `shell_command`, and
+derives from them an execution class (`Search` / `Read` / `Write`), a
+replay-safety answer, a primary argument and an observe key.
+
+Its real consumers are `leveler-agent` (observe key),
+`leveler-client-protocol` (safe-replay decision) and `leveler-tui` (display).
+The crate comment states the motive plainly: "execution policy must not
+duplicate name lists and argument-field guesses across crates". The motive is
+sound; the location is not.
+
+**Desired.** `leveler-model` knows only `ToolDefinition`, `ToolCall`,
+`ToolResult` and `ToolChoice`. Built-in Coding tool metadata belongs to the
+harness or to the tool composition that owns those tools.
+
+**Why it violates the constitution.** Rule 1, directly. A foundation primitive
+enumerates product tools, and every harness built on `leveler-model` inherits
+a Coding vocabulary.
+
+**Minimal correction.** Move the catalog to the layer that owns the tool set,
+and give the three consumers a way to reach it that does not run through a
+foundation primitive. Note that one exported function, `is_search_tool`, has
+no callers outside the crate.
+
+**Risk.** Medium. Three consumers across three layers currently share this;
+the replacement must not become three copies of the same list.
+
+### 18.7 `ToolOutput.metadata` is an untyped internal side channel
+
+**Current.**
+
+```rust
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
+    pub metadata: serde_json::Value,
+}
+```
+
+Producers in `leveler-tools` write string-keyed JSON; consumers in
+`leveler-agent/src/executor/dispatch.rs` read it back by key:
+`plan`, `image`, `applied_diff`, `executed_commands`, `modified_files`,
+`outcome`, plus the tool-expansion request. The producer and consumer are in
+different crates, connected only by a string convention.
+
+Four different kinds of thing travel in one field:
+
+```text
+Model output   ≠   Runtime facts   ≠   Harness control   ≠   UI payload
+```
+
+`modified_files` is a runtime fact that feeds verification obligations.
+`plan` is harness control. `image` is model-visible content. `applied_diff`
+is UI and evidence. None of them is typed, and a typo in a key fails silently.
+
+**Desired.** These four are distinguished in the type system.
+
+**Do not design the final enum now.** The shape should follow the capability
+extraction, not precede it.
+
+**Risk.** Medium. It touches every tool and the dispatch path at once, so it
+wants to be the last step, not the first.
+
+### 18.8 The verifier's doc comment claims completion authority
+
+**Current.** `crates/leveler-verifier/src/lib.rs` opens with "Only the
+verifier can mark a task complete".
+
+**Desired.** The verifier is the authority for verification verdicts.
+
+**Minimal correction.** Rewrite the doc comment. The code already separates
+the axes; the comment predates the split.
+
+**Risk.** None. It is a comment.
+
+### 18.9 The engine shells out to git for the baseline
 
 **Current.** `leveler-engine/src/baseline.rs` and `engine.rs` call
-`Command::new("git")` directly to stamp the base commit, while
-`leveler-vcs` exists and performs zero direct process spawns.
+`Command::new("git")` directly, while `leveler-vcs` exists and performs zero
+direct process spawns.
 
 **Desired.** The engine asks the VCS capability, which asks the host
 authority.
 
-**Why it violates the constitution.** Rule 4, and it puts a domain operation
-(git) in the runtime layer.
-
-**Minimal correction.** Route the baseline read through `leveler-vcs`.
-
-**Risk.** Low. It is a single read-only invocation.
+**Risk.** Low.
 
 ---
 
-## 18. Architecture change rules
+## 19. Open design questions
 
-1. **Extend above the foundation before modifying it.** A change that can live
-   in a harness or a product belongs there.
+Recorded so they are not silently decided by the first person who needs them.
+
+### 19.1 Should a tool result carry typed parts?
+
+The kernel's tool result is:
+
+```rust
+pub struct ToolOutcome { pub content: String, pub is_error: bool }
+```
+
+The model vocabulary already supports `ContentPart::Image`. Today an image
+reaches the model by travelling through `ToolOutput.metadata` and being
+re-attached by the harness (§18.7).
+
+The question: should the kernel's tool result support typed text/image parts?
+
+The constraint: **do not change the agent kernel for elegance.** This changes
+only if the provider protocol supports it and a real image or multimodal tool
+use case proves the metadata path insufficient.
+
+### 19.2 Is the canonical edit tool one tool or two?
+
+`apply_patch` and `replace` overlap. `replace` exists to give weaker models an
+exact find/replace path when patch context matching fails repeatedly.
+Flattening model capability differences is a product goal, so this is decided
+by measurement (§6.5), not by architecture.
+
+### 19.3 Does dynamic model-controlled tool expansion pay for itself?
+
+`expand_tools` buys schema tokens with an extra round and dynamic registry
+state. Harness-side selection buys the same tokens with none of that, at the
+cost of not adapting mid-session. Only evaluation settles which is worth more,
+and the burden of proof is on the dynamic option because it is the one that
+inverts ownership.
+
+---
+
+## 20. Architecture change rules
+
+1. **Extend above the foundation before modifying it.**
 2. **A foundation change needs evidence**, not elegance: two real
    implementations, a real dependency-inversion boundary, an observed coupling
    or ownership defect, or an independent protocol / security / persistence /
    runtime boundary.
-3. **Answer the decision test in §1 of `AGENTS.md` before you start**, in the
-   pull request, not afterwards.
+3. **Answer the decision test in `AGENTS.md` before you start**, in the pull
+   request, not afterwards.
 4. **Do not describe the target as the present.** If a change moves toward a
-   boundary without reaching it, update §17 rather than deleting the entry.
-5. **Do not add speculative interfaces for products that do not exist.** The
-   architecture must permit a Review harness. It must not pre-build one.
-6. **This document is the only canonical architecture.** Do not create
-   `ARCHITECTURE_V2.md`, `FOUNDATION_*.md` or a "final" variant. Amend this
-   file; the Chinese version tracks it.
+   boundary without reaching it, update §18 rather than deleting the entry.
+5. **Do not add speculative interfaces for products that do not exist.**
+6. **Do not simplify by deleting reliability.** Move complexity to its correct
+   owner instead. Every safety property named in §18 survives its move.
+7. **This document is the only canonical architecture.** Do not create
+   `ARCHITECTURE_V2.md`, `FOUNDATION_*.md` or a "final" variant.
 
 Roadmap items — multi-agent direction, browser direction, a Review product,
 cloud, ACP, remote workers, NPC workflows, future providers, future UI — are
 not architecture. This document may describe an extension point. It does not
 promise a feature.
+
+---
+
+## 21. Documentation status
+
+```text
+FOUNDATION_ARCHITECTURE_DEFINED   YES
+TOOL_ARCHITECTURE_DEFINED         YES
+
+TOOL_IMPLEMENTATION_ALIGNED       NO
+ENGINE_IMPLEMENTATION_ALIGNED     NO
+
+SECOND_HARNESS_TEST               NOT_YET_ENFORCED
+FOUNDATION_FROZEN                 NO
+```
+
+The architecture and the tool boundary are decided. The implementation is not
+aligned to them, and this document says where. No source was changed to
+improve any line of this table.
