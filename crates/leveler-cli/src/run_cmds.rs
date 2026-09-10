@@ -13,8 +13,8 @@ use leveler_agent::StopReason;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
 use leveler_local_transport::{
-    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
-    TcpRuntimeServer, TransportError,
+    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
+    TransportError,
 };
 use leveler_project::Layout;
 
@@ -320,7 +320,10 @@ fn verify_replacement(
 #[cfg(unix)]
 async fn runtime_is_current(client: &LocalSocketRuntimeClient) -> RuntimeConsistency {
     let expected = leveler_core::BuildIdentity::current();
-    let reported = client.runtime_info().await.ok().map(|info| info.build);
+    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(client)
+        .await
+        .ok()
+        .map(|info| info.build);
     classify_runtime(reported.as_ref(), &expected)
 }
 
@@ -477,7 +480,10 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
     // say it is the build we expected, or the bootstrap failed — and it fails
     // once, without a second attempt, because a restart loop over a build that
     // keeps coming back wrong helps nobody.
-    let reported = client.runtime_info().await.ok().map(|info| info.build);
+    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
+        .await
+        .ok()
+        .map(|info| info.build);
     verify_replacement(reported.as_ref(), &leveler_core::BuildIdentity::current())?;
     Ok(client)
 }
