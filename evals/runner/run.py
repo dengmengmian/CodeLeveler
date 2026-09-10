@@ -171,8 +171,7 @@ def _how_to_run_value(cfg: dict, mode: str) -> str:
         f"python3 evals/runner/run.py --suite multi_agent --experiment MA-VALUE-001 "
         f"--mode {mode} --model {model} --execute\n"
         "```\n\n"
-        "Spawn rate is a diagnostic, not a success metric. See "
-        "docs/evaluations/MA-VALUE-001.md.\n"
+        "Spawn rate is a diagnostic, not a success metric.\n"
     )
 
 
@@ -198,7 +197,6 @@ def _how_to_run_reviewer(cfg: dict, mode: str) -> str:
         f"--experiment MA-VALUE-REVIEWER-PILOT --mode {mode} "
         f"--model {model} --execute\n```\n\n"
         "n=5 pairs is a pipeline check. min_n=6 for a published verdict.\n"
-        "See docs/evaluations/MA-VALUE-REVIEWER-PILOT.md.\n"
     )
 
 
@@ -334,7 +332,7 @@ def run_safety(cfg: dict) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "HOW_TO_RUN.txt").write_text(
         "Safety probes stay in the control plane and MUST NOT enter the adoption denominator.\n"
-        "See docs/eval-methodology.md and evals/suites/safety/README.md.\n",
+        "See evals/suites/safety/README.md.\n",
         encoding="utf-8",
     )
     print(f"safety experiment `{cfg['experiment']}` is documented at {out_dir / 'HOW_TO_RUN.txt'}")

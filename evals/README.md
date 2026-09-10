@@ -17,7 +17,7 @@ evals/
   tests/        framework unit tests (offline, no model)
   reports/      generated per experiment (gitignored except README/EXAMPLE)
   runs/         per-batch isolated LEVELER_HOME + batch.json (gitignored)
-  baselines/    recorded capability results referenced by docs/
+  baselines/    recorded capability results
 ```
 
 `fixtures/repos/` holds the repositories cases run against. They are generated
@@ -46,8 +46,6 @@ separate metrics package.
 | --- | --- | --- |
 | `leveler eval run --cases evals/cases/<suite>` | Capability: did the agent produce a correct tree? Independent `expect`. | Rust, `crates/leveler-eval` |
 | `leveler eval run --suite <suite> --experiment <id>` | Behaviour: delegation decision, timing, safety counters, long-task EventLog. | Python, `evals/runner/run.py` |
-
-Methodology: `docs/eval-methodology.md`. Gate map: `docs/evaluations/`.
 
 ## Capability cases (`cases/`)
 

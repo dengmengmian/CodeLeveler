@@ -21,7 +21,7 @@ CodeLeveler 是**本地优先的编程代理运行时**，提供终端与浏览�
 
 当前主产品面是终端编程工作流；同一 runtime 也驱动 `leveler web` 与 host 侧远程
 bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Extension 框架是
-架构方向，**并非全部已交付**。CURRENT / TARGET / FUTURE 见
+架构方向，**并非全部已交付**。分层模型与当前代码尚未达到的边界见
 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
 
 CodeLeveler 目前处于 public beta：**`0.2.0-beta.1`**，以 pre-release 形式发布
@@ -221,15 +221,12 @@ CodeLeveler 可以修改文件和执行本地命令，因此安全边界会明�
 `leveler doctor` 会报告本机实际可用的能力。受限模式缺少必要隔离后端时会
 fail-closed；只有进程树控制时不会声称拥有完整沙箱。
 
-权限规则和 hooks 都可以按用户或按仓库配置。可以从[配置指南](docs/README.zh-CN.md)、
-[权限示例](docs/permissions.example.yaml)和 [hook 示例](docs/hooks.example.yaml)开始。
+权限规则和 hooks 都可以按用户或按仓库配置。
 
 ## 配置与文档
 
-- [中文文档索引](docs/README.zh-CN.md)
-- [项目配置示例](docs/leveler-config-example.yaml)
-- [Provider 与模型配置 schema](configs/example.yaml)
 - [架构说明](docs/ARCHITECTURE.zh-CN.md)
+- [Provider 与模型配置 schema](configs/example.yaml)
 - [评测工具](evals/README.md)
 
 运行 `leveler --help` 或 `leveler <command> --help` 查看完整命令。使用

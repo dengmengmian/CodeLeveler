@@ -1,7 +1,5 @@
 # Methodology
 
-Canonical protocol: [`docs/evaluations/MA-VALUE-001.md`](../../../../../docs/evaluations/MA-VALUE-001.md).
-
 Hypothesis: multi-agent reduces coding-task cost or improves quality (H1),
 versus no measurable improvement (H0).
 

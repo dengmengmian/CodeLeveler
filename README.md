@@ -24,7 +24,8 @@ The primary product surface today is the terminal coding workflow; the same
 runtime also powers `leveler web` and a host-side remote bridge. Desktop/mobile
 APP productization, long-running NPC workflows, and a Capability/Extension
 framework are architectural directions — not all shipped yet. See
-[Architecture](docs/ARCHITECTURE.md) for CURRENT vs TARGET vs FUTURE.
+[Architecture](docs/ARCHITECTURE.md) for the layer model and the boundaries
+the code does not meet yet.
 
 CodeLeveler is in public beta: **`0.2.0-beta.1`**, published as a pre-release
 (see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
@@ -254,17 +255,12 @@ is explicit rather than implicit.
 Restricted modes fail closed when a required isolation backend is unavailable;
 process-tree control alone is never reported as a full sandbox.
 
-Permission rules and hooks can be defined per user or per repository. Start
-with the [configuration guide](docs/README.md),
-[permission example](docs/permissions.example.yaml), and
-[hook example](docs/hooks.example.yaml).
+Permission rules and hooks can be defined per user or per repository.
 
 ## Configuration and documentation
 
-- [Documentation index](docs/README.md)
-- [Project configuration example](docs/leveler-config-example.yaml)
-- [Provider and model configuration schema](configs/example.yaml)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Provider and model configuration schema](configs/example.yaml)
 - [Evaluation harness](evals/README.md)
 
 Run `leveler --help` or `leveler <command> --help` for the CLI reference. Use
@@ -272,9 +268,8 @@ Run `leveler --help` or `leveler <command> --help` for the CLI reference. Use
 
 ## Public beta
 
-What will and will not keep working is written down rather than implied:
-[docs/STABILITY.md](docs/STABILITY.md) marks each CLI subcommand and config file
-Frozen, Provisional, or Unstable. `run`, `resume`, `tui` and the setup commands
+What will and will not keep working is written down rather than implied. Each
+CLI subcommand and config file is Frozen, Provisional, or Unstable. `run`, `resume`, `tui` and the setup commands
 are Frozen — name, arguments and meaning hold through 1.0. `serve`, `web`,
 `lsp`, `mcp`, `login`, `logout`, `completions` and `trust` are Provisional, and
 `eval` and `remote` are Unstable.

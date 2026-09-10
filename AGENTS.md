@@ -1,24 +1,154 @@
 # Working on CodeLeveler
 
-Notes for an AI agent (or a new contributor) changing this repository. This
-file indexes conventions rather than restating them — where a rule already
-lives in code or in another document, the pointer is the authority and this
-file is not.
+Notes for an AI agent (or a new contributor) changing this repository.
+
+This file is two things and nothing else: the **architecture constitution**
+that every change is judged against, and an **index** of the working rules
+that live elsewhere. Where a rule already lives in code or in another
+document, the pointer is the authority and this file is not.
+
+The full architecture is `docs/ARCHITECTURE.md` (Chinese:
+`docs/ARCHITECTURE.zh-CN.md`). This file does not duplicate it.
 
 ## Read first
 
 | Document | Covers |
 | --- | --- |
+| `docs/ARCHITECTURE.md` | Layers, boundaries, dependency direction, known debt — the canonical architecture |
 | `CONTRIBUTING.md` | PR expectations, the exact check commands, error-type and dependency-direction rules |
-| `docs/ARCHITECTURE.md` | Crate layout and how a turn flows through the system (`docs/ARCHITECTURE.zh-CN.md` is the Chinese version) |
-| `docs/STABILITY.md` | Draft compatibility tiers, with recommended answers awaiting maintainer sign-off — read before touching CLI flags or config schema |
 | `evals/README.md` | Required before adding evaluation cases |
-| `docs/MOBILE_FREEZE.md` | Mobile client is frozen at tag `mobile-beta-mvp` — no Push / fleet / voice / rewrite until real Beta users |
+
+The mobile client is frozen at tag `mobile-beta-mvp` — no Push / fleet / voice /
+rewrite until real Beta users.
 
 `CONTRIBUTING.md` already states the three rules most often gotten wrong:
 library crates expose typed errors, `anyhow` stays at application boundaries
 (`leveler-cli` / `leveler-app` only), and no lower-level crate may take a
 dependency edge back to a user-facing layer. Those are not repeated here.
+
+---
+
+# Architecture constitution
+
+CodeLeveler is not "a coding agent and everything under it". It is a
+foundation, with the coding agent as its first product on top:
+
+```text
+                     Leveler Foundation
+                            │
+          ┌─────────────────┼─────────────────┐
+          ▼                 ▼                 ▼
+    Coding Harness     Review Harness    Future Harness
+          ▼                 ▼                 ▼
+      CodeLeveler       Review Product     Future Product
+```
+
+The Foundation provides reusable agent-runtime capability. A Harness defines
+domain semantics. A Product defines experience, composition and delivery.
+
+## The six sentences
+
+```text
+The Kernel does not know the product.
+
+The Harness defines domain semantics.
+
+The Engine owns lifecycle, not agent intelligence.
+
+The Host Authority exclusively owns controlled side effects.
+
+Every durable fact has one authoritative owner.
+
+Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
+```
+
+## The twelve rules
+
+1. **The kernel is product-neutral.** `leveler-agent-core` owns the model↔tool
+   loop, streaming, retry, rounds, budgets, usage, deadlines, cancellation and
+   stop reasons. It owns no coding, review, repository, prompt, permission,
+   persistence or UI concept.
+2. **Harnesses are siblings.** A future `leveler-review` sits beside
+   `leveler-agent`, not under it. A harness never depends on another harness.
+3. **Tool contracts are separate from concrete capabilities.** The trait,
+   schema, registry and dispatch contract are one concern; `read_file`, `grep`,
+   `run_command`, browser and LSP are another. Today one crate holds both — see
+   the debt register in `docs/ARCHITECTURE.md`.
+4. **Host side effects have one authority.** `leveler-execution` owns workspace
+   path enforcement, permission, approval, process execution, sandboxing and
+   cancellation. An agent *requests* a side effect; the host authority
+   *performs* it. Do not build a second path to the filesystem or to a process.
+5. **The engine owns runtime mechanics, not product semantics.** Task/turn
+   lifecycle, event ordering, the append-only log, checkpoint, resume,
+   recovery, ownership, reaping. Not prompts, not tool selection, not what
+   "done" means.
+6. **Mechanical Truth ≠ Semantic Satisfaction ≠ User Acceptance.** The runtime
+   proves what ran and what changed. The model interprets whether the goal is
+   met. The user accepts. A green check is not proof that a request was
+   satisfied, and observing a changed tree is not proof that the work is done.
+7. **Every durable fact has one authoritative owner.** No parallel source of
+   truth for task status, turn status, evidence, ownership, usage or artifacts.
+8. **UI and protocol layers project truth; they do not invent it.** A tool
+   returning `Ok` does not let a client decide the task is complete.
+9. **Dependency direction is part of correctness.** Foundation ← capabilities
+   and runtime ← harnesses ← products. No lower layer may depend on a
+   user-facing one.
+10. **New abstractions require evidence.** See the next section.
+11. **Foundation changes carry a higher bar than product changes.** Extend
+    above the foundation before you modify it.
+12. **A second product harness must not require modifying the agent kernel.**
+    This is the *Second Harness Test*, defined in `docs/ARCHITECTURE.md`.
+
+## Anti-overengineering rule
+
+Do not add a crate, trait, manager, coordinator, supervisor, factory, adapter
+layer or generic framework because of "future extensibility", "clean
+architecture", "maybe useful later" or "more generic".
+
+A new abstraction needs at least one of:
+
+- two real implementations that need it;
+- a real dependency-inversion boundary;
+- an observed coupling or ownership defect;
+- an independent protocol, security, persistence or runtime boundary.
+
+Otherwise prefer the concrete implementation. In particular: do **not**
+pre-build interfaces for a Review or multi-agent product that does not exist
+yet. The architecture must *allow* them to appear. That is not the same as
+implementing them now.
+
+## Architecture decision test
+
+Before changing anything in the foundation, answer:
+
+- Why does this belong in this layer?
+- Is this runtime mechanism, or product semantics?
+- Does this introduce a new source of truth?
+- Does this create a reverse dependency?
+- Could it stay in the harness instead?
+- Would a Review harness need this too?
+- Would implementing Review require changing the agent kernel?
+- Is this abstracting a real duplication, or an imagined future?
+
+---
+
+# Working rules
+
+## Documentation ownership
+
+One rule, one canonical owner. Everywhere else links or summarizes.
+
+| Concern | Owner |
+| --- | --- |
+| Architecture | `docs/ARCHITECTURE.md` |
+| Agent / contributor constitution | this file |
+| Contribution workflow and checks | `CONTRIBUTING.md` |
+| Released changes | `CHANGELOG.md` |
+| Security policy | `SECURITY.md` |
+| Evaluation | `evals/README.md` |
+
+Do not copy a rule set from one of these into another. Two documents stating
+the same rule is how they start disagreeing.
 
 ## The unsafe policy has exactly one exception
 
@@ -36,9 +166,7 @@ it is explicitly allowed and justified the same way.
 
 ## Language conventions
 
-- **Code comments and doc comments: English.** Of ~1270 lines containing
-  Chinese, only ~83 are comment lines, and those are mostly glosses on
-  user-facing strings.
+- **Code comments and doc comments: English.**
 - **User-visible strings and TUI copy: Chinese is expected** where the product
   surface is Chinese (see `crates/leveler-execution/src/risk.rs`, where
   permission-profile names carry their Chinese label).
@@ -48,10 +176,9 @@ it is explicitly allowed and justified the same way.
 
 ## Tests
 
-- Integration tests go in `crates/<crate>/tests/`; 11 crates have them.
-- Unit tests are inline `#[cfg(test)] mod tests` in the file under test — 181
-  source files do this. Keep a test next to what it covers rather than
-  inventing a parallel structure.
+- Integration tests go in `crates/<crate>/tests/`.
+- Unit tests are inline `#[cfg(test)] mod tests` in the file under test. Keep a
+  test next to what it covers rather than inventing a parallel structure.
 - A test needing an OS capability that may be absent must use the project's
   existing capability checks, not assume the feature exists.
 
@@ -63,7 +190,7 @@ This codebase has several files over 2000 lines, and they attract mechanical
 1. **Do not infer a file's contents from its line count.** Command
    classification lives in `approval.rs`, shell-AST danger analysis in
    `shell_ast.rs`, risk vocabulary in `risk.rs` — not in `command.rs`, which
-  is what a line-count-driven reading tends to assume. Read the file.
+   is what a line-count-driven reading tends to assume. Read the file.
 2. **Line counts include inline tests.** `command.rs` measures 2649 lines when
    ~1501 of them are `mod tests`. Compare production code, not totals.
 

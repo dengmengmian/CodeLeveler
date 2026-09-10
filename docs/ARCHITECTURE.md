@@ -1,1012 +1,774 @@
 # CodeLeveler Architecture
 
-This document describes the stable boundaries of CodeLeveler against the
-**current codebase** (baseline `main@04a015b` and later, unless a section is
-explicitly marked otherwise). It intentionally avoids source-line references and
-release-specific counts so it remains useful as the workspace evolves.
+The canonical architecture document. `AGENTS.md` states the constitution in
+short form and points here; this file is where the boundaries are defined and
+where the gap between the current implementation and the target foundation is
+recorded honestly.
 
-## How to read this document
+Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md).
 
-Every architectural claim is one of four kinds. Do not mix them:
-
-| Marker | Meaning |
-| --- | --- |
-| **CURRENT** | Implemented and present in the tree today. |
-| **TARGET** | Intended next ownership shape; not fully done. |
-| **KNOWN DEBT** | Confirmed structural gap between CURRENT and TARGET. |
-| **FUTURE** | Product direction without a full implementation. |
-
-Gaps must not be marketed as shipped capabilities. Shipped capabilities must not
-be described as “planned only.”
-
-Companion docs:
-
-- [`TUI_ARCHITECTURE.md`](TUI_ARCHITECTURE.md) — CURRENT TUI ownership contract
-  (geometry / conversation / presentation) after the post-`eceb271` hardening.
-- [`TUI_ARCHITECTURE_AUDIT.md`](TUI_ARCHITECTURE_AUDIT.md) — pre-hardening audit
-  at `eceb271` (historical; geometry ownership has since landed).
+Everything below was verified against the workspace at commit `494ed1b`
+(31 crates) using `cargo metadata` and the crate sources. Where the code does
+not yet match the target boundary, it says so rather than describing the
+target as if it were already true.
 
 ---
 
-## Design goals
+## 1. Architecture principles
 
-CodeLeveler is not optimizing for the fewest crates or lines of code. It is a
-**local-first coding-agent runtime** meant to stay dependable as long-lived
-workflow infrastructure:
+CodeLeveler used to be read as "a coding agent, and everything else beneath
+it". That reading makes the coding product the top abstraction, and every new
+capability ends up pushed down into shared crates to serve it.
 
-1. **Single ownership.** Every state transition, completion decision, and side
-   effect has one clear owner instead of being reimplemented by the engine,
-   agent, and tool layers.
-2. **Predictable behavior.** Safety, budgets, cancellation, retry, recovery,
-   and termination are host semantics rather than model discretion.
-3. **Long-running reliability.** After a crash, disconnect, cancellation,
-   timeout, or restart, the runtime can determine what happened and whether it
-   is safe to continue.
-4. **Composable capabilities.** Planning, evidence, verification, delegation,
-   and (FUTURE) NPC behavior are policies layered above the direct loop, not
-   hard-coded into it.
-5. **Model-independent runtime.** Provider and wire-protocol differences do not
-   leak into orchestration, tools, or user interfaces.
-6. **Unbypassable safety boundary.** Paths, permissions, sandboxing, limits,
-   cancellation, and dangerous-command policy are enforced by host code.
-7. **Recoverable and auditable state.** Sessions, tool side-effect boundaries,
-   and runtime events can be persisted and resumed independently of a process
-   lifetime or remote control plane.
-8. **Evolvable interfaces.** Internals remain free to simplify while public
-   CLI, configuration, storage, and extension surfaces follow explicit
-   compatibility and migration rules.
-9. **Single-direction dependencies and typed errors.** Applications compose
-   lower-level libraries; foundational crates never depend back on applications,
-   and library boundaries preserve distinguishable failure types.
-10. **Consistent multi-client behavior.** Terminal, browser, and (FUTURE)
-    desktop/mobile clients share one runtime contract: commands, events,
-    snapshots, approvals, and cancellation.
-
----
-
-## Vocabulary
-
-| Term | Meaning (authoritative) |
-| --- | --- |
-| **Engine** | Long-running kernel / supervisor (`leveler-engine`): task/turn lifecycle, EventLog, persist-before-forward, recovery, resume, explicit termination, ownership fencing. |
-| **Agent Loop** | Model ↔ tool executor (`leveler-agent`). Not session durability, transport, or UI. |
-| **Tool** | Model-facing action registered in `leveler-tools` (`Tool` trait + `ToolRegistry`). |
-| **Host Execution** | Workspace safety, permissions, process execution, sandbox, checkpoint, artifacts (`leveler-execution`). |
-| **Task** | Engine-owned unit of work (`TaskId`). |
-| **Turn** | One bounded execution slice inside a task. |
-| **Session** | Conversation / client aggregate; today 1:1 with a primary task. |
-| **EngineEvent** | Canonical domain fact produced by the engine (persisted unless transient). |
-| **RuntimeEvent** | Client-facing projection of runtime facts (`leveler-client-protocol`). |
-| **ClientCommand** | Client intent into the runtime (submit, cancel, approve, …). |
-| **ClientOrigin** | Command provenance: `Local` \| `Remote` \| `RemoteTimeout`. **Not** User/Agent/System. |
-| **ExecutionKind** | Task/session execution strategy: `Direct` \| `Parallel`. **Not** Tool/Shell/MCP/Capability. |
-| **Workflow / Policy** | Replaceable planning/check/retry composition above the engine. |
-| **NPC** | Long-running runtime / workflow / policy domain (FUTURE productization). **Not** a UI client. |
-| **MCP** | CURRENT tool integration: discovered tools adapted to `Tool`, exposed as `mcp__<server>__<tool>`. |
-| **User Shell Execution** | CURRENT `!command`: user-initiated direct command, **no** LLM/agent loop (hard-gated by tests), reuses host execution safety via `CommandRunner::run_streaming`. |
-| **Capability / Extension** | FUTURE extension surface (may provide model tools, user capabilities, workflows, hooks). Not shipped. |
-
-Do **not** invent a second name such as `ExecutionOrigin` that merges
-`ClientOrigin` with action initiator (User / Agent / Policy) unless an ADR
-lands in code.
-
-For Tool / Shell / MCP / Capability distinctions in prose, prefer neutral
-phrases: **invocation type**, **operation type**, **execution surface** — not a
-new Rust enum name that collides with `ExecutionKind`.
-
----
-
-## Core architecture
-
-The product core is one job: **within host-enforced boundaries, let the model
-use tools to finish work in a repository, with recoverable and auditable
-state.** Everything else (TUI, Web, slash commands, skills, remote pairing) is
-an entry or extension surface on top of that.
-
-Crate count does not define a boundary; responsibility and data ownership do:
-
-| Piece | Sole responsibility | Must not own | Where it lives (CURRENT) |
-| --- | --- | --- | --- |
-| **1a. Engine** | Task/turn lifecycle, EventLog, recovery, resume, explicit stop, durable runtime facts. | Concrete tool behavior; UI; provider wire formats. | `leveler-engine` |
-| **1b. Agent kernel** | The generic loop: model → tool call → tool result → next request, with round/token/cost/duration limits, cancellation, and neutral stop reasons. | Anything CodeLeveler-specific: permission, write scope, repository, prompts, persistence, delegation. | `leveler-agent-core` |
-| **1c. Coding harness** | What makes that loop a *coding* agent: prompt, repository context, memory, skills, compaction policy, ToolHost admission, ownership, sub-agents, goal protocol, verification bridge. | Session durability; transport; UI; the iteration itself. | `leveler-agent` |
-| **2. ToolHost / execution** | Schema validation, risk/approval, path constraints, durable tool start/finish, process/FS execution, cancellation. | Conversation orchestration; task completion policy; UI state. | `leveler-tools` + `leveler-execution` |
-| **3. Session state** | Persist messages, canonical events, snapshots, migrations as ordered auditable facts. | Agent policy or implicit product decisions. | `leveler-storage` + engine EventLog |
-| **4. Model adaptation** | Provider-neutral request, streaming, tool-call semantics. | Session state, tool permissions, workflow decisions. | `leveler-model` + provider/protocol adapters |
-
-**Do not merge Engine, kernel, and harness in prose.** The engine owns durable
-task lifecycle; the kernel owns the iteration; the harness owns what the
-iteration is *for*. The engine does not supervise the model's judgement — it
-persists what mechanically happened and hands the next turn back to the user
-or to an explicit continuation.
-
-### Ownership layering
+The architecture is instead:
 
 ```text
-Foundation          leveler-core · leveler-model · leveler-protocol · leveler-provider
-        ↓
-Generic agent       leveler-agent-core          embeddable, repository-agnostic
-kernel                                          one model↔tool loop
-        ↓
-CodeLeveler         leveler-agent               prompt · context · memory · skills
-coding harness                                  ToolHost admission · ownership
-                                                sub-agents · goal protocol
-        ↓
-Reliable runtime    leveler-lifecycle · leveler-verifier · leveler-storage · leveler-engine
-        ↓
-Product             leveler-app · leveler-cli · leveler-tui · leveler-web · remote
+Foundation provides reusable agent-runtime capability.
+Harness defines domain semantics.
+Product defines experience, composition and delivery.
 ```
 
-Dependencies point downward only. The kernel depends on `leveler-model` and
-nothing else in the workspace, which is asserted by a test rather than trusted:
-`crates/leveler-agent-core/tests/kernel_boundary.rs`. Full contract:
-[AGENT_KERNEL.md](AGENT_KERNEL.md).
-
-### Target layering (all clients)
+Six sentences carry the whole model:
 
 ```text
-                         CLIENTS (CURRENT + FUTURE)
-
-               TUI       Web       APP (FUTURE)
-                │         │         │
-                └─────────┼─────────┘
-                          │
-                leveler-client-protocol
-                ClientCommand / RuntimeEvent / Snapshot
-                          │
-                          ▼
-                 APPLICATION LAYER  (leveler-app)
-                          │
-        ┌─────────────────┼──────────────────┐
-        │                 │                  │
- Interactive coding   Projection        Interaction
-        │                 │                  │
-        └─────────────────┼──────────────────┘
-                          │
-                          ▼
-                     ENGINE KERNEL
-                    leveler-engine
-         Lifecycle / EventLog / Recovery / Persistence
-                          │
-              ┌───────────┴───────────┐
-              │                       │
-              ▼                       ▼
-      Interactive Coding     NPC Runtime (FUTURE)
-                             Workflow / Policy
-              │                       │
-              └───────────┬───────────┘
-                          │
-                          ▼
-                      AGENT LOOP
-                    leveler-agent
-                          │
-                          ▼
-                    MODEL TOOLS
-                    leveler-tools  (+ MCP adapters)
-                          │
-                          ▼
-             HOST EXECUTION BOUNDARY
-                leveler-execution
-          Filesystem / Process / External I/O
+The Kernel does not know the product.
+The Harness defines domain semantics.
+The Engine owns lifecycle, not agent intelligence.
+The Host Authority exclusively owns controlled side effects.
+Every durable fact has one authoritative owner.
+Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
 ```
 
-**CURRENT today:** TUI, Web, remote host bridge (`leveler-remote-agent`),
-Engine, Agent Loop, tools + MCP, execution, client protocol, persistence.
-
-**FUTURE:** full desktop/mobile APP experience, User Shell (`!command`), NPC
-runtime productization, Capability / Extension framework.
-
-Do not invent crates that do not exist (`leveler-npc`, `leveler-capability`,
-…). Logical layers may later be extracted *if* ownership requires it.
-
 ---
 
-## Runtime kernel (Engine)
-
-**CURRENT.** `leveler-engine` is the long-running kernel / supervisor:
-
-- Task lifecycle and turn lifecycle
-- Append-only **EventLog** with **persist-before-forward**
-- Recovery, resume, reaping after restart
-- Explicit termination with typed outcomes
-- Ownership fencing and durable runtime facts
-- `ExecutionKind`: `Direct` | `Parallel` (task/session strategy)
-
-It must be able to answer: what is durable, which tool may already have caused
-a side effect, whether retry is safe, where recovery resumes, and why work
-stopped.
-
-Canonical tool-event persistence is part of the side-effect protocol: tool
-start is durably recorded before an external side effect; completion is
-durably recorded afterward. Display-only stream deltas may use a lossy path.
-
-Lifecycle vocabulary is shared via `leveler-lifecycle` (generic runtime states
-plus Coding workflow breadcrumbs that refine — never redefine — those states).
-
----
-
-## Agent Loop
-
-**CURRENT.** `leveler-agent` is the **Agent Executor / Agent Loop**:
+## 2. Layer model
 
 ```text
-Model → Tool Call → Host executes tool → Tool Result → Model
+┌─────────────────────────────────────────────────────────────┐
+│                         PRODUCTS                            │
+│   CodeLeveler        Review Product        Future Product   │
+│   app / cli / tui / web / remote / relay                    │
+└──────────┬──────────────────────┬───────────────────────────┘
+           │                      │
+           ▼                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        HARNESSES                            │
+│   Coding Harness                 Review Harness             │
+│   leveler-agent                  (future) leveler-review    │
+└──────────┬──────────────────────────┬───────────────────────┘
+           │                          │
+           └────────────┬─────────────┘
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      AGENT RUNTIME                          │
+│   leveler-agent-core          Tool runtime contracts        │
+└─────────────┬──────────────────────┬────────────────────────┘
+              │                      │
+              ▼                      ▼
+┌──────────────────────┐  ┌──────────────────────────────────┐
+│ Persistent Runtime   │  │ Reusable Capabilities            │
+│ engine / storage     │  │ context / project / vcs / lsp    │
+│ lifecycle            │  │ browser / memory / skills / media│
+└──────────┬───────────┘  └───────────────┬──────────────────┘
+           │                              │
+           └───────────────┬──────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    HOST AUTHORITY                           │
+│                  leveler-execution                          │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+                    Operating System
 ```
 
-It is **not**:
+Two places where the running code does not match this picture yet:
 
-- Session durability owner
-- Transport owner
-- UI owner
-- Provider-specific protocol owner
+- **The engine sits above the harness, not beside it.** `leveler-engine`
+  depends on `leveler-agent` and its public API names Coding concepts. See
+  §17.1.
+- **Tool contracts and concrete capabilities are one crate.** The box labelled
+  "Tool runtime contracts" and most of the "Reusable capabilities" row are both
+  reached through `leveler-tools`. See §17.2.
 
-Top-level product execution uses the **direct agent tool loop**. Long tasks
-stay on that path via goal mode (`update_goal` until complete or blocked) and
-optional `spawn_agent` fan-out. Legacy log kinds named `orchestrate` are
-accepted and run as direct.
-
-**A turn ends where the model stops.** The per-turn 100-round ceiling is an
-unconditional circuit breaker, not a scheduling decision: nothing re-drives a
-goal on the runtime's own initiative. De-engineering Wave 2 deleted the
-supervisor that used to open a second window (`SupervisorPolicy`,
-`DriveGoalAgain`, `ExtendBudget` and the cross-window no-progress counters);
-`WindowState` survives only so old event logs still decode, and nothing reads
-it. Continuing an unfinished goal is an explicit act — the user resumes, or the
-engine's `continue_active_goal` opens the next turn — and a turn that exhausts
-its round budget is incomplete and resumable, never `Failed`. Goal identity is
-the session.
+Everything else in the diagram is the real dependency shape.
 
 ---
 
-## Host execution boundary
+## 3. Foundation primitives
 
-**CURRENT.** `leveler-execution` owns:
-
-- Workspace safety and path resolution
-- `PermissionProfile`, `RiskLevel`, approval policy
-- Process execution (`CommandRunner`), sandbox backends, cancellation
-- Checkpoints, background processes, artifacts
-
-**Execution hosts in the daemon, not the client.** Approval is a per-session
-policy (`ApprovalPolicy`, carried on the trusted-local `CreateSessionRequest`):
-`--auto-approve` selects an unattended session on the daemon rather than forcing
-an in-process runtime, so a long-running goal survives the client disconnecting
-and a reconnect resumes the still-running turn. A remote/web client cannot
-elevate its own session to auto-approve — the boundary force-resets it to
-interactive.
-
-Platform controls (capability-detected, never over-claimed):
-
-- Windows: Job Objects; AppContainer / ACL where available
-- macOS: Seatbelt
-- Linux: Bubblewrap; audited `PR_SET_PDEATHSIG` orphan cleanup
-
-**Invariant:** every repository mutation and process execution crosses this
-boundary — including FUTURE User Shell (`!command`), Capability, and Extension
-tools. User-initiated work does **not** skip host safety.
-
-**One spawn path.** `CommandRunner::spawn(&ProcessRequest) -> ManagedProcess`
-is the only place a model-driven command is confined, environment-scrubbed,
-and process-grouped. Foreground `run`, the background task registry, and the
-verifier all go through it; the registry keeps only a `ManagedProcess` (and its
-`ProcessIdentity` for tree kill after the reaper takes the handle) and never
-spawns or `taskkill`s on its own. The single exception is the Windows
-AppContainer launcher for confined commands, which yields no process handle
-and is therefore foreground-only (the registry refuses it). Host lifecycle
-hooks are not model commands and run through their own spawn.
-
-Distinguish:
-
-- **Model authorization** (what the model is allowed to *request*)
-- **Host authorization** (what the host actually permits)
-
-The model never elevates its own privileges.
-
-**Reads need no authorization.** Structured file tools (`read_file`, `grep`,
-`list_files`, `find_files`, …) resolve any path — inside or outside the
-workspace — through `Workspace::resolve_for_read`, which canonicalizes and
-applies the credential-name denylist (`.env*`, private keys, `.ssh`/`.aws`,
-`.git` internals) but performs no scope check and raises no approval. Reading
-another checkout no longer needs a readonly root. The one write boundary is
-`WriteScope` (`None` / `Workspace { root }` / `Unrestricted`), applied by
-`Workspace::resolve_for_write` for structured edits and by the OS sandbox for
-commands. Network stays an independent capability precisely because "read
-anything + network" is an exfiltration path; it is not implied by any write
-scope. `ProcessRequest` carries only `write_scope` and `deny_network`; the
-host-side absolute-path read preflights are gone. **Windows caveat:** the
-AppContainer backend still allowlists reads to its write roots, so "read
-anything" does not yet hold there — the Restricted Token + ACL + Job
-write-confinement backend has to be built and verified on a Windows host.
-
----
-
-## Client runtime contract
-
-**CURRENT.** `leveler-client-protocol` is the stable cross-client contract — not
-a future design.
-
-| Surface | Role |
+| Crate | Owns |
 | --- | --- |
-| `ClientCommand` | Client intent into the runtime |
-| `RuntimeEvent` | Normalized client-facing fact |
-| `UiSessionSnapshot` | Reconnect / resync truth (+ watermark) |
-| `InteractiveRuntimeClient` | `send` / `subscribe` / `snapshot` |
-| Protocol version / envelope | Major compatibility; additive minors |
+| `leveler-core` | Typed identifiers, timestamps, resource budgets, base traits. No internal dependencies. |
+| `leveler-model` | The provider-neutral model vocabulary: `ModelRequest`, `ModelResponse`, `ModelEvent`, `ModelError`, and the `ModelRuntime` trait. |
+| `leveler-protocol` | Vendor wire adapters (OpenAI Chat Completions shape, SSE decoding). Knows no transport and no agent. |
+| `leveler-provider` | Provider configuration, model catalog, HTTP transport with retry, the `ProviderRegistry` implementing `ModelRuntime`. |
+| `leveler-lifecycle` | The execution lifecycle vocabulary: `SessionStatus`, `TaskOutcome`, `VerificationStatus`, `TurnOutcome`, plus the Coding workflow types. No internal dependencies. |
 
-Clients **must not** reimplement task lifecycle. Closing a client does not
-cancel work already accepted by the runtime. View state (scroll, expand,
-selection) may be client-local; task facts, permissions, and execution state
-come only from engine facts and snapshots.
+These crates must not learn coding, review, finding, repository-workflow, TUI,
+web, CLI or any other product concept.
 
-Transports may vary; the contract does not:
-
-- In-process (`InProcessRuntimeClient`)
-- Local daemon / Unix socket (`leveler-local-transport`)
-- Session wire / WebSocket (`leveler-client-protocol::session_wire`, Web)
-- Remote bridge (`leveler-remote-agent` + `leveler-remote-protocol` / relay)
-
-Do **not** invent a parallel “Presentation Protocol”, “UI Protocol”, or
-“Frontend Event Bus” unless a concrete requirement forces it.
-
-`ClientOrigin` (`Local` | `Remote` | `RemoteTimeout`) is **command provenance**
-for audit and remote-approval timeout pressure — not authorization and not
-action initiator (User / Agent / System).
+`leveler-lifecycle` already carries the split internally: its `runtime` module
+is domain-neutral and its `workflow` module holds Coding vocabulary, with
+`runtime` forbidden from referencing `workflow`. A future non-Coding domain
+depends on `runtime` without pulling Coding semantics in.
 
 ---
 
-## Application layer
+## 4. Agent kernel
 
-**CURRENT.** `leveler-app` is the composition root: config, storage open,
-provider/tool wiring, engine attachment, interactive session use-cases, and
-projection from engine facts toward clients.
+`leveler-agent-core` is the product-neutral agent kernel. Its only non-dev
+dependency is `leveler-model`.
 
-`InProcessRuntimeClient` currently concentrates many responsibilities (session
-runtime config, event streams, approvals, clarifications, media, checkpoints,
-live view, active turns, steering, command dispatch). That concentration is
-documented under [Current architecture debt](#current-architecture-debt--evolution-seams).
-
-Environment access is concentrated in configuration and application setup;
-downstream libraries receive resolved values.
-
----
-
-## Clients
-
-### TUI (**CURRENT**)
-
-`leveler-tui` is a first-class terminal client. It speaks only
-`leveler-client-protocol`. It does **not** own agent logic, tool execution,
-permission decisions, or persistence truth.
-
-On Unix, default `leveler tui` is discover-or-start against the repository
-daemon socket; closing the TUI does not cancel accepted work. `--in-process`
-is explicit embedded mode. Windows keeps the embedded runtime (no socket
-transport yet).
-
-TUI interaction correctness (historical disclosures, mouse, duration truth,
-PTY validation) is closed. Conversation geometry ownership has been hardened
-(see [TUI architecture](#tui-architecture)); residual maintainability seams
-remain in the debt section.
-
-### Web (**CURRENT**)
-
-`leveler-web` is **already** a runtime client — not a future concept. An axum
-server bridges a SPA to `LocalRuntimeService` via token-authenticated REST +
-WebSocket carrying `ClientCommand` / `RuntimeEvent` / snapshots. Loopback-only
-bind; 256-bit bearer token; multi-project via per-repo daemons and
-`RouterService`. See `crates/leveler-web/README.md`.
-
-### Remote / APP (**CURRENT bridge, FUTURE full product**)
-
-`leveler-remote-agent` is the **host-side remote bridge**. It deliberately does
-**not** depend on `leveler-web`; it works through `leveler-client-protocol::session_wire` and the
-runtime/client protocol boundary. That infrastructure already exists for a
-future desktop/mobile APP experience.
-
-Do **not** write “add Remote APP architecture from zero.” Full Desktop APP and
-mobile product UX remain **FUTURE**.
-
----
-
-## Workflow and NPC runtime
-
-Complex work does not justify growing the direct loop. The core supplies
-durable lifecycle, safe execution, and explicit termination. Replaceable
-**workflow / policy** composes planning, evidence, stage checks, and
-delegation.
+It owns:
 
 ```text
-Complex task / NPC (FUTURE productization)
-    ↓
-Workflow / Policy       planning, decomposition, checks, retry
-    ↓
-Engine                  lifecycle, supervision, persistence, recovery, stop
-    ↓
-Agent Loop              one model–tool–result loop
-    ├── Model Runtime
-    └── ToolHost / execution
+model ↔ tool loop        round management
+streaming                budgets (rounds / tokens / cost / duration)
+retry and backoff        usage and cost accounting
+deadlines                cancellation
+neutral stop reasons     one tool-dispatch seam
 ```
 
-### NPC is not a UI client
-
-**Wrong:** TUI | Web | APP | NPC as peer “interfaces.”
-
-**Right:**
-
-- **Clients / interfaces:** TUI, Web, APP
-- **NPC:** long-running runtime / workflow / policy domain above the same Engine
-
-NPC **must** reuse Engine, ToolHost, permission, persistence, recovery, and the
-event model. It must **not** grow a second agent loop, session model, permission
-model, or recovery model.
-
-NPC productization is **FUTURE**. Policy hooks and lifecycle primitives that
-such a runtime would sit on are **CURRENT** building blocks.
-
----
-
-## Event and projection model
-
-| Layer | Role |
-| --- | --- |
-| **EngineEvent** | Canonical domain fact (engine-owned). |
-| **RuntimeEvent** | Client-facing projection (protocol-owned). |
-
-**TARGET** dependency direction:
+It owns none of:
 
 ```text
-Engine → EngineEvent → single application projection → RuntimeEvent → TUI / Web / APP
+coding semantics      review semantics      repository semantics
+prompt semantics      persistence           UI
+what verification means                     task completion semantics
+user acceptance       product policy
 ```
 
-UI must not depend on the engine’s internal event model.
+The whole contract between the kernel and its host is the `AgentHarness`
+trait: the loop calls each seam at a fixed point in every round and the
+harness answers with a `Flow` (continue, start the next round, or stop with
+the harness's own outcome). Every seam except the two that name and run tools
+has a neutral default, so a plain tool-calling agent is `BasicHarness` over a
+`ToolRuntime` and nothing else.
 
-### CURRENT transitional path (**KNOWN DEBT**)
+The kernel never judges whether the model's work is good, complete or
+acceptable. A run ends where the model stops, where the host stops it, or
+where a mechanical limit stops it.
+
+A scan of the crate for product vocabulary (`coding`, `repository`,
+`permission`, `prompt`, `review`, `finding`, `verify`, `patch`, `filesystem`)
+returns hits only inside doc comments, and every one of them is the crate
+saying that concern belongs to somebody else. **The kernel is clean today.**
+
+---
+
+## 5. Tool runtime
+
+Two different concerns are worth separating in the reader's mind, because the
+code does not separate them yet.
+
+**Tool runtime contracts** — what a tool *is*:
 
 ```text
-EngineEvent
-  → engine_event_to_agent()   (leveler-app)
-  → AgentEvent
-  → EventBridge
-  → RuntimeEvent
+Tool trait          ToolSchema          ToolRegistry
+ToolCall            ToolResult          ToolContext contract
+ToolHost contract   admission           dispatch contract
 ```
 
-This shim is real code today. It is **not** the ideal architecture and must not
-be described as the end state. Collapsing to a single application projection is
-**TARGET** core hardening — not a shipped cleanup.
+**Concrete agent capabilities** — what tools there *are*: `read_file`,
+`list_files`, `grep`, `apply_patch`, `replace`, `run_command`,
+`shell_command`, `find_symbol`, `find_references`, `diagnostics`,
+`blast_radius`, `git_status`, `git_diff`, browser, memory, skills, web fetch
+and search, image viewing, task control, and MCP-discovered tools.
 
----
+### Current state
 
-## Persistence and recovery
+`leveler-tools` holds both. `src/tool.rs` and `src/registry.rs` are the
+contract; `src/tools/` is 29 concrete capabilities. The crate depends on
+`leveler-browser`, `leveler-context`, `leveler-execution`, `leveler-lsp`,
+`leveler-memory`, `leveler-project` and `leveler-skills` — those edges belong
+to the concrete tools, not to the contract.
 
-**CURRENT.** Canonical task facts, execution facts, messages, event log, and
-snapshots belong to runtime/persistence (`leveler-storage` + engine EventLog).
+The concrete coupling shows in `ToolContext`: `ToolServices` names
+`lsp_sessions`, `artifact_store`, `memory_root`, `background_tasks` and
+`browser` as struct fields. Any implementer of the `Tool` trait — including a
+future Review-specific tool that needs none of them — takes that whole shape.
+The fields are `Option`, so a caller *can* pass `None`; the type still carries
+every capability into every tool.
 
-Task and session are distinct identities: a **task** is the engine-owned unit of
-work; a **session** is the conversation/client aggregate. Today every task has
-exactly one primary session. The engine depends on narrow storage ports
-(`EventStore`, `TaskStore`, `SessionStore`, …) bundled as `EngineStores`.
+`ToolRegistry` itself composes freely: `ToolRegistry::new()` plus `register`,
+with `core_registry()` and `full_registry()` as two prebuilt selections. A
+different harness can build a different registry today.
 
-UI transient state (scroll, expanded, selection, focus, viewport, drag) is
-**never** canonical task truth. Client-local view preferences may be saved as
-client-local state only.
-
-Secrets may come from env or local `api_key`, but resolved credentials and
-Authorization headers must not enter session messages, runtime events, logs, or
-artifacts.
-
----
-
-## Tool and MCP system
-
-### Tools (**CURRENT**)
-
-`leveler-tools`:
-
-- `Tool` trait, `ToolRegistry`
-- Schema validation before dispatch
-- Model-facing registration for built-ins and adapters
-
-### MCP (**CURRENT**, not future-only)
-
-MCP tools are dynamically discovered, adapted to `Tool`, registered, and
-exposed as:
+### Target state
 
 ```text
-mcp__<server>__<tool>
+leveler-tool-core   → Tool, ToolSchema, ToolRegistry, ToolCall, ToolResult,
+                      ToolContext contract, ToolHost contract, admission,
+                      dispatch contract
+leveler-tools       → the concrete built-in capabilities
 ```
 
-Future enhancement (lifecycle, reconnect, extension/capability integration) is
-optional product work — MCP **already exists** as tool integration.
+**This split is a stated target, not scheduled work.** Do not create
+`leveler-tool-core` to make this document look finished. The split earns its
+place when a second harness actually needs the contract without the
+capabilities — see §16.
 
-### Execution surface (**CURRENT**)
-
-All mutations and process execution still go through `leveler-execution`. Write
-and command tools serialize where needed to avoid conflicting mutations.
-
-**Multi-agent:** parent may advertise `spawn_agent` (depth 0, delegation on);
-concurrent children with attributed activity events; child transcripts stay out
-of the parent message list. See `docs/multi-agent.md`.
+Note that the kernel already has its own narrower seam: `ToolRuntime` in
+`leveler-agent-core` needs only the tool definitions the model may see plus a
+way to turn a `ToolCall` into text. `leveler-tools` sits behind that seam, not
+inside the kernel.
 
 ---
 
-## TUI architecture
+## 6. Host execution authority
 
-Full CURRENT ownership map: [`TUI_ARCHITECTURE.md`](TUI_ARCHITECTURE.md).
+`leveler-execution` is the host side-effect authority. It owns:
 
 ```text
-TUI
-  → Client Protocol
-  → local presentation state
-  → Components
-  → Ratatui
+workspace path resolution and enforcement     process execution
+permission profiles and rules                 process-tree termination
+approval policy and approvers                 sandbox backends
+risk classification                            hooks
+checkpoints for rollback                       trust gating
+artifact storage for oversized output          background task registry
 ```
 
-TUI must not own: agent logic, tool execution, permission decisions, persistence
-truth.
-
-### Conversation subsystem (**CURRENT** after geometry hardening)
-
-Conversation owns authoritative geometry and related view concerns:
-
-- View state, geometry, viewport, scroll, auto-follow
-- Hit test, selection mapping, line/hit cache, bottom alignment
-
-Renderer and reducer must **not** each recompute viewport geometry (that
-duplication historically caused “click A expands B”).
-
-### Workbench
-
-Owns top-level layout and component composition. Does **not** own Conversation
-internal scroll math, duplicated screen/content coordinates, tool semantic
-classification, or runtime execution logic.
-
-### Disclosure
-
-Tool disclosure presentation exists today (`presentation::disclosure` as a
-domain-free visual; `activity_stream` as the Agent Tool adapter).
-
-**TARGET:** the same disclosure visual language can present Agent Tool, User
-Shell, and future Capability rows via adapters. User Shell / Capability are
-**not** wired yet.
-
----
-
-## Extension direction (**FUTURE**)
-
-Extension / Capability is **not** fully implemented. Do not document it as
-supported.
-
-Intended semantic shape only:
+The principle:
 
 ```text
-Extension
-   └── may provide
-         ├── Model Tool
-         ├── User Capability
-         ├── Workflow
-         └── Hook
-              └── Host execution / safety boundary
+An agent requests a side effect.
+The host authority performs it.
 ```
 
-Future Capability must not bypass permission, workspace, cancellation, audit,
-or execution.
+There must not be a second path from a harness or a tool to the filesystem or
+to a process. Do not duplicate security policy between the tool layer and the
+execution layer.
 
-This document does **not** freeze: `ExtensionHost`, `CapabilityRegistry`,
-manifest schema, WASM ABI, JSON-RPC plugin protocol, or a marketplace. Those
-need real implementation before they become architecture facts.
+### Verified state
 
-Shipped extension points today remain:
+Counting production (non-test) call sites of `fs::write`, `fs::remove`,
+`fs::create_dir`, `fs::rename`, `Command::new` and `tokio::process` outside
+`leveler-execution`:
 
-- Providers / protocol adapters
-- Registered tools + MCP servers
-- Verification commands
-- Skills
-- Hooks (pre/post tool external commands)
+| Crate | Production sites | Reading |
+| --- | --- | --- |
+| `leveler-agent` | 0 | The Coding harness performs no side effect directly. |
+| `leveler-context` | 0 | Read-only assembly. |
+| `leveler-vcs` | 0 | Every git invocation goes through the execution runner. |
+| `leveler-tools` | 13 | `replace.rs` writes through `context.execution.workspace` (root fd, symlink-safe). `mcp.rs` spawns configured MCP servers directly. |
+| `leveler-browser` | 15 | Driver install writes under the Leveler home; the driver process is spawned directly. |
+| `leveler-memory` | 11 | Writes the memory store under the Leveler home. |
+| `leveler-lsp` | 4 | Spawns language servers directly. |
+| `leveler-engine` | 3 | `git rev-parse` for the baseline commit. |
+| `leveler-skills` / `leveler-project` | 2 / 1 | Create state directories under the Leveler home. |
 
----
+Two distinct things sit in that table, and conflating them would misstate the
+boundary:
 
-## Current architecture debt / evolution seams
+1. **Model-requested effects on the user's repository.** These all go through
+   `Workspace` and `CommandRunner`. `leveler-agent` reaching zero is the
+   meaningful number.
+2. **The runtime's own state and sidecars.** Writes under the Leveler home
+   (memory, skills, project state, browser driver) and long-lived sidecar
+   processes (MCP servers, language servers, the browser driver) do not pass
+   through the permission/approval path, because they are not something the
+   model asked for.
 
-Only structural gaps confirmed in code. Not a wishlist.
-
-### 1. TUI geometry ownership — largely addressed
-
-| | |
-| --- | --- |
-| **Was (pre-hardening at `eceb271`)** | workbench / reducer / AppState all knew conversation rect, viewport, scroll, auto-follow, hit-test, screen→content mapping, selection, cache — risk of “click A expands B.” |
-| **CURRENT (`04a015b`+)** | `conversation::{geometry,view,build,viewport,interaction}` is the single owner; workbench composes; reducer asks interaction for hit meaning. Documented in `TUI_ARCHITECTURE.md`. |
-| **Remaining** | Dual expand semantics (`tools_expanded` vs per-group `expanded`); first-frame geometry fallback; User Shell presentation adapter not present. |
-| **Status** | Geometry single-owner: **DONE**. Residual maintainability items: **KNOWN SEAM**. |
-
-### 2. EngineEvent projection shim — addressed
-
-| | |
-| --- | --- |
-| **CURRENT** | `EngineEvent` → `EventBridge` (leveler-app) → `RuntimeEvent`, with an EXHAUSTIVE match: a new `EngineEvent` variant fails to compile until it gets a projection decision. Sixteen table-driven equivalence tests pin client-visible shapes. |
-| **Legacy** | `engine_event_to_agent` remains as a marked one-way adapter for the headless CLI renderer (`run_in_session`/`resume_session`) and eval collectors (`run_in_session_bounded`, `eval_signals`) only. Never a UI path. |
-| **Status** | **DONE** (core hardening). |
-
-### 3. Dynamic tool metadata — addressed
-
-| | |
-| --- | --- |
-| **CURRENT** | `Tool::name/description` return `&str` borrowed from the instance; the registry owns its keys (`BTreeMap<String, _>`); `McpTool` owns its discovered strings. Zero `Box::leak` in production code. Built-in tools unchanged. |
-| **Status** | **DONE** (core hardening). Reconnect/reload can rebuild registries without accumulating. |
-
-### 4. ToolContext growth — addressed
-
-| | |
-| --- | --- |
-| **CURRENT** | Three facets by lifecycle: `execution` (process-wide execution + write-safety infra), `policy` (gates/budgets; the scope-varying part — the two security-loosening switches are private behind `grant_network()` / `grant_unrestricted_fs()`), `services` (LSP/artifacts/memory/background). Anti-growth rule documented on the type: a new field must name its lifecycle and join a facet. |
-| **Placement guide** | Extension-provided service / secret provider → `services`; remote executor → `execution`. |
-| **Status** | **DONE** (core hardening). Enforcement semantics unchanged. |
-
-### 5. InProcessRuntimeClient responsibilities — partially addressed
-
-| | |
-| --- | --- |
-| **CURRENT** | `CheckpointStore` owns both checkpoint maps and their joint invariant; `LiveViews` owns reconnect state with a pure fold; `stage_turn` is the single turn-launch preamble. The facade routes commands and delegates: it assembles nothing itself and holds no runtime of its own. |
-| **Remaining** | Delivery middleware, session directory CRUD, runtime-config store, media/memory arms stay inline (stateless or single-path; extraction not yet justified by the rule "own state + own invariant + multiple paths"). Per-session map eviction on delete remains a KNOWN SEAM. |
-| **Status** | **CORE CLUSTERS DONE**; remainder tracked. A new client use case = a small handler + facade route, not another inline block. |
-
-### 6. Structured client events vs preformatted copy — policy set, migration started
-
-**The rule** (binding for new work): a stable product fact crosses the wire as
-a typed `RuntimeEvent`; clients own wording, layout, and locale. Free-form
-diagnostics (unexpected errors, transport failures, model/tool output) stay
-`Notification`/`String`. A domain fact is never a preformatted Chinese UI
-string.
-
-| | |
-| --- | --- |
-| **Migrated** | `ContextCompacted { from, to }` (protocol 1.4, additive; schemas + envelope golden regenerated; TUI localizes ZH/EN; Web mirror updated). Also fixed: the TUI reason-localizer matched `budget exhausted` (space) while the executor emits `budget_exhausted` — users saw the raw machine token. `ContextExpanded` is replay-only: Wave 2 deleted the adaptive-context ladder, so the variant still decodes an old log and nothing writes one. |
-| **Remaining** | AgentActivity advisory labels, turn-incomplete reason defaults, and assorted `interactive.rs` notices remain preformatted — tracked, migrate opportunistically under the rule above. |
-| **Status** | **POLICY IN FORCE; HIGH-CONFIDENCE FACTS DONE** |
+That second category is a real, deliberate boundary — but the sidecars are
+outside `CommandRunner`'s process-tree termination and sandbox semantics. See
+§17.4.
 
 ---
 
-## Runtime authority boundary
+## 7. Reusable capabilities
+
+These are capabilities a harness may select, not parts of the kernel:
+
+| Crate | Capability |
+| --- | --- |
+| `leveler-context` | Bounded repository context assembly: map, candidate files, related tests, merged project rules, token estimate, repeated-read guard. |
+| `leveler-project` | Project language detection and filesystem layout (config and state locations). |
+| `leveler-memory` | Durable project memory store and its promotion pipeline. |
+| `leveler-skills` | Skill discovery and loading. |
+| `leveler-vcs` | Git operations, performed through the execution authority. |
+| `leveler-lsp` | Language-server sessions, reused across tool calls. |
+| `leveler-browser` | Browser runtime, driver install, isolated per-project profile. |
+| `leveler-media` | Media handling. No internal dependencies. |
+
+A Coding harness selects context, project, VCS, LSP, browser, memory,
+filesystem mutation and process execution. A Review harness would plausibly
+select context, project, VCS, LSP, read-only filesystem and memory, and skip
+the rest. Do not bind the full capability set into the kernel to save a
+harness the trouble of choosing.
+
+---
+
+## 8. Persistent runtime
+
+`leveler-engine` is the persistent runtime. It owns:
+
+```text
+session and task lifecycle       checkpoint and resume
+turn boundaries                  crash recovery and reaping
+event ordering                   ownership registry
+append-only event log            runtime outcome
+persist-before-forward           context window policy
+```
+
+`persist-before-forward` is the guarantee that matters: a turn's events reach
+the log in emission order before any client sees them, so a client can never
+observe a fact the runtime has not durably recorded.
+
+The engine should not be the agent brain. It should not own coding prompts,
+review prompts, tool selection, repository strategy, or what completion means
+in a domain.
+
+The engine's own boundary work is partly done. `TaskSpec` is already split:
+
+```rust
+pub struct TaskSpec {
+    pub runtime: RuntimeTaskSpec,   // goal, kind, continuation, limits
+    pub coding: CodingTaskSpec,     // repository, permission mode, sandbox,
+                                    // verification plan, base commit
+}
+```
+
+The crate's own comment calls this "the migration seam toward a domain-neutral
+engine". The split makes each code path declare which half it reads. It does
+not yet remove the Coding dependency — see §17.1.
+
+---
+
+## 9. Storage and durable truth
+
+`leveler-storage` is the durable truth boundary: SQLite, embedded migrations,
+the connection pool, and one repository per concern. Business logic never
+issues SQL directly.
+
+```text
+A persistent fact
+    → has one authoritative owner
+    → has one canonical durable representation
+```
+
+This applies with no exceptions to task status, turn status, evidence,
+ownership, usage, artifacts and completion state. There must be no parallel
+source of truth.
+
+`leveler-storage` depends only on `leveler-core` and `leveler-lifecycle`. That
+is what lets the low-level persistence crate speak the lifecycle vocabulary
+without a back edge to a high-level crate — the reason the vocabulary lives in
+its own crate at all.
+
+---
+
+## 10. Verification and evidence
+
+`leveler-verifier` runs the project's declared checks — format, build, test —
+captures evidence, checks scope, and classifies failures.
+
+The precise statement of its authority:
+
+```text
+The verifier is the authority for VERIFICATION VERDICTS.
+The verifier is NOT the authority for semantic task completion.
+```
+
+It can prove that the configured checks passed, failed, or were blocked. It
+cannot, alone, prove that the user's intent was satisfied.
+
+A verification command a user declared explicitly is authority, not a
+heuristic input — the discovery layer marks it as such and the harness may not
+substitute its own guess for it.
+
+This is why `TaskOutcome` and `VerificationStatus` are separate axes in
+`leveler-lifecycle`. `TaskOutcome::Completed` means the model declared the goal
+complete; `VerificationStatus` says what the project's own checks reported
+about the final tree. The runtime reports both and never folds them into one
+word.
+
+The crate-level doc comment in `leveler-verifier/src/lib.rs` still says
+otherwise. See §17.3.
+
+---
+
+## 11. Harness layer
+
+`leveler-agent` is the **Coding Harness**. The crate name has not changed and
+this document does not propose changing it; the concept is what matters.
+
+It owns Coding domain semantics:
+
+```text
+coding prompt                     compaction strategy
+repository context strategy       goal semantics
+coding tool selection             coding verification policy
+write workflow                    delegation policy and sub-agent profiles
+ownership of paths across agents  coding completion contract
+```
+
+It reaches the kernel through one seam: `Drive` in
+`src/executor/drive.rs` implements `leveler_agent_core::AgentHarness`. The
+seams it fills are `tool_definitions`, `on_round_start`, `on_round_admitted`,
+`on_response`, `on_model_error`, `on_quiet`, `execute_calls`, `on_stop` and
+`on_event`. That is the entire kernel contract, and it is already exercised by
+a real harness rather than being a hypothetical extension point.
+
+A future Review harness is a **sibling**:
+
+```text
+              leveler-agent-core
+                /            \
+               ▼              ▼
+        leveler-agent    leveler-review
+        Coding Harness   Review Harness
+```
+
+The edge `leveler-review → leveler-agent` is forbidden. Review reuses the
+foundation, not the Coding product.
+
+Review would own its own vocabulary — `ReviewTarget`, `ReviewScope`,
+`ReviewPolicy`, `Finding`, `FindingSeverity`, `FindingEvidence`,
+`FindingLifecycle`, deduplication, suppression, `ReviewVerdict`,
+`ReviewReport` — and none of those types may enter the agent kernel.
+
+None of this is a commitment to build a Review harness. It is a constraint on
+what the foundation is allowed to assume.
+
+---
+
+## 12. Product layer
+
+| Crate | Role |
+| --- | --- |
+| `leveler-app` | The composition root: configuration, provider registry, database, event projection into client events. |
+| `leveler-cli` | Command-line surface. |
+| `leveler-tui` | Terminal client. Depends only on the client protocol, core, model and skills. |
+| `leveler-web` | Web client surface. |
+| `leveler-client-protocol` | The stable UI↔runtime contract: `ClientCommand` in, `RuntimeEvent` out, versioned envelope. |
+| `leveler-local-transport` / `leveler-remote-protocol` / `leveler-remote-agent` / `leveler-relay` | Local and remote transports and the pairing/relay path. |
+| `leveler-eval` | Capability evaluation harness. No internal dependencies. |
+| `leveler-test-support` | Shared test fixtures. Dev-dependency only. |
+
+These layers project authoritative runtime state. They do not derive new
+runtime truth. A tool call returning `Ok` does not let a client conclude that
+a task is complete; that word has one owner, and clients read it.
+
+The client protocol is what keeps this honest: UI code depends on
+`leveler-client-protocol` and never on the concrete runtime, providers, tools
+or storage. `leveler-tui` proves it — its dependencies are the client
+protocol, core, model and skills, and nothing else.
+
+---
+
+## 13. Dependency direction
+
+Target rule:
+
+```text
+Foundation
+    ↑
+Capabilities / Runtime
+    ↑
+Harnesses
+    ↑
+Products
+```
+
+No lower layer may depend on a user-facing one.
+
+Current graph, by topological level (normal dependencies only, dev-dependencies
+excluded):
+
+| Level | Crates | Internal dependencies |
+| --- | --- | --- |
+| 0 | `leveler-core`, `leveler-lifecycle`, `leveler-memory`, `leveler-media`, `leveler-eval` | none |
+| 1 | `leveler-model`, `leveler-project`, `leveler-skills`, `leveler-browser`, `leveler-execution` | `core` |
+| 1 | `leveler-storage` | `core`, `lifecycle` |
+| 2 | `leveler-agent-core` | `model` |
+| 2 | `leveler-protocol`, `leveler-client-protocol` | `core`, `model` |
+| 2 | `leveler-context` | `core`, `project`, `skills` |
+| 2 | `leveler-lsp` | `core`, `project` |
+| 2 | `leveler-vcs` | `core`, `execution` |
+| 2 | `leveler-verifier` | `core`, `execution`, `lifecycle`, `project` |
+| 3 | `leveler-provider` | `core`, `model`, `protocol` |
+| 3 | `leveler-tools` | `browser`, `context`, `core`, `execution`, `lsp`, `memory`, `model`, `project`, `skills` |
+| 3 | `leveler-local-transport`, `leveler-remote-protocol`, `leveler-tui`, `leveler-web` | client protocol and below |
+| 4 | `leveler-agent` | `agent-core`, `context`, `core`, `execution`, `lifecycle`, `memory`, `model`, `skills`, `tools` |
+| 4 | `leveler-relay`, `leveler-remote-agent` | remote protocol and below |
+| 5 | `leveler-engine` | `agent`, `context`, `core`, `execution`, `lifecycle`, `model`, `storage`, `tools`, `verifier` |
+| 6 | `leveler-app` | 18 internal crates |
+| 7 | `leveler-cli` | 21 internal crates |
+
+Findings:
+
+- **No reverse dependency exists.** Nothing depends on `leveler-app`,
+  `leveler-cli`, `leveler-tui` or `leveler-web`. The direction rule holds.
+- `leveler-agent-core` depends on exactly one internal crate. The kernel is as
+  narrow as the constitution asks.
+- `leveler-agent → leveler-execution` is a **vocabulary** edge, not an
+  execution edge: the harness uses `PermissionProfile`, `RiskLevel`,
+  `WriteScope` and `HookRunner` as types. Its direct side-effect count is zero.
+- `leveler-engine → leveler-agent` is the one edge that contradicts the layer
+  model. It is the debt in §17.1.
+
+---
+
+## 14. Runtime turn flow
+
+One turn, end to end:
+
+```text
+client command
+    │
+    ▼
+leveler-app                  composition; maps config to a running Application
+    │
+    ▼
+leveler-engine               opens a turns row, stamps messages with the turn
+    │                        id, wires the persist-before-forward EventLog,
+    │                        wraps the approver and clarifier as recorders
+    │
+    ├─ ExecutorFactory       one derivation of the execution configuration
+    │                        from the resolved policy and turn profile
+    ▼
+leveler-agent (Drive)        the Coding harness: prompt, context, tool
+    │                        selection, delegation, compaction, goal semantics
+    ▼
+leveler-agent-core           the loop: admit round → assemble model round →
+    │                        stream → parse → dispatch tools → next round,
+    │                        under budgets, deadline and cancellation
+    ▼
+leveler-tools                the concrete tool runs
+    │
+    ▼
+leveler-execution            workspace resolution, permission, approval,
+    │                        risk, sandbox, process execution
+    ▼
+operating system
+```
+
+And back out:
+
+```text
+events → EventLog (persisted first) → engine events → leveler-app
+       → client events → leveler-client-protocol → TUI / web / remote
+```
+
+Facts flow out only after they are durable. That ordering is the reason a
+client can never show a state the runtime cannot reproduce after a restart.
+
+---
+
+## 15. Truth and authority model
+
+```text
+Mechanical Truth  ≠  Semantic Satisfaction  ≠  User Acceptance
+```
+
+**The runtime authoritatively proves:**
+
+```text
+a command executed        a file was mutated
+its exit code             a test result
+a build result            an artifact exists
+an event was persisted    a tool returned this result
+observed runtime state
+```
+
+**The verifier authoritatively decides:** the configured verification verdict.
+
+**Neither of these implies the next step.**
+
+```text
+"the tool succeeded"  does not prove  "the goal is semantically satisfied"
+"the tests passed"    does not prove  "the user's request is fulfilled"
+```
+
+The model performs semantic judgement. The user holds final acceptance.
 
 ```text
 Runtime owns mechanical truth.
-The model owns semantic interpretation.
-The user owns acceptance.
+Model owns semantic interpretation.
+User owns acceptance.
 ```
 
-The runtime can mechanically establish: which files changed, which commands
-ran and how they exited, whether build/test/lint passed over the final tree,
-whether a check ran after the latest edit, whether a permission or ownership
-boundary held, whether a child agent ran and settled, and whether a budget or
-the absolute round ceiling was reached.
-
-The runtime does not decide whether the user's request was satisfied, whether
-the model's reading of the goal was right, whether an edit was "enough",
-whether exploration was worthwhile, or whether a change "needs" a reviewer.
-It never spends a hidden model call to have a second model grade the first.
-Those questions belong to the model's final answer and to the user's review.
-
-Consequences that hold today:
-
-- A task's terminal fact is two orthogonal values, never one word:
-  `TaskOutcome` (how the run ended: completed / blocked / budget_limited /
-  failed / interrupted) and `VerificationStatus` (what the project's own
-  checks said: passed / failed / not_run / unavailable). **Checks passed ≠
-  user intent proven.**
-- `update_goal(complete)` is refused only for mechanical reasons, and there
-  are exactly two: a delegated child is still running, or a step in the
-  model's own plan is still open. Wave 2 deleted the other two — a finding is
-  inert information a reviewer reports, and acceptance is the project's own
-  `verify` commands, not a contract parsed out of the task prose.
-- A failed check is reported, not repaired on the model's behalf. The model
-  sees its own test results inside the loop and decides what to do.
-- An independent reviewer runs only when configured (`independent_review:
-  required`); nothing is inferred from file names or diff size.
-- A structured plan is a cognitive aid. A multi-step task without one gets
-  one soft reminder; no tool is refused for a missing plan.
-- Hidden semantic model calls on the default path: **zero**. Compaction
-  summaries and closeout nudges are the only harness-initiated calls, and
-  neither judges the work.
-
-## Non-negotiable invariants
-
-- Every repository mutation and process execution crosses ToolHost/execution.
-- Each lifecycle state has one writer; projections and UIs consume canonical events.
-- Accepted work does not disappear because one UI disconnects.
-- Recovery never blindly replays a tool that may already have caused an external side effect.
-- Every stop has a typed reason: completed, blocked, cancelled, budget exhausted, or failed.
-- Policies are replaceable; safety, persistence, and cancellation boundaries are not.
-- Old configuration, databases, and events use explicit compatibility windows and migrations.
-- Disconnecting TUI, Web, or a remote client does not alter task facts; reconnect uses snapshot/resync only.
-- FUTURE User Shell / Capability / Extension still pass host execution safety.
-
-### Unsafe Rust
-
-Most crates use `#![forbid(unsafe_code)]`. **`leveler-execution` is different:**
-`#![deny(unsafe_code)]` with a single audited, scoped exception — the Linux
-`PR_SET_PDEATHSIG` pre-exec hook for orphan-process cleanup. Application and CLI
-may use `anyhow` for top-level context; library crates expose typed `thiserror`
-errors.
+Do not reintroduce a mechanical shortcut that stands in for semantic
+completion — an `observed_the_changed_tree()` style predicate that reads "the
+tree changed" as "the work is done". No such predicate exists in the codebase
+today, and `TaskOutcome` / `VerificationStatus` being orthogonal axes is what
+keeps it out.
 
 ---
 
-## Component map
+## 16. The Second Harness Test
 
-```text
-User
-  │
-  ├── leveler-cli ────────────────┐
-  ├── leveler-tui                 │
-  └── leveler-web (browser UI)    │
-          │                       │
-          ▼                       ▼
-  leveler-client-protocol    leveler-app  ◀── composition / config / projection
-          │                       │
-  leveler-local-transport         ▼
-  leveler-remote-agent     leveler-engine
-  leveler-remote-protocol         │
-  services/leveler-relay          │
-                                  │
-                 ┌────────────────┼─────────────────┐
-                 ▼                ▼                 ▼
-          leveler-agent                    leveler-verifier
-                 │                                  │
-                 ├────────▶ leveler-agent-core      │
-                 ├────────▶ leveler-context         │
-                 └────────▶ leveler-tools ◀─────────┘
-                                  │
-                                  ▼
-                         leveler-execution
+The foundation's architecture acceptance test.
 
-  leveler-provider ─▶ leveler-protocol ─▶ leveler-model
-         │                                      ▲
-         └──────────── used by the engine ──────┘
+> Can a semantically different agent product — Review, for instance — be built
+> on this foundation **without modifying the agent kernel**?
 
-  Supporting: leveler-core, leveler-lifecycle, leveler-storage,
-  leveler-project, leveler-vcs, leveler-lsp, leveler-skills,
-  leveler-memory, leveler-media, leveler-eval, leveler-test-support
-```
+Target answers:
 
-Arrows are conceptual dependency/call direction. Some edges are traits so
-runtimes can be tested with deterministic fakes.
+| Question | Required answer |
+| --- | --- |
+| Modify `leveler-agent-core` | NO |
+| Reuse the model and runtime vocabulary | YES |
+| Reuse the tool contracts | YES |
+| Reuse selected capabilities | YES |
+| Add Review-specific semantics | YES |
+| Add Review-specific tools | ALLOWED |
+| Depend on the Coding harness | NO |
 
----
+If a future Review harness turns out to require a change to
+`leveler-agent-core`, that is a **foundation leak**. The response is to
+analyse why, not to add the new business concept to the kernel.
 
-## Runtime flow
+### Current verdict: NOT YET ENFORCED
 
-### 1. Composition
+The kernel side passes. `leveler-agent-core` depends only on `leveler-model`,
+carries no product vocabulary, and its `AgentHarness` seam is already
+implemented by a real harness. A Review harness could implement the same trait
+without touching it.
 
-`leveler-app` resolves global and project configuration, opens storage, builds
-provider and tool registries, selects execution policy, and wires the engine to
-CLI, in-process client, or local transport.
+The foundation around it does not pass yet:
 
-### 2. Model request and streaming
+- A Review harness that wants persistence, resume, event ordering and recovery
+  has to go through `leveler-engine`, which depends on `leveler-agent` and
+  whose public API names `CodingTaskSpec` (§17.1).
+- A Review harness that wants tool contracts also takes the concrete
+  capability set and the `ToolServices` shape (§17.2).
 
-The agent produces a provider-neutral `ModelRequest`. `leveler-provider` selects
-provider/model; `leveler-protocol` converts to wire format.
+Neither of these forces a kernel change, which is why this is "not yet
+enforced" rather than "fail". They are the inputs to Foundation Hardening.
 
-```text
-HTTP byte stream
-  → SSE frame decoder
-  → protocol chunk decoder
-  → fragmented tool-call assembler
-  → ModelEvent stream
-  → engine and clients
-```
-
-Invalid or truncated tool-call JSON errors out; it is never “repaired” into an
-executable call.
-
-### 3. Turns and tool loop
-
-Engine owns task/turn lifecycle; agent runs the direct tool loop; host code owns
-transitions, budgets, cancellation, permissions, and completion rules.
-
-### 4. Tools and command execution
-
-Schema validation in `leveler-tools`; host enforcement in `leveler-execution`.
-
-### 5. Verification and completion
-
-`leveler-verifier` discovers or receives format/build/test commands, runs them
-over the final tree, records evidence, and classifies failures. The result is
-reported as `VerificationStatus` beside the task outcome; it never re-reads the
-goal, never derives acceptance semantics, and never triggers an automatic
-repair turn.
-
-- `format`: best-effort, does **not** affect the verification status
-- `build` / `test`: decide `passed` / `failed`
-- Any field under project `verify` **replaces** the whole auto-discovered plan
-- Acceptance is those commands and nothing else. The runtime does not read the
-  task prose for an `Acceptance:` block — that parser went with Wave 2's
-  `TaskContract`, because a sentence is not a contract.
-
-### 6. Persistence and reconnect
-
-SQLite-backed storage; clients resync via snapshot + event watermark.
-
-Each runtime state directory owns a durable `RuntimeId`. Exactly one daemon
-serves a state directory (socket bind + lock).
+**Do not modify code to convert this verdict to PASS as part of a
+documentation change.**
 
 ---
 
-## Important boundaries
+## 17. Known boundary debt
 
-### Provider boundary
+Recorded, not hidden. Each item states the current behaviour, the desired
+boundary, why it violates the constitution, the minimal correction, and the
+risk of making it.
 
-Upper layers consume `ModelRequest` / `ModelResponse` / `ModelEvent` /
-`ModelError`. Vendor JSON, SSE quirks, and auth headers stay below protocol.
+### 17.1 The engine depends on the Coding harness
 
-### Execution boundary
+**Current.** `leveler-engine → leveler-agent`. The engine's public API exports
+`CodingTaskSpec`, and `ExecutorFactory` constructs a
+`leveler_agent::Executor` directly. `recorders.rs`, `recovery.rs`, `turn.rs`
+and `policy_resolver.rs` all name `leveler_agent` types.
 
-No direct filesystem or process access from the agent loop that would bypass
-approvals, checkpoints, redaction, or cancellation.
+**Desired.** The engine runs a harness executor behind an abstraction; it does
+not name a domain. `TaskSpec` carries a runtime half and a domain half, and the
+engine reads only the runtime half.
 
-### Persistence boundary
+**Why it violates the constitution.** Rule 5 (the engine owns runtime
+mechanics, not product semantics) and rule 2 (harnesses are siblings): a
+second harness inherits the Coding harness through the engine.
 
-Redact credentials before any durable write.
+**Minimal correction.** The `RuntimeTaskSpec` / `CodingTaskSpec` split already
+exists and is described in the source as the migration seam. The next step is
+an executor abstraction the engine can drive without naming `leveler_agent`,
+with `ExecutorFactory` moving above the engine.
 
-### UI boundary
+**Risk.** Medium. `ExecutorFactory` is deliberately the single derivation of
+execution configuration; splitting it badly reintroduces the multiple-
+derivation bug it was built to remove.
 
-Clients render protocol events and send commands. They do not own agent
-execution. Multi-project Web behavior (daemon probe, spawn, `RouterService`,
-registry at `~/.leveler/state/web/projects.json`) is documented under
-Clients → Web.
+### 17.2 Tool contracts and concrete capabilities share a crate
 
----
+**Current.** `leveler-tools` holds the `Tool` trait, `ToolRegistry` and
+dispatch alongside 29 concrete tools, and depends on browser, context,
+execution, LSP, memory, project and skills. `ToolServices` names
+`lsp_sessions`, `artifact_store`, `memory_root`, `background_tasks` and
+`browser` as fields of the context every tool receives.
 
-## User Shell Execution (**CURRENT**)
+**Desired.** `leveler-tool-core` holds the contract; `leveler-tools` holds the
+capabilities. A harness takes the contract without the capability graph.
 
-`!command` is implemented (TUI entry point):
+**Why it violates the constitution.** Rule 3. A Review-specific tool needing
+none of those services still takes the whole shape.
 
-```text
-!git status
-  → TUI submit routing (raw first char `!`; never trimmed prose)
-  → ClientCommand::RunUserShell (protocol 1.5, additive)
-  → leveler-app use case (ActiveTurns foreground mutex; hang guard)
-  → CommandRunner::run_streaming — the SAME host boundary as agent shell
-      (permission-profile write confinement / network sandbox / env scrub /
-       process-tree termination / workspace-root cwd)
-  → canonical EngineEvent facts (Started/Output*/Finished; Output transient,
-      others persisted LocalOnly) → session EventLog (turn_id = None)
-  → exhaustive EventBridge projection → RuntimeEvent UserShell*
-  → TUI UserShell block (reuses presentation::disclosure) + Shell Details
-```
+**Minimal correction.** Extract the contract when a second harness needs it —
+not before. The registry already composes freely, so the practical cost today
+is the `ToolContext` shape rather than the tool set.
 
-Hard-gated by tests: ZERO model requests per execution; neither the command
-nor its output ever enters model context. Cancellation is per-execution by
-`UserShellId` (`CancelUserShell`), never `CancelCurrentTurn`. Reconnect
-restores active + bounded history via `UiSessionSnapshot.user_shells`.
-MVP is non-interactive shell execution (`sh -c` / `cmd /C`, stdin closed) —
-not a PTY/terminal emulator; TTY programs (vim/top/interactive ssh) are out
-of scope. Remote policy denies both commands. Runtime restart follows the
-existing process-cleanup policy (no cross-process adoption).
+**Risk.** Low if deferred, medium if done speculatively: a contract crate
+designed against one consumer usually has to be redesigned for the second.
 
----
+### 17.3 The verifier's doc comment claims completion authority
 
-## Next architecture phases (ordering)
+**Current.** `crates/leveler-verifier/src/lib.rs` opens with "Only the
+verifier can mark a task complete".
 
-1. Architecture documentation alignment *(this document)*
-2. Residual TUI maintainability seams (expand dual-state, shell presentation)
-3. Core architecture hardening (EngineEvent → RuntimeEvent projection; related)
-4. Full regression
-5. User Shell Execution (`!command`)
-6. Real-project dogfooding
-7. Capability / Extension only from observed needs
+**Desired.** The verifier is the authority for verification verdicts. Task
+outcome and verification status are orthogonal, which is what
+`leveler-lifecycle` implements.
 
-Do not schedule Capability ahead of User Shell without new evidence.
+**Why it violates the constitution.** Rule 6. This is the one place in the
+tree where a document still asserts that a green check is completion.
 
----
+**Minimal correction.** Rewrite the doc comment. No behaviour change — the
+code already separates the axes; the comment predates the split.
 
-## Configuration layers
+**Risk.** None. It is a comment.
 
-| Layer | Path | Role |
-| --- | --- | --- |
-| Global | `~/.leveler/config.toml` | Default model, providers, MCP |
-| Bundle | `configs/providers/`, `configs/models/` | Checked-in provider/model profiles |
-| Project | `<repo>/.leveler/config.yaml` | Model override, permission profile, verify, ignore, limits |
-| Permissions | `~/.leveler/permissions.yaml`, project file | Durable allow/ask/deny |
-| Hooks | `~/.leveler/hooks.yaml`, project file | Pre/post tool external commands |
+### 17.4 Sidecar processes bypass the command runner
 
-Examples: `*.example.yaml`, `leveler-config-example.yaml`,
-[`configs/example.yaml`](../configs/example.yaml).
+**Current.** MCP servers (`leveler-tools/src/mcp.rs`), the browser driver
+(`leveler-browser/src/driver.rs`) and language servers
+(`leveler-lsp/src/client.rs`, `registry.rs`) are spawned with `Command::new`
+directly rather than through `leveler_execution::CommandRunner`.
 
----
+**Desired.** Either these run under the host authority's process-tree
+termination and sandbox semantics, or the exemption is an explicit, named
+policy rather than an accident of implementation.
 
-## Home & runtime layout (**CURRENT**)
+**Why it partially violates the constitution.** Rule 4. These are not
+model-requested commands, so the permission and approval path does not apply.
+They are still host processes outside the authority that is supposed to own
+every host process.
 
-**Zero Workspace Pollution.** CodeLeveler never creates or mutates its own
-runtime/state infrastructure inside the workspace. Everything machine-written
-lives under one global home; a checkout stays clean and needs no `.gitignore`
-entry. The only `.leveler/` inside a repo is *user-authored, committable*
-config (`config.yaml`, `instructions.md`, `rules/`, `skills/`, `hooks.yaml`,
-plus `AGENTS.md`) — the runtime reads it, never writes it.
+**Minimal correction.** Name the category — "runtime sidecar" — and give it a
+defined lifecycle owner, rather than three independent spawn sites.
 
-`LevelerHome` ([`leveler-core/src/home.rs`](../crates/leveler-core/src/home.rs))
-is the single authority for every owned path. It resolves the root once
-(`$LEVELER_HOME`, else `$HOME/.leveler`, else `%USERPROFILE%\.leveler`, else a
-process-local temp dir — never a cwd-relative fallback) and hands out every
-sub-path through a named accessor. Business crates ask `LevelerHome`; they do
-not join onto the root. A test tripwire fails the build if any crate rebuilds
-a home path by hand.
+**Risk.** Low to medium. Sidecar lifetime is already entangled with daemon
+shutdown reaping; changing the spawn path touches that.
 
-```text
-~/.leveler/
-├── config.toml                      global user config (+ agents/, skills/, hooks.yaml, permissions.yaml, trusted.yaml)
-├── state/                           durable state
-│   ├── projects/<id>/               per-repo: sessions.db, memory/, permissions.yaml (machine), image store
-│   ├── remote/                      remote pairing key, config, devices
-│   └── web/  projects.json · uploads/   multi-project registry + imported attachments
-├── run/                             ephemeral runtime coordination
-│   ├── sockets/                     daemon Unix sockets (short per-repo hash → stays under macOS SUN_LEN)
-│   ├── locks/                       advisory workspace edit-locks
-│   └── sandboxes/<id>/ (+ <id>.lock)   per-command scratch under an OS lease
-├── cache/  tools/                   disposable, rebuildable toolchain caches
-├── runtimes/                        managed execution deps (reserved)
-└── logs/   leveler.log · crash/ · daemon/<id>.log
-```
+### 17.5 The engine shells out to git for the baseline
 
-The layout is lazy: asking for a path never creates it. A project's id is a
-readable slug plus a short SHA-256 of its canonical path, so state is keyed by
-repository without a registry.
+**Current.** `leveler-engine/src/baseline.rs` and `engine.rs` call
+`Command::new("git")` directly to stamp the base commit, while
+`leveler-vcs` exists and performs zero direct process spawns.
 
-**Sandbox lease + reaper.** Each sandboxed command gets a scratch dir under
-`run/sandboxes/` guarded by an exclusive advisory lock on its `<id>.lock`
-sidecar (the same `flock` primitive as the daemon election lock), held for the
-command's lifetime. RAII removes both on completion; the flock releases on
-crash. A fail-closed reaper runs once per process (never on a timer): a lock it
-can acquire proves the owner died, so it reclaims that scratch tree; a live
-lock, or a dir with no lock, is left untouched.
+**Desired.** The engine asks the VCS capability, which asks the host
+authority.
+
+**Why it violates the constitution.** Rule 4, and it puts a domain operation
+(git) in the runtime layer.
+
+**Minimal correction.** Route the baseline read through `leveler-vcs`.
+
+**Risk.** Low. It is a single read-only invocation.
 
 ---
 
-## Browser Capability (**CURRENT**)
+## 18. Architecture change rules
 
-Structured browser automation — the agent's primary way to verify web/frontend
-work, replacing adhoc `chrome --headless` / curl shell probes.
+1. **Extend above the foundation before modifying it.** A change that can live
+   in a harness or a product belongs there.
+2. **A foundation change needs evidence**, not elegance: two real
+   implementations, a real dependency-inversion boundary, an observed coupling
+   or ownership defect, or an independent protocol / security / persistence /
+   runtime boundary.
+3. **Answer the decision test in §1 of `AGENTS.md` before you start**, in the
+   pull request, not afterwards.
+4. **Do not describe the target as the present.** If a change moves toward a
+   boundary without reaching it, update §17 rather than deleting the entry.
+5. **Do not add speculative interfaces for products that do not exist.** The
+   architecture must permit a Review harness. It must not pre-build one.
+6. **This document is the only canonical architecture.** Do not create
+   `ARCHITECTURE_V2.md`, `FOUNDATION_*.md` or a "final" variant. Amend this
+   file; the Chinese version tracks it.
 
-```text
-Agent → browser_* tools (leveler-tools)
-      → ToolServices.browser (Arc<BrowserRuntime>, daemon-owned)
-      → BrowserRuntime (crates/leveler-browser): refs · generations · session
-        isolation · snapshot budgeting · lazy managed install
-      → Node/Playwright driver subprocess (JSON-RPC over stdio)
-      → system Chrome (channel:'chrome') or managed Chromium
-```
-
-- Tools: `browser_navigate/snapshot/click/type/select/press/wait/tabs/dialog/
-  console/screenshot`. The **semantic snapshot** (Playwright's ref-annotated
-  accessibility text, bounded) is the control protocol; a `[ref=…]` is valid only
-  in its `(session, page, generation)` and a superseded ref is refused as
-  `RefStale`, never retargeted. No `browser.evaluate`.
-- **Owned by the daemon** (`Application`, like `background_tasks`) so it survives
-  turns and client disconnect. Lazy: nothing starts until a browser tool runs.
-- **Filesystem:** managed runtime under `runtimes/browser/`, isolated per-project
-  profile under `state/projects/<id>/browser/profile/` — never the workspace,
-  never the user's real Chrome profile.
-- **Permissions:** reuses `RiskLevel`/`ApprovalPolicy` (reads = Safe, actions =
-  Network); `browser_navigate` runs the SSRF gate (`web_fetch::is_blocked_ip`).
-
----
-
-## Repository guide
-
-Every directory has one owner, and nothing lives at the root because it once
-did.
-
-- `crates/` — Rust workspace. SQLite migrations belong to the crate that runs
-  them: `crates/leveler-storage/migrations/`.
-- `configs/` — provider/model profiles
-- `docs/` — architecture and examples
-- `evals/` — the evaluation system, and everything only it uses: `cases/`,
-  `suites/`, `fixtures/` (the repositories cases run against), and `scripts/`
-  (generators, integrity checks, offline analyzers)
-- `packaging/` — release packaging: the Homebrew formula and the two scripts
-  CI runs to guard a release payload
-- `schemas/` — the public client-protocol contract, generated from the Rust
-  types and consumed by the TypeScript and Dart clients
-- `testdata/` — cross-language golden vectors: one answer key the Rust host and
-  the phone client are both checked against
-- `services/leveler-relay` — remote relay service
-- `.github/workflows/` — CI
-
-中文版：[`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md)。入口：[`README.md`](../README.md)。
+Roadmap items — multi-agent direction, browser direction, a Review product,
+cloud, ACP, remote workers, NPC workflows, future providers, future UI — are
+not architecture. This document may describe an extension point. It does not
+promise a feature.

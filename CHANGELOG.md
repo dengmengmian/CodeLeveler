@@ -213,7 +213,7 @@ is deliberately not published. Windows stays on stable `0.1.4`.
 - **Delegation is opportunity-based.** The runtime executes a delegation
   reliably whenever the model elects to collaborate; it does not promise that
   the agent splits a task on its own. Measured adoption on qualified tasks is
-  10–30 %. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+  10–30 %.
 - **Windows has no daemon socket transport.** Sessions and `resume` work;
   `leveler serve` / `web` / `remote projects` / `remote agent` refuse with a
   clear message rather than pretending. `!command` output for a *confined*
@@ -221,7 +221,7 @@ is deliberately not published. Windows stays on stable `0.1.4`.
 - **Three Windows tests fail on `main`** (`command_delivery`, `user_shell`,
   `side_effect_barrier_test`). The Windows build, clippy and security canaries
   are green. Diagnosis needs a Windows machine — see
-  [`docs/BETA_BLOCKER_RESOLUTION.md`](docs/BETA_BLOCKER_RESOLUTION.md) risk 0b.
+  the beta blocker resolution record, risk 0b.
 - **Long-running goals and structured sub-agent workflows are post-Beta.**
   Durable child sessions, a delegation advisor and capability negotiation are
   designed but not shipped.

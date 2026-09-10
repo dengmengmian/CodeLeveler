@@ -10,4 +10,3 @@ model, and re-authoring it later would repeat the spend.
 
 Both cleared the discriminance gate. Neither has headroom.
 
-See `docs/evaluations/MA-VALUE-REVIEWER-TASK-CALIBRATION.md`.

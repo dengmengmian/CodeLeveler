@@ -5,7 +5,6 @@ ownership:
   notes: Production matrix O1–O11. Do not fold into adoption denominators.
 
 sandbox:
-  in_repo_docs: docs/C2_3C_S_EVAL_SANDBOX_INTEGRITY.md
   in_repo_cases: evals/cases/navigation
 
 permission:

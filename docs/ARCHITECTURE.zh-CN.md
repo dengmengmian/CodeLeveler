@@ -1,903 +1,593 @@
 # CodeLeveler 架构
 
-本文对照**当前代码**描述 CodeLeveler 的稳定边界（基线 `main@04a015b` 及之后，
-除非某节另有标注）。故意不绑定源码行号与随版本变动的实现计数，以便仓库演进后
-仍可用。
+架构的唯一权威文档。`AGENTS.md` 只给出宪法的短版本并指向这里；边界定义、以及当前实现与目标之间的差距，都写在本文。
 
-## 如何阅读本文
+英文版：[`ARCHITECTURE.md`](ARCHITECTURE.md)，为 canonical 技术文档，本文与之语义一致。
 
-每条架构陈述只属于下面四类之一，禁止混写：
+以下内容全部基于 commit `494ed1b`（31 个 crate）的真实源码与 `cargo metadata` 验证。凡是代码还没到位的地方，直接写明，不把目标当成已完成的现状描述。
 
-| 标记 | 含义 |
+---
+
+## 1. 架构原则
+
+过去容易把 CodeLeveler 读成「一个 coding agent，其他都在它下面」。这种读法让 coding 产品成为最高抽象，于是每加一个能力都被往下压进公共 crate 去伺候它。
+
+正确的结构是：
+
+```text
+Foundation 提供可复用的 agent runtime 能力。
+Harness 定义领域语义。
+Product 定义体验、组合与交付。
+```
+
+六句话就是全部模型：
+
+```text
+Kernel 不懂产品。
+Harness 定义领域语义。
+Engine 管生命周期，不当 Agent Brain。
+Host Authority 独占受控真实副作用。
+每一个持久事实只有一个权威 Owner。
+机械事实不等于语义满足，更不等于用户验收。
+```
+
+---
+
+## 2. 分层模型
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                          产品层                              │
+│   CodeLeveler        Review 产品         未来产品            │
+│   app / cli / tui / web / remote / relay                    │
+└──────────┬──────────────────────┬───────────────────────────┘
+           │                      │
+           ▼                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        Harness 层                            │
+│   Coding Harness                 Review Harness             │
+│   leveler-agent                  （未来）leveler-review      │
+└──────────┬──────────────────────────┬───────────────────────┘
+           │                          │
+           └────────────┬─────────────┘
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Agent Runtime                          │
+│   leveler-agent-core              Tool 运行时契约            │
+└─────────────┬──────────────────────┬────────────────────────┘
+              │                      │
+              ▼                      ▼
+┌──────────────────────┐  ┌──────────────────────────────────┐
+│ 持久化 Runtime        │  │ 可复用能力                        │
+│ engine / storage     │  │ context / project / vcs / lsp    │
+│ lifecycle            │  │ browser / memory / skills / media│
+└──────────┬───────────┘  └───────────────┬──────────────────┘
+           │                              │
+           └───────────────┬──────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Host Authority                         │
+│                    leveler-execution                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           ▼
+                       操作系统
+```
+
+有两处，运行中的代码还对不上这张图：
+
+- **Engine 在 Harness 之上，不在它旁边。** `leveler-engine` 依赖 `leveler-agent`，公开 API 里直接出现 Coding 概念。见 §17.1。
+- **Tool 契约和具体能力在同一个 crate。** 图里「Tool 运行时契约」这个盒子，和「可复用能力」那一排的大部分，今天都是通过 `leveler-tools` 拿到的。见 §17.2。
+
+图里其余部分就是真实依赖形状。
+
+---
+
+## 3. Foundation 原语
+
+| Crate | 职责 |
 | --- | --- |
-| **CURRENT** | 树中已实现、今日可用。 |
-| **TARGET** | 下一阶段目标归属，尚未做完。 |
-| **KNOWN DEBT** | 已从代码确认的 CURRENT 与 TARGET 结构差距。 |
-| **FUTURE** | 产品方向，尚无完整实现。 |
+| `leveler-core` | 类型化标识符、时间戳、资源预算、少量基础 trait。无内部依赖。 |
+| `leveler-model` | provider 中立的模型词汇：`ModelRequest`、`ModelResponse`、`ModelEvent`、`ModelError`，以及 `ModelRuntime` trait。 |
+| `leveler-protocol` | 厂商 wire 协议适配（OpenAI Chat Completions 形状、SSE 解码）。不知道任何 transport 和 agent。 |
+| `leveler-provider` | provider 配置、模型目录、带重试的 HTTP transport、实现 `ModelRuntime` 的 `ProviderRegistry`。 |
+| `leveler-lifecycle` | 执行生命周期词汇：`SessionStatus`、`TaskOutcome`、`VerificationStatus`、`TurnOutcome`，以及 Coding workflow 类型。无内部依赖。 |
 
-差距不得宣传成已交付能力；已交付能力不得写成「仅规划」。
+这几个 crate 不得知道 coding、review、finding、仓库工作流、TUI、Web、CLI 或任何产品概念。
 
-配套文档：
-
-- [`TUI_ARCHITECTURE.md`](TUI_ARCHITECTURE.md) — Geometry / Conversation /
-  Presentation 的 **CURRENT** 所有权契约（`eceb271` 之后 hardening 已落地）。
-- [`TUI_ARCHITECTURE_AUDIT.md`](TUI_ARCHITECTURE_AUDIT.md) — `eceb271` 改前审计
-  （历史文档；geometry 单一 owner 其后已完成）。
+`leveler-lifecycle` 内部已经做好了切分：`runtime` 模块是领域中立的，`workflow` 模块放 Coding 词汇，且禁止 `runtime` 引用 `workflow`。未来的非 Coding 领域只依赖 `runtime`，不会连带拽进 Coding 语义。
 
 ---
 
-## 设计目标
+## 4. Agent Kernel
 
-CodeLeveler 不追求最少 crate 或最少行数，而是一套**本地优先的编程代理运行时**，
-能作为长期工作流基础设施：
+`leveler-agent-core` 是产品中立的 agent kernel。它的非 dev 依赖只有 `leveler-model` 一个。
 
-1. **职责唯一。** 每种状态迁移、完成判断和副作用只有一个明确负责人，不在
-   engine、agent 与工具层重复实现。
-2. **行为可预测。** 安全、预算、取消、重试、恢复与终止语义由宿主确定，不依赖
-   模型自觉。
-3. **长期稳定。** 进程崩溃、断流、取消、超时或重启后，系统能判断已经发生什么，
-   以及是否可以安全继续。
-4. **能力可组合。** 规划、证据、验证、委派与（FUTURE）NPC 行为是可组合策略，
-   不绑死在 direct loop 中。
-5. **模型无关运行时。** Provider / 线协议差异不渗入编排、工具或 UI。
-6. **安全边界不可绕过。** 路径、权限、沙箱、限额、取消与危险命令策略由宿主代码
-   强制。
-7. **状态可恢复、可审计。** Session、工具副作用边界与运行时事件可持久化并
-   resume，不依赖单一进程生命周期或远程控制面。
-8. **接口可演进。** 内部实现可以持续简化；公开 CLI、配置、存储与扩展接口按明确
-   的兼容和迁移规则演进。
-9. **单向依赖与类型化错误。** 应用层组合底层库；基础 crate 不反向依赖应用层，
-   库边界保留可判别的失败类型。
-10. **多端一致。** 终端、浏览器与（FUTURE）桌面/移动客户端共享同一 runtime
-    契约：命令、事件、快照、审批与取消语义。
-
----
-
-## 术语表
-
-| 术语 | 权威含义 |
-| --- | --- |
-| **Engine** | 长期运行内核 / 监督器（`leveler-engine`）：task/turn 生命周期、EventLog、persist-before-forward、recovery、resume、明确终止、ownership fencing。 |
-| **Agent Loop** | 模型 ↔ 工具执行器（`leveler-agent`）。不负责会话持久化、transport 或 UI。 |
-| **Tool** | 面向模型的动作，注册在 `leveler-tools`（`Tool` trait + `ToolRegistry`）。 |
-| **Host Execution** | 工作区安全、权限、进程执行、沙箱、检查点、artifact（`leveler-execution`）。 |
-| **Task** | Engine 拥有的工作单元（`TaskId`）。 |
-| **Turn** | Task 内一次有界执行切片。 |
-| **Session** | 对话 / 客户端聚合；今日与主 task 1:1。 |
-| **EngineEvent** | Engine 产出的规范域事实（非 transient 则持久化）。 |
-| **RuntimeEvent** | 面向客户端的投影事实（`leveler-client-protocol`）。 |
-| **ClientCommand** | 客户端发入 runtime 的意图（提交、取消、审批……）。 |
-| **ClientOrigin** | 命令来源：`Local` \| `Remote` \| `RemoteTimeout`。**不是** User/Agent/System。 |
-| **ExecutionKind** | Task/Session 执行策略：`Direct` \| `Parallel`。**不是** Tool/Shell/MCP/Capability。 |
-| **Workflow / Policy** | Engine 之上可替换的规划 / 检查 / 重试组合。 |
-| **NPC** | 长期运行 runtime / workflow / policy 域（FUTURE 产品化）。**不是** UI 客户端。 |
-| **MCP** | **CURRENT** 工具集成：发现后适配为 `Tool`，暴露为 `mcp__<server>__<tool>`。 |
-| **User Shell Execution** | CURRENT `!command`：用户发起的直接命令，**无** LLM/Agent Loop（测试硬门），经 `CommandRunner::run_streaming` 复用宿主执行安全。 |
-| **Capability / Extension** | FUTURE 扩展面（可提供 model tool、user capability、workflow、hook）。未交付。 |
-
-禁止在无 ADR 的情况下把 `ClientOrigin` 与动作发起者（User / Agent / Policy）
-合并成一个叫 `ExecutionOrigin` 的维度。
-
-在正文区分 Tool / Shell / MCP / Capability 时，优先用中性说法：**invocation
-type**、**operation type**、**execution surface**——不要另造与 `ExecutionKind`
-冲突的 Rust 枚举名。
-
----
-
-## 核心架构
-
-产品核心只有一件事：**在宿主强制的边界内，让模型用工具把仓库里的活干完，并且
-状态可恢复、可审计。** 其余（TUI、Web、slash、技能、远程配对）都是入口或扩展面，
-不是引擎本身。
-
-crate 数量不是边界，职责和数据所有权才是：
-
-| 块 | 唯一职责 | 不应承担 | 主要落点（CURRENT） |
-| --- | --- | --- | --- |
-| **1a. Engine** | Task/turn 生命周期、EventLog、恢复、resume、明确停止、可持久化 runtime 事实。 | 工具具体实现；UI；provider 线格式。 | `leveler-engine` |
-| **1b. Agent kernel** | 通用循环：模型 → 工具调用 → 结果 → 下一次请求，含 round/token/成本/时长上限、取消与语义中立的停止原因。 | 任何 CodeLeveler 专有的东西：权限、写边界、仓库、提示词、持久化、委派。 | `leveler-agent-core` |
-| **1c. Coding harness** | 让这个循环成为*编码* agent 的一切：提示词、仓库上下文、记忆、技能、压缩策略、ToolHost admission、写所有权、子 agent、goal 协议、验证桥接。 | 会话持久化；transport；UI；迭代本身。 | `leveler-agent` |
-| **2. ToolHost / 执行** | Schema 校验、风险与审批、路径约束、可靠工具起止记录、进程/文件执行与取消。 | 对话编排；任务完成策略；UI 状态。 | `leveler-tools` + `leveler-execution` |
-| **3. 会话状态** | 持久化消息、规范事件、快照与迁移，作为有序可审计事实。 | Agent 策略或隐式产品决策。 | `leveler-storage` + engine EventLog |
-| **4. 模型适配** | 厂商中立的请求、流式与工具调用语义。 | 会话状态、工具权限、工作流决策。 | `leveler-model` + provider/protocol 适配 |
-
-**正文不要把 Engine、kernel 与 harness 合并描述。** Engine 拥有持久的任务生命周期；
-kernel 拥有迭代；harness 拥有这次迭代*是为了什么*。Engine 不监督模型的判断——它只
-持久化机械上发生了什么，并把下一个 turn 交回给用户或一次显式的继续。
-
-### 所有权分层
+它拥有：
 
 ```text
-Foundation          leveler-core · leveler-model · leveler-protocol · leveler-provider
-        ↓
-通用 agent kernel    leveler-agent-core          可嵌入、与仓库无关
-                                                只有一个 model↔tool 循环
-        ↓
-CodeLeveler         leveler-agent               提示词 · 上下文 · 记忆 · 技能
-coding harness                                  ToolHost admission · 写所有权
-                                                子 agent · goal 协议
-        ↓
-可靠 runtime         leveler-lifecycle · leveler-verifier · leveler-storage · leveler-engine
-        ↓
-产品                 leveler-app · leveler-cli · leveler-tui · leveler-web · remote
+model ↔ tool 循环        round 管理
+流式输出                 预算（round / token / 成本 / 时长）
+重试与退避               用量与成本记账
+deadline                取消
+中立的 stop reason       唯一的 tool dispatch 接缝
 ```
 
-依赖只向下。kernel 只依赖 `leveler-model`，workspace 里没有别的——这一点由测试断言
-而非靠自觉：`crates/leveler-agent-core/tests/kernel_boundary.rs`。完整契约见
-[AGENT_KERNEL.md](AGENT_KERNEL.md)。
-
-### 目标分层（全体客户端）
+它不拥有：
 
 ```text
-                         客户端（CURRENT + FUTURE）
-
-               TUI       Web       APP（FUTURE）
-                │         │         │
-                └─────────┼─────────┘
-                          │
-                leveler-client-protocol
-                ClientCommand / RuntimeEvent / Snapshot
-                          │
-                          ▼
-                 应用层  (leveler-app)
-                          │
-        ┌─────────────────┼──────────────────┐
-        │                 │                  │
- 交互式编程用例        投影              交互用例
-        │                 │                  │
-        └─────────────────┼──────────────────┘
-                          │
-                          ▼
-                     ENGINE 内核
-                    leveler-engine
-         生命周期 / EventLog / 恢复 / 持久化
-                          │
-              ┌───────────┴───────────┐
-              │                       │
-              ▼                       ▼
-      交互式编程工作           NPC Runtime（FUTURE）
-                             Workflow / Policy
-              │                       │
-              └───────────┬───────────┘
-                          │
-                          ▼
-                      AGENT LOOP
-                    leveler-agent
-                          │
-                          ▼
-                    模型工具
-                    leveler-tools  （+ MCP 适配）
-                          │
-                          ▼
-             宿主执行边界
-                leveler-execution
-          文件系统 / 进程 / 外部 I/O
+coding 语义       review 语义        仓库语义
+prompt 语义       持久化             UI
+验证的含义                          任务完成语义
+用户验收          产品策略
 ```
 
-**CURRENT 今日已有：** TUI、Web、远程 host bridge（`leveler-remote-agent`）、
-Engine、Agent Loop、工具 + MCP、execution、client protocol、持久化。
+Kernel 与宿主之间的全部契约就是 `AgentHarness` trait：循环在每一轮的固定位置调用每个接缝，harness 返回一个 `Flow`（继续、进入下一轮、或用 harness 自己的 outcome 结束）。除了「声明有哪些工具」和「执行工具」这两个接缝，其余都有中立默认实现——所以一个普通的 tool-calling agent 就是 `ToolRuntime` 外面套一层 `BasicHarness`，再无其他。
 
-**FUTURE：** 完整桌面/移动 APP 体验、User Shell（`!command`）、NPC runtime
-产品化、Capability / Extension 框架。
+Kernel 从不判断模型的工作是好、是完成、还是可接受。一次运行的结束点只有三种：模型自己停、宿主让它停、机械上限让它停。
 
-不要凭空宣布不存在的 crate（`leveler-npc`、`leveler-capability`……）。逻辑层
-以后若所有权需要，可以再物理拆分。
+用产品词汇（`coding`、`repository`、`permission`、`prompt`、`review`、`finding`、`verify`、`patch`、`filesystem`）扫描整个 crate，命中全部落在文档注释里，而且每一条都是在说「这件事归别人管」。**Kernel 今天是干净的。**
 
 ---
 
-## Runtime 内核（Engine）
+## 5. Tool 运行时
 
-**CURRENT。** `leveler-engine` 是长期运行的内核 / 监督器：
+有两件事值得在读者脑子里分开，因为代码目前还没分开。
 
-- Task 与 Turn 生命周期
-- 追加写 **EventLog**，**persist-before-forward**
-- 崩溃恢复、resume、重启后 reap
-- 带类型结果的明确终止
-- ownership fencing 与可持久化 runtime 事实
-- `ExecutionKind`：`Direct` \| `Parallel`（task/session 策略）
-
-它必须能回答：哪些状态已持久化、哪个工具可能已产生副作用、能否安全重试、
-恢复点在哪里、任务为何停止。
-
-规范工具事件的持久化属于副作用协议：产生外部副作用前必须可靠记录开始，结束后
-必须可靠记录结果；仅用于显示的流式 delta 可以走允许丢失的通道。
-
-生命周期词汇由 `leveler-lifecycle` 共享（通用 runtime 状态 + Coding workflow
-面包屑；后者细化前者，从不重定义）。
-
----
-
-## Agent Loop
-
-**CURRENT。** `leveler-agent` 是 **Agent Executor / Agent Loop**：
+**Tool 运行时契约**——工具「是什么」：
 
 ```text
-模型 → 工具调用 → 宿主执行工具 → 工具结果 → 模型
+Tool trait          ToolSchema          ToolRegistry
+ToolCall            ToolResult          ToolContext 契约
+ToolHost 契约        准入                dispatch 契约
 ```
 
-它**不是**：
+**具体 agent 能力**——「有哪些」工具：`read_file`、`list_files`、`grep`、`apply_patch`、`replace`、`run_command`、`shell_command`、`find_symbol`、`find_references`、`diagnostics`、`blast_radius`、`git_status`、`git_diff`、浏览器、memory、skills、web 抓取与搜索、看图、任务控制，以及 MCP 发现的工具。
 
-- 会话持久化所有者
-- Transport 所有者
-- UI 所有者
-- 厂商协议所有者
+### 当前状态
 
-产品侧执行只有一条路径：**direct agent 工具循环**。长任务仍走该路径——goal
-模式（`update_goal` 直到 complete 或 blocked）与可选的 `spawn_agent` 扇出。
-日志里遗留的 `orchestrate` kind 会被接受并按 direct 跑。
+`leveler-tools` 两件事都装。`src/tool.rs` 和 `src/registry.rs` 是契约；`src/tools/` 是 29 个具体能力。这个 crate 依赖 `leveler-browser`、`leveler-context`、`leveler-execution`、`leveler-lsp`、`leveler-memory`、`leveler-project`、`leveler-skills`——这些边属于具体工具，不属于契约。
 
-**一个 turn 在模型停下的地方结束。** 单 turn 的 100-round 上限是无条件断路器，
-不是调度决策：runtime 不会自作主张重新驱动一个 goal。De-engineering Wave 2 删除了
-那个会开第二个窗口的 supervisor（`SupervisorPolicy`、`DriveGoalAgain`、
-`ExtendBudget` 以及跨窗 no-progress 计数器）；`WindowState` 之所以还在，只是为了让
-旧事件日志仍能解码，没有任何代码读它。继续一个未完成的 goal 是一次显式动作——用户
-resume，或 engine 的 `continue_active_goal` 开下一个 turn——用尽 round 预算的 turn
-是未完成、可恢复，绝不是 `Failed`。goal 身份即 session。
+耦合具体表现在 `ToolContext` 上：`ToolServices` 把 `lsp_sessions`、`artifact_store`、`memory_root`、`background_tasks`、`browser` 写成了结构体字段。任何实现 `Tool` trait 的人——包括未来一个完全用不上这些的 Review 专属工具——都得接下整个形状。这些字段是 `Option`，调用方**可以**传 `None`；但类型上，每个工具仍然看得见全部能力。
 
----
+`ToolRegistry` 本身是可自由组合的：`ToolRegistry::new()` 加 `register`，`core_registry()` 和 `full_registry()` 是两个预制选择。今天另一个 harness 就能构造出不同的 registry。
 
-## 宿主执行边界
-
-**CURRENT。** `leveler-execution` 负责：
-
-- 工作区安全与路径解析
-- `PermissionProfile`、`RiskLevel`、审批策略
-- 进程执行（`CommandRunner`）、沙箱后端、取消
-- 检查点、后台进程、artifact
-
-**执行宿主在 daemon 里，不在 client。** 审批是每 session 的策略
-（`ApprovalPolicy`，随 trusted-local 的 `CreateSessionRequest` 下发）：
-`--auto-approve` 是在 daemon 上选一个无人值守的 session，而不是把 runtime 嵌进
-TUI 进程——因此长跑的 goal 能熬过 client 断连，reconnect 能恢复仍在运行的 turn。
-remote/web client 不能把自己的 session 提升为 auto-approve——边界会把它强制
-重置回 interactive。
-
-平台控制（显式能力探测，从不虚报）：
-
-- Windows：Job Objects；可用时 AppContainer / ACL
-- macOS：Seatbelt
-- Linux：Bubblewrap；经审计的 `PR_SET_PDEATHSIG` 孤儿进程清理
-
-**不变量：** 所有仓库修改与进程执行都必须经过该边界——包括 FUTURE 的 User Shell
-（`!command`）、Capability 与 Extension 工具。用户发起 ≠ 绕过宿主安全。
-
-区分：
-
-- **模型授权**（模型可以*请求*什么）
-- **宿主授权**（宿主实际允许什么）
-
-模型永远不能自行提升权限。
-
----
-
-## 客户端运行时契约
-
-**CURRENT。** `leveler-client-protocol` 已是稳定的跨客户端契约——不是未来才需要
-的新设计。
-
-| 表面 | 职责 |
-| --- | --- |
-| `ClientCommand` | 客户端发入 runtime 的意图 |
-| `RuntimeEvent` | 归一化的面向客户端事实 |
-| `UiSessionSnapshot` | 重连 / resync 真相（+ 水位） |
-| `InteractiveRuntimeClient` | `send` / `subscribe` / `snapshot` |
-| 协议版本 / envelope | major 兼容；minor 可加字段 |
-
-客户端**不得**各自实现任务生命周期。关闭任一客户端不应取消 runtime 已接受的
-工作。视图状态（滚动、展开、选区）可以是客户端本地的；任务事实、权限决定与
-执行状态只能来自 engine 事实与快照。
-
-Transport 可变，契约不变：
-
-- 进程内（`InProcessRuntimeClient`）
-- 本地 daemon / Unix socket（`leveler-local-transport`）
-- Session wire / WebSocket（`leveler-client-protocol::session_wire`、Web）
-- 远程 bridge（`leveler-remote-agent` + remote protocol / relay）
-
-除非真实需求强制，否则不要平行新造「Presentation Protocol」「UI Protocol」
-或「Frontend Event Bus」。
-
-`ClientOrigin`（`Local` \| `Remote` \| `RemoteTimeout`）是**命令来源**（审计、
-远程审批超时压力），不是授权，也不是动作发起者（User / Agent / System）。
-
----
-
-## 应用层
-
-**CURRENT。** `leveler-app` 是组合根：配置、打开存储、组装 provider/工具、挂上
-engine、交互会话用例，以及从 engine 事实向客户端投影。
-
-`InProcessRuntimeClient` 当前集中了多种职责（会话 runtime 配置、事件流、审批、
-澄清、媒体、检查点、live view、活跃 turn、steering、命令分发）。该集中度记在
-[当前架构债](#当前架构债与演进接缝)。
-
-环境变量读取集中在配置与应用启动；下游库接收已解析的值。
-
----
-
-## 客户端
-
-### TUI（**CURRENT**）
-
-`leveler-tui` 是一等终端客户端，只通过 `leveler-client-protocol` 接入，**不**
-拥有 agent 逻辑、工具执行、权限决策或持久化真相。
-
-Unix 上默认 `leveler tui` 为 discover-or-start（探测仓库 daemon socket）；关闭
-TUI 不会取消已接受的工作。`--in-process` 为显式嵌入模式。Windows 保持嵌入式
-runtime（尚无 socket transport）。
-
-TUI 交互正确性（历史 disclosure、鼠标、时长真实性、PTY 校验）已收口。
-Conversation geometry 所有权已 hardening（见 [TUI 架构](#tui-架构)）；残余
-可维护性接缝见架构债。
-
-### Web（**CURRENT**）
-
-`leveler-web` **已经是** runtime 客户端——不是未来概念。axum 服务把 SPA 桥到
-`LocalRuntimeService`，经 token 鉴权的 REST + WebSocket 传输 `ClientCommand` /
-`RuntimeEvent` / 快照。仅绑定 loopback；256-bit bearer token；多项目靠 per-repo
-daemon 与 `RouterService`。详见 `crates/leveler-web/README.md`。
-
-### Remote / APP（**CURRENT** bridge，**FUTURE** 完整产品）
-
-`leveler-remote-agent` 是 **host 侧远程 bridge**。它刻意**不**依赖
-`leveler-web`，而是通过 `leveler-client-protocol::session_wire` 与 runtime/client 协议边界工作。
-面向未来桌面/移动 APP 的基础设施已经存在。
-
-不要写「未来从零增加 Remote APP architecture」。完整 Desktop APP 与移动产品
-体验仍属 **FUTURE**。
-
----
-
-## 工作流与 NPC Runtime
-
-复杂任务不靠扩大 direct loop 实现。核心提供持久化生命周期、安全执行和明确终止；
-规划、证据、阶段检查、委派由可替换的 **workflow / policy** 组合。
+### 目标状态
 
 ```text
-复杂任务 / NPC（FUTURE 产品化）
-    ↓
-Workflow / Policy       规划、拆解、检查、重试
-    ↓
-Engine                  生命周期、监督、持久化、恢复、终止
-    ↓
-Agent Loop              单一模型—工具—结果循环
-    ├── Model Runtime
-    └── ToolHost / 执行
+leveler-tool-core   → Tool、ToolSchema、ToolRegistry、ToolCall、ToolResult、
+                      ToolContext 契约、ToolHost 契约、准入、dispatch 契约
+leveler-tools       → 具体内置能力
 ```
 
-### NPC 不是 UI 客户端
+**这只是写下来的目标，不是排期中的工作。** 不要为了让本文看起来完整就去建 `leveler-tool-core`。这个拆分要等到真的有第二个 harness 需要「只要契约、不要能力」时才成立——见 §16。
 
-**错误：** 把 TUI | Web | APP | NPC 全部并列成 Interface。
-
-**正确：**
-
-- **客户端 / 界面：** TUI、Web、APP
-- **NPC：** 同一 Engine 之上的长期运行 runtime / workflow / policy 域
-
-NPC **必须**复用 Engine、ToolHost、权限、持久化、恢复与事件模型，**不能**产生
-第二套 Agent Loop、Session、Permission 或 Recovery 模型。
-
-NPC 产品化是 **FUTURE**。支撑它的 policy / 生命周期原语是 **CURRENT** 积木。
+另外注意：kernel 侧已经有一个更窄的接缝。`leveler-agent-core` 里的 `ToolRuntime` 只需要两样东西：模型能看见的工具定义，以及把一次 `ToolCall` 变成模型下一步要读的文本的方法。`leveler-tools` 坐在那个接缝后面，不在 kernel 里面。
 
 ---
 
-## 事件与投影模型
+## 6. Host 执行权威
 
-| 层 | 职责 |
-| --- | --- |
-| **EngineEvent** | 规范域事实（engine 拥有）。 |
-| **RuntimeEvent** | 面向客户端的投影（协议拥有）。 |
-
-**TARGET** 依赖方向：
+`leveler-execution` 是宿主副作用的唯一权威。它拥有：
 
 ```text
-Engine → EngineEvent → 单一应用层投影 → RuntimeEvent → TUI / Web / APP
+workspace 路径解析与强制         进程执行
+权限 profile 与规则              进程树终止
+审批策略与 approver              沙箱后端
+风险分级                         hooks
+可回滚的 checkpoint              信任门禁
+超大输出的 artifact 存储          后台任务注册表
 ```
 
-UI 不应依赖 engine 内部事件模型。
-
-### CURRENT 过渡路径（**KNOWN DEBT**）
+原则：
 
 ```text
-EngineEvent
-  → engine_event_to_agent()   (leveler-app)
-  → AgentEvent
-  → EventBridge
-  → RuntimeEvent
+Agent 请求副作用。
+Host Authority 执行副作用。
 ```
 
-这是今日真实代码中的 transitional bridge，**不是**理想终点，也不得假装已删除。
-收敛为单一应用层投影是 **TARGET** 的 core hardening，不是已完成能力。
+不允许存在第二条从 harness 或 tool 通往文件系统、通往进程的路径。也不要让 tool 层和 execution 层各自持有一套安全策略。
 
----
+### 实测状态
 
-## 持久化与恢复
+统计 `leveler-execution` 之外、生产代码（排除测试）中 `fs::write`、`fs::remove`、`fs::create_dir`、`fs::rename`、`Command::new`、`tokio::process` 的调用点：
 
-**CURRENT。** 规范 task 事实、执行事实、消息、event log 与快照属于
-runtime/持久化（`leveler-storage` + engine EventLog）。
-
-Task 与 Session 身份不同：**task** 是 engine 拥有的工作单元；**session** 是
-对话/客户端聚合。今日每个 task 恰好有一个主 session。Engine 只依赖窄的存储
-port（`EventStore`、`TaskStore`、`SessionStore`…，打包为 `EngineStores`）。
-
-UI 瞬时状态（滚动、展开、选区、焦点、viewport、拖拽）**绝不是**规范 task 真相。
-客户端若需保存视图偏好，只能是 client-local state。
-
-密钥可来自环境变量或本地 `api_key`，但解析后的凭证与 Authorization 头不得写入
-session 消息、runtime 事件、日志或 artifact。
-
----
-
-## 工具与 MCP
-
-### 工具（**CURRENT**）
-
-`leveler-tools`：
-
-- `Tool` trait、`ToolRegistry`
-- 执行前 schema 校验
-- 内置工具与适配器的模型侧注册
-
-### MCP（**CURRENT**，不是「未来功能」）
-
-MCP 工具动态发现后适配为 `Tool` 并注册，暴露名为：
-
-```text
-mcp__<server>__<tool>
-```
-
-生命周期、重连、与 extension/capability 的更深层集成属于可选后续增强——MCP
-**已经**作为工具集成存在。
-
-### 执行面（**CURRENT**）
-
-所有 mutation 与进程执行仍经过 `leveler-execution`。写操作与命令类工具在必要
-时串行，避免冲突修改。
-
-**多 Agent：** 父 executor 可在 depth 0 且启用委派时广告 `spawn_agent`；并发子
-agent 的工具起止以归属 activity 上浮；完整子对话不进父消息列表。详见
-`docs/multi-agent.zh-CN.md`。
-
----
-
-## TUI 架构
-
-完整 **CURRENT** 所有权图：[`TUI_ARCHITECTURE.md`](TUI_ARCHITECTURE.md)。
-
-```text
-TUI
-  → Client Protocol
-  → 本地呈现状态
-  → Components
-  → Ratatui
-```
-
-TUI 不得拥有：agent 逻辑、工具执行、权限决策、持久化真相。
-
-### Conversation 子系统（geometry hardening 后 **CURRENT**）
-
-Conversation 拥有权威 geometry 及相关视图关注点：
-
-- View state、geometry、viewport、scroll、auto-follow
-- Hit test、选区映射、行/hit 缓存、bottom alignment
-
-Renderer 与 reducer **不得**各自再算一份 viewport geometry（历史「点 A 展开 B」
-正源于此）。
-
-### Workbench
-
-负责顶层布局与组件组合。**不**负责 Conversation 内部滚动数学、重复的
-screen/content 坐标、工具语义分类或 runtime 执行逻辑。
-
-### Disclosure
-
-Tool disclosure 呈现已存在（`presentation::disclosure` 为 domain-free 视觉；
-`activity_stream` 为 Agent Tool 适配器）。
-
-**CURRENT：** 同一 disclosure 视觉语言已通过适配器呈现 Agent Tool 与 User
-Shell（第二个消费者证明了边界）；未来 Capability 行沿同一适配器模式接入。
-
----
-
-## 扩展方向（**FUTURE**）
-
-Extension / Capability **没有**完整实现。禁止写成已支持。
-
-仅描述语义方向：
-
-```text
-Extension
-   └── 可提供
-         ├── Model Tool
-         ├── User Capability
-         ├── Workflow
-         └── Hook
-              └── 宿主执行 / 安全边界
-```
-
-未来 Capability 不能绕过权限、工作区、取消、审计或执行。
-
-本文**不**冻结：`ExtensionHost`、`CapabilityRegistry`、manifest schema、WASM
-ABI、JSON-RPC 插件协议或 marketplace。这些需有真实实现后才成为架构事实。
-
-今日已有的扩展点仍是：
-
-- Provider / 协议适配
-- 注册工具 + MCP server
-- 校验命令
-- Skills
-- Hooks（工具前后外部命令）
-
----
-
-## 当前架构债与演进接缝
-
-只记录代码已确认的结构问题，不是 wishlist。
-
-### 1. TUI geometry 所有权 — 主体已完成
-
-| | |
-| --- | --- |
-| **曾是（`eceb271` 改前）** | workbench / reducer / AppState 共同知道 conversation rect、viewport、scroll、auto-follow、hit-test、screen→content、选区、缓存——存在「点 A 展开 B」类风险。 |
-| **CURRENT（`04a015b`+）** | `conversation::{geometry,view,build,viewport,interaction}` 为唯一 owner；workbench 只做组合；reducer 向 interaction 询问点击语义。见 `TUI_ARCHITECTURE.md`。 |
-| **残余** | 双重展开语义（`tools_expanded` vs per-group `expanded`）；首帧 geometry fallback；User Shell 呈现适配器尚未存在。 |
-| **状态** | Geometry 单一 owner：**已完成**。残余可维护性项：**KNOWN SEAM**。 |
-
-### 2. EngineEvent 投影 shim —— 已解决
-
-| | |
-| --- | --- |
-| **CURRENT** | `EngineEvent` → `EventBridge`（leveler-app）→ `RuntimeEvent`，**穷举 match**：新增 EngineEvent 变体必须显式做投影决策才能编译。16 条表驱动等价测试钉住客户端可见形态。 |
-| **Legacy** | `engine_event_to_agent` 仅作单向适配器保留，服务 headless CLI 渲染器与 eval 收集器；永不作为 UI 路径。 |
-| **状态** | **DONE**（core hardening）。 |
-
-### 3. 动态 Tool 元数据 —— 已解决
-
-| | |
-| --- | --- |
-| **CURRENT** | `Tool::name/description` 返回借自实例的 `&str`；Registry 拥有自己的 key（`BTreeMap<String, _>`）；`McpTool` 持有 owned 元数据。生产代码零 `Box::leak`；内建工具零改动。 |
-| **状态** | **DONE**（core hardening）。reconnect/reload 可重建 registry 而不累积泄漏。 |
-
-### 4. ToolContext 膨胀 —— 已解决
-
-| | |
-| --- | --- |
-| **CURRENT** | 按生命周期分三个 facet：`execution`（进程级执行+写安全基础设施）、`policy`（门禁/预算；两个放权开关为私有字段，仅 `grant_network()` / `grant_unrestricted_fs()` 可放权）、`services`（LSP/artifact/memory/background）。类型上写明 anti-growth 规则：新字段必须声明生命周期并入 facet。 |
-| **归属指引** | Extension 服务 / secret provider → `services`；remote executor → `execution`。 |
-| **状态** | **DONE**（core hardening）。执法语义零变更。 |
-
-### 5. InProcessRuntimeClient 职责集中 —— 部分解决
-
-| | |
-| --- | --- |
-| **CURRENT** | `CheckpointStore`（双 map 联合不变量）、`LiveViews`（重连状态 + 纯 fold）、`stage_turn`（唯一 turn 启动前奏）已提取；facade 只做路由与委托：它自己不装配任何东西，也不持有自己的 runtime。 |
-| **残余** | 交付中间件、会话目录 CRUD、runtime-config store、media/memory 臂保持内联（无独立状态/单一路径，按提取规则暂不拆）；删除会话时 per-session map 不清理仍为 KNOWN SEAM。 |
-| **状态** | **核心簇 DONE**；其余登记在案。新增 client use case = 小 handler + facade 路由。 |
-
-### 6. 结构化客户端事件 vs 预格式化文案 —— 规则已立，迁移已启动
-
-**规则**（对新代码有约束力）：稳定产品事实以 typed `RuntimeEvent` 过线，客户端
-负责措辞/排版/语言；自由诊断（意外错误、传输故障、模型/工具输出）保留
-`Notification`/`String`。领域事实永远不是一条预格式化中文字符串。
-
-| | |
-| --- | --- |
-| **已迁移** | `ContextCompacted { from, to }`（协议 1.4 additive；schema+golden 已再生成；TUI 双语本地化；Web 镜像更新）。顺带修复：TUI 曾以 `budget exhausted`（空格）嗅探而执行器发 `budget_exhausted`（下划线）——用户看到裸机器串。`ContextExpanded` 仅用于回放：Wave 2 删除了自适应上下文阶梯，该变体只为解码旧日志保留，没有任何代码写入。 |
-| **残余** | AgentActivity 咨询标签、turn-incomplete 默认 reason、interactive.rs 各处通知仍为预格式化——登记在案，按上方规则机会性迁移。 |
-| **状态** | **政策生效；高置信事实 DONE** |
-
----
-
-## Runtime 权责边界
-
-```text
-Runtime 只对机械事实拥有 Authority。
-模型负责语义解释。
-用户负责验收。
-```
-
-Runtime 能机械确认的事实：哪些文件被修改、哪些命令执行过及其 exit code、
-build/test/lint 在最终代码树上是否通过、verification 是否发生在最新 mutation
-之后、permission / ownership 边界是否成立、child agent 是否运行并结束、预算或
-绝对回合上限是否触及。
-
-Runtime 不判断：用户需求是否被满足、模型对目标的理解是否正确、某次修改是否
-"足够"、探索是否值得、某个改动是否"需要"reviewer。它也不会偷偷发起第二次模型
-调用去评判第一次的结果。这些问题属于模型的最终回答和用户的审查。
-
-当前成立的推论：
-
-- 任务终态是两个正交值，不是一个词：`TaskOutcome`（如何结束：completed /
-  blocked / budget_limited / failed / interrupted）与 `VerificationStatus`
-  （项目自身检查的结果：passed / failed / not_run / unavailable）。
-  **Checks Passed ≠ 用户意图被证明。**
-- `update_goal(complete)` 只因机械原因被拒绝，而且只剩两条：委派的子 agent 仍在
-  运行，或模型自己计划中仍有未完成步骤。另外两条被 Wave 2 删除了——finding 是
-  reviewer 报告的惰性信息，acceptance 是项目自己的 `verify` 命令，而不是从任务
-  文本里解析出来的契约。
-- 检查失败只会被报告，不会代替模型自动修复。模型在循环内看到自己的测试结果，
-  自行决定下一步。
-- 独立 reviewer 只在显式配置（`independent_review: required`）时启动；不再根据
-  文件名或 diff 大小推断。
-- 结构化计划是认知辅助。多步任务没有计划时最多得到一条软提醒；不会因缺少计划
-  拒绝任何工具调用。
-- 默认路径上的隐藏语义模型调用：**0**。压缩摘要与收口提醒是仅有的宿主发起调用，
-  两者都不评判工作本身。
-
-## 不可破坏的核心约束
-
-- 所有仓库修改与进程执行只能经过 ToolHost / execution 边界。
-- 同一个生命周期状态只能有一个写入者；投影和 UI 只能消费规范事件。
-- 已被宿主接受的工作不能因为某个 UI 断开而丢失。
-- 恢复不得盲目重放可能已经产生外部副作用的工具调用。
-- 每次停止都必须有可判别原因：完成、阻塞、取消、预算耗尽或失败。
-- 策略可以替换或关闭；安全、持久化和取消边界不能关闭或绕过。
-- 旧配置、旧数据库和旧事件通过显式兼容窗口与迁移处理。
-- 断开 TUI、Web 或远程客户端不会改变任务事实；重连只能通过规范 snapshot /
-  resync 恢复。
-- FUTURE 的 User Shell / Capability / Extension 仍须经过宿主执行安全。
-
-### Unsafe Rust
-
-大多数 crate 使用 `#![forbid(unsafe_code)]`。**`leveler-execution` 例外：**
-`#![deny(unsafe_code)]`，并有一处经审计、局部允许的 Linux
-`PR_SET_PDEATHSIG` pre-exec hook，用于孤儿进程清理。应用与 CLI 可用 `anyhow`
-补充上下文；可复用的库 crate 暴露 `thiserror` 类型化错误。
-
----
-
-## 组件图
-
-```text
-User
-  │
-  ├── leveler-cli ────────────────┐
-  ├── leveler-tui                 │
-  └── leveler-web（浏览器 UI）     │
-          │                       │
-          ▼                       ▼
-  leveler-client-protocol    leveler-app  ◀── 组合 / 配置 / 投影
-          │                       │
-  leveler-local-transport         ▼
-  leveler-remote-agent     leveler-engine
-  leveler-remote-agent            │
-  leveler-remote-protocol         │
-  services/leveler-relay          │
-                 ┌────────────────┼─────────────────┐
-                 ▼                ▼                 ▼
-          leveler-agent                    leveler-verifier
-                 │                                  │
-                 ├────────▶ leveler-context         │
-                 └────────▶ leveler-tools ◀─────────┘
-                                  │
-                                  ▼
-                         leveler-execution
-
-  leveler-provider ─▶ leveler-protocol ─▶ leveler-model
-         │                                      ▲
-         └──────────── 由 engine 使用 ──────────┘
-
-  支撑：leveler-core, leveler-lifecycle, leveler-storage,
-  leveler-project, leveler-vcs, leveler-lsp, leveler-skills,
-  leveler-memory, leveler-media, leveler-eval, leveler-test-support
-```
-
-箭头是概念上的依赖与调用方向。部分边通过 trait 表达，便于用确定性假实现测试。
-
----
-
-## 运行时流程
-
-### 1. 组合
-
-`leveler-app` 解析全局与项目配置、打开存储、构建 provider 与工具注册表、选择
-执行策略，并把 engine 接到 CLI、进程内 client 或本地 transport。
-
-### 2. 模型请求与流式
-
-Agent 产出与 provider 无关的 `ModelRequest`。`leveler-provider` 选择
-provider/model；`leveler-protocol` 负责线格式互转。
-
-```text
-HTTP 字节流
-  → SSE 帧解码
-  → 协议 chunk 解码
-  → 分片 tool-call 组装
-  → ModelEvent 流
-  → engine 与客户端
-```
-
-非法或截断的 tool-call JSON 会报错，**不会**被「修好」成可执行调用。
-
-### 3. Turn 与工具循环
-
-Engine 拥有 task/turn 生命周期；Agent 跑 direct 工具循环；宿主代码拥有状态迁移、
-预算、取消、权限与完成规则。
-
-### 4. 工具与命令执行
-
-`leveler-tools` 做 schema 校验与分发；`leveler-execution` 强制宿主边界。
-
-### 5. 校验与完成
-
-`leveler-verifier` 发现或接收 format / build / test 命令，在最终代码树上执行，
-记录证据并分类失败。结果作为 `VerificationStatus` 与任务终态并列报告；它不重新
-解读目标、不派生验收语义，也不触发自动修复回合。
-
-- `format`：尽力而为，**不影响**验证状态
-- `build` / `test`：决定 `passed` / `failed`
-- 项目 `verify` 任一字段出现时，**整段替换**语言自动发现计划
-- acceptance 就是这些命令，没有别的。Runtime 不会去任务文本里读 `Acceptance:`
-  块——那个解析器随 Wave 2 的 `TaskContract` 一起删掉了，因为一句话不是契约
-
-### 6. 持久化与重连
-
-SQLite 存储；客户端经 snapshot + 事件水位 resync。
-
-每个 runtime 状态目录拥有持久 `RuntimeId`。同一状态目录上同一时间只服务一个
-daemon（socket bind + 锁）。
-
----
-
-## 重要边界
-
-### Provider 边界
-
-上层只消费 `ModelRequest` / `ModelResponse` / `ModelEvent` / `ModelError`。
-厂商 JSON、SSE 癖性与 Authorization 头留在协议层以下。
-
-### 执行边界
-
-Agent 循环内不得直接访问文件系统或进程以绕过审批、检查点、脱敏与取消。
-
-### 持久化边界
-
-写入前脱敏凭证。
-
-### UI 边界
-
-客户端渲染协议事件并发送命令，不拥有 agent 执行。多项目 Web 行为（daemon
-探测、spawn、`RouterService`、`~/.leveler/state/web/projects.json`）见「客户端 → Web」。
-
----
-
-## User Shell Execution（**CURRENT**）
-
-`!command` 已实现（TUI 入口）：
-
-```text
-!git status
-  → TUI submit 路由（原始首字符 `!`，不 trim；散文永不误执行）
-  → ClientCommand::RunUserShell（协议 1.5，additive）
-  → leveler-app use case（ActiveTurns 前台互斥；hang guard）
-  → CommandRunner::run_streaming —— 与 agent shell 同一宿主边界
-      （权限档写限制 / 网络沙箱 / env 清洗 / 进程树终止 / 仓库根 cwd）
-  → 规范 EngineEvent 事实（Started/Output*/Finished；Output transient，
-      其余持久化 LocalOnly）→ 会话 EventLog（turn_id = None）
-  → 穷举 EventBridge 投影 → RuntimeEvent UserShell*
-  → TUI UserShell block（复用 presentation::disclosure）+ Shell Details
-```
-
-测试硬门：每次执行零模型请求；命令与输出永不进入模型上下文。取消按
-`UserShellId` 逐执行（`CancelUserShell`），绝非 `CancelCurrentTurn`。重连经
-`UiSessionSnapshot.user_shells` 恢复活跃 + 有界历史。MVP 为非交互 shell
-（`sh -c` / `cmd /C`，stdin 关闭）——不是 PTY/终端模拟器，vim/top/交互式 ssh
-不在范围。Remote policy 拒绝两条命令。runtime 重启按既有进程清理策略处理
-（无跨进程收养）。
-
----
-
-## 下一阶段架构顺序
-
-1. 架构文档校准（本文）
-2. 残余 TUI 可维护性接缝（双重展开态、shell 呈现）
-3. Core architecture hardening（EngineEvent → RuntimeEvent 投影等）
-4. 全量回归
-5. User Shell Execution（`!command`）
-6. 真实项目 dogfooding
-7. 仅在观察到需求后再做 Capability / Extension
-
-没有新证据时，不要把 Capability 排到 User Shell 之前。
-
----
-
-## 配置分层
-
-| 层 | 路径 | 作用 |
+| Crate | 生产调用点 | 解读 |
 | --- | --- | --- |
-| 全局 | `~/.leveler/config.toml` | 默认模型、provider、MCP |
-| 包配置 | `configs/providers/`、`configs/models/` | 可入库的 provider/model 档案 |
-| 项目 | `<repo>/.leveler/config.yaml` | 模型覆盖、权限 profile、verify、ignore、只读根、limits |
-| 权限 | `~/.leveler/permissions.yaml`、项目文件 | 持久 allow/ask/deny |
-| Hooks | `~/.leveler/hooks.yaml`、项目文件 | 工具前后外部命令 |
+| `leveler-agent` | 0 | Coding harness 不直接产生任何副作用。 |
+| `leveler-context` | 0 | 只读装配。 |
+| `leveler-vcs` | 0 | 每次 git 调用都走 execution 的 runner。 |
+| `leveler-tools` | 13 | `replace.rs` 经 `context.execution.workspace` 写入（root fd、防符号链接替换）；`mcp.rs` 直接拉起用户配置的 MCP server。 |
+| `leveler-browser` | 15 | driver 安装写在 Leveler home 下；driver 进程直接 spawn。 |
+| `leveler-memory` | 11 | 在 Leveler home 下写 memory 存储。 |
+| `leveler-lsp` | 4 | 直接 spawn language server。 |
+| `leveler-engine` | 3 | 用 `git rev-parse` 打 baseline commit。 |
+| `leveler-skills` / `leveler-project` | 2 / 1 | 在 Leveler home 下建状态目录。 |
 
-示例见同目录 `*.example.yaml`、`leveler-config-example.yaml` 与
-[`configs/example.yaml`](../configs/example.yaml)。
+这张表里其实是两类东西，混为一谈就会把边界说错：
+
+1. **模型请求的、作用在用户仓库上的副作用。** 全部走 `Workspace` 和 `CommandRunner`。`leveler-agent` 是 0，这个数字才是关键。
+2. **Runtime 自己的状态与 sidecar。** 写在 Leveler home 下的内容（memory、skills、project 状态、浏览器 driver），以及长驻 sidecar 进程（MCP server、language server、浏览器 driver），不走权限/审批路径——因为它们不是模型要求的。
+
+第二类是真实且有意为之的边界。但这些 sidecar 确实在 `CommandRunner` 的进程树终止与沙箱语义之外。见 §17.4。
 
 ---
 
-## Home 与运行时布局（**CURRENT**）
+## 7. 可复用能力
 
-**零工作区污染。** CodeLeveler 绝不在工作区内创建或修改自己的运行时/状态设施；
-所有机器写入都落在唯一的全局 home 下，checkout 保持干净、无需 `.gitignore`。
-仓库内唯一的 `.leveler/` 是**用户手写、可入库**的配置（`config.yaml`、
-`instructions.md`、`rules/`、`skills/`、`hooks.yaml`，以及 `AGENTS.md`）——
-运行时只读不写。
+以下是 harness 可以按需挑选的能力，不是 kernel 的一部分：
 
-`LevelerHome`（[`leveler-core/src/home.rs`](../crates/leveler-core/src/home.rs)）
-是所有自有路径的唯一权威：它只解析一次根目录（`$LEVELER_HOME`，否则
-`$HOME/.leveler`，否则 `%USERPROFILE%\.leveler`，否则进程级临时目录——绝不用
-cwd 相对兜底），并通过具名访问器交出每个子路径。业务 crate 只向 `LevelerHome`
-索取，不自行拼接根目录。一个测试探针会在任何 crate 手工重建 home 路径时让构建失败。
+| Crate | 能力 |
+| --- | --- |
+| `leveler-context` | 有界的仓库上下文装配：map、候选文件、相关测试、合并后的项目规则、token 估算、重复读防护。 |
+| `leveler-project` | 项目语言识别与文件布局（配置与状态位置）。 |
+| `leveler-memory` | 持久项目记忆存储与其晋升流水线。 |
+| `leveler-skills` | Skill 发现与加载。 |
+| `leveler-vcs` | Git 操作，经执行权威落地。 |
+| `leveler-lsp` | language server 会话，跨工具调用复用。 |
+| `leveler-browser` | 浏览器运行时、driver 安装、按项目隔离的 profile。 |
+| `leveler-media` | 多媒体处理。无内部依赖。 |
+
+Coding Harness 选的是 context、project、VCS、LSP、browser、memory、文件写入与进程执行。Review Harness 大概率只需要 context、project、VCS、LSP、只读文件系统和 memory，其余不要。不要为了替 harness 省掉「挑选」这一步，就把全套能力绑死在 kernel 上。
+
+---
+
+## 8. 持久化 Runtime
+
+`leveler-engine` 是持久化 runtime。它拥有：
 
 ```text
-~/.leveler/
-├── config.toml                      全局用户配置（+ agents/、skills/、hooks.yaml、permissions.yaml、trusted.yaml）
-├── state/                           持久状态
-│   ├── projects/<id>/               每仓库：sessions.db、memory/、permissions.yaml（机器写）、图片存储
-│   ├── remote/                      远程配对密钥、配置、设备
-│   └── web/  projects.json · uploads/   多项目注册表 + 导入附件
-├── run/                             临时运行时协调
-│   ├── sockets/                     daemon Unix socket（短的每仓库哈希 → 守住 macOS SUN_LEN）
-│   ├── locks/                       工作区编辑咨询锁
-│   └── sandboxes/<id>/ (+ <id>.lock)   带 OS 租约的单命令 scratch
-├── cache/  tools/                   可丢弃、可重建的工具链缓存
-├── runtimes/                        受管执行依赖（预留）
-└── logs/   leveler.log · crash/ · daemon/<id>.log
+session 与 task 生命周期        checkpoint 与 resume
+turn 边界                      崩溃恢复与 reaper
+事件顺序                       ownership 注册表
+append-only 事件日志            runtime outcome
+persist-before-forward         上下文窗口策略
 ```
 
-布局是惰性的：索取路径绝不创建它。项目 id = 可读 slug + 其规范路径的短 SHA-256，
-因此状态以仓库为键、无需注册表。
+真正关键的是 `persist-before-forward`：一个 turn 的事件按发出顺序先落日志，客户端才看得到。所以客户端永远不可能观察到一个 runtime 没有持久记录过的事实。
 
-**Sandbox 租约 + reaper。** 每个受沙箱命令在 `run/sandboxes/` 下拿到一个 scratch
-目录，由其 `<id>.lock` 旁文件上的排他咨询锁（与 daemon 选举锁同一 `flock` 原语）
-守护，持有到命令结束。RAII 在完成时清除两者；崩溃时 flock 由 OS 释放。一个
-fail-closed 的 reaper 每进程运行一次（绝不定时）：能拿到的锁即证明持有者已死，
-于是回收该 scratch；仍被持有的锁、或没有锁的目录，一律不动。
+Engine 不应该成为 agent brain。它不该拥有 coding prompt、review prompt、工具选择、仓库策略，也不该定义某个领域里「完成」是什么意思。
+
+Engine 自己的边界工作做了一半。`TaskSpec` 已经拆开：
+
+```rust
+pub struct TaskSpec {
+    pub runtime: RuntimeTaskSpec,   // goal、kind、continuation、limits
+    pub coding: CodingTaskSpec,     // repository、权限模式、sandbox、
+                                    // 验证计划、base commit
+}
+```
+
+源码里自己把这称为「通往领域中立 engine 的迁移接缝」。这个拆分让每条代码路径必须声明自己读的是哪一半，但还没有消除对 Coding 的依赖——见 §17.1。
 
 ---
 
-## Browser Capability（**CURRENT**）
+## 9. 存储与持久事实
 
-结构化浏览器自动化——agent 验证 Web/前端工作的主路径，取代 `chrome --headless`/curl 临时脚本。
+`leveler-storage` 是持久事实的边界：SQLite、内嵌 migration、连接池，每个关注点一个 repository。业务逻辑从不直接发 SQL。
 
 ```text
-Agent → browser_* 工具（leveler-tools）
-      → ToolServices.browser（Arc<BrowserRuntime>，daemon 持有）
-      → BrowserRuntime（crates/leveler-browser）：refs · generation · session 隔离
-        · snapshot 预算 · 懒式受管安装
-      → Node/Playwright driver 子进程（stdio 上的 JSON-RPC）
-      → 系统 Chrome（channel:'chrome'）或受管 Chromium
+一个持久事实
+    → 只有一个权威 Owner
+    → 只有一份 canonical 持久表示
 ```
 
-- 工具：`browser_navigate/snapshot/click/type/select/press/wait/tabs/dialog/
-  console/screenshot`。**语义快照**（Playwright 带 ref 的可访问性文本，有预算上限）是
-  控制协议；`[ref=…]` 只在其 `(session, page, generation)` 内有效，过期 ref 被判
-  `RefStale`、绝不改指向。无 `browser.evaluate`。
-- **daemon 持有**（在 `Application` 上，同 `background_tasks`），跨回合、跨客户端断连存活。
-  懒式：首次调用 browser 工具前不启动。
-- **文件系统**：受管 runtime 在 `runtimes/browser/`，每项目隔离 profile 在
-  `state/projects/<id>/browser/profile/`——绝不入工作区、绝不用用户真实 Chrome profile。
-- **权限**：复用 `RiskLevel`/`ApprovalPolicy`（读=Safe，动作=Network）；`browser_navigate`
-  走 SSRF 门（`web_fetch::is_blocked_ip`）。
+任务状态、turn 状态、证据、ownership、用量、artifact、完成状态，无一例外。不允许出现平行真相源。
+
+`leveler-storage` 只依赖 `leveler-core` 和 `leveler-lifecycle`。这正是低层持久化 crate 能讲生命周期词汇、又不需要反向依赖高层 crate 的原因——也是这套词汇要单独成 crate 的理由。
 
 ---
 
-## 仓库导览
+## 10. 验证与证据
 
-每个目录只有一个 owner；没有任何东西因为"历史上就在那儿"而留在根目录。
+`leveler-verifier` 跑项目声明的检查（格式、构建、测试），采集证据，检查范围，对失败分类。
 
-- `crates/` — Rust workspace。SQLite 迁移属于执行它们的 crate：
-  `crates/leveler-storage/migrations/`。
-- `configs/` — provider/model 档案
-- `docs/` — 架构与配置示例
-- `evals/` — 评测系统，以及只有它使用的一切：`cases/`、`suites/`、
-  `fixtures/`（case 运行所针对的仓库）、`scripts/`（生成器、完整性检查、离线分析）
-- `packaging/` — 发布打包：Homebrew formula，以及 CI 用来守护发布载荷的两个脚本
-- `schemas/` — 公开的 client-protocol 契约，从 Rust 类型生成，供 TypeScript 与
-  Dart 客户端消费
-- `testdata/` — 跨语言 golden 向量：Rust 宿主与手机客户端共用的同一份答案
-- `services/leveler-relay` — 远程中继服务
-- `.github/workflows/` — CI
+它的权威范围必须这样表述：
 
-英文版：[`ARCHITECTURE.md`](ARCHITECTURE.md)。入口：[`README.zh-CN.md`](../README.zh-CN.md)。
+```text
+Verifier 是「验证结论」的权威。
+Verifier 不是「语义任务完成」的权威。
+```
+
+它能证明配置的检查通过、失败还是被阻塞。它无法单独证明用户的意图已被满足。
+
+用户显式声明的验证命令是权威，不是启发式输入——discovery 层会这样标记它，harness 不得用自己的猜测替换它。
+
+这就是为什么 `TaskOutcome` 和 `VerificationStatus` 在 `leveler-lifecycle` 里是两条正交的轴。`TaskOutcome::Completed` 表示模型宣告目标完成；`VerificationStatus` 表示项目自己的检查对最终代码树说了什么。Runtime 两个都报，绝不合成一个词。
+
+`leveler-verifier/src/lib.rs` 的 crate 级注释目前还是相反的说法。见 §17.3。
+
+---
+
+## 11. Harness 层
+
+`leveler-agent` 就是 **Coding Harness**。crate 名字没有改，本文也不主张改名；重要的是概念。
+
+它拥有 Coding 领域语义：
+
+```text
+coding prompt                    压缩策略
+仓库上下文策略                    goal 语义
+coding 工具选择                   coding 验证策略
+写入工作流                        委派策略与子 agent profile
+跨 agent 的路径 ownership          coding 完成契约
+```
+
+它通过唯一一个接缝接到 kernel：`src/executor/drive.rs` 里的 `Drive` 实现了 `leveler_agent_core::AgentHarness`。它填的接缝是 `tool_definitions`、`on_round_start`、`on_round_admitted`、`on_response`、`on_model_error`、`on_quiet`、`execute_calls`、`on_stop`、`on_event`。这就是 kernel 契约的全部，而且已经被一个真实 harness 用起来了，不是一个假设中的扩展点。
+
+未来的 Review harness 是**兄弟**：
+
+```text
+              leveler-agent-core
+                /            \
+               ▼              ▼
+        leveler-agent    leveler-review
+        Coding Harness   Review Harness
+```
+
+`leveler-review → leveler-agent` 这条边是禁止的。Review 复用的是 Foundation，不是 Coding 产品。
+
+Review 会拥有自己的词汇——`ReviewTarget`、`ReviewScope`、`ReviewPolicy`、`Finding`、`FindingSeverity`、`FindingEvidence`、`FindingLifecycle`、去重、抑制、`ReviewVerdict`、`ReviewReport`——这些类型一个都不许进 agent kernel。
+
+以上不构成任何要做 Review harness 的承诺。它是对「Foundation 允许假设什么」的约束。
+
+---
+
+## 12. 产品层
+
+| Crate | 角色 |
+| --- | --- |
+| `leveler-app` | 组合根：配置、provider registry、数据库、把引擎事件投影为客户端事件。 |
+| `leveler-cli` | 命令行界面。 |
+| `leveler-tui` | 终端客户端。只依赖 client protocol、core、model、skills。 |
+| `leveler-web` | Web 客户端。 |
+| `leveler-client-protocol` | UI 与 runtime 之间的稳定契约：`ClientCommand` 进、`RuntimeEvent` 出、带版本信封。 |
+| `leveler-local-transport` / `leveler-remote-protocol` / `leveler-remote-agent` / `leveler-relay` | 本地与远程 transport，以及配对/中继路径。 |
+| `leveler-eval` | 能力评测框架。无内部依赖。 |
+| `leveler-test-support` | 共享测试夹具，仅作 dev-dependency。 |
+
+这些层投影权威 runtime 状态，不推导新的 runtime 真相。一次工具调用返回 `Ok`，不构成客户端断定任务完成的依据；那个词只有一个 owner，客户端只负责读。
+
+保证这一点的是 client protocol：UI 代码依赖 `leveler-client-protocol`，从不依赖具体 runtime、provider、tools 或 storage。`leveler-tui` 就是证明——它的依赖只有 client protocol、core、model、skills，再无其他。
+
+---
+
+## 13. 依赖方向
+
+目标规则：
+
+```text
+Foundation
+    ↑
+Capabilities / Runtime
+    ↑
+Harnesses
+    ↑
+Products
+```
+
+低层不得依赖任何面向用户的层。
+
+当前依赖图，按拓扑层级排列（只统计 normal dependency，排除 dev-dependency）：
+
+| 层级 | Crate | 内部依赖 |
+| --- | --- | --- |
+| 0 | `leveler-core`、`leveler-lifecycle`、`leveler-memory`、`leveler-media`、`leveler-eval` | 无 |
+| 1 | `leveler-model`、`leveler-project`、`leveler-skills`、`leveler-browser`、`leveler-execution` | `core` |
+| 1 | `leveler-storage` | `core`、`lifecycle` |
+| 2 | `leveler-agent-core` | `model` |
+| 2 | `leveler-protocol`、`leveler-client-protocol` | `core`、`model` |
+| 2 | `leveler-context` | `core`、`project`、`skills` |
+| 2 | `leveler-lsp` | `core`、`project` |
+| 2 | `leveler-vcs` | `core`、`execution` |
+| 2 | `leveler-verifier` | `core`、`execution`、`lifecycle`、`project` |
+| 3 | `leveler-provider` | `core`、`model`、`protocol` |
+| 3 | `leveler-tools` | `browser`、`context`、`core`、`execution`、`lsp`、`memory`、`model`、`project`、`skills` |
+| 3 | `leveler-local-transport`、`leveler-remote-protocol`、`leveler-tui`、`leveler-web` | client protocol 及以下 |
+| 4 | `leveler-agent` | `agent-core`、`context`、`core`、`execution`、`lifecycle`、`memory`、`model`、`skills`、`tools` |
+| 4 | `leveler-relay`、`leveler-remote-agent` | remote protocol 及以下 |
+| 5 | `leveler-engine` | `agent`、`context`、`core`、`execution`、`lifecycle`、`model`、`storage`、`tools`、`verifier` |
+| 6 | `leveler-app` | 18 个内部 crate |
+| 7 | `leveler-cli` | 21 个内部 crate |
+
+结论：
+
+- **不存在反向依赖。** 没有任何 crate 依赖 `leveler-app`、`leveler-cli`、`leveler-tui` 或 `leveler-web`。方向规则成立。
+- `leveler-agent-core` 只依赖一个内部 crate。Kernel 已经窄到宪法要求的程度。
+- `leveler-agent → leveler-execution` 是**词汇**边，不是执行边：harness 用的是 `PermissionProfile`、`RiskLevel`、`WriteScope`、`HookRunner` 这些类型，它直接产生副作用的调用点是 0。
+- `leveler-engine → leveler-agent` 是唯一一条与分层模型冲突的边。它就是 §17.1 的债务。
+
+---
+
+## 14. 一次 turn 的运行流程
+
+一个 turn，从头到尾：
+
+```text
+客户端命令
+    │
+    ▼
+leveler-app                  组合；把配置映射成一个运行中的 Application
+    │
+    ▼
+leveler-engine               开 turns 行、给消息打 turn id、接上
+    │                        persist-before-forward 的 EventLog、
+    │                        把 approver 与 clarifier 包成 recorder
+    │
+    ├─ ExecutorFactory       从已解析策略与 turn profile 出发的
+    │                        唯一一份执行配置推导
+    ▼
+leveler-agent（Drive）        Coding harness：prompt、上下文、工具选择、
+    │                        委派、压缩、goal 语义
+    ▼
+leveler-agent-core           循环：准入一轮 → 组装 model round → 流式 →
+    │                        解析 → dispatch 工具 → 下一轮，
+    │                        全程在预算、deadline 与取消之下
+    ▼
+leveler-tools                具体工具执行
+    │
+    ▼
+leveler-execution            workspace 解析、权限、审批、
+    │                        风险、沙箱、进程执行
+    ▼
+操作系统
+```
+
+回传方向：
+
+```text
+事件 → EventLog（先持久化） → 引擎事件 → leveler-app
+     → 客户端事件 → leveler-client-protocol → TUI / Web / 远程
+```
+
+事实先落盘再外流。正是这个顺序，保证客户端不可能显示一个重启后 runtime 无法重现的状态。
+
+---
+
+## 15. 真相与权威模型
+
+```text
+机械事实  ≠  语义满足  ≠  用户验收
+```
+
+**Runtime 可以权威证明：**
+
+```text
+命令执行了              文件被修改了
+退出码是多少            测试结果
+构建结果                artifact 存在
+事件被持久化了          工具返回了这个结果
+观察到的 runtime 状态
+```
+
+**Verifier 可以权威判定：** 配置的验证结论。
+
+**但这两者都不能自动推出下一步。**
+
+```text
+「工具成功了」    不能推出    「目标在语义上被满足了」
+「测试通过了」    不能推出    「用户的请求被完成了」
+```
+
+语义判断由模型做。最终验收权在用户。
+
+```text
+Runtime 拥有机械事实。
+Model 拥有语义解释。
+User 拥有验收。
+```
+
+不要重新引入把机械观察当语义完成的捷径——比如一个 `observed_the_changed_tree()` 式的判定，把「树变了」读成「活干完了」。代码库里现在没有这种判定，而 `TaskOutcome` 与 `VerificationStatus` 保持正交，正是把它挡在外面的机制。
+
+---
+
+## 16. Second Harness Test
+
+Foundation 的架构验收测试。
+
+> 一个语义上不同的 agent 产品（比如 Review），能否**在不修改 agent kernel 的前提下**建在这套 Foundation 上？
+
+目标答案：
+
+| 问题 | 要求的答案 |
+| --- | --- |
+| 修改 `leveler-agent-core` | NO |
+| 复用 model 与 runtime 词汇 | YES |
+| 复用 tool 契约 | YES |
+| 复用选定的能力 | YES |
+| 加入 Review 语义 | YES |
+| 加入 Review 专属工具 | ALLOWED |
+| 依赖 Coding Harness | NO |
+
+如果将来 Review harness 必须改 `leveler-agent-core` 才能跑起来，那就是 **foundation leak**。正确反应是分析原因，而不是往 kernel 里塞新的业务概念。
+
+### 当前结论：NOT YET ENFORCED
+
+Kernel 这一侧是过的。`leveler-agent-core` 只依赖 `leveler-model`，不带任何产品词汇，`AgentHarness` 接缝已经被真实 harness 实现过。Review harness 可以实现同一个 trait，不必碰它。
+
+围绕它的 Foundation 还没过：
+
+- Review harness 若想要持久化、resume、事件顺序和恢复，就得走 `leveler-engine`，而它依赖 `leveler-agent`，公开 API 里还有 `CodingTaskSpec`（§17.1）。
+- Review harness 若想要 tool 契约，就得连具体能力集和 `ToolServices` 形状一起接下（§17.2）。
+
+这两条都不强制 kernel 变更，所以结论是「尚未强制成立」，不是「失败」。它们是 Foundation Hardening 的输入。
+
+**不要为了把这个结论改成 PASS，在一次文档变更里去动代码。**
+
+---
+
+## 17. 已知边界债务
+
+记录下来，不掩盖。每一条都写清当前行为、期望边界、为什么违宪、最小修正、以及修正的风险。
+
+### 17.1 Engine 依赖 Coding Harness
+
+**当前。** `leveler-engine → leveler-agent`。Engine 的公开 API 导出 `CodingTaskSpec`，`ExecutorFactory` 直接构造 `leveler_agent::Executor`。`recorders.rs`、`recovery.rs`、`turn.rs`、`policy_resolver.rs` 都在点名 `leveler_agent` 的类型。
+
+**期望。** Engine 通过一层抽象驱动 harness executor，不点名任何领域。`TaskSpec` 分成 runtime 一半和领域一半，engine 只读 runtime 那一半。
+
+**为什么违宪。** 违反规则 5（Engine 管 runtime 机制，不管产品语义）和规则 2（Harness 是兄弟）：第二个 harness 会经由 engine 继承到 Coding harness。
+
+**最小修正。** `RuntimeTaskSpec` / `CodingTaskSpec` 的拆分已经存在，源码里也写明它是迁移接缝。下一步是给 engine 一个不必点名 `leveler_agent` 的 executor 抽象，并把 `ExecutorFactory` 上移到 engine 之上。
+
+**风险。** 中。`ExecutorFactory` 被刻意设计成执行配置的唯一推导入口；拆得不好会把它当初要消除的「多份推导」bug 放回来。
+
+### 17.2 Tool 契约与具体能力同处一个 crate
+
+**当前。** `leveler-tools` 同时装着 `Tool` trait、`ToolRegistry`、dispatch 和 29 个具体工具，并依赖 browser、context、execution、LSP、memory、project、skills。`ToolServices` 把 `lsp_sessions`、`artifact_store`、`memory_root`、`background_tasks`、`browser` 作为字段放进每个工具都会收到的 context。
+
+**期望。** `leveler-tool-core` 放契约，`leveler-tools` 放能力。Harness 可以只取契约，不接整张能力图。
+
+**为什么违宪。** 违反规则 3。一个完全不需要这些服务的 Review 专属工具，仍然得接下整个形状。
+
+**最小修正。** 等第二个 harness 真的需要时再抽契约，不要提前。Registry 本身已经可自由组合，所以今天的实际代价在 `ToolContext` 的形状上，而不在工具集合上。
+
+**风险。** 推迟做，低；投机地做，中——只面向一个消费者设计的契约 crate，通常要为第二个消费者重新设计一遍。
+
+### 17.3 Verifier 的注释宣称拥有完成权
+
+**当前。** `crates/leveler-verifier/src/lib.rs` 开头写着「只有 verifier 能标记任务完成」。
+
+**期望。** Verifier 是验证结论的权威。任务 outcome 与验证状态正交，这正是 `leveler-lifecycle` 实现的模型。
+
+**为什么违宪。** 违反规则 6。这是整个代码树里唯一一处仍在断言「检查绿了就是完成」的文本。
+
+**最小修正。** 改写这段注释。无行为变更——代码早就把两条轴分开了，注释停留在拆分之前。
+
+**风险。** 无。它只是注释。
+
+### 17.4 Sidecar 进程绕开 CommandRunner
+
+**当前。** MCP server（`leveler-tools/src/mcp.rs`）、浏览器 driver（`leveler-browser/src/driver.rs`）和 language server（`leveler-lsp/src/client.rs`、`registry.rs`）都是用 `Command::new` 直接拉起，不经 `leveler_execution::CommandRunner`。
+
+**期望。** 要么让它们进入宿主权威的进程树终止与沙箱语义，要么把这个豁免写成一条显式命名的策略，而不是实现上的偶然。
+
+**为什么部分违宪。** 违反规则 4。它们不是模型请求的命令，所以权限与审批路径本就不适用；但它们仍是宿主进程，而宿主权威本应拥有每一个宿主进程。
+
+**最小修正。** 给这一类命名——「runtime sidecar」——并给它一个确定的生命周期 owner，而不是三个各自为政的 spawn 点。
+
+**风险。** 低到中。Sidecar 的存活期已经和 daemon 关停时的 reaping 缠在一起，改 spawn 路径会碰到那部分。
+
+### 17.5 Engine 直接 shell 出去调 git
+
+**当前。** `leveler-engine/src/baseline.rs` 和 `engine.rs` 直接 `Command::new("git")` 来打 base commit，而 `leveler-vcs` 存在，且直接 spawn 进程数为 0。
+
+**期望。** Engine 问 VCS 能力，VCS 问宿主权威。
+
+**为什么违宪。** 违反规则 4，同时把一个领域操作（git）放进了 runtime 层。
+
+**最小修正。** 把 baseline 读取改走 `leveler-vcs`。
+
+**风险。** 低。只有一次只读调用。
+
+---
+
+## 18. 架构变更规则
+
+1. **先在 Foundation 之上扩展，再考虑改它。** 能放在 harness 或产品里的变更，就该放在那儿。
+2. **改 Foundation 需要证据**，不是优雅：两个真实实现、一个真实的依赖倒置边界、一处观察到的耦合或 ownership 缺陷，或一条独立的协议 / 安全 / 持久化 / runtime 边界。
+3. **动手前先回答 `AGENTS.md` 里的架构决策测试**，写在 PR 里，不是事后补。
+4. **不要把目标写成现状。** 如果一次变更朝某个边界推进但没到位，去更新 §17，而不是删掉那一条。
+5. **不要为不存在的产品预建接口。** 架构必须允许 Review harness 出现，但这不等于现在就把它建出来。
+6. **本文是唯一 canonical 架构文档。** 不要新建 `ARCHITECTURE_V2.md`、`FOUNDATION_*.md` 或所谓 final 版本。要改就改本文；中文版跟随英文版。
+
+Roadmap 类内容——多 agent 方向、浏览器方向、Review 产品、云、ACP、远程 worker、NPC 工作流、未来 provider、未来 UI——都不是架构。本文可以描述扩展点，但不承诺功能。

@@ -418,10 +418,10 @@ async fn projects() -> anyhow::Result<std::process::ExitCode> {
 /// The router every remote path shares: the browser UI's registry, and the same
 /// per-repository socket the daemon already listens on.
 /// Remote control routes a phone to a per-repository daemon over the local
-/// socket, and that transport does not exist on this platform (see
-/// `docs/STABILITY.md`: `remote` is Unstable, and the Windows daemon socket is
-/// deferred). Refusing here is the honest answer — the alternative is a paired
-/// device that lists no projects and never explains why.
+/// socket, and that transport does not exist on this platform (`remote` is
+/// Unstable, and the Windows daemon socket is deferred). Refusing here is the
+/// honest answer — the alternative is a paired device that lists no projects
+/// and never explains why.
 #[cfg(not(unix))]
 async fn projects() -> anyhow::Result<std::process::ExitCode> {
     bail!("`leveler remote projects` 需要本机 daemon socket，当前平台尚不支持")

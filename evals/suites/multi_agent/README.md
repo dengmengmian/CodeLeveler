@@ -6,7 +6,6 @@ improves real coding tasks relative to a single-agent control.
 
 Experiment: `MA-VALUE-001` (`evals/configs/multi_agent/MA-VALUE-001.yaml`).
 Cases: pointers to Real Usage R005–R010 under `multi_agent_value/cases/`.
-Methodology: `docs/evaluations/MA-VALUE-001.md`.
 
 ```sh
 leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode single

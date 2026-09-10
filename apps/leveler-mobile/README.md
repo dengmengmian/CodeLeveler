@@ -1,11 +1,11 @@
 # leveler-mobile
 
-**状态：FROZEN（tag `mobile-beta-mvp`）。** 功能投入停止，等真实 Beta 用户用过再决定下一轮。权威说明：[`docs/MOBILE_FREEZE.zh-CN.md`](../../docs/MOBILE_FREEZE.zh-CN.md)。
+**状态：FROZEN（tag `mobile-beta-mvp`）。** 功能投入停止，等真实 Beta 用户用过再决定下一轮。
 
 手机端远程控制客户端（iOS / Android，Flutter）。控制你**自己的**开发机上的 CodeLeveler：切换项目、跑任务、处理审批、中途干预、预览已登记产物。
 
-产品收口（工作台，不是 Chat App）：[`docs/MOBILE_UI_UX_CLOSURE.zh-CN.md`](../../docs/MOBILE_UI_UX_CLOSURE.zh-CN.md)。  
-Steer / 产物 / Task Detail：[`docs/MOBILE_RUNTIME_ALIGNMENT.zh-CN.md`](../../docs/MOBILE_RUNTIME_ALIGNMENT.zh-CN.md)、[`docs/MOBILE_BETA_CLOSURE.zh-CN.md`](../../docs/MOBILE_BETA_CLOSURE.zh-CN.md)。不推翻本目录已有配对 / 验签 / 会话栈。
+产品定位：工作台，不是 Chat App。  
+Steer / 产物 / Task Detail：不推翻本目录已有配对 / 验签 / 会话栈。
 
 ---
 

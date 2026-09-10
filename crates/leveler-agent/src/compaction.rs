@@ -394,7 +394,6 @@ mod estimate_tests {
     /// sequence measured against DeepSeek `prompt_tokens` on 2026-08-10
     /// (framing-corrected); the tolerance encodes the acceptance gate: never
     /// under-estimate by more than 10%, over-estimation bounded at 40%.
-    /// Raw data: docs/measurements/c5-s2/.
     #[test]
     fn calibration_fixtures_stay_within_measured_tolerance() {
         for (fixture, actual, tool) in [

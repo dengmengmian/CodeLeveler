@@ -1,7 +1,5 @@
 # Methodology
 
-Canonical protocol: [`docs/evaluations/MA-VALUE-REVIEWER-PILOT.md`](../../../../../docs/evaluations/MA-VALUE-REVIEWER-PILOT.md).
-
 Question: does an independent Reviewer after implementation produce better
 final code than self-verification?
 

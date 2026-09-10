@@ -8,7 +8,7 @@ resolves it; this directory holds pointers, arm overlays, and methodology.
 | --- | --- |
 | `cases/` | R005–R010 pointers. Not `EvaluationCase` YAML. No model-visible task. |
 | `configs/` | Arm overlays (`single` / `multi`) using the shipped `agents.delegation` key |
-| `methodology/` | Pointer to `docs/evaluations/MA-VALUE-001.md` |
+| `methodology/` | Hypothesis and PASS criteria |
 | `reports/` | Local notes. Generated batches land in `evals/reports/multi_agent/` |
 
 Do not vendor the third-party repositories or hidden verifiers.
