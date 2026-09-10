@@ -1130,11 +1130,12 @@ async fn a_long_chain_of_distinct_searches_is_never_refused() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// …and the mechanical guard that DOES survive still fires. The same call with
-/// the same arguments returning the same result is a runaway loop, and bounding
-/// it needs no reading of intent.
+/// …and so does the identical repeat. Bounding a runaway loop is what the
+/// round ceiling, the token and cost budgets and the wall clock are for; a
+/// per-call refusal telling the model "do something different" was reading its
+/// reasoning, not enforcing a limit (`docs/ARCHITECTURE.md` §1.1).
 #[tokio::test]
-async fn the_exact_repeat_loop_guard_still_fires() {
+async fn an_identical_repeat_is_not_refused() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-loopguard-{}",
         std::process::id() as u64 * 13 + 7
@@ -1178,11 +1179,27 @@ async fn the_exact_repeat_loop_guard_still_fires() {
         .await
         .unwrap();
 
-    let guarded = events.iter().any(|e| {
-        matches!(e, leveler_agent::AgentEvent::ToolResult { name, is_error: true, preview, .. }
-            if name == "grep" && preview.contains("same"))
-    });
-    assert!(guarded, "an exact repeat must still be bounded: {events:?}");
+    let refused: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            leveler_agent::AgentEvent::ToolResult {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "grep" => Some(preview.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an identical repeat is the model's to notice: {refused:?}"
+    );
+    let ran = events
+        .iter()
+        .filter(|e| matches!(e, leveler_agent::AgentEvent::ToolCall { name, .. } if name == "grep"))
+        .count();
+    assert_eq!(ran, 8, "every repeat reached the tool: {events:?}");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1256,8 +1273,7 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    .with_structure(false);
+    );
 
     let outcome = executor
         .run("你好", &mut |_| {}, &mut NoopSink, CancellationToken::new())
@@ -1881,162 +1897,6 @@ async fn non_retryable_model_error_is_not_retried() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The loop guard refuses BEFORE a call runs, using the previous count — and a
-/// refused call never executes, so it can never record new content and never
-/// clears its own entry. Without a novelty epoch that makes the refusal
-/// PERMANENT for the rest of the turn, which kills any zero-argument tool
-/// whose result legitimately changes later. `browser_snapshot` is the case
-/// that found this: re-snapshotting is the only documented stale-ref
-/// recovery, and after two identical snapshots it was locked out — the agent
-/// could no longer verify its own fix in the browser.
-///
-/// Real dogfood trace (TailAdmin, R010):
-///   navigate → snapshot REFUSED → type → "ref is stale (generation 5)"
-///   → snapshot REFUSED → navigate REFUSED
-#[tokio::test]
-async fn a_novel_result_lets_a_previously_refused_call_try_again() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-loopepoch-{}",
-        std::process::id() as u64 * 31 + 11
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(dir.join("other.txt"), "one\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // Two identical list_files (the key reaches the threshold), then a
-    // genuinely novel read, then the SAME list_files again. The third
-    // list_files must be allowed to run: something moved, so "made no
-    // progress" is no longer a true statement about the world.
-    let responses: Vec<ModelResponse> = vec![
-        assistant_tool_call("c0", "list_files", serde_json::json!({"path": "."})),
-        assistant_tool_call("c1", "list_files", serde_json::json!({"path": "."})),
-        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "other.txt"})),
-        assistant_tool_call("c3", "list_files", serde_json::json!({"path": "."})),
-        assistant_text("done"),
-    ];
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-    let mut events = Vec::new();
-    executor
-        .run(
-            "observe, learn something, observe again",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    let refused_after_novelty = events.iter().any(|e| {
-        matches!(e,
-        leveler_agent::AgentEvent::ToolResult { id, is_error: true, preview, .. }
-            if id == "c3" && preview.contains("no progress"))
-    });
-    assert!(
-        !refused_after_novelty,
-        "a novel result must un-freeze the key, not leave it locked: {events:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn repeated_identical_call_is_blocked_by_loop_guard() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-loopguard-{}",
-        std::process::id() as u64 * 23 + 7
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // The model calls the same list_files 4 times (identical output), then
-    // stops. R007 F1 must NOT weaken this: a genuine repeat is still refused
-    // per key and still ends the turn bounded (§32 Case B).
-    let mut responses: Vec<ModelResponse> = (0..4)
-        .map(|i| {
-            assistant_tool_call(
-                &format!("c{i}"),
-                "list_files",
-                serde_json::json!({"path": "."}),
-            )
-        })
-        .collect();
-    responses.push(assistant_text("done"));
-    let runtime = Arc::new(MockRuntime::new(responses));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "list repeatedly",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Incomplete,
-        "identical-call thrash hard-stop must not be Answered"
-    );
-    let blocked = events.iter().any(|e| {
-        matches!(e,
-        leveler_agent::AgentEvent::ToolResult { is_error: true, preview, .. }
-            if preview.contains("no progress"))
-    });
-    assert!(
-        blocked,
-        "loop guard should block the repeated identical call: {events:?}"
-    );
-
-    // A guard refuses the call before it runs, but the call still happened —
-    // it must be surfaced. A ToolResult whose id was never announced by a
-    // ToolCall leaves the UI with no arguments to render, so the row comes out
-    // blank ("✗ 运行" with no command attached).
-    let announced: std::collections::HashSet<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            leveler_agent::AgentEvent::ToolCall { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let orphans: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            leveler_agent::AgentEvent::ToolResult { id, .. }
-                if !announced.contains(id.as_str()) =>
-            {
-                Some(id.as_str())
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(
-        orphans.is_empty(),
-        "every tool result must have a matching tool call; orphaned results: {orphans:?}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[tokio::test]
 async fn nested_agents_rules_are_loaded_before_the_first_scoped_edit() {
     let dir = std::env::temp_dir().join(format!(
@@ -2226,8 +2086,7 @@ async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> A
         tool_context,
         ModelRef::new("mock", "m"),
         0,
-    )
-    .with_structure(true);
+    );
     executor
         .run(
             "rewrite every file, one step per group",
@@ -2238,68 +2097,6 @@ async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> A
         .await
         .unwrap();
     runtime
-}
-
-/// F2: a plan that says "step 1 in progress" while the agent edits file after
-/// file has stopped describing the work. The runtime cannot know whether step
-/// 1 is done, so it asks once and changes nothing.
-#[tokio::test]
-async fn a_plan_that_stops_tracking_the_work_earns_one_reminder() {
-    let dir = plan_freshness_dir("stale", 8);
-    let mut script = vec![plan_call(
-        "p1",
-        &[("build", "in_progress"), ("verify", "pending")],
-    )];
-    script.extend((0..8).map(|i| edit_call(&format!("e{i}"), i)));
-    script.push(assistant_text("done"));
-    let runtime = run_plan_script(&dir, script).await;
-    assert_eq!(
-        freshness_hits(&runtime),
-        1,
-        "a stale plan is asked about once"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// F3: the model ignoring the advisory is allowed. Repeating it every round
-/// would turn a reminder into spam and burn the rounds it is trying to save.
-#[tokio::test]
-async fn an_ignored_reminder_is_not_repeated_every_round() {
-    let dir = plan_freshness_dir("nospam", 14);
-    let mut script = vec![plan_call(
-        "p1",
-        &[("build", "in_progress"), ("verify", "pending")],
-    )];
-    script.extend((0..14).map(|i| edit_call(&format!("e{i}"), i)));
-    script.push(assistant_text("done"));
-    let runtime = run_plan_script(&dir, script).await;
-    assert_eq!(freshness_hits(&runtime), 1, "still exactly one");
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// F4: synchronizing the plan starts the interval over, and a later stale
-/// stretch earns its own single reminder.
-#[tokio::test]
-async fn synchronizing_the_plan_resets_the_interval() {
-    let dir = plan_freshness_dir("reset", 16);
-    let mut script = vec![plan_call(
-        "p1",
-        &[("build", "in_progress"), ("verify", "pending")],
-    )];
-    script.extend((0..7).map(|i| edit_call(&format!("a{i}"), i)));
-    script.push(plan_call(
-        "p2",
-        &[("build", "completed"), ("verify", "in_progress")],
-    ));
-    script.extend((7..15).map(|i| edit_call(&format!("b{i}"), i)));
-    script.push(assistant_text("done"));
-    let runtime = run_plan_script(&dir, script).await;
-    assert_eq!(
-        freshness_hits(&runtime),
-        2,
-        "one per stale interval, not one per run"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// F5: reading and searching are work INSIDE a step. A plan that stands still
@@ -2349,8 +2146,7 @@ async fn the_reminder_never_changes_a_single_plan_status() {
         tool_context,
         ModelRef::new("mock", "m"),
         0,
-    )
-    .with_structure(true);
+    );
     let mut plans = Vec::new();
     executor
         .run(
@@ -2406,7 +2202,6 @@ async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
         ModelRef::new("mock", "m"),
         0,
     )
-    .with_structure(true)
     .with_seeded_plan(seeded);
 
     let mut plans = Vec::new();
@@ -2886,9 +2681,7 @@ async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    // Conversational tasks assemble with the evidence gate off (Step 2).
-    .with_structure(false);
+    );
 
     let outcome = executor
         .run(
@@ -2947,8 +2740,7 @@ async fn evidence_gate_does_not_nudge_inert_changes() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    .with_structure(false);
+    );
 
     let outcome = executor
         .run(
@@ -3077,8 +2869,7 @@ async fn cargo_command_is_completion_evidence() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    .with_structure(false);
+    );
 
     let outcome = executor
         .run(
@@ -3390,7 +3181,7 @@ async fn duration_budget_stops_the_run_between_rounds() {
 }
 
 #[tokio::test]
-async fn replace_outside_write_allowlist_is_rejected_before_running() {
+async fn a_whole_file_write_outside_the_allowlist_is_rejected_before_running() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-replallow-{}",
         std::process::id() as u64 * 83 + 37
@@ -3406,8 +3197,8 @@ async fn replace_outside_write_allowlist_is_rejected_before_running() {
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
-            "replace",
-            serde_json::json!({"path": "docs/out.md", "old": "keep me", "new": "changed"}),
+            "write_file",
+            serde_json::json!({"path": "docs/out.md", "content": "changed\n"}),
         ),
         assistant_text("giving up"),
     ]));
@@ -3435,7 +3226,7 @@ async fn replace_outside_write_allowlist_is_rejected_before_running() {
     assert_eq!(
         std::fs::read_to_string(dir.join("docs/out.md")).unwrap(),
         "keep me\n",
-        "the out-of-allowlist replace must not land"
+        "the out-of-allowlist write must not land"
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -4672,8 +4463,7 @@ async fn complex_task_allows_readonly_explore_before_plan() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    )
-    .with_structure(true);
+    );
     let mut events = Vec::new();
     executor
         .run(
@@ -4701,11 +4491,11 @@ async fn complex_task_allows_readonly_explore_before_plan() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// C2.3A: after the old explore-budget threshold, the model keeps the full
-/// navigation tool table and Auto tool choice. A soft plan nudge may appear
-/// once; continuing to read is legal; voluntary update_plan still works.
+/// Reading for as long as the evidence is still useful is the model's call.
+/// The surface does not shrink, tool choice is never forced, and no advisory
+/// appears telling it to write a plan (`docs/ARCHITECTURE.md` §1.1).
 #[tokio::test]
-async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_nudge() {
+async fn a_long_explore_keeps_the_whole_surface_and_earns_no_plan_advisory() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-plan-nudge-{}",
         std::process::id() as u64 * 31 + 53
@@ -4718,7 +4508,6 @@ async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_n
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
-        // Round 3: past the old PLAN_EXPLORE_ROUNDS=2 wall — still reading.
         assistant_tool_call("r3", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r4", "grep", serde_json::json!({"pattern": "a"})),
         assistant_tool_call(
@@ -4740,8 +4529,7 @@ async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_n
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    )
-    .with_structure(true);
+    );
 
     let mut events = Vec::new();
     let outcome = executor
@@ -4756,81 +4544,51 @@ async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_n
     assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
 
     let requests = runtime.recorded_requests();
-    assert!(
-        requests.len() >= 5,
-        "expected explore + plan + close rounds, got {}",
-        requests.len()
-    );
+    assert!(requests.len() >= 5, "got {}", requests.len());
 
-    // Every request keeps Auto tool_choice and the full navigation surface —
-    // never tools=[update_plan] only.
     for (i, req) in requests.iter().enumerate() {
         assert_eq!(
             req.tool_choice,
             ToolChoice::Auto,
-            "request {i} must not force update_plan: {req:?}"
+            "request {i} must not force a tool: {req:?}"
         );
         let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&"read_file")
-                && names.contains(&"grep")
-                && names.contains(&"find_symbol")
-                && names.contains(&"find_references")
-                && names.contains(&"update_plan")
-                && names.contains(&"apply_patch"),
-            "request {i} must expose navigation + plan + edit tools, got {names:?}"
-        );
-        assert!(
-            names.len() > 1,
-            "request {i} must not collapse to only update_plan"
-        );
+        for expected in [
+            "read_file",
+            "grep",
+            "find_symbol",
+            "find_references",
+            "update_plan",
+            "apply_patch",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "request {i} lost {expected}: {names:?}"
+            );
+        }
     }
 
-    // Soft plan nudge appears exactly once as a user message after the
-    // explore threshold (not as a forced tool round).
-    let nudge_hits: usize = requests
+    // A task written as a numbered list used to be classified as multi-step
+    // and earn an injected "this task may benefit from a plan" message. The
+    // runtime no longer classifies the task, and injects nothing.
+    let injected: Vec<&str> = runtime
+        .recorded_requests()
         .iter()
-        .map(|req| {
-            req.messages
-                .iter()
-                .filter(|m| {
-                    m.role == leveler_model::Role::User
-                        && m.text_content()
-                            .contains("may benefit from a structured plan")
-                })
-                .count()
+        .flat_map(|r| r.messages.iter())
+        .map(leveler_model::Message::text_content)
+        .filter(|t| {
+            t.contains("benefit from a structured plan") || t.contains("A plan is not required")
         })
-        .sum();
-    assert!(
-        nudge_hits >= 1,
-        "soft plan nudge must appear at least once in model-visible messages"
-    );
+        .map(|_| "nudge")
+        .collect();
+    assert!(injected.is_empty(), "no plan advisory may be injected");
 
-    // Post-threshold reads and greps must succeed (not plan_gate denials).
-    let nav_ok = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                AgentEvent::ToolResult {
-                    id,
-                    is_error: false,
-                    ..
-                } if matches!(id.as_str(), "r3" | "r4")
-            )
-        })
-        .count();
-    assert_eq!(
-        nav_ok, 2,
-        "r3/r4 navigation after threshold must succeed: {events:?}"
-    );
-
-    // Voluntary update_plan still works.
+    // The voluntary plan still lands.
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::PlanUpdated { .. })),
-        "voluntary update_plan must still advance plan state: {events:?}"
+            .any(|e| matches!(e, leveler_agent::AgentEvent::PlanUpdated { .. })),
+        "a plan the model chose to write must still register"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -4860,8 +4618,7 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    )
-    .with_structure(true);
+    );
 
     let outcome = executor
         .run(
@@ -5345,85 +5102,6 @@ async fn chat_second_message_rebinds_objective() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// No plan: pure list_files thrash ends via no-progress streak hard-stop (AC3).
-/// After the streak cap the executor gives one forced "answer from findings"
-/// round; if the model keeps thrashing, hard-stop still fires (AC3 preserved).
-#[tokio::test]
-async fn no_plan_observe_streak_hard_stops() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-nplan-{}",
-        std::process::id() as u64 * 19 + 2
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    // Enough identical list_files rounds to hit LOOP_GUARD_THRESHOLD, then
-    // ProgressCaps::no_progress_rounds, then the forced-answer second chance,
-    // then hard-stop. Final text must not run.
-    let mut responses: Vec<ModelResponse> = (0..8)
-        .map(|i| {
-            assistant_tool_call(
-                &format!("l{i}"),
-                "list_files",
-                serde_json::json!({"path": "."}),
-            )
-        })
-        .collect();
-    responses.push(assistant_text("should not reach"));
-    let runtime = Arc::new(MockRuntime::new(responses));
-    let executor = Executor::new(
-        runtime.clone(),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-    let mut events = Vec::new();
-    let outcome = executor
-        .run(
-            "explore only",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome.stop_reason,
-        StopReason::Incomplete,
-        "no-plan observe thrash must not be Answered/Completed"
-    );
-    assert!(
-        outcome
-            .stop_detail
-            .as_deref()
-            .is_some_and(|d| d.contains("no-progress") || d.contains("thrash")),
-        "expected hard-stop stop_detail, got {:?}",
-        outcome.stop_detail
-    );
-    assert!(
-        outcome.progress.no_progress_streak
-            >= leveler_lifecycle::ProgressCaps::default().no_progress_rounds,
-        "progress streak must reach cap: {}",
-        outcome.progress.no_progress_streak
-    );
-    // Model rounds bounded: hard-stop before burning all scripted responses.
-    assert!(
-        runtime.recorded_requests().len() < 9,
-        "expected bounded model requests, got {}",
-        runtime.recorded_requests().len()
-    );
-    // Final scripted text must remain unused (hard-stop ends drive).
-    assert!(
-        !outcome.final_text.contains("should not reach"),
-        "must not reach post-thrash assistant text: {}",
-        outcome.final_text
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// A sink that records every appended message, standing in for the resume
 /// transcript store.
 struct RecordingSink(Arc<Mutex<Vec<Message>>>);
@@ -5560,59 +5238,63 @@ async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A round in which every tool call was refused by a guard (loop guard, plan
-/// gate, budget, allowlist) is NOT progress. Repeated all-refused rounds must
-/// feed the no-progress streak and hard-stop the turn — otherwise a model that
-/// keeps re-issuing the same guarded non-observe call spins forever under
-/// `UntilTerminal` (the guard refuses, the refusal resets the streak, repeat).
+/// A round in which every tool call was refused by a guard (budget, write
+/// allowlist, permission) is NOT progress. Repeated all-refused rounds feed the
+/// no-progress streak and hard-stop the turn — otherwise a model re-issuing the
+/// same guarded call spins forever under `UntilTerminal`.
+///
+/// This is a lifecycle bound and it is unconditional: no policy flag switches
+/// it off, because a safety boundary is not an experiment.
 #[tokio::test]
 async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-denied-rounds-{}",
         std::process::id() as u64 * 97 + 43
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("docs/out.md"), "keep me\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The same non-observe command every round. Rounds 1–2 run it (identical
-    // output), from round 3 the loop guard refuses it. The refused rounds must
-    // trip the no-progress hard stop long before the script runs dry.
-    let echo = || {
+    // The same out-of-scope write every round. The write allowlist refuses it
+    // before it runs, every time, so no round makes progress.
+    let blocked = || {
         assistant_tool_call(
             "c1",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["same-thing"]}),
+            "write_file",
+            serde_json::json!({"path": "docs/out.md", "content": "changed\n"}),
         )
     };
     let runtime = Arc::new(MockRuntime::new(vec![
-        echo(),
-        echo(),
-        echo(),
-        echo(),
-        echo(),
-        echo(),
-        echo(),
-        echo(),
-        assistant_text("all done"),
+        blocked(),
+        blocked(),
+        blocked(),
+        blocked(),
+        blocked(),
+        blocked(),
+        assistant_text("should not reach"),
     ]));
 
-    let outcome = Executor::new(
+    let executor = Executor::new(
         runtime,
         registry,
         tool_context,
         ModelRef::new("mock", "m"),
-        10,
+        20,
     )
-    .run(
-        "do the thing",
-        &mut |_| {},
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    .with_write_allowlist(Some(vec!["src".to_string()]));
+
+    let outcome = executor
+        .run(
+            "rewrite the docs",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(
         outcome.stop_reason,
@@ -5620,14 +5302,16 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
         "all-refused rounds must hard-stop as no progress, not run the script dry: {outcome:?}"
     );
     assert!(
-        outcome.rounds <= 6,
-        "the no-progress stop must fire within a few refused rounds, got {}",
-        outcome.rounds
+        outcome
+            .stop_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("no-progress")),
+        "expected the no-progress stop detail, got {:?}",
+        outcome.stop_detail
     );
-    assert!(
-        !outcome.final_text.contains("all done"),
-        "the scripted closing text must never be reached: {}",
-        outcome.final_text
+    assert_eq!(
+        std::fs::read_to_string(dir.join("docs/out.md")).unwrap(),
+        "keep me\n"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -5939,7 +5623,6 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_structure(false)
     .with_goal_mode(true)
     .run(
         "Add an `added` function to lib.rs",
@@ -6119,60 +5802,6 @@ async fn minimal_policy_disables_the_identical_result_loop_guard() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The same script under the DEFAULT policy: the guard fires. Locks that
-/// switching the policy — not editing the loop — is what changed above.
-#[tokio::test]
-async fn default_policy_still_denies_identical_result_loops() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-defaultguard-{}",
-        std::process::id() as u64 * 13 + 8
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-    let same_read =
-        || assistant_tool_call("c", "read_file", serde_json::json!({"path": "src/lib.rs"}));
-    let runtime = Arc::new(MockRuntime::new(vec![
-        same_read(),
-        same_read(),
-        same_read(),
-        same_read(),
-        assistant_text("done"),
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    );
-
-    let mut events = Vec::new();
-    executor
-        .run(
-            "watch the file",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        events.iter().any(|e| {
-            matches!(e, leveler_agent::AgentEvent::ToolResult { is_error, preview, .. }
-                if *is_error && preview.contains("with the same result"))
-        }),
-        "the default policy keeps the loop guard: {events:?}"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// Switching to the minimal policy must not loosen the host safety boundary:
 /// a dangerous command still needs approval and a denial still blocks it.
 #[tokio::test]
@@ -6318,7 +5947,6 @@ async fn observe_tools_including_git_status_run_without_a_plan() {
         ModelRef::new("mock", "m"),
         8,
     )
-    .with_structure(true)
     .run(
         "1. inspect the current implementation\n2. change the behavior\n3. run verification",
         &mut |event| events.push(event),
@@ -7987,8 +7615,7 @@ async fn a_complex_task_without_a_plan_can_still_edit_and_run() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    )
-    .with_structure(true);
+    );
     let mut events = Vec::new();
     let outcome = executor
         .run(
@@ -8103,5 +7730,76 @@ async fn a_long_novel_exploration_is_not_interrupted_by_a_progress_heuristic() {
         injected.is_empty(),
         "no engagement advisory may be injected: {injected:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The harness-control surface: which protocol tools a turn advertises, and
+/// the condition on each. These are the Coding harness's own protocol, not
+/// reusable capability, and they are injected around the registry rather than
+/// registered in it.
+#[tokio::test]
+async fn a_turn_advertises_the_harness_control_protocol_it_can_actually_use() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-controls-{}",
+        std::process::id() as u64 * 61 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_text("done")]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    );
+    executor
+        .run(
+            "hello",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let advertised: Vec<String> = runtime.recorded_requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Unconditional: asking the user is always available.
+    for always in ["request_user_input", "ask_user"] {
+        assert!(
+            advertised.iter().any(|n| n == always),
+            "{always} must always be advertised: {advertised:?}"
+        );
+    }
+    // Conditional on a real mechanical fact, not on the task or the model.
+    assert!(
+        advertised.iter().any(|n| n == "request_permissions"),
+        "assisted mode can still be asked to widen: {advertised:?}"
+    );
+    // Depth 0 without delegation configured: no child protocol.
+    for child_only in ["claim_write_scope", "report_finding"] {
+        assert!(
+            !advertised.iter().any(|n| n == child_only),
+            "{child_only} belongs to a child turn: {advertised:?}"
+        );
+    }
+    // Goal mode is off here, so the goal protocol is not advertised.
+    assert!(
+        !advertised.iter().any(|n| n == "update_goal"),
+        "update_goal appears only in goal mode: {advertised:?}"
+    );
+    // And the plan capability is present without anything forcing its use.
+    assert!(
+        advertised.iter().any(|n| n == "update_plan"),
+        "the plan capability stays available: {advertised:?}"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -563,30 +563,46 @@ criterion and is no longer asked.
 
 ### 6.2 What the model sees today
 
-Measured from `crates/leveler-tools/src/registry.rs` at this commit:
+The surface is composed, not inherited. `leveler-app` builds it from what this
+host can actually do, once, before the turn starts:
+
+```text
+CORE                 always
+HARNESS CONTROLS     injected by the executor, each on its own condition
+OPTIONAL PACKS       when the capability's precondition holds
+EXTENSIONS           MCP tools from configured servers
+```
 
 | Set | Count |
 | --- | --- |
-| `core_registry()` | 14 |
-| `full_registry()` = core + 18 + 12 browser | 44 |
-| Harness control tools injected by the executor | 7 |
-| `default_registry()` | `full_registry()` |
+| `core_surface()` | 12 |
+| `model_surface(CapabilityPacks::ALL)` = core + 26 | 38 |
+| Harness control tools injected by the executor | 1–7, by condition |
+| MCP extensions | as configured |
 
-So the default surface is on the order of fifty tools. `core_registry()` is
-selected by the economy work profile, and `expand_tools` lets the model ask
-for more mid-session.
+A pack is gated on a mechanical fact, never on the task or the model:
 
-Two facts worth naming, because they cut against the obvious reading:
+| Pack | Tools | Condition |
+| --- | --- | --- |
+| Code Intelligence | `find_symbol`, `read_symbol`, `find_references`, `diagnostics`, `blast_radius` | on outside Economy |
+| VCS | `git_status`, `git_diff` | on outside Economy |
+| Web fetch | `web_fetch` | on outside Economy |
+| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` is set — the tool refuses without it |
+| Media | `view_image` | the model's profile declares `vision` |
+| Memory | `memory`, `remember`, `forget` | on outside Economy |
+| Skills | `load_skill` | on outside Economy |
+| Browser | `browser_*` (12) | Node is on `PATH` — the driver cannot start without it |
 
-- **`find_files` and `write_file` are not in `core_registry()`.** The economy
-  surface has `grep` and `list_files` but reaches `find_files` only through
-  `expand_tools("search")`, and `write_file` joined the full surface rather
-  than core. Both are Core Primitive Foundation members (§6.3), so this is a
-  surface-composition gap for the Tool Surface Closure to fix, not a
-  capability gap.
-- **`replace`, `shell_command`, `update_plan`, `load_skill`, `expand_tools`
-  and `memory` *are* in core.** The economy surface is not the primitive set;
-  it is a historical selection.
+`WorkProfile::Economy` composes `CapabilityPacks::NONE`: the primitives and the
+protocol, nothing else. That is a user's decision about cost, not an inference
+about the task.
+
+**A defect worth naming.** An interactive turn reads the work profile from the
+`Application` default rather than from the session row
+(`crates/leveler-app/src/session.rs`, `run_in_session_with_content`), so
+`/work-mode economy` in the TUI does not shrink the next interactive turn's
+surface — it does for eval and resume, which read the row. One durable fact,
+two readers; the row is the owner. Not fixed here.
 
 ### 6.3 The Core Primitive Foundation
 
@@ -615,54 +631,65 @@ deliberately replace a whole file, versus change part of one — so both are
 primitives. That distinction is stable and has nothing to do with whether a
 model can construct a patch.
 
-Explicitly:
+`core_registry()` and `full_registry()` were the historical answer to this
+question and were not the same set. They are gone: the composition is now
+`core_surface()` plus explicit `CapabilityPacks` (§6.2), so the primitive
+baseline and the model-visible surface are stated separately and neither is
+inferred from the other.
+
+### 6.3.1 The five categories
+
+Every model-facing capability ends in exactly one of these.
+
+**CORE** — the Core Primitive Foundation above, plus what it entails:
 
 ```text
-core_registry()  !=  Core Primitive Foundation
+read_file  list_files  find_files  grep  apply_patch  write_file
+run_command  shell_command
+get_task  wait_task  kill_task
 ```
 
-`core_registry()` is an implementation and history artifact — the set the
-economy work profile happens to select — until a separate Tool Surface Closure
-aligns it. Do not read one as a definition of the other.
+`run_command` can start a background task, and a task the caller cannot observe
+or stop is an orphan — so the lifecycle trio is part of the command primitive,
+not an optional capability.
 
-### 6.3.1 The four categories
+**OPTIONAL CAPABILITY PACKS** — real capabilities with real preconditions,
+composed by the harness from host facts (§6.2). Optional does not mean hidden
+behind model-triggered discovery; it means the product exposes the pack when
+the capability is there.
 
-**Core capability tools** — the Core Primitive Foundation above.
-
-Whether both `run_command` and `shell_command` stay on the model surface is a
-semantic question about distinct intent and analysability (§6.5), not a
-question about model strength.
-
-**Optional capability packs** — real capabilities that need not be visible
-every round:
+**HARNESS CONTROLS** — the Coding harness's control protocol, not reusable
+capability. `crates/leveler-agent/src/injected_tools.rs` injects them around the
+registry, each on its own condition:
 
 ```text
-Code Intelligence   find_symbol, read_symbol, find_references,
-                    diagnostics, blast_radius
-VCS                 git_status, git_diff
-Browser / Web       browser_* (12), web_fetch, web_search
-Media               view_image
-Memory              memory, remember
-Skills              load_skill
-Background process  get_task, wait_task, kill_task
+request_user_input (alias ask_user)   always
+request_permissions                   mode != full-access
+spawn_agent                           delegation configured, depth < max
+claim_write_scope                     child turn with write access
+report_finding                        child turn
+update_goal                           goal mode
 ```
 
-An implementation existing is not a reason to expose it by default.
+`update_plan` belongs here and is still registered in `leveler-tools`; see
+§18.5.
 
-**Harness control tools** — the Coding harness's control protocol, not
-reusable capability:
+**EXTENSIONS** — MCP-discovered tools, registered from configured servers and
+filtered out of delegated children.
+
+**RUNTIME OR USER ONLY** — implemented, and deliberately not advertised as an
+ordinary coding affordance:
 
 ```text
-request_user_input (alias ask_user)    update_goal
-update_plan                            request_permissions
-spawn_agent                            claim_write_scope
-report_finding
+create_checkpoint / restore_checkpoint   the runtime checkpoints before every
+                                         write and owns rollback and recovery
+consolidate_memory                       memory-subsystem maintenance
+create_skill                             system customization; the user makes
+                                         skills, the model loads them
 ```
 
-A Review harness would have a different set here. That is the point.
-
-**Extension tools** — MCP-discovered tools. The MCP protocol and runtime stay
-conceptually separate from the `McpTool` adapter.
+Whether both `run_command` and `shell_command` stay is a semantic question
+about distinct intent and analysability (§6.5), decided in favour of both.
 
 ### 6.4 Who decides the surface
 
@@ -673,12 +700,9 @@ The Harness decides what tools exist for the product.
 It decides from the work profile, the task type, the capabilities configured
 and the model profile. The kernel knows none of this.
 
-This is why `expand_tools` is architecturally suspect: it inverts the
-ownership, letting the model ask the runtime to reveal more tools. That costs
-an extra tool call, an extra round, dynamic registry state, more replay and
-control semantics. Unless evaluation shows the schema-token saving beats the
-extra round on both success and cost, harness-side selection is the pattern
-and `expand_tools` is not.
+`expand_tools` inverted that ownership, and is deleted. The architectural
+objection stood on its own; the implementation turned out never to have worked
+(§6.5).
 
 ### 6.5 Surface value is an evaluation decision, not an aesthetic one
 
@@ -697,20 +721,23 @@ whose implementation is mechanically wrong — non-deterministic semantics, a
 second path to the filesystem, environment-dependent meaning — is fixed
 directly; see §6.6.
 
-Candidates for evaluation, with the reason each is on the list:
+Dispositions, and the evidence behind each. The usage numbers are from
+`evals/baselines/tool-surface-t0-e623f53/`: 1725 tool calls across 99 sessions,
+one model, one profile — strong enough to reject a claim, too weak to establish
+one.
 
-| Tool | Why it is a candidate |
-| --- | --- |
-| `expand_tools` | Inverts surface ownership; costs a round to buy schema tokens. Strong removal candidate. |
-| `create_checkpoint` / `restore_checkpoint` | The runtime already maintains checkpoints and recovery. Asking the model to know when to checkpoint adds cognitive load and turns a runtime facility into tool semantics. Should leave the default model surface absent a specific product requirement. |
-| `consolidate_memory` | Memory subsystem maintenance, not a coding capability. Can run in the background, at session close, periodically, or on an explicit user command. |
-| `forget` | Destructive mutation of durable state on a semantic judgement the model is not positioned to make. Deleting durable memory is closer to a user action. |
-| `create_skill` | System customization / metaprogramming. `load_skill` can stay optional; creation should not be a default coding-task affordance. |
-| `blast_radius` | An advanced Code Intelligence operation (references → enclosing symbols → BFS), not a primitive. Move to the optional pack, then evaluate whether it reduces rounds or improves refactor recall. |
-| `read_symbol` | `find_symbol` + `read_file` reproduces it. It survives only if it measurably cuts tokens or rounds. Pure evaluation question. |
-| `replace` | **REMOVE / SURFACE-EVAL CANDIDATE.** Its original rationale — exact find/replace for weaker models that fail on patch context matching — is withdrawn (§1.1) and is no longer a reason to keep it. The remaining question is the ordinary one: does `replace` express a distinct, generally useful coding primitive that `edit` + `write` do not already cover? Judge the overlap; a weak-model A/B is not a precondition for removing it. |
-| `shell_command` vs `run_command` | **Decided: both stay.** They are distinct model intents, not two spellings of one. `run_command` is program+args — cross-platform, no shell quoting, trivially analysable for approval, and the only one that can start a background task. `shell_command` is a shell line, which is what a pipeline, a redirect or an `&&` chain actually is, and collapsing it into argv would cost rounds. `shell_command` already reuses `run_command`'s `execute_program`, so this is two adapters over one capability. The remaining asymmetry — `shell_command` cannot background — is recorded, not fixed. |
-| `git_status` / `git_diff` | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell, has stable output and replays cleanly. Keep the interface for now; move the implementation to `leveler-vcs`. |
+| Tool | Disposition | Why |
+| --- | --- | --- |
+| `expand_tools` | **DELETED** | Not a surface judgement: it could never work. Nothing consumed its `expand_categories` metadata, the registry it claimed to grow is an immutable `Arc` and the definitions are snapshotted once per drive, so the promise "the host will register matching tools" was unbacked. It also advertised `mcp` and `subagent`, which registered nothing, and rejected `browser`, the one category with an implementation. One call in the whole evidence set, and it failed. |
+| `replace` | **DELETED** | Zero calls in 1725, including through six `apply_patch` context-matching failures — the exact case it was built to absorb, where the model retried `apply_patch` every time. Its weak-model rationale is withdrawn (§1.1), and `edit` + `write` cover the intent. |
+| `read_symbol` | **OPTIONAL + EVAL_LOCKED** | Zero calls, but so are `find_symbol` and `find_references`, which suggests the language server never came up rather than that this tool is redundant. Off the default surface as part of the Code Intelligence pack; A/B-READ-SYMBOL is still owed. |
+| `blast_radius` | **OPTIONAL + EVAL_LOCKED** | An advanced derived operation, not a primitive. Same evidence problem as `read_symbol`; same disposition. |
+| `create_checkpoint` / `restore_checkpoint` | **RUNTIME OR USER ONLY** | Ownership, not usage: the runtime already checkpoints before every write and owns rollback and crash recovery. Asking the model when to checkpoint duplicates a runtime facility. Zero calls agrees. |
+| `consolidate_memory` | **RUNTIME OR USER ONLY** | Subsystem maintenance. It can run in the background, at session close, or on a user command. |
+| `create_skill` | **RUNTIME OR USER ONLY** | System customization. `load_skill` stays; creating one is the user's act. |
+| `forget` | **OPTIONAL (Memory pack)** | Destructive, but consent-gated: it raises an approval prompt, and correcting a memory the repository has outgrown is part of the work. Classified per operation, not per crate (§25). |
+| `shell_command` vs `run_command` | **BOTH STAY** | Distinct model intents, not two spellings of one. `run_command` is program+args — cross-platform, no shell quoting, trivially analysable for approval, and the only one that can background. `shell_command` is a shell line, which is what a pipeline or an `&&` chain actually is. The remaining asymmetry — `shell_command` cannot background — is recorded, not fixed. |
+| `git_status` / `git_diff` | **OPTIONAL (VCS pack)** | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell and replays cleanly. Keep the interface; move the implementation to `leveler-vcs`. |
 
 `list_files` and `find_files` are deliberately **not** merge candidates. They
 express different model intents — "what is in this directory" versus "where in
@@ -738,8 +765,9 @@ changes what the code *is*, not what the product *offers*.
 capability's value is unclear, or when removing a tool could materially change
 product behaviour, take a usage baseline from real sessions: which tools are
 called, at what success and retry rate, and whether their presence improves
-task success. `replace`, `read_symbol`, `blast_radius`, `expand_tools` and the
-checkpoint tools are the priority list for that measurement.
+task success. Of the original priority list, `replace`, `expand_tools` and
+the checkpoint tools were settled by ownership or by a mechanical defect rather
+than by measurement (§6.5); `read_symbol` and `blast_radius` still owe theirs.
 
 ---
 
@@ -917,6 +945,46 @@ tool admission (the ToolHost)     delegation policy and sub-agent profiles
 write workflow                    coding completion contract
 ownership of paths across agents  the harness control tool surface
 ```
+
+### 12.1 What the harness tells the model, and what it does not
+
+The system prompt is a contract, not an operating manual. It carries four
+things, and the test for each is whether the model could know it any other way:
+
+```text
+identity and the authority boundary   who outranks what, what an edit tool
+                                      guarantees that a shell does not, what a
+                                      denied approval means
+runtime state                         cwd, permission mode, network, project
+                                      rules, the workspace listing
+harness protocol                      how a decision reaches the user, how a
+                                      goal ends, how delegation and ownership
+                                      work, how memory consent works
+product constraints                   the user's language, message length, no
+                                      duplicated narration, no process closeout
+```
+
+It does not carry a method. Removed in W1: when to make a plan and how to keep
+it synchronized; a required verification step before declaring completion; a
+progress-narration template (`current step k/n · evidence → next`); which tool
+to prefer for which shape of work; how to investigate a question; how to
+diagnose a failure; when to persist and when to stop retrying. Each was the
+harness reasoning on the model's behalf.
+
+The same line applies to what the loop injects mid-turn. Protocol repair stays
+— an unresolved goal, a malformed tool call, a truncated response, a settled
+child, a discovered rules file, a budget position — because each states a
+mechanical fact and names the operation that resolves it. Advisories that read
+the model's reasoning are gone: the plan nudge, the plan-freshness reminder,
+and the identical-call loop guard, whose payload was "do something different".
+
+What bounds a runaway loop is unchanged and unconditional: the round ceiling,
+the token, cost and duration budgets, the wall clock, cancellation, and the
+no-progress stop when every call in consecutive rounds is refused.
+
+**Plan capability, not plan enforcement.** `update_plan` is available every
+turn, its state is persisted, and the UI renders it. Nothing classifies the
+task, nothing counts rounds without a plan, and nothing asks for one.
 
 It reaches the kernel through one seam: `Drive` in
 `src/executor/drive.rs` implements `leveler_agent_core::AgentHarness`, filling
@@ -1275,8 +1343,8 @@ traversal. They are not read primitives and were left alone.
 tool to a file on disk: the advisory cross-process lock held across compare and
 rename, the compare-and-swap, the unguessable staging name, the
 capability/descriptor-relative write, checkpoint capture, and write-scope
-revalidation under the lock. `apply_patch`, `replace` and `write_file` all call
-it.
+revalidation under the lock. `apply_patch` and `write_file` call it, and
+`replace` did until it was removed from the surface (§6.5).
 
 The code did not change — it was already the shared commit path, but it lived
 inside the `replace` tool, so the shared runtime was named after one of its
@@ -1378,19 +1446,22 @@ reaping.
 
 ### 18.5 `update_plan` sits with the capability adapters
 
-**Current.** Six of the seven harness control tools live in
-`crates/leveler-agent/src/injected_tools.rs`. `update_plan` is registered in
-`leveler-tools`' `core_registry()` alongside `read_file` and `grep`.
+`update_plan` is a harness control — it carries no capability, touches no
+`ToolContext` field, and exists only because the Coding harness has a plan
+protocol. The other seven controls live in
+`crates/leveler-agent/src/injected_tools.rs`; this one is registered in
+`leveler-tools`.
 
-**Desired.** Harness control tools are the harness's control protocol and
-belong with the harness.
+**Why it did not move in W1.** The injected path bypasses the registry
+entirely, so moving it would mean hand-reimplementing four registry services
+for one tool: `normalize_input` (it repairs a nested-envelope shape models
+emit), JSON-Schema validation, the `schemars`-derived schema, and output
+capping. It would also need the metadata→`PlanUpdated` path rewired, because
+the injected interception arms build a tool result directly and never produce
+metadata for `extract_plan` to read.
 
-**Why it violates the constitution.** A future Review harness taking the
-Coding capability adapters would inherit the Coding plan protocol with them.
-
-**Minimal correction.** Move it next to the other injected tools.
-
-**Risk.** Low.
+That is not a reason to keep the wrong owner; it is a sign the move belongs
+after the registry stops owning policy. **W2 blocker.**
 
 ### 18.6 `leveler-model` knows the Coding tool names
 
@@ -1506,38 +1577,42 @@ The constraint: **do not change the agent kernel for elegance.** This changes
 only if the provider protocol supports it and a real image or multimodal tool
 use case proves the metadata path insufficient.
 
-### 19.2 Is the canonical edit tool one tool or two?
+### 19.2 Closed: the canonical edit tool is `apply_patch` plus `write_file`
 
-`apply_patch` is the canonical structured edit and `write_file` is the
-canonical whole-file write. `replace` overlaps both. The rationale it was built
-on — an exact find/replace path for models that fail repeatedly at patch
-context matching — is withdrawn (§1.1). What is left is a plain surface
-question: does `replace` express a distinct model intent that `edit` and
-`write` do not already cover? The default answer is now no.
+`replace` is deleted. It overlapped both, its weak-model rationale was withdrawn
+(§1.1), and it went unused through the patch failures it was built to absorb
+(§6.5).
 
-### 19.3 How loose should patch context matching be?
+### 19.3 Closed: patch context matching is exact
 
-`seek_sequence` locates a hunk through five progressively looser passes: exact,
-trailing whitespace, edge whitespace, typographic-Unicode folding, and internal
-whitespace squash (`a+b` matches `a + b`). The first three are ordinary format
-tolerance. The last two exist because a model re-types a body it just read with
-spacing drift, which is transcription compensation rather than a mechanical
-tolerance, and §1.1 is against it.
+`seek_sequence` used to locate a hunk through five progressively looser passes.
+The question was framed as a matter of degree; reading the apply path settled it
+as correctness.
 
-They stay for now, deliberately. Tightening the matcher changes edit success on
-the single path where a bug corrupts a user's file, and this is exactly the
-case §6.6 says is owed evidence rather than taste. The comparable mechanism in
-`replace` — a fuzzy fallback that matched a *different* string and could not
-report where it wrote — was removed, because a mutation the tool cannot locate
-is unreportable, which is a mechanical defect and not a matter of degree.
+A located hunk is applied by `file.splice(start..end, replacement)`, and an
+unchanged (` `) context line is part of that splice. So a hunk located by a
+loose comparison rewrites the file's real bytes on lines the model never asked
+to change: trailing whitespace disappears, typographic quotes become ASCII,
+spacing is reformatted — inside a call that reports success and reports nothing
+about it. It also put the two edit tools in direct contradiction, since
+`replace` refused the typographic near-miss that `apply_patch` silently folded.
 
-### 19.4 Does dynamic model-controlled tool expansion pay for itself?
+The comparison is now byte-exact. The tolerances that remain are
+representation, not meaning: BOM strip and restore, CRLF fold and restore, the
+trailing-blank retry, and the trailing-newline rule — each preserves or is
+explicitly documented to change bytes. An inexact patch fails, the file is
+untouched, and the error shows what the file really contains at the anchor.
 
-`expand_tools` buys schema tokens with an extra round and dynamic registry
-state. Harness-side selection buys the same tokens with none of that, at the
-cost of not adapting mid-session. Only evaluation settles which is worth more,
-and the burden of proof is on the dynamic option because it is the one that
-inverts ownership.
+One consequence is recorded rather than fixed: in a mixed-ending file where LF
+dominates, a stray `\r` stays embedded in the line, and such a line no longer
+matches a patch written without it. Making that exact would mean per-line
+ending preservation on write.
+
+### 19.4 Closed: dynamic tool expansion does not pay for itself
+
+`expand_tools` bought schema tokens with an extra round, dynamic registry state
+and inverted surface ownership. It is deleted, and the deciding fact was not the
+trade: nothing consumed its output, so it never expanded anything (§6.5).
 
 ---
 
@@ -1577,13 +1652,17 @@ CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
-TOOL_SURFACE_CLOSED               NO
+TOOL_SURFACE_CLOSED               YES
+PLAN_ENFORCEMENT                  REMOVED
+EDIT_MATCHING                     EXACT
+TOOLREGISTRY_CLOSED               NO
+TOOLCONTEXT_CLOSED                NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO
 ```
 
-The architecture and the tool boundary are decided. The seven core primitives
-are implemented against them; the wider tool surface, `ToolContext`,
-`ToolRegistry` and the engine are not, and §18 says where. No source was
-changed to improve any line of this table.
+The architecture, the tool boundary and the model-visible surface are decided,
+and the seven core primitives are implemented against them. `ToolContext`,
+`ToolRegistry` and the engine are not, and §18 says where. No source was changed
+to improve any line of this table.

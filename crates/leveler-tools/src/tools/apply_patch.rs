@@ -64,11 +64,10 @@ Example (add a function after an existing one):
 +}
 *** End Patch
 
-Every hunk is planned before the first write. Commits use compare-and-swap; if a
+Every hunk is planned before the first write, so a hunk that fails to match
+fails the whole call and nothing is written. Commits use compare-and-swap; if a
 later commit conflicts, earlier commits are rolled back without overwriting the
-conflicting writer (and a rollback conflict is surfaced loudly). So after a
-call succeeds, do NOT re-read the file to check the edit landed — a hunk that
-failed to match fails the whole call loudly. Re-reading only burns context."#;
+conflicting writer, and a rollback conflict is surfaced loudly."#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -549,13 +548,25 @@ impl Tool for ApplyPatchTool {
 mod tests {
     use super::*;
 
-    /// The patch is atomic, so a failed hunk fails the call. A model that
-    /// re-reads the file "to check" after every successful patch burns context
-    /// for nothing — the tool description has to say so, or it will.
+    /// The description states the contract the matcher enforces and stops
+    /// there. What the caller does with its own context budget afterwards is
+    /// not the tool's to prescribe.
     #[test]
-    fn description_forbids_re_reading_the_file_to_verify_the_edit() {
-        assert!(DESCRIPTION.contains("do NOT re-read the file"));
-        assert!(DESCRIPTION.contains("fails the whole call"));
+    fn description_states_the_contract_without_coaching() {
+        assert!(
+            DESCRIPTION.contains("must match the file EXACTLY"),
+            "the matching contract must be stated: {DESCRIPTION}"
+        );
+        assert!(
+            DESCRIPTION.contains("nothing is written"),
+            "all-or-nothing is part of the contract: {DESCRIPTION}"
+        );
+        for coaching in ["burns context", "do NOT re-read"] {
+            assert!(
+                !DESCRIPTION.contains(coaching),
+                "tool descriptions state capability, not strategy ({coaching:?})"
+            );
+        }
     }
 
     /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and

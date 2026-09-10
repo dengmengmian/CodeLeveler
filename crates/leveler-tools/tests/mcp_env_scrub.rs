@@ -50,7 +50,7 @@ fn only_pure_file_readers_claim_replay_safety() {
         "view_image",
     ];
 
-    let registry = leveler_tools::full_registry();
+    let registry = leveler_tools::default_registry();
     let mut claimed: Vec<&str> = registry
         .definitions()
         .iter()

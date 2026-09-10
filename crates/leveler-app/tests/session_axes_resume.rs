@@ -11,7 +11,7 @@ use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::SessionRepository;
-use leveler_tools::{core_registry, full_registry};
+use leveler_tools::core_surface;
 
 fn isolate_global_config() {
     use std::sync::OnceLock;
@@ -94,8 +94,8 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
     let n = engine.factory.registry.definitions().len();
     assert_eq!(
         n,
-        core_registry().definitions().len(),
-        "economy must ship Core surface; got {n}"
+        core_surface().definitions().len(),
+        "economy composes no optional pack: the primitives and the protocol; got {n}"
     );
 
     let engine_full = app
@@ -111,9 +111,13 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        engine_full.factory.registry.definitions().len(),
-        full_registry().definitions().len()
+    // Delivery composes whatever packs THIS host can offer, which depends on
+    // the machine (a browser runtime, a search key, a vision model). The
+    // invariant that does not depend on the machine is that it is a superset
+    // of the core surface.
+    assert!(
+        engine_full.factory.registry.definitions().len() >= core_surface().definitions().len(),
+        "a full profile is never smaller than the core surface"
     );
 }
 

@@ -596,29 +596,29 @@ async fn run_tier(
 /// flipped away from its default. Legacy `require_*` names stay as aliases so
 /// existing scripts keep working.
 ///
-/// Direction: control = production default, ablated = the flip that measures
-/// "what is this knob worth". Rails that default ON ablate OFF; the plan gate
-/// defaults ON in the resolver, so its ablated arm is `false`.
+/// Resolve an ablation knob into an override pair.
+///
+/// The list is empty. Every knob this seam once carried named a harness
+/// behaviour that has since been deleted rather than measured, and a knob that
+/// resolves to "no change" would make an experiment report noise as a result.
 fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, bool)> {
-    let mut o = ExecutionOverrides::default();
-    let (before, after) = match knob {
-        "explicit_plan" | "require_explicit_plan" => {
-            // Production resolve defaults to true; flip it off to measure value.
-            o.explicit_plan = Some(false);
-            (true, false)
-        }
-        // Tools-layer read guard and agent-level progress heuristics share this
-        // seam (factory wires both from the resolved flag).
-        "repeated_read_guard" | "progress_guards" => {
-            o.repeated_read_guard = Some(false);
-            (true, false)
-        }
-        _ => anyhow::bail!(
-            "unknown knob `{knob}` — expected one of: explicit_plan, \
-             repeated_read_guard, progress_guards"
+    match knob {
+        // Both mechanisms were removed: plan enforcement and the identical-call
+        // loop guard were harness behaviour aimed at the model's reasoning, not
+        // rails the runtime needs (`docs/ARCHITECTURE.md` §1.1). An experiment
+        // that ablates a mechanism which no longer exists would run two
+        // identical arms and report the difference as a result, so this fails
+        // instead of accepting the knob and doing nothing.
+        "explicit_plan" | "require_explicit_plan" => anyhow::bail!(
+            "`{knob}` no longer exists: plan enforcement was removed, so there is \
+             nothing to ablate. `update_plan` remains available to the model."
         ),
-    };
-    Ok((o, before, after))
+        "repeated_read_guard" | "progress_guards" => anyhow::bail!(
+            "`{knob}` no longer exists: the identical-call loop guard was removed, \
+             and the no-progress stop it fed is now unconditional."
+        ),
+        _ => anyhow::bail!("unknown knob `{knob}` — no ablatable knob remains"),
+    }
 }
 
 /// The per-case checkpoint file that shadows a baseline: `x.json` → `x.partial.jsonl`.
@@ -1624,30 +1624,27 @@ mod ablation_tests {
     use leveler_agent::StopReason;
     use leveler_eval::TerminationClass;
 
+    /// An experiment that ablates a mechanism which no longer exists would run
+    /// two identical arms and report the difference as a result. Every knob
+    /// this seam once carried names a deleted harness behaviour, so each one
+    /// fails with the reason rather than resolving to "no change".
     #[test]
-    fn ablation_overrides_flip_exactly_the_named_resolver_input() {
-        // Plan gate defaults ON in the resolver; ablate turns it OFF.
-        let (o, before, after) = super::ablation_overrides("explicit_plan").unwrap();
-        assert!(before && !after);
-        assert_eq!(o.explicit_plan, Some(false), "the named knob flipped OFF");
-        // The single-variable contract: nothing else moved.
-        assert_eq!(o.repeated_read_guard, None);
-        assert_eq!(o.max_parallel_tools, None);
-
-        // Safety rails ablate in the OFF direction (they default on).
-        let (o, before, after) = super::ablation_overrides("progress_guards").unwrap();
-        assert!(before && !after);
-        assert_eq!(o.repeated_read_guard, Some(false));
-
-        // Legacy knob names keep working.
-        let (legacy, ..) = super::ablation_overrides("require_explicit_plan").unwrap();
-        assert_eq!(legacy.explicit_plan, Some(false));
-
-        let err = super::ablation_overrides("not_a_knob").unwrap_err();
-        assert!(
-            err.to_string().contains("repeated_read_guard"),
-            "unknown knob lists the valid ones: {err}"
-        );
+    fn a_removed_knob_fails_instead_of_ablating_nothing() {
+        for knob in [
+            "explicit_plan",
+            "require_explicit_plan",
+            "repeated_read_guard",
+            "progress_guards",
+        ] {
+            let err = super::ablation_overrides(knob)
+                .expect_err("a removed knob must not resolve")
+                .to_string();
+            assert!(err.contains("no longer exists"), "{knob}: {err}");
+        }
+        let err = super::ablation_overrides("not_a_knob")
+            .expect_err("unknown knob")
+            .to_string();
+        assert!(err.contains("no ablatable knob remains"), "{err}");
     }
 
     #[test]

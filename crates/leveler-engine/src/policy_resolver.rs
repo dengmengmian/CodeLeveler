@@ -63,10 +63,8 @@ pub enum IndependentReviewPolicy {
 /// experiment, not a configuration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionOverrides {
-    pub explicit_plan: Option<bool>,
     pub max_parallel_tools: Option<usize>,
     pub max_files_per_step: Option<usize>,
-    pub repeated_read_guard: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_output_bytes: Option<usize>,
     /// Measurement knob: persist the model context after every round
@@ -91,8 +89,6 @@ pub struct ResolvedExecutionPolicy {
     pub context_budget: u32,
     pub max_parallel_tools: usize,
     pub max_files_per_step: usize,
-    pub explicit_plan: bool,
-    pub repeated_read_guard: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte budget for a single tool result (the central output cap).
     pub max_tool_output_bytes: usize,
@@ -151,9 +147,7 @@ pub fn resolve_execution_policy(
         // Planning is task-driven, not model-tier-driven. This only shapes the
         // prompt's planning guidance and the one soft plan reminder; nothing
         // is refused for a missing plan.
-        explicit_plan: o.explicit_plan.unwrap_or(true),
         // Safety rail: only the eval seam may lower it.
-        repeated_read_guard: o.repeated_read_guard.unwrap_or(true),
         reasoning_effort: leveler_model::resolve_reasoning_effort(
             o.reasoning_effort,
             &profile.reasoning,
@@ -285,20 +279,6 @@ mod tests {
     }
 
     #[test]
-    fn safety_rails_are_on_without_overrides_and_only_eval_can_lower_them() {
-        let p = profile();
-        let plain = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
-        assert!(plain.repeated_read_guard);
-
-        let ablated = ExecutionOverrides {
-            repeated_read_guard: Some(false),
-            ..ExecutionOverrides::default()
-        };
-        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&ablated));
-        assert!(!r.repeated_read_guard);
-    }
-
-    #[test]
     fn worker_seat_serializes_writes_and_explorer_keeps_wide_read_parallelism() {
         let p = profile();
         let worker = resolve_execution_policy(&p, ExecutionRole::Worker, &goal_turn(), None);
@@ -354,27 +334,5 @@ mod tests {
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
         assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
-    }
-
-    #[test]
-    fn explicit_plan_gate_defaults_on_but_can_be_overridden_per_task() {
-        let p = profile();
-        let plain = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
-        assert!(
-            plain.explicit_plan,
-            "the executor decides task complexity; every model gets the gate"
-        );
-
-        // Overrides still reach the resolved policy — checked on a knob that
-        // is actually consulted at runtime.
-        let complex_task = ExecutionOverrides {
-            explicit_plan: Some(false),
-            max_files_per_step: Some(6),
-            ..ExecutionOverrides::default()
-        };
-        let r =
-            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&complex_task));
-        assert!(!r.explicit_plan);
-        assert_eq!(r.max_files_per_step, 6);
     }
 }

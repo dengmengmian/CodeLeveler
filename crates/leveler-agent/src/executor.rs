@@ -3,7 +3,6 @@
 pub mod closeout;
 mod dispatch;
 mod drive;
-mod gates;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
@@ -407,11 +406,6 @@ impl Clarifier for AutoClarify {
         ClarifyOutcome::Unattended
     }
 }
-
-/// Block a `(tool, args)` call once it has already produced an identical result
-/// this many times (no-progress loop guard). Two "maybe this time" attempts run;
-/// the third identical repeat is short-circuited.
-const LOOP_GUARD_THRESHOLD: u32 = 2;
 
 /// What decides whether another model/tool round may start.
 ///
@@ -897,7 +891,6 @@ impl TranscriptSink for SubAgentProgressSink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubAgentExecutionPolicy {
     pub max_parallel_tools: usize,
-    pub require_explicit_plan: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -944,8 +937,6 @@ pub struct TurnPolicy {
     /// Max read-only tools executed concurrently within one round's parallel
     /// batch (0 = unbounded).
     pub max_parallel_tools: usize,
-    /// Ask the model to write an explicit plan before acting (spec §17).
-    pub require_explicit_plan: bool,
     /// Per-request reasoning effort selected by the execution-policy resolver.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The usable context window in tokens (0 = disabled). When the last
@@ -963,11 +954,6 @@ pub struct TurnPolicy {
     /// The run ends only when the model explicitly calls
     /// `update_goal(complete|blocked)`. Going quiet does not finish it.
     pub goal_mode: bool,
-    /// Mechanical loop protection: the identical-call/identical-result loop
-    /// guard and the all-calls-refused streak. OFF disables them but never
-    /// the safety boundary — the absolute round ceiling, step limits, wall
-    /// clock, and cancellation are host safety and remain unconditional.
-    pub progress_guards: bool,
 
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
@@ -982,12 +968,10 @@ impl Default for TurnPolicy {
     fn default() -> Self {
         Self {
             max_parallel_tools: 0,
-            require_explicit_plan: false,
             reasoning_effort: None,
             context_budget: 0,
             context_trace: false,
             goal_mode: false,
-            progress_guards: true,
             allow_delegation: true,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
@@ -1001,10 +985,7 @@ impl TurnPolicy {
     /// barrier, step limits, the absolute round ceiling, and cancellation
     /// apply exactly as always.
     pub fn minimal() -> Self {
-        Self {
-            progress_guards: false,
-            ..Self::default()
-        }
+        Self { ..Self::default() }
     }
 }
 
@@ -1401,7 +1382,6 @@ impl Executor {
                 } else {
                     self.policy.max_parallel_tools
                 },
-                require_explicit_plan: self.policy.require_explicit_plan,
                 reasoning_effort: self.policy.reasoning_effort,
             },
             |policies| policies.for_role(role),
@@ -1448,7 +1428,6 @@ impl Executor {
             policy: TurnPolicy {
                 // Loop shape comes from the role's resolved policy…
                 max_parallel_tools: child_policy.max_parallel_tools,
-                require_explicit_plan: child_policy.require_explicit_plan,
                 reasoning_effort: child_policy.reasoning_effort,
                 // …the rest is inherited or deliberately reset for a child.
                 context_budget: self.policy.context_budget,
@@ -1464,7 +1443,6 @@ impl Executor {
                 // run uses explicit goal resolution.
                 goal_mode: false,
                 // A child inherits the parent's product-guard stance.
-                progress_guards: self.policy.progress_guards,
             },
             depth: self.depth + 1,
             agent_role: role,
@@ -1570,20 +1548,6 @@ impl Executor {
         self
     }
 
-    /// Ask for an explicit plan before acting (spec §17).
-    pub fn with_structure(mut self, require_explicit_plan: bool) -> Self {
-        self.policy.require_explicit_plan = require_explicit_plan;
-        self
-    }
-
-    /// Toggle the mechanical loop guards (identical-result loop guard and the
-    /// all-refused streak). Safety limits are unaffected. See
-    /// [`TurnPolicy::progress_guards`].
-    pub fn with_progress_guards(mut self, on: bool) -> Self {
-        self.policy.progress_guards = on;
-        self
-    }
-
     /// Replace the entire turn policy (minimal direct mode / custom hosts).
     /// Prefer the narrow builders unless a host really owns the whole policy.
     pub fn with_turn_policy(mut self, policy: TurnPolicy) -> Self {
@@ -1614,7 +1578,6 @@ impl Executor {
                 user_language: crate::prompt::user_language(request),
                 repo_map: workspace_listing(self.tool_context.execution.workspace.root()),
             })
-            .require_explicit_plan(self.policy.require_explicit_plan)
             .memory_index(self.memory_index.clone())
             .build();
         match self.agent_role {
@@ -2130,8 +2093,6 @@ mod recall_tests {
 
 #[cfg(test)]
 mod compaction_tests {
-    use super::dispatch::task_needs_structured_plan;
-
     use crate::authorization::{extract_command, patch_paths, push_unique_path};
     use crate::compaction::{ACTIVE_OBJECTIVE_MARKER, compact_messages, estimate_tokens};
     use leveler_core::ToolCallId;
@@ -2211,39 +2172,6 @@ mod compaction_tests {
         push_unique_path(&mut paths, "/tmp/secret");
 
         assert_eq!(paths, vec!["src/lib.rs"]);
-    }
-
-    #[test]
-    fn long_multi_concern_request_needs_a_structured_plan() {
-        let task = "先检查为什么项目规则没有生效，而且任务执行时间异常。还要把计划实时展示出来，验证失败不要突然倾倒整屏日志。最后跑完整测试并编译本地版本。";
-
-        assert!(task_needs_structured_plan(task));
-        assert!(!task_needs_structured_plan(
-            "把 README 的标题改成 CodeLeveler"
-        ));
-    }
-
-    #[test]
-    fn url_output_labels_do_not_make_a_simple_request_complex() {
-        let task = concat!(
-            " - Local: http://localhost:3000\n",
-            " - Network: http://10.9.9.199:3000 这些URL 为什么在TUI上能不能让他可点击。"
-        );
-
-        assert!(!task_needs_structured_plan(task));
-        assert!(task_needs_structured_plan(
-            "1. inspect the current implementation\n\
-             2. change the behavior"
-        ));
-        assert!(!task_needs_structured_plan(
-            "- inspect the current implementation\n\
-             - change the behavior"
-        ));
-        assert!(task_needs_structured_plan(
-            "- inspect the current implementation\n\
-             - change the behavior\n\
-             - run verification"
-        ));
     }
 
     #[test]

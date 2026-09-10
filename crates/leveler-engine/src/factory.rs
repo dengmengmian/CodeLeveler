@@ -115,7 +115,6 @@ impl ExecutorFactory {
                 resolve_execution_policy(&model_profile, role, &profile, self.overrides.as_ref());
             SubAgentExecutionPolicy {
                 max_parallel_tools: policy.max_parallel_tools,
-                require_explicit_plan: policy.explicit_plan,
                 reasoning_effort: policy.reasoning_effort,
             }
         };
@@ -155,12 +154,6 @@ impl ExecutorFactory {
         .with_steering_opt(self.steering.clone())
         .with_commit_co_author(self.commit_co_author)
         .with_execution_controls(resolved.max_parallel_tools)
-        .with_structure(resolved.explicit_plan)
-        // The mechanical loop guards share the eval ablation seam with the
-        // tools-layer repeated-read guard so a single-knob flip measures the
-        // whole class. Production default is on; only ExecutionOverrides may
-        // lower them.
-        .with_progress_guards(resolved.repeated_read_guard)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
         // Every profile carries only the limits explicitly selected by its caller.

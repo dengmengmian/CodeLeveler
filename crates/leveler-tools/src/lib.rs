@@ -14,8 +14,8 @@ pub mod tools;
 pub(crate) mod workspace;
 
 pub use registry::{
-    OBSERVE_CLASS_TOOLS, ToolRegistry, core_registry, default_registry, expand_tool_category,
-    full_registry, is_observe_class_tool,
+    CapabilityPacks, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface, default_registry,
+    is_observe_class_tool, model_surface,
 };
 pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
 

@@ -432,21 +432,38 @@ ToolRegistry
 
 ### 6.2 模型今天看到什么
 
-从本次 commit 的 `crates/leveler-tools/src/registry.rs` 实测：
+工具面是**组合出来的**，不是继承来的。`leveler-app` 在回合开始前，按这台机器实际具备的能力组合一次：
+
+```text
+CORE                 永远在
+HARNESS CONTROLS     执行器注入，各有各的条件
+OPTIONAL PACKS       该能力的前置条件成立时
+EXTENSIONS           已配置 MCP server 的工具
+```
 
 | 集合 | 数量 |
 | --- | --- |
-| `core_registry()` | 14 |
-| `full_registry()` = core + 18 + 12 个 browser | 44 |
-| 执行器注入的 Harness 控制工具 | 7 |
-| `default_registry()` | 就是 `full_registry()` |
+| `core_surface()` | 12 |
+| `model_surface(CapabilityPacks::ALL)` = core + 26 | 38 |
+| 执行器注入的 Harness 控制工具 | 1–7，按条件 |
+| MCP 扩展 | 按配置 |
 
-所以默认工具面在五十个量级。`core_registry()` 由 economy work profile 选中，`expand_tools` 让模型在会话中途要更多。
+每个 pack 的开关都是一个**机械事实**，绝不是对任务或模型的判断：
 
-有两个事实值得点名，因为它们和直觉相反：
+| Pack | 工具 | 条件 |
+| --- | --- | --- |
+| Code Intelligence | `find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` | 非 Economy 时开 |
+| VCS | `git_status`、`git_diff` | 非 Economy 时开 |
+| Web fetch | `web_fetch` | 非 Economy 时开 |
+| Web search | `web_search` | 设置了 `LEVELER_SEARCH_API_KEY`——没有这个 key 工具必然拒绝 |
+| Media | `view_image` | 模型 profile 声明了 `vision` |
+| Memory | `memory`、`remember`、`forget` | 非 Economy 时开 |
+| Skills | `load_skill` | 非 Economy 时开 |
+| Browser | `browser_*`（12 个） | `PATH` 上有 Node——没有它 driver 根本起不来 |
 
-- **`find_files` 和 `write_file` 不在 `core_registry()` 里。** economy 工具面有 `grep` 和 `list_files`，但要通过 `expand_tools("search")` 才拿得到 `find_files`；`write_file` 也只进了 full 而不是 core。两个都是核心原语基座成员（§6.3），所以这是留给 Tool Surface Closure 的工具面组合缺口，不是能力缺失。
-- **`replace`、`shell_command`、`update_plan`、`load_skill`、`expand_tools`、`memory` 都在 core 里。** economy 工具面不是「原语集合」，它是一份历史选择。
+`WorkProfile::Economy` 组合出 `CapabilityPacks::NONE`：只有原语和协议。这是用户对成本的决定，不是对任务难度的推断。
+
+**一个值得点名的缺陷。** 交互回合读的是 `Application` 的默认 work profile，而不是 session 行（`crates/leveler-app/src/session.rs` 的 `run_in_session_with_content`），所以在 TUI 里 `/work-mode economy` 并不会缩小下一个交互回合的工具面——eval 和 resume 会，因为它们读的是行。一个持久事实两个读取方，权威在行。这次没修。
 
 ### 6.3 核心原语基座（Core Primitive Foundation）
 
@@ -470,47 +487,49 @@ read    ls    find    grep    edit    write    bash
 
 「整文件写入」和「局部编辑」是两个不同的模型意图——新建或有意替换整个文件，对改动文件的一部分——所以两个都是原语。这个区分是稳定的，与「模型能不能造出 patch」无关。
 
-明确一句：
+`core_registry()` 和 `full_registry()` 曾经是这个问题的历史答案，而且两者并不是同一个集合。它们已经没了：现在的组合是 `core_surface()` 加显式的 `CapabilityPacks`（§6.2），所以「原语基线」和「模型可见工具面」是分开陈述的，谁也不从谁推导。
+
+### 6.3.1 五个类别
+
+每一个面向模型的能力，最终只能落在其中一个类别里。
+
+**CORE**——上面的核心原语基座，加上它必然带来的：
 
 ```text
-core_registry()  !=  核心原语基座
+read_file  list_files  find_files  grep  apply_patch  write_file
+run_command  shell_command
+get_task  wait_task  kill_task
 ```
 
-`core_registry()` 是实现与历史的产物——economy work profile 恰好选中的那一组——在单独的 Tool Surface Closure 把它对齐之前，不要拿其中一个当另一个的定义。
+`run_command` 能起后台任务，而一个调用方看不见也停不掉的任务就是孤儿——所以这三个生命周期工具属于命令原语本身，不是可选能力。
 
-### 6.3.1 四个类别
+**OPTIONAL CAPABILITY PACKS**——真实能力，带真实前置条件，由 Harness 从宿主事实组合（§6.2）。「可选」不等于「藏在模型触发的发现机制后面」，而是「这个能力在，产品就把它放出来」。
 
-**核心能力工具**——上面的核心原语基座。
-
-`run_command` 和 `shell_command` 是否都留在模型面上，是关于「意图是否独立」和「是否好做安全分析」的语义问题（§6.5），不是关于模型强弱的问题。
-
-**可选能力包**——真实能力，但不必每轮都可见：
+**HARNESS CONTROLS**——Coding harness 自己的控制协议，不是可复用能力。`crates/leveler-agent/src/injected_tools.rs` 在 registry 之外注入，各有条件：
 
 ```text
-Code Intelligence   find_symbol、read_symbol、find_references、
-                    diagnostics、blast_radius
-VCS                 git_status、git_diff
-Browser / Web       browser_*（12 个）、web_fetch、web_search
-Media               view_image
-Memory              memory、remember
-Skills              load_skill
-后台进程             get_task、wait_task、kill_task
+request_user_input（别名 ask_user）    永远
+request_permissions                   非 full-access
+spawn_agent                           配置了委派，且 depth < 上限
+claim_write_scope                     有写权限的子 Agent 回合
+report_finding                        子 Agent 回合
+update_goal                           goal 模式
 ```
 
-「实现存在」不是「默认暴露」的理由。
+`update_plan` 属于这一类，但仍注册在 `leveler-tools` 里，见 §18.5。
 
-**Harness 控制工具**——Coding harness 的控制协议，不是可复用能力：
+**EXTENSIONS**——MCP 发现的工具，从已配置的 server 注册，并对被委派的子 Agent 过滤掉。
+
+**RUNTIME OR USER ONLY**——实现保留，但刻意不作为普通 coding 顺手工具暴露：
 
 ```text
-request_user_input（别名 ask_user）      update_goal
-update_plan                            request_permissions
-spawn_agent                            claim_write_scope
-report_finding
+create_checkpoint / restore_checkpoint   运行时本来就在每次写入前 checkpoint，
+                                         并且拥有回滚与崩溃恢复
+consolidate_memory                       memory 子系统维护
+create_skill                             系统定制：技能由用户创建，模型只加载
 ```
 
-Review harness 在这一格会是另一套。这正是重点。
-
-**扩展工具**——MCP 发现的工具。MCP 协议与运行时，和 `McpTool` 适配器，概念上必须分开。
+`run_command` 和 `shell_command` 是否都留，是关于「意图是否独立」和「是否好做安全分析」的语义问题（§6.5），结论是都留。
 
 ### 6.4 谁决定工具面
 
@@ -520,7 +539,7 @@ Harness 决定这个产品有哪些工具。
 
 它根据 work profile、任务类型、已配置的能力和模型 profile 来决定。Kernel 对此一无所知。
 
-这就是 `expand_tools` 在架构上可疑的原因：它把 ownership 反过来了，让模型请求运行时给它更多工具。代价是一次额外工具调用、一个额外 round、动态 registry 状态、更多 replay 与控制语义。除非 Eval 证明省下的 schema token 在成功率和成本两边都盖过那个额外 round，否则 harness 侧选择才是模式，`expand_tools` 不是。
+`expand_tools` 把这个 ownership 反了过来，现在已删除。架构上的反对本来就站得住；而实现层面它其实从来没有真正工作过（§6.5）。
 
 ### 6.5 工具面价值是 Eval 决策，不是审美决策
 
@@ -532,20 +551,20 @@ Harness 决定这个产品有哪些工具。
 
 这说的是**产品工具面**，不是实现正确性。实现本身机械上就是错的——语义不确定、第二条通往文件系统的路径、含义随环境改变——那是直接修的，见 §6.6。
 
-Eval 候选，以及各自上榜的理由：
+各工具的处置，以及背后的证据。使用数据来自 `evals/baselines/tool-surface-t0-e623f53/`：99 个会话共 1725 次工具调用，一个模型、一份 profile——足以否定一个说法，不足以确立一个说法。
 
-| 工具 | 为什么是候选 |
-| --- | --- |
-| `expand_tools` | 反转了工具面 ownership；用一个 round 去买 schema token。**强删除候选**。 |
-| `create_checkpoint` / `restore_checkpoint` | 运行时本就维护 checkpoint 与恢复。要求模型判断何时该 checkpoint 增加认知负担，还把运行时设施变成了工具语义。除非有明确产品需求，否则应退出默认模型工具面。 |
-| `consolidate_memory` | 属于 memory 子系统维护，不是 coding 能力。可以后台跑、会话结束时跑、周期跑，或由用户显式命令触发。 |
-| `forget` | 基于模型的语义判断去破坏性修改持久状态，而模型并不处在做这个判断的位置。删除持久 memory 更接近用户动作。 |
-| `create_skill` | 系统定制 / 元编程能力。`load_skill` 可以留作可选；「创建」不该是默认 coding 任务里的顺手选项。 |
-| `blast_radius` | 高级 Code Intelligence 操作（references → 外层符号 → BFS），不是原语。先移入可选包，再 Eval 它是否真的减少 round 或提升重构召回。 |
-| `read_symbol` | `find_symbol` + `read_file` 可复现。只有当它可测量地省 token 或省 round 时才该留。纯 Eval 问题。 |
-| `replace` | **REMOVE / SURFACE-EVAL 候选。** 它原本的理由——给较弱模型一条精确 find/replace 路径，避免在 patch 上下文匹配上反复失败——已经撤销（§1.1），不再是保留它的理由。剩下的是一个普通问题：`replace` 是否表达了 `edit` + `write` 覆盖不到的、独立且普遍有用的编码原语？就按重叠度判断；删除它不以「弱模型 A/B」为前提。 |
-| `shell_command` vs `run_command` | **已决定：两个都留。** 它们是两个不同的模型意图，不是同一件事的两种写法。`run_command` 是 program+args：跨平台、无 shell 引号问题、审批时易做安全分析，而且只有它能起后台任务。`shell_command` 是一整行 shell——管道、重定向、`&&` 链本来就是这个形状，硬拆成 argv 只会多花 round。`shell_command` 已经复用 `run_command` 的 `execute_program`，所以这是「两个适配器、一个能力」。剩下的不对称——`shell_command` 不能起后台——是记录，不是这次修。 |
-| `git_status` / `git_diff` | 用 `run_command` 也能做，但 git 检视是高频动作，不需要 shell，输出稳定，可 replay。接口暂时保留；实现迁到 `leveler-vcs`。 |
+| 工具 | 处置 | 理由 |
+| --- | --- | --- |
+| `expand_tools` | **已删除** | 这不是工具面判断，而是它根本不可能工作：没有任何消费者读它的 `expand_categories` metadata，它声称要扩张的 registry 是不可变的 `Arc`，而 definitions 在每次 drive 只快照一次——所以「host 会在后续 round 注册匹配工具」这句话没有任何东西兑现。它还宣传 `mcp` 和 `subagent`（两者什么都不注册），并拒绝 `browser`（唯一真有实现的类别）。整个证据集里只有一次调用，还失败了。 |
+| `replace` | **已删除** | 1725 次调用里零次，包括在六次 `apply_patch` 上下文匹配失败中——那正是它被造出来吸收的场景，而模型每一次都改成重试 `apply_patch`。它的弱模型理由已撤销（§1.1），`edit` + `write` 覆盖了这个意图。 |
+| `read_symbol` | **OPTIONAL + EVAL_LOCKED** | 零调用，但 `find_symbol` 和 `find_references` 同样是零，这更像是 language server 从没起来，而不是这个工具冗余。它随 Code Intelligence pack 离开默认面；A/B-READ-SYMBOL 仍然欠着。 |
+| `blast_radius` | **OPTIONAL + EVAL_LOCKED** | 高级派生操作，不是原语。证据问题与 `read_symbol` 相同，处置相同。 |
+| `create_checkpoint` / `restore_checkpoint` | **RUNTIME OR USER ONLY** | 归属问题，不是使用量问题：运行时本来就在每次写入前 checkpoint，并拥有回滚与崩溃恢复。让模型判断何时该 checkpoint 是在重复一个运行时设施。零调用与此一致。 |
+| `consolidate_memory` | **RUNTIME OR USER ONLY** | 子系统维护。可以后台跑、会话结束跑，或由用户命令触发。 |
+| `create_skill` | **RUNTIME OR USER ONLY** | 系统定制。`load_skill` 留下；创建技能是用户的动作。 |
+| `forget` | **OPTIONAL（Memory pack）** | 破坏性，但是 consent-gated：它会弹审批，而修正一条已经被仓库淘汰的记忆本来就是工作的一部分。按操作分类，不按 crate 分类（§25）。 |
+| `shell_command` vs `run_command` | **都留** | 两个不同的模型意图，不是同一件事的两种写法。`run_command` 是 program+args：跨平台、无 shell 引号问题、审批时易做安全分析，而且只有它能起后台。`shell_command` 是一整行 shell——管道、`&&` 链本来就是这个形状。剩下的不对称——`shell_command` 不能起后台——是记录，不是这次修。 |
+| `git_status` / `git_diff` | **OPTIONAL（VCS pack）** | 用 `run_command` 也能做，但 git 检视高频、不需要 shell、可 replay。接口保留；实现迁到 `leveler-vcs`。 |
 
 `list_files` 和 `find_files` **不是**合并候选。它们表达不同的模型意图——「这个目录里有什么」对「仓库里哪里有符合这个模式的文件」。真正该统一的是它们底下的文件系统遍历和 ignore 语义。
 
@@ -560,7 +579,7 @@ Eval 候选，以及各自上榜的理由：
 
 **直接修，不需要 A/B。** 靠检查就能证明的缺陷就是缺陷：归属错误、语义不确定或随环境改变、运行时实现重复、跨平台行为分叉、service-locator 耦合、运行时能力长在 Tool 适配器里。修这些改变的是代码**是什么**，不是产品**提供什么**。
 
-**先测量。** 当两个都合理的原语发生重叠、当某个可选能力的价值不清楚、当删掉一个工具可能实质改变产品行为时，先从真实会话取一次使用基线：哪些工具真的被调用、成功率与重试率如何、它们的存在是否提升任务成功。`replace`、`read_symbol`、`blast_radius`、`expand_tools` 和 checkpoint 工具是这份测量的优先名单。
+**先测量。** 当两个都合理的原语发生重叠、当某个可选能力的价值不清楚、当删掉一个工具可能实质改变产品行为时，先从真实会话取一次使用基线：哪些工具真的被调用、成功率与重试率如何、它们的存在是否提升任务成功。原来那份优先名单里，`replace`、`expand_tools` 和 checkpoint 工具最后是被归属或机械缺陷定的，不是被测量定的（§6.5）；`read_symbol` 和 `blast_radius` 仍然欠着自己的那一份。
 
 ---
 
@@ -707,6 +726,27 @@ coding 工具选择                   coding 验证策略
 写入工作流                        coding 完成契约
 跨 agent 的路径 ownership          harness 控制工具面
 ```
+
+### 12.1 Harness 告诉模型什么，不告诉什么
+
+System prompt 是一份**契约**，不是操作手册。它只承载四类东西，每一类的检验标准都是「模型有没有别的办法知道这件事」：
+
+```text
+身份与权威边界      谁压过谁、编辑工具提供了 shell 提供不了的什么保证、
+                    审批被拒意味着什么
+运行时状态          cwd、权限模式、网络、项目规则、workspace 清单
+Harness 协议        决策怎么送到用户、goal 怎么结束、委派与 ownership 怎么运作、
+                    memory 的同意机制怎么走
+产品约束            用户语言、消息长度、不要重复叙述、不要过程性收尾
+```
+
+它**不承载方法**。W1 移除的有：何时该做计划、计划怎么同步；宣告完成前必须先跑验证；进度叙述模板（`current step k/n · evidence → next`）；什么形状的活该优先用哪个工具；理解类问题该怎么调查；失败该怎么诊断；何时该坚持、何时该停止重试。每一条都是 Harness 在替模型思考。
+
+回合中途注入的内容也守同一条线。**协议修复保留**——goal 未解决、tool 调用畸形、响应被截断、子 Agent 已结算、发现了规则文件、预算位置——因为每一条都在陈述一个机械事实并点名解决它的操作。**读模型推理的提示已删除**：计划提醒、计划过期提醒，以及那个 payload 是「换个做法」的重复调用 loop guard。
+
+约束跑飞循环的东西没有变，而且是无条件的：round 上限、token/成本/时长预算、wall clock、取消，以及「连续多个 round 里每一次调用都被拒绝」时的 no-progress 停止。
+
+**计划是能力，不是强制。** `update_plan` 每一轮都可用，状态会持久化，UI 会渲染。没有任何东西对任务分类，没有任何东西统计「多少轮没有计划」，也没有任何东西开口要一份计划。
 
 它通过唯一一个接缝接到 kernel：`src/executor/drive.rs` 里的 `Drive` 实现了 `leveler_agent_core::AgentHarness`，填的接缝是 `tool_definitions`、`on_round_start`、`on_round_admitted`、`on_response`、`on_model_error`、`on_quiet`、`execute_calls`、`on_stop`、`on_event`。这就是 kernel 契约的全部，已经被一个真实 harness 用起来了。
 
@@ -969,7 +1009,7 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 #### C. Workspace 编辑只有一个 Owner（已关闭）
 
-`leveler-tools::workspace::WorkspaceEditor` 是工具通往磁盘文件的唯一受保护路径：跨进程 advisory 锁横跨比较与 rename、CAS、不可猜的暂存名、capability/描述符相对写、checkpoint 捕获，以及在锁内重新校验写入范围。`apply_patch`、`replace`、`write_file` 都调它。
+`leveler-tools::workspace::WorkspaceEditor` 是工具通往磁盘文件的唯一受保护路径：跨进程 advisory 锁横跨比较与 rename、CAS、不可猜的暂存名、capability/描述符相对写、checkpoint 捕获，以及在锁内重新校验写入范围。`apply_patch` 和 `write_file` 调它，`replace` 在从工具面移除前也调它（§6.5）。
 
 代码本身没变——它本来就是共享提交路径，只是住在 `replace` 工具里，于是共享 runtime 被以它的一个调用方命名。这次只搬了 Owner。
 
@@ -1029,15 +1069,11 @@ dev-server 安全不变：恢复仍然只在显式白名单下发生，所以默
 
 ### 18.5 `update_plan` 和能力适配器待在一起
 
-**当前。** 七个 harness 控制工具里有六个住在 `crates/leveler-agent/src/injected_tools.rs`。`update_plan` 却注册在 `leveler-tools` 的 `core_registry()` 里，和 `read_file`、`grep` 并排。
+`update_plan` 是一个 Harness 控制——它不携带任何能力，不碰 `ToolContext` 的任何字段，存在的唯一理由是 Coding harness 有一套计划协议。另外七个控制工具住在 `crates/leveler-agent/src/injected_tools.rs`，只有这一个注册在 `leveler-tools` 里。
 
-**期望。** Harness 控制工具是 harness 的控制协议，应该跟 harness 在一起。
+**W1 为什么没搬。** 注入路径完全绕开 registry，所以搬它意味着为一个工具手写重实现四项 registry 服务：`normalize_input`（它修复模型会发出的嵌套信封形状）、JSON-Schema 校验、`schemars` 生成的 schema、输出封顶。还得重接 metadata→`PlanUpdated` 这条路，因为注入分支直接构造工具结果，从不产出给 `extract_plan` 读的 metadata。
 
-**为什么违宪。** 未来的 Review harness 若取用 Coding 的能力适配器，会连 Coding 的 plan 协议一起继承过去。
-
-**最小修正。** 把它移到其他注入工具旁边。
-
-**风险。** 低。
+这不是「保留错误 Owner」的理由，而是「这次搬家应该排在 registry 不再拥有策略之后」的信号。**W2 blocker。**
 
 ### 18.6 `leveler-model` 知道 Coding 工具名
 
@@ -1119,19 +1155,23 @@ pub struct ToolOutcome { pub content: String, pub is_error: bool }
 
 约束：**不要为了优雅而修改 agent kernel。** 只有当 provider 协议支持、并且有真实的图片或多模态用例证明 metadata 路径不够用时，才动它。
 
-### 19.2 canonical 编辑工具是一个还是两个？
+### 19.2 已关闭：canonical 编辑工具是 `apply_patch` 加 `write_file`
 
-`apply_patch` 是 canonical 结构化编辑，`write_file` 是 canonical 整文件写入，`replace` 与两者都重叠。它当初成立的理由——在 patch 上下文匹配反复失败时给模型一条精确 find/replace 路径——已经撤销（§1.1）。剩下的是一个普通的工具面问题：`replace` 是否表达了 `edit` 和 `write` 覆盖不到的独立模型意图？现在的默认答案是「否」。
+`replace` 已删除。它与两者都重叠，弱模型理由已撤销（§1.1），而且在它本该吸收的 patch 失败里一次也没被用到（§6.5）。
 
-### 19.3 patch 上下文匹配该松到什么程度？
+### 19.3 已关闭：patch 上下文匹配是精确匹配
 
-`seek_sequence` 用五轮逐级放松来定位一个 hunk：精确、去尾部空白、去两端空白、typographic Unicode 折叠、内部空白压缩（`a+b` 匹配 `a + b`）。前三轮是普通的格式容忍。后两轮存在的理由是「模型把刚读过的内容重打一遍时会有空格漂移」，这属于转录补偿而不是机械容忍，§1.1 不认可。
+`seek_sequence` 原来用五轮逐级放松来定位 hunk。这个问题一度被当成「松到什么程度」的分寸问题；读完 apply 路径之后，它是正确性问题。
 
-但它们暂时保留，这是有意的。收紧匹配器会改变编辑成功率，而且改的是「一旦有 bug 就会损坏用户文件」的那条路径——这正是 §6.6 所说「该由证据而不是审美来定」的情形。`replace` 里那个可比的机制已经删除：它匹配的是**另一个**字符串，而且连自己写到哪一行都报不出来；一次工具无法定位的变更是不可上报的变更，那是机械缺陷，不是程度问题。
+定位到的 hunk 是用 `file.splice(start..end, replacement)` 应用的，而未改动的（` `）上下文行**也在这个 splice 里**。所以一次松匹配会把文件真实字节改写成模型的写法——尾部空白消失、typographic 引号变成 ASCII、空格被重排——全都发生在一个报告成功、且对此只字不提的调用里。它还让两个编辑工具直接互相矛盾：`replace` 拒绝的 typographic 近似匹配，`apply_patch` 会静默折叠掉。
 
-### 19.4 模型控制的动态工具扩展划得来吗？
+现在比较是逐字节精确的。留下的容忍都属于**表示层**而不是语义层：BOM 剥离与恢复、CRLF 折叠与恢复、trailing-blank 重试、结尾换行规则——每一条要么保持字节不变，要么明确写明了它会改变什么。不精确的 patch 会失败，文件原样不动，错误里给出锚点处文件真正的内容。
 
-`expand_tools` 用一个额外 round 加动态 registry 状态去买 schema token。Harness 侧选择用同样的 token 收益换来零动态状态，代价是不能会话中途自适应。只有 Eval 能定哪个更值，而且举证责任在动态方案这一边，因为是它反转了 ownership。
+有一个后果是记录而不是修复：在 LF 占多数的混合换行文件里，游离的 `\r` 会留在行内，这样的行不再匹配没有 `\r` 的 patch。要做到精确，需要写入时逐行保留原始换行符。
+
+### 19.4 已关闭：模型控制的动态工具扩展不划算
+
+`expand_tools` 用一个额外 round、动态 registry 状态和反转的工具面 ownership 去买 schema token。它已删除，而且决定性的事实不是这笔交易：没有任何东西消费它的输出，所以它从来没有扩张过任何东西（§6.5）。
 
 ---
 
@@ -1161,10 +1201,14 @@ CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
-TOOL_SURFACE_CLOSED               NO
+TOOL_SURFACE_CLOSED               YES
+PLAN_ENFORCEMENT                  REMOVED
+EDIT_MATCHING                     EXACT
+TOOLREGISTRY_CLOSED               NO
+TOOLCONTEXT_CLOSED                NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO
 ```
 
-架构和工具边界已经定了。七个核心原语已经按它实现；更宽的工具面、`ToolContext`、`ToolRegistry` 和 Engine 还没对齐，§18 写明了差在哪里。没有为了让这张表里任何一行好看而修改源码。
+架构、工具边界和模型可见的工具面都已经定了，七个核心原语也按它实现了。`ToolContext`、`ToolRegistry` 和 Engine 还没对齐，§18 写明了差在哪里。没有为了让这张表里任何一行好看而修改源码。

@@ -309,42 +309,143 @@ fn validate_schema(
     }
 }
 
-/// Build a registry with every built-in tool registered.
-pub fn default_registry() -> ToolRegistry {
-    full_registry()
+/// The optional capability packs a host can put on the model's surface.
+///
+/// Every field is a mechanical fact about this machine or an explicit product
+/// choice — is a browser runtime installed, is a search provider configured,
+/// does this model accept images. None of them is a judgement about the task
+/// or about the model's ability (`docs/ARCHITECTURE.md` §1.1): the surface
+/// never grows because a task looks hard or shrinks because a model looks
+/// weak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilityPacks {
+    /// Symbol navigation over a language server.
+    pub code_intelligence: bool,
+    /// Repository inspection.
+    pub vcs: bool,
+    /// Fetching a URL. Needs network.
+    pub web_fetch: bool,
+    /// Searching the web. Needs a configured search provider.
+    pub web_search: bool,
+    /// Showing the model an image. Needs a model that accepts one.
+    pub media: bool,
+    /// Durable project memory.
+    pub memory: bool,
+    /// Skill loading.
+    pub skills: bool,
+    /// The structured browser. Needs an installed browser runtime.
+    pub browser: bool,
 }
 
-/// Full tool surface (historical default / WorkProfile::Balanced).
-pub fn full_registry() -> ToolRegistry {
+impl CapabilityPacks {
+    /// No optional capability: the primitives and the protocol, nothing else.
+    pub const NONE: Self = Self {
+        code_intelligence: false,
+        vcs: false,
+        web_fetch: false,
+        web_search: false,
+        media: false,
+        memory: false,
+        skills: false,
+        browser: false,
+    };
+
+    /// Every pack. The composition a host reaches when each capability's own
+    /// precondition holds; also what tests use so a tool is never missing for
+    /// an environmental reason.
+    pub const ALL: Self = Self {
+        code_intelligence: true,
+        vcs: true,
+        web_fetch: true,
+        web_search: true,
+        media: true,
+        memory: true,
+        skills: true,
+        browser: true,
+    };
+}
+
+/// The Core Primitive Foundation, plus the lifecycle the command primitive
+/// entails and the one harness control that still lives in this crate.
+///
+/// `read`, `ls`, `find`, `grep`, `edit`, `write` and `bash` are here because
+/// they express fundamental coding operations (§6.3). `get_task` / `wait_task`
+/// / `kill_task` are here because `run_command` can start a background task,
+/// and a task the caller cannot observe or stop is an orphan — they are that
+/// primitive's lifecycle, not an optional capability. `update_plan` is a
+/// harness control that has not moved yet; see §18.5.
+pub fn core_surface() -> ToolRegistry {
     use crate::tools;
-    let mut registry = core_registry();
+    let mut registry = ToolRegistry::new();
+    // read / ls / find / grep
+    registry.register(Arc::new(tools::ReadFileTool));
+    registry.register(Arc::new(tools::ListFilesTool));
     registry.register(Arc::new(tools::FindFilesTool));
-    // The `write` primitive (§6.3). It joins the full surface here and not
-    // `core_registry()`, because aligning the registry sets to the Core
-    // Primitive Foundation is the separate Tool Surface Closure's job.
+    registry.register(Arc::new(tools::GrepTool));
+    // edit / write
+    registry.register(Arc::new(tools::ApplyPatchTool));
     registry.register(Arc::new(tools::WriteFileTool));
-    registry.register(Arc::new(tools::FindSymbolTool));
-    registry.register(Arc::new(tools::ReadSymbolTool));
-    registry.register(Arc::new(tools::FindReferencesTool));
-    registry.register(Arc::new(tools::DiagnosticsTool));
-    registry.register(Arc::new(tools::BlastRadiusTool));
-    registry.register(Arc::new(tools::WebSearchTool));
-    registry.register(Arc::new(tools::WebFetchTool));
-    registry.register(Arc::new(tools::ViewImageTool));
-    registry.register(Arc::new(tools::GitStatusTool));
-    registry.register(Arc::new(tools::GitDiffTool));
-    registry.register(Arc::new(tools::CreateCheckpointTool));
-    registry.register(Arc::new(tools::RestoreCheckpointTool));
-    registry.register(Arc::new(tools::CreateSkillTool));
-    registry.register(Arc::new(tools::RememberTool));
-    registry.register(Arc::new(tools::ForgetTool));
-    registry.register(Arc::new(tools::ConsolidateMemoryTool));
-    register_browser(&mut registry);
+    // bash, and the background lifecycle it creates
+    registry.register(Arc::new(tools::RunCommandTool));
+    registry.register(Arc::new(tools::ShellCommandTool));
+    registry.register(Arc::new(tools::GetTaskTool));
+    registry.register(Arc::new(tools::WaitTaskTool));
+    registry.register(Arc::new(tools::KillTaskTool));
+    // Harness control (§18.5 debt: it belongs with the injected controls).
+    registry.register(Arc::new(tools::UpdatePlanTool));
     registry
 }
 
-/// The structured browser tools (§19). Grouped so `full_registry` and the
-/// `"browser"` expand category register exactly the same set.
+/// The model-visible surface: the core primitives plus the packs this host can
+/// actually offer.
+///
+/// This is the whole composition. There is no dynamic expansion and no
+/// model-controlled discovery: the harness decides what exists, once, before
+/// the turn starts.
+pub fn model_surface(packs: CapabilityPacks) -> ToolRegistry {
+    use crate::tools;
+    let mut registry = core_surface();
+    if packs.code_intelligence {
+        registry.register(Arc::new(tools::FindSymbolTool));
+        registry.register(Arc::new(tools::ReadSymbolTool));
+        registry.register(Arc::new(tools::FindReferencesTool));
+        registry.register(Arc::new(tools::DiagnosticsTool));
+        registry.register(Arc::new(tools::BlastRadiusTool));
+    }
+    if packs.vcs {
+        registry.register(Arc::new(tools::GitStatusTool));
+        registry.register(Arc::new(tools::GitDiffTool));
+    }
+    if packs.web_fetch {
+        registry.register(Arc::new(tools::WebFetchTool));
+    }
+    if packs.web_search {
+        registry.register(Arc::new(tools::WebSearchTool));
+    }
+    if packs.media {
+        registry.register(Arc::new(tools::ViewImageTool));
+    }
+    if packs.memory {
+        registry.register(Arc::new(tools::MemoryTool));
+        registry.register(Arc::new(tools::RememberTool));
+        registry.register(Arc::new(tools::ForgetTool));
+    }
+    if packs.skills {
+        registry.register(Arc::new(tools::LoadSkillTool));
+    }
+    if packs.browser {
+        register_browser(&mut registry);
+    }
+    registry
+}
+
+/// Every pack on. The entry point tests use; production composes packs from
+/// what the host actually has (see `leveler-app`).
+pub fn default_registry() -> ToolRegistry {
+    model_surface(CapabilityPacks::ALL)
+}
+
+/// The structured browser tools (§19), grouped so the pack registers one set.
 fn register_browser(registry: &mut ToolRegistry) {
     use crate::tools;
     registry.register(Arc::new(tools::BrowserNavigateTool));
@@ -361,67 +462,6 @@ fn register_browser(registry: &mut ToolRegistry) {
     registry.register(Arc::new(tools::BrowserScreenshotTool));
 }
 
-/// Economy / Core tool surface (appendix B). Missing categories via expand_tools.
-pub fn core_registry() -> ToolRegistry {
-    use crate::tools;
-    let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(tools::ReadFileTool));
-    registry.register(Arc::new(tools::ListFilesTool));
-    registry.register(Arc::new(tools::GrepTool));
-    registry.register(Arc::new(tools::ApplyPatchTool));
-    registry.register(Arc::new(tools::ReplaceTool));
-    registry.register(Arc::new(tools::RunCommandTool));
-    registry.register(Arc::new(tools::ShellCommandTool));
-    registry.register(Arc::new(tools::GetTaskTool));
-    registry.register(Arc::new(tools::WaitTaskTool));
-    registry.register(Arc::new(tools::KillTaskTool));
-    registry.register(Arc::new(tools::UpdatePlanTool));
-    registry.register(Arc::new(tools::LoadSkillTool));
-    registry.register(Arc::new(tools::ExpandToolsTool));
-    // Read-only memory search is Core; remember/forget stay Full (Dangerous).
-    registry.register(Arc::new(tools::MemoryTool));
-    registry
-}
-
-/// Register tools for an expand_tools category onto `registry` (idempotent names).
-pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
-    use crate::tools;
-    match category {
-        "search" => {
-            registry.register(Arc::new(tools::FindFilesTool));
-        }
-        "lsp" => {
-            registry.register(Arc::new(tools::FindSymbolTool));
-            registry.register(Arc::new(tools::ReadSymbolTool));
-            registry.register(Arc::new(tools::FindReferencesTool));
-            registry.register(Arc::new(tools::DiagnosticsTool));
-            registry.register(Arc::new(tools::BlastRadiusTool));
-        }
-        "git" => {
-            registry.register(Arc::new(tools::GitStatusTool));
-            registry.register(Arc::new(tools::GitDiffTool));
-        }
-        "web" => {
-            registry.register(Arc::new(tools::WebSearchTool));
-            registry.register(Arc::new(tools::WebFetchTool));
-        }
-        "checkpoint" => {
-            registry.register(Arc::new(tools::CreateCheckpointTool));
-            registry.register(Arc::new(tools::RestoreCheckpointTool));
-        }
-        "media" => {
-            registry.register(Arc::new(tools::ViewImageTool));
-        }
-        "skills" => {
-            registry.register(Arc::new(tools::CreateSkillTool));
-        }
-        "browser" => {
-            register_browser(registry);
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod navigation_tool_contract {
     //! The tool table is what an eval measures navigation against, so the
@@ -432,7 +472,7 @@ mod navigation_tool_contract {
 
     #[test]
     fn read_file_takes_an_optional_range_and_says_what_each_form_returns() {
-        let registry = crate::full_registry();
+        let registry = crate::default_registry();
         let read = registry
             .definitions()
             .into_iter()
@@ -477,7 +517,7 @@ mod navigation_tool_contract {
     /// eval cannot tell "used the wrong tool" from "did not look".
     #[test]
     fn localisation_tools_stay_distinguishable() {
-        let registry = crate::full_registry();
+        let registry = crate::default_registry();
         let by_name: std::collections::HashMap<_, _> = registry
             .definitions()
             .into_iter()
@@ -493,46 +533,173 @@ mod navigation_tool_contract {
 mod tests {
     use super::*;
 
+    /// The model-visible surface, named. A normal turn does not receive
+    /// "whatever the registry happens to contain": it receives the core
+    /// primitives plus the packs this host can actually offer.
     #[test]
-    fn default_registry_advertises_all_tools() {
-        let reg = default_registry();
-        let names: Vec<_> = reg.definitions().into_iter().map(|d| d.name).collect();
-        assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"apply_patch".to_string()));
-        assert!(names.contains(&"replace".to_string()));
-        assert!(names.contains(&"run_command".to_string()));
-        assert!(names.contains(&"shell_command".to_string()));
-        assert!(names.contains(&"find_files".to_string()));
-        assert!(!names.contains(&"repository_search".to_string()));
-        assert!(!names.contains(&"glob".to_string()));
-        assert!(names.contains(&"find_symbol".to_string()));
-        assert!(names.contains(&"read_symbol".to_string()));
-        assert!(names.contains(&"find_references".to_string()));
-        assert!(names.contains(&"diagnostics".to_string()));
-        assert!(names.contains(&"blast_radius".to_string()));
-        assert!(names.contains(&"restore_checkpoint".to_string()));
-        assert!(names.contains(&"update_plan".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
-        assert!(names.contains(&"web_fetch".to_string()));
-        assert!(names.contains(&"view_image".to_string()));
-        assert!(names.contains(&"load_skill".to_string()));
-        assert!(names.contains(&"create_skill".to_string()));
-        assert!(names.contains(&"expand_tools".to_string()));
-        assert!(names.contains(&"memory".to_string()));
-        assert!(names.contains(&"remember".to_string()));
-        assert!(names.contains(&"forget".to_string()));
-        assert!(names.contains(&"browser_navigate".to_string()));
-        assert!(names.contains(&"browser_snapshot".to_string()));
-        assert!(names.contains(&"browser_click".to_string()));
-        assert!(names.contains(&"browser_drag".to_string()));
-        assert!(names.contains(&"write_file".to_string()));
-        // core (14) + full extras (18) + browser (12) = 44
-        assert_eq!(names.len(), 44);
+    fn the_core_surface_is_the_primitives_and_what_they_entail() {
+        let names: Vec<String> = core_surface()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        let mut expected = vec![
+            // read / ls / find / grep
+            "read_file",
+            "list_files",
+            "find_files",
+            "grep",
+            // edit / write
+            "apply_patch",
+            "write_file",
+            // bash, and the background lifecycle run_command can create
+            "run_command",
+            "shell_command",
+            "get_task",
+            "wait_task",
+            "kill_task",
+            // harness control that still lives in this crate (§18.5)
+            "update_plan",
+        ];
+        expected.sort_unstable();
+        let mut got: Vec<&str> = names.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// A pack is all-or-nothing and adds only its own tools.
+    #[test]
+    fn each_pack_adds_exactly_its_own_tools() {
+        let core = core_surface().definitions().len();
+        for (packs, added) in [
+            (
+                CapabilityPacks {
+                    code_intelligence: true,
+                    ..CapabilityPacks::NONE
+                },
+                5,
+            ),
+            (
+                CapabilityPacks {
+                    vcs: true,
+                    ..CapabilityPacks::NONE
+                },
+                2,
+            ),
+            (
+                CapabilityPacks {
+                    memory: true,
+                    ..CapabilityPacks::NONE
+                },
+                3,
+            ),
+            (
+                CapabilityPacks {
+                    browser: true,
+                    ..CapabilityPacks::NONE
+                },
+                12,
+            ),
+            (
+                CapabilityPacks {
+                    skills: true,
+                    ..CapabilityPacks::NONE
+                },
+                1,
+            ),
+            (
+                CapabilityPacks {
+                    media: true,
+                    ..CapabilityPacks::NONE
+                },
+                1,
+            ),
+        ] {
+            assert_eq!(
+                model_surface(packs).definitions().len(),
+                core + added,
+                "{packs:?}"
+            );
+        }
+    }
+
+    /// No pack means no pack. `Economy` composes exactly the core surface.
+    #[test]
+    fn no_packs_is_the_core_surface() {
+        assert_eq!(
+            model_surface(CapabilityPacks::NONE).definitions().len(),
+            core_surface().definitions().len()
+        );
+    }
+
+    /// Every pack on is the widest surface a host can offer.
+    #[test]
+    fn every_pack_on_is_the_widest_surface() {
+        let names: Vec<String> = default_registry()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for present in [
+            "read_file",
+            "write_file",
+            "find_files",
+            "apply_patch",
+            "shell_command",
+            "find_symbol",
+            "git_status",
+            "web_fetch",
+            "web_search",
+            "view_image",
+            "memory",
+            "remember",
+            "forget",
+            "load_skill",
+            "browser_navigate",
+        ] {
+            assert!(names.iter().any(|n| n == present), "missing {present}");
+        }
+        // core (12) + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
+        // + browser 12 = 38
+        assert_eq!(names.len(), 38);
+    }
+
+    /// Tools the model no longer chooses. Each left for its own reason, and
+    /// none of them because a model looked weak (`docs/ARCHITECTURE.md` §1.1):
+    /// two were deleted, four belong to the runtime or the user.
+    #[test]
+    fn the_model_surface_excludes_what_the_model_does_not_own() {
+        let names: Vec<String> = default_registry()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for absent in [
+            // Deleted: it could never work — nothing consumed its request and
+            // the registry it claimed to grow is immutable mid-turn.
+            "expand_tools",
+            // Deleted: overlapped edit + write, and went unused through the
+            // patch failures it was built to absorb.
+            "replace",
+            // The runtime already checkpoints before every write and owns
+            // rollback and crash recovery.
+            "create_checkpoint",
+            "restore_checkpoint",
+            // Memory-subsystem maintenance, not a coding capability.
+            "consolidate_memory",
+            // System customization: the user makes skills, the model loads them.
+            "create_skill",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "{absent} must not be on the model surface"
+            );
+        }
     }
 
     #[test]
     fn read_only_subset_is_an_explicit_allowlist_without_side_effect_tools() {
-        let subset = full_registry().read_only_subset();
+        let subset = default_registry().read_only_subset();
         // Pure lookups stay in.
         for name in ["read_file", "grep", "list_files", "git_status", "git_diff"] {
             assert!(subset.get(name).is_some(), "{name} must be in the subset");
@@ -551,21 +718,6 @@ mod tests {
             let tool = subset.get(&def.name).unwrap();
             assert_eq!(tool.risk(), RiskLevel::Safe, "{}", def.name);
         }
-    }
-
-    #[test]
-    fn core_registry_is_smaller_than_full_and_expand_adds_search() {
-        let core = core_registry();
-        let full = full_registry();
-        let core_n = core.definitions().len();
-        let full_n = full.definitions().len();
-        assert!(core_n < full_n, "core={core_n} full={full_n}");
-        let mut expanded = core_registry();
-        expand_tool_category(&mut expanded, "search");
-        let names: Vec<_> = expanded.definitions().into_iter().map(|d| d.name).collect();
-        assert!(names.contains(&"find_files".to_string()));
-        assert!(!names.contains(&"repository_search".to_string()));
-        assert!(!names.contains(&"glob".to_string()));
     }
 
     #[test]
@@ -865,7 +1017,7 @@ mod tests {
     #[test]
     fn builtin_tools_declare_their_effect_class() {
         let reg = default_registry();
-        for name in ["apply_patch", "replace", "write_file"] {
+        for name in ["apply_patch", "write_file"] {
             assert!(reg.mutates_files(name), "{name} must declare mutates_files");
             assert!(!reg.runs_command(name), "{name} does not run a command");
         }
@@ -989,8 +1141,8 @@ mod schema_budget {
                 .map(|d| serde_json::to_string(d).expect("schema serializes").len())
                 .sum::<usize>()
         };
-        let core = super::core_registry();
-        let full = super::full_registry();
+        let core = super::core_surface();
+        let full = super::default_registry();
         let (core_bytes, full_bytes) = (bytes(&core), bytes(&full));
         assert!(
             core_bytes < 20_000,

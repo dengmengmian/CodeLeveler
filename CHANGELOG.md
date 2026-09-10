@@ -7,6 +7,13 @@ All notable changes to CodeLeveler are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The model-visible tool surface is composed, not inherited.** A turn gets
+  the core primitives, plus the optional capability packs this host can
+  actually offer, plus the harness controls its situation allows, plus MCP
+  extensions. Each pack's condition is a mechanical fact — a search key is
+  configured, the model's profile declares vision, Node is on `PATH` so the
+  browser driver can start — never a judgement about the task or the model.
+  `WorkProfile::Economy` composes no pack at all.
 - **`write_file(path, content)`** — the canonical whole-file write, on the
   full tool surface. Creating or deliberately replacing a whole file is a
   different intent from changing part of one. It goes through the same guarded
@@ -29,6 +36,33 @@ All notable changes to CodeLeveler are documented here. The format follows
   themselves deleted in this release; compaction folds remain.)
 
 ### Changed
+- **The system prompt is a contract, not an operating manual.** It carries
+  identity, the authority boundary, runtime state, harness protocol and product
+  constraints. It no longer carries a method: when to make a plan and how to
+  keep it synchronized, a required verification step before completion, a
+  progress-narration template, which tool to prefer for which shape of work,
+  how to investigate a question, how to diagnose a failure, when to persist and
+  when to stop retrying. 130 lines became 50.
+- **Plan capability, not plan enforcement.** `update_plan` is available every
+  turn and its state is still persisted and rendered. What is gone is the
+  task-complexity classifier that decided a request "needs" a plan, the
+  injected reminder that followed, and the reminder that a plan had stopped
+  tracking the work. Whether a plan helps is the model's judgement.
+- **`apply_patch` matches exactly.** Its description always said the context
+  and removed lines must match the file EXACTLY; the matcher had four fallback
+  passes below exact. Because a located hunk is applied by splicing the
+  caller's lines over the file's, a loose match rewrote real bytes on context
+  lines nobody asked to change — trailing whitespace stripped, typographic
+  quotes flattened to ASCII, spacing reformatted, inside a call that reported
+  success. An inexact patch now fails, the file is untouched, and the error
+  shows what the file really contains.
+- **`get_task` / `wait_task` / `kill_task` are core.** `run_command` can start
+  a background task, and a task the caller cannot observe or stop is an orphan.
+- **Sub-agent and budget advisories state mechanics only.** The delegation hint
+  describes concurrency, child isolation, the ownership fence and when a
+  background call blocks; the budget note states the position and the operation
+  that reports being blocked.
+
 - **The harness exposes capability; it does not emulate intelligence.**
   Flattening model capability differences is withdrawn as a product goal. The
   model owns reasoning, the harness owns domain semantics and capability
@@ -193,6 +227,29 @@ All notable changes to CodeLeveler are documented here. The format follows
     list guessing at it.
 
 ### Removed
+- **`expand_tools`.** Not a surface judgement: it could never work. Nothing
+  consumed its output, the registry it claimed to grow is immutable and the
+  tool definitions are snapshotted once per turn. It also advertised two
+  categories that registered nothing and rejected the one category with an
+  implementation.
+- **`replace`.** Zero calls across the recorded evidence, including through six
+  `apply_patch` context-matching failures — the exact case it existed to
+  absorb, where the model retried `apply_patch` every time. `apply_patch` and
+  `write_file` cover the intent.
+- **The identical-call loop guard.** Refusing a repeat with "do something
+  different" read the model's reasoning. A runaway loop is still bounded, by
+  the round ceiling, the token, cost and duration budgets, the wall clock and
+  cancellation, and the no-progress stop is now unconditional rather than
+  switchable from an eval knob.
+- **`create_checkpoint`, `restore_checkpoint`, `consolidate_memory` and
+  `create_skill` leave the model surface.** Each has an owner that is not the
+  model: the runtime already checkpoints before every write and owns rollback
+  and recovery, memory consolidation is subsystem maintenance, and creating a
+  skill is the user's act. The implementations stay.
+- **The `explicit_plan` and `repeated_read_guard` ablation knobs.** Both named
+  a mechanism that no longer exists. An eval config that asks for either now
+  fails with the reason rather than running two identical arms.
+
 - **The repeated-read guard.** How often a model re-reads an unchanged range
   is a judgement about its reasoning, not a fact about the filesystem, so the
   reader no longer annotates it.

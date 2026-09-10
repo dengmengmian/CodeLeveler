@@ -22,30 +22,17 @@ pub const MULTI_AGENT_HINT_HEADER: &str = "## Multi-agent coordination";
 /// agent and the coordinator of this workspace.
 pub fn multi_agent_steer_hint() -> String {
     "## Multi-agent coordination\n\
-     You are both the coding agent and the coordinator of this workspace. \
-     Delegate focused, INDEPENDENT work to `spawn_agent` children so it does \
-     not consume this conversation's context. `task` is the only required \
-     argument: the child starts read-capable, inspects the code, and claims \
-     its own bounded write scope (claim_write_scope) — the runtime enforces \
-     exclusive ownership, so you do not pre-plan file ownership. Put a \
-     complete self-contained `task` in each spawn — children do not see your \
-     history.\n\
-     Children run in the background by default: the call returns immediately \
-     with the child's id, and the runtime tells you when each settles — do not \
-     poll. Start independent delegations together in one assistant message and \
-     CONTINUE USEFUL WORK while they run: another disjoint area, integration \
-     boundaries, test preparation. Never write into files a running child owns \
-     — by editor tools (the runtime refuses those) or by shell commands — and \
-     do not redo child-owned work; inspect and integrate its result when it \
-     settles. Set run_in_background=false only when your next action depends \
-     on that child's result.\n\
-     Work that is small, tightly coupled, or needs your in-flight context \
-     simply stays here — not calling `spawn_agent` is already that choice, so \
-     it needs no announcement. A piece blocked by unfinished work can go out \
-     later, once its blockers clear: freeze its contract (expected outputs, \
-     interfaces, acceptance commands) in the task text and hand it off.\n\
-     Long work stays in this direct tool loop: keep calling tools / spawn_agent \
-     until the goal is proven; do not stop early with a plan-only summary."
+     `spawn_agent` calls emitted in ONE assistant message run concurrently; \
+     calls in separate messages run in sequence. A child does not see this \
+     conversation, so `task` must be self-contained — it is the only required \
+     argument, and the child claims its own bounded write scope with \
+     claim_write_scope rather than being handed one.\n\
+     A child runs in the background by default: the call returns its id \
+     immediately and the runtime tells you when it settles, so there is \
+     nothing to poll. The ownership fence refuses your writes to a file a \
+     running child owns, by editor tool or by shell. Set \
+     run_in_background=false when your next action depends on that child's \
+     result."
         .to_string()
 }
 
@@ -383,31 +370,32 @@ mod tests {
         // The dedup needle must be the hint's actual first line (必改③).
         assert!(h.starts_with(MULTI_AGENT_HINT_HEADER));
         assert!(h.contains("spawn_agent"));
-        assert!(h.contains("direct tool loop"));
     }
 
-    /// V2 coordination policy contract: the four load-bearing sentences must
-    /// stay present, and forced-spawn framing stays banned. Delegation-
-    /// preferred-for-INDEPENDENT-work is deliberate product policy; "always/
-    /// must spawn" is not.
+    /// The hint states the delegation MECHANICS and nothing else: how
+    /// concurrency is expressed, what a child can see, who owns which files,
+    /// and when a background call blocks. When to delegate, and what is worth
+    /// delegating, is the model's judgement (`docs/ARCHITECTURE.md` §1.1).
     #[test]
-    fn steer_hint_is_coordinator_policy_not_always_spawn() {
+    fn the_steer_hint_states_mechanics_not_strategy() {
         let h = multi_agent_steer_hint();
         let lower = h.to_ascii_lowercase();
-        assert!(lower.contains("coordinator"));
-        assert!(lower.contains("independent"));
-        assert!(lower.contains("background by default"));
-        assert!(lower.contains("continue useful work"));
-        assert!(lower.contains("run_in_background=false only"));
-        // Phase B: no KEEP sermon — not calling spawn_agent already IS keeping
-        // the work, so the hint states that as a fact instead of sanctioning a
-        // refusal the model can reach for.
-        assert!(!lower.contains("keep is a first-class outcome"));
-        assert!(lower.contains("simply stays here"));
-        // …and still no pressure in the other direction.
-        assert!(!lower.contains("always spawn"));
-        assert!(!lower.contains("must spawn"));
-        assert!(!lower.contains("every task"));
+        // Mechanics the model cannot derive from the tool schema alone.
+        assert!(lower.contains("one assistant message run concurrently"));
+        assert!(lower.contains("does not see this conversation"));
+        assert!(lower.contains("claim_write_scope"));
+        assert!(lower.contains("ownership fence"));
+        assert!(lower.contains("run_in_background=false"));
+        // Strategy that used to ride along with them.
+        for coaching in [
+            "continue useful work",
+            "simply stays here",
+            "do not stop early",
+            "always spawn",
+            "you are both the coding agent",
+        ] {
+            assert!(!lower.contains(coaching), "coaching left in: {coaching:?}");
+        }
     }
 
     #[test]

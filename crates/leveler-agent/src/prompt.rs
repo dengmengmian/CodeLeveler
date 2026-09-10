@@ -12,7 +12,6 @@ const BASE_PROMPT: &str = include_str!("../prompts/base.md");
 
 #[derive(Debug, Clone)]
 pub(crate) struct PromptBuilder {
-    require_explicit_plan: bool,
     turn_context: Option<TurnContext>,
     base_instructions: Option<String>,
     commit_co_author: bool,
@@ -23,7 +22,6 @@ pub(crate) struct PromptBuilder {
 impl Default for PromptBuilder {
     fn default() -> Self {
         Self {
-            require_explicit_plan: false,
             turn_context: None,
             base_instructions: None,
             commit_co_author: true,
@@ -115,11 +113,6 @@ impl PromptBuilder {
         Self::default()
     }
 
-    pub(crate) fn require_explicit_plan(mut self, enabled: bool) -> Self {
-        self.require_explicit_plan = enabled;
-        self
-    }
-
     pub(crate) fn turn_context(mut self, context: TurnContext) -> Self {
         self.turn_context = Some(context);
         self
@@ -173,76 +166,18 @@ impl PromptBuilder {
                 ));
             }
         }
-        // Narration contract (K28): map progress to the active plan step when one
-        // exists; always cite concrete evidence. Lives outside replaceable model
-        // profiles so every model produces interpretable progress.
+        // Product UX, not a reasoning format. The user reads these lines while
+        // the work happens, so they must be legible and in their language, and
+        // they must not repeat what the interface already draws. WHAT to say is
+        // the model's judgement; that it is short and not duplicated is the
+        // product's constraint.
         prompt.push_str(
-            "\n\nProgress narration: when a plan is active, lead with \
-             `current step k/n · <step text> — just did … (evidence) → next …`. \
-             Every interim update must name concrete evidence you observed, its \
-             implication, and the next action. Never emit a bare claim such as \
-             \"found the root cause\" without naming what was found and why it \
-             matters. Keep updates concise and in the user's language.",
+            "\n\nKeep interim updates short and in the user's language. The \
+             interface already renders every tool call, so a line that only \
+             restates the next action — \"let me read a few files\", \"running \
+             the tests\" — prints the same fact twice; when there is nothing to \
+             add, call the tool with no prose at all.",
         );
-        // The UI already draws every tool call ("reading 4 files"). Prose that
-        // only restates the next action therefore prints the same fact twice
-        // and pushes the actual work down the screen. Silence is a legitimate
-        // answer here — the runtime narrates the action, the model narrates
-        // the reasoning.
-        prompt.push_str(
-            "\n\nDo not narrate what the tool call already shows. The interface \
-             renders every tool call as it happens, so a line that only restates \
-             the next action — \"let me read a few files\", \"searching again\", \
-             \"running the tests\" — says the same thing twice and adds nothing. \
-             Say something only when you have a purpose, an observation, what it \
-             implies, or a reason for the next step: \"the entry point already \
-             moved to the new router, so I am checking what still references the \
-             old one\". When there is nothing to add, call the tool with no prose \
-             at all — that is better than an empty line of narration. One \
-             sentence is enough; this is not a request for longer explanations.",
-        );
-        if self.require_explicit_plan {
-            prompt.push_str(
-                "\n\nIf this is multi-step work (several independently checkable \
-                 pieces, multi-file changes, or migrate/architecture work), call \
-                 update_plan with one in_progress step and the rest pending \
-                 (statuses: pending/in_progress/completed) — not a prose checklist \
-                 alone — before you start changing files. Locating and reading \
-                 code needs no plan: \
-                 investigate as long as the evidence still changes your \
-                 understanding, and write the plan once you know what the work \
-                 actually is. If a single action covers the request, skip \
-                 update_plan and just do the task.",
-            );
-            // A plan is only worth showing if it tracks the work. Created once
-            // and never touched again, it leaves the user watching "step 1/8 in
-            // progress" while the agent is building step 5 — and the runtime
-            // cannot fix that for them: whether a step is done is a judgement
-            // only the model can make.
-            prompt.push_str(
-                "\n\nWhen an active plan exists, keep it synchronized with your actual \
-                 work. At most one step is in_progress. When you finish the current \
-                 step and move on to another, call update_plan at that transition to \
-                 mark the finished step completed and the next one in_progress — not \
-                 several steps later, and not as one batch at the end. Do not call it \
-                 between the tool calls inside a single step: a step that needs a \
-                 read, two edits and a test run stays in_progress for all of them. If \
-                 you finished several steps in one stretch, mark them all completed in \
-                 one call. Never mark a step completed just to make the checklist look \
-                 current — update it only when you believe that step's work is \
-                 actually done, and if you are unsure, leave it as it is.",
-            );
-            // Zero-cost guidance, unlike the removed MissingEvidence nudge: it
-            // costs no extra round, and a model that verifies inside the turn
-            // can still fix what it finds. The engine's gating checks remain
-            // the actual verdict either way.
-            prompt.push_str(
-                "\n\nFor tasks where you edit files, do NOT declare the task complete \
-                 until you have run the build or tests with run_command and seen \
-                 them pass. Cite that result as your evidence. For chat, explanation, \
-                 or read-only questions, answer directly without verification tools.",
-            );
-        }
         prompt
     }
 }
@@ -259,11 +194,9 @@ impl TurnContext {
         let language = match self.user_language {
             Some(named) => format!(
                 "- language: the user writes {named}. Write EVERY user-visible sentence in \
-                 {named} — interim progress notes, plans, status narration, reasoning/thinking \
-                 text streamed to the UI, and the final summary. Do not slip into English \
-                 process templates such as \"Now...\", \"First...\", \"Good...\", or \"Let \
-                 me...\"; if a draft sentence comes out in the wrong language, rewrite it \
-                 before sending. Code, commands, identifiers and quoted source stay as they are"
+                 {named} — interim notes, status narration, reasoning text streamed to the \
+                 UI, and the final summary. Code, commands, identifiers and quoted source \
+                 stay as they are"
             ),
             None => "- language: use the same natural language as the latest user message for \
                      responses and all reasoning/thinking text streamed to the UI"
@@ -287,10 +220,7 @@ impl TurnContext {
         rendered.push_str("\n\n");
         rendered.push_str(&self.operating_rules(network == "allowed"));
         if let Some(map) = self.repo_map.as_deref().filter(|m| !m.trim().is_empty()) {
-            rendered.push_str(
-                "\n\nWorkspace files (bounded listing; do not call a directory tool just to \
-                 learn what exists here — read or search what you need):\n",
-            );
+            rendered.push_str("\n\nWorkspace files (bounded listing):\n");
             rendered.push_str(map.trim_end());
             rendered.push('\n');
         }
@@ -311,9 +241,7 @@ impl TurnContext {
             "- For file tools, pass workspace-relative paths and use `.` for cwd itself. \
              If the user mentions the absolute cwd, translate it to `.` before calling a tool. \
              Never prefix an absolute path with `~` and never construct `~/Users/...` for \
-             structured file tools. Prefer `shell_command` for git/shell one-liners; use \
-             `list_files` for directories and `read_file` only for files. Do not answer a \
-             task-like message with only a greeting.\n\
+             structured file tools.\n\
              - Git mutate (`git pull`/`fetch`/`commit`/`rebase`/…): under assisted/request-approval, \
              workspace `.git` is write-protected. Just run the git command; when the sandbox \
              denies it, retry that same command with `escalate` set (`filesystem` = \
@@ -360,14 +288,6 @@ impl TurnContext {
              output, call request_user_input — do not only write that request in prose and \
              keep going. Do not request the same or a broader permission again.\n",
         );
-        rules.push_str(
-            "- Diagnosis: separate confirmed facts from speculation. A sandbox reproduction \
-             is not a host reproduction. A CONNECT 502 is not proof the sandbox blocked \
-             the network unless a policy denial said so. A SQLite readonly error is not \
-             proof of a leftover process lock. Do not recommend destructive first steps \
-             (pkill -f, deleting WAL/SHM, chmod of large trees) without direct evidence; \
-             inspect safely first, then ask the user to verify host state you cannot see.",
-        );
         rules
     }
 }
@@ -387,46 +307,20 @@ mod tests {
     #[test]
     fn base_prompt_contains_agent_identity() {
         let prompt = PromptBuilder::new().build();
-
         assert!(prompt.contains("You are CodeLeveler"));
-        assert!(prompt.contains("Read before you edit"));
     }
 
+    /// A named language is a product requirement, and it covers the streamed
+    /// reasoning text too — that is where it was measured breaking.
     #[test]
-    fn base_prompt_contains_persistence_guidance() {
-        let prompt = PromptBuilder::new().build();
-
-        assert!(prompt.contains("Persist until the task is fully handled"));
-        assert!(prompt.contains("do not stop just because a tool call failed"));
-    }
-
-    #[test]
-    fn progress_updates_explain_evidence_impact_and_next_action() {
-        let prompt = PromptBuilder::new()
-            .base_instructions(Some("custom model prompt".to_string()))
-            .build();
-
-        assert!(prompt.contains("evidence"), "{prompt}");
-        assert!(prompt.contains("implication"), "{prompt}");
-        assert!(prompt.contains("next action"), "{prompt}");
-        assert!(prompt.contains("found the root cause"), "{prompt}");
-    }
-
-    /// The full language contract — the ban on English process templates and the
-    /// rewrite-before-send rule — now lives in the turn context's NAMED language
-    /// line, not the base prompt. That is the load-bearing copy: it survives a
-    /// model-profile override (which replaces the base) and is not paid for on
-    /// turns whose language we cannot name. The base prompt no longer duplicates
-    /// it.
-    #[test]
-    fn named_language_context_forbids_english_process_templates() {
+    fn a_named_language_covers_every_user_visible_sentence() {
         let prompt = PromptBuilder::new()
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: std::path::PathBuf::from("/w"),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级工具库"),
                 repo_map: None,
@@ -434,40 +328,8 @@ mod tests {
             .build();
 
         assert!(prompt.contains("Write EVERY user-visible sentence"));
-        assert!(prompt.contains("interim progress notes"));
-        assert!(prompt.contains("reasoning/thinking"));
-        assert!(prompt.contains("\"Now...\", \"First...\", \"Good...\", or \"Let me...\""));
-        assert!(prompt.contains("wrong language"));
-
-        // The base prompt itself no longer carries the language contract.
-        assert!(!PromptBuilder::new().build().contains("Language matching"));
-    }
-
-    #[test]
-    fn base_prompt_guides_javascript_package_script_commands() {
-        let prompt = PromptBuilder::new().build();
-
-        assert!(prompt.contains("Inspect the repository manifest before choosing commands"));
-        assert!(prompt.contains("`npm run test -- test/foo.test.ts`"));
-        assert!(prompt.contains("do not run package scripts through `npx run ...`"));
-        assert!(prompt.contains("Use `npx` only for package binaries"));
-        assert!(prompt.contains("If the user names an exact verification command"));
-        assert!(prompt.contains("as the first verification attempt"));
-        assert!(prompt.contains("do not add wrappers"));
-        assert!(prompt.contains("missing from PATH"));
-    }
-
-    #[test]
-    fn structural_guidance_is_opt_in() {
-        let base = PromptBuilder::new().build();
-
-        assert!(!base.contains("before you start changing files"));
-        assert!(!base.contains("do NOT declare the task complete"));
-
-        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
-
-        assert!(prompt.contains("before you start changing files"));
-        assert!(prompt.contains("do NOT declare the task complete"));
+        assert!(prompt.contains("Chinese"));
+        assert!(prompt.contains("reasoning text streamed to the"));
     }
 
     #[test]
@@ -596,20 +458,11 @@ mod tests {
         assert!(BASE_PROMPT.contains("You are CodeLeveler"));
     }
 
-    /// C2.3B §30 A/B/C — navigation discipline is HARNESS baseline behavior:
-    /// it ships in `prompts/base.md`, so every production request carries it,
-    /// and every provider gets the same principles. A model profile that
-    /// C2.3B §2/§6 — broader reads must stay legitimate. The guidance may not
-    /// forbid whole-file reads or argue from token cost: the goal is evidence
-    /// C2.3B §4 — a known location must not cost a ceremonial search. The
-    /// guidance has to state the KNOWN case, or "search first" degrades into
-    /// `list_files` was the FIRST tool call on 5 of 7 baseline cases: a whole
-    /// round trip spent asking what exists. The listing rides in the system
-    /// prompt, which is built once per turn and stays byte-identical for the
-    /// loop, so it is paid for once and served from the prefix cache after.
+    /// The listing is context. It states what is there and stops — which tool
+    /// to reach for next is the model's call.
     #[test]
-    fn the_workspace_listing_reaches_the_prompt_and_says_what_it_is_for() {
-        let mut ctx = context(PermissionProfile::Assisted, false);
+    fn the_workspace_listing_reaches_the_prompt() {
+        let mut ctx = context(PermissionProfile::Assisted, true);
         ctx.repo_map = Some("src/lib.rs\nsrc/main.rs".to_string());
         let prompt = PromptBuilder::new().turn_context(ctx).build();
         assert!(
@@ -617,8 +470,8 @@ mod tests {
             "{prompt}"
         );
         assert!(
-            prompt.contains("do not call a directory tool just to learn what exists"),
-            "the listing has to say why it is there: {prompt}"
+            !prompt.contains("do not call a directory tool"),
+            "context states facts; it does not route tool choice: {prompt}"
         );
     }
 
@@ -637,273 +490,90 @@ mod tests {
         }
     }
 
-    /// A goal that ends correctly but in two turns costs a whole extra round
-    /// trip — measured at ~3.8 s, and it fired on 5 of 7 baseline cases. The
-    /// closeout nudge recovers it, but recovery is not the normal path. The
-    /// prompt used to call `update_goal` "silent bookkeeping", which reads as
-    /// a formality to do afterwards rather than the act that ends the goal.
+    /// `update_goal` is what ends a goal, and the ordering is the whole point:
+    /// final prose does not close one, and a turn spent only on the call costs
+    /// a round trip.
     #[test]
     fn the_goal_contract_puts_completion_in_the_finishing_turn() {
         let prompt = PromptBuilder::new().build();
         assert!(
-            prompt.contains("SAME turn as your final answer"),
+            prompt.contains("same turn as your final answer"),
             "the ordering is the whole point: {prompt}"
         );
         assert!(
-            prompt.contains("Final prose does not close a goal"),
-            "what does NOT end a goal has to be said: {prompt}"
-        );
-        assert!(
-            !prompt.contains("silent bookkeeping"),
-            "that framing is what made it look optional: {prompt}"
-        );
-        assert!(
-            prompt.contains("never narrate process state"),
-            "keeping the call invisible to the user must survive: {prompt}"
+            prompt.contains("final prose does not close a goal"),
+            "{prompt}"
         );
     }
 
-    /// The UI already draws every tool call, so prose that only restates the
-    /// next action prints the same fact twice. The contract has to say that
-    /// silence is allowed — otherwise the model fills every gap with
-    /// "let me read a few files" above a row that already says so.
+    /// The interface draws every tool call, so prose that only restates the
+    /// next action prints the same fact twice. This is a UX constraint on
+    /// duplication, not a template for what to think.
     #[test]
     fn narration_guidance_forbids_echoing_the_tool_call() {
         let prompt = PromptBuilder::new().build();
         assert!(
-            prompt.contains("Do not narrate what the tool call already shows"),
+            prompt.contains("interface already renders every tool call"),
             "the rule must be explicit: {prompt}"
         );
         assert!(
-            prompt.contains("call the tool with no prose"),
-            "saying nothing has to be an allowed answer: {prompt}"
+            prompt.contains("no prose at all"),
+            "silence must be allowed: {prompt}"
         );
-        assert!(
-            prompt.contains("purpose") && prompt.contains("implies"),
-            "what a narration should add must be named: {prompt}"
-        );
-        assert!(
-            prompt.contains("One sentence is enough"),
-            "and it must not invite longer prose: {prompt}"
-        );
-    }
-
-    /// A plan created once and never touched again is worse than no plan: the
-    /// user watches "step 1/8 in progress" while the agent builds step 5. The
-    /// prompt has to name WHEN to synchronize, because the runtime cannot —
-    /// whether a step is done is a judgement only the model can make.
-    #[test]
-    fn plan_guidance_says_when_to_synchronize_not_just_to_revise() {
-        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
-        assert!(
-            prompt.contains("keep it synchronized"),
-            "the standing obligation must be explicit: {prompt}"
-        );
-        assert!(
-            prompt.contains("at that transition"),
-            "the moment matters, not just the act: {prompt}"
-        );
-        assert!(
-            prompt.contains("At most one step is in_progress"),
-            "the structural rule travels with the timing rule: {prompt}"
-        );
-        assert!(
-            prompt.contains("Do not call it") && prompt.contains("inside a single step"),
-            "one call per tool call would burn rounds for nothing: {prompt}"
-        );
-        assert!(
-            prompt.contains("Never mark a step completed just to make the checklist look"),
-            "a checklist that lies to look current is worse than a stale one: {prompt}"
-        );
-    }
-
-    /// C2.3B §30 D/F — C2.3A's contract is untouched: the plan block may ask
-    /// for a plan before *mutations*, but nothing in the prompt may frame
-    /// navigation as optional or as a lesser action, and no guidance may force
-    /// a tool choice.
-    #[test]
-    fn plan_guidance_does_not_demote_navigation() {
-        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
-        assert!(
-            prompt.contains("update_plan"),
-            "multi-step mutation still expects a plan"
-        );
-        for demoting in ["optional read-only explore", "first substantive action"] {
+        for template in ["current step k/n", "evidence) → next"] {
             assert!(
-                !prompt.contains(demoting),
-                "C2.3A removed the navigation wall; the prompt must not rebuild it: {demoting:?}"
+                !prompt.contains(template),
+                "a reasoning template is not a UX constraint ({template:?})"
             );
         }
-        assert!(
-            prompt.contains("before you start changing files"),
-            "the plan requirement must be scoped to mutation: {prompt}"
-        );
     }
 
-    /// C2.3B §15 — the dual of "re-read when a recollection may be stale":
-    /// Analysis/review answers must not promote "tests passed" into unearned
-    /// performance or "no regression" claims (evidence discipline).
+    /// Reporting discipline: what a green suite actually supports, and the ban
+    /// on unmeasured performance claims.
     #[test]
     fn base_prompt_requires_evidence_layers_for_analysis_claims() {
         let prompt = PromptBuilder::new().build();
+        assert!(prompt.contains("Reporting what happened"), "{prompt}");
         assert!(
-            prompt.contains("Evidence discipline"),
-            "must name the analysis evidence rules"
+            prompt.contains("no failures were found on the paths those tests cover"),
+            "{prompt}"
         );
+        assert!(prompt.contains("not measured"), "{prompt}");
         assert!(
-            prompt.contains("not measured") || prompt.contains("Not measured"),
-            "must force unmeasured benefits to be labeled"
-        );
-        assert!(
-            prompt.contains("first true deep copy") || prompt.contains("deep copy"),
-            "must require tracing Arc/clone claims to the first deep copy"
-        );
-        assert!(
-            prompt.contains("do **not** write \"no regression\"")
-                || prompt.contains("no regression"),
-            "must forbid overclaiming from default test green"
+            prompt.contains("Report an action from its tool result"),
+            "{prompt}"
         );
     }
 
-    /// The default guidance tells the model to GO DEEP, which is right for
-    /// analysis but wrong for reporting an edit — it produces a final message
-    /// pasting whole before/after bodies the user can already see in the diff.
+    /// An edit report is sized to the edit, and never pastes the diff the user
+    /// already has.
     #[test]
     fn reporting_a_code_change_is_compact_and_never_pastes_the_diff() {
         let prompt = PromptBuilder::new().build();
-
+        assert!(prompt.contains("match depth to the question"), "{prompt}");
         assert!(
-            prompt.contains("size the message to the change"),
-            "the report must scale with the edit"
+            prompt.contains("Do not paste diffs, whole files, or before/after pairs"),
+            "{prompt}"
         );
-        assert!(
-            prompt.contains("NEVER paste before/after pairs"),
-            "the user already has the diff"
-        );
-        assert!(
-            prompt.contains("does not apply to analysis"),
-            "must not muzzle explanation answers"
-        );
+        assert!(prompt.contains("`path:line`"), "{prompt}");
     }
 
-    /// We inject nested AGENTS.md blocks mid-transcript but never told the model
-    /// how they compose. Two holes: a deep rule silently loses to a root rule (or
-    /// vice versa, unpredictably), and — the security one — a rules FILE can tell
-    /// the model to ignore the user, because nothing established who outranks whom.
+    /// A rules file has a scope and a rank. Without the rank, a file in the
+    /// repository can tell the model to ignore the user.
     #[test]
     fn project_rules_have_a_scope_and_a_precedence_order() {
         let prompt = PromptBuilder::new().build();
-
         assert!(
-            prompt.contains("entire directory tree rooted at"),
-            "scope must be stated"
+            prompt.contains("directory tree it came from"),
+            "scope must be stated: {prompt}"
         );
         assert!(
-            prompt.contains("more deeply nested"),
-            "conflicts need a winner"
+            prompt.contains("most deeply nested block wins"),
+            "conflict order must be stated: {prompt}"
         );
         assert!(
-            prompt.contains("take precedence over any project rule"),
-            "a rules file must not be able to outrank the user"
-        );
-    }
-
-    /// Running the whole suite first is slow and, worse, surfaces pre-existing
-    /// failures the model then tries to "fix" — derailing the actual task. And a
-    /// repo with no tests must not grow a test framework the user never asked for.
-    #[test]
-    fn verification_narrows_before_it_widens_and_ignores_unrelated_failures() {
-        let prompt = PromptBuilder::new().build();
-
-        assert!(
-            prompt.contains("narrowest check that exercises your change"),
-            "must verify the change itself before the whole suite"
-        );
-        assert!(
-            prompt.contains("do NOT fix them"),
-            "pre-existing failures are not this task"
-        );
-        assert!(
-            prompt.contains("no tests at all"),
-            "must not bolt a test framework onto a repo that has none"
-        );
-    }
-
-    /// "Keep a short checklist" names the tool but sets no bar, and the observed
-    /// failure is a plan whose steps merely restate the goal ("1. Build the CLI
-    /// tool") — pure overhead that verifies nothing. The prompt must show the
-    /// difference and forbid the degenerate cases.
-    #[test]
-    fn plan_guidance_sets_a_quality_bar_not_just_a_tool_name() {
-        let prompt = PromptBuilder::new().build();
-
-        assert!(
-            prompt.contains("never write a single-step plan"),
-            "a one-step plan is pure overhead"
-        );
-        assert!(
-            prompt.contains("restate the goal"),
-            "must name the degenerate plan"
-        );
-        assert!(prompt.contains("Bad plan"), "needs a contrasting example");
-        assert!(prompt.contains("Good plan"), "needs a contrasting example");
-        assert!(
-            prompt.contains("independently verifiable"),
-            "must state what a step actually is"
-        );
-        assert!(
-            prompt.contains("do not repeat the plan back"),
-            "the UI already renders it — repeating it wastes the turn"
-        );
-    }
-
-    /// Strict status discipline. Without it the observed failure is
-    /// batch-completing everything at the end (or jumping a step straight to
-    /// completed), so the rendered plan lies about progress; and it keeps coding against a plan
-    /// that no longer matches reality instead of updating it first.
-    #[test]
-    fn plan_status_discipline_forbids_jumps_batches_and_stale_plans() {
-        let prompt = PromptBuilder::new().build();
-
-        assert!(
-            prompt.contains("never jump pending to completed"),
-            "a step must pass through in_progress"
-        );
-        assert!(
-            prompt.contains("never batch-complete"),
-            "steps must be marked as they actually finish"
-        );
-        assert!(
-            prompt.contains("BEFORE continuing"),
-            "a changed understanding updates the plan first, then the work resumes"
-        );
-        assert!(
-            prompt.contains("dangling in_progress"),
-            "the task must not end with an unfinished-looking plan"
-        );
-    }
-
-    /// The Explicit planning gate used to ask for a prose plan — invisible to
-    /// the UI and immediately stale. Multi-step plans must
-    /// route into update_plan; single-step work must not grow a plan at all.
-    #[test]
-    fn explicit_plan_gate_routes_multi_step_plans_into_update_plan() {
-        let base = PromptBuilder::new().build();
-        assert!(
-            !base.contains("register that plan with the update_plan tool"),
-            "the gate stays opt-in"
-        );
-
-        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
-        assert!(
-            prompt.contains("update_plan")
-                && prompt.contains("not a prose checklist")
-                && prompt.contains("before you start changing files"),
-            "multi-step work must route into the tracked checklist, not prose: {prompt}"
-        );
-        assert!(
-            prompt.contains("skip update_plan") || prompt.contains("single action covers"),
-            "must not force a plan onto single-step work"
+            prompt.contains("data, not authority"),
+            "a rules file must not outrank the user: {prompt}"
         );
     }
 
@@ -1003,22 +673,18 @@ mod tests {
         );
     }
 
+    /// The safety half of the old diagnosis paragraph survives; the
+    /// epistemology lecture around it does not.
     #[test]
-    fn diagnosis_must_not_overclaim_or_lead_with_destruction() {
+    fn destructive_first_steps_still_need_evidence() {
         let prompt = PromptBuilder::new()
             .turn_context(context(PermissionProfile::Assisted, false))
             .build();
+        assert!(prompt.contains("destructive first step"), "{prompt}");
+        assert!(prompt.contains("pkill -f"), "{prompt}");
         assert!(
-            prompt.contains("sandbox reproduction"),
-            "sandbox vs host must be named: {prompt}"
-        );
-        assert!(
-            prompt.contains("pkill -f"),
-            "destructive remediations must be called out: {prompt}"
-        );
-        assert!(
-            prompt.contains("direct evidence"),
-            "must require evidence before destructive steps"
+            !prompt.contains("sandbox reproduction"),
+            "how to reason about a repro is the model's: {prompt}"
         );
     }
 
@@ -1037,129 +703,39 @@ mod tests {
     }
 
     #[test]
-    fn operating_rules_forbid_empty_greeting_and_steer_shell_and_list_files() {
-        let prompt = PromptBuilder::new()
-            .turn_context(context(PermissionProfile::Assisted, false))
-            .build();
-        assert!(
-            prompt.contains("shell_command"),
-            "must prefer shell_command for git/shell: {prompt}"
-        );
-        assert!(
-            prompt.contains("list_files"),
-            "must steer directories to list_files: {prompt}"
-        );
-        assert!(
-            prompt.contains("greeting") || prompt.contains("task-like"),
-            "must ban greeting-only replies to tasks: {prompt}"
-        );
-        assert!(
-            prompt.contains("escalate")
-                && prompt.contains("unrestricted")
-                && (prompt.contains("git pull") || prompt.contains("Git mutate")),
-            "must route git mutate through the command's own FS escalation: {prompt}"
-        );
-    }
-
-    #[test]
     fn base_prompt_enforces_concise_presentation() {
         let prompt = PromptBuilder::new().build();
+        assert!(prompt.contains("Presenting your work"), "{prompt}");
+        assert!(prompt.contains("Be concise by default"), "{prompt}");
+        assert!(prompt.contains("No process closeout"), "{prompt}");
         assert!(
-            prompt.contains("Presenting your work and final message"),
-            "must include presentation guidance: {prompt}"
-        );
-        assert!(
-            prompt.contains("greetings") || prompt.contains("casual conversation"),
-            "must teach casual/greeting brevity: {prompt}"
-        );
-        assert!(
-            prompt.contains("no previous context") || prompt.contains("Same-session"),
-            "must teach follow-up context use: {prompt}"
-        );
-        assert!(
-            !prompt.contains("stacked \"analysis done"),
-            "old closeout-filler wording should be gone"
-        );
-        assert!(
-            prompt.contains("Soft follow-up tip"),
-            "must teach optional friendly tip (not process closeout): {prompt}"
-        );
-        assert!(
-            prompt.contains("at most one short tip line")
-                || prompt.contains("at most one soft tip"),
-            "must cap tips to one line: {prompt}"
-        );
-        assert!(
-            prompt.contains("Do not tip when") || prompt.contains("don't invent a multi-item"),
-            "must forbid invented roadmaps as tips: {prompt}"
-        );
-        assert!(
-            prompt.contains("纯信息查询") || prompt.contains("process closeout"),
-            "must keep process-closeout examples banned: {prompt}"
+            prompt.contains("at most one short follow-up tip"),
+            "{prompt}"
         );
     }
 
+    /// Removed with the rest of the effort coaching: how much to do for a
+    /// given message is the model's read of it, and the prompt no longer
+    /// scripts the greeting case.
     #[test]
-    fn base_prompt_bans_generic_greeting_on_tasks() {
+    fn base_prompt_does_not_script_the_greeting_case() {
         let prompt = PromptBuilder::new().build();
-        assert!(
-            prompt.contains("Never reply with only a generic greeting")
-                || prompt.contains("generic greeting"),
-            "base prompt must ban empty greetings on tasks"
-        );
-        assert!(prompt.contains("shell_command"));
-        assert!(prompt.contains("list_files"));
-        assert!(
-            prompt.contains("request_user_input"),
-            "base prompt must advertise the primary clarification tool"
-        );
-        // The git-mutate elevation rule depends on the permission mode, so it
-        // lives in the turn context (see operating_rules), not the base prompt.
-        assert!(
-            !prompt.contains("escalate"),
-            "git elevation is a turn-context rule, not a base-prompt one"
-        );
-        assert!(
-            prompt.contains("SKILL TURN INJECTION")
-                || prompt.contains("load_skill")
-                || prompt.contains("progressive disclosure"),
-            "base prompt must include skills how-to-use: {prompt}"
-        );
-        assert!(
-            prompt.contains("$name") || prompt.contains("$skill") || prompt.contains("`$name`"),
-            "base prompt must mention $name skill naming"
-        );
+        assert!(!prompt.contains("generic greeting"), "{prompt}");
+        assert!(!prompt.contains("Scale your effort"), "{prompt}");
     }
 
-    /// Choice forks must use structured options via request_user_input, not a
-    /// prose "waiting for confirmation" pause (L1 decision-gate rule).
+    /// A fork the user must settle goes through `request_user_input` with
+    /// options. Prose is not a pause: the interface renders a choice from
+    /// `options`, so "waiting for confirmation" in a message stops nothing.
     #[test]
     fn base_prompt_requires_structured_decision_gates() {
         let prompt = PromptBuilder::new().build();
+        assert!(prompt.contains("request_user_input"), "{prompt}");
         assert!(
-            prompt.contains("Decision gates") || prompt.contains("decision gate"),
-            "base prompt must name decision gates: {prompt}"
+            prompt.contains("2–4 mutually exclusive choices"),
+            "{prompt}"
         );
-        assert!(
-            prompt.contains("request_user_input"),
-            "decision gates must route through request_user_input"
-        );
-        assert!(
-            prompt.contains("options"),
-            "decision gates must require concrete options"
-        );
-        assert!(
-            prompt.contains("fake pause")
-                || prompt.contains("waiting for confirmation")
-                || prompt.contains("想问一下"),
-            "must ban prose-only waiting as a substitute for a real gate"
-        );
-        assert!(
-            prompt.contains("mutually exclusive")
-                || prompt.contains("2–4")
-                || prompt.contains("2-4"),
-            "must specify option shape for choice forks"
-        );
+        assert!(prompt.contains("Prose alone is not a pause"), "{prompt}");
     }
 
     /// Full access grants no network prompt, so the blocked-network rules must not fire.
@@ -1265,16 +841,15 @@ mod tests {
         assert!(user_language("把 `CodeFinder.find()` 的返回值改成 `([]string, error)`").is_some());
     }
 
+    /// The cache-stable prefix: two assemblies with the same inputs are the
+    /// same bytes, so the provider's prefix cache is not invalidated per turn.
     #[test]
     fn core_system_prefix_is_byte_stable_across_assemblies() {
-        // Cache-stable prefix: same builder options must yield identical system text
-        // when turn context is absent (task contracts never land in this path).
-        let a = PromptBuilder::new().require_explicit_plan(true).build();
-        let b = PromptBuilder::new().require_explicit_plan(true).build();
+        let a = PromptBuilder::new().build();
+        let b = PromptBuilder::new().build();
         assert_eq!(a, b);
         assert!(!a.contains("Request:"));
         assert!(!a.contains("Constraints:"));
-        assert!(a.contains("current step k/n") || a.contains("Progress narration"));
     }
 
     /// Regression lock on `base.md`'s proactive-memory section: it must reach
@@ -1365,10 +940,7 @@ mod prompt_budget {
     #[test]
     fn the_system_prompt_stays_within_its_measured_budget() {
         let plain = PromptBuilder::new().build().len();
-        let planned = PromptBuilder::new()
-            .require_explicit_plan(true)
-            .build()
-            .len();
+        let planned = PromptBuilder::new().build().len();
         assert!(plain < 30_000, "system prompt grew to {plain} bytes");
         assert!(planned < 32_000, "with the plan block: {planned} bytes");
     }

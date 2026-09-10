@@ -12,15 +12,13 @@ use leveler_model::{
 };
 use leveler_tools::ToolRegistry;
 
-use super::gates;
-
 use super::closeout::{
     CLOSEOUT_NUDGE_BUDGET, CloseoutAction, CloseoutBudget, CloseoutInput, CloseoutReason, decide,
     stalled_detail,
 };
 use super::dispatch::{
     collect_modified, compact_json, deny_call, extract_applied_diff, extract_image, extract_plan,
-    newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
+    newly_modified_paths, note_tool_side_effects, preview,
 };
 use super::host::AdmitError;
 use super::{
@@ -28,7 +26,7 @@ use super::{
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    collect_scoped_paths_from_call, is_verification_program, observe_class, push_unique_path,
+    collect_scoped_paths_from_call, is_verification_program, push_unique_path,
     unproven_verification_note,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
@@ -42,7 +40,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::{first_user_text, goal_resolve_nudge};
+use crate::nudges::goal_resolve_nudge;
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
     multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
@@ -95,21 +93,6 @@ impl Drop for BackgroundChildren {
     }
 }
 
-/// Whether a plan is claiming that some step is underway right now. Only such
-/// a plan can go stale: one with nothing in progress asserts nothing about
-/// the current work.
-fn plan_has_active_step(plan: &PlanState) -> bool {
-    plan.steps.iter().any(|s| s.status == "in_progress")
-}
-
-/// The one soft reminder a multi-step task gets when the model has worked
-/// for a few rounds without registering a plan. Advisory only: no tool is
-/// refused for a missing plan, and the model may keep working without one.
-pub(crate) const PLAN_SOFT_NUDGE_TEXT: &str = "This task may benefit from a structured plan: if you already have a \
-                     clear multi-step execution path, you may register it with update_plan \
-                     (one in_progress step, the rest pending) so progress is visible. A \
-                     plan is not required — continue exploring or editing as you see fit.";
-
 /// Default per-turn round ceiling for BOUNDED work that did not pin its own
 /// `max_rounds` — a measured unit (an eval case, an orchestration node) is
 /// supposed to have a hard edge, so it gets one.
@@ -120,33 +103,9 @@ pub(crate) const PLAN_SOFT_NUDGE_TEXT: &str = "This task may benefit from a stru
 /// long tasks stop with "round ceiling reached" and forced the user to type
 /// 「继续」 to resume the very same work. Such a turn ends on a semantic
 /// terminal state or on a real mechanical guard (cancellation, the
-/// token/cost/duration budgets, the repeated-call and no-progress watchdogs),
-/// never on a round tally.
+/// token/cost/duration budgets, the no-progress watchdog), never on a round
+/// tally.
 const MAX_BOUNDED_TURN_ROUNDS: u32 = 100;
-
-/// Soft plan nudge only: after this many rounds without a plan on a task that
-/// reads as multi-step, inject one advisory. Never used to refuse a tool or
-/// force ToolChoice — the plan is the model's cognitive aid, not a mutation
-/// license.
-const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
-
-/// The one advisory an ACTIVE plan gets when it has stopped tracking the
-/// work. Advisory only: no tool is refused, no status is changed, and a model
-/// that is genuinely still on the same step is told to leave it alone.
-pub(crate) const PLAN_FRESHNESS_TEXT: &str = "Your active plan has not been updated for a while. If your work has \
-     moved on to another plan step, synchronize it with update_plan: mark the \
-     finished step completed and the one you are on now in_progress. If the \
-     current step is genuinely still active, leave the plan unchanged and \
-     continue.";
-
-/// Rounds of REAL work (a workspace mutation or an executed command) that may
-/// pass after a plan update before the model is reminded once. Counted in work
-/// rounds, not raw rounds: thinking and reading are part of a step, so a plan
-/// that stands still through them is not stale.
-///
-/// This detects a stale plan. It never decides that a step is DONE — that is a
-/// semantic judgement the runtime has no authority to make.
-const PLAN_FRESHNESS_AFTER_WORK_ROUNDS: u32 = 6;
 
 /// Bounded recovery from a malformed tool call: tool arguments sometimes
 /// arrive as invalid JSON (an unescaped backslash from a regex, a raw newline
@@ -188,18 +147,6 @@ pub(crate) struct Drive<'a> {
     epoch_tokens_at_start: u64,
     epoch_estimated_at_start: u64,
     epoch_duration_at_start: std::time::Duration,
-    structured_plan_required: bool,
-    plan_rounds_without_plan: u32,
-    plan_soft_nudge_sent: bool,
-    /// Work rounds since the plan was last synchronized. Reset by every
-    /// successful `update_plan`, so a model that keeps its plan current is
-    /// never reminded.
-    plan_stale_work_rounds: u32,
-    /// One advisory per stale interval — a per-round reminder would be spam.
-    plan_freshness_notice_sent: bool,
-    /// Baselines for "did this round do real work", compared per round.
-    plan_work_files_seen: usize,
-    plan_work_commands_seen: u32,
     budget_note_sent: bool,
     plan_state: PlanState,
     structured_plan_started: bool,
@@ -221,9 +168,6 @@ pub(crate) struct Drive<'a> {
     verification_ran: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
-    /// No-progress loop guard: "name\0args" -> (last result, repeats, epoch).
-    call_history: std::collections::HashMap<String, (String, u32, u64)>,
-    novelty_epoch: u64,
     decode_retries: u32,
     length_continuations: u32,
     continued_text: String,
@@ -283,12 +227,6 @@ impl Executor {
             tools.push(update_goal_tool_definition());
         }
 
-        // Active objective is host-pinned (this turn / session goal).
-        let original_task = if objective.is_empty() {
-            first_user_text(&messages)
-        } else {
-            objective.text().to_string()
-        };
         let mut progress = self
             .seeded_progress
             .clone()
@@ -364,8 +302,6 @@ impl Executor {
             observer,
             sink,
             tools,
-            structured_plan_required: self.policy.require_explicit_plan
-                && task_needs_structured_plan(&original_task),
             modified_files: Vec::new(),
             scoped_paths: Vec::new(),
             progress_caps: ProgressCaps::default(),
@@ -376,12 +312,6 @@ impl Executor {
                 progress.cumulative_duration_ms,
             ),
             commands_run: progress.cumulative_commands,
-            plan_rounds_without_plan: 0,
-            plan_soft_nudge_sent: false,
-            plan_stale_work_rounds: 0,
-            plan_freshness_notice_sent: false,
-            plan_work_files_seen: 0,
-            plan_work_commands_seen: progress.cumulative_commands,
             budget_note_sent: false,
             structured_plan_started: !self.seeded_plan.is_empty(),
             plan_state: self.seeded_plan.clone(),
@@ -404,8 +334,6 @@ impl Executor {
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
-            call_history: std::collections::HashMap::new(),
-            novelty_epoch: 0,
             decode_retries: 0,
             length_continuations: 0,
             continued_text: String::new(),
@@ -740,35 +668,6 @@ impl AgentHarness for Drive<'_> {
             // next turn, so this never duplicates the system prompt).
             self.sink.append(std::slice::from_ref(&rules)).await?;
             messages.push(rules);
-        }
-
-        // One soft plan reminder for a multi-step task the model has been
-        // working on without a plan. Advisory: nothing is refused.
-        if self.structured_plan_required
-            && !self.structured_plan_started
-            && self.plan_rounds_without_plan >= PLAN_SOFT_NUDGE_AFTER_ROUNDS
-            && !self.plan_soft_nudge_sent
-        {
-            let nudge = Message::text(Role::User, PLAN_SOFT_NUDGE_TEXT);
-            self.sink.append(std::slice::from_ref(&nudge)).await?;
-            messages.push(nudge);
-            self.plan_soft_nudge_sent = true;
-        }
-
-        // One advisory when an ACTIVE plan has stopped tracking the work.
-        // The runtime can see that the plan has not moved while real work
-        // happened; it cannot see whether the current step is done, so it
-        // asks and changes nothing. A plan with no in-progress step is not
-        // claiming anything is underway, so it is not stale.
-        if self.structured_plan_started
-            && !self.plan_freshness_notice_sent
-            && self.plan_stale_work_rounds >= PLAN_FRESHNESS_AFTER_WORK_ROUNDS
-            && plan_has_active_step(&self.plan_state)
-        {
-            let note = Message::text(Role::User, PLAN_FRESHNESS_TEXT);
-            self.sink.append(std::slice::from_ref(&note)).await?;
-            messages.push(note);
-            self.plan_freshness_notice_sent = true;
         }
 
         // A pinned task budget is the model's to spend: at 80% it is told
@@ -1182,14 +1081,13 @@ impl AgentHarness for Drive<'_> {
         struct ParallelJob {
             index: usize,
             admitted: crate::executor::host::AdmittedCall,
-            loop_key: String,
         }
         let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
         // spawn_agent calls deferred to run concurrently after this pass.
         let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-        // Calls a guard refused before they ran (loop guard, budgets,
-        // allowlist, permission). A round consisting solely of refusals is
-        // no progress — it feeds the all-refused streak.
+        // Calls a guard refused before they ran (budgets, allowlist,
+        // permission). A round consisting solely of refusals is no progress —
+        // it feeds the all-refused streak.
         let mut denied_calls_this_round: usize = 0;
         // User cancel observed inside this batch. The batch stops, but the
         // round is still committed (results + spend) before Cancelled
@@ -1635,32 +1533,6 @@ impl AgentHarness for Drive<'_> {
                 }
             }
 
-            // No-progress loop guard: same observe class (e.g. git status via
-            // run_command vs shell_command) or exact (tool, args) already
-            // produced an identical result LOOP_GUARD_THRESHOLD times.
-            let loop_key = observe_class(&call.name, &call.arguments)
-                .unwrap_or_else(|| format!("{}\0{}", call.name, compact_json(&call.arguments)));
-            let repeats = if self.executor.policy.progress_guards {
-                match self.call_history.get(&loop_key) {
-                    // Something novel happened since this key last repeated:
-                    // let it run and let the RESULT decide, instead of
-                    // predicting that the world stood still.
-                    Some((_, _, epoch)) if *epoch != self.novelty_epoch => 0,
-                    Some((_, n, _)) => *n,
-                    None => 0,
-                }
-            } else {
-                0
-            };
-            if let gates::GateVerdict::Refuse(msg) = gates::loop_guard(&call.name, repeats) {
-                // The loop guard only refuses after the SAME key produced
-                // IDENTICAL content twice: mechanical repetition, counted
-                // on the all-refused track like every other refusal.
-                denied_calls_this_round += 1;
-                results[index] = Some(deny_call(&mut *self.observer, call, msg));
-                continue;
-            }
-
             // Step budgets (spec §27): refuse the call BEFORE it runs once a
             // limit is reached; the run ends after this round's results are
             // committed. File budget also refuses a single multi-file patch
@@ -1948,11 +1820,7 @@ impl AgentHarness for Drive<'_> {
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
-                    parallel_jobs.push(ParallelJob {
-                        index,
-                        admitted,
-                        loop_key,
-                    });
+                    parallel_jobs.push(ParallelJob { index, admitted });
                     continue;
                 }
                 Ok(admitted) => {
@@ -2055,20 +1923,6 @@ impl AgentHarness for Drive<'_> {
                 pending_images.push(part);
             }
 
-            // Update the loop-guard window: identical output → count up,
-            // any change (progress) → reset to this new result.
-            match self.call_history.get_mut(&loop_key) {
-                Some(entry) if entry.0 == content => {
-                    entry.1 += 1;
-                    entry.2 = self.novelty_epoch;
-                }
-                _ => {
-                    self.novelty_epoch = self.novelty_epoch.saturating_add(1);
-                    self.call_history
-                        .insert(loop_key, (content.clone(), 1, self.novelty_epoch));
-                }
-            }
-
             // Validate plan updates against the in-memory mirror before
             // accepting them (skip-step / origin rules). Host mirror only
             // advances on success; tool text is rewritten on rejection.
@@ -2090,8 +1944,6 @@ impl AgentHarness for Drive<'_> {
                             // The plan now describes the work again: the
                             // stale interval starts over, and a future one
                             // may earn its own single reminder.
-                            self.plan_stale_work_rounds = 0;
-                            self.plan_freshness_notice_sent = false;
                             (self.observer)(AgentEvent::PlanUpdated {
                                 steps: self.plan_state.steps.clone(),
                             });
@@ -2260,19 +2112,6 @@ impl AgentHarness for Drive<'_> {
                 }
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
-                }
-                match self.call_history.get_mut(&job.loop_key) {
-                    Some(entry) if entry.0 == content => {
-                        entry.1 += 1;
-                        entry.2 = self.novelty_epoch;
-                    }
-                    _ => {
-                        self.novelty_epoch = self.novelty_epoch.saturating_add(1);
-                        self.call_history.insert(
-                            job.loop_key.clone(),
-                            (content.clone(), 1, self.novelty_epoch),
-                        );
-                    }
                 }
                 (self.observer)(AgentEvent::ToolResult {
                     id: job.admitted.call.id.as_str().to_string(),
@@ -2814,11 +2653,13 @@ impl AgentHarness for Drive<'_> {
         // a row and the turn stops, so an `UntilTerminal` run cannot spin
         // forever re-issuing guarded actions. Nothing here reads the
         // model's work for meaning: rounds with executed tools — failed or
-        // not — always count as progress, and identical repeats are
-        // already bounded by the per-key loop guard above.
-        let all_refused = self.executor.policy.progress_guards
-            && !call_snapshot.is_empty()
-            && denied_calls_this_round == call_snapshot.len();
+        // not — always count as progress.
+        // Unconditional: a run in which every attempted action is refused is
+        // making no progress, and stopping is lifecycle correctness rather
+        // than advice to the model. Nothing here reads a policy flag, because
+        // a safety boundary is not an experiment.
+        let all_refused =
+            !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len();
         if all_refused {
             self.progress.note_no_progress_round(round);
             (self.observer)(AgentEvent::ProgressUpdated {
@@ -2842,26 +2683,6 @@ impl AgentHarness for Drive<'_> {
             }
         } else if !call_snapshot.is_empty() {
             self.progress.note_progress(round);
-        }
-
-        // Count rounds without a plan so a single soft nudge can fire
-        // later. Never caps anything; not a budget.
-        if self.structured_plan_required && !self.structured_plan_started {
-            self.plan_rounds_without_plan = self.plan_rounds_without_plan.saturating_add(1);
-        }
-
-        // Did this round move the workspace? Reuses the signals the ledger
-        // already keeps — a file the tools reported modifying, a command
-        // they reported running — rather than counting tool calls, so a
-        // step spent reading and thinking never ages the plan.
-        let files_now = self.modified_files.len();
-        let commands_now = self.commands_run;
-        let did_work =
-            files_now > self.plan_work_files_seen || commands_now > self.plan_work_commands_seen;
-        self.plan_work_files_seen = files_now;
-        self.plan_work_commands_seen = commands_now;
-        if did_work && self.structured_plan_started {
-            self.plan_stale_work_rounds = self.plan_stale_work_rounds.saturating_add(1);
         }
 
         // Goal mode: an explicit update_goal this round ends the run now that
@@ -3404,9 +3225,8 @@ pub(crate) fn budget_note(used: u32, total: u32, already_sent: bool) -> Option<S
         return None;
     }
     Some(format!(
-        "Budget: {used} of {total} rounds for this task are used. Converge now: land \
-         the change, run the check that proves it, and call update_goal. If the \
-         goal cannot be reached in what remains, say so with update_goal(blocked)."
+        "Budget: {used} of {total} rounds for this task are used. If the goal \
+         cannot be reached in what remains, update_goal(blocked) says so."
     ))
 }
 

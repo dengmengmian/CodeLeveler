@@ -114,6 +114,13 @@ whose purpose is to normalize model intelligence across models. CodeLeveler
 accepts model intelligence as an input, not a deficiency the runtime must
 correct.
 
+Concretely, the system prompt carries identity, the authority boundary, runtime
+state, harness protocol and product constraints — and no method. It does not
+say when to plan, how to investigate, which tool to prefer, or when to stop
+retrying. An advisory injected mid-turn repairs a protocol state and names the
+operation that resolves it; it never reads the model's reasoning back to it.
+`docs/ARCHITECTURE.md` §12.1.
+
 The line is ownership, not effort:
 
 ```text
@@ -170,6 +177,10 @@ Three more, on what the model sees:
   divergence, runtime capability living in a tool adapter — is fixed directly.
   Removing a *capability* the product may depend on is where measurement is
   owed.
+- **The surface is composed, not inherited.** Every model-visible tool is in
+  one category — core primitive, optional pack, harness control, extension —
+  and every pack's condition is a mechanical fact about the host. A condition
+  may never read the task or the model. `docs/ARCHITECTURE.md` §6.2.
 
 `docs/ARCHITECTURE.md` §5 and §6 carry the detail. Do not copy it here.
 

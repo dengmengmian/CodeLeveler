@@ -55,7 +55,7 @@ pub struct ToolTaxonomyEntry {
 
 /// Built-in + virtual agent tools known to the TUI.
 ///
-/// Completeness against `leveler_tools::full_registry()` is asserted in tests.
+/// Completeness against `leveler_tools::default_registry()` is asserted in tests.
 pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "read_file",
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn taxonomy_covers_full_registry_tools() {
-        let reg = leveler_tools::full_registry();
+        let reg = leveler_tools::default_registry();
         let names: Vec<String> = reg.definitions().into_iter().map(|d| d.name).collect();
         assert!(!names.is_empty());
         for name in &names {

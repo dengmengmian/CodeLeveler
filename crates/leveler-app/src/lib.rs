@@ -47,7 +47,7 @@ use leveler_provider::{
     load_provider_config, resolve_api_key,
 };
 use leveler_storage::{Database, SessionRepository};
-use leveler_tools::{ToolContext, core_registry, full_registry};
+use leveler_tools::{CapabilityPacks, ToolContext, model_surface};
 
 /// Errors assembling the application.
 #[derive(Debug, thiserror::Error)]
@@ -471,6 +471,49 @@ impl Application {
         .await
     }
 
+    /// Which optional capability packs this host can put on the model's
+    /// surface.
+    ///
+    /// Every answer is a mechanical fact: is a browser runtime installed, is a
+    /// search provider configured, does this model accept an image. The work
+    /// profile is the one product choice in the list, and `Economy` means "the
+    /// primitives and the protocol, nothing else" — it is a user's decision
+    /// about cost, not an inference about the task.
+    ///
+    /// Nothing here consults the model's ability. A surface that grew because
+    /// a task looked hard, or shrank because a model looked weak, would be the
+    /// harness deciding for the model (`docs/ARCHITECTURE.md` §1.1).
+    async fn capability_packs(
+        &self,
+        work_profile: WorkProfile,
+        model: &leveler_model::ModelRef,
+    ) -> CapabilityPacks {
+        if work_profile == WorkProfile::Economy {
+            return CapabilityPacks::NONE;
+        }
+        let environment = self.environment.as_ref();
+        CapabilityPacks {
+            code_intelligence: true,
+            vcs: true,
+            web_fetch: true,
+            // The tool refuses without a key; advertising it anyway spends
+            // schema on a call that can only fail.
+            web_search: environment.var("LEVELER_SEARCH_API_KEY").is_some(),
+            // An image is useless to a model that cannot read one.
+            media: self
+                .registry
+                .profile(model)
+                .await
+                .map(|profile| profile.capabilities.vision)
+                .unwrap_or(false),
+            memory: true,
+            skills: true,
+            // The browser driver runs under Node; without it every one of the
+            // twelve browser tools fails on its first call.
+            browser: leveler_browser::which(environment, "node").is_some(),
+        }
+    }
+
     /// Like [`Self::engine_for`], but force a work profile (resume / axes reload).
     #[allow(clippy::too_many_arguments)]
     pub async fn engine_for_with_profile(
@@ -519,11 +562,9 @@ impl Application {
             Some(scope) => tool_context.with_session_scope(scope),
             None => tool_context,
         };
-        // Economy ships Core tool surface; balanced/delivery use Full.
-        let mut registry = match work_profile {
-            WorkProfile::Economy => core_registry(),
-            WorkProfile::Balanced | WorkProfile::Delivery => full_registry(),
-        };
+        // The model-visible surface is composed here, from what this host can
+        // actually do — never from a guess about the task or the model.
+        let mut registry = model_surface(self.capability_packs(work_profile, model).await);
         // Attach external MCP tools (connect once, cached across turns).
         for tool in self.mcp_tools().await {
             registry.register(tool);
