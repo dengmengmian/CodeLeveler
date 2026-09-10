@@ -452,15 +452,15 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
     if packs.web_fetch {
         registry.register(Arc::new(tools::WebFetchTool));
     }
-    if packs.web_search {
-        // The pack flag IS "a search key is configured" (see
-        // `leveler_app::Application::capability_availability`), so an exposed
-        // pack always arrives with its handle. A caller that sets the flag
-        // without the key gets a key-less client and the provider's own 401 —
-        // no second configuration check lives inside the tool.
-        registry.register(Arc::new(tools::WebSearchTool::new(
-            capabilities.search_api_key.clone().unwrap_or_default(),
-        )));
+    // The search pack needs BOTH halves and there is no stand-in for the
+    // missing one: the flag says the product asked for search, the key is what
+    // a search actually takes. A key-less `WebSearchTool` would be a tool whose
+    // every call is a 401, so it is not built — and because it is never built,
+    // `execute` has no "am I configured" branch to carry.
+    if packs.web_search
+        && let Some(key) = &capabilities.search_api_key
+    {
+        registry.register(Arc::new(tools::WebSearchTool::new(key.clone())));
     }
     if packs.media {
         registry.register(Arc::new(tools::ViewImageTool));
@@ -483,6 +483,11 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
 /// Every pack on, over in-process capability handles. The entry point tests
 /// use; production composes packs from what the host was asked for and can
 /// actually do, and hands over the services it owns (see `leveler-app`).
+///
+/// One pack cannot be composed here: `web_search` takes a provider key, and a
+/// constructor that needs nothing from a host has nowhere honest to get one.
+/// It is therefore absent from this registry — see
+/// [`model_surface`] with a keyed [`Capabilities`] for the full surface.
 pub fn default_registry() -> ToolRegistry {
     model_surface(
         CapabilityPacks::ALL,
@@ -686,10 +691,12 @@ mod tests {
         );
     }
 
-    /// Every pack on is the widest surface a host can offer.
+    /// Every pack on is the widest surface a host can offer. Composed over
+    /// handles that carry a search key, because `default_registry` has none
+    /// and a pack without its handle is not composed.
     #[test]
     fn every_pack_on_is_the_widest_surface() {
-        let names: Vec<String> = default_registry()
+        let names: Vec<String> = model_surface(CapabilityPacks::ALL, &keyed_test_capabilities())
             .definitions()
             .into_iter()
             .map(|d| d.name)
@@ -719,6 +726,34 @@ mod tests {
         // host composes, so `leveler_agent::register_harness_controls` adds
         // them on top.
         assert_eq!(names.len(), 37);
+    }
+
+    /// In-process handles plus the search key a configured host would have
+    /// found. The value is a placeholder: every test that uses it asserts on
+    /// composition, never on a request.
+    fn keyed_test_capabilities() -> crate::capabilities::Capabilities {
+        crate::tools::test_capabilities().with_search_api_key(Some("tvly-test-value".to_string()))
+    }
+
+    /// The mirror of the test above: asking for the search pack without a key
+    /// composes nothing. `default_registry` has no key, so this is also what
+    /// every test entry point sees.
+    #[test]
+    fn the_search_pack_without_a_key_composes_nothing() {
+        let with_key = model_surface(CapabilityPacks::ALL, &keyed_test_capabilities())
+            .definitions()
+            .len();
+        let without_key = model_surface(CapabilityPacks::ALL, &crate::tools::test_capabilities())
+            .definitions()
+            .len();
+        assert_eq!(without_key, with_key - 1, "only web_search moved");
+        assert!(
+            !default_registry()
+                .definitions()
+                .into_iter()
+                .any(|d| d.name == "web_search"),
+            "a key-less host must not carry a web_search that can only 401"
+        );
     }
 
     /// Tools the model no longer chooses. Each left for its own reason, and

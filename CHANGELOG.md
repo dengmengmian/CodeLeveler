@@ -36,6 +36,20 @@ All notable changes to CodeLeveler are documented here. The format follows
   themselves deleted in this release; compaction folds remain.)
 
 ### Changed
+- **`web_search` is Tavily, and `LEVELER_SEARCH_API_KEY` now holds a Tavily
+  key.** The tool used to carry two backends (Bing Search and Google Custom
+  Search) behind a provider switch. It now makes one request to one API.
+  **Migration:** put a Tavily key in `LEVELER_SEARCH_API_KEY` — the variable
+  name is unchanged, its meaning is not. `LEVELER_SEARCH_PROVIDER` and
+  `LEVELER_SEARCH_CX` are gone and are ignored if still set; a Bing or Google
+  key left in `LEVELER_SEARCH_API_KEY` will now fail with an HTTP 401 from
+  Tavily. The model's tool contract is untouched: `query` + `count`, default 5,
+  max 10. Configuration has a single owner — the host reads the key once, a
+  blank value counts as unset, and that one answer decides both whether
+  `web_search` is advertised and what it is built with. A host without a key
+  registers no `web_search` at all, so the tool no longer checks at call time
+  whether it was configured, and no longer advises the model on what to do
+  instead when a search fails.
 - **The system prompt is a contract, not an operating manual.** It carries
   identity, the authority boundary, runtime state, harness protocol and product
   constraints. It no longer carries a method: when to make a plan and how to
