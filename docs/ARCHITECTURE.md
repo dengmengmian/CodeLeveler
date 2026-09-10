@@ -657,7 +657,7 @@ can provide it (§6.4). Neither answer is ever about the task or the model:
 | Code Intelligence | `find_symbol`, `read_symbol`, `find_references`, `diagnostics`, `blast_radius` | always — the scan fallback needs nothing installed | outside Economy |
 | VCS | `git_status`, `git_diff` | `git` is on `PATH` | outside Economy |
 | Web fetch | `web_fetch` | always | outside Economy |
-| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` is set — the tool refuses without it | outside Economy |
+| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` holds a non-blank Tavily key | outside Economy |
 | Media | `view_image` | the model's profile declares `vision` | outside Economy |
 | Memory | `memory`, `remember`, `forget` | always — the app hands the tools a store root | outside Economy |
 | Skills | `load_skill` | always | outside Economy |
@@ -1547,22 +1547,31 @@ and then hashes and stores; `view_image` calls it and then base64-encodes.
 `leveler-tools` gained a dependency on `leveler-media` to do it, which is the
 right direction: the tool layer calls the capability.
 
-#### G. `web_search` owns provider configuration (open, by decision)
+#### G. `web_search` owns provider configuration (closed)
 
-The tool reads `LEVELER_SEARCH_API_KEY`, `LEVELER_SEARCH_PROVIDER` and
-`LEVELER_SEARCH_CX` from the environment snapshot, builds its own HTTP client,
-and implements both the Bing and Google Custom Search request and response
-shapes.
+The tool used to read `LEVELER_SEARCH_API_KEY`, `LEVELER_SEARCH_PROVIDER` and
+`LEVELER_SEARCH_CX` from the environment snapshot itself, and carried both the
+Bing and the Google Custom Search request and response shapes. It also decided,
+at call time, whether it was configured at all — which is the composition
+root's answer, not a tool's.
 
-**Left open on purpose.** There is one caller, one place the two provider
-shapes are written down, and no second consumer of a search capability. A
-`SearchProvider` extracted now would be a wrapper with one implementation and
-one user — the abstraction §5.3 exists to prevent. The audit found no
-duplicate runtime and no Host Authority bypass here: the tool goes through
-admission like any other, and `web_fetch` shares its SSRF gate.
+**Closed by deletion, not by abstraction.** The two provider shapes went; one
+backend (Tavily) remains, written down once, with no `SearchProvider` in front
+of it — a trait with one implementation and one user is the wrapper §5.3 exists
+to prevent. Configuration now has a single owner: `leveler-app` reads the key
+once, a blank value counts as unset, and that one answer feeds BOTH
+`capability_availability` and `WebSearchTool::new`. A host without a key
+registers no `web_search`, so the tool has no "not configured" branch left —
+that state cannot reach it.
 
-Extract it when a second consumer appears, or when a second provider shape has
-to be added.
+What stayed is not duplication. The `network_denied` check inside `execute` is
+the ONLY enforcement point for a tool that dials the network in-process: the
+ToolHost freezes `network_allowed` into the resolved policy, but the OS sandbox
+that enforces it covers `run_command` children, not a `reqwest` call in this
+process. `web_fetch` and the browser tools carry the same check for the same
+reason.
+
+Extract a provider seam when a second backend actually has to be supported.
 
 #### H. Background settlement belongs to the runtime (closed)
 

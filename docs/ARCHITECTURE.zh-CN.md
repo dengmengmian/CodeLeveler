@@ -485,7 +485,7 @@ EXTENSIONS           已配置 MCP server 的工具
 | Code Intelligence | `find_symbol`、`read_symbol`、`find_references`、`diagnostics`、`blast_radius` | 恒真——扫描 fallback 不需要装任何东西 | 非 Economy |
 | VCS | `git_status`、`git_diff` | `PATH` 上有 `git` | 非 Economy |
 | Web fetch | `web_fetch` | 恒真 | 非 Economy |
-| Web search | `web_search` | 设置了 `LEVELER_SEARCH_API_KEY`——没有 key 工具必然拒绝 | 非 Economy |
+| Web search | `web_search` | `LEVELER_SEARCH_API_KEY` 里有一个非空的 Tavily key | 非 Economy |
 | Media | `view_image` | 模型 profile 声明了 `vision` | 非 Economy |
 | Memory | `memory`、`remember`、`forget` | 恒真——app 会把 store root 交给工具 | 非 Economy |
 | Skills | `load_skill` | 恒真 | 非 Economy |
@@ -1088,13 +1088,15 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 现在这条流水线是一个函数 `leveler_media::process_image`：内容判定真实类型、解码器分配之前先设字节与像素上限、按最长边降采样、重编码为 PNG。`MediaStore::import_bytes` 调它然后哈希入库；`view_image` 调它然后 base64。为此 `leveler-tools` 新增了对 `leveler-media` 的依赖，方向是对的：工具层调用能力。
 
-#### G. `web_search` 拥有 provider 配置（开放，主动决定）
+#### G. `web_search` 拥有 provider 配置（已关闭）
 
-工具自己从环境快照读 `LEVELER_SEARCH_API_KEY`、`LEVELER_SEARCH_PROVIDER`、`LEVELER_SEARCH_CX`，自己建 HTTP 客户端，并且自己实现了 Bing 和 Google Custom Search 两套请求与响应形状。
+工具过去自己从环境快照读 `LEVELER_SEARCH_API_KEY`、`LEVELER_SEARCH_PROVIDER`、`LEVELER_SEARCH_CX`，自己实现了 Bing 和 Google Custom Search 两套请求与响应形状，还在调用时自己判断「我到底配没配」——而那是 composition root 的答案，不是工具的。
 
-**故意留着。** 只有一个调用方、两套 provider 形状只写在一处、也没有第二个搜索能力的消费者。现在抽一个 `SearchProvider` 出来，就是一个只有一个实现、一个使用者的 wrapper——正是 §5.3 存在的目的所要拦的东西。这次审计在这里没有发现重复运行时，也没有发现 Host Authority 绕过：工具和其他调用一样过准入，SSRF 闸门与 `web_fetch` 共用。
+**靠删除关闭，不是靠抽象关闭。** 两套 provider 形状删了，只剩一个后端（Tavily），只写一处，前面不加 `SearchProvider`——一个只有一个实现、一个使用者的 trait 正是 §5.3 要拦的 wrapper。配置现在只有一个 owner：`leveler-app` 读一次 key，空字符串等同未配置，同一个答案同时喂给 `capability_availability` 和 `WebSearchTool::new`。没有 key 的宿主根本不注册 `web_search`，所以工具里那条「未配置」分支已经没有了——那个状态到不了它。
 
-等出现第二个消费者、或者必须加第二套 provider 形状时再抽。
+留下来的那条不是重复。`execute` 里的 `network_denied` 检查，是进程内直接拨网络的工具唯一的执行点：ToolHost 会把 `network_allowed` 冻进 resolved policy，但真正执行它的 OS 沙箱管的是 `run_command` 子进程，管不到本进程里的 `reqwest`。`web_fetch` 和浏览器工具出于同样理由带着同样的检查。
+
+等真的必须支持第二个后端时，再抽 provider 缝。
 
 #### H. 后台结算归运行时（已关闭）
 

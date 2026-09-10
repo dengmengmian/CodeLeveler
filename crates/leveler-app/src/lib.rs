@@ -490,9 +490,9 @@ impl Application {
             // can only report that it could not start.
             vcs: leveler_browser::which(environment, "git").is_some(),
             web_fetch: true,
-            // The tool refuses without a key; advertising it anyway spends
-            // schema on a call that can only fail.
-            web_search: environment.var("LEVELER_SEARCH_API_KEY").is_some(),
+            // Advertising a search tool without a key spends schema on a call
+            // that can only fail. A blank value is not a configuration.
+            web_search: search_api_key(environment).is_some(),
             // An image is useless to a model that cannot read one.
             media: self
                 .registry
@@ -572,7 +572,8 @@ impl Application {
             .with_background_tasks(bg.clone())
             .with_artifact_store(artifact_store)
             .with_memory_root(self.layout.memory_dir())
-            .with_browser(self.browser.clone());
+            .with_browser(self.browser.clone())
+            .with_search_api_key(search_api_key(self.environment.as_ref()));
         let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
             .with_policy_limits(max_files)
             .with_sandbox(sandbox)
@@ -814,6 +815,16 @@ impl Application {
     }
 }
 
+/// The one reader of `LEVELER_SEARCH_API_KEY` (a Tavily key). `None` when
+/// unset, empty or whitespace — availability and the tool's construction both
+/// come from here, so they can never disagree.
+fn search_api_key(environment: &leveler_core::EnvSnapshot) -> Option<String> {
+    environment
+        .var("LEVELER_SEARCH_API_KEY")
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 pub(crate) fn provider_secret_env_names(providers: &[ProviderConfig]) -> Vec<String> {
     let mut names: Vec<String> = providers
         .iter()
@@ -902,6 +913,51 @@ mod merge_tests {
         merge_providers(&mut repo, vec![provider("bigmodel", Some("BIGMODEL_KEY"))]);
         assert_eq!(repo.len(), 2);
         assert_eq!(repo[1].id, "bigmodel");
+    }
+
+    fn env_with(search_key: Option<&str>) -> leveler_core::EnvSnapshot {
+        let values = search_key.into_iter().map(|k| {
+            (
+                std::ffi::OsString::from("LEVELER_SEARCH_API_KEY"),
+                std::ffi::OsString::from(k),
+            )
+        });
+        leveler_core::EnvSnapshot::new(
+            values,
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp"),
+        )
+    }
+
+    /// Case A — no key at all. `web_search` is not AVAILABLE, so it never
+    /// reaches the model surface however much the product mode wants it.
+    #[test]
+    fn no_search_key_is_not_available() {
+        assert_eq!(crate::search_api_key(&env_with(None)), None);
+    }
+
+    /// Case B — a key that is present but blank is not a configuration. A
+    /// `Some("")` that counted as configured would advertise a tool whose
+    /// every call is a 401.
+    #[test]
+    fn blank_search_key_is_not_available() {
+        assert_eq!(crate::search_api_key(&env_with(Some(""))), None);
+        assert_eq!(crate::search_api_key(&env_with(Some("   "))), None);
+        assert_eq!(crate::search_api_key(&env_with(Some("\t\n"))), None);
+    }
+
+    /// Case C — a real key is AVAILABLE, and reaches the tool trimmed.
+    #[test]
+    fn a_real_search_key_is_available_and_trimmed() {
+        assert_eq!(
+            crate::search_api_key(&env_with(Some("tvly-test-value"))).as_deref(),
+            Some("tvly-test-value")
+        );
+        assert_eq!(
+            crate::search_api_key(&env_with(Some("  tvly-test-value  "))).as_deref(),
+            Some("tvly-test-value"),
+            "surrounding whitespace is not part of the key"
+        );
     }
 
     #[test]

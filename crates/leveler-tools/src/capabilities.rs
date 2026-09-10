@@ -41,6 +41,10 @@ pub struct Capabilities {
     /// and its isolated profile survive client disconnect. `None` disables the
     /// browser tools (they error clearly).
     pub browser: Option<Arc<leveler_browser::BrowserRuntime>>,
+    /// The search provider key `web_search` is constructed with. `None` is the
+    /// same mechanical fact as `CapabilityPacks::web_search == false`; the host
+    /// answers it once and both follow from that answer.
+    pub search_api_key: Option<String>,
 }
 
 impl Capabilities {
@@ -57,6 +61,7 @@ impl Capabilities {
             artifact_store: None,
             memory_root: None,
             browser: None,
+            search_api_key: None,
         }
     }
 
@@ -69,6 +74,14 @@ impl Capabilities {
     /// The project memory store directory (`active/` + `archive/`).
     pub fn with_memory_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.memory_root = Some(root.into());
+        self
+    }
+
+    /// The search provider key `web_search` is built with. A blank value is
+    /// not a configuration: it is normalised to `None` here so availability and
+    /// construction cannot disagree.
+    pub fn with_search_api_key(mut self, key: Option<String>) -> Self {
+        self.search_api_key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
         self
     }
 

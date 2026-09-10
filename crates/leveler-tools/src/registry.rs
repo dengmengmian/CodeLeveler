@@ -328,7 +328,7 @@ pub struct CapabilityPacks {
     pub vcs: bool,
     /// Fetching a URL. Needs network.
     pub web_fetch: bool,
-    /// Searching the web. Needs a configured search provider.
+    /// Searching the web. Needs a configured search key.
     pub web_search: bool,
     /// Showing the model an image. Needs a model that accepts one.
     pub media: bool,
@@ -453,7 +453,14 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
         registry.register(Arc::new(tools::WebFetchTool));
     }
     if packs.web_search {
-        registry.register(Arc::new(tools::WebSearchTool));
+        // The pack flag IS "a search key is configured" (see
+        // `leveler_app::Application::capability_availability`), so an exposed
+        // pack always arrives with its handle. A caller that sets the flag
+        // without the key gets a key-less client and the provider's own 401 —
+        // no second configuration check lives inside the tool.
+        registry.register(Arc::new(tools::WebSearchTool::new(
+            capabilities.search_api_key.clone().unwrap_or_default(),
+        )));
     }
     if packs.media {
         registry.register(Arc::new(tools::ViewImageTool));
