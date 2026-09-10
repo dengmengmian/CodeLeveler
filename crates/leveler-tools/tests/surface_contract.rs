@@ -14,6 +14,17 @@ fn caps() -> leveler_tools::Capabilities {
     ))
 }
 
+/// The same handles plus a browser, since the browser pack — like the search
+/// pack — composes nothing without the handle it is built from. Constructing
+/// one starts no process and touches no browser.
+fn caps_with_browser() -> leveler_tools::Capabilities {
+    caps().with_browser(std::sync::Arc::new(leveler_browser::Browser::new(
+        leveler_core::environment().clone(),
+        std::env::temp_dir().join("leveler-surface-contract-profile"),
+        None,
+    )))
+}
+
 fn names(registry: &leveler_tools::ToolRegistry) -> Vec<String> {
     registry.definitions().into_iter().map(|d| d.name).collect()
 }
@@ -60,23 +71,19 @@ fn the_background_lifecycle_travels_with_the_command_primitive() {
 /// removes exactly its own tools and nothing else.
 #[test]
 fn a_pack_is_independent_of_every_other_pack() {
-    let all = names(&default_registry());
+    let all = names(&model_surface(CapabilityPacks::ALL, &caps_with_browser()));
     let without_browser = names(&model_surface(
         CapabilityPacks {
             browser: false,
             ..CapabilityPacks::ALL
         },
-        &caps(),
+        &caps_with_browser(),
     ));
     let dropped: Vec<&String> = all
         .iter()
         .filter(|n| !without_browser.contains(n))
         .collect();
-    assert_eq!(
-        dropped.len(),
-        12,
-        "only the browser pack moved: {dropped:?}"
-    );
+    assert_eq!(dropped.len(), 3, "only the browser pack moved: {dropped:?}");
     assert!(
         dropped.iter().all(|n| n.starts_with("browser_")),
         "{dropped:?}"
@@ -87,7 +94,7 @@ fn a_pack_is_independent_of_every_other_pack() {
 /// left because a model looked weak.
 #[test]
 fn the_removed_and_demoted_tools_stay_off_the_surface() {
-    let got = names(&default_registry());
+    let got = names(&model_surface(CapabilityPacks::ALL, &caps_with_browser()));
     for absent in [
         "expand_tools",
         "replace",
@@ -95,6 +102,21 @@ fn the_removed_and_demoted_tools_stay_off_the_surface() {
         "restore_checkpoint",
         "consolidate_memory",
         "create_skill",
+        // The twelve narrow browser tools. They did not shrink because a model
+        // looked weak: browser_tab, browser_act and browser_inspect cover every
+        // one of them, so keeping an alias would be schema spent on a synonym.
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_drag",
+        "browser_type",
+        "browser_select",
+        "browser_press",
+        "browser_wait",
+        "browser_tabs",
+        "browser_dialog",
+        "browser_console",
+        "browser_screenshot",
     ] {
         assert!(
             !got.iter().any(|n| n == absent),
@@ -109,7 +131,12 @@ fn the_removed_and_demoted_tools_stay_off_the_surface() {
 #[test]
 fn a_removed_tool_name_fails_closed() {
     let registry = default_registry();
-    for gone in ["replace", "expand_tools"] {
+    for gone in [
+        "replace",
+        "expand_tools",
+        "browser_navigate",
+        "browser_click",
+    ] {
         assert!(registry.get(gone).is_none(), "{gone} must not dispatch");
         assert!(
             !registry.replay_is_side_effect_free(gone),

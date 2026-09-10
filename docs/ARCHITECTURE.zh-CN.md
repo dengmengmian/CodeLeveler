@@ -259,11 +259,11 @@ RunCommandTool    → CommandExecution
 ShellCommandTool  → CommandExecution
 FindSymbolTool    → LspSessions
 GitStatusTool     → GitWorkflow
-BrowserClickTool  → BrowserRuntime
+BrowserTabTool    → Browser
 ViewImageTool     → leveler_media::process_image
 MemoryTool        → MemoryStore
 McpTool           → McpClient
-WebSearchTool     → Search provider（仍在工具里；§18.3 G）
+WebSearchTool     → Tavily，构造时注入 key
 ```
 
 箭头是**构造函数**，不是查找。每个工具只持有自己箭头左边那一个句柄，别的都拿不到——见 §5.5。
@@ -287,8 +287,9 @@ Capability != crate
 | `CodeIntelligence` | `leveler_lsp::LspSessions`——拥有 `LspClient` 的那个 crate |
 | VCS | `leveler_vcs::GitWorkflow` |
 | Media | `leveler_media::process_image` |
-| Browser | `leveler_browser::BrowserRuntime` |
+| Browser | `leveler_browser::Browser`，每种协议一个 `BrowserBackend`（CDP、WebDriver） |
 | Memory | `leveler_memory::MemoryStore` |
+| Web search | Tavily，直接调用。一个后端只写一处，前面不加接缝（§18.3 G） |
 | MCP | `leveler_tools::mcp::McpClient` |
 
 `CommandExecution` 留在 `leveler-tools` 而没有下沉到 `leveler-execution`：它要从 `ToolContext` 上读这次调用的授权，并返回 `ToolOutput`，而位于工具层之下的 `leveler-execution` 不能依赖这两个类型。它是一个两个命令工具都被注入的模块，谁也不拥有谁——以前 `shell_command` 是 import `run_command` 的内部实现来跑自己的运行时的。
@@ -335,7 +336,7 @@ ToolContext = ExecutionResources + ToolPolicy + session_scope
 | `run_command`、`shell_command` | 共享的 `CommandExecution` |
 | `get_task`、`wait_task`、`kill_task` | `BackgroundTaskRegistry` |
 | `memory`、`remember`、`forget` | memory store root |
-| `browser_*` | `leveler_browser::BrowserRuntime` |
+| `browser_tab`、`browser_act`、`browser_inspect` | `leveler_browser::Browser` |
 | 核心读/搜/编辑工具、`git_*`、`view_image`、`load_skill`、`web_*` | 除 context 外什么都不要 |
 
 这些句柄以 `leveler_tools::Capabilities` 的形式交给组装方，由组装根持有、被 `model_surface` 消费一次。一个与某能力无关的工具，没有任何途径能拿到它；`crates/leveler-tools/tests/ownership_boundaries.rs` 会在句柄重新出现在 context 上时失败。
@@ -410,7 +411,7 @@ ToolRegistry
 │                  CAPABILITIES                    │
 │ Workspace 读/搜索        Workspace 编辑           │
 │ 命令执行                 Code Intelligence        │
-│ Browser Runtime         VCS      Memory          │
+│ Browser                 VCS      Memory          │
 │ Skills   Media   Web/Search   MCP Runtime        │
 └───────────────────────┬──────────────────────────┘
                         ▼
@@ -475,8 +476,11 @@ EXTENSIONS           已配置 MCP server 的工具
 | --- | --- |
 | `core_surface(&capabilities)` | 11 |
 | `model_surface(CapabilityPacks::ALL, &capabilities)` = core + 26 | 37 |
+| 同上，但宿主没有搜索 key | 36 |
 | Harness 控制（`update_plan` + 1–7 个注入，按条件） | 2–8 |
 | MCP 扩展 | 按配置 |
+
+两个数字都重要。一个 pack 需要产品要它**并且**宿主能提供它，而对 `web_search` 来说「能提供」就是手上有 key——所以没有 key 的宿主组合出 36 个，而 `default_registry()` 存在的全部意义就是「不需要宿主给任何东西」，它正是其中之一。
 
 一个 pack 只有在「产品模式启用了它」**且**「这台宿主能提供它」时才到模型面前（§6.4）。两个答案都绝不关于任务或模型：
 
@@ -489,7 +493,7 @@ EXTENSIONS           已配置 MCP server 的工具
 | Media | `view_image` | 模型 profile 声明了 `vision` | 非 Economy |
 | Memory | `memory`、`remember`、`forget` | 恒真——app 会把 store root 交给工具 | 非 Economy |
 | Skills | `load_skill` | 恒真 | 非 Economy |
-| Browser | `browser_*`（12 个） | `PATH` 上有 Node——没有它 driver 根本起不来 | 非 Economy |
+| Browser | `browser_tab`、`browser_act`、`browser_inspect`（3 个） | 本机**选中**的那个浏览器——先看调用、再看 `[browser].default`、最后看系统默认——是它能驱动的 | 非 Economy |
 
 `WorkProfile::Economy` 启用 `CapabilityPacks::NONE`：只有原语和协议。这是用户对成本的决定，不是对任务难度的推断——而且**无论这台机器多强都成立**。一台装了浏览器运行时、配了搜索 key、用着视觉模型的笔记本，Economy 回合看到的仍然是 11 个原语加控制。
 
@@ -582,6 +586,16 @@ ENABLED     当前产品模式 / session 是不是要它？
 EXPOSED     模型真正看到什么 = ENABLED ∩ AVAILABLE
 ```
 
+**浏览器的联网授权来自暴露本身。** 其它每一个会拨网络的能力都在 `execute` 里复查 `network_denied`，因为对进程内的 `reqwest` 来说那是唯一执行点。浏览器不查，而这个「不查」是决定本身，不是遗漏：这个能力存在的意义就是打开真实页面——dev server、staging、文档站——去验证用户自己的浏览器会看到什么。一个只能去策略逐次放行之处的浏览器，是另一种、有用得多的能力；而要把那套强制做成真的（正向代理、DNS pin、按页 grant、两套协议各自的请求拦截），CodeLeveler 就得再拥有并维护第二套网络运行时。
+
+所以规则只在能力面上写一次：
+
+```text
+Browser Pack EXPOSED  =  浏览器网络出口已授权
+```
+
+localhost、局域网 dev server、公网都可达；点击触发的跳转、页面里的 `fetch`、WebSocket、子资源加载，行为都和用户自己的浏览器一致。只留下一条导航目标规则，而它不是网络边界：`browser_tab navigate` 拒绝 link-local 和云实例元数据地址，因为把浏览器指向 `169.254.169.254` 是一次穿着 URL 外衣的凭证读取。它不约束、也不声称约束一个已经打开的页面在做什么。
+
 「可用」本身什么也不买。`Economy` 不启用任何可选 pack，所以一台装了浏览器运行时的机器，在普通 Economy 回合里看到的浏览器工具是零个。反过来也一样：要一个这台机器做不到的能力也什么都不买——没有搜索 key 的宿主不会暴露 `web_search`，无论产品模式多想要。
 
 两边都不能放大另一边，这才让交集是一条**边界**而不是一句建议（`crates/leveler-tools/tests/capability_composition.rs`）。
@@ -662,7 +676,7 @@ Host Authority 执行副作用。
 | `leveler-context` | 0 | 只读装配。 |
 | `leveler-vcs` | 0 | 每次 git 调用都走 execution 的 runner。 |
 | `leveler-tools` | 13 | `replace.rs` 经 `context.execution.workspace` 写入（root fd、防符号链接替换）；`mcp.rs` 直接拉起用户配置的 MCP server。 |
-| `leveler-browser` | 15 | driver 安装写在 Leveler home 下；driver 进程直接 spawn。 |
+| `leveler-browser` | 3 | 浏览器进程直接 spawn（Unix 进程组、Windows Job Object）；profile 目录建在 Leveler home 下。 |
 | `leveler-memory` | 11 | 在 Leveler home 下写 memory 存储。 |
 | `leveler-lsp` | 4 | 直接 spawn language server。 |
 | `leveler-engine` | 3 | 用 `git rev-parse` 打 baseline commit。 |
@@ -671,7 +685,7 @@ Host Authority 执行副作用。
 这张表里其实是两类东西：
 
 1. **模型请求的、作用在用户仓库上的副作用。** 全部走 `Workspace` 和 `CommandRunner`。`leveler-agent` 是 0，这个数字才是关键。
-2. **Runtime 自己的状态与 sidecar。** 写在 Leveler home 下的内容，以及长驻 sidecar 进程（MCP server、language server、浏览器 driver），不走权限/审批路径——因为它们不是模型要求的。
+2. **Runtime 自己的状态与 sidecar。** 写在 Leveler home 下的内容，以及长驻 sidecar 进程（MCP server、language server、浏览器），不走权限/审批路径——因为它们不是模型要求的。
 
 第二类是真实且有意为之的边界，但这些 sidecar 确实在 `CommandRunner` 的进程树终止与沙箱语义之外。见 §18.4。
 
@@ -687,7 +701,7 @@ Host Authority 执行副作用。
 | `leveler-skills` | Skill 发现与加载。 |
 | `leveler-vcs` | Git 操作，经执行权威落地。 |
 | `leveler-lsp` | language server 会话，跨工具调用复用。 |
-| `leveler-browser` | 浏览器运行时、driver 安装、按项目隔离的 profile。 |
+| `leveler-browser` | 浏览器产品选择、ref 与标签页归属，以及两个协议适配器（Chrome/Edge/Chromium 走 CDP，Safari 走 WebDriver）。 |
 | `leveler-media` | 有内容类型保障的图片导入：从内容判定真实 MIME、解码与像素上限、剥离 EXIF、降采样、内容寻址存储。 |
 
 Coding Harness 选 context、project、VCS、LSP、browser、memory、文件写入与进程执行。Review Harness 大概率只需要 context、project、VCS、LSP、只读文件系统和 memory。
@@ -1094,7 +1108,7 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 **靠删除关闭，不是靠抽象关闭。** 两套 provider 形状删了，只剩一个后端（Tavily），只写一处，前面不加 `SearchProvider`——一个只有一个实现、一个使用者的 trait 正是 §5.3 要拦的 wrapper。配置现在只有一个 owner：`leveler-app` 读一次 key，空字符串等同未配置，同一个答案同时喂给 `capability_availability` 和 `WebSearchTool::new`。没有 key 的宿主根本不注册 `web_search`，所以工具里那条「未配置」分支已经没有了——那个状态到不了它。
 
-留下来的那条不是重复。`execute` 里的 `network_denied` 检查，是进程内直接拨网络的工具唯一的执行点：ToolHost 会把 `network_allowed` 冻进 resolved policy，但真正执行它的 OS 沙箱管的是 `run_command` 子进程，管不到本进程里的 `reqwest`。`web_fetch` 和浏览器工具出于同样理由带着同样的检查。
+留下来的那条不是重复。`execute` 里的 `network_denied` 检查，是进程内直接拨网络的工具唯一的执行点：ToolHost 会把 `network_allowed` 冻进 resolved policy，但真正执行它的 OS 沙箱管的是 `run_command` 子进程，管不到本进程里的 `reqwest`。`web_fetch` 和 `web_search` 出于同样理由带着同样的检查。浏览器**不带**：它是一个被明确授权联网的能力，暴露它本身就是授权（§5.3）。
 
 等真的必须支持第二个后端时，再抽 provider 缝。
 
@@ -1110,7 +1124,7 @@ dev-server 安全不变：恢复仍然只在显式白名单下发生，所以默
 
 ### 18.4 Sidecar 进程绕开 CommandRunner
 
-**当前。** MCP server（`leveler-tools/src/mcp.rs`）、浏览器 driver（`leveler-browser/src/driver.rs`）和 language server（`leveler-lsp/src/client.rs`、`registry.rs`）都是用 `Command::new` 直接拉起，不经 `leveler_execution::CommandRunner`。
+**当前。** MCP server（`leveler-tools/src/mcp.rs`）、浏览器（`leveler-browser/src/cdp.rs`、`webdriver.rs`）和 language server（`leveler-lsp/src/client.rs`、`registry.rs`）都是用 `Command::new` 直接拉起，不经 `leveler_execution::CommandRunner`。
 
 **期望。** 要么让它们进入宿主权威的进程树终止与沙箱语义，要么把这个豁免写成一条显式命名的策略——「runtime sidecar」——并给它确定的生命周期 Owner。
 
@@ -1190,6 +1204,14 @@ pub struct ToolOutput {
 
 ---
 
+### 18.10 Browser 实现已被取代（已关闭）
+
+**曾经。** `leveler-browser` 通过 Playwright 驱动 Chromium，中间隔着一个 CodeLeveler 自己写的 Node 桥，在 stdio 上说自定义 JSON-RPC，SSRF 边界就在那个桥里强制。
+
+**现在。** Browser Capability Closure 已经把它换掉。Chrome、Edge、Chromium 直接走 CDP；Safari 走 W3C WebDriver 经 `safaridriver`。没有 Node、没有 Playwright、没有 npm 安装、没有托管浏览器下载、没有自定义 RPC。跑哪个浏览器由用户的系统默认浏览器决定，除非调用或 `[browser].default` 另有指定；选中的浏览器驱动不了就报错，不换成另一个。
+
+**跟着一起关闭的。** 之前挂起的 `loopback_ws_from_a_granted_dev_page_connects` 抖动，是关于桥里那个 JavaScript WebSocket gate 的发现。那个 gate 连同它所属的整套 page-scoped loopback grant 都已删除：浏览器是被授权联网的，已经不存在需要逐请求做的 loopback 判定，也就没有可竞态的东西。这条发现是被删除关闭的，不是被修复关闭的。
+
 ## 19. 开放设计问题
 
 记录下来，免得被第一个碰到它的人悄悄定掉。
@@ -1264,6 +1286,8 @@ TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
 
+BROWSER_IMPLEMENTATION            SUPERSEDED_PENDING_REPLACEMENT
+
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 SECOND_HARNESS_WRITTEN            NO
 FOUNDATION_FROZEN                 NO
@@ -1272,3 +1296,5 @@ FOUNDATION_FROZEN                 NO
 架构、工具边界和模型可见的工具面都已经定了；七个核心原语、能力 ownership 和组合方式也按它实现了。剩下的是 Engine：它仍然点名 `leveler_agent` 和 `CodingTaskSpec`（§18.1），而这也是 `SECOND_HARNESS_TEST` 还没强制成立的唯一原因。
 
 有四行从 NO 变成 YES，是因为代码变了而不是措辞变了：`ToolServices` 已删除、registry 不再做任何授权判断、`leveler-model` 不含任何工具名、一个回合的 work profile 来自 session 行。每一条都在自己那节里点了绊线的名字。没有为了让这张表里任何一行好看而修改源码。
+
+`BROWSER_IMPLEMENTATION` 已关闭。Node 桥、Playwright、自定义 RPC 和那些 JavaScript 网络 gate 都没了；`leveler-browser` 直接说 CDP 和 WebDriver，§18.10 记录了这次关闭了什么。

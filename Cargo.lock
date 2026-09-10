@@ -1850,18 +1850,17 @@ dependencies = [
 name = "leveler-browser"
 version = "0.2.0-beta.1"
 dependencies = [
- "base64",
- "fs2",
+ "async-trait",
+ "futures-util",
  "leveler-core",
  "libc",
+ "process-wrap",
+ "reqwest",
  "serde",
  "serde_json",
- "sha1",
- "tempfile",
- "thiserror",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]

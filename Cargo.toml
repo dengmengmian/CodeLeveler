@@ -92,6 +92,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 bytes = "1"
 
+# CDP transport: one plain ws:// socket to the browser's DevTools endpoint.
+# No TLS features — the endpoint is always 127.0.0.1.
+tokio-tungstenite = "0.26"
+
 # Web UI server (browser client)
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
 rust-embed = { version = "8", features = ["debug-embed"] }

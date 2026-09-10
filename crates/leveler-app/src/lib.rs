@@ -102,6 +102,9 @@ pub struct LoadedConfig {
     pub agents_delegation: bool,
     /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
+    /// `[browser].default`: the browser the browser capability drives. `None`
+    /// means the operating system's default browser.
+    pub browser_default: Option<leveler_browser::BrowserProduct>,
 }
 
 impl Default for LoadedConfig {
@@ -115,6 +118,7 @@ impl Default for LoadedConfig {
             mcp_servers: Vec::new(),
             agents_delegation: true,
             agents_independent_review: leveler_project::IndependentReview::default(),
+            browser_default: None,
         }
     }
 }
@@ -159,11 +163,11 @@ pub struct Application {
     /// every background process — hence servers dying between turns. Only the
     /// process exit drops the last handle.
     background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
-    /// Daemon-owned, lazily-started browser runtime, shared (cloned `Arc`) into
+    /// Daemon-owned, lazily-started browser, shared (cloned `Arc`) into
     /// every engine/turn so the browser and its isolated project profile survive
     /// across turns and client disconnect. Nothing starts until a browser tool
     /// is first used.
-    browser: Arc<leveler_browser::BrowserRuntime>,
+    browser: Arc<leveler_browser::Browser>,
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
@@ -240,8 +244,8 @@ impl Application {
         &self.background_tasks
     }
 
-    /// The daemon-owned browser runtime (R004 F7 shutdown teardown).
-    pub fn browser(&self) -> &Arc<leveler_browser::BrowserRuntime> {
+    /// The daemon-owned browser (shutdown teardown).
+    pub fn browser(&self) -> &Arc<leveler_browser::Browser> {
         &self.browser
     }
 
@@ -279,6 +283,7 @@ impl Application {
             mcp_servers: global.mcp_servers,
             agents_delegation: global.agents_delegation,
             agents_independent_review: global.agents_independent_review,
+            browser_default: global.browser_default,
         })
     }
 
@@ -325,11 +330,12 @@ impl Application {
         let background_tasks = Arc::new(
             leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone()),
         );
-        // Lazy: the runtime holds only paths until a browser tool starts it.
-        let browser = Arc::new(leveler_browser::BrowserRuntime::new(
-            layout.home().clone(),
+        // Lazy: this holds only paths and the configured product until the
+        // first navigate actually starts a browser.
+        let browser = Arc::new(leveler_browser::Browser::new(
             (*environment).clone(),
             layout.browser_profile_dir(),
+            config.browser_default,
         ));
         Ok(Self {
             layout,
@@ -504,9 +510,13 @@ impl Application {
             // read skills from.
             memory: true,
             skills: true,
-            // The browser driver runs under Node; without it every one of the
-            // twelve browser tools fails on its first call.
-            browser: leveler_browser::which(environment, "node").is_some(),
+            // Not "is a browser installed": is the browser this host would
+            // SELECT — the call's, then `[browser].default`, then the system
+            // default — one it can actually drive? Answering with a different
+            // browser is exactly what the no-fallback rule forbids, so a user
+            // whose default is a browser CodeLeveler cannot drive sees no
+            // browser tools rather than a surprise one.
+            browser: self.browser.resolve(None).is_ok(),
         }
     }
 

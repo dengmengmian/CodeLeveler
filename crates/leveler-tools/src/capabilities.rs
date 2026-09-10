@@ -37,10 +37,11 @@ pub struct Capabilities {
     /// Durable project memory root. `None` means memory is unconfigured, and
     /// the memory tools say so rather than inventing a location.
     pub memory_root: Option<PathBuf>,
-    /// The daemon-owned browser runtime, shared across turns so the browser
-    /// and its isolated profile survive client disconnect. `None` disables the
-    /// browser tools (they error clearly).
-    pub browser: Option<Arc<leveler_browser::BrowserRuntime>>,
+    /// The daemon-owned browser, shared across turns so its tabs, cookies and
+    /// login state survive client disconnect. `None` is the same mechanical
+    /// fact as `CapabilityPacks::browser == false`: no browser is drivable
+    /// here, so the tools are not built.
+    pub browser: Option<Arc<leveler_browser::Browser>>,
     /// The search provider key `web_search` is constructed with. `None` is the
     /// same mechanical fact as `CapabilityPacks::web_search == false`; the host
     /// answers it once and both follow from that answer.
@@ -92,9 +93,9 @@ impl Capabilities {
         self
     }
 
-    /// Share the daemon-owned browser runtime.
-    pub fn with_browser(mut self, runtime: Arc<leveler_browser::BrowserRuntime>) -> Self {
-        self.browser = Some(runtime);
+    /// Share the daemon-owned browser.
+    pub fn with_browser(mut self, browser: Arc<leveler_browser::Browser>) -> Self {
+        self.browser = Some(browser);
         self
     }
 }

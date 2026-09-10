@@ -1,12 +1,23 @@
-//! Structured browser tools (§19). Thin wrappers over the daemon-owned
-//! [`leveler_browser::BrowserRuntime`], which each tool is CONSTRUCTED with —
-//! it used to be fished out of `ToolContext.services.browser`, where every
-//! other tool could reach it too. All page/ref/generation safety lives in the
-//! runtime; these tools add the tool-boundary concerns: the network/SSRF gate
-//! on navigation, session scoping, and structured `ToolOutput`.
+//! The three browser tools.
+//!
+//! One tool per job, and the jobs are genuinely different: `browser_tab` moves
+//! between pages and reads them, `browser_act` behaves like a user inside one,
+//! `browser_inspect` reads what the browser observed. Twelve narrow tools were
+//! collapsed into these three; none of the three is an `action=`-shaped
+//! catch-all for the other two.
+//!
+//! The tools are thin. Refs, generations, tab ownership, product selection,
+//! process lifetime and the disconnect lifecycle all live in
+//! [`leveler_browser::Browser`]; what is added here is the tool boundary —
+//! input parsing, cancellation, and a structured `ToolOutput`.
+//!
+//! **The browser is a network-authorised capability.** Exposing it IS the
+//! authorisation, so there is no per-navigation network gate here: localhost,
+//! LAN dev servers and the public internet are all reachable, and a click that
+//! navigates, a page's `fetch`, a WebSocket and a subresource all behave the
+//! way they do in the user's own browser.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -14,832 +25,475 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_browser::{
-    BrowserError, BrowserPageId, BrowserRuntime, BrowserSessionId, Interaction, WaitCondition,
+    Act, Browser, BrowserError, BrowserProduct, BrowserSessionId, InspectKind, InspectReport, TabId,
 };
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-// ── shared helpers ───────────────────────────────────────────────────────────
-
-/// Declare the browser tools. Each one holds the runtime it was constructed
-/// with and nothing else; a `None` runtime means this host has no browser, and
-/// the tool says exactly that instead of guessing.
-///
-/// A macro because twelve tools need the identical handle and the identical
-/// "not enabled" refusal, and twelve copies of both would be twelve places for
-/// them to drift.
-macro_rules! browser_tools {
-    ($($name:ident),* $(,)?) => { $(
-        pub struct $name {
-            browser: Option<Arc<BrowserRuntime>>,
-        }
-
-        impl $name {
-            pub fn new(browser: Option<Arc<BrowserRuntime>>) -> Self {
-                Self { browser }
-            }
-
-            /// The runtime and this call's session scope, or a clear
-            /// model-visible error when there is no browser on this host.
-            fn runtime(
-                &self,
-                scope: &str,
-            ) -> Result<(&Arc<BrowserRuntime>, BrowserSessionId), ToolOutput> {
-                match &self.browser {
-                    Some(rt) => Ok((rt, BrowserSessionId::new(scope))),
-                    None => Err(ToolOutput::error(
-                        "the browser capability is not enabled in this runtime",
-                    )),
-                }
-            }
-        }
-    )* };
+/// Each tool holds the browser handle it was constructed with, and nothing
+/// else. Written out three times rather than generated: at this size a macro
+/// hides more than it saves.
+pub struct BrowserTabTool {
+    browser: Arc<Browser>,
 }
 
-browser_tools!(
-    BrowserNavigateTool,
-    BrowserSnapshotTool,
-    BrowserClickTool,
-    BrowserDragTool,
-    BrowserTypeTool,
-    BrowserSelectTool,
-    BrowserPressTool,
-    BrowserWaitTool,
-    BrowserTabsTool,
-    BrowserDialogTool,
-    BrowserConsoleTool,
-    BrowserScreenshotTool,
-);
+pub struct BrowserActTool {
+    browser: Arc<Browser>,
+}
 
-fn err_out(e: BrowserError) -> ToolOutput {
+pub struct BrowserInspectTool {
+    browser: Arc<Browser>,
+}
+
+impl BrowserTabTool {
+    pub fn new(browser: Arc<Browser>) -> Self {
+        Self { browser }
+    }
+}
+
+impl BrowserActTool {
+    pub fn new(browser: Arc<Browser>) -> Self {
+        Self { browser }
+    }
+}
+
+impl BrowserInspectTool {
+    pub fn new(browser: Arc<Browser>) -> Self {
+        Self { browser }
+    }
+}
+
+fn scope(context: &ToolContext) -> BrowserSessionId {
+    BrowserSessionId::new(context.session_scope())
+}
+
+fn target(tab: Option<String>) -> Option<TabId> {
+    tab.filter(|t| !t.is_empty()).map(TabId::new)
+}
+
+fn failed(e: BrowserError) -> ToolOutput {
     ToolOutput::error(e.to_string())
 }
 
-/// Resolve the target page: the explicit `page` argument, else the session's
-/// active page (set by the last navigate/snapshot).
-async fn resolve_page(
-    rt: &BrowserRuntime,
-    session: &BrowserSessionId,
-    page: Option<String>,
-) -> Result<BrowserPageId, ToolOutput> {
-    match page {
-        Some(p) if !p.is_empty() => Ok(BrowserPageId::new(p)),
-        _ => rt.active_page(session).await.map_err(err_out),
-    }
+/// Run one browser operation, ending it the moment the turn is cancelled.
+///
+/// Dropping the operation's future abandons the in-flight protocol call; the
+/// browser session itself is untouched, so a cancelled click does not cost the
+/// model its page, its cookies or its tabs.
+macro_rules! cancellable {
+    ($cancel:expr, $op:expr) => {
+        tokio::select! {
+            biased;
+            _ = $cancel.cancelled() => return Ok(ToolOutput::error("browser operation cancelled")),
+            r = $op => r,
+        }
+    };
 }
 
-/// Format an action result for the model.
-fn fmt_action(r: &leveler_browser::BrowserActionResult) -> String {
-    let mut s = format!("page: {}\nurl: {}\ntitle: {}", r.page, r.url, r.title);
-    if r.navigated {
+/// How an action result is reported. Deliberately flat facts: what the tab is,
+/// where it is, whether it moved. No suggestion about what to do next (§33).
+fn describe(outcome: &leveler_browser::ActionOutcome) -> String {
+    let mut s = format!(
+        "tab: {}\nurl: {}\ntitle: {}",
+        outcome.tab, outcome.url, outcome.title
+    );
+    if outcome.navigated {
         s.push_str("\nnavigated: true");
     }
-    if let Some(np) = &r.new_page {
-        s.push_str(&format!("\nnew_page: {np}"));
+    if let Some(new) = &outcome.new_tab {
+        s.push_str(&format!("\nnew_tab: {new}"));
     }
-    if let Some(reason) = &r.blocked {
-        s.push_str(&format!("\n⚠ blocked by network policy: {reason}"));
-    }
-    s.push_str("\n(call browser.snapshot to see the current refs)");
     s
 }
 
-// ── the localhost-aware network gate (§15) ──────────────────────────────────
-
-/// Enforce the existing network policy on a navigation target. Deny when the
-/// session is network-denied; otherwise allow http/https, permit loopback dev
-/// URLs, and reject any other host that resolves into a blocked (private /
-/// link-local / metadata / loopback) range — so the browser cannot become an
-/// SSRF bypass around the runtime's own gate.
-fn check_navigation(context: &ToolContext, url: &str) -> Result<(), String> {
-    if context.policy.network_denied() {
-        return Err("network access is denied for this run".into());
-    }
-    navigation_host_allowed(url)
-}
-
-/// The URL/host half of the gate (pure, no policy) — split out so the SSRF
-/// logic is testable without a full `ToolContext`.
-fn navigation_host_allowed(url: &str) -> Result<(), String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| format!("unsupported URL (need http/https): {url}"))?;
-    if !matches!(scheme, "http" | "https") {
-        return Err(format!(
-            "unsupported URL scheme `{scheme}` (need http/https)"
-        ));
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    // Strip a :port (but keep IPv6 `[..]`).
-    let host = if let Some(stripped) = host.strip_prefix('[') {
-        stripped.split(']').next().unwrap_or(stripped)
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    if host.is_empty() {
-        return Err(format!("URL has no host: {url}"));
-    }
-    // Loopback dev servers are explicitly allowed (the §15 narrow exception).
-    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        return Ok(());
-    }
-    // Any other host must resolve entirely to non-blocked addresses.
-    use std::net::ToSocketAddrs;
-    match (host, 80u16).to_socket_addrs() {
-        Ok(addrs) => {
-            let mut any = false;
-            for addr in addrs {
-                any = true;
-                if crate::tools::web_fetch::is_blocked_ip(addr.ip()) {
-                    return Err(format!(
-                        "navigation to a blocked/private address is refused: {host}"
-                    ));
-                }
-            }
-            if !any {
-                return Err(format!("could not resolve host: {host}"));
-            }
-            Ok(())
-        }
-        Err(e) => Err(format!("could not resolve host {host}: {e}")),
-    }
-}
-
-// ── navigate ─────────────────────────────────────────────────────────────────
+// ── browser_tab ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct NavigateInput {
-    /// Absolute http/https URL (localhost dev servers allowed).
-    url: String,
+#[serde(rename_all = "snake_case")]
+enum TabAction {
+    Navigate,
+    Snapshot,
+    Screenshot,
+    Reload,
+    ListTabs,
+    NewTab,
+    SelectTab,
+    CloseTab,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TabInput {
+    /// What to do with the page or tab.
+    action: TabAction,
+    /// Absolute http/https URL. Required by `navigate`.
+    #[serde(default)]
+    url: Option<String>,
+    /// Tab id from a previous result (defaults to the current tab).
+    #[serde(default)]
+    tab: Option<String>,
+    /// Which browser to drive: `safari`, `chrome`, `edge` or `chromium`.
+    /// Omit to use the configured or system default browser. Naming a
+    /// different browser than the one already running closes that one and
+    /// starts this one, so its tabs and login state do not carry over.
+    #[serde(default)]
+    browser: Option<String>,
 }
 
 #[async_trait]
-impl Tool for BrowserNavigateTool {
+impl Tool for BrowserTabTool {
     fn name(&self) -> &'static str {
-        "browser_navigate"
+        "browser_tab"
     }
+
     fn description(&self) -> &'static str {
-        "Open a URL in the isolated project browser (creating/reusing the current \
-         page). Then use browser_snapshot to read the page."
+        "Drive pages and tabs in a real browser: navigate to a URL, read a \
+         semantic snapshot of the current page, capture a screenshot, reload, \
+         and list/open/select/close tabs. The snapshot's [ref] tokens are what \
+         browser_act operates on. Uses your default browser unless `browser` \
+         names one."
     }
+
     fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<NavigateInput>()
+        super::schema_of::<TabInput>()
     }
+
     fn risk(&self) -> RiskLevel {
         RiskLevel::Network
     }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancel: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let input: NavigateInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
+        let input: TabInput = super::parse_input(self.name(), input)?;
+        let session = scope(&context);
+        let b = &self.browser;
+        let tab = target(input.tab);
+
+        let product = match input
+            .browser
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(name) => match BrowserProduct::parse(name) {
+                Some(p) => Some(p),
+                None => {
+                    return Ok(ToolOutput::error(format!(
+                        "`{name}` is not a browser CodeLeveler drives (safari, chrome, edge, chromium)"
+                    )));
+                }
+            },
         };
-        if let Err(reason) = check_navigation(&context, &input.url) {
-            return Ok(ToolOutput::error(reason));
-        }
-        match rt.open(&session, &input.url).await {
-            Ok(r) => Ok(ToolOutput::ok(fmt_action(&r))),
-            Err(e) => Ok(err_out(e)),
-        }
+
+        Ok(match input.action {
+            TabAction::Navigate => {
+                let Some(url) = input.url.as_deref().filter(|u| !u.trim().is_empty()) else {
+                    return Ok(ToolOutput::error("browser_tab navigate needs a `url`"));
+                };
+                match cancellable!(cancellation, b.navigate(&session, product, url.trim())) {
+                    Ok(o) => ToolOutput::ok(describe(&o)),
+                    Err(e) => failed(e),
+                }
+            }
+            TabAction::Snapshot => match cancellable!(cancellation, b.snapshot(&session, tab)) {
+                Ok(s) => {
+                    let mut header = format!(
+                        "tab: {}\nurl: {}\ntitle: {}\ngeneration: {}",
+                        s.tab, s.url, s.title, s.generation
+                    );
+                    if s.truncated {
+                        header.push_str(&format!(
+                            "\ntruncated: true (showing {} of ~{} nodes)",
+                            s.nodes_returned,
+                            s.approximate_total.unwrap_or(s.nodes_returned)
+                        ));
+                    }
+                    ToolOutput::ok(format!("{header}\n\n{}", s.text))
+                }
+                Err(e) => failed(e),
+            },
+            TabAction::Screenshot => {
+                match cancellable!(cancellation, b.screenshot(&session, tab)) {
+                    Ok(data) => ToolOutput::ok("captured page screenshot").with_metadata(
+                        serde_json::json!({"image": {"media_type": "image/png", "data": data}}),
+                    ),
+                    Err(e) => failed(e),
+                }
+            }
+            TabAction::Reload => match cancellable!(cancellation, b.reload(&session)) {
+                Ok(o) => ToolOutput::ok(describe(&o)),
+                Err(e) => failed(e),
+            },
+            TabAction::ListTabs => match cancellable!(cancellation, b.tabs(&session)) {
+                Ok(tabs) if tabs.is_empty() => ToolOutput::ok("no open tabs"),
+                Ok(tabs) => ToolOutput::ok(
+                    tabs.iter()
+                        .map(|t| {
+                            format!(
+                                "{}{}  {}  {}",
+                                if t.active { "* " } else { "  " },
+                                t.tab,
+                                t.title,
+                                t.url
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(e) => failed(e),
+            },
+            TabAction::NewTab => match cancellable!(cancellation, b.new_tab(&session)) {
+                Ok(t) => ToolOutput::ok(format!("tab: {t}\nurl: about:blank")),
+                Err(e) => failed(e),
+            },
+            TabAction::SelectTab => {
+                let Some(t) = tab else {
+                    return Ok(ToolOutput::error("browser_tab select_tab needs a `tab`"));
+                };
+                match cancellable!(cancellation, b.select_tab(&session, &t)) {
+                    Ok(o) => ToolOutput::ok(describe(&o)),
+                    Err(e) => failed(e),
+                }
+            }
+            TabAction::CloseTab => {
+                let Some(t) = tab else {
+                    return Ok(ToolOutput::error("browser_tab close_tab needs a `tab`"));
+                };
+                match cancellable!(cancellation, b.close_tab(&session, &t)) {
+                    Ok(()) => ToolOutput::ok(format!("closed {t}")),
+                    Err(e) => failed(e),
+                }
+            }
+        })
     }
 }
 
-// ── snapshot ─────────────────────────────────────────────────────────────────
+// ── browser_act ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct PageInput {
-    /// Page id (defaults to the current page).
+#[serde(rename_all = "snake_case")]
+enum ActAction {
+    Click,
+    Fill,
+    Type,
+    Press,
+    Select,
+    Scroll,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ActInput {
+    /// The interaction to perform.
+    action: ActAction,
+    /// A [ref] token from the latest browser_tab snapshot. Required by
+    /// click/fill/type/select; optional for press and scroll.
+    #[serde(default, rename = "ref")]
+    element: Option<String>,
+    /// Text to enter. `fill` replaces the field's value; `type` appends.
     #[serde(default)]
-    page: Option<String>,
+    text: Option<String>,
+    /// Key to press, e.g. "Enter", "Escape", "Tab", "ArrowDown".
+    #[serde(default)]
+    key: Option<String>,
+    /// Option label(s) or value(s) to choose in a dropdown.
+    #[serde(default)]
+    values: Option<Vec<String>>,
+    /// Horizontal scroll distance in pixels.
+    #[serde(default)]
+    dx: Option<f64>,
+    /// Vertical scroll distance in pixels.
+    #[serde(default)]
+    dy: Option<f64>,
+    /// Tab id (defaults to the current tab).
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 #[async_trait]
-impl Tool for BrowserSnapshotTool {
+impl Tool for BrowserActTool {
     fn name(&self) -> &'static str {
-        "browser_snapshot"
+        "browser_act"
     }
+
     fn description(&self) -> &'static str {
-        "Read a semantic, ref-annotated snapshot of the current page. Use the \
-         [ref=…] tokens with browser_click/type/select/press."
+        "Act on the current page as a user would: click, fill or type into a \
+         field, press a key, choose from a dropdown, or scroll. Elements are \
+         addressed by the [ref] tokens from the latest browser_tab snapshot; a \
+         ref from an older snapshot is refused as stale."
     }
+
     fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<PageInput>()
+        super::schema_of::<ActInput>()
     }
+
+    fn risk(&self) -> RiskLevel {
+        RiskLevel::Network
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let input: ActInput = super::parse_input(self.name(), input)?;
+        let session = scope(&context);
+        let tab = target(input.tab);
+        let element = input.element.as_deref().filter(|r| !r.is_empty());
+        let values = input.values.unwrap_or_default();
+
+        let needs_ref = |what: &str| {
+            ToolOutput::error(format!("browser_act {what} needs a `ref` from a snapshot"))
+        };
+        let act = match input.action {
+            ActAction::Click => match element {
+                Some(r) => Act::Click { r#ref: r },
+                None => return Ok(needs_ref("click")),
+            },
+            ActAction::Fill | ActAction::Type => {
+                let Some(r) = element else {
+                    return Ok(needs_ref("fill/type"));
+                };
+                let Some(text) = input.text.as_deref() else {
+                    return Ok(ToolOutput::error("browser_act fill/type needs `text`"));
+                };
+                if matches!(input.action, ActAction::Fill) {
+                    Act::Fill { r#ref: r, text }
+                } else {
+                    Act::Type { r#ref: r, text }
+                }
+            }
+            ActAction::Press => {
+                let Some(key) = input.key.as_deref().filter(|k| !k.is_empty()) else {
+                    return Ok(ToolOutput::error("browser_act press needs a `key`"));
+                };
+                Act::Press {
+                    r#ref: element,
+                    key,
+                }
+            }
+            ActAction::Select => {
+                let Some(r) = element else {
+                    return Ok(needs_ref("select"));
+                };
+                if values.is_empty() {
+                    return Ok(ToolOutput::error("browser_act select needs `values`"));
+                }
+                Act::Select {
+                    r#ref: r,
+                    values: &values,
+                }
+            }
+            ActAction::Scroll => Act::Scroll {
+                r#ref: element,
+                dx: input.dx.unwrap_or(0.0),
+                dy: input.dy.unwrap_or(0.0),
+            },
+        };
+
+        Ok(
+            match cancellable!(cancellation, self.browser.act(&session, tab, act)) {
+                Ok(o) => ToolOutput::ok(describe(&o)),
+                Err(e) => failed(e),
+            },
+        )
+    }
+}
+
+// ── browser_inspect ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum InspectWhat {
+    Console,
+    PageErrors,
+    Network,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct InspectInput {
+    /// Which channel to read.
+    what: InspectWhat,
+    /// Tab id (defaults to the current tab).
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+#[async_trait]
+impl Tool for BrowserInspectTool {
+    fn name(&self) -> &'static str {
+        "browser_inspect"
+    }
+
+    fn description(&self) -> &'static str {
+        "Read what the browser observed on the current page: console \
+         errors/warnings, uncaught page errors, or the network requests it \
+         made and how they finished. Availability depends on the browser: \
+         Safari's automation protocol has no such channels and says so."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        super::schema_of::<InspectInput>()
+    }
+
     fn risk(&self) -> RiskLevel {
         RiskLevel::Safe
     }
+
     fn supports_parallel(&self) -> bool {
         true
     }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancel: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let input: PageInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
+        let input: InspectInput = super::parse_input(self.name(), input)?;
+        let session = scope(&context);
+        let tab = target(input.tab);
+        let kind = match input.what {
+            InspectWhat::Console => InspectKind::Console,
+            InspectWhat::PageErrors => InspectKind::PageErrors,
+            InspectWhat::Network => InspectKind::Network,
         };
-        let page = match resolve_page(rt, &session, input.page).await {
-            Ok(p) => p,
-            Err(o) => return Ok(o),
-        };
-        match rt.snapshot(&session, &page).await {
-            Ok(s) => {
-                let mut header = format!(
-                    "page: {}\nurl: {}\ntitle: {}\ngeneration: {}",
-                    s.page, s.url, s.title, s.generation
-                );
-                if s.truncated {
-                    header.push_str(&format!(
-                        "\ntruncated: true (showing {} of ~{} nodes)",
-                        s.nodes_returned,
-                        s.approximate_total.unwrap_or(s.nodes_returned)
-                    ));
+
+        Ok(
+            match cancellable!(cancellation, self.browser.inspect(&session, tab, kind)) {
+                Ok(InspectReport::Console(entries)) if entries.is_empty() => {
+                    ToolOutput::ok(format!("no {} entries", kind.as_str()))
                 }
-                Ok(ToolOutput::ok(format!("{header}\n\n{}", s.text)))
-            }
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-// ── interactions (click / type / select / press) ────────────────────────────
-
-macro_rules! ref_input {
-    ($name:ident { $($extra:tt)* }) => {
-        #[derive(Debug, Deserialize, JsonSchema)]
-        struct $name {
-            /// A [ref=…] token from the latest browser_snapshot.
-            r#ref: String,
-            /// Page id (defaults to the current page).
-            #[serde(default)]
-            page: Option<String>,
-            $($extra)*
-        }
-    };
-}
-
-ref_input!(ClickInput {});
-ref_input!(TypeInput {
-    /// Text to enter. Replaces the field's value unless `append` is true.
-    text: String,
-    #[serde(default)]
-    append: bool,
-});
-ref_input!(SelectInput {
-    /// Option label(s) to choose (or value(s) when `by_value`).
-    values: Vec<String>,
-    #[serde(default)]
-    by_value: bool,
-});
-ref_input!(PressInput {
-    /// Key to press, e.g. "Enter", "Escape", "ArrowDown".
-    key: String,
-});
-ref_input!(DragInput {
-    /// Target [ref=…] to drop onto (drag-and-drop). Omit when using dx/dy.
-    #[serde(default)]
-    to_ref: Option<String>,
-    /// Horizontal drag distance in pixels from the element's center.
-    #[serde(default)]
-    dx: Option<f64>,
-    /// Vertical drag distance in pixels from the element's center.
-    #[serde(default)]
-    dy: Option<f64>,
-    /// Intermediate mouse-move steps (default 12; canvas handlers need >1).
-    #[serde(default)]
-    steps: Option<u32>,
-});
-
-/// The shared body of every ref-driven interaction. Takes the runtime the
-/// calling tool was constructed with, so it cannot reach for one of its own.
-async fn run_interaction(
-    rt: &BrowserRuntime,
-    session: BrowserSessionId,
-    page: Option<String>,
-    r#ref: &str,
-    action: Interaction,
-) -> ToolOutput {
-    let page = match resolve_page(rt, &session, page).await {
-        Ok(p) => p,
-        Err(o) => return o,
-    };
-    match rt.interact(&session, &page, r#ref, action).await {
-        Ok(r) => ToolOutput::ok(fmt_action(&r)),
-        Err(e) => err_out(e),
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserClickTool {
-    fn name(&self) -> &'static str {
-        "browser_click"
-    }
-    fn description(&self) -> &'static str {
-        "Click the element identified by a [ref=…] token from browser_snapshot."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<ClickInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: ClickInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        Ok(run_interaction(rt, session, input.page, &input.r#ref, Interaction::Click).await)
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserDragTool {
-    fn name(&self) -> &'static str {
-        "browser_drag"
-    }
-    fn description(&self) -> &'static str {
-        "Drag from a [ref=…] element: either onto `to_ref` (drag-and-drop) or \
-         by a pixel offset `dx`/`dy` from its center (canvas drawing). Exactly \
-         one target form must be given."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<DragInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: DragInput = super::parse_input(self.name(), input)?;
-        let has_offset = input.dx.is_some() || input.dy.is_some();
-        if input.to_ref.is_some() == has_offset {
-            return Ok(ToolOutput::error(
-                "browser_drag needs exactly one target: `to_ref` (drop onto an \
-                 element) OR `dx`/`dy` (drag by an offset).",
-            ));
-        }
-        let action = Interaction::Drag {
-            to_ref: input.to_ref,
-            dx: input.dx.unwrap_or(0.0),
-            dy: input.dy.unwrap_or(0.0),
-            steps: input.steps.unwrap_or(12).clamp(1, 100),
-        };
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        Ok(run_interaction(rt, session, input.page, &input.r#ref, action).await)
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserTypeTool {
-    fn name(&self) -> &'static str {
-        "browser_type"
-    }
-    fn description(&self) -> &'static str {
-        "Type text into a [ref=…] field. Replaces the current value unless append=true."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<TypeInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: TypeInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        Ok(run_interaction(
-            rt,
-            session,
-            input.page,
-            &input.r#ref,
-            Interaction::Type {
-                text: input.text,
-                append: input.append,
+                Ok(InspectReport::Console(entries)) => ToolOutput::ok(
+                    entries
+                        .iter()
+                        .map(|e| format!("[{}] {}", e.level, e.text))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Ok(InspectReport::Network(rows)) if rows.is_empty() => {
+                    ToolOutput::ok("no network requests recorded")
+                }
+                Ok(InspectReport::Network(rows)) => ToolOutput::ok(
+                    rows.iter()
+                        .map(|r| {
+                            let outcome = match (&r.status, &r.failure) {
+                                (_, Some(f)) => format!("FAILED {f}"),
+                                (Some(s), None) => s.to_string(),
+                                (None, None) => "pending".into(),
+                            };
+                            format!("{:>6}  {}  {}", outcome, r.method, r.url)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(e) => failed(e),
             },
         )
-        .await)
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserSelectTool {
-    fn name(&self) -> &'static str {
-        "browser_select"
-    }
-    fn description(&self) -> &'static str {
-        "Select option(s) in a [ref=…] dropdown by label (or value when by_value=true)."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<SelectInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: SelectInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        Ok(run_interaction(
-            rt,
-            session,
-            input.page,
-            &input.r#ref,
-            Interaction::Select {
-                values: input.values,
-                by_value: input.by_value,
-            },
-        )
-        .await)
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserPressTool {
-    fn name(&self) -> &'static str {
-        "browser_press"
-    }
-    fn description(&self) -> &'static str {
-        "Press a key (Enter/Escape/Tab/Arrow…) while a [ref=…] element is focused."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<PressInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: PressInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        Ok(run_interaction(
-            rt,
-            session,
-            input.page,
-            &input.r#ref,
-            Interaction::Press { key: input.key },
-        )
-        .await)
-    }
-}
-
-// ── wait ─────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct WaitInput {
-    #[serde(default)]
-    page: Option<String>,
-    /// Wait for the page load event.
-    #[serde(default)]
-    load: bool,
-    /// Wait until the URL contains this substring.
-    #[serde(default)]
-    url_contains: Option<String>,
-    /// Wait until this text is visible.
-    #[serde(default)]
-    text_visible: Option<String>,
-    /// Wait until this text is gone.
-    #[serde(default)]
-    text_gone: Option<String>,
-    /// Wait until this [ref=…] is visible.
-    #[serde(default)]
-    ref_visible: Option<String>,
-    /// Wait until this [ref=…] is hidden.
-    #[serde(default)]
-    ref_hidden: Option<String>,
-    /// Timeout in seconds (default 15).
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-}
-
-#[async_trait]
-impl Tool for BrowserWaitTool {
-    fn name(&self) -> &'static str {
-        "browser_wait"
-    }
-    fn description(&self) -> &'static str {
-        "Wait for a structured condition (load / url / text / ref visible|hidden) \
-         instead of sleeping."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<WaitInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Safe
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: WaitInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        let page = match resolve_page(rt, &session, input.page).await {
-            Ok(p) => p,
-            Err(o) => return Ok(o),
-        };
-        let condition = if input.load {
-            WaitCondition::Load
-        } else if let Some(u) = input.url_contains {
-            WaitCondition::UrlContains(u)
-        } else if let Some(t) = input.text_visible {
-            WaitCondition::TextVisible(t)
-        } else if let Some(t) = input.text_gone {
-            WaitCondition::TextGone(t)
-        } else if let Some(r) = input.ref_visible {
-            WaitCondition::RefVisible(r)
-        } else if let Some(r) = input.ref_hidden {
-            WaitCondition::RefHidden(r)
-        } else {
-            return Ok(ToolOutput::error(
-                "specify one wait condition (load / url_contains / text_visible / \
-                 text_gone / ref_visible / ref_hidden)",
-            ));
-        };
-        let timeout = Duration::from_secs(input.timeout_seconds.unwrap_or(15).clamp(1, 120));
-        match rt.wait(&session, &page, condition, timeout).await {
-            Ok(()) => Ok(ToolOutput::ok("condition met")),
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-// ── tabs / dialog / console / screenshot ─────────────────────────────────────
-
-#[async_trait]
-impl Tool for BrowserTabsTool {
-    fn name(&self) -> &'static str {
-        "browser_tabs"
-    }
-    fn description(&self) -> &'static str {
-        "List the open browser pages/tabs and their urls."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<PageInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Safe
-    }
-    async fn execute(
-        &self,
-        _input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        match rt.tabs(&session).await {
-            Ok(tabs) => {
-                let body = tabs
-                    .iter()
-                    .map(|t| {
-                        format!(
-                            "{}{}  {}  {}",
-                            if t.active { "* " } else { "  " },
-                            t.page,
-                            t.title,
-                            t.url
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Ok(ToolOutput::ok(if body.is_empty() {
-                    "no open pages".into()
-                } else {
-                    body
-                }))
-            }
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct DialogInput {
-    #[serde(default)]
-    page: Option<String>,
-    /// Answer the NEXT dialog by accepting it (default dismiss).
-    #[serde(default)]
-    accept: bool,
-    /// Text to enter for a prompt dialog when accepting.
-    #[serde(default)]
-    prompt_text: Option<String>,
-}
-
-#[async_trait]
-impl Tool for BrowserDialogTool {
-    fn name(&self) -> &'static str {
-        "browser_dialog"
-    }
-    fn description(&self) -> &'static str {
-        "Set how the NEXT native dialog (alert/confirm/prompt) is answered, before \
-         the action that triggers it. Default is dismiss."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<DialogInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Network
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: DialogInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        let page = match resolve_page(rt, &session, input.page).await {
-            Ok(p) => p,
-            Err(o) => return Ok(o),
-        };
-        match rt
-            .set_dialog_policy(&session, &page, input.accept, input.prompt_text)
-            .await
-        {
-            Ok(()) => Ok(ToolOutput::ok(format!(
-                "next dialog will be {}",
-                if input.accept {
-                    "accepted"
-                } else {
-                    "dismissed"
-                }
-            ))),
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for BrowserConsoleTool {
-    fn name(&self) -> &'static str {
-        "browser_console"
-    }
-    fn description(&self) -> &'static str {
-        "Read recent console errors/warnings and uncaught page errors for the page."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<PageInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Safe
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: PageInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        let page = match resolve_page(rt, &session, input.page).await {
-            Ok(p) => p,
-            Err(o) => return Ok(o),
-        };
-        match rt.console_tail(&session, &page).await {
-            Ok(entries) if entries.is_empty() => {
-                Ok(ToolOutput::ok("no console errors or warnings"))
-            }
-            Ok(entries) => Ok(ToolOutput::ok(
-                entries
-                    .iter()
-                    .map(|e| format!("[{}] {}", e.level, e.text))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )),
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ScreenshotInput {
-    #[serde(default)]
-    page: Option<String>,
-    /// Capture the full scrollable page (default: viewport only).
-    #[serde(default)]
-    full_page: bool,
-}
-
-#[async_trait]
-impl Tool for BrowserScreenshotTool {
-    fn name(&self) -> &'static str {
-        "browser_screenshot"
-    }
-    fn description(&self) -> &'static str {
-        "Capture a PNG screenshot of the current page (auxiliary; the snapshot is \
-         the primary way to read a page)."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        super::schema_of::<ScreenshotInput>()
-    }
-    fn risk(&self) -> RiskLevel {
-        RiskLevel::Safe
-    }
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: ToolContext,
-        _cancel: CancellationToken,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: ScreenshotInput = super::parse_input(self.name(), input)?;
-        let (rt, session) = match self.runtime(context.session_scope()) {
-            Ok(v) => v,
-            Err(o) => return Ok(o),
-        };
-        let page = match resolve_page(rt, &session, input.page).await {
-            Ok(p) => p,
-            Err(o) => return Ok(o),
-        };
-        match rt.screenshot(&session, &page, input.full_page).await {
-            Ok((b64, media_type)) => Ok(ToolOutput::ok("captured page screenshot").with_metadata(
-                serde_json::json!({"image": {"media_type": media_type, "data": b64}}),
-            )),
-            Err(e) => Ok(err_out(e)),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::navigation_host_allowed;
-
-    #[test]
-    fn ssrf_gate_allows_localhost_and_public_forms_but_blocks_private() {
-        // Loopback dev servers are the narrow allowed exception.
-        assert!(navigation_host_allowed("http://localhost:3000/users").is_ok());
-        assert!(navigation_host_allowed("http://127.0.0.1/").is_ok());
-        assert!(navigation_host_allowed("https://[::1]/").is_ok());
-
-        // Private / link-local / metadata addresses are refused (IP literals,
-        // so this is hermetic — no DNS needed).
-        assert!(navigation_host_allowed("http://10.0.0.1/").is_err());
-        assert!(navigation_host_allowed("http://192.168.1.1/").is_err());
-        assert!(navigation_host_allowed("http://169.254.169.254/latest/meta-data").is_err());
-
-        // Non-http schemes and malformed URLs are refused (no file://, no data:).
-        assert!(navigation_host_allowed("file:///etc/passwd").is_err());
-        assert!(navigation_host_allowed("ftp://example.com/").is_err());
-        assert!(navigation_host_allowed("not-a-url").is_err());
-        assert!(navigation_host_allowed("http:///no-host").is_err());
     }
 }

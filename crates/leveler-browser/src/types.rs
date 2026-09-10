@@ -1,16 +1,92 @@
-//! The typed browser domain. These are the values that cross the tool boundary;
-//! `serde_json::Value` is confined to the driver transport, never the domain.
+//! The typed browser domain. These are the values that cross the tool
+//! boundary; `serde_json::Value` is confined to the two protocol adapters.
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies the isolation scope a page/ref belongs to. Refs are only valid
-/// within their owning session (§10 session isolation).
+/// A browser PRODUCT — what the user actually runs.
+///
+/// Deliberately separate from the protocol that drives it: "Chromium backend"
+/// is a protocol, not a browser. A user whose default browser is Edge must be
+/// driven through Edge, never through Chrome merely because both speak CDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserProduct {
+    Safari,
+    Chrome,
+    Edge,
+    Chromium,
+}
+
+impl BrowserProduct {
+    /// The stable id used in config, tool input and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safari => "safari",
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+            Self::Chromium => "chromium",
+        }
+    }
+
+    /// Parse a config/tool value. Unknown values are `None` — never coerced to
+    /// a default, because a typo must not silently pick a different browser.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "safari" => Some(Self::Safari),
+            "chrome" | "google chrome" | "google-chrome" => Some(Self::Chrome),
+            "edge" | "msedge" | "microsoft edge" => Some(Self::Edge),
+            "chromium" => Some(Self::Chromium),
+            _ => None,
+        }
+    }
+
+    /// Every product, for exhaustive discovery/diagnostics.
+    pub const ALL: [Self; 4] = [Self::Safari, Self::Chrome, Self::Edge, Self::Chromium];
+}
+
+impl std::fmt::Display for BrowserProduct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where a resolved product came from. Carried into diagnostics so an
+/// unavailable browser can say WHY that browser was the one chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductSource {
+    /// The tool call named it.
+    Explicit,
+    /// `[browser].default` in the global config.
+    Configured,
+    /// The operating system's default web browser.
+    SystemDefault,
+}
+
+impl ProductSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicitly requested",
+            Self::Configured => "configured as [browser].default",
+            Self::SystemDefault => "the system default browser",
+        }
+    }
+}
+
+/// A product plus how it was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedProduct {
+    pub product: BrowserProduct,
+    pub source: ProductSource,
+}
+
+/// Identifies the isolation scope a tab/ref belongs to. Refs and tabs are only
+/// valid within their owning session (§19).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BrowserSessionId(pub String);
 
-/// Identifies one page/tab within the runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BrowserPageId(pub String);
+/// Identifies one tab within the live browser.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TabId(pub String);
 
 impl BrowserSessionId {
     pub fn new(s: impl Into<String>) -> Self {
@@ -21,7 +97,7 @@ impl BrowserSessionId {
     }
 }
 
-impl BrowserPageId {
+impl TabId {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
@@ -30,101 +106,74 @@ impl BrowserPageId {
     }
 }
 
-impl std::fmt::Display for BrowserPageId {
+impl std::fmt::Display for TabId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-/// A safe handle to one element, valid **only** within the (session, page,
-/// generation) it was produced in (§13). It is never resolved by guessing a
-/// similar element: if `generation` no longer matches the page's current
-/// generation, or the driver cannot resolve `token`, the action fails with
-/// [`crate::BrowserError::RefStale`].
+/// A bounded, semantic view of a page (§17).
 ///
-/// `token` is the driver's accessibility-ref (e.g. Playwright `aria-ref`),
-/// which is bound to a specific accessibility snapshot — resolving a token from
-/// a superseded snapshot fails at the driver rather than matching a lookalike.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserRef {
-    pub session: BrowserSessionId,
-    pub page: BrowserPageId,
-    /// The snapshot generation this ref was minted in.
-    pub generation: u64,
-    /// Driver-side accessibility ref token (opaque to the agent).
-    pub token: String,
-}
-
-impl BrowserRef {
-    /// True when this ref belongs to `page` and is still on its current
-    /// `generation` — the cheap proactive staleness guard before the driver is
-    /// even asked.
-    pub fn is_current(&self, page: &BrowserPageId, current_generation: u64) -> bool {
-        &self.page == page && self.generation == current_generation
-    }
-}
-
-/// A bounded, semantic view of a page (§21/§23).
-///
-/// `text` is the accessibility-oriented rendering — roles, accessible names,
-/// state, and `[ref=…]` interaction tokens, with nesting for tables/lists —
-/// never raw DOM/HTML/CSS. It is the native, ref-annotated snapshot the driver
-/// produces; the agent reads it directly. `truncated` is never silent.
+/// `text` is role + accessible name + `[ref]` tokens, never raw DOM/HTML. The
+/// same renderer serves both backends, so a model reads one format whichever
+/// browser is driving. `truncated` is never silent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSnapshot {
-    pub page: BrowserPageId,
+    pub tab: TabId,
     pub url: String,
     pub title: String,
-    /// Monotonic per-page generation; bumped on structural change/navigation.
-    /// The `[ref=…]` tokens embed this generation so a ref from a superseded
-    /// snapshot is detected as stale rather than retargeting a lookalike.
+    /// Monotonic per-tab generation. Model-facing refs embed it, so a ref from
+    /// a superseded snapshot is mechanically stale rather than retargeted.
     pub generation: u64,
-    /// The rendered semantic snapshot (interactive-first, budget-bounded).
     pub text: String,
-    /// True when the node/char budget clipped the view.
     pub truncated: bool,
-    /// Interactive/semantic nodes actually included after budgeting.
     pub nodes_returned: usize,
-    /// Best-effort total node estimate when truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approximate_total: Option<usize>,
 }
 
-/// A native JS dialog surfaced to the agent (§35). CodeLeveler never lets a
-/// dialog hang the driver — it is reported and the agent decides accept/dismiss.
+/// The structured outcome of an act/navigate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DialogInfo {
-    /// `alert` | `confirm` | `prompt` | `beforeunload`.
-    pub kind: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_value: Option<String>,
-}
-
-/// The structured outcome of an interaction (click/type/select/press).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserActionResult {
-    pub page: BrowserPageId,
+pub struct ActionOutcome {
+    pub tab: TabId,
     pub url: String,
     pub title: String,
     /// The page navigated as a result of the action.
     pub navigated: bool,
-    /// A new page/tab was opened (target=_blank / window.open).
+    /// A new tab was opened (target=_blank / window.open) and adopted by this
+    /// session.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_page: Option<BrowserPageId>,
-    /// The action's resulting navigation was refused by the SSRF network gate
-    /// (B-1). Present means "the request never egressed"; surfaced, never silent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<String>,
-    /// A dialog opened and awaits the agent's decision.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dialog: Option<DialogInfo>,
-    /// The page generation after the action (a bump signals prior refs stale).
-    pub generation: u64,
+    pub new_tab: Option<TabId>,
 }
 
-/// One console/page-error entry surfaced to the agent (§36). Only
-/// errors/warnings are collected — never the full `console.log` firehose.
+/// One entry of the tab list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub tab: TabId,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
+}
+
+/// What `browser_inspect` is asking the backend for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectKind {
+    Console,
+    PageErrors,
+    Network,
+}
+
+impl InspectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Console => "console",
+            Self::PageErrors => "page_errors",
+            Self::Network => "network",
+        }
+    }
+}
+
+/// One console message / page error surfaced to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleEntry {
     /// `error` | `warning` | `pageerror`.
@@ -132,110 +181,105 @@ pub struct ConsoleEntry {
     pub text: String,
 }
 
-/// One entry of the tab/page list (§34).
+/// One network request/response pair the backend observed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TabInfo {
-    pub page: BrowserPageId,
+pub struct NetworkEntry {
+    pub method: String,
     pub url: String,
-    pub title: String,
-    pub active: bool,
+    /// `None` when the request failed before a response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u32>,
+    /// Set when the request failed; carries the browser's own error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
-/// Which browser engine backs the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserEngine {
-    /// System-installed Google Chrome (`channel: chrome`).
-    SystemChrome,
-    /// System-installed Chromium.
-    SystemChromium,
-    /// CodeLeveler-managed Chromium under `runtimes/browser/`.
-    ManagedChromium,
+/// What an inspect returned.
+///
+/// A backend that cannot observe the asked-for channel returns
+/// [`crate::BrowserError::Unsupported`] instead of an empty variant, so
+/// "nothing happened" and "this browser cannot see it" are never the same
+/// answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectReport {
+    Console(Vec<ConsoleEntry>),
+    Network(Vec<NetworkEntry>),
 }
 
-/// Lifecycle state of the runtime (§17). `Installing` carries progress so the
-/// TUI can show a managed download without a fake spinner.
+/// Lifecycle state of the browser capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum BrowserRuntimeStatus {
-    /// Never started; no process yet (the lazy default).
-    NotReady,
-    /// A managed runtime is being fetched/prepared.
-    Installing {
-        received_bytes: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        total_bytes: Option<u64>,
+pub enum BrowserStatus {
+    /// Nothing started; no process (the lazy default).
+    NotStarted,
+    /// A browser is live and usable.
+    Live { product: BrowserProduct },
+    /// The protocol connection dropped. The next navigate starts a fresh
+    /// session; every other operation reports this state (§24).
+    Disconnected {
+        product: BrowserProduct,
+        reason: String,
     },
-    /// A driver + browser are live and usable.
-    Ready,
-    /// The driver/browser crashed; the next call may restart it.
-    Crashed { reason: String },
-}
-
-/// Non-sensitive description of the live runtime (§44 — no executable path,
-/// no profile path; those never reach the model/logs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserRuntimeInfo {
-    pub engine: BrowserEngine,
-    /// Browser version string (e.g. Chrome `127.0.x`).
-    pub browser_version: String,
-    /// Managed driver version, when a managed runtime is in use.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub driver_version: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Three products share CDP, and sharing a protocol does not make them the
+    /// same browser. `discover` proves the install paths stay separate; this
+    /// pins the values themselves.
     #[test]
-    fn ref_currency_requires_same_page_and_generation() {
-        let r = BrowserRef {
-            session: BrowserSessionId::new("s1"),
-            page: BrowserPageId::new("p1"),
-            generation: 5,
-            token: "e12".into(),
-        };
-        assert!(r.is_current(&BrowserPageId::new("p1"), 5));
-        assert!(
-            !r.is_current(&BrowserPageId::new("p1"), 6),
-            "generation bump ⇒ stale"
+    fn a_product_is_not_its_protocol() {
+        assert_ne!(BrowserProduct::Edge, BrowserProduct::Chrome);
+        assert_ne!(BrowserProduct::Chromium, BrowserProduct::Chrome);
+        let ids: Vec<&str> = BrowserProduct::ALL.iter().map(|p| p.as_str()).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "each product has its own id: {ids:?}"
         );
-        assert!(
-            !r.is_current(&BrowserPageId::new("p2"), 5),
-            "wrong page ⇒ stale"
+    }
+
+    #[test]
+    fn parse_round_trips_and_refuses_unknown() {
+        for p in BrowserProduct::ALL {
+            assert_eq!(BrowserProduct::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(
+            BrowserProduct::parse("Microsoft Edge"),
+            Some(BrowserProduct::Edge)
         );
+        assert_eq!(
+            BrowserProduct::parse("Google Chrome"),
+            Some(BrowserProduct::Chrome)
+        );
+        // A typo must not silently become a different browser.
+        assert_eq!(BrowserProduct::parse("chrom"), None);
+        assert_eq!(BrowserProduct::parse("firefox"), None);
+        assert_eq!(BrowserProduct::parse(""), None);
     }
 
     #[test]
     fn snapshot_round_trips_and_omits_empty() {
         let snap = BrowserSnapshot {
-            page: BrowserPageId::new("p1"),
+            tab: TabId::new("tab-1"),
             url: "http://localhost:3000/users".into(),
             title: "Users".into(),
             generation: 18,
-            text: "[ref=18e15] button \"Create user\"".into(),
+            text: "[18e15] button \"Create user\"".into(),
             truncated: false,
             nodes_returned: 1,
             approximate_total: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("approximate_total"));
-        let back: BrowserSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, snap);
-    }
-
-    #[test]
-    fn runtime_status_is_tagged() {
-        let s = BrowserRuntimeStatus::Installing {
-            received_bytes: 10,
-            total_bytes: Some(100),
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"state\":\"installing\""));
         assert_eq!(
-            serde_json::from_str::<BrowserRuntimeStatus>(&json).unwrap(),
-            s
+            serde_json::from_str::<BrowserSnapshot>(&json).unwrap(),
+            snap
         );
     }
 }

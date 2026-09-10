@@ -350,11 +350,11 @@ RunCommandTool    → CommandExecution
 ShellCommandTool  → CommandExecution
 FindSymbolTool    → LspSessions
 GitStatusTool     → GitWorkflow
-BrowserClickTool  → BrowserRuntime
+BrowserTabTool    → Browser
 ViewImageTool     → leveler_media::process_image
 MemoryTool        → MemoryStore
 McpTool           → McpClient
-WebSearchTool     → Search provider  (still the tool; §18.3 G)
+WebSearchTool     → Tavily, keyed at construction
 ```
 
 The arrow is a CONSTRUCTOR, not a lookup. Each tool holds the handle on the
@@ -387,8 +387,9 @@ trait, no registry, no new crate:
 | `CodeIntelligence` | `leveler_lsp::LspSessions` — the crate that owns `LspClient` |
 | VCS | `leveler_vcs::GitWorkflow` |
 | Media | `leveler_media::process_image` |
-| Browser | `leveler_browser::BrowserRuntime` |
+| Browser | `leveler_browser::Browser`, over one `BrowserBackend` per protocol (CDP, WebDriver) |
 | Memory | `leveler_memory::MemoryStore` |
+| Web search | Tavily, called directly. One backend written down once, no seam in front of it (§18.3 G) |
 | MCP | `leveler_tools::mcp::McpClient` |
 
 `CommandExecution` stays inside `leveler-tools` rather than moving down to
@@ -468,7 +469,7 @@ Every tool is now constructed with the handles it uses and no others:
 | `run_command`, `shell_command` | the shared `CommandExecution` |
 | `get_task`, `wait_task`, `kill_task` | `BackgroundTaskRegistry` |
 | `memory`, `remember`, `forget` | the memory store root |
-| `browser_*` | `leveler_browser::BrowserRuntime` |
+| `browser_tab`, `browser_act`, `browser_inspect` | `leveler_browser::Browser` |
 | the core read/search/edit tools, `git_*`, `view_image`, `load_skill`, `web_*` | nothing but the context |
 
 The handles reach the composer as `leveler_tools::Capabilities`, which the
@@ -568,7 +569,7 @@ The registry must not become a policy engine again.
 │                  CAPABILITIES                    │
 │ Workspace Read/Search   Workspace Edit           │
 │ Command Execution       Code Intelligence        │
-│ Browser Runtime         VCS      Memory          │
+│ Browser                 VCS      Memory          │
 │ Skills   Media   Web/Search   MCP Runtime        │
 └───────────────────────┬──────────────────────────┘
                         ▼
@@ -646,8 +647,14 @@ EXTENSIONS           MCP tools from configured servers
 | --- | --- |
 | `core_surface(&capabilities)` | 11 |
 | `model_surface(CapabilityPacks::ALL, &capabilities)` = core + 26 | 37 |
+| the same, on a host with no search key | 36 |
 | Harness controls (`update_plan` + 1–7 injected, by condition) | 2–8 |
 | MCP extensions | as configured |
+
+Both numbers matter. A pack needs the product to have asked for it AND the host
+to be able to provide it, and for `web_search` "able to provide it" means
+holding a key — so a key-less host composes 36, and `default_registry()`, whose
+whole point is that it needs nothing from a host, is one of them.
 
 A pack reaches the model only when the product mode ENABLED it and this host
 can provide it (§6.4). Neither answer is ever about the task or the model:
@@ -661,7 +668,7 @@ can provide it (§6.4). Neither answer is ever about the task or the model:
 | Media | `view_image` | the model's profile declares `vision` | outside Economy |
 | Memory | `memory`, `remember`, `forget` | always — the app hands the tools a store root | outside Economy |
 | Skills | `load_skill` | always | outside Economy |
-| Browser | `browser_*` (12) | Node is on `PATH` — the driver cannot start without it | outside Economy |
+| Browser | `browser_tab`, `browser_act`, `browser_inspect` (3) | the browser this host would SELECT — the call's, then `[browser].default`, then the system default — is one it can drive | outside Economy |
 
 `WorkProfile::Economy` enables `CapabilityPacks::NONE`: the primitives and the
 protocol, nothing else. That is a user's decision about cost, not an inference
@@ -674,6 +681,31 @@ functions over separate inputs, and the intersection is the only way either
 reaches the model:
 `Application::capability_availability` (mechanical),
 `Application::capability_selection` (product), `CapabilityPacks::intersect`.
+
+**The browser is network-authorised by exposure.** Every other capability that
+reaches the network re-checks `network_denied` inside `execute`, because for an
+in-process `reqwest` call that check is the only enforcement point. The browser
+does not, and the omission is the decision, not an oversight: the capability
+exists to open real pages — a dev server, a staging host, a docs site — and
+verify what the user's own browser would show. A browser that could navigate
+only where a policy re-permitted it per request would be a different, much less
+useful capability, and the enforcement to make that real (a forward proxy, DNS
+pinning, per-page grants, request interception in two protocols) is a second
+network runtime CodeLeveler would then own and maintain.
+
+So the rule is stated once, at the surface:
+
+```text
+Browser Pack EXPOSED  =  browser network egress authorized
+```
+
+Localhost, LAN dev servers and the public internet are all reachable, and a
+click that navigates, a page's `fetch`, a WebSocket and a subresource behave as
+they do in the user's browser. One navigation-target rule survives, and it is
+not a network boundary: `browser_tab navigate` refuses link-local and cloud
+instance-metadata addresses, because pointing a browser at
+`169.254.169.254` is a credential read wearing a URL. It does not, and does not
+claim to, constrain what an already-open page does.
 
 ### 6.3 The Core Primitive Foundation
 
@@ -921,7 +953,7 @@ Counting production (non-test) call sites of `fs::write`, `fs::remove`,
 | `leveler-context` | 0 | Read-only assembly. |
 | `leveler-vcs` | 0 | Every git invocation goes through the execution runner. |
 | `leveler-tools` | 13 | `workspace/editor.rs` writes through the workspace root fd (symlink-safe). `mcp.rs` spawns configured MCP servers directly. |
-| `leveler-browser` | 15 | Driver install writes under the Leveler home; the driver process is spawned directly. |
+| `leveler-browser` | 3 | The browser process is spawned directly (Unix process group, Windows Job Object); the profile directory is created under the Leveler home. |
 | `leveler-memory` | 11 | Writes the memory store under the Leveler home. |
 | `leveler-lsp` | 4 | Spawns language servers directly, from the session pool that owns their lifetime. |
 | `leveler-engine` | 3 | `git rev-parse` for the baseline commit. |
@@ -953,7 +985,7 @@ outside `CommandRunner`'s process-tree termination and sandbox semantics. See
 | `leveler-skills` | Skill discovery and loading. |
 | `leveler-vcs` | Git operations, performed through the execution authority; `GitWorkflow::inspect` is how the read-only git tools invoke `git`, on the caller's runner. |
 | `leveler-lsp` | Language-server sessions (`LspSessions`), reused across tool calls; the one owner of client lifetime, startup and dead-server eviction. |
-| `leveler-browser` | Browser runtime, driver install, isolated per-project profile. |
+| `leveler-browser` | Browser product selection, refs and tab ownership, and the two protocol adapters (CDP for Chrome/Edge/Chromium, WebDriver for Safari). |
 | `leveler-media` | Content-typed image import: real MIME from content, decode and pixel limits, EXIF stripping, downscaling, content-addressed storage. |
 
 A Coding harness selects context, project, VCS, LSP, browser, memory,
@@ -1568,8 +1600,9 @@ What stayed is not duplication. The `network_denied` check inside `execute` is
 the ONLY enforcement point for a tool that dials the network in-process: the
 ToolHost freezes `network_allowed` into the resolved policy, but the OS sandbox
 that enforces it covers `run_command` children, not a `reqwest` call in this
-process. `web_fetch` and the browser tools carry the same check for the same
-reason.
+process. `web_fetch` and `web_search` carry the same check for the same reason. The
+browser does NOT: it is an explicitly network-authorised capability, so
+exposing it IS the authorisation (§5.3).
 
 Extract a provider seam when a second backend actually has to be supported.
 
@@ -1598,8 +1631,8 @@ to two minutes and swallow it.
 
 ### 18.4 Sidecar processes bypass the command runner
 
-**Current.** MCP servers (`leveler-tools/src/mcp.rs`), the browser driver
-(`leveler-browser/src/driver.rs`) and language servers
+**Current.** MCP servers (`leveler-tools/src/mcp.rs`), the browser
+(`leveler-browser/src/cdp.rs`, `webdriver.rs`) and language servers
 (`leveler-lsp/src/client.rs`, `registry.rs`) are spawned with `Command::new`
 directly rather than through `leveler_execution::CommandRunner`.
 
@@ -1724,6 +1757,26 @@ authority.
 
 ---
 
+### 18.10 The browser implementation was superseded (closed)
+
+**Was.** `leveler-browser` drove Chromium through Playwright over a
+CodeLeveler-authored Node bridge speaking custom JSON-RPC on stdio, with an
+SSRF boundary enforced inside that bridge.
+
+**Now.** The Browser Capability Closure replaced it. Chrome, Edge and Chromium
+are driven directly over CDP; Safari is driven over W3C WebDriver through
+`safaridriver`. There is no Node, no Playwright, no npm install, no managed
+browser download and no custom RPC. Which browser runs is the user's default
+browser unless a call or `[browser].default` says otherwise, and a product that
+cannot be driven is an error rather than a different product.
+
+**What closed with it.** The parked
+`loopback_ws_from_a_granted_dev_page_connects` flake was a finding about the
+bridge's JavaScript WebSocket gate. That gate is deleted, along with the whole
+page-scoped loopback grant it belonged to: the browser is network-authorised,
+so there is no per-request loopback decision left to race. The finding is
+closed by deletion, not by a fix.
+
 ## 19. Open design questions
 
 Recorded so they are not silently decided by the first person who needs them.
@@ -1831,6 +1884,8 @@ TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
 
+BROWSER_IMPLEMENTATION            SUPERSEDED_PENDING_REPLACEMENT
+
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 SECOND_HARNESS_WRITTEN            NO
 FOUNDATION_FROZEN                 NO
@@ -1847,3 +1902,7 @@ Four lines went from NO to YES because the code changed, not the prose:
 `leveler-model` holds no tool name, and a turn's work profile comes from the
 session row. Each has a tripwire named in its section. Nothing here was
 changed to improve a line of this table.
+
+`BROWSER_IMPLEMENTATION` is closed. The Node bridge, Playwright, the custom
+RPC and the JavaScript network gates are gone; `leveler-browser` speaks CDP and
+WebDriver directly, and §18.10 records what that closed.

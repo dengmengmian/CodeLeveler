@@ -16,6 +16,10 @@
 //! [ui]
 //! theme = "auto"               # optional TUI theme: auto | dark | light | high-contrast
 //!
+//! [browser]
+//! default = "chrome"           # optional: safari | chrome | edge | chromium.
+//!                              # Unset uses the operating system's default browser.
+//!
 //! [vcs]
 //! co_author = true             # optional; append the CodeLeveler/model commit trailer
 //!
@@ -66,6 +70,9 @@ pub struct GlobalConfig {
     /// UI preferences (theme, …).
     #[serde(default)]
     ui: GlobalUi,
+    /// Which browser the browser capability drives.
+    #[serde(default)]
+    browser: GlobalBrowser,
     /// Git commit attribution. Enabled unless explicitly disabled.
     #[serde(default)]
     vcs: GlobalVcs,
@@ -110,6 +117,20 @@ impl Default for GlobalAgents {
             completion_judge_timeout_seconds: None,
         }
     }
+}
+
+/// `[browser]`. One key: which browser to drive.
+///
+/// Unset is not "pick one for me" — it means the operating system's default
+/// browser, which is the whole point of the setting: the user is verifying
+/// their frontend in the browser they actually use, and this exists only to
+/// override that.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalBrowser {
+    /// `safari` | `chrome` | `edge` | `chromium`.
+    #[serde(default)]
+    default: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -291,6 +312,10 @@ pub struct GlobalBundle {
     pub agents_delegation: bool,
     /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
+    /// `[browser].default`, parsed. An unrecognised value is `None` and the
+    /// system default browser is used — a typo must not silently pick a
+    /// different browser than the one named.
+    pub browser_default: Option<leveler_browser::BrowserProduct>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -545,6 +570,11 @@ impl GlobalConfig {
             mcp_servers,
             agents_delegation: self.agents.delegation,
             agents_independent_review: self.agents.independent_review,
+            browser_default: self
+                .browser
+                .default
+                .as_deref()
+                .and_then(leveler_browser::BrowserProduct::parse),
         }
     }
 }

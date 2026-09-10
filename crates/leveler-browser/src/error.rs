@@ -1,103 +1,86 @@
 //! The one error type every browser operation returns.
 //!
-//! Each variant is a distinct, actionable failure mode — a tool maps these to a
-//! model-visible `ToolOutput::error` so the agent knows *what* went wrong (a
-//! stale ref is not a crashed runtime is not a denied navigation). Never a bare
-//! "browser failed".
+//! Each variant is a distinct, mechanically distinguishable failure — a stale
+//! ref is not a disconnected session is not an unsupported backend operation.
+//! The `Display` text states the mechanical fact and nothing else: it never
+//! tells the model what to do next (§33).
 
 use std::fmt;
 
-/// A structured browser failure. Categorized so tools and the agent can react
-/// precisely; the `Display` text is safe to surface to the model.
+/// A structured browser failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserError {
-    /// No usable browser at all (no system browser found and managed runtime
-    /// absent/could-not-be-prepared). Distinct from a *launch* failure.
+    /// No usable browser: the selected product is not installed, or its
+    /// automation prerequisite is not met. Carries the mechanical reason.
+    /// Never a fallback to a different product (§34).
     Unavailable(String),
-    /// Managed runtime download/install failed (network, extraction, etc.).
-    RuntimeInstallFailed(String),
-    /// A managed runtime is present but incomplete/corrupt (missing executable,
-    /// bad metadata) — the reaper/installer should repair it.
-    RuntimeCorrupt(String),
-    /// A browser executable path was expected but not found on disk.
-    ExecutableNotFound(String),
-    /// The browser process failed to launch (bad flags, sandbox, permissions).
+    /// The browser process was found but failed to start or to speak its
+    /// protocol.
     LaunchFailed(String),
     /// The isolated project profile directory is unusable.
     ProfileUnavailable(String),
-    /// The driver IPC channel dropped (EOF/broken pipe) — distinct from a
-    /// full runtime crash; a reconnect/restart may recover it.
-    DriverDisconnected(String),
-    /// The driver process (or the browser it owns) crashed. After this the
-    /// runtime may restart, and all prior refs are invalid.
-    RuntimeCrashed(String),
-    /// An action exceeded its deadline. `stage` names which phase timed out
-    /// (bootstrap/install/launch/navigate/action/wait) so the agent can tell a
-    /// slow page from a stuck runtime.
-    ActionTimeout { stage: String, message: String },
-    /// A ref no longer identifies its element (structural page change, new
-    /// generation, navigation). NEVER silently retargeted — a BLOCKER-level
-    /// safety invariant.
+    /// The protocol connection to the browser dropped: the process exited, was
+    /// killed, or stopped answering. All prior refs are invalid.
+    Disconnected(String),
+    /// An operation exceeded its deadline. `stage` names the phase.
+    Timeout { stage: String, message: String },
+    /// A ref no longer identifies its element (page changed / navigated / a
+    /// newer snapshot superseded it). NEVER silently retargeted (§18).
     RefStale(String),
-    /// The page/tab the operation targeted is closed.
-    PageClosed(String),
-    /// The action reached the page but could not complete (element not
-    /// actionable, obscured, detached, driver-reported failure).
+    /// The tab the operation targeted is closed or not owned by this session.
+    TabClosed(String),
+    /// The operation reached the page but could not complete.
     ActionFailed(String),
-    /// The navigation/action was refused by policy (network denied, blocked
-    /// host/SSRF, permission). Carries the human reason.
+    /// The backend's protocol cannot provide this operation (§16/§32). Not a
+    /// failure to try harder: the capability does not exist.
+    Unsupported(String),
+    /// The navigation target is refused by the runtime's link-local/metadata
+    /// rule (§21). This is a navigation-target refusal, not a network boundary.
     Denied(String),
+    /// The caller's cancellation token fired while the operation was in flight.
+    Cancelled,
 }
 
 impl BrowserError {
-    /// A short, stable machine tag for logs/metrics (never includes the
-    /// free-text detail, so it is safe to aggregate on).
+    /// A short, stable machine tag for logs/metrics (never the free text).
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Unavailable(_) => "unavailable",
-            Self::RuntimeInstallFailed(_) => "runtime_install_failed",
-            Self::RuntimeCorrupt(_) => "runtime_corrupt",
-            Self::ExecutableNotFound(_) => "executable_not_found",
             Self::LaunchFailed(_) => "launch_failed",
             Self::ProfileUnavailable(_) => "profile_unavailable",
-            Self::DriverDisconnected(_) => "driver_disconnected",
-            Self::RuntimeCrashed(_) => "runtime_crashed",
-            Self::ActionTimeout { .. } => "action_timeout",
+            Self::Disconnected(_) => "disconnected",
+            Self::Timeout { .. } => "timeout",
             Self::RefStale(_) => "ref_stale",
-            Self::PageClosed(_) => "page_closed",
+            Self::TabClosed(_) => "tab_closed",
             Self::ActionFailed(_) => "action_failed",
+            Self::Unsupported(_) => "unsupported",
             Self::Denied(_) => "denied",
+            Self::Cancelled => "cancelled",
         }
     }
 
-    /// Whether the runtime may still be usable after this error. A stale ref or
-    /// a denied action leaves the runtime healthy; a crash/disconnect does not.
-    pub fn runtime_still_healthy(&self) -> bool {
-        !matches!(
-            self,
-            Self::RuntimeCrashed(_) | Self::DriverDisconnected(_) | Self::RuntimeCorrupt(_)
-        )
+    /// Whether the live session may still be used after this error. Only a
+    /// dropped protocol connection invalidates it; a stale ref, an unsupported
+    /// operation and a cancelled call all leave the browser healthy (§23).
+    pub fn session_still_live(&self) -> bool {
+        !matches!(self, Self::Disconnected(_))
     }
 }
 
 impl fmt::Display for BrowserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unavailable(m) => write!(f, "no usable browser: {m}"),
-            Self::RuntimeInstallFailed(m) => write!(f, "browser runtime install failed: {m}"),
-            Self::RuntimeCorrupt(m) => write!(f, "browser runtime is corrupt: {m}"),
-            Self::ExecutableNotFound(m) => write!(f, "browser executable not found: {m}"),
+            Self::Unavailable(m) => write!(f, "browser backend unavailable: {m}"),
             Self::LaunchFailed(m) => write!(f, "browser failed to launch: {m}"),
             Self::ProfileUnavailable(m) => write!(f, "browser profile unavailable: {m}"),
-            Self::DriverDisconnected(m) => write!(f, "browser driver disconnected: {m}"),
-            Self::RuntimeCrashed(m) => write!(f, "browser runtime crashed: {m}"),
-            Self::ActionTimeout { stage, message } => {
-                write!(f, "browser {stage} timed out: {message}")
-            }
-            Self::RefStale(m) => write!(f, "browser ref is stale (page changed): {m}"),
-            Self::PageClosed(m) => write!(f, "browser page is closed: {m}"),
+            Self::Disconnected(m) => write!(f, "browser session disconnected: {m}"),
+            Self::Timeout { stage, message } => write!(f, "browser {stage} timed out: {message}"),
+            Self::RefStale(m) => write!(f, "stale browser ref: {m}"),
+            Self::TabClosed(m) => write!(f, "browser tab is closed: {m}"),
             Self::ActionFailed(m) => write!(f, "browser action failed: {m}"),
-            Self::Denied(m) => write!(f, "browser action denied: {m}"),
+            Self::Unsupported(m) => write!(f, "{m}"),
+            Self::Denied(m) => write!(f, "browser navigation refused: {m}"),
+            Self::Cancelled => write!(f, "browser operation cancelled"),
         }
     }
 }
@@ -115,20 +98,20 @@ mod tests {
     fn kind_is_stable_and_detail_free() {
         assert_eq!(BrowserError::RefStale("e12".into()).kind(), "ref_stale");
         assert_eq!(
-            BrowserError::ActionTimeout {
+            BrowserError::Timeout {
                 stage: "navigate".into(),
                 message: "slow".into()
             }
             .kind(),
-            "action_timeout"
+            "timeout"
         );
     }
 
     #[test]
-    fn health_distinguishes_recoverable_from_fatal() {
-        assert!(BrowserError::RefStale("x".into()).runtime_still_healthy());
-        assert!(BrowserError::Denied("x".into()).runtime_still_healthy());
-        assert!(!BrowserError::RuntimeCrashed("x".into()).runtime_still_healthy());
-        assert!(!BrowserError::DriverDisconnected("x".into()).runtime_still_healthy());
+    fn only_a_dropped_connection_invalidates_the_session() {
+        assert!(BrowserError::RefStale("x".into()).session_still_live());
+        assert!(BrowserError::Unsupported("x".into()).session_still_live());
+        assert!(BrowserError::Cancelled.session_still_live());
+        assert!(!BrowserError::Disconnected("browser exited".into()).session_still_live());
     }
 }

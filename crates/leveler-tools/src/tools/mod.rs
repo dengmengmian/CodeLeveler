@@ -32,11 +32,7 @@ mod write_file;
 
 pub use apply_patch::ApplyPatchTool;
 pub use blast_radius::BlastRadiusTool;
-pub use browser::{
-    BrowserClickTool, BrowserConsoleTool, BrowserDialogTool, BrowserDragTool, BrowserNavigateTool,
-    BrowserPressTool, BrowserScreenshotTool, BrowserSelectTool, BrowserSnapshotTool,
-    BrowserTabsTool, BrowserTypeTool, BrowserWaitTool,
-};
+pub use browser::{BrowserActTool, BrowserInspectTool, BrowserTabTool};
 pub use diagnostics::DiagnosticsTool;
 pub use find_files::FindFilesTool;
 pub use find_references::FindReferencesTool;

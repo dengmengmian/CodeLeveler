@@ -191,7 +191,17 @@ fn no_tool_reimplements_its_capability_runtime() {
             &["command_execution.rs"],
         ),
         ("infer::get", "leveler_media::process_image", &[]),
-        ("BrowserRuntime::new", "the host that owns the browser", &[]),
+        ("Browser::new", "the host that owns the browser", &[]),
+        (
+            "CdpBackend::launch",
+            "leveler_browser, which owns every browser protocol",
+            &[],
+        ),
+        (
+            "WebDriverBackend::launch",
+            "leveler_browser, which owns every browser protocol",
+            &[],
+        ),
     ];
     let mut violations = Vec::new();
     for path in crate_sources("src/tools") {

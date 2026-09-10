@@ -336,7 +336,8 @@ pub struct CapabilityPacks {
     pub memory: bool,
     /// Skill loading.
     pub skills: bool,
-    /// The structured browser. Needs an installed browser runtime.
+    /// The browser. Needs a browser this machine can actually drive: the
+    /// selected product installed, and for Safari, Remote Automation on.
     pub browser: bool,
 }
 
@@ -474,8 +475,17 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
     if packs.skills {
         registry.register(Arc::new(tools::LoadSkillTool));
     }
-    if packs.browser {
-        register_browser(&mut registry, capabilities.browser.clone());
+    // Like `web_search`, the browser pack needs BOTH halves: the flag says the
+    // product asked for a browser, the handle is what a browser actually takes.
+    // A handle-less browser tool could only ever report that it has no browser,
+    // so it is not built — and because it is never built, `execute` carries no
+    // "is there a browser" branch.
+    if packs.browser
+        && let Some(browser) = &capabilities.browser
+    {
+        registry.register(Arc::new(tools::BrowserTabTool::new(browser.clone())));
+        registry.register(Arc::new(tools::BrowserActTool::new(browser.clone())));
+        registry.register(Arc::new(tools::BrowserInspectTool::new(browser.clone())));
     }
     registry
 }
@@ -493,26 +503,6 @@ pub fn default_registry() -> ToolRegistry {
         CapabilityPacks::ALL,
         &Capabilities::in_process(Arc::new(leveler_core::environment().clone())),
     )
-}
-
-/// The structured browser tools (§19), grouped so the pack registers one set.
-fn register_browser(
-    registry: &mut ToolRegistry,
-    browser: Option<Arc<leveler_browser::BrowserRuntime>>,
-) {
-    use crate::tools;
-    registry.register(Arc::new(tools::BrowserNavigateTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserSnapshotTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserClickTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserDragTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserTypeTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserSelectTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserPressTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserWaitTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserTabsTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserDialogTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserConsoleTool::new(browser.clone())));
-    registry.register(Arc::new(tools::BrowserScreenshotTool::new(browser)));
 }
 
 #[cfg(test)]
@@ -621,9 +611,8 @@ mod tests {
     /// A pack is all-or-nothing and adds only its own tools.
     #[test]
     fn each_pack_adds_exactly_its_own_tools() {
-        let core = core_surface(&crate::tools::test_capabilities())
-            .definitions()
-            .len();
+        let capabilities = configured_test_capabilities();
+        let core = core_surface(&capabilities).definitions().len();
         for (packs, added) in [
             (
                 CapabilityPacks {
@@ -651,7 +640,7 @@ mod tests {
                     browser: true,
                     ..CapabilityPacks::NONE
                 },
-                12,
+                3,
             ),
             (
                 CapabilityPacks {
@@ -669,9 +658,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                model_surface(packs, &crate::tools::test_capabilities())
-                    .definitions()
-                    .len(),
+                model_surface(packs, &capabilities).definitions().len(),
                 core + added,
                 "{packs:?}"
             );
@@ -696,11 +683,12 @@ mod tests {
     /// and a pack without its handle is not composed.
     #[test]
     fn every_pack_on_is_the_widest_surface() {
-        let names: Vec<String> = model_surface(CapabilityPacks::ALL, &keyed_test_capabilities())
-            .definitions()
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let names: Vec<String> =
+            model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
         for present in [
             "read_file",
             "write_file",
@@ -716,44 +704,66 @@ mod tests {
             "remember",
             "forget",
             "load_skill",
-            "browser_navigate",
+            "browser_tab",
+            "browser_act",
+            "browser_inspect",
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
         // core 11 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
-        // + browser 12 = 37. The harness controls (`update_plan` and the
+        // + browser 3 = 28. The harness controls (`update_plan` and the
         // injected ones) are not in this count: they are not a capability the
         // host composes, so `leveler_agent::register_harness_controls` adds
         // them on top.
-        assert_eq!(names.len(), 37);
+        assert_eq!(names.len(), 28);
     }
 
-    /// In-process handles plus the search key a configured host would have
-    /// found. The value is a placeholder: every test that uses it asserts on
-    /// composition, never on a request.
-    fn keyed_test_capabilities() -> crate::capabilities::Capabilities {
-        crate::tools::test_capabilities().with_search_api_key(Some("tvly-test-value".to_string()))
+    /// In-process handles plus the two a configured host would have found: a
+    /// search key and a browser. Both are placeholders — every test that uses
+    /// them asserts on composition, never on a request or a live browser.
+    fn configured_test_capabilities() -> crate::capabilities::Capabilities {
+        crate::tools::test_capabilities()
+            .with_search_api_key(Some("tvly-test-value".to_string()))
+            .with_browser(std::sync::Arc::new(leveler_browser::Browser::new(
+                leveler_core::environment().clone(),
+                std::env::temp_dir().join("leveler-registry-test-profile"),
+                None,
+            )))
     }
 
-    /// The mirror of the test above: asking for the search pack without a key
-    /// composes nothing. `default_registry` has no key, so this is also what
-    /// every test entry point sees.
+    /// The mirror of the test above: a pack without the handle it is built
+    /// from composes nothing. Two packs work this way — search needs a key,
+    /// the browser needs a browser — and `default_registry` has neither, so
+    /// this is also what every test entry point sees.
     #[test]
-    fn the_search_pack_without_a_key_composes_nothing() {
-        let with_key = model_surface(CapabilityPacks::ALL, &keyed_test_capabilities())
+    fn a_pack_without_its_handle_composes_nothing() {
+        let configured = model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
             .definitions()
             .len();
-        let without_key = model_surface(CapabilityPacks::ALL, &crate::tools::test_capabilities())
+        let bare = model_surface(CapabilityPacks::ALL, &crate::tools::test_capabilities())
             .definitions()
             .len();
-        assert_eq!(without_key, with_key - 1, "only web_search moved");
-        assert!(
-            !default_registry()
-                .definitions()
-                .into_iter()
-                .any(|d| d.name == "web_search"),
-            "a key-less host must not carry a web_search that can only 401"
+        assert_eq!(
+            bare,
+            configured - 4,
+            "web_search plus the three browser tools moved"
         );
+        let names: Vec<String> = default_registry()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for absent in [
+            "web_search",
+            "browser_tab",
+            "browser_act",
+            "browser_inspect",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "a host without the handle must not carry {absent}"
+            );
+        }
     }
 
     /// Tools the model no longer chooses. Each left for its own reason, and

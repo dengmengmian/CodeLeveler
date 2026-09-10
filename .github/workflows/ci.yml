@@ -89,6 +89,24 @@ jobs:
           cargo test -p leveler-remote-agent --all-features --locked
           cargo test -p leveler-relay --all-features --locked
 
+      # Browser acceptance is opt-in, so the workspace run below cannot imply
+      # it passed. Run it here against a browser each runner image already
+      # has — Edge on Windows, Chrome elsewhere — so "Windows is a supported
+      # platform" rests on a real CDP session, a real click and a real process
+      # cleanup rather than on the crate having compiled. A runner without that
+      # browser prints SKIP and stays green; it never prints PASS.
+      - name: Browser acceptance (Windows · Edge)
+        if: runner.os == 'Windows'
+        env:
+          LEVELER_BROWSER_ACCEPTANCE: edge
+        run: cargo test -p leveler-browser --test acceptance --locked -- --test-threads=1 --nocapture
+
+      - name: Browser acceptance (Chrome)
+        if: runner.os != 'Windows'
+        env:
+          LEVELER_BROWSER_ACCEPTANCE: chrome
+        run: cargo test -p leveler-browser --test acceptance --locked -- --test-threads=1 --nocapture
+
       - name: Test
         # --no-fail-fast: run every test binary and report ALL failures in one
         # run instead of stopping at the first failing crate (so a Windows-only
