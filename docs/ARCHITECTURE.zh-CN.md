@@ -4,7 +4,7 @@
 
 英文版：[`ARCHITECTURE.md`](ARCHITECTURE.md)，为 canonical 技术文档，本文与之语义一致。
 
-以下内容全部基于 commit `6724268`（31 个 crate）的真实源码与 `cargo metadata` 验证。凡是代码还没到位的地方，直接写明，不把目标当成已完成的现状描述。
+以下内容全部基于 Foundation Freeze 基线 commit `70e63900`（31 个 crate）的真实源码与 `cargo metadata` 验证。凡是代码还没到位的地方，直接写明，不把目标当成已完成的现状描述。
 
 ---
 
@@ -877,22 +877,22 @@ Products
 | 2 | `leveler-lsp` | `core`、`project` |
 | 2 | `leveler-vcs` | `core`、`execution` |
 | 2 | `leveler-verifier` | `core`、`execution`、`lifecycle`、`project` |
+| 2 | `leveler-test-support` | `core`、`model` |
+| 3 | `leveler-engine` | `context`、`core`、`execution`、`lifecycle`、`model`、`storage` |
 | 3 | `leveler-provider` | `core`、`model`、`protocol` |
-| 3 | `leveler-tools` | `browser`、`context`、`core`、`execution`、`lsp`、`memory`、`model`、`project`、`skills` |
-| 3 | `leveler-local-transport`、`leveler-remote-protocol`、`leveler-tui`、`leveler-web` | client protocol 及以下 |
-| 4 | `leveler-agent` | `agent-core`、`context`、`core`、`execution`、`lifecycle`、`memory`、`model`、`skills`、`tools` |
-| 4 | `leveler-relay`、`leveler-remote-agent` | remote protocol 及以下 |
-| 5 | `leveler-engine` | `agent`、`context`、`core`、`execution`、`lifecycle`、`model`、`storage`、`tools`、`verifier` |
-| 6 | `leveler-app` | 18 个内部 crate |
-| 7 | `leveler-cli` | 21 个内部 crate |
+| 3 | `leveler-tools` | `browser`、`context`、`core`、`execution`、`lsp`、`media`、`memory`、`model`、`project`、`skills`、`vcs` |
+| 3 | `leveler-local-transport`、`leveler-remote-protocol`、`leveler-tui` | client protocol 及以下 |
+| 4 | `leveler-agent` | `agent-core`、`context`、`core`、`engine`、`execution`、`lifecycle`、`memory`、`model`、`skills`、`storage`、`tools`、`verifier` |
+| 4 | `leveler-relay`、`leveler-remote-agent`、`leveler-web` | remote / client protocol 及以下 |
+| 5 | `leveler-app` | 18 个内部 crate |
+| 6 | `leveler-cli` | 21 个内部 crate |
 
 结论：
 
 - **不存在反向依赖。** 没有任何 crate 依赖 `leveler-app`、`leveler-cli`、`leveler-tui` 或 `leveler-web`。
 - `leveler-agent-core` 只依赖一个内部 crate。
 - `leveler-agent → leveler-execution` 是**词汇**边：harness 用的是 `PermissionProfile`、`RiskLevel`、`WriteScope`、`HookRunner` 这些类型，它直接产生副作用的调用点是 0。
-- `leveler-tools` **不**依赖 `leveler-media`，这正是 `view_image` 自己重新实现图片处理的原因（§18.3.F）。
-- `leveler-engine → leveler-agent` 是唯一一条与分层模型冲突的边（§18.1）。
+- **Engine 在 Harness 之下。** 两者之间只剩 `leveler-agent → leveler-engine` 一条边，`leveler-engine` 不点名任何 harness crate。`crates/leveler-engine/tests/ownership_direction.rs` 会读 engine 自己的 manifest 和全部源码，这条边只要以任何方式（manifest、改名、一次顺手的 import）回来，构建就红。
 
 ---
 
@@ -995,24 +995,20 @@ Review 必须能在同一个 Agent Kernel 之上，建立它自己的 Harness To
 
 Foundation 不要求所有 Harness 使用同一套工具管路。
 
-### 当前结论：NOT YET ENFORCED
+### 当前结论：ENFORCED
 
-Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `leveler-model`，不带产品词汇，`ToolRuntime` 只有两个方法，Review harness 可以用自己的方式实现。`AgentHarness` 已经被真实 harness 实现过。
+Kernel 和工具边界这两侧早就是过的。`leveler-agent-core` 只依赖 `leveler-model`，不带产品词汇，`ToolRuntime` 只有两个方法；`leveler-model` 不知道任何 Coding 工具名（§18.6）；组装工具面不需要 Coding 的任何工具管路，想要自己工具的 harness 就注册自己的，`register_harness_controls` 展示了形状。
 
-现在过了、以前没过的：
+把最后一段补上的是：
 
-- `leveler-model` 已经不知道任何 Coding 工具名（§18.6），Review 的工具集除了协议什么都不继承。
-- 组装一个工具面不再需要 Coding 的任何工具管路：想要自己工具的 harness 就注册自己的，而 `register_harness_controls` 展示了形状——harness 在宿主组合出的能力之上，加上「操纵自己」的那部分。
+- W3 把 harness 放到了 engine 之上。`leveler-engine` 不依赖任何 harness crate，公开 API 也不点名任何 Coding 类型：一个 turn 就是一个吃 `TurnPorts`、吐 `TurnFacts<T>` 的闭包，`T` 是 harness 自己的返回类型。Engine 只在它旁边记录机械事实，一个字都不读（§18.1）。
+- Engine 自己的 `git` 进程也一并没了。仓库事实通过 `WorkspaceFacts` 端口进来，Coding harness 用 `GitWorkspace` 实现它（§18.9）。
 
-还没过的：
+证明是机械的，不是架构论述。`crates/leveler-engine/tests/minimal_harness.rs` 用一个不是本产品的 harness 跑完一整个会话：建会话、跑 turn、持久化、崩溃、reap、resume、终态。它的 payload 是一个字符串，不拥有仓库，不跑任何工具，而且它的测试二进制根本链接不到 `leveler-agent`——engine 的 dev-dependency 里没有这条路。把它立起来没有新增任何 engine API、任何 trait、任何 crate、任何抽象，这一条才是真正吃重的：一个需要为第二个消费者现造接缝的 engine，不叫通用，只叫将就。
 
-- Review harness 若想要持久化、resume、事件顺序和恢复，就得走 `leveler-engine`，而它依赖 `leveler-agent`，公开 API 里还有 `CodingTaskSpec`（§18.1）。这就是剩下的全部，也就是 W3。
+**第二个 Harness 产品仍然不存在。** minimal harness 是一个测试。它证明边界成立，不主张任何人已经建出了 Review 产品；为验证设计而造一个 demo harness 产品，依然是假消费者（§5.3）。
 
-它不强制 kernel 变更，所以结论是「尚未强制成立」，不是「失败」。
-
-**没有写第二个 Harness。** 这里没有任何一条是靠真的建一个来证明的；为了验证设计而造一个 demo harness 会是假消费者（§5.3）。这里主张的只是「Foundation 不再要求 Coding 的工具管路」，不是「第二个 harness 已经存在」。
-
-**不要为了把这个结论改成 PASS，在一次文档变更里去动代码。**
+**不要为了改这个结论，在一次文档变更里去动代码。**
 
 ---
 
@@ -1020,17 +1016,15 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 记录下来，不掩盖。每一条都写清当前行为、期望边界、为什么违宪、最小修正、以及风险。
 
-### 18.1 Engine 依赖 Coding Harness
+### 18.1 Engine 曾依赖 Coding Harness（已关闭）
 
-**当前。** `leveler-engine → leveler-agent`。Engine 公开 API 导出 `CodingTaskSpec`，`ExecutorFactory` 直接构造 `leveler_agent::Executor`。`recorders.rs`、`recovery.rs`、`turn.rs`、`policy_resolver.rs` 都在点名 `leveler_agent` 的类型。
+**曾经。** `leveler-engine → leveler-agent`。Engine 公开 API 导出 `CodingTaskSpec`，`ExecutorFactory` 直接构造 `leveler_agent::Executor`，`recorders.rs`、`recovery.rs`、`turn.rs`、`policy_resolver.rs` 都在点名 `leveler_agent` 的类型。第二个 harness 会经由 engine 继承到 Coding harness（违反规则 5 和规则 2）。
 
-**期望。** Engine 通过一层抽象驱动 harness executor，不点名任何领域。
+**现在。** 边反过来了：`leveler-agent → leveler-engine`，engine 的 manifest 不点名任何 harness crate。Turn 里跑什么，是一个吃 `TurnPorts` 的闭包，回报一个 engine 只搬运、不阅读的 `TurnFacts<T>`。`ExecutorFactory` 上移进了 harness（`leveler-agent/src/coding/factory.rs`），执行配置的唯一推导入口本来就该在那里。
 
-**为什么违宪。** 违反规则 5 和规则 2：第二个 harness 会经由 engine 继承到 Coding harness。
+**由谁关闭。** W3（Engine ↔ Harness 解耦），W4 验收。
 
-**最小修正。** `RuntimeTaskSpec` / `CodingTaskSpec` 的拆分已经作为迁移接缝存在。下一步是给 engine 一个不必点名 `leveler_agent` 的 executor 抽象，并把 `ExecutorFactory` 上移。
-
-**风险。** 中。`ExecutorFactory` 被刻意设计成执行配置的唯一推导入口；拆得不好会把它当初要消除的「多份推导」bug 放回来。
+**绊线。** `crates/leveler-engine/tests/ownership_direction.rs`：engine 的 manifest 或任何一个 engine 源文件伸手去够 `leveler-agent`、`leveler-tools`、`leveler-verifier`，构建就红。`crates/leveler-engine/tests/minimal_harness.rs`：用一个不是本产品的 harness 跑完整个会话。
 
 ### 18.2 ToolContext 曾是通用 service locator（已关闭）
 
@@ -1194,13 +1188,13 @@ pub struct ToolOutput {
 
 **风险。** 无。它只是注释。
 
-### 18.9 Engine 直接 shell 调 git
+### 18.9 Engine 曾直接 shell 调 git（已关闭）
 
-**当前。** `leveler-engine/src/baseline.rs` 和 `engine.rs` 直接 `Command::new("git")`，而 `leveler-vcs` 存在且直接 spawn 数为 0。
+**曾经。** `leveler-engine/src/baseline.rs` 和 `engine.rs` 直接 `Command::new("git")`，而 `leveler-vcs` 存在且直接 spawn 数为 0。
 
-**期望。** Engine 问 VCS 能力，VCS 问宿主权威。
+**现在。** `baseline.rs` 已经不存在，engine 一个进程都不 spawn。仓库事实通过 `WorkspaceFacts` 端口进入一个 turn，Coding harness 用 `GitWorkspace` 实现它（`leveler-agent/src/coding/workspace.rs`）。没有仓库的 harness——§17 里那个 minimal harness——传 `None`，engine 什么都不问。
 
-**风险。** 低。
+**由谁关闭。** W3，W4 验收。
 
 ---
 
@@ -1211,6 +1205,20 @@ pub struct ToolOutput {
 **现在。** Browser Capability Closure 已经把它换掉。Chrome、Edge、Chromium 直接走 CDP；Safari 走 W3C WebDriver 经 `safaridriver`。没有 Node、没有 Playwright、没有 npm 安装、没有托管浏览器下载、没有自定义 RPC。跑哪个浏览器由用户的系统默认浏览器决定，除非调用或 `[browser].default` 另有指定；选中的浏览器驱动不了就报错，不换成另一个。
 
 **跟着一起关闭的。** 之前挂起的 `loopback_ws_from_a_granted_dev_page_connects` 抖动，是关于桥里那个 JavaScript WebSocket gate 的发现。那个 gate 连同它所属的整套 page-scoped loopback grant 都已删除：浏览器是被授权联网的，已经不存在需要逐请求做的 loopback 判定，也就没有可竞态的东西。这条发现是被删除关闭的，不是被修复关闭的。
+
+### 18.11 并行父 session 有第二个生命周期写者
+
+**当前。** `TaskEngine::finish_task` 的注释说 engine 是 session 生命周期的唯一写者、没有任何 app 层会盖第二份。对每一个由 engine 跑的 session 这是真的，对它不跑的那个就不是：并行多 agent 的**父** session 由 `leveler-app/src/parallel.rs` 创建、置 `Running`、并写终态行，它直接调 `SessionStore::update_status_owned` 和 `TerminalStore::finish_task_owned`。
+
+**不是双写缺陷。** 两个写者拥有的是不相交的 session，重叠不可达。父 session 从不进入 engine 的执行路径，也拉不进去：`run --resume` 拒绝没有 transcript 的 session，而 `parallel.rs` 不给父 session 写任何消息、任何 turn。何况两个写者都被同一个 ownership token 围栏，过期 runtime 两边都盖不下去。已通过 resume 一个没有 transcript 的 `parallel` 类型 session 验证：engine 拒绝。
+
+**真正错的地方。** Engine 的注释宣称了一份代码并不具备的排他性；而让这个宣称成立的屏障是偶然的——transcript 为空——而不是一次对 `Parallel` session 的明确拒绝。`CodingRuntime::resume` 里那个 `kind` 守卫也永远不会触发，因为比较的两边读自同一行 session。
+
+**最小修正。** 把 engine 注释改成实话；并让 resume 路径直接拒绝 `ExecutionKind::Parallel`，而不是依赖 transcript 恰好为空。
+
+**风险。** 低。目前没有任何观察到的路径触到这个重叠。
+
+---
 
 ## 19. 开放设计问题
 
@@ -1259,6 +1267,7 @@ pub struct ToolOutcome { pub content: String, pub is_error: bool }
 5. **不要为不存在的产品预建接口。**
 6. **不要靠删可靠性来简化。** 要把复杂度搬到正确的 Owner。§18 里点名的每一条安全属性都必须在搬家后完好无损。
 7. **本文是唯一 canonical 架构文档。** 不要新建 `ARCHITECTURE_V2.md`、`FOUNDATION_*.md` 或所谓 final 版本。
+8. **Foundation 已冻结（§21）。** 没有观察到的机械证据，就不做架构驱动的 Foundation 重构。「看起来还能更优雅」「以后可能要扩展」「某竞品这么设计」都不是证据；「两个真实实现需要这条边界」也许是；「真实运行暴露了 ownership / 安全 / 可靠性缺陷」才是。
 
 Roadmap 类内容——多 agent 方向、浏览器方向、Review 产品、云、ACP、远程 worker、NPC 工作流、未来 provider、未来 UI——都不是架构。本文可以描述扩展点，但不承诺功能。
 
@@ -1274,7 +1283,7 @@ WEAK_MODEL_COMPENSATION_GOAL      REMOVED
 CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       YES
-ENGINE_IMPLEMENTATION_ALIGNED     NO
+ENGINE_IMPLEMENTATION_ALIGNED     YES
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
 TOOL_SURFACE_CLOSED               YES
 CAPABILITY_MODEL_CLOSED           YES
@@ -1288,12 +1297,17 @@ WORK_PROFILE_AUTHORITY            SESSION_ROW
 
 BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
-SECOND_HARNESS_TEST               NOT_YET_ENFORCED
-SECOND_HARNESS_WRITTEN            NO
-FOUNDATION_FROZEN                 NO
+SECOND_HARNESS_TEST               ENFORCED
+SECOND_HARNESS_WRITTEN            TEST_ONLY_PROOF
+SECOND_HARNESS_PRODUCT            NO
+FOUNDATION_FROZEN                 YES
 ```
 
-架构、工具边界和模型可见的工具面都已经定了；七个核心原语、能力 ownership 和组合方式也按它实现了。剩下的是 Engine：它仍然点名 `leveler_agent` 和 `CodingTaskSpec`（§18.1），而这也是 `SECOND_HARNESS_TEST` 还没强制成立的唯一原因。
+架构、工具边界和模型可见的工具面都已经定了；七个核心原语、能力 ownership 和组合方式也按它实现了。Engine 是最后一块，W3 把它关掉了：`leveler-engine` 不点名任何 harness crate、任何 Coding 类型（§18.1），所以 `SECOND_HARNESS_TEST` 是被一个测试强制成立的，不是在文字里论证出来的（§17）。
+
+`FOUNDATION_FROZEN` 的基线是 `70e63900`。这条冻结是什么意思，写在 §20 规则 8：Foundation 不是禁止改动，是禁止只凭架构论述去改动。真实运行暴露 ownership / 安全 / 可靠性缺陷，就重新打开它；对 crate 图的审美判断，不行。
+
+冻结依据的是它自己在那个 commit 上的验收。一个不是本产品的 harness 在 engine 上跑完了一整个会话——建会话、跑 turn、持久化、崩溃、reap、resume、终态——没有新增任何 engine API、trait、crate 或抽象。随后真实 Coding harness 端到端跑了三个真任务：一个改完验证转绿的小改动；一个被 `kill -9` 打断、resume 后跑到完成、丢失的那个 turn 被如实记为 `interrupted` 的运行；以及一次经浏览器驱动的前端改动。`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets` 干净，workspace 套件连续三次 3599 通过、0 失败。
 
 有四行从 NO 变成 YES，是因为代码变了而不是措辞变了：`ToolServices` 已删除、registry 不再做任何授权判断、`leveler-model` 不含任何工具名、一个回合的 work profile 来自 session 行。每一条都在自己那节里点了绊线的名字。没有为了让这张表里任何一行好看而修改源码。
 

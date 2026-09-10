@@ -7,8 +7,8 @@ recorded honestly.
 
 Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md).
 
-Everything below was verified against the workspace at the Core Primitive
-Foundation closure, using `cargo metadata` and the crate sources. Where the
+Everything below was verified against the workspace at the Foundation Freeze
+baseline (`70e63900`), using `cargo metadata` and the crate sources. Where the
 code does not yet match the target boundary, it says so rather than describing
 the target as if it were already true.
 
@@ -993,8 +993,8 @@ filesystem mutation and process execution. A Review harness would plausibly
 select context, project, VCS, LSP, read-only filesystem and memory, and skip
 the rest.
 
-`leveler-media` currently has exactly one consumer, `leveler-app`. The
-`view_image` tool does not use it. See §18.3.F.
+`leveler-media` has two consumers, `leveler-app` and `leveler-tools`:
+`view_image` calls it rather than reimplementing image handling. See §18.3.F.
 
 ---
 
@@ -1213,14 +1213,15 @@ Current graph, by topological level (normal dependencies only):
 | 2 | `leveler-lsp` | `core`, `project` |
 | 2 | `leveler-vcs` | `core`, `execution` |
 | 2 | `leveler-verifier` | `core`, `execution`, `lifecycle`, `project` |
+| 2 | `leveler-test-support` | `core`, `model` |
+| 3 | `leveler-engine` | `context`, `core`, `execution`, `lifecycle`, `model`, `storage` |
 | 3 | `leveler-provider` | `core`, `model`, `protocol` |
-| 3 | `leveler-tools` | `browser`, `context`, `core`, `execution`, `lsp`, `memory`, `model`, `project`, `skills` |
-| 3 | `leveler-local-transport`, `leveler-remote-protocol`, `leveler-tui`, `leveler-web` | client protocol and below |
-| 4 | `leveler-agent` | `agent-core`, `context`, `core`, `execution`, `lifecycle`, `memory`, `model`, `skills`, `tools` |
-| 4 | `leveler-relay`, `leveler-remote-agent` | remote protocol and below |
-| 5 | `leveler-engine` | `agent`, `context`, `core`, `execution`, `lifecycle`, `model`, `storage`, `tools`, `verifier` |
-| 6 | `leveler-app` | 18 internal crates |
-| 7 | `leveler-cli` | 21 internal crates |
+| 3 | `leveler-tools` | `browser`, `context`, `core`, `execution`, `lsp`, `media`, `memory`, `model`, `project`, `skills`, `vcs` |
+| 3 | `leveler-local-transport`, `leveler-remote-protocol`, `leveler-tui` | client protocol and below |
+| 4 | `leveler-agent` | `agent-core`, `context`, `core`, `engine`, `execution`, `lifecycle`, `memory`, `model`, `skills`, `storage`, `tools`, `verifier` |
+| 4 | `leveler-relay`, `leveler-remote-agent`, `leveler-web` | remote / client protocol and below |
+| 5 | `leveler-app` | 18 internal crates |
+| 6 | `leveler-cli` | 21 internal crates |
 
 Findings:
 
@@ -1230,10 +1231,11 @@ Findings:
 - `leveler-agent → leveler-execution` is a **vocabulary** edge: the harness
   uses `PermissionProfile`, `RiskLevel`, `WriteScope` and `HookRunner` as
   types. Its direct side-effect count is zero.
-- `leveler-tools` does **not** depend on `leveler-media`, which is why
-  `view_image` reimplements image handling (§18.3.F).
-- `leveler-engine → leveler-agent` is the one edge that contradicts the layer
-  model (§18.1).
+- **The engine sits below the harness.** `leveler-agent → leveler-engine` is
+  the only edge between them, and `leveler-engine` names no harness crate at
+  all. `crates/leveler-engine/tests/ownership_direction.rs` reads the engine's
+  own manifest and every engine source and fails the build if the edge
+  returns — by manifest, by rename, or by one convenient import.
 
 ---
 
@@ -1344,39 +1346,43 @@ surface over the same agent kernel.
 
 The foundation does not require every harness to use the same tool plumbing.
 
-### Current verdict: NOT YET ENFORCED
+### Current verdict: ENFORCED
 
-The kernel and the tool boundary pass. `leveler-agent-core` depends only on
-`leveler-model`, carries no product vocabulary, and `ToolRuntime` is two
-methods a Review harness can implement its own way. `AgentHarness` is already
-implemented by a real harness.
+The kernel and the tool boundary passed already. `leveler-agent-core` depends
+only on `leveler-model`, carries no product vocabulary, and `ToolRuntime` is
+two methods a Review harness can implement its own way. `leveler-model` knows
+no Coding tool name (§18.6), and composing a surface requires none of the
+Coding tool plumbing: a harness registers its own tools, and
+`register_harness_controls` shows the shape.
 
-What now passes that did not before:
+What closed the last of it:
 
-- `leveler-model` no longer knows any Coding tool name (§18.6), so a Review
-  tool set inherits nothing but the protocol.
-- Nothing about the Coding tool plumbing is required to compose a surface: a
-  harness that wants its own tools registers its own, and
-  `register_harness_controls` shows the shape — a harness adds what steers it,
-  on top of whatever capabilities the host composed.
+- W3 put the harness above the engine. `leveler-engine` depends on no harness
+  crate, and its public API names no Coding type: a turn is a closure over
+  `TurnPorts` that returns `TurnFacts<T>`, and `T` is whatever the harness
+  returns. The engine records the mechanical facts beside it and reads none of
+  it (§18.1).
+- The engine's own `git` spawns went with it. Repository facts arrive through
+  the `WorkspaceFacts` port, which the Coding harness implements as
+  `GitWorkspace` (§18.9).
 
-What does not pass yet:
+The proof is mechanical rather than architectural.
+`crates/leveler-engine/tests/minimal_harness.rs` drives a whole session from a
+harness that is not this product: create, turn, persist, crash, reap, resume,
+terminal. Its payload is a string, it owns no repository, it runs no tool, and
+its test binary cannot link `leveler-agent` — the engine's dev-dependencies do
+not reach it. Standing it up required no new engine API, no new trait, no new
+crate and no new abstraction of any kind, which is the part that carries the
+weight: an engine that needed a seam invented for its second consumer would
+not have been general, only accommodating.
 
-- A Review harness that wants persistence, resume, event ordering and recovery
-  goes through `leveler-engine`, which depends on `leveler-agent` and whose
-  public API names `CodingTaskSpec` (§18.1). This is the whole of what is
-  left, and it is W3.
+**A second harness PRODUCT still does not exist.** The minimal harness is a
+test. It proves the boundary holds; it claims nothing about a Review product
+nobody has built, and building a demo harness product to validate the design
+would still be a fake consumer (§5.3).
 
-That does not force a kernel change, which is why this is "not yet enforced"
-rather than "fail". It is the input to Foundation Hardening.
-
-**No second harness has been written.** Nothing here was proven by building
-one, and a demo harness invented to validate the design would be a fake
-consumer (§5.3). The claim is only that the foundation no longer requires the
-Coding tool plumbing — not that a second harness exists.
-
-**Do not modify code to convert this verdict to PASS as part of a
-documentation change.**
+**Do not modify code to convert this verdict as part of a documentation
+change.**
 
 ---
 
@@ -1386,26 +1392,28 @@ Recorded, not hidden. Each item states the current behaviour, the desired
 boundary, why it violates the constitution, the minimal correction, and the
 risk.
 
-### 18.1 The engine depends on the Coding harness
+### 18.1 The engine depended on the Coding harness (closed)
 
-**Current.** `leveler-engine → leveler-agent`. The engine's public API exports
-`CodingTaskSpec`, and `ExecutorFactory` constructs a `leveler_agent::Executor`
-directly. `recorders.rs`, `recovery.rs`, `turn.rs` and `policy_resolver.rs`
-all name `leveler_agent` types.
+**Was.** `leveler-engine → leveler-agent`. The engine's public API exported
+`CodingTaskSpec`, `ExecutorFactory` constructed a `leveler_agent::Executor`
+directly, and `recorders.rs`, `recovery.rs`, `turn.rs` and
+`policy_resolver.rs` all named `leveler_agent` types. A second harness
+inherited the Coding harness through the engine (rules 5 and 2).
 
-**Desired.** The engine runs a harness executor behind an abstraction; it does
-not name a domain.
+**Now.** The edge is reversed: `leveler-agent → leveler-engine`, and the
+engine's manifest names no harness crate. What runs inside a turn arrives as
+a closure over `TurnPorts` and reports a `TurnFacts<T>` the engine carries
+without reading. `ExecutorFactory` moved up into the harness
+(`leveler-agent/src/coding/factory.rs`), which is where the single derivation
+of execution configuration belongs.
 
-**Why it violates the constitution.** Rules 5 and 2: a second harness inherits
-the Coding harness through the engine.
+**Closed by.** W3 (engine ↔ harness decoupling), accepted in W4.
 
-**Minimal correction.** The `RuntimeTaskSpec` / `CodingTaskSpec` split already
-exists as the migration seam. Next is an executor abstraction the engine can
-drive without naming `leveler_agent`, with `ExecutorFactory` moving above it.
-
-**Risk.** Medium. `ExecutorFactory` is deliberately the single derivation of
-execution configuration; splitting it badly reintroduces the multiple-
-derivation bug it was built to remove.
+**Tripwires.** `crates/leveler-engine/tests/ownership_direction.rs` fails the
+build if the engine's manifest or any engine source reaches for
+`leveler-agent`, `leveler-tools` or `leveler-verifier`.
+`crates/leveler-engine/tests/minimal_harness.rs` runs a full session from a
+harness that is not this product.
 
 ### 18.2 ToolContext was a universal service locator (closed)
 
@@ -1744,16 +1752,19 @@ the axes; the comment predates the split.
 
 **Risk.** None. It is a comment.
 
-### 18.9 The engine shells out to git for the baseline
+### 18.9 The engine shelled out to git for the baseline (closed)
 
-**Current.** `leveler-engine/src/baseline.rs` and `engine.rs` call
-`Command::new("git")` directly, while `leveler-vcs` exists and performs zero
+**Was.** `leveler-engine/src/baseline.rs` and `engine.rs` called
+`Command::new("git")` directly, while `leveler-vcs` existed and performed zero
 direct process spawns.
 
-**Desired.** The engine asks the VCS capability, which asks the host
-authority.
+**Now.** `baseline.rs` is gone and the engine spawns no process at all.
+Repository facts reach a turn through the `WorkspaceFacts` port, which the
+Coding harness implements as `GitWorkspace`
+(`leveler-agent/src/coding/workspace.rs`). A harness with no repository — the
+minimal harness in §17 — passes `None` and the engine asks for nothing.
 
-**Risk.** Low.
+**Closed by.** W3, accepted in W4.
 
 ---
 
@@ -1776,6 +1787,39 @@ bridge's JavaScript WebSocket gate. That gate is deleted, along with the whole
 page-scoped loopback grant it belonged to: the browser is network-authorised,
 so there is no per-request loopback decision left to race. The finding is
 closed by deletion, not by a fix.
+
+### 18.11 The parallel parent session has a second lifecycle writer
+
+**Current.** `TaskEngine::finish_task` says the engine is the one writer of
+the session lifecycle and that no app layer stamps a second copy. That is
+true of every session the engine runs, and false of one it does not: the
+parallel multi-agent PARENT session is created, marked `Running` and given
+its terminal row by `leveler-app/src/parallel.rs`, which calls
+`SessionStore::update_status_owned` and `TerminalStore::finish_task_owned`
+directly.
+
+**Not a two-writer defect.** The two writers own disjoint sessions and the
+overlap is not reachable. The parent never enters the engine's run path, and
+it cannot be pulled into one: `run --resume` refuses a session with no
+transcript, and `parallel.rs` writes the parent no messages and no turns.
+Both writers are fenced on the same ownership token besides, so a stale
+runtime stamps nothing either way. Verified by resuming a `parallel`-kind
+session with no transcript, which the engine refuses.
+
+**What is actually wrong.** The engine's doc comment claims an exclusivity
+the code does not have, and the barrier that makes the claim hold is
+incidental — an empty transcript — rather than an explicit refusal to run a
+`Parallel` session. `CodingRuntime::resume` also carries a `kind` guard that
+cannot fire, because both sides of its comparison are read from the same
+session row.
+
+**Minimal correction.** Say what is true in the engine's comment, and make
+the resume path refuse `ExecutionKind::Parallel` outright instead of relying
+on the transcript being empty.
+
+**Risk.** Low. Nothing observed has reached the overlap.
+
+---
 
 ## 19. Open design questions
 
@@ -1854,6 +1898,11 @@ trade: nothing consumed its output, so it never expanded anything (§6.5).
    owner instead. Every safety property named in §18 survives its move.
 7. **This document is the only canonical architecture.** Do not create
    `ARCHITECTURE_V2.md`, `FOUNDATION_*.md` or a "final" variant.
+8. **The foundation is frozen (§21).** No architecture-driven foundation
+   refactor without observed mechanical evidence. "It could be more elegant",
+   "we might extend it later" and "a competitor designs it this way" are not
+   evidence. Two real implementations that need a boundary might be. A real
+   run that exposes an ownership, safety or reliability defect is.
 
 Roadmap items — multi-agent direction, browser direction, a Review product,
 cloud, ACP, remote workers, NPC workflows, future providers, future UI — are
@@ -1872,7 +1921,7 @@ WEAK_MODEL_COMPENSATION_GOAL      REMOVED
 CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       YES
-ENGINE_IMPLEMENTATION_ALIGNED     NO
+ENGINE_IMPLEMENTATION_ALIGNED     YES
 CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
 TOOL_SURFACE_CLOSED               YES
 CAPABILITY_MODEL_CLOSED           YES
@@ -1886,16 +1935,34 @@ WORK_PROFILE_AUTHORITY            SESSION_ROW
 
 BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
-SECOND_HARNESS_TEST               NOT_YET_ENFORCED
-SECOND_HARNESS_WRITTEN            NO
-FOUNDATION_FROZEN                 NO
+SECOND_HARNESS_TEST               ENFORCED
+SECOND_HARNESS_WRITTEN            TEST_ONLY_PROOF
+SECOND_HARNESS_PRODUCT            NO
+FOUNDATION_FROZEN                 YES
 ```
 
 The architecture, the tool boundary and the model-visible surface are decided;
 the seven core primitives, the capability ownership and the composition are
-implemented against them. What is left is the engine: it still names
-`leveler_agent` and `CodingTaskSpec` (§18.1), which is the only reason
-`SECOND_HARNESS_TEST` is not enforced.
+implemented against them. The engine was the last of it, and W3 closed it:
+`leveler-engine` names no harness crate and no Coding type (§18.1), so
+`SECOND_HARNESS_TEST` is enforced by a test rather than argued for in prose
+(§17).
+
+`FOUNDATION_FROZEN` is baselined at `70e63900`. What that baseline means is in
+§20 rule 8: the foundation is not sealed against change, it is sealed against
+change argued from architecture alone. A real run that exposes an ownership,
+safety or reliability defect reopens it; an aesthetic reading of the crate
+graph does not.
+
+The freeze rests on its own acceptance, run at that commit. A harness that is
+not this product ran a full session — create, turn, persist, crash, reap,
+resume, terminal — over the engine and needed no new engine API, trait, crate
+or abstraction. The real Coding harness then ran three live tasks end to end:
+a small edit verified green, an interrupted run killed with `kill -9` and
+resumed to completion with the lost turn recorded as `interrupted`, and a
+front-end change driven through the browser. `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets` were clean, and the workspace suite
+ran three consecutive times at 3599 passing and none failing.
 
 Four lines went from NO to YES because the code changed, not the prose:
 `ToolServices` is deleted, the registry decides no authorization,
