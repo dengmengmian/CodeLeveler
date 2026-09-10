@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::StopReason;
+use leveler_agent::coding::ExecutionOverrides;
 use leveler_app::Application;
-use leveler_engine::ExecutionOverrides;
 use leveler_execution::PermissionProfile;
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::Layout;
@@ -864,14 +864,14 @@ async fn run_bare_case(
             return (None, false, 0, format!("engine: {e}"), termination, cause);
         }
     };
-    let spec = leveler_engine::TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+    let spec = leveler_agent::coding::TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: case.task.clone(),
             kind: leveler_engine::ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: app.layout.repo_root.clone(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -1022,10 +1022,10 @@ fn infrastructure_cause_from_engine_error(
     error: &leveler_engine::EngineError,
 ) -> Option<leveler_eval::FailureCategory> {
     match error {
-        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Model(error)) => {
-            infrastructure_cause_from_model_error(error)
-        }
-        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled) => None,
+        leveler_engine::EngineError::Execution {
+            model: Some(error), ..
+        } => infrastructure_cause_from_model_error(error),
+        leveler_engine::EngineError::Cancelled => None,
         _ => Some(leveler_eval::FailureCategory::Runtime),
     }
 }
@@ -1047,12 +1047,10 @@ fn termination_from_engine_error(
     error: &leveler_engine::EngineError,
 ) -> leveler_eval::TerminationClass {
     match error {
-        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Model(error)) => {
-            termination_from_model_error(error)
-        }
-        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled) => {
-            leveler_eval::TerminationClass::Incomplete
-        }
+        leveler_engine::EngineError::Execution {
+            model: Some(error), ..
+        } => termination_from_model_error(error),
+        leveler_engine::EngineError::Cancelled => leveler_eval::TerminationClass::Incomplete,
         _ => leveler_eval::TerminationClass::InfrastructureFailed,
     }
 }
@@ -1692,14 +1690,14 @@ mod ablation_tests {
             },
         };
 
-        let bare = leveler_engine::TaskSpec {
-            runtime: leveler_engine::RuntimeTaskSpec {
+        let bare = leveler_agent::coding::TaskSpec {
+            runtime: leveler_agent::coding::RuntimeTaskSpec {
                 goal: case.task.clone(),
                 kind: leveler_engine::ExecutionKind::Direct,
                 continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
                 limits: leveler_agent::StepLimits::default(),
             },
-            coding: leveler_engine::CodingTaskSpec {
+            coding: leveler_agent::coding::CodingTaskSpec {
                 repository: std::path::PathBuf::from("/repo"),
                 mode: leveler_execution::PermissionProfile::Assisted,
                 sandbox: false,

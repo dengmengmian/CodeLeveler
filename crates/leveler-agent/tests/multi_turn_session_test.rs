@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_agent::{AutoClarify, ContinuationPolicy, StepLimits};
 use leveler_core::{RequestId, ToolCallId};
-use leveler_engine::{EngineEvent, ExecutionKind, ExecutorFactory, TaskEngine, TaskSpec};
+use leveler_engine::{EngineEvent, ExecutionKind, TaskEngine};
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
 use leveler_lifecycle::TaskOutcome;
 use leveler_model::{
@@ -128,7 +129,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
 }
 
 struct Harness {
-    engine: TaskEngine,
+    engine: CodingRuntime,
     db: Database,
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -143,9 +144,11 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -161,7 +164,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -176,13 +179,13 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
 
 fn spec(h: &Harness, goal: &str) -> TaskSpec {
     TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: goal.into(),
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::bounded(6),
             limits: StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -986,14 +989,14 @@ async fn the_checkpoint_watermark_binds_when_it_reaches_further_back() {
 #[test]
 fn no_engine_path_hands_a_model_an_unassembled_transcript() {
     const MARKER: &str = "TurnInput::Resume(";
-    let source = include_str!("../src/engine.rs");
+    let source = include_str!("../src/coding/run.rs");
     // Split at the test MODULE, not at any `#[cfg(test)]` attribute: the file
     // carries a cfg-gated field mid-implementation, and cutting there would
     // hide most of the production code from this scan.
     let production = source
         .split("\n#[cfg(test)]\nmod ")
         .next()
-        .expect("engine.rs has production code");
+        .expect("run.rs has production code");
 
     let mut inputs = Vec::new();
     for (at, _) in production.match_indices(MARKER) {

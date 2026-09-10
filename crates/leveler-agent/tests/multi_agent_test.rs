@@ -2438,7 +2438,7 @@ mod child_side_effects_are_recoverable {
 
     #[async_trait::async_trait]
     impl EventBarrier for RecordingBarrier {
-        async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+        async fn flush(&self) -> Result<(), leveler_engine::PortError> {
             self.order.lock().unwrap().push("flush");
             Ok(())
         }
@@ -2730,7 +2730,7 @@ struct RecordingSink {
 
 #[async_trait]
 impl leveler_agent::TranscriptSink for RecordingSink {
-    async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_agent::AgentError> {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_engine::PortError> {
         self.messages.lock().unwrap().extend_from_slice(messages);
         Ok(())
     }
@@ -4530,7 +4530,7 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
     struct RecordingSink(Arc<Mutex<Vec<Message>>>);
     #[async_trait]
     impl leveler_agent::TranscriptSink for RecordingSink {
-        async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_agent::AgentError> {
+        async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_engine::PortError> {
             self.0.lock().unwrap().extend_from_slice(messages);
             Ok(())
         }
@@ -5899,14 +5899,14 @@ impl leveler_agent::TranscriptSink for SpendSink {
     async fn append(
         &mut self,
         _messages: &[leveler_model::Message],
-    ) -> Result<(), leveler_agent::AgentError> {
+    ) -> Result<(), leveler_engine::PortError> {
         Ok(())
     }
 
     async fn record_model_request(
         &mut self,
         record: &leveler_agent::ModelRequestRecord,
-    ) -> Result<(), leveler_agent::AgentError> {
+    ) -> Result<(), leveler_engine::PortError> {
         self.0.lock().unwrap().push(record.clone());
         Ok(())
     }

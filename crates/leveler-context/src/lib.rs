@@ -6,12 +6,17 @@
 //! index yet (spec §26.3).
 #![forbid(unsafe_code)]
 
+pub mod compaction;
 pub mod context;
 pub mod guard;
 pub mod repo_map;
 pub mod rules;
 pub mod symbols;
 
+pub use compaction::{
+    ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD,
+    compact_messages, estimate_tokens, summarize_with_model,
+};
 pub use context::{ContextCompiler, ContextPackage, estimate_text_tokens};
 pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;

@@ -613,12 +613,6 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].id, "a1");
         assert_eq!(log.unfinished_children().await.unwrap().len(), 1);
-        assert!(
-            !crate::turn::session_had_review(&store, &session)
-                .await
-                .unwrap(),
-            "the reviewer has not finished"
-        );
         assert_eq!(
             store.whole_log_loads(),
             0,

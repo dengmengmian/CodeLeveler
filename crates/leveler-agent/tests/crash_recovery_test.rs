@@ -15,10 +15,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::AutoClarify;
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_core::{ApprovalId, RequestId, SessionId, ToolCallId, TurnId};
-use leveler_engine::{
-    EngineError, EngineEvent, EventLog, ExecutionKind, ExecutorFactory, TaskEngine, TaskSpec,
-};
+use leveler_engine::{EngineError, EngineEvent, EventLog, ExecutionKind, TaskEngine};
 use leveler_execution::{
     ApprovalDecision, ApprovalRequest, Approver, AutoApprove, AutoDeny, PermissionProfile,
     Workspace,
@@ -148,7 +147,7 @@ impl Approver for PanickingApprover {
 async fn harness(
     approver: Arc<dyn Approver>,
     responses: Vec<ModelResponse>,
-) -> (TaskEngine, Database, tempfile::TempDir) {
+) -> (CodingRuntime, Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
@@ -156,9 +155,11 @@ async fn harness(
     let workspace = Workspace::new(dir.path()).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),
@@ -174,7 +175,7 @@ async fn harness(
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver,
         clarifier: Arc::new(AutoClarify),
@@ -184,13 +185,13 @@ async fn harness(
 
 fn direct_spec(dir: &Path) -> TaskSpec {
     TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: dir.to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -218,7 +219,7 @@ async fn seed_transcript(db: &Database, session: &SessionId) {
 /// `ToolCallFinished`, exactly what a crash mid-execution leaves behind.
 async fn seed_dangling_call(
     db: &Database,
-    engine: &TaskEngine,
+    engine: &CodingRuntime,
     session: &SessionId,
     name: &str,
     arguments: String,
@@ -250,7 +251,7 @@ async fn seed_dangling_call(
 /// dispatch never ran, so there is no side effect to recover.
 async fn seed_pending_approval_call(
     db: &Database,
-    engine: &TaskEngine,
+    engine: &CodingRuntime,
     session: &SessionId,
     name: &str,
     arguments: String,
@@ -893,7 +894,12 @@ async fn stale_runtime_cannot_acknowledge_crash_window() {
     seed_transcript(&db, &session).await;
     seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
 
-    let task = engine.task_for_session(&session).await.unwrap().unwrap();
+    let task = engine
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
     let rt = leveler_core::RuntimeId::new("rt-test");
     let stale = leveler_storage::OwnershipStore::acquire(
         &db,
@@ -928,7 +934,12 @@ async fn foreign_runtime_cannot_acknowledge_crash_window() {
     seed_transcript(&db, &session).await;
     seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
 
-    let task = engine.task_for_session(&session).await.unwrap().unwrap();
+    let task = engine
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
     leveler_storage::OwnershipStore::acquire(
         &db,
         &task,

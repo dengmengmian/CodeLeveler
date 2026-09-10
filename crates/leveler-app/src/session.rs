@@ -10,13 +10,12 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::{TaskReport, TaskSpec, mode_str};
 use leveler_agent::{
     AdvisoryKind, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify, Clarifier,
     StopReason,
 };
-use leveler_engine::{
-    EngineError, EngineEvent, ExecutionKind, TaskOutcome, TaskReport, TaskSpec, mode_str,
-};
+use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 use leveler_execution::{Approver, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
 use leveler_storage::{SessionRecord, SessionRepository};
@@ -314,7 +313,16 @@ fn unverified_detail(report: &TaskReport) -> String {
 
 pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
     match error {
-        EngineError::Agent(e) => AppError::Agent(e),
+        // A provider fault stays typed all the way to the app: the callers
+        // that classify infrastructure failures read the error, not the text.
+        EngineError::Execution {
+            model: Some(error), ..
+        } => AppError::Model(error),
+        EngineError::Execution { detail, .. } => AppError::Engine(detail),
+        EngineError::Cancelled => AppError::Agent(leveler_agent::AgentError::Cancelled),
+        EngineError::StaleOwnership(m) => {
+            AppError::Agent(leveler_agent::AgentError::StaleOwnership(m))
+        }
         EngineError::Storage(e) => AppError::Storage(e),
         EngineError::Serde(e) => AppError::Serde(e.to_string()),
         EngineError::Config(m) | EngineError::Corrupt(m) => AppError::Engine(m),
@@ -438,13 +446,13 @@ impl Application {
     /// from `.leveler/config.yaml` or the repo's manifests.
     fn direct_spec(&self, goal: String, mode: PermissionProfile, sandbox: bool) -> TaskSpec {
         TaskSpec {
-            runtime: leveler_engine::RuntimeTaskSpec {
+            runtime: leveler_agent::coding::RuntimeTaskSpec {
                 goal,
                 kind: ExecutionKind::Direct,
                 continuation: crate::goal_continuation_for(self.task_round_limit),
                 limits: self.top_level_limits(),
             },
-            coding: leveler_engine::CodingTaskSpec {
+            coding: leveler_agent::coding::CodingTaskSpec {
                 repository: self.layout.repo_root.clone(),
                 mode,
                 sandbox,
@@ -710,7 +718,7 @@ impl Application {
     async fn record_goal_windows(
         &self,
         goal: Option<&leveler_core::GoalId>,
-        result: &Result<leveler_engine::TaskReport, leveler_engine::EngineError>,
+        result: &Result<leveler_agent::coding::TaskReport, leveler_engine::EngineError>,
     ) {
         let Some(goal) = goal else { return };
         // A run that never produced a report still opened one window. Saying
@@ -1279,7 +1287,7 @@ mod tests {
 /// failed is finished — the goal owes nothing more automatically, and how it
 /// went lives on the session row. Only a run that was *cut short* still owes.
 pub(crate) fn goal_owes_no_more_work(
-    result: &Result<leveler_engine::TaskReport, leveler_engine::EngineError>,
+    result: &Result<leveler_agent::coding::TaskReport, leveler_engine::EngineError>,
 ) -> bool {
     use leveler_lifecycle::TaskOutcome;
     match result {
@@ -1294,7 +1302,7 @@ pub(crate) fn goal_owes_no_more_work(
             TaskOutcome::Interrupted => false,
         },
         // Cancelled mid-flight. The work was stopped, not finished.
-        Err(leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled)) => false,
+        Err(leveler_engine::EngineError::Cancelled) => false,
         // The engine could not reach a verdict at all. A goal with no verdict
         // is not a settled goal: leaving it owed is what keeps it discoverable
         // instead of silently dropped.
@@ -1305,7 +1313,8 @@ pub(crate) fn goal_owes_no_more_work(
 #[cfg(test)]
 mod goal_settlement_tests {
     use super::goal_owes_no_more_work;
-    use leveler_engine::{EngineError, TaskReport};
+    use leveler_agent::coding::TaskReport;
+    use leveler_engine::EngineError;
     use leveler_lifecycle::TaskOutcome;
 
     fn report(outcome: TaskOutcome) -> Result<TaskReport, EngineError> {
@@ -1337,9 +1346,7 @@ mod goal_settlement_tests {
     fn a_run_cut_short_leaves_the_goal_owed() {
         assert!(!goal_owes_no_more_work(&report(TaskOutcome::BudgetLimited)));
         assert!(!goal_owes_no_more_work(&report(TaskOutcome::Interrupted)));
-        assert!(!goal_owes_no_more_work(&Err(EngineError::Agent(
-            leveler_agent::AgentError::Cancelled
-        ))));
+        assert!(!goal_owes_no_more_work(&Err(EngineError::Cancelled)));
     }
 
     #[test]

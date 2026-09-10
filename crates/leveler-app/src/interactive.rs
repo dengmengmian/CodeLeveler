@@ -1106,7 +1106,9 @@ impl InProcessRuntimeClient {
                         &stores,
                         &session_id,
                         leveler_lifecycle::CheckpointReason::Manual,
-                        Some(app.layout.repo_root.as_path()),
+                        Some(&leveler_agent::coding::GitWorkspace::new(
+                            &app.layout.repo_root,
+                        )),
                         semantic,
                     )
                     .await
@@ -1231,7 +1233,7 @@ impl InProcessRuntimeClient {
                             &log,
                             None,
                             Some(question.as_str()),
-                            u64::from(leveler_engine::CHAT_CONTEXT_BUDGET),
+                            u64::from(leveler_agent::coding::CHAT_CONTEXT_BUDGET),
                         )
                         .await
                         .map_err(|e| e.to_string())?;

@@ -403,7 +403,11 @@ impl BrowserProcess {
 #[derive(Clone)]
 struct Attached {
     target_id: String,
-    session_id: String,
+    /// `None` until this tab is actually operated on. Listing tabs must not
+    /// attach: `Target.getTargets` already carries every target's url and
+    /// title, and attaching costs five `*.enable` round trips against a
+    /// renderer that may not be ready to answer them.
+    session_id: Option<String>,
 }
 
 pub struct CdpBackend {
@@ -472,23 +476,37 @@ impl CdpBackend {
         Ok(session_id)
     }
 
+    /// The session for `tab`, attaching on first use.
     async fn session_of(&self, tab: &TabId) -> BrowserResult<String> {
-        self.tabs
-            .lock()
-            .await
-            .get(tab)
-            .map(|a| a.session_id.clone())
-            .ok_or_else(|| BrowserError::TabClosed(format!("unknown tab {tab}")))
+        let existing = {
+            let tabs = self.tabs.lock().await;
+            let attached = tabs
+                .get(tab)
+                .ok_or_else(|| BrowserError::TabClosed(format!("unknown tab {tab}")))?;
+            match &attached.session_id {
+                Some(session) => return Ok(session.clone()),
+                None => attached.target_id.clone(),
+            }
+        };
+        let session = self.attach(&existing).await?;
+        if let Some(attached) = self.tabs.lock().await.get_mut(tab) {
+            attached.session_id = Some(session.clone());
+        }
+        Ok(session)
     }
 
     /// Reconcile the tab map with the browser's live page targets: adopt pages
     /// this backend has not seen (popups), drop pages the browser has closed.
-    async fn sync_targets(&self) -> BrowserResult<()> {
+    /// Reconcile the tab map with the browser's live page targets: adopt page
+    /// targets this backend has not seen (popups), drop the ones the browser
+    /// has closed. One protocol call, no attaching — `targetInfo` carries what
+    /// a listing needs.
+    async fn sync_targets(&self) -> BrowserResult<Vec<(String, String, String)>> {
         let res = self
             .conn
             .call(None, "Target.getTargets", json!({}), ACTION_TIMEOUT)
             .await?;
-        let mut live: Vec<(String, String)> = Vec::new(); // (targetId, url)
+        let mut live = Vec::new(); // (targetId, url, title)
         if let Some(infos) = res.get("targetInfos").and_then(Value::as_array) {
             for t in infos {
                 if t.get("type").and_then(Value::as_str) != Some("page") {
@@ -499,40 +517,36 @@ impl CdpBackend {
                     continue;
                 }
                 if let Some(id) = t.get("targetId").and_then(Value::as_str) {
-                    live.push((id.to_string(), url.to_string()));
+                    live.push((
+                        id.to_string(),
+                        url.to_string(),
+                        t.get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    ));
                 }
             }
         }
-        let live_ids: Vec<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
-        {
-            let mut tabs = self.tabs.lock().await;
-            tabs.retain(|_, a| live_ids.contains(&a.target_id.as_str()));
-        }
-        let known: Vec<String> = self
-            .tabs
-            .lock()
-            .await
-            .values()
-            .map(|a| a.target_id.clone())
-            .collect();
-        for (target_id, _) in &live {
-            if known.contains(target_id) {
+        let mut tabs = self.tabs.lock().await;
+        tabs.retain(|_, a| live.iter().any(|(id, _, _)| id == &a.target_id));
+        for (target_id, _, _) in &live {
+            if tabs.values().any(|a| &a.target_id == target_id) {
                 continue;
             }
-            let session_id = self.attach(target_id).await?;
             let tab = TabId::new(format!(
                 "tab-{}",
                 self.next_tab.fetch_add(1, Ordering::Relaxed)
             ));
-            self.tabs.lock().await.insert(
+            tabs.insert(
                 tab,
                 Attached {
                     target_id: target_id.clone(),
-                    session_id,
+                    session_id: None,
                 },
             );
         }
-        Ok(())
+        Ok(live)
     }
 
     async fn eval(&self, session: &str, expression: &str) -> BrowserResult<Value> {
@@ -743,7 +757,7 @@ impl BrowserBackend for CdpBackend {
             .and_then(Value::as_str)
             .ok_or_else(|| BrowserError::ActionFailed("createTarget returned no id".into()))?
             .to_string();
-        let session_id = self.attach(&target_id).await?;
+        let session_id = Some(self.attach(&target_id).await?);
         let tab = TabId::new(format!(
             "tab-{}",
             self.next_tab.fetch_add(1, Ordering::Relaxed)
@@ -779,19 +793,20 @@ impl BrowserBackend for CdpBackend {
     }
 
     async fn list_tabs(&self) -> BrowserResult<Vec<RawTab>> {
-        self.sync_targets().await?;
-        let tabs: Vec<(TabId, String)> = self
-            .tabs
-            .lock()
-            .await
+        let live = self.sync_targets().await?;
+        let tabs = self.tabs.lock().await;
+        let mut out: Vec<RawTab> = tabs
             .iter()
-            .map(|(t, a)| (t.clone(), a.session_id.clone()))
+            .filter_map(|(tab, attached)| {
+                live.iter()
+                    .find(|(id, _, _)| id == &attached.target_id)
+                    .map(|(_, url, title)| RawTab {
+                        tab: tab.clone(),
+                        url: url.clone(),
+                        title: title.clone(),
+                    })
+            })
             .collect();
-        let mut out = Vec::new();
-        for (tab, session) in tabs {
-            let (url, title) = self.locate_session(&session).await.unwrap_or_default();
-            out.push(RawTab { tab, url, title });
-        }
         out.sort_by(|a, b| a.tab.cmp(&b.tab));
         Ok(out)
     }
@@ -1072,7 +1087,6 @@ fn launch_args(profile_dir: &Path) -> Vec<String> {
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-search-engine-choice-screen".into(),
-        "about:blank".into(),
     ]
 }
 

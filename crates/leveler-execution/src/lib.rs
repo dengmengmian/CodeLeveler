@@ -17,6 +17,7 @@ pub mod approval;
 pub mod artifact;
 pub mod background;
 pub mod checkpoint;
+mod clarify;
 pub mod command;
 pub mod hooks;
 pub mod permission_rules;
@@ -44,6 +45,7 @@ pub use background::{
     MutationBaseline,
 };
 pub use checkpoint::Checkpoint;
+pub use clarify::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
 pub use command::{
     CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessError, ProcessIdentity,
     ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,

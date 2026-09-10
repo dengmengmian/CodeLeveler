@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_engine::{EngineEvent, EventLog, ExecutionKind, TaskOutcome, mode_str};
+use leveler_agent::coding::mode_str;
+use leveler_engine::{EngineEvent, EventLog, ExecutionKind, TaskOutcome};
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_model::ModelRef;

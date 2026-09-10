@@ -9,7 +9,7 @@
 
 use leveler_model::{ModelProfile, ReasoningEffort};
 
-use crate::factory::TurnProfile;
+use crate::coding::factory::TurnProfile;
 
 /// Local read-only tool batch width for main/explorer seats. This is a *local
 /// executor* resource guard over calls the model already emitted — the model's
@@ -77,7 +77,7 @@ pub struct ExecutionOverrides {
 /// a task folds at the model's own declared reliable context. Resolved
 /// through this one seam so the two cannot drift apart unnoticed (C2.1
 /// recorded them diverging: 24k vs the task budget).
-pub const CHAT_CONTEXT_BUDGET: u32 = leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD as u32;
+pub const CHAT_CONTEXT_BUDGET: u32 = crate::PRE_REQUEST_COMPACT_THRESHOLD as u32;
 
 /// The fully resolved execution configuration for one executor. For the
 /// numeric budget fields `0` means unlimited, matching executor semantics.
@@ -170,8 +170,8 @@ pub fn resolve_execution_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::factory::TurnProfile;
-    use leveler_agent::{ContinuationPolicy, StepLimits};
+    use crate::coding::factory::TurnProfile;
+    use crate::{ContinuationPolicy, StepLimits};
     use leveler_model::{ModelProfile, ReasoningEffort};
 
     fn profile() -> ModelProfile {

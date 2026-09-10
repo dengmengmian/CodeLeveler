@@ -9,15 +9,12 @@ repository.workspace = true
 description = "The persistent task/turn engine: one execution kernel with Direct/Plan strategies, an append-only event log, and resume."
 
 [dependencies]
-leveler-agent = { workspace = true }
 leveler-context = { workspace = true }
 leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-model = { workspace = true }
 leveler-storage = { workspace = true }
-leveler-tools = { workspace = true }
-leveler-verifier = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

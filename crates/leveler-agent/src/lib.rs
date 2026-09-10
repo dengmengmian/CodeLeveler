@@ -13,7 +13,7 @@
 
 mod authorization;
 mod child_profile;
-mod compaction;
+pub mod coding;
 pub mod executor;
 mod injected_tools;
 pub mod named_agent;
@@ -26,23 +26,26 @@ mod update_plan;
 // The kernel owns these: one definition of what a spent budget is, shared by
 // the loop that enforces it and the outcome that reports it.
 pub use child_profile::child_profile_trace;
-pub use compaction::{
-    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages,
-    estimate_tokens, summarize_with_model,
-};
 pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus,
-    AutoClarify, ChildToolEvent, ClarificationRequest, Clarifier, ClarifyOutcome,
-    CompactionCheckpoint, ContinuationPolicy, EventBarrier, ExecutionFence, Executor,
-    ModelCallKind, ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
-    SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
+    ContinuationPolicy, Executor, NoopSink, SteeringSource, StepLimits, SubAgentExecutionPolicies,
+    SubAgentExecutionPolicy, TurnPolicy, closeout,
 };
 pub use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
+pub use leveler_context::{
+    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages,
+    estimate_tokens, summarize_with_model,
+};
+pub use leveler_engine::{
+    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind,
+    ModelRequestRecord, PortError, TranscriptSink,
+};
+pub use leveler_execution::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
 pub use leveler_lifecycle::{
     CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState,
-    PlanStep, ProgressCaps, ProgressLedger, TurnPhase, WorkProfile,
+    PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase, WorkProfile,
 };
 pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

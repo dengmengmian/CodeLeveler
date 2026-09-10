@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_agent::{AutoClarify, StopReason};
 use leveler_core::{RequestId, ToolCallId};
-use leveler_engine::{
-    EngineEvent, ExecutionKind, ExecutorFactory, TaskEngine, TaskOutcome, TaskSpec,
-};
+use leveler_engine::{EngineEvent, ExecutionKind, TaskEngine, TaskOutcome};
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
@@ -157,7 +156,7 @@ fn patch_resolve_and_proven_ac() -> Vec<ModelResponse> {
 }
 
 struct Harness {
-    engine: TaskEngine,
+    engine: CodingRuntime,
     db: Database,
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -193,9 +192,11 @@ async fn harness_with(
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -211,7 +212,7 @@ async fn harness_with(
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -232,9 +233,9 @@ async fn factory_reasoning_override_reaches_every_model_request() {
         serde_json::json!({"status": "complete", "summary": "done"}),
     )])
     .await;
-    h.engine.factory.overrides = Some(leveler_engine::ExecutionOverrides {
+    h.engine.factory.overrides = Some(leveler_agent::coding::ExecutionOverrides {
         reasoning_effort: Some(leveler_model::ReasoningEffort::High),
-        ..leveler_engine::ExecutionOverrides::default()
+        ..leveler_agent::coding::ExecutionOverrides::default()
     });
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -371,7 +372,7 @@ async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
         serde_json::json!({"status": "complete", "summary": "done"}),
     )])
     .await;
-    h.engine.stores.terminal = Arc::new(FailingTerminal);
+    h.engine.engine.stores.terminal = Arc::new(FailingTerminal);
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -411,7 +412,7 @@ async fn a_failed_transcript_append_fails_the_turn_loudly() {
         serde_json::json!({"status": "complete", "summary": "done"}),
     )])
     .await;
-    h.engine.stores.messages = Arc::new(FailingMessages);
+    h.engine.engine.stores.messages = Arc::new(FailingMessages);
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -544,7 +545,13 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
     let h = harness(Vec::new()).await;
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
-    let task = h.engine.task_for_session(&session).await.unwrap().unwrap();
+    let task = h
+        .engine
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
     let rt = leveler_core::RuntimeId::new("rt-test");
     let old = leveler_storage::OwnershipStore::acquire(
         &h.db,
@@ -596,7 +603,13 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
     let h = harness(Vec::new()).await;
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
-    let task = h.engine.task_for_session(&session).await.unwrap().unwrap();
+    let task = h
+        .engine
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
     let other = leveler_core::RuntimeId::new("rt-other");
     let foreign = leveler_storage::OwnershipStore::acquire(
         &h.db,
@@ -653,6 +666,7 @@ async fn create_task_records_the_durable_task_association() {
 
     let task = h
         .engine
+        .engine
         .task_for_session(&session)
         .await
         .unwrap()
@@ -686,7 +700,10 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
     );
     SessionRepository::new(&h.db).create(&record).await.unwrap();
     let session = leveler_core::SessionId::new(record.id);
-    assert_eq!(h.engine.task_for_session(&session).await.unwrap(), None);
+    assert_eq!(
+        h.engine.engine.task_for_session(&session).await.unwrap(),
+        None
+    );
 
     let mut events = Vec::new();
     h.engine
@@ -700,6 +717,7 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
         .unwrap();
 
     let task = h
+        .engine
         .engine
         .task_for_session(&session)
         .await
@@ -718,13 +736,13 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
 
 fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
     TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -1169,7 +1187,10 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .expect_err("an exhausted model runtime must fail the task");
-    assert!(matches!(error, leveler_engine::EngineError::Agent(_)));
+    assert!(matches!(
+        error,
+        leveler_engine::EngineError::Execution { .. }
+    ));
 
     let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
@@ -1225,10 +1246,7 @@ async fn cancellation_is_recorded_as_interrupted() {
         .run(&session, &spec, &mut |_| {}, token)
         .await
         .expect_err("a pre-cancelled run must not succeed");
-    assert!(matches!(
-        err,
-        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled)
-    ));
+    assert!(matches!(err, leveler_engine::EngineError::Cancelled));
 
     let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
@@ -1331,9 +1349,11 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     std::fs::create_dir_all(dir2.path().join("src")).unwrap();
     std::fs::write(dir2.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(dir2.path()).unwrap();
-    let engine2 = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&h.db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine2 = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&h.db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
             registry: Arc::new(default_registry()),
@@ -1357,19 +1377,19 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
     };
     let spec2 = TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: dir2.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -1513,7 +1533,7 @@ async fn independent_review_required_launches_on_an_ordinary_change() {
     responses.push(text("ordinary change: no blocking defect"));
     responses.push(text("ordinary change: no blocking defect"));
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -1571,7 +1591,7 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
     responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
 
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
@@ -1659,7 +1679,7 @@ async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
         text("unused"),
     ])
     .await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let mut s = spec_windowed(&h, "harden the login path", 2);
     // Pin the round budget so the ceiling is the GOAL terminal (no next window)
     // — exactly R011's ending, minus the wait.
@@ -1767,9 +1787,11 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
         fail_from: 1,
     });
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -1785,19 +1807,19 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Required,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Required,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
     };
     let s = TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a login entry point".to_string(),
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -1899,7 +1921,7 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
         ));
     }
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -1990,7 +2012,7 @@ async fn a_reviewer_finding_is_adopted_without_gating_the_closure() {
     ];
 
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -2054,7 +2076,7 @@ async fn a_reviewer_observation_does_not_refuse_the_closure() {
     ];
 
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -2104,7 +2126,7 @@ async fn persisted_findings_reload_without_duplication() {
         text("reviewed: one blocking defect"),
     ];
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
@@ -2164,7 +2186,7 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
     ];
 
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2218,7 +2240,7 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
 
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2380,7 +2402,7 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     let mut h = harness(responses).await;
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -2508,7 +2530,7 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
     // The reviewer is the child lane this reconciliation is about, and
     // `IndependentReviewPolicy` defaults to `Off`: a run that spends in one
     // lane only cannot prove the two authorities agree, so ask for it.
-    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();

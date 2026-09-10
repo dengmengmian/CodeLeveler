@@ -145,13 +145,13 @@ pub enum EngineEvent {
         #[serde(default)]
         outcome: TurnOutcome,
         /// Human-oriented stop text (historically the Debug repr of
-        /// [`leveler_agent::StopReason`], or an error message). Kept for
+        /// [`leveler_lifecycle::StopReason`], or an error message). Kept for
         /// display compatibility; machine consumers use `stop`.
         stop_reason: String,
         /// Typed executor stop reason. `None` on legacy rows and on turns
         /// that ended in an error instead of an executor outcome.
         #[serde(default)]
-        stop: Option<leveler_agent::StopReason>,
+        stop: Option<leveler_lifecycle::StopReason>,
         rounds: u32,
         modified_files: Vec<String>,
     },
@@ -167,7 +167,7 @@ pub enum EngineEvent {
         /// product reinterpretation). `None` on legacy rows and on tasks that
         /// ended in cancellation or an engine error.
         #[serde(default)]
-        stop: Option<leveler_agent::StopReason>,
+        stop: Option<leveler_lifecycle::StopReason>,
     },
 
     // ── kernel: model / tools (1:1 from AgentEvent) ──────────────────────
@@ -279,7 +279,7 @@ pub enum EngineEvent {
     /// The model replaced its structured plan (update_plan tool). Full list,
     /// not a delta; step text derives from the task/model output.
     PlanUpdated {
-        steps: Vec<leveler_agent::PlanStep>,
+        steps: Vec<leveler_lifecycle::PlanStep>,
     },
     /// Host refused update_goal(complete) (process gate). Persisted for UI/resume.
     GoalIntercepted {
@@ -942,167 +942,6 @@ pub enum DataClass {
     /// Contains source, model content, tool output, or full context — never
     /// leaves the local machine.
     LocalOnly,
-}
-
-/// Convert the executor's event stream 1:1. `Finished` becomes the transient
-/// [`EngineEvent::RunFinished`]; the turn runner emits the real
-/// [`EngineEvent::TurnFinished`] with turn identity and stop reason.
-impl From<leveler_agent::AgentEvent> for EngineEvent {
-    fn from(event: leveler_agent::AgentEvent) -> Self {
-        use leveler_agent::AgentEvent as A;
-        match event {
-            A::StreamAttemptStarted => EngineEvent::StreamAttemptStarted,
-            A::AssistantDelta(text) => EngineEvent::AssistantDelta { text },
-            A::ReasoningDelta(text) => EngineEvent::ReasoningDelta { text },
-            A::AssistantText(text) => EngineEvent::AssistantMessage { text },
-            A::ToolCall {
-                id,
-                name,
-                arguments,
-                parallel,
-            } => EngineEvent::ToolCallStarted {
-                call_id: id,
-                name,
-                arguments,
-                parallel,
-                // Risk is stamped by the turn pump, which owns the registry.
-                risk: None,
-                // The top-level loop's own call; a delegated one arrives as a
-                // ChildToolEvent and carries its agent id.
-                agent_id: None,
-            },
-            A::ToolResult {
-                id,
-                name,
-                is_error,
-                preview,
-                applied_diff,
-            } => EngineEvent::ToolCallFinished {
-                call_id: id,
-                name,
-                is_error,
-                preview,
-                agent_id: None,
-                applied_diff,
-            },
-            A::WorkspaceSnapshot { call_id, snapshot } => {
-                EngineEvent::WorkspaceSnapshotCreated { call_id, snapshot }
-            }
-            A::Usage {
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-            } => EngineEvent::TokenUsage {
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-            },
-            A::Compacted { from, to } => EngineEvent::Compacted { from, to },
-            A::AdvisoryStarted { kind } => EngineEvent::AdvisoryStarted {
-                kind: kind.as_key().to_string(),
-            },
-            A::CommandProgress { label, elapsed_ms } => {
-                EngineEvent::CommandProgress { label, elapsed_ms }
-            }
-            A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
-            A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
-            A::DelegationStage { action, detail } => {
-                EngineEvent::DelegationStage { action, detail }
-            }
-            A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },
-            A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
-            A::ContextSnapshot { messages } => EngineEvent::ContextSnapshot {
-                messages,
-                // Executor in-loop snapshots carry no durable ordinal; they
-                // merge via the legacy overlap heuristic on restore.
-                through_ordinal: None,
-            },
-            A::VerificationStarted => EngineEvent::VerificationStarted,
-            A::VerificationCheck {
-                name,
-                status,
-                evidence,
-            } => EngineEvent::VerificationCheck {
-                name,
-                status: match status {
-                    leveler_agent::AgentVerificationStatus::Passed => "passed".to_string(),
-                    leveler_agent::AgentVerificationStatus::Failed => "failed".to_string(),
-                    leveler_agent::AgentVerificationStatus::Skipped => "skipped".to_string(),
-                },
-                evidence,
-            },
-            A::VerificationFinished { passed } => EngineEvent::VerificationFinished { passed },
-            A::SubAgentStarted {
-                id,
-                nickname,
-                role,
-                task,
-                profile_id,
-                profile_role,
-                read_only,
-            } => EngineEvent::SubAgentStarted {
-                id,
-                nickname,
-                role,
-                task,
-                profile_id,
-                profile_role,
-                read_only,
-            },
-            // Durable-only: the drive loop intercepts this and writes the
-            // row. Nothing downstream renders it, and the child's running
-            // totals already reach the screen as SubAgentProgress. Mapping it
-            // to that keeps the conversion total without inventing an engine
-            // event nobody consumes.
-            A::SubAgentModelRequest { record } => EngineEvent::SubAgentProgress {
-                id: record.agent_id.clone().unwrap_or_default(),
-                active: true,
-                input_tokens: record.usage.input_tokens.min(u32::MAX as u64) as u32,
-                output_tokens: record.usage.output_tokens.min(u32::MAX as u64) as u32,
-                cached_input_tokens: record.usage.cached_input_tokens.min(u32::MAX as u64) as u32,
-            },
-            A::SubAgentProgress {
-                id,
-                active,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-            } => EngineEvent::SubAgentProgress {
-                id,
-                active,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-            },
-            A::SubAgentFinished {
-                id,
-                nickname,
-                ok,
-                summary,
-                contribution,
-            } => EngineEvent::SubAgentFinished {
-                id,
-                nickname,
-                ok,
-                summary,
-                contribution,
-            },
-            A::SubAgentActivity {
-                id,
-                phase,
-                tool,
-                preview,
-                is_error,
-            } => EngineEvent::SubAgentActivity {
-                id,
-                phase,
-                tool,
-                preview,
-                is_error,
-            },
-            A::Finished(text) => EngineEvent::RunFinished { text },
-        }
-    }
 }
 
 #[cfg(test)]

@@ -10,9 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_agent::{AutoClarify, ContinuationPolicy, StepLimits};
 use leveler_core::{RequestId, ToolCallId};
-use leveler_engine::{ExecutionKind, ExecutorFactory, TaskEngine, TaskSpec};
+use leveler_engine::{ExecutionKind, TaskEngine};
 use leveler_execution::{
     AutoApprove, BackgroundTaskRegistry, BackgroundTaskStatus, PermissionProfile, ProcessRequest,
     Workspace,
@@ -135,7 +136,7 @@ fn spawn_sleep_server() -> ModelResponse {
 }
 
 struct Harness {
-    engine: TaskEngine,
+    engine: CodingRuntime,
     #[allow(dead_code)]
     db: Database,
     dir: tempfile::TempDir,
@@ -169,9 +170,11 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         leveler_tools::model_surface(leveler_tools::CapabilityPacks::ALL, &capabilities);
     let runtime = Arc::new(MockRuntime::new(responses));
     let db = Database::connect_in_memory().await.unwrap();
-    let engine = TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(&db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(tool_registry),
@@ -187,7 +190,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -202,13 +205,13 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
 
 fn spec(h: &Harness, goal: &str) -> TaskSpec {
     TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: goal.into(),
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::bounded(6),
             limits: StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,

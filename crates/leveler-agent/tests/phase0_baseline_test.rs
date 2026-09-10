@@ -21,9 +21,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::CodingRuntime;
+use leveler_agent::coding::{ExecutorFactory, TurnInput};
 use leveler_agent::{AutoClarify, ContinuationPolicy, StepLimits};
 use leveler_core::{RequestId, SessionId, Timestamp, ToolCallId, TurnId};
-use leveler_engine::{EngineEvent, EventLog, ExecutorFactory, TurnInput, TurnKind, TurnRunner};
+use leveler_engine::{EngineEvent, EventLog, TurnKind, TurnRunner};
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
@@ -270,7 +272,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
         steering: None,
         allow_delegation: true,
-        independent_review: leveler_engine::IndependentReviewPolicy::Off,
+        independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
     };
     Harness {
         db,
@@ -280,8 +282,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     }
 }
 
-fn chat_profile() -> leveler_engine::TurnProfile {
-    leveler_engine::TurnProfile::Chat {
+fn chat_profile() -> leveler_agent::coding::TurnProfile {
+    leveler_agent::coding::TurnProfile::Chat {
         continuation: ContinuationPolicy::UntilTerminal,
         limits: StepLimits::default(),
     }
@@ -336,29 +338,39 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
     )
     .await
     .unwrap();
+    let cancellation = CancellationToken::new();
     let runner = TurnRunner {
         stores: &stores,
         token,
         session_id: h.session.clone(),
         log: &log,
-        factory: &h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
-        repo: None,
     };
 
     let recorded = runner
         .run_turn(
             TurnKind::Chat,
-            chat_profile(),
-            TurnInput::Content {
-                prior: Vec::new(),
-                content: vec![ContentPart::Text {
-                    text: "add a function".into(),
-                }],
+            leveler_engine::SeedRequest::Fresh {
+                continues_active_goal: false,
             },
+            None,
             &mut |_| {},
-            CancellationToken::new(),
+            cancellation.clone(),
+            |ports| {
+                leveler_agent::coding::turn::drive_turn(
+                    &h.factory,
+                    chat_profile(),
+                    TurnInput::Content {
+                        prior: Vec::new(),
+                        content: vec![ContentPart::Text {
+                            text: "add a function".into(),
+                        }],
+                    },
+                    ports,
+                    cancellation.clone(),
+                )
+            },
         )
         .await
         .expect("turn must complete");
@@ -408,7 +420,8 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
 /// honestly reported an unreachable goal had failed at it.)
 #[tokio::test]
 async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
-    use leveler_engine::{ExecutionKind, TaskEngine, TaskOutcome, TaskSpec};
+    use leveler_agent::coding::TaskSpec;
+    use leveler_engine::{ExecutionKind, TaskEngine, TaskOutcome};
 
     let h = harness(vec![tool_call(
         "g1",
@@ -417,21 +430,23 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
     )])
     .await;
     let stores = leveler_storage::EngineStores::from_database(&h.db);
-    let engine = TaskEngine {
-        stores,
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores,
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
     };
     let spec = TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "do the impossible".to_string(),
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -486,7 +501,8 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
 /// with the outcome.
 #[tokio::test]
 async fn engine_stamps_running_and_terminal_session_status_itself() {
-    use leveler_engine::{ExecutionKind, TaskEngine, TaskSpec};
+    use leveler_agent::coding::TaskSpec;
+    use leveler_engine::{ExecutionKind, TaskEngine};
 
     let h = harness(vec![
         patch_response(),
@@ -498,21 +514,23 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
     ])
     .await;
     let stores = leveler_storage::EngineStores::from_database(&h.db);
-    let engine = TaskEngine {
-        stores,
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    let engine = CodingRuntime {
+        engine: TaskEngine {
+            stores,
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
     };
     let spec = TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
             kind: ExecutionKind::Direct,
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,

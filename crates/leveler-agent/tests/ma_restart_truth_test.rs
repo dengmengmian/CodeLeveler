@@ -15,10 +15,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::AutoClarify;
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_core::{RequestId, SessionId, ToolCallId, TurnId};
-use leveler_engine::{
-    EngineEvent, EventLog, ExecutionKind, ExecutorFactory, TaskEngine, TaskOutcome, TaskSpec,
-};
+use leveler_engine::{EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome};
 use leveler_execution::{
     ApprovalDecision, ApprovalRequest, Approver, PermissionProfile, Workspace,
 };
@@ -162,12 +161,14 @@ fn understand_met_required_ac() -> ModelResponse {
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
-fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> TaskEngine {
+fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> CodingRuntime {
     let workspace = Workspace::new(dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    TaskEngine {
-        stores: leveler_storage::EngineStores::from_database(db),
-        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+    CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),
@@ -183,7 +184,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> TaskEn
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
-            independent_review: leveler_engine::IndependentReviewPolicy::Off,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -207,13 +208,13 @@ fn gated_spec(dir: &Path) -> TaskSpec {
         ("true".to_string(), Vec::new())
     };
     TaskSpec {
-        runtime: leveler_engine::RuntimeTaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: leveler_agent::StepLimits::default(),
         },
-        coding: leveler_engine::CodingTaskSpec {
+        coding: leveler_agent::coding::CodingTaskSpec {
             repository: dir.to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
@@ -911,7 +912,7 @@ async fn reviewer_lifecycle_events_share_truthful_null_attribution() {
             text("reviewed src/auth.rs: nothing to flag"),
         ]),
     );
-    engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Required;
+    engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let spec = gated_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     engine

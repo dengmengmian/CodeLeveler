@@ -14,13 +14,20 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_agent_core::BudgetExhaustion;
 use leveler_context::load_rules;
-use leveler_core::{ClarificationId, TurnId};
-use leveler_execution::{ApprovalPolicy, Approver, AutoApprove, AutoReviewer, NeedUserReviewer};
-use leveler_lifecycle::{EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger};
+use leveler_engine::{
+    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelRequestRecord,
+    PortError, TranscriptSink,
+};
+use leveler_execution::{
+    ApprovalPolicy, Approver, AutoApprove, AutoClarify, AutoReviewer, ClarificationRequest,
+    Clarifier, ClarifyOutcome, NeedUserReviewer,
+};
+use leveler_lifecycle::{
+    EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, StopReason,
+};
 use leveler_memory::MemoryStore;
 use leveler_model::{
-    ContentPart, FinishReason, Message, ModelError, ModelPricing, ModelRef, ModelRuntime,
-    ReasoningEffort, Role, TokenUsage,
+    ContentPart, Message, ModelError, ModelPricing, ModelRef, ModelRuntime, ReasoningEffort, Role,
 };
 use leveler_tools::{ToolContext, ToolRegistry};
 
@@ -343,70 +350,6 @@ mod advisory_kind_tests {
 
 // PlanStep lives in leveler-lifecycle; re-exported from crate root.
 
-/// A request for the user to clarify something mid-task (spec §35): the model
-/// calls `request_user_input` (or legacy `ask_user`), which blocks until the UI answers.
-#[derive(Debug, Clone)]
-pub struct ClarificationRequest {
-    pub id: ClarificationId,
-    /// Filled by the engine recorder once the persisted turn exists.
-    pub turn_id: Option<TurnId>,
-    pub tool: String,
-    pub call_id: String,
-    pub action_fingerprint: String,
-    pub question: String,
-    pub options: Vec<String>,
-}
-
-/// How a clarification request ended. `Answered` is the ONLY variant that may
-/// be presented to the model as the user speaking; every other variant must
-/// surface as "no user reply", never as an (empty) answer. This is the
-/// clarification-side counterpart of `Approver::has_human` (R004 F2: an empty
-/// string silently impersonated the user).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClarifyOutcome {
-    /// A human answered with this text (may still be empty = explicit skip).
-    Answered(String),
-    /// A human saw the question and explicitly skipped it.
-    Skipped,
-    /// No human is attached to this run (headless run, sub-agent, or the
-    /// question could not be delivered to any client).
-    Unattended,
-    /// The question was delivered but nobody responded before the deadline.
-    TimedOut,
-    /// The turn is being cancelled; the answer no longer matters.
-    Cancelled,
-}
-
-impl ClarifyOutcome {
-    /// Short machine label for recording/observability.
-    pub fn label(&self) -> &'static str {
-        match self {
-            ClarifyOutcome::Answered(_) => "answered",
-            ClarifyOutcome::Skipped => "skipped",
-            ClarifyOutcome::Unattended => "unattended",
-            ClarifyOutcome::TimedOut => "timed_out",
-            ClarifyOutcome::Cancelled => "cancelled",
-        }
-    }
-}
-
-/// Something that can answer clarification requests.
-#[async_trait]
-pub trait Clarifier: Send + Sync {
-    async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome;
-}
-
-/// Non-interactive default: no human is attached, and the model must be told
-/// so instead of receiving a fabricated empty "answer".
-pub struct AutoClarify;
-
-#[async_trait]
-impl Clarifier for AutoClarify {
-    async fn clarify(&self, _request: &ClarificationRequest) -> ClarifyOutcome {
-        ClarifyOutcome::Unattended
-    }
-}
-
 /// What decides whether another model/tool round may start.
 ///
 /// Top-level user turns run until a semantic terminal state. Bounded work is
@@ -461,55 +404,6 @@ pub struct StepLimits {
     /// This is an unconditional circuit breaker — independent of progress
     /// heuristics — so an `UntilTerminal` turn always terminates.
     pub max_rounds: Option<u32>,
-}
-
-/// Why the loop stopped. Serialized (snake_case) into terminal engine events
-/// so blocked/budget/complete stay machine-discriminable after the fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    /// The task has explicit completion evidence, rather than merely a natural
-    /// end to one model response.
-    Completed,
-    /// The model naturally ended its answer. This closes the conversational
-    /// turn but does not prove that an external task is complete.
-    ///
-    /// `closeout_forced` is a legacy wire value from the deleted closeout
-    /// watchdog; it read as "the plan was done, the turn ended abnormally"
-    /// and decodes here.
-    #[serde(alias = "closeout_forced")]
-    Answered,
-    /// The run ended without finishing: every attempted action was refused
-    /// for several rounds in a row.
-    Incomplete,
-    /// A token or cost budget was exhausted first.
-    BudgetExhausted,
-    /// The absolute per-turn round ceiling was hit. This is the unconditional
-    /// circuit breaker that fires even when every progress watchdog was evaded
-    /// (a "busy" loop that fakes progress each round). It guarantees termination
-    /// but is not a budget the user can lift by saying "继续" — so it is kept
-    /// distinct from `BudgetExhausted` for honest logs/telemetry. Maps to the
-    /// same session outcome as `BudgetExhausted` (Incomplete / Execute).
-    TurnLimitReached,
-    /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
-    ///
-    /// `policy_blocked` is a legacy wire value from the deleted plan-gate
-    /// escalation track and decodes here.
-    #[serde(alias = "policy_blocked")]
-    Blocked,
-    /// Goal mode: the model went quiet without ever resolving the goal via
-    /// `update_goal`, even after the quiet-nudge cap. Not a success.
-    Stalled,
-    /// The run finished its work, but the project's checks did not run or
-    /// could not produce a verdict. Synthesized by the app's verification
-    /// mapping — the token loop never emits this. It means "done, checks not
-    /// run", NOT "failed" or "gave up".
-    CompletedUnverified,
-    /// The run finished its work and the project's checks then FAILED over
-    /// the final tree. Synthesized by the app's verification mapping — the
-    /// token loop never emits this. Both facts are reported; neither is
-    /// laundered into the other.
-    CompletedChecksFailed,
 }
 
 /// The result of an executor run.
@@ -605,6 +499,17 @@ pub enum AgentError {
     Persistence(String),
 }
 
+impl From<PortError> for AgentError {
+    /// A lifecycle port refused. Both cases abort the run: the engine could
+    /// not make a fact durable, or this runtime no longer owns the task.
+    fn from(error: PortError) -> Self {
+        match error {
+            PortError::Persistence(detail) => AgentError::Persistence(detail),
+            PortError::StaleOwnership(detail) => AgentError::StaleOwnership(detail),
+        }
+    }
+}
+
 impl From<leveler_agent_core::AgentCoreError> for AgentError {
     /// The kernel's neutral failures, in this crate's vocabulary. A tool
     /// runtime never fails here — this harness dispatches its own tools — so
@@ -618,189 +523,6 @@ impl From<leveler_agent_core::AgentCoreError> for AgentError {
             Kernel::ToolRuntime(error) => AgentError::Persistence(error.to_string()),
         }
     }
-}
-
-/// Awaitable durability barrier for canonical tool events (side-effect
-/// barrier, convergence plan phase 1). `flush` resolves once every canonical
-/// event emitted through the observer so far is durable. The loop awaits it
-/// after announcing a tool call (before hooks/approval can act) and again
-/// after authorization (before dispatch), so a crash can never leave a side
-/// effect whose `ToolCallStarted` — or whose approval outcome — was lost.
-/// A flush failure aborts the run: the tool is NOT executed, because an
-/// unexecuted tool is recoverable but an unrecorded side effect is not.
-///
-/// Hosts without durable persistence (sub-agents, standalone library use)
-/// leave the barrier unset; the loop then proceeds without waiting.
-/// The ownership fence: proves the runtime still owns its task before a
-/// model-proposed tool may produce an external side effect. Checked AFTER
-/// the persistence barriers (ToolCallStarted + approval durable) and BEFORE
-/// dispatch. It cannot make side effects exactly-once - it only guarantees a
-/// runtime already known stale dispatches nothing new.
-#[async_trait::async_trait]
-pub trait ExecutionFence: Send + Sync {
-    /// Err(reason) = the token is stale; the run must abort.
-    async fn ensure_current(&self) -> Result<(), String>;
-}
-
-#[async_trait]
-pub trait EventBarrier: Send + Sync {
-    async fn flush(&self) -> Result<(), AgentError>;
-
-    /// Record a canonical tool event from a DELEGATED agent, attributed to it.
-    ///
-    /// A sub-agent's tool calls used to surface only as transient
-    /// `SubAgentActivity`, so a worker child that crashed mid-edit left
-    /// nothing the host could reconcile. These are the durable facts instead.
-    ///
-    /// The implementation MUST enqueue this on the same ordered queue that
-    /// [`Self::flush`] drains. Anything else races: the flush marker could
-    /// overtake the event it is supposed to be waiting for, and the barrier
-    /// would report durability for a call that is not recorded yet.
-    ///
-    /// Required, deliberately. A default no-op would let a barrier flush
-    /// successfully while silently discarding the record — the caller would
-    /// then run a delegated side effect believing it was durable, which is
-    /// the exact failure this method exists to prevent.
-    fn record_child_tool_event(&self, event: ChildToolEvent);
-}
-
-/// Host port: cut a durable goal checkpoint at the context-compaction
-/// boundary (long-goal P3), so the fold's summary is backed by persisted
-/// truth instead of an ephemeral paragraph.
-///
-/// Contract: the implementation must make every event emitted so far durable
-/// BEFORE capturing its cursor (flush-then-read), persist the checkpoint,
-/// and return its rendered context block — which the loop folds with in
-/// place of the bare summary.
-///
-/// - `Ok(Some(block))`: a durable checkpoint exists; fold with `block`.
-/// - `Ok(None)`: no goal is in scope (plain chat); fold proceeds exactly as
-///   without the port.
-/// - `Err(_)`: the durable boundary could not be established. The loop must
-///   NOT fold this round — old context is kept and the fold retries at the
-///   next boundary (fail closed: continuity is never dropped uncheckpointed).
-#[async_trait]
-pub trait CompactionCheckpoint: Send + Sync {
-    /// `summary` is the semantic compaction summary when one was produced.
-    async fn checkpoint_before_compaction(
-        &self,
-        summary: Option<&str>,
-    ) -> Result<Option<String>, AgentError>;
-}
-
-/// A delegated agent's tool call, attributed to the child that made it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChildToolEvent {
-    Started {
-        agent_id: String,
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-    Finished {
-        agent_id: String,
-        call_id: String,
-        name: String,
-        is_error: bool,
-        preview: String,
-    },
-    /// A write-ownership transition (`claim_write_scope` granted or denied).
-    ///
-    /// Rides this queue, not the activity channel, because the grant must be
-    /// durable BEFORE any event whose authorization depends on it — a child's
-    /// writes flush here immediately, so a grant recorded anywhere else can
-    /// land after the write it authorized and read as a bypass.
-    ///
-    /// Deliberately NOT a `Started`/`Finished` pair: `claim_write_scope` is a
-    /// virtual tool the drive loop answers inline and never registers, so a
-    /// `ToolCallStarted` for it would look like a dangling call to crash
-    /// recovery and demand human reconciliation for an operation with no
-    /// external side effect — the registry it mutates is in memory and dies
-    /// with the process.
-    Ownership {
-        agent_id: String,
-        action: String,
-        detail: String,
-    },
-}
-
-impl ModelRequestRecord {
-    /// Fill in the estimated cost from the model's pricing, if any.
-    ///
-    /// Cost is priced once, here, against the usage the provider actually
-    /// reported — including how much of the prompt it served from cache. A row
-    /// that carries its own cost can be summed later without re-deriving it
-    /// from a price table that may since have changed.
-    pub fn priced(mut self, pricing: Option<&leveler_model::ModelPricing>) -> Self {
-        self.cost_usd_micros = pricing.map(|p| {
-            p.cost_usd_micros_cached(
-                self.usage.input_tokens,
-                self.usage.cached_input_tokens,
-                self.usage.output_tokens,
-            )
-        });
-        self
-    }
-}
-
-/// A sink that persists the transcript as the loop advances, enabling resume.
-/// Called with the messages appended in each step (seed, then per round).
-#[async_trait]
-pub trait TranscriptSink: Send {
-    async fn append(&mut self, messages: &[Message]) -> Result<(), AgentError>;
-
-    async fn record_model_request(
-        &mut self,
-        _record: &ModelRequestRecord,
-    ) -> Result<(), AgentError> {
-        Ok(())
-    }
-}
-
-/// Diagnostic facts for a completed provider request. Persisting the normalized
-/// finish reason makes truncation distinguishable from semantic completion.
-#[derive(Debug, Clone)]
-pub struct ModelRequestRecord {
-    /// The provider's request id, when it reported one. A diagnostic, not a
-    /// key: the engine generates the row's identity, because a repeated
-    /// provider id used to abort the turn on a UNIQUE violation.
-    pub provider_request_id: Option<String>,
-    pub provider: String,
-    pub model: String,
-    pub usage: TokenUsage,
-    pub finish_reason: FinishReason,
-    pub latency_ms: u64,
-    /// Retries *before* this outcome. One record is one LOGICAL call, so the
-    /// physical traffic behind it is `1 + retry_count`.
-    pub retry_count: u32,
-    /// Which lane this call belongs to. A fold's summarization is a provider
-    /// call like any other; recording it under its own lane is what lets a
-    /// session's cost be attributed to the work versus the overhead.
-    pub kind: ModelCallKind,
-    /// The sub-agent that made this call, or `None` for the parent's own. A
-    /// child runs as an owned `'static` future and cannot borrow the parent's
-    /// sink, so its records travel back over the progress channel carrying
-    /// this; without it a reviewer's spend has nowhere to land.
-    pub agent_id: Option<String>,
-    /// Estimated cost in micro-USD, priced where the model has pricing
-    /// configured. `None` means unpriced, never free.
-    pub cost_usd_micros: Option<u64>,
-}
-
-/// Which lane a model call belongs to. The drive loop's rounds are the work;
-/// a fold's summarization is overhead the runtime chose to spend, and cost
-/// attribution has to be able to tell them apart. Mapped onto the storage
-/// enum at the engine boundary — this crate does not depend on storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelCallKind {
-    /// A main-loop round: the model deciding what to do next.
-    Round,
-    /// The summarization behind a compaction fold.
-    Compaction,
-    /// A bounded harness-initiated call that is not a main-loop round: a
-    /// compaction summary, or a closeout nudge's extra round. Never a second
-    /// model judging the first — that class of call no longer exists.
-    Advisory,
 }
 
 /// Where a bounded advisory call reports what it cost.
@@ -817,7 +539,7 @@ pub struct NoopSink;
 
 #[async_trait]
 impl TranscriptSink for NoopSink {
-    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), PortError> {
         Ok(())
     }
 }
@@ -848,14 +570,11 @@ impl SubAgentProgressSink {
 
 #[async_trait]
 impl TranscriptSink for SubAgentProgressSink {
-    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), PortError> {
         Ok(())
     }
 
-    async fn record_model_request(
-        &mut self,
-        record: &ModelRequestRecord,
-    ) -> Result<(), AgentError> {
+    async fn record_model_request(&mut self, record: &ModelRequestRecord) -> Result<(), PortError> {
         self.input_tokens = self.input_tokens.saturating_add(record.usage.input_tokens);
         self.output_tokens = self
             .output_tokens
@@ -1750,8 +1469,8 @@ impl Executor {
         keep_recent: usize,
         keep_recent_tokens: u64,
         cancellation: &CancellationToken,
-    ) -> Option<crate::compaction::CompactionSummary> {
-        crate::compaction::summarize_with_model(
+    ) -> Option<leveler_context::CompactionSummary> {
+        leveler_context::summarize_with_model(
             self.runtime.as_ref(),
             &self.model,
             self.policy.reasoning_effort,
@@ -2114,7 +1833,7 @@ mod recall_tests {
 #[cfg(test)]
 mod compaction_tests {
     use crate::authorization::{extract_command, patch_paths, push_unique_path};
-    use crate::compaction::{ACTIVE_OBJECTIVE_MARKER, compact_messages, estimate_tokens};
+    use leveler_context::{ACTIVE_OBJECTIVE_MARKER, compact_messages, estimate_tokens};
     use leveler_core::ToolCallId;
     use leveler_model::{ContentPart, Message, Role, ToolCall, ToolResultContent};
 
@@ -2386,6 +2105,8 @@ mod compaction_tests {
 #[cfg(test)]
 mod child_accounting_tests {
     use super::*;
+    use leveler_engine::ModelCallKind;
+    use leveler_model::{FinishReason, TokenUsage};
 
     fn a_record() -> ModelRequestRecord {
         ModelRequestRecord {

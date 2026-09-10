@@ -70,5 +70,7 @@ pub use plan::{PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
-pub use runtime::{SessionStatus, TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus};
+pub use runtime::{
+    SessionStatus, StopReason, TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus,
+};
 pub use workflow::AgentState;

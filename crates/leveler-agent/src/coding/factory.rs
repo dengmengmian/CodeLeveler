@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
-use leveler_agent::{
+use crate::{
     ContinuationPolicy, Executor, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
 };
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_tools::{ToolContext, ToolRegistry};
 
-use crate::EngineError;
-use crate::policy_resolver::{ExecutionOverrides, ExecutionRole, resolve_execution_policy};
+use crate::coding::policy::{ExecutionOverrides, ExecutionRole, resolve_execution_policy};
+use leveler_engine::EngineError;
 
 /// What kind of turn the executor will drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +91,12 @@ pub struct ExecutorFactory {
     pub hook_runner: leveler_execution::HookRunner,
     /// Mid-turn user input for the main turn, when the host supplies any.
     /// Sub-agents deliberately do not inherit it (see `Executor::child_for_role_on`).
-    pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+    pub steering: Option<Arc<dyn crate::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
     /// Whether the harness launches an independent reviewer at closure.
     /// Default `Off`; only explicit configuration turns it on.
-    pub independent_review: crate::policy_resolver::IndependentReviewPolicy,
+    pub independent_review: crate::coding::policy::IndependentReviewPolicy,
 }
 
 impl ExecutorFactory {

@@ -5122,7 +5122,7 @@ struct RecordingSink(Arc<Mutex<Vec<Message>>>);
 
 #[async_trait]
 impl leveler_agent::TranscriptSink for RecordingSink {
-    async fn append(&mut self, messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_engine::PortError> {
         self.0.lock().unwrap().extend_from_slice(messages);
         Ok(())
     }
@@ -6535,10 +6535,12 @@ impl leveler_agent::CompactionCheckpoint for RecordingCheckpoint {
     async fn checkpoint_before_compaction(
         &self,
         _summary: Option<&str>,
-    ) -> Result<Option<String>, AgentError> {
+    ) -> Result<Option<String>, leveler_engine::PortError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail {
-            return Err(AgentError::Persistence("checkpoint store down".into()));
+            return Err(leveler_engine::PortError::Persistence(
+                "checkpoint store down".into(),
+            ));
         }
         Ok(Some(
             "[GOAL CHECKPOINT]\nGoal:\nport the parser\nNext:\ninspect the API".to_string(),
@@ -6933,14 +6935,14 @@ struct LedgerSink(Arc<Mutex<Vec<(Option<String>, leveler_agent::ModelCallKind)>>
 
 #[async_trait]
 impl leveler_agent::TranscriptSink for LedgerSink {
-    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), leveler_engine::PortError> {
         Ok(())
     }
 
     async fn record_model_request(
         &mut self,
         record: &leveler_agent::ModelRequestRecord,
-    ) -> Result<(), AgentError> {
+    ) -> Result<(), leveler_engine::PortError> {
         self.0
             .lock()
             .unwrap()
@@ -7021,14 +7023,14 @@ struct SpendSink(Arc<Mutex<Vec<leveler_agent::ModelRequestRecord>>>);
 
 #[async_trait]
 impl leveler_agent::TranscriptSink for SpendSink {
-    async fn append(&mut self, _messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), leveler_engine::PortError> {
         Ok(())
     }
 
     async fn record_model_request(
         &mut self,
         record: &leveler_agent::ModelRequestRecord,
-    ) -> Result<(), AgentError> {
+    ) -> Result<(), leveler_engine::PortError> {
         self.0.lock().unwrap().push(record.clone());
         Ok(())
     }

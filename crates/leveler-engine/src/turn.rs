@@ -1,49 +1,138 @@
-//! The turn runner: the ONE place the engine drives an `Executor`.
+//! The turn runner: the ONE place a turn becomes durable.
 //!
 //! Each turn gets a `turns` row, its messages are stamped with the turn id,
 //! its events flow through the persist-before-forward [`EventLog`], and its
-//! approvals/clarifications are recorded. The executor's observer is a sync
-//! callback and its future is `!Send`, so events are pumped over an unbounded
-//! channel and drained concurrently on the same task via `futures::join!` —
-//! ordering into the log is exactly emission order.
+//! approvals/clarifications are recorded. The engine owns all of that; what
+//! actually runs inside the turn is a closure the harness supplies, and the
+//! engine knows nothing about it beyond the facts it reports back.
+//!
+//! A harness observer is a sync callback and its future may be `!Send`, so
+//! events are pumped over a bounded channel and drained concurrently on the
+//! same task via `futures::join!` — ordering into the log is exactly
+//! emission order.
 
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{AgentError, AgentOutcome, Clarifier, Executor, TranscriptSink};
 use leveler_core::{SessionId, TurnId};
-use leveler_execution::Approver;
+use leveler_execution::{Approver, Clarifier};
+use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger, StopReason};
 use leveler_model::Message;
 use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore};
 
-use crate::factory::{ExecutorFactory, TurnProfile};
 use crate::log::EventLog;
+use crate::ports::{
+    CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord,
+    PortError, TranscriptSink, WorkspaceFacts,
+};
 use crate::recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
 
-/// What the executor starts from this turn.
-pub enum TurnInput {
-    /// A fresh goal (seeds system + user messages). Optional `prior` is the
-    /// bounded session history so multi-turn Goal can refer to earlier turns.
-    Goal { goal: String, prior: Vec<Message> },
-    /// A resumed transcript (drive continues mid-conversation).
-    Resume(Vec<Message>),
-    /// A conversational turn: prior transcript + new content parts.
-    Content {
-        prior: Vec<Message>,
-        content: Vec<leveler_model::ContentPart>,
-    },
+/// Whether this turn inherits the session's prior task state.
+#[derive(Debug, Clone, Copy)]
+pub enum SeedRequest {
+    /// A resumed turn: always seed, the task epoch is unchanged.
+    Resume,
+    /// A fresh request. Seeds only when the prior state is still open —
+    /// `continues_active_goal` marks a turn the runtime issued after a refused
+    /// close, which continues the SAME goal rather than opening a new one.
+    Fresh { continues_active_goal: bool },
 }
 
-/// A finished turn.
-pub struct TurnRecordedOutcome {
+/// The durable state a fresh execution resumes from. Every field is read off
+/// the event log: the engine reports what was persisted and does not interpret
+/// any of it.
+pub struct TurnSeeds {
+    pub plan: Option<PlanState>,
+    pub ledger: Option<EvidenceLedger>,
+    pub progress: Option<ProgressLedger>,
+    /// Children whose outstanding entry is contradicted by a durable terminal
+    /// fact: they finished, and the settlement raced the window's end.
+    pub settled_children: Vec<SettledChild>,
+}
+
+/// A child whose recorded settlement has to be re-delivered after a restart.
+#[derive(Debug, Clone)]
+pub struct SettledChild {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    pub ok: bool,
+    pub summary: String,
+}
+
+/// Everything the engine offers the harness for one turn.
+///
+/// This is the whole seam. The engine hands over durable ports and the state
+/// it read back; what the harness builds on top of them — a model loop, a
+/// prompt, a tool surface — the engine never sees.
+pub struct TurnPorts {
     pub turn_id: TurnId,
-    pub outcome: AgentOutcome,
+    /// Where harness events enter the persist-before-forward log.
+    pub emitter: EventEmitter,
+    /// Persists the transcript and the model-call rows for this turn.
+    pub sink: TurnSink,
+    /// `None` when this turn must not inherit prior task state.
+    pub seeds: Option<TurnSeeds>,
+    pub barrier: Arc<dyn EventBarrier>,
+    pub fence: Arc<dyn ExecutionFence>,
+    pub checkpoint: Arc<dyn CompactionCheckpoint>,
+    /// The turn's approver/clarifier, wrapped so every request and decision
+    /// is recorded before it is answered.
+    pub approver: Arc<dyn Approver>,
+    pub clarifier: Arc<dyn Clarifier>,
+}
+
+/// What the harness reports about a turn that ran to its own end.
+///
+/// `outcome` is the harness's own result type, carried through untouched —
+/// the engine records the mechanical facts beside it and reads nothing from
+/// it.
+pub struct TurnFacts<T> {
+    pub stop: StopReason,
+    pub rounds: u32,
+    pub modified_files: Vec<String>,
+    pub outcome: T,
+}
+
+/// Why the harness stopped without reporting facts.
+#[derive(Debug)]
+pub struct TurnFailure {
+    /// A cancelled turn is `interrupted`, not `failed`: the run was stopped,
+    /// it did not break.
+    pub cancelled: bool,
+    pub detail: String,
+    /// This runtime lost the task mid-turn. The terminal write is skipped:
+    /// the current owner decides the task's future.
+    pub stale_ownership: bool,
+    /// The provider failure behind this stop, when there was one.
+    pub model: Option<leveler_model::ModelError>,
+}
+
+impl From<TurnFailure> for EngineError {
+    fn from(failure: TurnFailure) -> Self {
+        if failure.cancelled {
+            EngineError::Cancelled
+        } else if failure.stale_ownership {
+            EngineError::StaleOwnership(failure.detail)
+        } else {
+            EngineError::Execution {
+                detail: failure.detail,
+                model: failure.model,
+            }
+        }
+    }
+}
+
+/// A finished turn, paired with whatever the harness returned for it.
+pub struct TurnRecordedOutcome<T> {
+    pub turn_id: TurnId,
+    pub outcome: T,
 }
 
 /// A transcript sink that stamps every persisted message with the turn.
-struct TurnSink {
+pub struct TurnSink {
     messages: Arc<dyn MessageStore>,
     model_requests: Arc<dyn ModelRequestStore>,
     token: leveler_core::OwnershipToken,
@@ -53,12 +142,12 @@ struct TurnSink {
 
 #[async_trait::async_trait]
 impl TranscriptSink for TurnSink {
-    async fn append(&mut self, messages: &[Message]) -> Result<(), AgentError> {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), PortError> {
         let payloads: Vec<String> = messages
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()
-            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+            .map_err(|e| PortError::Persistence(e.to_string()))?;
         self.messages
             .append_in_turn_owned(
                 &self.token,
@@ -68,17 +157,14 @@ impl TranscriptSink for TurnSink {
                 leveler_core::now(),
             )
             .await
-            .map_err(|e| AgentError::Persistence(e.to_string()))
+            .map_err(|e| PortError::Persistence(e.to_string()))
     }
 
-    async fn record_model_request(
-        &mut self,
-        record: &leveler_agent::ModelRequestRecord,
-    ) -> Result<(), AgentError> {
+    async fn record_model_request(&mut self, record: &ModelRequestRecord) -> Result<(), PortError> {
         self.model_requests
             .insert(&storage_model_request(record, &self.session_id))
             .await
-            .map_err(|error| AgentError::Persistence(error.to_string()))
+            .map_err(|error| PortError::Persistence(error.to_string()))
     }
 }
 
@@ -86,8 +172,8 @@ impl TranscriptSink for TurnSink {
 /// delegated child, or the harness-launched closure reviewer. The record
 /// already carries the caller's `agent_id`; the engine owns the row's
 /// identity and the session it belongs to.
-pub(crate) fn storage_model_request(
-    record: &leveler_agent::ModelRequestRecord,
+pub fn storage_model_request(
+    record: &ModelRequestRecord,
     session_id: &SessionId,
 ) -> leveler_storage::ModelRequestRecord {
     let finish_reason = serde_json::to_value(record.finish_reason)
@@ -115,48 +201,45 @@ pub(crate) fn storage_model_request(
         latency_ms: Some(record.latency_ms),
         retry_count: record.retry_count,
         kind: match record.kind {
-            leveler_agent::ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
-            leveler_agent::ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
-            leveler_agent::ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
+            ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
+            ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
+            ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
         },
         created_at: leveler_core::now(),
     }
 }
 
-/// The engine's [`leveler_agent::ExecutionFence`]: before a tool dispatch,
+/// The engine's [`ExecutionFence`]: before a tool dispatch,
 /// re-read the task's current owner and compare it to this run's token.
 /// Long-goal P3: the compaction-boundary checkpoint port handed to the
-/// executor. Flush-then-cursor: every event emitted so far becomes durable
+/// harness. Flush-then-cursor: every event emitted so far becomes durable
 /// BEFORE the cursor is captured, so the checkpoint can never represent an
 /// event that is not on disk. The `GoalCheckpointCreated` announcement is
 /// emitted after the row exists and lands after the cursor — part of the
 /// recent delta, exactly where a fact newer than the checkpoint belongs.
-struct CompactionCheckpointPort {
+pub(crate) struct CompactionCheckpointPort {
     stores: leveler_storage::EngineStores,
     session_id: SessionId,
-    repo: Option<std::path::PathBuf>,
+    workspace: Option<Arc<dyn WorkspaceFacts>>,
     events: crate::recorders::EventEmitter,
 }
 
 #[async_trait::async_trait]
-impl leveler_agent::CompactionCheckpoint for CompactionCheckpointPort {
+impl CompactionCheckpoint for CompactionCheckpointPort {
     async fn checkpoint_before_compaction(
         &self,
         summary: Option<&str>,
-    ) -> Result<Option<String>, leveler_agent::AgentError> {
-        self.events
-            .flush()
-            .await
-            .map_err(leveler_agent::AgentError::Persistence)?;
+    ) -> Result<Option<String>, PortError> {
+        self.events.flush().await.map_err(PortError::Persistence)?;
         let record = crate::checkpoint::create_goal_checkpoint(
             &self.stores,
             &self.session_id,
             leveler_lifecycle::CheckpointReason::ContextCompaction,
-            self.repo.as_deref(),
+            self.workspace.as_deref(),
             crate::checkpoint::SemanticRecap::briefing(summary),
         )
         .await
-        .map_err(|e| leveler_agent::AgentError::Persistence(e.to_string()))?;
+        .map_err(|e| PortError::Persistence(e.to_string()))?;
         let Some(record) = record else {
             // No goal in scope (plain chat): the fold proceeds as before P3.
             return Ok(None);
@@ -169,13 +252,13 @@ impl leveler_agent::CompactionCheckpoint for CompactionCheckpointPort {
 
 /// Inherently check-then-dispatch (§ the fence guarantees a runtime already
 /// known stale dispatches nothing new; it does not claim exactly-once).
-struct OwnershipFence {
+pub(crate) struct OwnershipFence {
     ownership: Arc<dyn leveler_storage::OwnershipStore>,
     token: leveler_core::OwnershipToken,
 }
 
 #[async_trait::async_trait]
-impl leveler_agent::ExecutionFence for OwnershipFence {
+impl ExecutionFence for OwnershipFence {
     async fn ensure_current(&self) -> Result<(), String> {
         match self.ownership.current(&self.token.task_id).await {
             Ok(Some(owner))
@@ -204,26 +287,44 @@ pub struct TurnRunner<'a> {
     pub token: leveler_core::OwnershipToken,
     pub session_id: SessionId,
     pub log: &'a EventLog<'a>,
-    pub factory: &'a ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
-    /// Repository root for bounded workspace metadata on goal checkpoints
-    /// (long-goal P3). `None` = no workspace facts captured, never assumed.
-    pub repo: Option<std::path::PathBuf>,
 }
 
 impl TurnRunner<'_> {
-    /// Run one fully-persisted turn. On success the turn row is terminal
-    /// (`completed`); an executor error marks it `failed` (or `interrupted`
-    /// on cancellation) before the error propagates.
-    pub async fn run_turn(
+    /// The ownership fence for this runner's task, for a harness that runs an
+    /// execution outside [`Self::run_turn`] — a closure-boundary child, say.
+    /// Fenced the same way: a stale runtime dispatches nothing new.
+    pub fn ownership_fence(&self) -> Arc<dyn ExecutionFence> {
+        Arc::new(OwnershipFence {
+            ownership: self.stores.ownership.clone(),
+            token: self.token.clone(),
+        })
+    }
+
+    /// Run one fully-persisted turn.
+    ///
+    /// The engine opens the turn, hands the harness its [`TurnPorts`], pumps
+    /// every event it emits into the log, and stamps the terminal row. What
+    /// runs inside `execute` is the harness's business: the engine sees only
+    /// the [`TurnFacts`] it reports, or the [`TurnFailure`] it ended on.
+    ///
+    /// On success the turn row is terminal (`completed`); a reported failure
+    /// marks it `failed` (or `interrupted` when the harness says it was
+    /// cancelled) before the error propagates.
+    pub async fn run_turn<T, F, Fut>(
         &self,
         kind: TurnKind,
-        profile: TurnProfile,
-        input: TurnInput,
+        seed: SeedRequest,
+        workspace: Option<Arc<dyn WorkspaceFacts>>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
-    ) -> Result<TurnRecordedOutcome, EngineError> {
+        execute: F,
+    ) -> Result<TurnRecordedOutcome<T>, EngineError>
+    where
+        F: FnOnce(TurnPorts) -> Fut,
+        Fut: std::future::Future<Output = Result<TurnFacts<T>, TurnFailure>>,
+    {
         let payload = match &kind {
             TurnKind::Node { node_id } => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
             TurnKind::Repair { attempt } => Some(format!(r#"{{"attempt":{attempt}}}"#)),
@@ -274,12 +375,11 @@ impl TurnRunner<'_> {
 
         // MA-RT-2: durable ghosts — children a dead window STARTED and never
         // finished — are reconciled into truthful terminal debt BEFORE this
-        // turn seeds its state, so both completion gates (the drive's
-        // update_goal refusal and the closure-boundary ledger check) see the
-        // debt instead of an empty outstanding list. Hard error on purpose:
-        // running a turn past an unreconciled ghost Worker is exactly the
-        // false-Verified path this exists to close. The finished facts feed
-        // the C10 settlement re-delivery during seeding below.
+        // turn seeds its state, so both completion gates see the debt instead
+        // of an empty outstanding list. Hard error on purpose: running a turn
+        // past an unreconciled ghost Worker is exactly the false-Verified path
+        // this exists to close. The finished facts feed the settlement
+        // re-delivery during seeding below.
         let (open_ghosts, finished_children) = self.log.child_reconciliation_view().await?;
         if !open_ghosts.is_empty() {
             self.settle_ghost_children(
@@ -291,6 +391,8 @@ impl TurnRunner<'_> {
             .await?;
         }
 
+        let seeds = self.turn_seeds(seed, &finished_children).await?;
+
         // Margin, not the fix. The fix is the batching pump below: raising this
         // alone only moves the cliff, and a wider fan-out would walk straight
         // back off it. Sized so a burst from several agents has somewhere to sit
@@ -298,7 +400,7 @@ impl TurnRunner<'_> {
         const EVENT_BUFFER_CAPACITY: usize = 4096;
         let (events, mut rx, pump_state) =
             EventEmitter::channel(EVENT_BUFFER_CAPACITY, cancellation.clone());
-        let mut sink = TurnSink {
+        let sink = TurnSink {
             messages: self.stores.messages.clone(),
             model_requests: self.stores.model_requests.clone(),
             token: self.token.clone(),
@@ -306,183 +408,49 @@ impl TurnRunner<'_> {
             turn_id: turn_id.clone(),
         };
 
-        // The executor block OWNS the emitter (observer closure + recorders); when it
-        // ends, every sender is dropped and the pump drains to close.
-        let is_goal_profile = matches!(profile, TurnProfile::Goal { .. });
-        let continues_active_goal = matches!(
-            profile,
-            TurnProfile::Goal {
-                continues_active_goal: true,
-                ..
-            }
-        );
-        // P3: the raw request text feeds task-class gate grading in the
-        // factory. Resume turns carry no new request, so they stay
-        // unclassified and keep the default (fully gated) assembly.
-        let task_text: Option<String> = match &input {
-            TurnInput::Goal { goal, .. } => Some(goal.clone()),
-            TurnInput::Content { content, .. } => {
-                let text = content_text(content);
-                (!text.is_empty()).then_some(text)
-            }
-            TurnInput::Resume(_) => None,
-        };
+        // The harness block OWNS the emitter (its ports and observer closure);
+        // when it ends, every sender is dropped and the pump drains to close.
         let exec = async {
-            let mut executor: Executor = self
-                .factory
-                .build(profile, task_text.as_deref())
-                .await?
-                .with_approver(Arc::new(RecordingApprover {
+            let ports = TurnPorts {
+                turn_id: turn_id.clone(),
+                emitter: events.clone(),
+                sink,
+                seeds,
+                barrier: Arc::new(crate::recorders::PumpBarrier {
+                    events: events.clone(),
+                }),
+                fence: Arc::new(OwnershipFence {
+                    ownership: self.stores.ownership.clone(),
+                    token: self.token.clone(),
+                }),
+                checkpoint: Arc::new(CompactionCheckpointPort {
+                    stores: self.stores.clone(),
+                    session_id: self.session_id.clone(),
+                    workspace: workspace.clone(),
+                    events: events.clone(),
+                }),
+                approver: Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
                     events: events.clone(),
                     turn_id: turn_id.clone(),
-                }))
-                .with_clarifier(Arc::new(RecordingClarifier {
+                }),
+                clarifier: Arc::new(RecordingClarifier {
                     inner: self.clarifier.clone(),
                     events: events.clone(),
                     turn_id: turn_id.clone(),
-                }))
-                // Side-effect barrier: tool dispatch waits until the announcing
-                // canonical events are durable in this turn's event log.
-                .with_event_barrier(Arc::new(crate::recorders::PumpBarrier {
-                    events: events.clone(),
-                }))
-                // Long-goal P3: a context fold first cuts a durable goal
-                // checkpoint (flush-then-cursor inside the port); the fold's
-                // summary becomes persisted truth, and a failed checkpoint
-                // keeps the context uncompacted (fail closed in the loop).
-                .with_compaction_checkpoint(Arc::new(CompactionCheckpointPort {
-                    stores: self.stores.clone(),
-                    session_id: self.session_id.clone(),
-                    repo: self.repo.clone(),
-                    events: events.clone(),
-                }))
-                // Ownership fence: after the barriers, before dispatch, the
-                // host re-proves this runtime still owns the task. Inherited
-                // by delegated child executors.
-                .with_execution_fence(Arc::new(OwnershipFence {
-                    ownership: self.stores.ownership.clone(),
-                    token: self.token.clone(),
-                }));
-            // Resume / same unfinished task: seed Plan/Ledger/Progress so
-            // Delivery and closeout stay consistent. Fresh Content turns must
-            // NOT inherit terminal Closing/Completed state (new task epoch).
-            // Load the last persisted plan/progress once and reuse them for both
-            // the seed decision and the seeding itself. Each `last_persisted_*`
-            // call scans the full event log, so loading plan/progress twice
-            // (as this did) doubled that cost every Content/Goal turn.
-            let mut progress =
-                last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
-            // MA-RT-3 C10/C11: an outstanding entry whose child durably
-            // FINISHED is not lost — the settlement raced the window's end.
-            // Prune it (the lost note must never contradict a terminal fact)
-            // and re-deliver the recorded outcome instead. Genuine ghosts were
-            // already settled above and stay listed for the lost note.
-            let mut settled_notices: Vec<leveler_agent::SettledChildNotice> = Vec::new();
-            if let Some(p) = progress.as_mut() {
-                p.outstanding_children.retain(|entry| {
-                    let mut parts = entry.splitn(4, '|');
-                    let id = parts.next().unwrap_or("");
-                    let role = parts.nth(1).unwrap_or("?");
-                    match finished_children.iter().find(|f| f.id == id) {
-                        Some(fact) => {
-                            settled_notices.push(leveler_agent::SettledChildNotice {
-                                id: fact.id.clone(),
-                                nickname: fact.nickname.clone(),
-                                role: role.to_string(),
-                                ok: fact.ok,
-                                summary: fact.summary.clone(),
-                            });
-                            false
-                        }
-                        None => true,
-                    }
-                });
-            }
-            let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
-            let seed_state = match &input {
-                TurnInput::Resume(_) => true,
-                TurnInput::Content { .. } | TurnInput::Goal { .. } => {
-                    should_seed_task_state(plan.as_ref(), progress.as_ref(), continues_active_goal)
-                }
+                }),
             };
-            if seed_state {
-                if let Some(plan) = plan {
-                    executor = executor.with_seeded_plan(plan);
-                }
-                if let Some(ledger) =
-                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
-                {
-                    executor = executor.with_seeded_ledger(ledger);
-                }
-                if let Some(progress) = progress {
-                    executor = executor.with_seeded_progress(progress);
-                }
-                if !settled_notices.is_empty() {
-                    executor = executor.with_restart_settled_children(settled_notices);
-                }
-            }
-            let mut forward = |event: leveler_agent::AgentEvent| {
-                events.emit(EngineEvent::from(event));
-            };
-            let result = match input {
-                TurnInput::Goal { goal, prior } => {
-                    let objective =
-                        leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
-                    if prior.is_empty() {
-                        executor
-                            .with_objective(objective)
-                            .run(&goal, &mut forward, &mut sink, cancellation.clone())
-                            .await
-                    } else {
-                        // Multi-turn Goal: carry bounded history so deictic
-                        // follow-ups ("刚才那个") resolve against prior work.
-                        executor
-                            .with_objective(objective)
-                            .run_conversation(
-                                prior,
-                                vec![leveler_model::ContentPart::Text { text: goal }],
-                                &mut forward,
-                                &mut sink,
-                                cancellation.clone(),
-                            )
-                            .await
-                    }
-                }
-                TurnInput::Resume(prior) => {
-                    executor
-                        .resume(prior, &mut forward, &mut sink, cancellation.clone())
-                        .await
-                }
-                TurnInput::Content { prior, content } => {
-                    let text = content_text(&content);
-                    let objective = if is_goal_profile {
-                        leveler_lifecycle::ObjectiveAnchor::from_session_goal(text)
-                    } else {
-                        leveler_lifecycle::ObjectiveAnchor::from_user_message(text)
-                    };
-                    executor
-                        .with_objective(objective)
-                        .run_conversation(
-                            prior,
-                            content,
-                            &mut forward,
-                            &mut sink,
-                            cancellation.clone(),
-                        )
-                        .await
-                }
-            };
+            let result = execute(ports).await;
             drop(events);
-            result.map_err(EngineError::from)
+            result
         };
 
         // Persist-then-forward each pumped event, in emission order. A
         // persistence failure stops persisting but keeps draining so the
-        // executor never blocks; the error aborts the turn afterwards. Flush
+        // harness never blocks; the error aborts the turn afterwards. Flush
         // markers (the side-effect barrier) are acknowledged with the current
         // persistence state: after a failed append the barrier reports the
-        // failure, so the executor refuses to run the tool it was announcing.
+        // failure, so the harness refuses to run the tool it was announcing.
         // Drain in batches. One `append` per event costs two database
         // round-trips, and a Multi-Agent turn out-produces that: parent plus
         // children plus background tasks all emit into this one channel, and a
@@ -513,11 +481,6 @@ impl TurnRunner<'_> {
                     }
                 }
                 if !batch.is_empty() {
-                    for event in &mut batch {
-                        if let EngineEvent::ToolCallStarted { name, risk, .. } = event {
-                            *risk = self.factory.registry.get(name).map(|tool| tool.risk());
-                        }
-                    }
                     let drained = std::mem::take(&mut batch);
                     if result.is_ok() {
                         result = self
@@ -538,10 +501,7 @@ impl TurnRunner<'_> {
             // the worst possible moment to lose an event. Its identity is also
             // what the diagnostic needs, so read that off before it moves.
             let mut overflow_diagnostic = None;
-            if let Some(mut event) = pump_state.take_overflow() {
-                if let EngineEvent::ToolCallStarted { name, risk, .. } = &mut event {
-                    *risk = self.factory.registry.get(name).map(|tool| tool.risk());
-                }
+            if let Some(event) = pump_state.take_overflow() {
                 overflow_diagnostic = Some((
                     event
                         .to_row()
@@ -567,21 +527,24 @@ impl TurnRunner<'_> {
         };
 
         let (exec_result, pump_result) = futures::join!(exec, pump);
-        let run_result = match pump_result {
-            Ok(()) => exec_result,
+        // A pump failure outranks whatever the harness reported: losing
+        // canonical history is the more serious fact, and the harness's
+        // outcome was computed against a log that is now incomplete.
+        let run_result: Result<TurnFacts<T>, EngineError> = match pump_result {
+            Ok(()) => exec_result.map_err(EngineError::from),
             Err(error) => Err(error),
         };
         // The terminal event and query projection commit atomically. Forwarding
         // happens only after commit, so observers never see an uncommitted fact.
         let (terminal, stop_reason, stop, rounds, modified_files) = match &run_result {
-            Ok(outcome) => (
+            Ok(facts) => (
                 TurnOutcome::Completed,
-                format!("{:?}", outcome.stop_reason),
-                Some(outcome.stop_reason),
-                outcome.rounds,
-                outcome.modified_files.clone(),
+                format!("{:?}", facts.stop),
+                Some(facts.stop),
+                facts.rounds,
+                facts.modified_files.clone(),
             ),
-            Err(EngineError::Agent(AgentError::Cancelled)) => (
+            Err(EngineError::Cancelled) => (
                 TurnOutcome::Interrupted,
                 "cancelled".to_string(),
                 None,
@@ -657,23 +620,75 @@ impl TurnRunner<'_> {
             .await?;
         observer(event);
 
-        let outcome = run_result?;
+        let facts = run_result?;
 
-        Ok(TurnRecordedOutcome { turn_id, outcome })
-    }
-}
-
-/// Join the text parts of a multimodal user message (objective anchors and
-/// P3 task classification both read the request through this one view).
-fn content_text(content: &[leveler_model::ContentPart]) -> String {
-    content
-        .iter()
-        .filter_map(|p| match p {
-            leveler_model::ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
+        Ok(TurnRecordedOutcome {
+            turn_id,
+            outcome: facts.outcome,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+    }
+
+    /// The durable state a fresh execution should resume from.
+    ///
+    /// Resume always seeds. A fresh request seeds only when the prior state is
+    /// still open: a new task epoch must NOT inherit a terminal
+    /// Closing/Completed plan, or the harness reads the previous task's
+    /// conclusion as this one's.
+    async fn turn_seeds(
+        &self,
+        seed: SeedRequest,
+        finished_children: &[crate::log::FinishedChildFact],
+    ) -> Result<Option<TurnSeeds>, EngineError> {
+        // Load the last persisted plan/progress once and reuse them for both
+        // the seed decision and the seeding itself. Each `last_persisted_*`
+        // call scans the full event log, so loading plan/progress twice (as
+        // this did) doubled that cost every Content/Goal turn.
+        let mut progress =
+            last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
+        // MA-RT-3 C10/C11: an outstanding entry whose child durably FINISHED
+        // is not lost — the settlement raced the window's end. Prune it (the
+        // lost note must never contradict a terminal fact) and re-deliver the
+        // recorded outcome instead. Genuine ghosts were already settled by the
+        // caller and stay listed for the lost note.
+        let mut settled_children: Vec<SettledChild> = Vec::new();
+        if let Some(p) = progress.as_mut() {
+            p.outstanding_children.retain(|entry| {
+                let mut parts = entry.splitn(4, '|');
+                let id = parts.next().unwrap_or("");
+                let role = parts.nth(1).unwrap_or("?");
+                match finished_children.iter().find(|f| f.id == id) {
+                    Some(fact) => {
+                        settled_children.push(SettledChild {
+                            id: fact.id.clone(),
+                            nickname: fact.nickname.clone(),
+                            role: role.to_string(),
+                            ok: fact.ok,
+                            summary: fact.summary.clone(),
+                        });
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
+        let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
+        let seeding = match seed {
+            SeedRequest::Resume => true,
+            SeedRequest::Fresh {
+                continues_active_goal,
+            } => should_seed_task_state(plan.as_ref(), progress.as_ref(), continues_active_goal),
+        };
+        if !seeding {
+            return Ok(None);
+        }
+        let ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?;
+        Ok(Some(TurnSeeds {
+            plan,
+            ledger,
+            progress,
+            settled_children,
+        }))
+    }
 }
 
 /// Whether a fresh Content/Goal turn should inherit Plan/Ledger/Progress.
@@ -690,7 +705,7 @@ fn content_text(content: &[leveler_model::ContentPart]) -> String {
 /// not. Whether the carried evidence is still valid is then the workspace
 /// revision's question, never the epoch's.
 pub(crate) fn should_seed_task_state(
-    plan: Option<&leveler_agent::PlanState>,
+    plan: Option<&PlanState>,
     progress: Option<&leveler_lifecycle::ProgressLedger>,
     continues_active_goal: bool,
 ) -> bool {
@@ -729,13 +744,13 @@ async fn last_event_of_type(
 }
 
 /// Last full-list plan from the event log (SoT for resume PlanState).
-pub(crate) async fn last_persisted_plan(
+pub async fn last_persisted_plan(
     events: &dyn EventStore,
     session_id: &SessionId,
-) -> Result<Option<leveler_agent::PlanState>, EngineError> {
+) -> Result<Option<PlanState>, EngineError> {
     Ok(
         match last_event_of_type(events, session_id, "plan_updated").await? {
-            Some(EngineEvent::PlanUpdated { steps }) => Some(leveler_agent::PlanState { steps }),
+            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
             _ => None,
         },
     )
@@ -801,220 +816,10 @@ impl TurnRunner<'_> {
         }
         Ok(())
     }
-
-    /// Run one independent reviewer child over work this session already did,
-    /// and report whether the review actually completed.
-    ///
-    /// R007b N7 (mechanism half): the harness decides the review is warranted
-    /// and launches it here, through the same child primitive the `spawn_agent`
-    /// tool uses — same registry, limits, cancellation and ownership fence. It
-    /// is not a turn: no turn row, no plan/ledger seeding, no goal state. The
-    /// started/finished pair is persisted because "was this reviewed?" has to be
-    /// answerable from durable history rather than from a task card.
-    pub(crate) async fn run_review(
-        &self,
-        profile: TurnProfile,
-        brief: String,
-        files: Vec<String>,
-        // The task's wall time already spent: the review is its tail.
-        parent_elapsed: std::time::Duration,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: CancellationToken,
-    ) -> Result<bool, EngineError> {
-        let executor = self
-            .factory
-            .build(profile, None)
-            .await?
-            .with_execution_fence(Arc::new(OwnershipFence {
-                ownership: self.stores.ownership.clone(),
-                token: self.token.clone(),
-            }));
-        let id = format!("reviewer-{}", leveler_core::RequestId::generate());
-        let (profile_id, profile_role, read_only) = leveler_agent::child_profile_trace("reviewer");
-        let (profile_id_trace, profile_role_trace, read_only_trace) =
-            (profile_id.clone(), profile_role.clone(), read_only);
-        self.log
-            .append(
-                None,
-                EngineEvent::SubAgentStarted {
-                    id: id.clone(),
-                    nickname: "reviewer".to_string(),
-                    role: "reviewer".to_string(),
-                    task: brief.clone(),
-                    profile_id: Some(profile_id),
-                    profile_role: Some(profile_role),
-                    read_only,
-                },
-                observer,
-            )
-            .await?;
-        // The reviewer's model calls arrive as progress events; the engine's
-        // own sink is the only thing that can make them rows. Collect here,
-        // write below — the child drains its channel after it finishes.
-        let mut child_records: Vec<leveler_agent::ModelRequestRecord> = Vec::new();
-        let result = {
-            let mut forward = |event: leveler_agent::AgentEvent| {
-                if let leveler_agent::AgentEvent::SubAgentModelRequest { record } = &event {
-                    child_records.push((**record).clone());
-                }
-                observer(EngineEvent::from(event))
-            };
-            executor
-                .run_reviewer_child(
-                    id.clone(),
-                    brief,
-                    files,
-                    parent_elapsed,
-                    &mut forward,
-                    cancellation,
-                )
-                .await
-        };
-        // The review's spend is the session's spend: the reviewer's own rounds
-        // and commands fold in from its ledger, and its TOKENS AND COST fold in
-        // from the very records being written down here — the same authority
-        // the bill reconciles against, never a second summary of it.
-        let mut progress = last_persisted_progress(self.stores.events.as_ref(), &self.session_id)
-            .await?
-            .unwrap_or_default();
-        for record in &child_records {
-            self.stores
-                .model_requests
-                .insert(&storage_model_request(record, &self.session_id))
-                .await?;
-            progress.absorb_request_spend(
-                record.usage.total(),
-                0,
-                record.cost_usd_micros.unwrap_or(0),
-            );
-        }
-        progress.absorb_child_work(&result.progress);
-        self.log
-            .append(
-                None,
-                EngineEvent::ProgressUpdated { ledger: progress },
-                observer,
-            )
-            .await?;
-        // Unified findings: adopt first so the finish summary can name the
-        // parent-side ids the TUI projects as a finding count.
-        let mut summary = result.result.for_parent("reviewer");
-        // Held across the finish event: the projection below is computed from
-        // the same ledger the findings were adopted into. Scoping it to the
-        // adoption branch is what left `contribution: None` on every reviewer
-        // that ran — the data was there, one block too deep.
-        let mut adopted_ledger: Option<leveler_lifecycle::EvidenceLedger> = None;
-        if !result.findings.is_empty() {
-            let mut ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
-                .await?
-                .unwrap_or_default();
-            let adopted: Vec<String> = result
-                .findings
-                .iter()
-                .map(|finding| ledger.adopt_finding(&id, "reviewer", finding))
-                .collect();
-            if let Some(pos) = summary.find('\n') {
-                summary.insert_str(
-                    pos + 1,
-                    &format!("Structured findings adopted: {}.\n", adopted.join(", ")),
-                );
-            } else {
-                summary.push_str(&format!(
-                    "\nStructured findings adopted: {}.",
-                    adopted.join(", ")
-                ));
-            }
-            self.log
-                .append(
-                    None,
-                    EngineEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    },
-                    observer,
-                )
-                .await?;
-            adopted_ledger = Some(ledger);
-        }
-        self.log
-            .append(
-                None,
-                EngineEvent::SubAgentFinished {
-                    id: id.clone(),
-                    nickname: "reviewer".to_string(),
-                    ok: result.ok,
-                    summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
-                    // A reviewer that ran always reports a projection. Zero
-                    // findings is a measured zero — a real fact about this
-                    // review — and only an absent projection means "not
-                    // measured". MA-VALUE-REVIEWER-PILOT could not tell those
-                    // apart and reported five zero-finding reviewers that had
-                    // every one of them reported.
-                    contribution: Some(
-                        leveler_lifecycle::ChildResultProjection::from_findings(
-                            &id,
-                            "reviewer",
-                            adopted_ledger
-                                .as_ref()
-                                .map(|l| l.findings.as_slice())
-                                .unwrap_or(&[]),
-                        )
-                        .with_profile(
-                            profile_id_trace,
-                            profile_role_trace,
-                            read_only_trace,
-                        ),
-                    ),
-                },
-                observer,
-            )
-            .await?;
-        Ok(result.ok)
-    }
-}
-
-/// Whether this session has an independent review on record.
-///
-/// R007b N7: the reviewer designation only means something if the runtime can
-/// answer "was this reviewed?" from durable history rather than from a task
-/// card. The role lives on `SubAgentStarted` and the terminal on
-/// `SubAgentFinished`, so a review counts only when the same agent id appears
-/// in both — a reviewer that started and died without finishing has not
-/// reviewed anything (N1's shape, deliberately not credited).
-pub(crate) async fn session_had_review(
-    events: &dyn EventStore,
-    session_id: &SessionId,
-) -> Result<bool, EngineError> {
-    let mut reviewers: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let rows = events
-        .load_by_types(session_id, &["sub_agent_started", "sub_agent_finished"])
-        .await?;
-    for row in rows {
-        match row.event_type.as_str() {
-            "sub_agent_started" => {
-                if let Ok(EngineEvent::SubAgentStarted { id, role, .. }) =
-                    EngineEvent::from_payload(&row.payload)
-                    && role.eq_ignore_ascii_case("reviewer")
-                {
-                    reviewers.insert(id);
-                }
-            }
-            "sub_agent_finished" => {
-                if let Ok(EngineEvent::SubAgentFinished { id, ok, .. }) =
-                    EngineEvent::from_payload(&row.payload)
-                    && ok
-                    && reviewers.contains(&id)
-                {
-                    return Ok(true);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(false)
 }
 
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
-pub(crate) async fn last_persisted_ledger(
+pub async fn last_persisted_ledger(
     events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {
@@ -1027,7 +832,7 @@ pub(crate) async fn last_persisted_ledger(
 }
 
 /// Last ProgressLedger snapshot (closeout / no-progress streak for continue).
-async fn last_persisted_progress(
+pub async fn last_persisted_progress(
     events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::ProgressLedger>, EngineError> {

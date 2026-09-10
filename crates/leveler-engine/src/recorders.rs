@@ -8,11 +8,13 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::TurnId;
-use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver};
+use leveler_execution::{
+    ApprovalDecision, ApprovalRequest, Approver, ClarificationRequest, Clarifier, ClarifyOutcome,
+};
 
 use crate::EngineEvent;
+use crate::ports::{ChildToolEvent, EventBarrier, PortError};
 
 /// Bounded bridge from the executor's synchronous observer to the async event
 /// log pump. Transient deltas may be dropped under pressure. The first
@@ -24,7 +26,7 @@ use crate::EngineEvent;
 /// before it — the side-effect barrier rides the same ordered queue and can
 /// never race the events it waits for.
 #[derive(Clone)]
-pub(crate) struct EventEmitter {
+pub struct EventEmitter {
     tx: Sender<PumpItem>,
     state: EventPumpState,
     cancel: CancellationToken,
@@ -36,19 +38,19 @@ pub(crate) struct EventEmitter {
 /// `EngineEvent` is large (trace payloads on `SubAgentStarted` /
 /// `SubAgentFinished`); boxing it would add a heap hop on every persist.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum PumpItem {
+pub enum PumpItem {
     Event(EngineEvent),
     Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Clone)]
-pub(crate) struct EventPumpState {
+pub struct EventPumpState {
     overloaded: Arc<AtomicBool>,
     overflow: Arc<Mutex<Option<EngineEvent>>>,
 }
 
 impl EventEmitter {
-    pub(crate) fn channel(
+    pub fn channel(
         capacity: usize,
         cancel: CancellationToken,
     ) -> (Self, Receiver<PumpItem>, EventPumpState) {
@@ -68,7 +70,7 @@ impl EventEmitter {
         )
     }
 
-    pub(crate) fn emit(&self, event: EngineEvent) {
+    pub fn emit(&self, event: EngineEvent) {
         if self.state.is_overloaded() {
             return;
         }
@@ -99,7 +101,7 @@ impl EventEmitter {
     /// Resolve once the pump has durably appended every event emitted before
     /// this call, or report why it cannot. Uses an awaiting send (never drops
     /// the marker): the barrier must not silently degrade under load.
-    pub(crate) async fn flush(&self) -> Result<(), String> {
+    pub async fn flush(&self) -> Result<(), String> {
         if self.state.is_overloaded() {
             return Err("event pump overloaded; canonical event was dropped".into());
         }
@@ -115,52 +117,49 @@ impl EventEmitter {
 }
 
 impl EventPumpState {
-    pub(crate) fn is_overloaded(&self) -> bool {
+    pub fn is_overloaded(&self) -> bool {
         self.overloaded.load(Ordering::Acquire)
     }
 
-    pub(crate) fn take_overflow(&self) -> Option<EngineEvent> {
+    pub fn take_overflow(&self) -> Option<EngineEvent> {
         self.overflow.lock().unwrap().take()
     }
 }
 
 /// The engine's side-effect barrier: flushing the turn's event pump makes
 /// every canonical event emitted so far durable (see `EventLog`). Handed to
-/// the executor via [`leveler_agent::Executor::with_event_barrier`].
-pub(crate) struct PumpBarrier {
-    pub(crate) events: EventEmitter,
+/// the harness as the turn's [`EventBarrier`].
+pub struct PumpBarrier {
+    pub events: EventEmitter,
 }
 
 #[async_trait]
-impl leveler_agent::EventBarrier for PumpBarrier {
-    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
-        self.events
-            .flush()
-            .await
-            .map_err(leveler_agent::AgentError::Persistence)
+impl EventBarrier for PumpBarrier {
+    async fn flush(&self) -> Result<(), PortError> {
+        self.events.flush().await.map_err(PortError::Persistence)
     }
 
     /// Enqueue a delegated agent's tool event on the SAME queue `flush`
     /// drains. That ordering is the whole point: a separate channel would let
     /// the flush marker overtake the event, and the barrier would report a
     /// side effect durable that is not recorded yet.
-    fn record_child_tool_event(&self, event: leveler_agent::ChildToolEvent) {
+    fn record_child_tool_event(&self, event: ChildToolEvent) {
         self.events.emit(match event {
-            leveler_agent::ChildToolEvent::Started {
+            ChildToolEvent::Started {
                 agent_id,
                 call_id,
                 name,
                 arguments,
+                risk,
             } => EngineEvent::ToolCallStarted {
                 call_id,
                 name,
                 arguments,
                 parallel: false,
-                // Stamped by the pump, which owns the registry.
-                risk: None,
+                risk,
                 agent_id: Some(agent_id),
             },
-            leveler_agent::ChildToolEvent::Finished {
+            ChildToolEvent::Finished {
                 agent_id,
                 call_id,
                 name,
@@ -174,7 +173,7 @@ impl leveler_agent::EventBarrier for PumpBarrier {
                 agent_id: Some(agent_id),
                 applied_diff: None,
             },
-            leveler_agent::ChildToolEvent::Ownership {
+            ChildToolEvent::Ownership {
                 agent_id,
                 action,
                 detail,
@@ -188,8 +187,8 @@ impl leveler_agent::EventBarrier for PumpBarrier {
 
 pub struct RecordingApprover {
     pub inner: Arc<dyn Approver>,
-    pub(crate) events: EventEmitter,
-    pub(crate) turn_id: TurnId,
+    pub events: EventEmitter,
+    pub turn_id: TurnId,
 }
 
 #[async_trait]
@@ -230,8 +229,8 @@ impl Approver for RecordingApprover {
 
 pub struct RecordingClarifier {
     pub inner: Arc<dyn Clarifier>,
-    pub(crate) events: EventEmitter,
-    pub(crate) turn_id: TurnId,
+    pub events: EventEmitter,
+    pub turn_id: TurnId,
 }
 
 #[async_trait]

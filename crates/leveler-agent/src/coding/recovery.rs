@@ -13,13 +13,13 @@
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::PriorlyAdmitted;
+use crate::PriorlyAdmitted;
 use leveler_tools::{ToolContext, ToolRegistry};
 
 /// Re-run a dangling call through the host's reconciliation entry.
 ///
 /// The engine no longer executes tools itself: it hands a
-/// [`PriorlyAdmitted`] call to `leveler_agent::reconcile`, so the whole
+/// [`PriorlyAdmitted`] call to `crate::reconcile`, so the whole
 /// system has ONE place that runs a tool, not one per crate. Returns
 /// `(is_error, preview)`; `None` when the tool refuses reconstruction
 /// (unknown to this build, or never declared replay-safe), which the caller
@@ -32,8 +32,7 @@ pub(crate) async fn replay_tool(
     cancellation: &CancellationToken,
 ) -> Option<(bool, String)> {
     let admitted = PriorlyAdmitted::from_persisted(registry, name, args)?;
-    let (is_error, output) =
-        leveler_agent::reconcile(registry, context, &admitted, cancellation).await;
+    let (is_error, output) = crate::reconcile(registry, context, &admitted, cancellation).await;
     Some((is_error, preview(&output)))
 }
 

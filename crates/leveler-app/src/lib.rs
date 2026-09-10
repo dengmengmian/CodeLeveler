@@ -126,8 +126,8 @@ impl Default for LoadedConfig {
 fn combine_independent_review(
     global: leveler_project::IndependentReview,
     project: leveler_project::IndependentReview,
-) -> leveler_engine::IndependentReviewPolicy {
-    use leveler_engine::IndependentReviewPolicy as P;
+) -> leveler_agent::coding::IndependentReviewPolicy {
+    use leveler_agent::coding::IndependentReviewPolicy as P;
     use leveler_project::IndependentReview as I;
     // Explicit only: a review runs when either layer requires it.
     match (global, project) {
@@ -147,7 +147,7 @@ pub struct Application {
     database: Arc<tokio::sync::Mutex<Option<Database>>>,
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
-    execution_overrides: Option<leveler_engine::ExecutionOverrides>,
+    execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
     /// Product work profile (economy / balanced / delivery).
     work_profile: WorkProfile,
     /// Collaboration mode (chat / plan / goal).
@@ -400,7 +400,7 @@ impl Application {
     /// control and ablated runs differ in exactly the flipped knob.
     pub fn with_execution_overrides(
         mut self,
-        overrides: leveler_engine::ExecutionOverrides,
+        overrides: leveler_agent::coding::ExecutionOverrides,
     ) -> Self {
         self.execution_overrides = Some(overrides);
         self
@@ -452,8 +452,7 @@ impl Application {
         guard.clone().unwrap_or_default()
     }
 
-    /// Build the persistent [`leveler_engine::TaskEngine`] for `model`,
-    /// rooted at the repository. Uses this Application's work profile
+    /// Build the Coding harness for `model`, rooted at the repository. Uses this Application's work profile
     /// (CLI / create-time default). Resume must call
     /// [`Self::engine_for_with_profile`] with axes loaded from the session row.
     pub async fn engine_for(
@@ -463,7 +462,7 @@ impl Application {
         sandbox: bool,
         approver: Arc<dyn leveler_execution::Approver>,
         clarifier: Arc<dyn leveler_agent::Clarifier>,
-    ) -> Result<leveler_engine::TaskEngine, AppError> {
+    ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
         self.engine_for_with_profile(
             model,
             mode,
@@ -558,14 +557,15 @@ impl Application {
         work_profile: WorkProfile,
         read_only: bool,
         session_scope: Option<&str>,
-    ) -> Result<leveler_engine::TaskEngine, AppError> {
+    ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
         let workspace = Workspace::new(&self.layout.repo_root)?;
         // The ablation seam (`leveler eval ablate`): overrides reach BOTH
         // consumers — the executor factory's resolver and the tool-context
         // limits — so a run differs from control in exactly the flipped knob.
         // Every execution path (direct, orchestrated, bare) funnels through
         // here.
-        let max_files = leveler_engine::resolve_tool_limits(self.execution_overrides.as_ref());
+        let max_files =
+            leveler_agent::coding::resolve_tool_limits(self.execution_overrides.as_ref());
         let artifact_store = std::sync::Arc::new(leveler_execution::ArtifactStore::new(
             self.layout.state_dir.join("artifacts"),
         ));
@@ -627,12 +627,14 @@ impl Application {
         let hook_runner =
             leveler_execution::HookRunner::load(&leveler_home, &self.layout.repo_root);
         let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
-        Ok(leveler_engine::TaskEngine {
-            // The composition root chooses the adapter: every engine port
-            // backed by this repository's SQLite database (shared pool).
-            stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
-            runtime_id: self.runtime_id()?,
-            factory: leveler_engine::ExecutorFactory {
+        Ok(leveler_agent::coding::CodingRuntime {
+            engine: leveler_engine::TaskEngine {
+                // The composition root chooses the adapter: every engine port
+                // backed by this repository's SQLite database (shared pool).
+                stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
+                runtime_id: self.runtime_id()?,
+            },
+            factory: leveler_agent::coding::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),
                 tool_context,
@@ -646,7 +648,7 @@ impl Application {
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
                 // Per-session; attached by the caller that knows the session
-                // (see `TaskEngine::with_steering`).
+                // (see `CodingRuntime::with_steering`).
                 steering: None,
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation

@@ -98,7 +98,9 @@ pub(crate) fn compaction_span(
 }
 
 /// Marker for the host-pinned active objective re-injected after compaction.
-pub(crate) const ACTIVE_OBJECTIVE_MARKER: &str = "[Active objective — host-pinned]";
+/// Marks the host-pinned objective block so a fold can recognise and
+/// replace its own previous injection instead of stacking a second one.
+pub const ACTIVE_OBJECTIVE_MARKER: &str = "[Active objective — host-pinned]";
 
 /// Build the user message that re-pins the host objective after a fold.
 pub(crate) fn objective_pin_message(objective: &str) -> Message {

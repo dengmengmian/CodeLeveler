@@ -1,29 +1,26 @@
 //! `leveler-engine` — the persistent task/turn engine (plan 阶段B).
 //!
 //! One execution kernel: session lifecycle, turn boundaries, an append-only
-//! event log (persist-before-forward), and executor construction, with
-//! Direct strategy layered on top. `leveler-agent`'s `Executor` stays the
-//! turn-runner; this crate wraps it with persistence.
+//! event log (persist-before-forward), resume and crash recovery.
+//!
+//! The engine owns lifecycle, not agent intelligence. What runs inside a turn
+//! is a harness's business: it arrives as a closure over [`TurnPorts`], and
+//! nothing here knows whether that harness is driving a coding agent or
+//! anything else.
 #![forbid(unsafe_code)]
 
-mod baseline;
 mod checkpoint;
 mod engine;
 mod event;
-mod factory;
 mod log;
-mod policy_resolver;
+pub mod ports;
 mod reaper;
 mod recorders;
-mod recovery;
 mod session_context;
 mod turn;
 pub mod window;
 
-pub use engine::{
-    CodingTaskSpec, RuntimeTaskSpec, TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window,
-    budget_prior_messages, mode_str,
-};
+pub use engine::{NewSession, TaskEngine, acknowledge_crash_window, budget_prior_messages};
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
     PublicTurnKind, TurnKind,
@@ -34,16 +31,20 @@ pub use checkpoint::{
     ProjectedCheckpoint, SemanticRecap, checkpoint_created_event, create_goal_checkpoint,
     project_goal_checkpoint, resume_prior_from_checkpoint,
 };
-pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
-pub use log::{EventLog, SnapshotView};
-pub use policy_resolver::{
-    CHAT_CONTEXT_BUDGET, ExecutionOverrides, ExecutionRole, IndependentReviewPolicy,
-    ResolvedExecutionPolicy, resolve_execution_policy, resolve_tool_limits,
+pub use log::{DanglingCall, EventLog, SnapshotView};
+pub use ports::{
+    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind,
+    ModelRequestRecord, PortError, TranscriptSink, WorkspaceFacts,
 };
 pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
+pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
-pub use turn::{TurnInput, TurnRecordedOutcome, TurnRunner};
+pub use turn::{
+    SeedRequest, SettledChild, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner,
+    TurnSeeds, TurnSink, last_persisted_ledger, last_persisted_plan, last_persisted_progress,
+    storage_model_request,
+};
 
 /// Engine-level errors. Persistence and replay failures are hard errors —
 /// the engine never silently drops history or runs ungated.
@@ -51,8 +52,27 @@ pub use turn::{TurnInput, TurnRecordedOutcome, TurnRunner};
 pub enum EngineError {
     #[error("storage error: {0}")]
     Storage(#[from] leveler_storage::StorageError),
-    #[error("agent error: {0}")]
-    Agent(#[from] leveler_agent::AgentError),
+    /// The harness stopped this turn without reporting facts. The engine
+    /// records how the turn ended; it does not interpret why.
+    ///
+    /// `model` carries a provider failure when that is what ended the turn.
+    /// Calling a model is not domain knowledge — any harness does it — and
+    /// classifying an infrastructure fault from a typed error beats parsing
+    /// the sentence back out of `detail`.
+    #[error("execution error: {detail}")]
+    Execution {
+        detail: String,
+        model: Option<leveler_model::ModelError>,
+    },
+    /// The run was cancelled. Kept distinct from [`EngineError::Execution`]
+    /// because a cancelled turn is `interrupted`, not `failed`.
+    #[error("cancelled")]
+    Cancelled,
+    /// The run aborted because this runtime no longer owns the task. Kept
+    /// distinct from a plain execution failure: a stale runtime writes no
+    /// further canonical facts, not even a terminal one.
+    #[error("stale runtime ownership: {0}")]
+    StaleOwnership(String),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]

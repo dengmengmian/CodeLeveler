@@ -223,6 +223,55 @@ impl TurnOutcome {
     }
 }
 
+/// Why the loop stopped. Serialized (snake_case) into terminal engine events
+/// so blocked/budget/complete stay machine-discriminable after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The task has explicit completion evidence, rather than merely a natural
+    /// end to one model response.
+    Completed,
+    /// The model naturally ended its answer. This closes the conversational
+    /// turn but does not prove that an external task is complete.
+    ///
+    /// `closeout_forced` is a legacy wire value from the deleted closeout
+    /// watchdog; it read as "the plan was done, the turn ended abnormally"
+    /// and decodes here.
+    #[serde(alias = "closeout_forced")]
+    Answered,
+    /// The run ended without finishing: every attempted action was refused
+    /// for several rounds in a row.
+    Incomplete,
+    /// A token or cost budget was exhausted first.
+    BudgetExhausted,
+    /// The absolute per-turn round ceiling was hit. This is the unconditional
+    /// circuit breaker that fires even when every progress watchdog was evaded
+    /// (a "busy" loop that fakes progress each round). It guarantees termination
+    /// but is not a budget the user can lift by saying "继续" — so it is kept
+    /// distinct from `BudgetExhausted` for honest logs/telemetry. Maps to the
+    /// same session outcome as `BudgetExhausted` (Incomplete / Execute).
+    TurnLimitReached,
+    /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
+    ///
+    /// `policy_blocked` is a legacy wire value from the deleted plan-gate
+    /// escalation track and decodes here.
+    #[serde(alias = "policy_blocked")]
+    Blocked,
+    /// Goal mode: the model went quiet without ever resolving the goal via
+    /// `update_goal`, even after the quiet-nudge cap. Not a success.
+    Stalled,
+    /// The run finished its work, but the project's checks did not run or
+    /// could not produce a verdict. Synthesized by the app's verification
+    /// mapping — the token loop never emits this. It means "done, checks not
+    /// run", NOT "failed" or "gave up".
+    CompletedUnverified,
+    /// The run finished its work and the project's checks then FAILED over
+    /// the final tree. Synthesized by the app's verification mapping — the
+    /// token loop never emits this. Both facts are reported; neither is
+    /// laundered into the other.
+    CompletedChecksFailed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

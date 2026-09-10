@@ -29,7 +29,6 @@ use crate::authorization::{
     collect_scoped_paths_from_call, is_verification_program, push_unique_path,
     unproven_verification_note,
 };
-use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
     REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
@@ -47,6 +46,7 @@ use crate::sub_agent::{
     should_inject_delegation_hint,
 };
 use async_trait::async_trait;
+use leveler_context::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 
 use leveler_agent_core::{
     Agent, AgentCoreError, AgentHarness, BudgetDimension, BudgetExhaustion, Flow, LoopContext,
@@ -446,7 +446,7 @@ impl<'a> Drive<'a> {
 
     /// Persist a model call the kernel already folded into the run's spend.
     async fn persist_request(&mut self, record: ModelRequestRecord) -> Result<(), AgentError> {
-        self.sink.record_model_request(&record).await
+        Ok(self.sink.record_model_request(&record).await?)
     }
 
     /// Fold a model call the harness made on its own account — a compaction

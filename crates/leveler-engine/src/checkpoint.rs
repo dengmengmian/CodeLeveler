@@ -4,17 +4,17 @@
 //! projects through this module, so a Recap in the TUI, the compaction
 //! breadcrumb, and the resume context all present the SAME persisted facts.
 //! Nothing here asks the model what the runtime already knows: structured
-//! facts come from the event log, the evidence ledger, and bounded git
-//! metadata. The optional semantic wording is applied by the caller on top
-//! and can fail without costing the structured checkpoint.
+//! facts come from the event log, the evidence ledger, and whatever bounded
+//! workspace metadata the harness supplies through
+//! [`crate::ports::WorkspaceFacts`] — the engine records those, it does not
+//! know how to obtain them. The optional semantic wording is applied by the
+//! caller on top and can fail without costing the structured checkpoint.
 //!
 //! Cursor discipline: [`project_goal_checkpoint`] reads the committed
 //! `MAX(sequence)` of the session's event log. The CALLER owns making that
 //! read safe — every trigger sits behind a durable boundary (the event flush
 //! barrier, a committed terminal turn, or the reaper's fenced commit), so
 //! the cursor can never point beyond durable EventLog state.
-
-use std::path::Path;
 
 use leveler_core::SessionId;
 use leveler_lifecycle::{
@@ -49,7 +49,7 @@ pub async fn project_goal_checkpoint(
     messages: &dyn MessageStore,
     goal: &GoalRecord,
     session_id: &SessionId,
-    repo: Option<&Path>,
+    workspace: Option<&dyn crate::ports::WorkspaceFacts>,
 ) -> Result<ProjectedCheckpoint, EngineError> {
     let event_cursor = events.latest_sequence(session_id).await?.unwrap_or(0);
     let transcript_ordinal = messages.load(session_id).await?.len() as u64;
@@ -80,8 +80,8 @@ pub async fn project_goal_checkpoint(
         findings,
         children: settled_children(events, session_id).await?,
         artifact_refs: Vec::new(),
-        workspace: match repo {
-            Some(repo) => capture_workspace(repo).await,
+        workspace: match workspace {
+            Some(facts) => facts.capture().await,
             None => CheckpointWorkspace::default(),
         },
         ..Default::default()
@@ -135,7 +135,7 @@ pub async fn create_goal_checkpoint(
     stores: &EngineStores,
     session_id: &SessionId,
     reason: CheckpointReason,
-    repo: Option<&Path>,
+    workspace: Option<&dyn crate::ports::WorkspaceFacts>,
     semantic: Option<SemanticRecap>,
 ) -> Result<Option<GoalCheckpointRecord>, EngineError> {
     let Some(task) = stores.tasks.task_for_session(session_id).await? else {
@@ -158,7 +158,7 @@ pub async fn create_goal_checkpoint(
         stores.messages.as_ref(),
         goal,
         session_id,
-        repo,
+        workspace,
     )
     .await?;
     let mut payload = projected.payload;
@@ -396,49 +396,6 @@ async fn settled_children(
         out.drain(..out.len() - MAX_REFS);
     }
     Ok(out)
-}
-
-/// Bounded git metadata. Every failure yields `None` — unknown, never an
-/// assumed-clean workspace. Never captures diffs or file contents.
-async fn capture_workspace(repo: &Path) -> CheckpointWorkspace {
-    let head = git_line(repo, &["rev-parse", "HEAD"]).await;
-    let branch = git_line(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-    let status = git_output(repo, &["status", "--porcelain"]).await;
-    let (dirty, changed_paths) = match status {
-        Some(text) => {
-            let paths: Vec<String> = text
-                .lines()
-                .filter(|l| l.len() > 3)
-                .take(MAX_REFS)
-                .map(|l| l[3..].trim().to_string())
-                .collect();
-            (Some(!text.trim().is_empty()), paths)
-        }
-        None => (None, Vec::new()),
-    };
-    CheckpointWorkspace {
-        branch,
-        head,
-        dirty,
-        changed_paths,
-    }
-}
-
-async fn git_line(repo: &Path, args: &[&str]) -> Option<String> {
-    let text = git_output(repo, args).await?;
-    let line = text.trim().to_string();
-    (!line.is_empty()).then_some(line)
-}
-
-async fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let repo = repo.to_path_buf();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    tokio::task::spawn_blocking(move || {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        leveler_core::git_stdout(&repo, &args)
-    })
-    .await
-    .ok()?
 }
 
 #[cfg(test)]

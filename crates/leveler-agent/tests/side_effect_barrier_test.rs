@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::{ExecutorFactory, TurnInput};
 use leveler_agent::{AutoClarify, ContinuationPolicy, StepLimits};
 use leveler_core::{RequestId, SessionId, Timestamp, ToolCallId, TurnId};
-use leveler_engine::{EventLog, ExecutorFactory, TurnInput, TurnKind, TurnRunner};
+use leveler_engine::{EventLog, TurnKind, TurnRunner};
 use leveler_execution::{
     ApprovalDecision, ApprovalRequest, Approver, PermissionProfile, Workspace,
 };
@@ -171,7 +172,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
         steering: None,
         allow_delegation: true,
-        independent_review: leveler_engine::IndependentReviewPolicy::Off,
+        independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
     };
     Harness {
         db,
@@ -181,8 +182,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     }
 }
 
-fn chat_profile() -> leveler_engine::TurnProfile {
-    leveler_engine::TurnProfile::Chat {
+fn chat_profile() -> leveler_agent::coding::TurnProfile {
+    leveler_agent::coding::TurnProfile::Chat {
         continuation: ContinuationPolicy::UntilTerminal,
         limits: StepLimits::default(),
     }
@@ -193,7 +194,10 @@ async fn run_chat_turn(
     log: &EventLog<'_>,
     approver: Arc<dyn Approver>,
     text: &str,
-) -> Result<leveler_engine::TurnRecordedOutcome, leveler_engine::EngineError> {
+) -> Result<
+    leveler_engine::TurnRecordedOutcome<leveler_agent::AgentOutcome>,
+    leveler_engine::EngineError,
+> {
     let stores = leveler_storage::EngineStores::from_database(&h.db);
     let task =
         leveler_storage::TaskStore::ensure_for_session(&h.db, &h.session, leveler_core::now())
@@ -216,21 +220,31 @@ async fn run_chat_turn(
         token,
         session_id: h.session.clone(),
         log,
-        factory: &h.factory,
         approver,
         clarifier: Arc::new(AutoClarify),
-        repo: None,
     };
+    let cancellation = CancellationToken::new();
     runner
         .run_turn(
             TurnKind::Chat,
-            chat_profile(),
-            TurnInput::Content {
-                prior: Vec::new(),
-                content: vec![ContentPart::Text { text: text.into() }],
+            leveler_engine::SeedRequest::Fresh {
+                continues_active_goal: false,
             },
+            None,
             &mut |_| {},
-            CancellationToken::new(),
+            cancellation.clone(),
+            |ports| {
+                leveler_agent::coding::turn::drive_turn(
+                    &h.factory,
+                    chat_profile(),
+                    TurnInput::Content {
+                        prior: Vec::new(),
+                        content: vec![ContentPart::Text { text: text.into() }],
+                    },
+                    ports,
+                    cancellation.clone(),
+                )
+            },
         )
         .await
 }

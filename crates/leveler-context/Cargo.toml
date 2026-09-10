@@ -10,11 +10,14 @@ description = "Context compiler: repository map, candidate selection, rules, tok
 
 [dependencies]
 leveler-core = { workspace = true }
+leveler-model = { workspace = true }
 leveler-project = { workspace = true }
 leveler-skills = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

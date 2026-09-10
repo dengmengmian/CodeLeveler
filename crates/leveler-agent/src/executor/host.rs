@@ -173,6 +173,9 @@ impl Executor {
                 call_id: call.id.as_str().to_string(),
                 name: call.name.clone(),
                 arguments: super::dispatch::compact_json(&call.arguments),
+                // The harness owns the registry, so it stamps the risk the
+                // engine records.
+                risk: self.registry.get(&call.name).map(|tool| tool.risk()),
             });
         }
         // Side-effect barrier, first wait: the announcing `ToolCallStarted`
@@ -182,7 +185,7 @@ impl Executor {
         if let Some(barrier) = &self.event_barrier
             && let Err(error) = barrier.flush().await
         {
-            return Err(AdmitError::Fatal(error));
+            return Err(AdmitError::Fatal(error.into()));
         }
         if let Some(reason) = self.refuse_unboundable_delegated_tool(&call) {
             return Err(AdmitError::Refused { call, reason });
@@ -214,7 +217,7 @@ impl Executor {
             && let Some(barrier) = &self.event_barrier
             && let Err(error) = barrier.flush().await
         {
-            return Err(AdmitError::Fatal(error));
+            return Err(AdmitError::Fatal(error.into()));
         }
         // The approval outcome is durable now, so a standing "always" grant can
         // be written without the risk of outliving an unresolved approval in
@@ -225,7 +228,7 @@ impl Executor {
                 && let Some(barrier) = &self.event_barrier
                 && let Err(error) = barrier.flush().await
             {
-                return Err(AdmitError::Fatal(error));
+                return Err(AdmitError::Fatal(error.into()));
             }
             self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
         }

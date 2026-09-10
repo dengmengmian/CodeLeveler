@@ -603,7 +603,7 @@ struct RecordingBarrier {
 
 #[async_trait]
 impl leveler_agent::EventBarrier for RecordingBarrier {
-    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+    async fn flush(&self) -> Result<(), leveler_engine::PortError> {
         self.order.lock().unwrap().push("flush".to_string());
         Ok(())
     }
@@ -621,9 +621,9 @@ struct ArmedFailingBarrier {
 
 #[async_trait]
 impl leveler_agent::EventBarrier for ArmedFailingBarrier {
-    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+    async fn flush(&self) -> Result<(), leveler_engine::PortError> {
         if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(leveler_agent::AgentError::Persistence(
+            return Err(leveler_engine::PortError::Persistence(
                 "event log unavailable (injected)".to_string(),
             ));
         }

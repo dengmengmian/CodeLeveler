@@ -16,6 +16,9 @@ leveler-tools = { workspace = true }
 leveler-memory = { workspace = true }
 leveler-agent-core = { workspace = true }
 leveler-execution = { workspace = true }
+leveler-engine = { workspace = true }
+leveler-storage = { workspace = true }
+leveler-verifier = { workspace = true }
 leveler-context = { workspace = true }
 leveler-skills = { workspace = true }
 serde = { workspace = true }
@@ -28,6 +31,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 leveler-test-support = { workspace = true }
