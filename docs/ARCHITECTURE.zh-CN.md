@@ -1286,7 +1286,7 @@ TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
 
-BROWSER_IMPLEMENTATION            SUPERSEDED_PENDING_REPLACEMENT
+BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 SECOND_HARNESS_WRITTEN            NO
@@ -1297,4 +1297,6 @@ FOUNDATION_FROZEN                 NO
 
 有四行从 NO 变成 YES，是因为代码变了而不是措辞变了：`ToolServices` 已删除、registry 不再做任何授权判断、`leveler-model` 不含任何工具名、一个回合的 work profile 来自 session 行。每一条都在自己那节里点了绊线的名字。没有为了让这张表里任何一行好看而修改源码。
 
-`BROWSER_IMPLEMENTATION` 已关闭。Node 桥、Playwright、自定义 RPC 和那些 JavaScript 网络 gate 都没了；`leveler-browser` 直接说 CDP 和 WebDriver，§18.10 记录了这次关闭了什么。
+`BROWSER_IMPLEMENTATION` 以替换关闭。Node 桥、Playwright、自定义 RPC 和那些 JavaScript 网络 gate 都没了；`leveler-browser` 直接说 CDP 和 WebDriver，§18.10 记录了这次关闭了什么。
+
+这一行依据的是新实现自己的验收，而不是「旧抖动不再复现」。Chrome 和 Safari 各自连续三次通过 11 项真机端到端检查，workspace 套件连续三次 3591 通过、0 失败。旧的 `loopback_ws_from_a_granted_dev_page_connects` 保留它诚实的墓志铭：根因 UNPROVEN、修复 NONE、代码路径 REMOVED。对一个已经不存在的实现里的竞态，什么都没有被证明。

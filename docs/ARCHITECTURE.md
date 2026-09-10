@@ -1884,7 +1884,7 @@ TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
 
-BROWSER_IMPLEMENTATION            SUPERSEDED_PENDING_REPLACEMENT
+BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 SECOND_HARNESS_WRITTEN            NO
@@ -1903,6 +1903,15 @@ Four lines went from NO to YES because the code changed, not the prose:
 session row. Each has a tripwire named in its section. Nothing here was
 changed to improve a line of this table.
 
-`BROWSER_IMPLEMENTATION` is closed. The Node bridge, Playwright, the custom
-RPC and the JavaScript network gates are gone; `leveler-browser` speaks CDP and
-WebDriver directly, and §18.10 records what that closed.
+`BROWSER_IMPLEMENTATION` is closed by replacement. The Node bridge,
+Playwright, the custom RPC and the JavaScript network gates are gone;
+`leveler-browser` speaks CDP and WebDriver directly, and §18.10 records what
+that closed.
+
+The line rests on the replacement's own acceptance, not on the old flake
+having stopped reproducing. Chrome and Safari each passed eleven live
+end-to-end checks three consecutive times, and the workspace suite ran three
+consecutive times at 3591 passing and none failing. The old
+`loopback_ws_from_a_granted_dev_page_connects` finding keeps its honest
+epitaph: root cause UNPROVEN, fix NONE, code path REMOVED. Nothing was proved
+about a race in an implementation that no longer exists.
