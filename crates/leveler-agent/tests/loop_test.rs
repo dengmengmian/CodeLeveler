@@ -615,8 +615,8 @@ async fn executor_reads_patches_and_finishes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A weaker model routinely emits a `run_command` tool call whose arguments are
-/// not valid JSON (an unescaped backslash from a regex/path). Today that decode
+/// A `run_command` tool call sometimes arrives with arguments that are not
+/// valid JSON (an unescaped backslash from a regex/path). Today that decode
 /// error kills the whole turn. Instead, the loop should feed the error back to
 /// the model and let it retry, so a single malformed tool call is recoverable.
 #[tokio::test]

@@ -7,10 +7,10 @@ recorded honestly.
 
 Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md).
 
-Everything below was verified against the workspace at commit `6724268`
-(31 crates) using `cargo metadata` and the crate sources. Where the code does
-not yet match the target boundary, it says so rather than describing the
-target as if it were already true.
+Everything below was verified against the workspace at the Core Primitive
+Foundation closure, using `cargo metadata` and the crate sources. Where the
+code does not yet match the target boundary, it says so rather than describing
+the target as if it were already true.
 
 ---
 
@@ -369,6 +369,12 @@ two real consumers, a real dependency inversion, an independent
 security/runtime/protocol boundary, or an observed coupling defect. Prefer a
 concrete struct over a trait until a second implementation exists.
 
+Three of the five are now real, and they are exactly that: three concrete
+crate-private structs in `crates/leveler-tools/src/workspace/`
+(`reader.rs`, `search.rs`, `editor.rs`), with no trait, no registry and no new
+crate. `CommandExecution` and `CodeIntelligence` are still owned by their
+tools; see §18.3 D and E.
+
 ### 5.4 ToolHost admits; Host Execution performs
 
 ```text
@@ -562,7 +568,7 @@ Measured from `crates/leveler-tools/src/registry.rs` at this commit:
 | Set | Count |
 | --- | --- |
 | `core_registry()` | 14 |
-| `full_registry()` = core + 17 + 12 browser | 43 |
+| `full_registry()` = core + 18 + 12 browser | 44 |
 | Harness control tools injected by the executor | 7 |
 | `default_registry()` | `full_registry()` |
 
@@ -572,11 +578,12 @@ for more mid-session.
 
 Two facts worth naming, because they cut against the obvious reading:
 
-- **`find_files` is not in `core_registry()`.** The economy surface has
-  `grep` and `list_files` but reaches `find_files` only through
-  `expand_tools("search")`. If `find_files` is a core primitive — and the
-  distinct model intent argues it is — that is a surface-composition bug, not
-  a capability gap.
+- **`find_files` and `write_file` are not in `core_registry()`.** The economy
+  surface has `grep` and `list_files` but reaches `find_files` only through
+  `expand_tools("search")`, and `write_file` joined the full surface rather
+  than core. Both are Core Primitive Foundation members (§6.3), so this is a
+  surface-composition gap for the Tool Surface Closure to fix, not a
+  capability gap.
 - **`replace`, `shell_command`, `update_plan`, `load_skill`, `expand_tools`
   and `memory` *are* in core.** The economy surface is not the primitive set;
   it is a historical selection.
@@ -702,7 +709,7 @@ Candidates for evaluation, with the reason each is on the list:
 | `blast_radius` | An advanced Code Intelligence operation (references → enclosing symbols → BFS), not a primitive. Move to the optional pack, then evaluate whether it reduces rounds or improves refactor recall. |
 | `read_symbol` | `find_symbol` + `read_file` reproduces it. It survives only if it measurably cuts tokens or rounds. Pure evaluation question. |
 | `replace` | **REMOVE / SURFACE-EVAL CANDIDATE.** Its original rationale — exact find/replace for weaker models that fail on patch context matching — is withdrawn (§1.1) and is no longer a reason to keep it. The remaining question is the ordinary one: does `replace` express a distinct, generally useful coding primitive that `edit` + `write` do not already cover? Judge the overlap; a weak-model A/B is not a precondition for removing it. |
-| `shell_command` vs `run_command` | `run_command` is program+args: cross-platform, no shell quoting, simple to analyse. `shell_command` is the string form models know best. `shell_command` already reuses `run_command`'s `execute_program`, so two adapters over one capability is architecturally fine. Whether both stay on the model surface is an evaluation question. |
+| `shell_command` vs `run_command` | **Decided: both stay.** They are distinct model intents, not two spellings of one. `run_command` is program+args — cross-platform, no shell quoting, trivially analysable for approval, and the only one that can start a background task. `shell_command` is a shell line, which is what a pipeline, a redirect or an `&&` chain actually is, and collapsing it into argv would cost rounds. `shell_command` already reuses `run_command`'s `execute_program`, so this is two adapters over one capability. The remaining asymmetry — `shell_command` cannot background — is recorded, not fixed. |
 | `git_status` / `git_diff` | Reproducible via `run_command`, but git inspection is high-frequency, needs no shell, has stable output and replays cleanly. Keep the interface for now; move the implementation to `leveler-vcs`. |
 
 `list_files` and `find_files` are deliberately **not** merge candidates. They
@@ -1193,93 +1200,87 @@ ahead of the extraction it is supposed to serve.
 ### 18.3 Concrete tool implementation debts
 
 Each of these is a tool implementing capability behavior it should be calling.
+A–C and H are closed by the Core Primitive Foundation work and are kept here
+with what was actually done, and with what is still open inside each; D–G are
+open.
 
-#### A. `read_file` does too much, and two of its policies are wrong
+#### A. `read_file` still carries the stale-write observation (mostly closed)
 
-`crates/leveler-tools/src/tools/read_file.rs` currently owns: file reading,
-paging, binary detection, full-file fingerprinting, repeated-read policy,
-stale-write state preparation, output budgeting and model guidance.
+`crates/leveler-tools/src/tools/read_file.rs` is now a model-facing adapter:
+schema, rendering and paging copy. Reading itself belongs to
+`leveler-tools::workspace::WorkspaceReader`, which returns bounded content plus
+a `ReadObservation`.
 
-Verified consequences:
+Closed:
 
-- **A narrow range read still scans the whole file.** The source says so:
-  "Stream the complete file once … while still producing the full-file
-  fingerprint needed by stale-write protection and the total line count used
-  in paging copy." Memory stays bounded; time is O(file).
-- **Files over 10 MB are refused outright**, before any range is considered,
-  and the model is told to "use `grep` … or `run_command` with sed/head/tail".
-  A bounded 50-line read of a 100 MB file is a reasonable request that the
-  tool cannot serve, and the suggested workaround is not cross-platform — a
-  problem the project's Windows support makes concrete.
-- **Invalid UTF-8 is silently rewritten.** Lines are rendered with
-  `String::from_utf8_lossy`, so invalid bytes reach the model as `U+FFFD`.
-  The binary guard only scans the first 8 KB for NUL, so a file that is
-  non-UTF-8 but NUL-free in its opening bytes takes the lossy path. The bytes
-  on disk and the text shown to the model differ, and nothing says so.
-- **Repeated-read policy lives in the read tool.** Whether the model is
-  wasting rounds re-reading the same range is harness behavior policy, not
-  filesystem read semantics.
-- **Stale-write tracking lives in the read tool.** `read_file` records a
-  fingerprint into `FileStateTracker` so `apply_patch` can later refuse a
-  stale write. That is why a narrow read must scan everything: reading carries
-  the precondition state for a future edit.
+- **Size no longer refuses a read.** The 10 MB cap is gone, and the tool no
+  longer points the model at `sed`/`head`/`tail` — a bounded window of a 100 MB
+  file is an ordinary call, and paging is stated in the tool's own contract.
+- **Invalid UTF-8 is reported, not rewritten.** Every line of the file is
+  decoded; the first invalid line is an explicit error naming the line number,
+  and NUL bytes are reported as "not a text file". Nothing reaches the model as
+  `U+FFFD` pretending to be the file's text.
+- **Repeated-read policy is gone.** `RepeatedReadGuard` and its config plumbing
+  are deleted. How often a model re-reads a range is a judgement about its
+  reasoning, and the harness does not make it (§1.1).
+- **Result-budget policy is explicit, not implicit.** The reader is told how
+  many bytes the caller can render, including the caller's per-line
+  decoration, so the rendered result really does fit the budget.
 
-**Target contract** (behavior, not an API):
+Still open:
 
-```text
-Read is bounded.
-Read semantics are deterministic.
-A narrow range read does not require unrelated full-file work unless
-  mechanical correctness proves it necessary.
-Reading does not own edit policy.
-Reading does not own repeated-read policy.
-Reading does not own result-budget policy.
-Invalid text or binary data is reported honestly rather than silently
-  rewritten into different text.
-Large files are inspectable through bounded reads rather than requiring
-  a shell command merely because of file size.
-```
+- **A narrow window read still streams the whole file.** The fingerprint that
+  guards a later edit covers the whole file, and there is no equally strong
+  cheaper version of it. Memory is O(longest line + window); time is O(file).
+  Correctness outranks the optimization, so this stays until a replacement
+  proves itself.
 
-**Target ownership.** `ReadFileTool → WorkspaceReader`, returning a bounded
-structured read result. Stale-write protection becomes an explicit mechanism
-between workspace read observation and `WorkspaceEditor`, not a side effect
-hidden in a read tool. Repeated-read nudging moves to the harness, which
-already sees tool history.
+**Target ownership, remaining.** Stale-write protection is already an explicit
+mechanism between `ReadObservation` and `WorkspaceEditor` rather than a hidden
+side effect, but the fingerprint is still recorded into the shared
+`FileStateTracker` by the read tool rather than travelling with the
+observation.
 
-**Risk of correcting.** Medium. Stale-write protection is a real safety
-property; it must survive the move intact. It must not be weakened to make a
-read faster.
+#### B. Workspace search is deterministic (closed for the four primitives)
 
-#### B. Workspace search has environment-dependent semantics
+`list_files`, `find_files` and `grep` are adapters over
+`leveler-tools::workspace::WorkspaceSearch`: one traversal, one ignore rule
+set, one glob dialect, one regex dialect, entirely in process.
 
-`list_files`, `find_files`, `grep` and the symbol fallback scans each carry
-their own directory traversal, ignore rules and result caps.
+- **No subprocess.** `git ls-files` and `rg` are gone. All four read primitives
+  now declare `replay_is_side_effect_free`, which is the mechanical proof that
+  no binary is consulted.
+- **One meaning per invocation.** `grep`'s pattern is a regex, with `literal`
+  and `ignore_case` as explicit parameters; it no longer degrades to a
+  substring scan when `rg` is absent. `find_files`'s pattern is a glob, with
+  the gitignore/ripgrep anchoring rule (no `/` matches the file name, a `/`
+  matches the relative path); the `auto`/`substring`/`glob` mode switch is
+  gone.
+- **No Git-dependent candidate universe.** `.gitignore` and `.ignore` are
+  honoured by the `ignore` crate whether or not this is a repository and
+  whether or not Git is installed; the user's global gitignore is deliberately
+  not read, because it would make the same repository search differently on two
+  machines.
+- **`list_files` is directory inspection.** It lists the direct children of one
+  directory and hides nothing — `max_depth` is gone and so is the build-output
+  filter, because a one-level listing never descends into `target/` anyway and
+  concealing it costs the model a true fact.
 
-Worse, `grep` changes query semantics with the machine: with `rg` installed
-the pattern is a regex; without it, the built-in fallback matches it as a
-literal substring. The tool does append a `[note] ripgrep unavailable …` line
-when the pattern looks regex-shaped, so it is not silent — but the same tool
-call still means different things on different machines.
+Still open: `locate_hint` and the symbol fallback scans carry their own
+traversal. They are not read primitives and were left alone.
 
-**Target.** One deterministic workspace-search semantics across macOS, Linux
-and Windows, with one traversal and one ignore rule set beneath `list_files`,
-`find_files` and `grep`.
+#### C. Workspace edit has one owner (closed)
 
-**Risk.** Medium. A bundled regex engine changes match results for existing
-users; the change needs to be deliberate and announced.
+`leveler-tools::workspace::WorkspaceEditor` is the single guarded path from a
+tool to a file on disk: the advisory cross-process lock held across compare and
+rename, the compare-and-swap, the unguessable staging name, the
+capability/descriptor-relative write, checkpoint capture, and write-scope
+revalidation under the lock. `apply_patch`, `replace` and `write_file` all call
+it.
 
-#### C. Workspace edit logic is duplicated across two tools
-
-`apply_patch` and `replace` each carry stale protection, compare-and-swap,
-atomic mutation, rollback and diff/evidence.
-
-**Target.** `ApplyPatchTool` and `ReplaceTool` both call one
-`WorkspaceEditor`. Compare-and-swap, stale protection, rollback and
-all-or-nothing behavior are preserved exactly; only the owner changes.
-
-**Risk.** Medium-high. This is the code path where a bug corrupts a user's
-file. It moves only under the existing tests, with no behavior change in the
-same step.
+The code did not change — it was already the shared commit path, but it lived
+inside the `replace` tool, so the shared runtime was named after one of its
+callers. Only the owner moved.
 
 #### D. `run_command` owns most of command execution
 
@@ -1334,19 +1335,28 @@ know provider credentials or configuration.
 
 **Risk.** Low.
 
-#### H. `wait_task` owns workspace settlement
+#### H. Background settlement belongs to the runtime (closed)
 
-`WaitTaskTool` is deliberately not `RiskLevel::Safe`, because at wait-end it
-runs `account_background_mutations`, which can restore the whole workspace to
-a snapshot. Its own source comment says so.
+`WaitTaskTool` used to run `account_background_mutations` at wait-end, which
+could restore the whole workspace to a snapshot. Settlement therefore depended
+on the model choosing to wait: a turn that ended first, or a model that never
+waited, left a write-scope violation standing on disk.
 
-A model-facing tool named "wait" should not own workspace rollback semantics.
+`BackgroundTaskRegistry` now settles a task when its process exits. The reaper
+consumes the `MutationBaseline`, diffs the workspace, and — only under an
+explicit write allowlist — restores what the task was not allowed to touch,
+then stores a `BackgroundSettlement` before publishing the terminal state. The
+allowlist travels in the baseline because the authority a background task runs
+under is the one it was spawned with; it outlives the round, so there is no
+later scope to consult. `wait_task` reads that settlement once and renders it.
 
-**Target.** A `BackgroundTaskRuntime` owns settlement. `get_task` and
-`wait_task` read or await state.
+Dev-server safety is unchanged: restore still runs only under an explicit
+allowlist, so a default background task is accounted and never rolled back
+(K17).
 
-**Risk.** Medium. Background-task settlement interacts with dev-server safety
-rules that exist for a reason.
+`wait_task` stays non-`Safe`. It no longer performs the settlement, but it
+consumes the one-time report, and a crash replay would block recovery for up
+to two minutes and swallow it.
 
 ### 18.4 Sidecar processes bypass the command runner
 
@@ -1505,7 +1515,23 @@ context matching — is withdrawn (§1.1). What is left is a plain surface
 question: does `replace` express a distinct model intent that `edit` and
 `write` do not already cover? The default answer is now no.
 
-### 19.3 Does dynamic model-controlled tool expansion pay for itself?
+### 19.3 How loose should patch context matching be?
+
+`seek_sequence` locates a hunk through five progressively looser passes: exact,
+trailing whitespace, edge whitespace, typographic-Unicode folding, and internal
+whitespace squash (`a+b` matches `a + b`). The first three are ordinary format
+tolerance. The last two exist because a model re-types a body it just read with
+spacing drift, which is transcription compensation rather than a mechanical
+tolerance, and §1.1 is against it.
+
+They stay for now, deliberately. Tightening the matcher changes edit success on
+the single path where a bug corrupts a user's file, and this is exactly the
+case §6.6 says is owed evidence rather than taste. The comparable mechanism in
+`replace` — a fuzzy fallback that matched a *different* string and could not
+report where it wrote — was removed, because a mutation the tool cannot locate
+is unreportable, which is a mechanical defect and not a matter of degree.
+
+### 19.4 Does dynamic model-controlled tool expansion pay for itself?
 
 `expand_tools` buys schema tokens with an extra round and dynamic registry
 state. Harness-side selection buys the same tokens with none of that, at the
@@ -1550,12 +1576,14 @@ CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
-CORE_PRIMITIVE_FOUNDATION_ALIGNED NO
+CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
+TOOL_SURFACE_CLOSED               NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO
 ```
 
-The architecture and the tool boundary are decided. The implementation is not
-aligned to them, and this document says where. No source was changed to
-improve any line of this table.
+The architecture and the tool boundary are decided. The seven core primitives
+are implemented against them; the wider tool surface, `ToolContext`,
+`ToolRegistry` and the engine are not, and §18 says where. No source was
+changed to improve any line of this table.

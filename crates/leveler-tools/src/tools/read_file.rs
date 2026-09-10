@@ -1,4 +1,8 @@
-//! `read_file` — read a workspace file with line numbers (spec §18.3).
+//! `read_file` — the `read` primitive: a bounded window of one text file.
+//!
+//! The tool owns the model-facing contract (schema, rendering, paging copy).
+//! Everything filesystem-shaped belongs to
+//! [`crate::workspace::WorkspaceReader`].
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -8,20 +12,30 @@ use tokio_util::sync::CancellationToken;
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::workspace::{Clip, ReadError, ReadWindow, WorkspaceReader};
 
-/// Ceiling on the bytes of file content returned per call; ranges page through
+/// Bytes `render_line` adds around a line's own text: the right-aligned line
+/// number, the tab, and the newline. The reader charges this against the
+/// result budget so the rendered output really does fit.
+fn line_overhead(number: usize) -> usize {
+    number.to_string().len().max(6) + 2
+}
+
+fn render_line(number: usize, text: &str) -> String {
+    format!("{number:>6}\t{text}\n")
+}
+
+/// Ceiling on the bytes of file content returned per call; windows page through
 /// the rest. The effective budget is the turn's tool-result budget
-/// ([`ToolContext::tool_output_budget`]) minus [`MARKER_RESERVE`], so this
-/// tool's own paging marker is the only truncation the model sees: a result
-/// the registry's central cap had to chop would carry a `start_line=N` that
-/// points past an elided middle, and the model would page over lines it never
-/// saw. This ceiling still applies when a budget is larger than it.
+/// ([`crate::tool::ToolPolicy::tool_output_budget`]) minus [`MARKER_RESERVE`],
+/// so this tool's own paging marker is the only truncation the model sees: a
+/// result the registry's central cap had to chop would carry a `start_line=N`
+/// that points past an elided middle, and the model would page over lines it
+/// never saw. This ceiling still applies when a budget is larger than it.
 const MAX_BYTES: usize = 256 * 1024;
-/// Bytes held back from the budget for the truncation/paging marker and the
-/// repeated-read note, so appending them cannot push the result over the cap.
+/// Bytes held back from the budget for the paging marker, so appending it
+/// cannot push the result over the cap.
 const MARKER_RESERVE: usize = 512;
-/// Maximum file size read into memory; larger files are refused with guidance.
-const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -49,9 +63,11 @@ impl Tool for ReadFileTool {
          `list_files` instead — `read_file` does not list directories. Any \
          absolute path is readable (reads are not confined to the workspace; \
          credential files such as `.env` and private keys are refused). \
-         Returns content with 1-based line \
-         numbers. `start_line`/`end_line` return only that inclusive range; \
-         omitting both returns the whole file."
+         Returns content with 1-based line numbers. `start_line`/`end_line` \
+         return only that inclusive range; omitting both returns the whole \
+         file. A result too large for one call is cut at a line boundary and \
+         names the line to continue from, so any file is readable in windows \
+         regardless of its size."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -81,179 +97,86 @@ impl Tool for ReadFileTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let path = context.execution.workspace.resolve_for_read(&input.path)?;
 
-        let meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ToolOutput::error(crate::recoverable::missing_file(
-                    &input.path,
-                )));
-            }
-            Err(e) => return Err(ToolError::Io(format!("stat {}: {e}", input.path))),
-        };
-        if meta.is_dir() {
-            return Ok(ToolOutput::error(crate::recoverable::path_is_directory(
-                &input.path,
-            )));
-        }
-        if meta.len() > MAX_FILE_BYTES {
-            return Ok(ToolOutput::error(format!(
-                "file too large to read: `{}` is {} bytes (limit {} MB). Use `grep` \
-                 to locate the relevant part, or `run_command` with sed/head/tail \
-                 to slice it.",
-                input.path,
-                meta.len(),
-                MAX_FILE_BYTES / (1024 * 1024)
-            )));
-        }
-
-        // Detect wasteful repeated reads of the same unchanged range (spec §28).
-        // This is deliberately a nudge, not a denial: edit tools can require a
-        // fresh read to recover, and a read operation that returned content did
-        // not fail.
-        let range_key = format!(
-            "{}:{}-{}",
-            input.path,
-            input.start_line.unwrap_or(0),
-            input.end_line.unwrap_or(0)
-        );
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ToolOutput::error(crate::recoverable::missing_file(
-                    &input.path,
-                )));
-            }
-            Err(e) => return Err(ToolError::Io(format!("read {}: {e}", input.path))),
-        };
-
-        let start = input.start_line.unwrap_or(1).max(1);
-        let end = input.end_line.unwrap_or(usize::MAX);
         // Page at the budget the registry will enforce, less the room the
-        // markers need. `saturating_sub` keeps a pathologically small budget
+        // marker needs. `saturating_sub` keeps a pathologically small budget
         // from wrapping; the registry's own floor keeps it sane in practice.
         let max_bytes = context
             .policy
             .tool_output_budget
             .saturating_sub(MARKER_RESERVE)
             .clamp(1, MAX_BYTES);
-        let mut out = String::new();
-        let mut reader = tokio::io::BufReader::new(file);
-        let mut line = Vec::new();
-        let mut fingerprint = leveler_context::ContentFingerprint::default();
-        let mut scanned_for_binary = 0usize;
-        let mut binary = false;
-        let mut total_lines = 0usize;
-        let mut first_shown = None;
-        let mut last_shown = 0usize;
-        let mut clipped = false;
-        let mut clipped_inside_line = false;
+        let window =
+            ReadWindow::rendered(input.start_line, input.end_line, max_bytes, line_overhead);
 
-        // Stream the complete file once: this keeps narrow ranges O(line size)
-        // in memory while still producing the full-file fingerprint needed by
-        // stale-write protection and the total line count used in paging copy.
-        loop {
-            use tokio::io::AsyncBufReadExt;
-            line.clear();
-            let read = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    return Ok(ToolOutput::error("read_file cancelled"));
-                }
-                read = reader.read_until(b'\n', &mut line) => read,
+        let read = match WorkspaceReader::read(&path, window, &cancellation).await {
+            Ok(read) => read,
+            Err(ReadError::NotFound) => {
+                return Ok(ToolOutput::error(crate::recoverable::missing_file(
+                    &input.path,
+                )));
             }
-            .map_err(|e| ToolError::Io(format!("read {}: {e}", input.path)))?;
-            if read == 0 {
-                break;
+            Err(ReadError::IsDirectory) => {
+                return Ok(ToolOutput::error(crate::recoverable::path_is_directory(
+                    &input.path,
+                )));
             }
-            fingerprint.update(&line);
-            if scanned_for_binary < 8192 {
-                let scan_len = (8192 - scanned_for_binary).min(line.len());
-                binary |= line[..scan_len].contains(&0);
-                scanned_for_binary += scan_len;
+            Err(ReadError::NotUtf8 { line }) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{}` is not valid UTF-8: decoding fails at line {line}. The file \
+                     was not read; its bytes are not text and no substitute text was \
+                     invented for them.",
+                    input.path
+                )));
             }
-            total_lines += 1;
-            let lineno = total_lines;
-            if clipped || lineno < start || lineno > end {
-                continue;
+            Err(ReadError::Binary) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{}` contains NUL bytes, so it is not a text file.",
+                    input.path
+                )));
             }
+            Err(ReadError::Cancelled) => return Ok(ToolOutput::error("read_file cancelled")),
+            Err(ReadError::Io(message)) => {
+                return Err(ToolError::Io(format!("read {}: {message}", input.path)));
+            }
+        };
 
-            let prefix = format!("{lineno:>6}\t");
-            if out.len() + prefix.len() + 1 > max_bytes {
-                clipped = true;
-                continue;
-            }
-            let mut content_end = line.as_slice();
-            if content_end.ends_with(b"\n") {
-                content_end = &content_end[..content_end.len() - 1];
-            }
-            if content_end.ends_with(b"\r") {
-                content_end = &content_end[..content_end.len() - 1];
-            }
-            let rendered = String::from_utf8_lossy(content_end);
-            let remaining = max_bytes - out.len() - prefix.len() - 1;
-            if rendered.len() > remaining && !out.is_empty() {
-                clipped = true;
-                continue;
-            }
-            let shown = leveler_core::floor_char_boundary(&rendered, rendered.len().min(remaining));
-            first_shown.get_or_insert(lineno);
-            last_shown = lineno;
-            out.push_str(&prefix);
-            out.push_str(&rendered[..shown]);
-            out.push('\n');
-            if shown < rendered.len() {
-                clipped = true;
-                clipped_inside_line = true;
-            }
-        }
-
-        if binary {
-            return Ok(ToolOutput::error(format!(
-                "refusing to read binary file: {}",
-                input.path
-            )));
-        }
-
-        let fingerprint = fingerprint.finish();
-        let repeated = context
-            .execution
-            .read_guard
-            .tripped_fingerprint(&range_key, fingerprint);
+        // The observation this read took is what a later `apply_patch` checks
+        // its precondition against.
         context
             .execution
             .file_state
-            .record_fingerprint(&input.path, fingerprint);
+            .record_fingerprint(&input.path, read.observation.fingerprint);
 
-        if repeated {
-            out.insert_str(
-                0,
-                "[note: this unchanged range was read multiple times; returning it again so recovery is not blocked]\n",
-            );
+        let total_lines = read.observation.total_lines;
+        let mut out = String::new();
+        for (number, text) in &read.lines {
+            out.push_str(&render_line(*number, text));
         }
-        if clipped {
-            if clipped_inside_line {
-                out.push_str(&format!(
-                    "… [truncated within line {last_shown} of {total_lines}; the file is {} \
-                     bytes / ~{} tokens — use grep or run_command to inspect that long line]\n",
-                    meta.len(),
-                    crate::registry::approx_tokens(meta.len() as usize),
-                ));
-            } else {
+        match read.clip {
+            Clip::None => {
+                if read.lines.is_empty() {
+                    out.push_str(&format!(
+                        "(no lines in the requested range; the file has {total_lines} lines)\n"
+                    ));
+                }
+            }
+            Clip::AtLine { next_line } => {
                 out.push_str(&format!(
                     "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
-                     / ~{} tokens total); continue with start_line={}]\n",
-                    first_shown.unwrap_or(start),
-                    last_shown,
-                    meta.len(),
-                    crate::registry::approx_tokens(meta.len() as usize),
-                    last_shown + 1
+                     / ~{} tokens total); continue with start_line={next_line}]\n",
+                    read.lines.first().map(|(n, _)| *n).unwrap_or(next_line),
+                    next_line.saturating_sub(1),
+                    read.observation.file_bytes,
+                    crate::registry::approx_tokens(read.observation.file_bytes as usize),
                 ));
             }
-        }
-        if first_shown.is_none() && !clipped {
-            out.push_str(&format!(
-                "(no lines in the requested range; the file has {total_lines} lines)\n"
-            ));
+            Clip::InsideLine { line, line_bytes } => {
+                out.push_str(&format!(
+                    "… [truncated inside line {line} of {total_lines}: that single line is \
+                     {line_bytes} bytes, more than this call's {max_bytes}-byte result \
+                     budget]\n"
+                ));
+            }
         }
 
         Ok(ToolOutput::ok(out))
@@ -449,30 +372,7 @@ mod tests {
             "a single line must not allocate/return the whole file: {} bytes",
             out.content.len()
         );
-        assert!(out.content.contains("truncated"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn oversized_file_is_a_recoverable_error() {
-        // Files past the in-memory limit are refused with guidance instead of
-        // being read whole (memory) or silently clipped.
-        let content = "y".repeat(MAX_FILE_BYTES as usize + 1);
-        let (ctx, dir) = ctx_with("huge.bin.log", &content).await;
-        let out = ReadFileTool
-            .execute(
-                serde_json::json!({"path": "huge.bin.log"}),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(out.is_error, "oversized file must be a model-facing error");
-        assert!(
-            out.content.contains("grep") || out.content.contains("run_command"),
-            "must steer to a tool that can slice it: {}",
-            out.content
-        );
+        assert!(out.content.contains("truncated inside line 1"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -521,8 +421,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_read_still_returns_the_requested_content() {
+    async fn repeated_reads_return_the_same_content_unannotated() {
         let (ctx, dir) = ctx_with("a.txt", "one\ntwo\n").await;
+        let mut first = None;
         for attempt in 1..=4 {
             let out = ReadFileTool
                 .execute(
@@ -532,12 +433,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(
-                !out.is_error,
-                "attempt {attempt} must remain recoverable: {}",
-                out.content
+            assert!(!out.is_error, "attempt {attempt}: {}", out.content);
+            let previous = first.get_or_insert_with(|| out.content.clone());
+            assert_eq!(
+                *previous, out.content,
+                "how often the model reads is not the reader's business"
             );
-            assert!(out.content.contains("one"));
         }
         std::fs::remove_dir_all(&dir).ok();
     }

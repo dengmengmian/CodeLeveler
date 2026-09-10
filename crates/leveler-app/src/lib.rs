@@ -490,8 +490,7 @@ impl Application {
         // limits — so a run differs from control in exactly the flipped knob.
         // Every execution path (direct, orchestrated, bare) funnels through
         // here.
-        let (max_files, read_guard) =
-            leveler_engine::resolve_tool_limits(self.execution_overrides.as_ref());
+        let max_files = leveler_engine::resolve_tool_limits(self.execution_overrides.as_ref());
         let artifact_store = std::sync::Arc::new(leveler_execution::ArtifactStore::new(
             self.layout.state_dir.join("artifacts"),
         ));
@@ -502,7 +501,7 @@ impl Application {
         // task id) — the "服务活不过一个回合" bug.
         let bg = self.background_tasks.clone();
         let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
-            .with_policy_limits(max_files, read_guard)
+            .with_policy_limits(max_files)
             .with_sandbox(sandbox)
             .with_deny_env(provider_secret_env_names(&self.config.providers))
             .with_artifact_store(artifact_store)

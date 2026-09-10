@@ -1,58 +1,32 @@
-//! `find_files` — locate files by glob shape or forgiving path substring.
-
-use std::collections::HashMap;
-use std::time::Duration;
+//! `find_files` — the `find` primitive: locate paths by glob.
+//!
+//! One meaning for one invocation. The pattern is always a glob, the candidate
+//! set always comes from the same in-process traversal, and neither depends on
+//! whether Git is installed or whether this directory is a repository.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{ProcessRequest, RiskLevel};
+use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::workspace::{SearchError, WorkspaceSearch};
 
-const DEFAULT_MAX: usize = 100;
-const HARD_MAX: usize = 1000;
-const FALLBACK_CANDIDATE_LIMIT: usize = 5000;
-const IGNORED: &[&str] = &[
-    "target",
-    "node_modules",
-    ".git",
-    "dist",
-    "vendor",
-    ".leveler",
-];
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum MatchMode {
-    /// Infer glob mode when `pattern` contains `*` or `?`; substring otherwise.
-    #[default]
-    Auto,
-    /// Case-insensitive substring of the workspace-relative path.
-    Substring,
-    /// Case-sensitive `*`, `**`, and `?` path glob.
-    Glob,
-}
+const DEFAULT_LIMIT: usize = 100;
+const HARD_LIMIT: usize = 1000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
-    /// File-name/path pattern. Plain text is a case-insensitive substring;
-    /// `*`, `**`, and `?` automatically select glob matching.
+    /// Glob over file paths, e.g. `**/*.rs` or `Cargo.toml`.
     pattern: String,
-    /// Override automatic matching: auto (default), substring, or glob.
-    #[serde(default)]
-    mode: MatchMode,
     /// Optional directory to search below. Defaults to the workspace root.
     #[serde(default)]
     path: Option<String>,
-    /// Optional extension filter, with or without a leading dot.
-    #[serde(default)]
-    extension: Option<String>,
     /// Maximum results (default 100, hard cap 1000).
-    #[serde(default)]
-    max_results: Option<usize>,
+    #[serde(default, alias = "max_results")]
+    limit: Option<usize>,
 }
 
 pub struct FindFilesTool;
@@ -64,11 +38,12 @@ impl Tool for FindFilesTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find files by path/name. `pattern` is a forgiving case-insensitive \
-         substring by default; patterns containing `*`, `**`, or `?` are treated \
-         as case-sensitive globs (or set mode explicitly). Optional `path`, \
-         `extension`, and `max_results` narrow the search. Use `grep` for file \
-         contents and `list_files` to inspect a directory tree."
+        "Find files by path. `pattern` is a glob: a pattern with no `/` matches \
+         the file name at any depth (`Cargo.toml`, `*.rs`), and a pattern \
+         containing `/` matches the path relative to the search root \
+         (`src/**/*.rs`). It is never a substring match. Results are paths \
+         relative to the workspace root. Use `grep` for file contents and \
+         `list_files` to inspect one directory."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -77,6 +52,12 @@ impl Tool for FindFilesTool {
 
     fn risk(&self) -> RiskLevel {
         RiskLevel::Safe
+    }
+
+    /// Pure in-process traversal: no write, no subprocess, no language
+    /// server, no network. Re-running it after a crash changes nothing.
+    fn replay_is_side_effect_free(&self) -> bool {
+        true
     }
 
     fn supports_parallel(&self) -> bool {
@@ -90,301 +71,131 @@ impl Tool for FindFilesTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        if input.pattern.is_empty() {
-            return Ok(ToolOutput::error("`pattern` must not be empty"));
-        }
         let base_label = input.path.as_deref().unwrap_or(".");
         let base = context.execution.workspace.resolve_for_read(base_label)?;
-        if !base.is_dir() {
-            return Ok(ToolOutput::error(crate::recoverable::path_not_directory(
-                base_label,
-            )));
-        }
-        let mode = match input.mode {
-            MatchMode::Auto if input.pattern.contains(['*', '?']) => MatchMode::Glob,
-            MatchMode::Auto => MatchMode::Substring,
-            mode => mode,
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
+
+        let found = match WorkspaceSearch::find(
+            &base,
+            context.execution.workspace.root(),
+            &input.pattern,
+            limit,
+            &cancellation,
+        )
+        .await
+        {
+            Ok(found) => found,
+            Err(SearchError::NotDirectory) => {
+                return Ok(ToolOutput::error(crate::recoverable::path_not_directory(
+                    base_label,
+                )));
+            }
+            Err(SearchError::InvalidGlob { pattern, message }) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{pattern}` is not a valid glob: {message}"
+                )));
+            }
+            Err(SearchError::Cancelled) => return Ok(ToolOutput::error("find_files cancelled")),
+            Err(other) => return Err(ToolError::Io(format!("find {base_label}: {other:?}"))),
         };
-        let extension = input
-            .extension
-            .as_deref()
-            .map(|extension| extension.trim_start_matches('.'))
-            .filter(|extension| !extension.is_empty());
-        let max = input.max_results.unwrap_or(DEFAULT_MAX).clamp(1, HARD_MAX);
-        let candidates = enumerate_candidates(&context, &base, &cancellation).await;
 
-        let query_lower =
-            matches!(mode, MatchMode::Substring).then(|| input.pattern.to_lowercase());
-        let mut matches: Vec<String> = candidates
-            .paths
-            .into_iter()
-            .filter(|candidate| {
-                let pattern_matches = match mode {
-                    MatchMode::Glob => glob_match(&input.pattern, candidate),
-                    MatchMode::Substring => candidate
-                        .to_lowercase()
-                        .contains(query_lower.as_deref().unwrap_or_default()),
-                    MatchMode::Auto => unreachable!("auto mode is resolved above"),
-                };
-                pattern_matches
-                    && extension
-                        .map(|extension| {
-                            std::path::Path::new(candidate)
-                                .extension()
-                                .and_then(|value| value.to_str())
-                                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
-                        })
-                        .unwrap_or(true)
-            })
-            .collect();
-        matches.sort();
-        matches.dedup();
-        let total = matches.len();
-        matches.truncate(max);
-
-        let mut body = if matches.is_empty() {
+        let mut body = if found.paths.is_empty() {
             "(no matching files)\n".to_string()
         } else {
-            format!("{}\n", matches.join("\n"))
+            let mut body = String::new();
+            for path in &found.paths {
+                body.push_str(&path.0);
+                body.push('\n');
+            }
+            body
         };
-        if total > max {
+        if found.omitted > 0 {
             body.push_str(&format!(
-                "… [showing {max} of {total} matches; raise max_results or narrow \
-                 pattern/path]\n"
-            ));
-        }
-        if candidates.truncated {
-            body.push_str(&format!(
-                "… [candidate scan was capped at {FALLBACK_CANDIDATE_LIMIT} entries; \
-                 results may be incomplete — narrow `path`]\n"
+                "… [{} more matches not shown; raise limit or narrow pattern/path]\n",
+                found.omitted
             ));
         }
         Ok(ToolOutput::ok(body))
     }
 }
 
-struct Candidates {
-    paths: Vec<String>,
-    truncated: bool,
-}
-
-/// One candidate enumerator shared by substring and glob matching.
-async fn enumerate_candidates(
-    context: &ToolContext,
-    base: &std::path::Path,
-    cancellation: &CancellationToken,
-) -> Candidates {
-    let mut request = ProcessRequest::new(
-        "git",
-        vec![
-            "ls-files".into(),
-            "--cached".into(),
-            "--others".into(),
-            "--exclude-standard".into(),
-        ],
-        base.to_path_buf(),
-    );
-    request.timeout = Duration::from_secs(30);
-    if let Ok(output) = context
-        .execution
-        .runner
-        .run(request, cancellation.child_token())
-        .await
-        && output.success()
-    {
-        return Candidates {
-            paths: output.stdout.lines().map(str::to_string).collect(),
-            truncated: output.truncated,
-        };
-    }
-
-    let mut candidates = Candidates {
-        paths: Vec::new(),
-        truncated: false,
-    };
-    walk(base, base, &mut candidates);
-    candidates
-}
-
-fn walk(root: &std::path::Path, dir: &std::path::Path, candidates: &mut Candidates) {
-    if candidates.paths.len() >= FALLBACK_CANDIDATE_LIMIT {
-        candidates.truncated = true;
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        if candidates.paths.len() >= FALLBACK_CANDIDATE_LIMIT {
-            candidates.truncated = true;
-            return;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if IGNORED.contains(&name.as_str()) {
-            continue;
-        }
-        let path = entry.path();
-        let is_symlink = path
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink());
-        // Never descend through a symlinked directory (R004 F3).
-        if path.is_dir() && !is_symlink {
-            walk(root, &path, candidates);
-        } else if !path.is_dir()
-            && let Ok(relative) = path.strip_prefix(root)
-        {
-            candidates
-                .paths
-                .push(relative.to_string_lossy().replace('\\', "/"));
-        }
-    }
-}
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let pattern: Vec<&str> = pattern.split('/').collect();
-    let segments: Vec<&str> = path.split('/').collect();
-    segments_match(&pattern, &segments, 0, 0, &mut HashMap::new())
-}
-
-fn segments_match(
-    pattern: &[&str],
-    segments: &[&str],
-    pattern_index: usize,
-    segment_index: usize,
-    memo: &mut HashMap<(usize, usize), bool>,
-) -> bool {
-    if let Some(&cached) = memo.get(&(pattern_index, segment_index)) {
-        return cached;
-    }
-    let matched = match pattern.get(pattern_index) {
-        None => segment_index == segments.len(),
-        Some(&"**") => {
-            segments_match(pattern, segments, pattern_index + 1, segment_index, memo)
-                || (segment_index < segments.len()
-                    && segments_match(pattern, segments, pattern_index, segment_index + 1, memo))
-        }
-        Some(part) => {
-            segment_index < segments.len()
-                && one_segment(part, segments[segment_index])
-                && segments_match(
-                    pattern,
-                    segments,
-                    pattern_index + 1,
-                    segment_index + 1,
-                    memo,
-                )
-        }
-    };
-    memo.insert((pattern_index, segment_index), matched);
-    matched
-}
-
-fn one_segment(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    let (mut pattern_index, mut text_index) = (0usize, 0usize);
-    let (mut star, mut mark) = (None::<usize>, 0usize);
-    while text_index < text.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == '?' || pattern[pattern_index] == text[text_index])
-        {
-            pattern_index += 1;
-            text_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-            star = Some(pattern_index);
-            mark = text_index;
-            pattern_index += 1;
-        } else if let Some(star_index) = star {
-            pattern_index = star_index + 1;
-            mark += 1;
-            text_index = mark;
-        } else {
-            return false;
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn context(dir: &std::path::Path) -> ToolContext {
-        super::super::test_ctx_in(dir, leveler_execution::PermissionProfile::RequestApproval)
+    fn workspace() -> (tempfile::TempDir, ToolContext) {
+        let dir = tempfile::Builder::new()
+            .prefix("leveler-find-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/inner")).unwrap();
+        std::fs::write(dir.path().join("src/inner/parser.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        (dir, ctx)
     }
 
-    #[test]
-    fn globstar_is_memoized_and_matches_across_directories() {
-        assert!(glob_match("**/*_test.go", "internal/model/user_test.go"));
-        assert!(glob_match("**/*_test.go", "user_test.go"));
-        assert!(glob_match("src/**/*.rs", "src/lib.rs"));
-        assert!(glob_match("src/**/*.rs", "src/a/b/lib.rs"));
-        assert!(!glob_match("src/*.rs", "src/a/lib.rs"));
-
-        let adversarial = format!("{}/end.rs", "a/".repeat(200));
-        assert!(glob_match("**/**/**/end.rs", &adversarial));
-    }
-
-    #[tokio::test]
-    async fn auto_mode_supports_substring_and_glob_through_one_tool() {
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-find-files-{}",
-            super::super::test_ordinal()
-        ));
-        std::fs::create_dir_all(dir.join("internal/model")).unwrap();
-        std::fs::write(dir.join("internal/model/Order_Service.rs"), "").unwrap();
-        std::fs::write(dir.join("internal/model/user_test.go"), "").unwrap();
-
-        let substring = FindFilesTool
-            .execute(
-                serde_json::json!({"pattern": "order_service", "extension": "rs"}),
-                context(&dir),
-                CancellationToken::new(),
-            )
+    async fn find(ctx: &ToolContext, args: serde_json::Value) -> ToolOutput {
+        FindFilesTool
+            .execute(args, ctx.clone(), CancellationToken::new())
             .await
-            .unwrap();
-        assert!(substring.content.contains("Order_Service.rs"));
-
-        let glob = FindFilesTool
-            .execute(
-                serde_json::json!({"pattern": "**/*_test.go"}),
-                context(&dir),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(glob.content.contains("user_test.go"));
-        assert!(!glob.content.contains("Order_Service.rs"));
-        std::fs::remove_dir_all(&dir).ok();
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn fallback_cap_is_reported_instead_of_silent() {
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-find-files-cap-{}",
-            super::super::test_ordinal()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        for index in 0..=FALLBACK_CANDIDATE_LIMIT {
-            std::fs::write(dir.join(format!("file-{index:05}.txt")), "").unwrap();
-        }
-        let out = FindFilesTool
-            .execute(
-                serde_json::json!({"pattern": "file-", "max_results": 1}),
-                context(&dir),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    async fn a_bare_name_glob_matches_at_any_depth() {
+        let (_dir, ctx) = workspace();
+        let out = find(&ctx, serde_json::json!({"pattern": "parser.rs"})).await;
+        assert_eq!(out.content, "src/inner/parser.rs\n");
+    }
+
+    #[tokio::test]
+    async fn a_slashed_glob_matches_the_relative_path() {
+        let (_dir, ctx) = workspace();
+        let out = find(&ctx, serde_json::json!({"pattern": "src/*.rs"})).await;
+        assert_eq!(out.content, "src/lib.rs\n");
+    }
+
+    /// Paths come back relative to the workspace root, so the model can hand
+    /// one straight to `read_file` without reconstructing the prefix it
+    /// searched under.
+    #[tokio::test]
+    async fn results_are_relative_to_the_workspace_root_not_the_search_root() {
+        let (_dir, ctx) = workspace();
+        let out = find(&ctx, serde_json::json!({"pattern": "*.rs", "path": "src"})).await;
+        assert!(out.content.contains("src/lib.rs"), "{}", out.content);
         assert!(
-            out.content.contains("candidate scan was capped"),
+            out.content.contains("src/inner/parser.rs"),
             "{}",
             out.content
         );
-        assert!(out.content.contains("narrow `path`"), "{}", out.content);
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_invalid_glob_names_the_constraint() {
+        let (_dir, ctx) = workspace();
+        let out = find(&ctx, serde_json::json!({"pattern": "src/["})).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("not a valid glob"), "{}", out.content);
+    }
+
+    /// Old event-log calls carry `max_results`. Replaying one must keep its
+    /// bound rather than silently falling back to the default.
+    #[tokio::test]
+    async fn the_historical_max_results_name_still_binds() {
+        let (_dir, ctx) = workspace();
+        let out = find(
+            &ctx,
+            serde_json::json!({"pattern": "**/*", "max_results": 1}),
+        )
+        .await;
+        assert_eq!(out.content.lines().count(), 2, "{}", out.content);
+        assert!(
+            out.content.contains("more matches not shown"),
+            "{}",
+            out.content
+        );
     }
 }

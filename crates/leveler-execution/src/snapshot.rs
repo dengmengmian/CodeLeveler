@@ -9,7 +9,21 @@
 //! snapshotted; callers must say so instead of silently losing rollback.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Serializes every capture, because they share one persistent git index per
+/// repository (see [`WorkspaceSnapshot::capture`]).
+///
+/// Captures used to be effectively serial: they happened inside a foreground
+/// command, or at the end of a `wait_task` call. Background settlement now runs
+/// when a task's process exits, which can be at any moment, so two captures can
+/// overlap. Git takes an exclusive `.lock` on an index file, so the loser gets
+/// "Unable to create '…snapshot.index.lock'" — and a settlement that cannot
+/// diff cannot enforce the task's write scope. One global lock is enough:
+/// a capture is short, and it is already the serialization point for the
+/// commands it measures.
+static CAPTURE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// A captured workspace state: a git tree object id.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +67,7 @@ impl WorkspaceSnapshot {
         if let Some(parent) = index.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _serialized = CAPTURE.lock().await;
         git(root, &["add", "-A", "."], Some(&index)).await?;
         let sha = git(root, &["write-tree"], Some(&index)).await?;
         Ok(Some(SnapshotId(sha.trim().to_string())))

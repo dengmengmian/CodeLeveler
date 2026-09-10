@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{BackgroundTaskStatus, MutationBaseline, RiskLevel, WorkspaceSnapshot};
+use leveler_execution::{BackgroundTaskStatus, RiskLevel};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -115,10 +115,10 @@ impl Tool for WaitTaskTool {
     }
 
     fn risk(&self) -> RiskLevel {
-        // Not Safe: under a command_write_allowlist this tool can restore the
-        // whole workspace to a snapshot (see account_background_mutations) —
-        // Safe would auto-replay it on crash recovery and admit it into
-        // read-only tool subsets.
+        // Not Safe, even though the runtime — not this tool — now performs the
+        // settlement. Waiting consumes the task's settlement report exactly
+        // once, and a crash replay would block recovery for up to two minutes
+        // and swallow that report. Neither belongs in an unattended re-run.
         RiskLevel::WorkspaceWrite
     }
 
@@ -151,26 +151,28 @@ impl Tool for WaitTaskTool {
                 )
             }
             Ok(snap) => {
-                // PR-3b: account file diffs at wait end; auto-restore only when
-                // command_write_allowlist is set (worker/node constrained).
-                // Default Goal background (dev server/watcher): account only.
-                let baseline = reg.take_mutation_baseline(&task_id).await;
-                let (command_modified, mutation_error, snapshot_note) =
-                    account_background_mutations(baseline.as_ref(), &context).await;
+                // The task is terminal, so the runtime already settled it when
+                // the process exited: diffed the workspace and, under a write
+                // allowlist, restored what the task was not allowed to touch.
+                // This reads that result — it does not produce it.
+                let settlement = reg.take_settlement(&task_id).await;
 
                 let mut text = format_snap(&snap);
-                if let Some(note) = snapshot_note {
-                    text.push_str(&note);
+                if let Some(note) = settlement.as_ref().and_then(|s| s.note.as_deref()) {
+                    text.push_str("\n[note] ");
+                    text.push_str(note);
+                    text.push('\n');
                 }
-                if let Some(error) = &mutation_error {
+                let violation = settlement.as_ref().and_then(|s| s.violation.as_deref());
+                if let Some(violation) = violation {
                     text.push_str("\n[mutation rejected] ");
-                    text.push_str(error);
+                    text.push_str(violation);
                     text.push('\n');
                 }
 
                 let failed = snap.status != BackgroundTaskStatus::Exited
                     || snap.exit_code.unwrap_or(1) != 0
-                    || mutation_error.is_some();
+                    || violation.is_some();
                 let content = if failed {
                     text
                 } else {
@@ -183,75 +185,16 @@ impl Tool for WaitTaskTool {
                 };
                 Ok(out.with_metadata(serde_json::json!({
                     "exit_code": snap.exit_code,
-                    "modified_files": command_modified,
-                    "workspace_snapshot": baseline.as_ref().map(|b| b.snapshot.0.clone()),
+                    "modified_files": settlement
+                        .as_ref()
+                        .map(|s| s.modified.clone())
+                        .unwrap_or_default(),
+                    "workspace_snapshot": settlement.as_ref().map(|s| s.snapshot.0.clone()),
                 })))
             }
             Err(e) => Ok(ToolOutput::error(e)),
         }
     }
-}
-
-/// Wait-end mutation accounting (PR-3b).
-///
-/// Always records `changed_since` when a baseline exists. Auto-restore runs
-/// **only** when `command_write_allowlist` is set and a path falls outside it.
-/// Budget alone does not restore (dev-server safety: K17).
-async fn account_background_mutations(
-    baseline: Option<&MutationBaseline>,
-    context: &ToolContext,
-) -> (Vec<String>, Option<String>, Option<String>) {
-    let Some(baseline) = baseline else {
-        return (Vec::new(), None, None);
-    };
-    let root = &baseline.workspace_root;
-    let id = &baseline.snapshot;
-
-    let mut command_modified = Vec::new();
-    let mut snapshot_note = None;
-    match WorkspaceSnapshot::changed_since(root, id).await {
-        Ok(changed) => command_modified = changed,
-        Err(error) => {
-            snapshot_note = Some(format!(
-                "\n[note] could not diff the workspace after this background task ({error}); \
-                 its file changes were not tracked.\n"
-            ));
-        }
-    }
-
-    // Restore ONLY under allowlist constraint (design §2.4 / K17).
-    let mut mutation_error = None;
-    if let Some(allowlist) = context.policy.command_write_allowlist.as_deref() {
-        let outside: Vec<&str> = command_modified
-            .iter()
-            .map(String::as_str)
-            .filter(|path| !allowlist.iter().any(|allowed| path_allows(allowed, path)))
-            .collect();
-        if !outside.is_empty() {
-            let violation = format!(
-                "background task modified files outside allowed paths: {}",
-                outside.join(", ")
-            );
-            match WorkspaceSnapshot::restore(root, id).await {
-                Ok(()) => {
-                    command_modified.clear();
-                    mutation_error = Some(format!("{violation}; workspace restored"));
-                }
-                Err(error) => {
-                    mutation_error = Some(format!(
-                        "{violation}; automatic workspace restore failed: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
-    (command_modified, mutation_error, snapshot_note)
-}
-
-fn path_allows(allowed: &str, modified: &str) -> bool {
-    let allowed = allowed.trim_end_matches('/');
-    modified == allowed || modified.starts_with(&format!("{allowed}/"))
 }
 
 pub struct KillTaskTool;

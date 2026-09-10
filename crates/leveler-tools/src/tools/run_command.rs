@@ -197,8 +197,8 @@ async fn execute_background(
         .workspace
         .resolve_command_cwd(&rel, &context.write_scope())?;
 
-    // Pre-spawn snapshot for wait-end mutation accounting (PR-3b). Restore is
-    // only applied later when command_write_allowlist is set; default Goal
+    // Pre-spawn snapshot the runtime settles against when the process exits.
+    // Restore only applies when a write allowlist is set; default Goal
     // background (dev servers) keeps the baseline for accounting only.
     let root = context.execution.workspace.root().to_path_buf();
     let mutation_baseline = if context.policy.read_only {
@@ -212,6 +212,14 @@ async fn execute_background(
                 Some(MutationBaseline {
                     snapshot: id,
                     workspace_root: root,
+                    // The authority this task runs under is the one it is
+                    // spawned with: it outlives this round, so there is no
+                    // later scope for the runtime to consult when it settles.
+                    write_allowlist: context
+                        .policy
+                        .command_write_allowlist
+                        .as_deref()
+                        .map(|allow| allow.to_vec()),
                 })
             }
             Ok(None) => None,

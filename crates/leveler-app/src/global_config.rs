@@ -231,7 +231,7 @@ struct GlobalModel {
     #[serde(default)]
     max_parallel_tool_calls: Option<usize>,
     /// Per-tool-result byte budget fed to the executor's central output cap.
-    /// Omitted → 48 KiB. Lower it for weak models with small reliable contexts.
+    /// Omitted → 48 KiB. Lower it for a model with a small reliable context.
     #[serde(default)]
     max_tool_output_bytes: Option<usize>,
     /// Whether the provider accepts a caller-chosen `temperature`. Kimi For

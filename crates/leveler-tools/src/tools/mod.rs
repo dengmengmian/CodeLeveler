@@ -30,6 +30,7 @@ mod update_plan;
 mod view_image;
 mod web_fetch;
 mod web_search;
+mod write_file;
 
 pub use apply_patch::ApplyPatchTool;
 pub use blast_radius::BlastRadiusTool;
@@ -59,6 +60,7 @@ pub use update_plan::UpdatePlanTool;
 pub use view_image::ViewImageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
+pub use write_file::WriteFileTool;
 
 use crate::tool::ToolError;
 

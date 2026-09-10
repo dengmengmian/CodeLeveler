@@ -4,6 +4,14 @@ One eval system, two entry points, one rule: **eval observes the product; it
 does not special-case it.** Nothing under `evals/` changes spawn, claim,
 ownership, settlement, prompts, or tool schema. There is no `eval_mode`.
 
+A second rule follows from `docs/ARCHITECTURE.md` §1.1: **eval does not reward
+model equalization.** Results are reported for the named model and
+configuration as observed. A capability limit of that model is not
+automatically a harness defect, and closing a gap between two models is not a
+result. The questions are whether a runtime or harness change improved the
+product, whether a tool improved agency or efficiency, and whether correctness
+regressed.
+
 ```
 evals/
   cases/        what is evaluated: capability cases (EvaluationCase YAML)

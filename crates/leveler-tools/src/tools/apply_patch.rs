@@ -17,8 +17,9 @@ use super::applied_diff::{self, AppliedHunk};
 use super::patch::{FileChange, apply_update_located, parse_patch};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// Precise format spec + example given to the model. Weaker models must be told
-/// the exact grammar; unified diff is accepted as a compatibility adapter.
+/// The exact grammar, with an example. A structured edit format has to be
+/// stated precisely or it is not a contract; unified diff is accepted as a
+/// compatibility adapter.
 const DESCRIPTION: &str = r#"Edit workspace files. Prefer this exact format:
 
 *** Begin Patch
@@ -123,28 +124,32 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
             path,
             expected,
             content,
-        } => match super::replace::commit_replace(context, &path, &expected, &content).await {
-            Ok(super::replace::Commit::Written) => Ok(Applied::Replaced {
+        } => match crate::workspace::WorkspaceEditor::replace(context, &path, &expected, &content)
+            .await
+        {
+            Ok(crate::workspace::Commit::Written) => Ok(Applied::Replaced {
                 path,
                 before: expected,
                 after: content,
             }),
-            Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+            Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                 "{} changed on disk between planning and writing this patch — another process or \
                  command edited it. Re-read it and rebuild the patch against what is there now.",
                 path.display()
             ))),
-            Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+            Ok(crate::workspace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
             Err(error) => Err(CommitFailure::Infrastructure(error)),
         },
         Op::Create { path, content } => {
-            match super::replace::commit_create(context, &path, &content).await {
-                Ok(super::replace::Commit::Written) => Ok(Applied::Created { path, content }),
-                Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+            match crate::workspace::WorkspaceEditor::create(context, &path, &content).await {
+                Ok(crate::workspace::Commit::Written) => Ok(Applied::Created { path, content }),
+                Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                     "{} was created by another writer while this patch was being committed",
                     path.display()
                 ))),
-                Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+                Ok(crate::workspace::Commit::Rejected(message)) => {
+                    Err(CommitFailure::Model(message))
+                }
                 Err(error) => Err(CommitFailure::Infrastructure(error)),
             }
         }
@@ -152,18 +157,18 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
             path,
             expected,
             permissions,
-        } => match super::replace::commit_remove(context, &path, &expected).await {
-            Ok(super::replace::Commit::Written) => Ok(Applied::Removed {
+        } => match crate::workspace::WorkspaceEditor::remove(context, &path, &expected).await {
+            Ok(crate::workspace::Commit::Written) => Ok(Applied::Removed {
                 path,
                 content: expected,
                 permissions,
             }),
-            Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+            Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                 "{} changed on disk between planning and deleting it — another process or \
                      command edited it. Re-read it and rebuild the patch against what is there now.",
                 path.display()
             ))),
-            Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+            Ok(crate::workspace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
             Err(error) => Err(CommitFailure::Infrastructure(error)),
         },
     }
@@ -178,11 +183,11 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
                 after,
             } => (
                 path,
-                super::replace::commit_replace(context, path, after, before).await?,
+                crate::workspace::WorkspaceEditor::replace(context, path, after, before).await?,
             ),
             Applied::Created { path, content } => (
                 path,
-                super::replace::commit_remove(context, path, content).await?,
+                crate::workspace::WorkspaceEditor::remove(context, path, content).await?,
             ),
             Applied::Removed {
                 path,
@@ -190,7 +195,7 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
                 permissions,
             } => (
                 path,
-                super::replace::commit_create_with_permissions(
+                crate::workspace::WorkspaceEditor::create_with_permissions(
                     context,
                     path,
                     content,
@@ -200,14 +205,14 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
             ),
         };
         match outcome {
-            super::replace::Commit::Written => {}
-            super::replace::Commit::Stale => {
+            crate::workspace::Commit::Written => {}
+            crate::workspace::Commit::Stale => {
                 return Err(ToolError::Io(format!(
                     "rollback refused to overwrite a concurrent change at {}",
                     path.display()
                 )));
             }
-            super::replace::Commit::Rejected(message) => {
+            crate::workspace::Commit::Rejected(message) => {
                 return Err(ToolError::Io(format!(
                     "rollback rejected {}: {message}",
                     path.display()
@@ -446,8 +451,8 @@ impl Tool for ApplyPatchTool {
             }
         }
 
-        // Enforce the model-policy per-step file cap (spec §17): weaker models
-        // are kept to small, reviewable edits.
+        // Enforce the caller's per-step file cap (spec §17). Unlimited by
+        // default; a caller that wants small, reviewable edits sets a budget.
         if context.policy.max_files_per_step > 0 {
             let distinct: std::collections::BTreeSet<&String> = modified.iter().collect();
             if distinct.len() > context.policy.max_files_per_step {
@@ -1293,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn enforces_max_files_per_step() {
         let (context, dir) = ctx();
-        let context = context.with_policy_limits(2, true); // cap at 2 files
+        let context = context.with_policy_limits(2); // cap at 2 files
         let patch = "*** Begin Patch\n*** Add File: a.rs\n+a\n*** Add File: b.rs\n+b\n*** Add File: c.rs\n+c\n*** End Patch";
         let out = ApplyPatchTool
             .execute(

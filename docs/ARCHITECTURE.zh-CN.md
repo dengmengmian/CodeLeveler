@@ -272,6 +272,8 @@ Capability != crate
 
 不要为了让图对称就去建 `leveler-workspace-search`、`leveler-workspace-editor`、`leveler-code-intelligence`。拆 crate 需要：两个真实消费者、真实的依赖倒置、独立的安全/运行时/协议边界，或者观察到的耦合缺陷。在第二个实现出现之前，优先用具体 struct 而不是 trait。
 
+五个里已经有三个是真的，而且就是字面意义上的三个具体 struct：`crates/leveler-tools/src/workspace/` 下的 `reader.rs`、`search.rs`、`editor.rs`，crate 私有，没有 trait、没有 registry、没有新 crate。`CommandExecution` 和 `CodeIntelligence` 仍然长在各自的工具里，见 §18.3 D 和 E。
+
 ### 5.4 ToolHost 准入，Host Execution 执行
 
 ```text
@@ -435,7 +437,7 @@ ToolRegistry
 | 集合 | 数量 |
 | --- | --- |
 | `core_registry()` | 14 |
-| `full_registry()` = core + 17 + 12 个 browser | 43 |
+| `full_registry()` = core + 18 + 12 个 browser | 44 |
 | 执行器注入的 Harness 控制工具 | 7 |
 | `default_registry()` | 就是 `full_registry()` |
 
@@ -443,7 +445,7 @@ ToolRegistry
 
 有两个事实值得点名，因为它们和直觉相反：
 
-- **`find_files` 不在 `core_registry()` 里。** economy 工具面有 `grep` 和 `list_files`，但要通过 `expand_tools("search")` 才拿得到 `find_files`。如果 `find_files` 是核心原语——从模型意图的角度看它是——那这是一个工具面组合的错误，不是能力缺失。
+- **`find_files` 和 `write_file` 不在 `core_registry()` 里。** economy 工具面有 `grep` 和 `list_files`，但要通过 `expand_tools("search")` 才拿得到 `find_files`；`write_file` 也只进了 full 而不是 core。两个都是核心原语基座成员（§6.3），所以这是留给 Tool Surface Closure 的工具面组合缺口，不是能力缺失。
 - **`replace`、`shell_command`、`update_plan`、`load_skill`、`expand_tools`、`memory` 都在 core 里。** economy 工具面不是「原语集合」，它是一份历史选择。
 
 ### 6.3 核心原语基座（Core Primitive Foundation）
@@ -542,7 +544,7 @@ Eval 候选，以及各自上榜的理由：
 | `blast_radius` | 高级 Code Intelligence 操作（references → 外层符号 → BFS），不是原语。先移入可选包，再 Eval 它是否真的减少 round 或提升重构召回。 |
 | `read_symbol` | `find_symbol` + `read_file` 可复现。只有当它可测量地省 token 或省 round 时才该留。纯 Eval 问题。 |
 | `replace` | **REMOVE / SURFACE-EVAL 候选。** 它原本的理由——给较弱模型一条精确 find/replace 路径，避免在 patch 上下文匹配上反复失败——已经撤销（§1.1），不再是保留它的理由。剩下的是一个普通问题：`replace` 是否表达了 `edit` + `write` 覆盖不到的、独立且普遍有用的编码原语？就按重叠度判断；删除它不以「弱模型 A/B」为前提。 |
-| `shell_command` vs `run_command` | `run_command` 是 program+args：跨平台、无 shell 引号问题、安全分析简单。`shell_command` 是模型最熟悉的字符串形式。`shell_command` 已经复用 `run_command` 的 `execute_program`，所以「两个适配器、一个能力」在架构上完全没问题。模型面是否只留一个，是 Eval 问题。 |
+| `shell_command` vs `run_command` | **已决定：两个都留。** 它们是两个不同的模型意图，不是同一件事的两种写法。`run_command` 是 program+args：跨平台、无 shell 引号问题、审批时易做安全分析，而且只有它能起后台任务。`shell_command` 是一整行 shell——管道、重定向、`&&` 链本来就是这个形状，硬拆成 argv 只会多花 round。`shell_command` 已经复用 `run_command` 的 `execute_program`，所以这是「两个适配器、一个能力」。剩下的不对称——`shell_command` 不能起后台——是记录，不是这次修。 |
 | `git_status` / `git_diff` | 用 `run_command` 也能做，但 git 检视是高频动作，不需要 shell，输出稳定，可 replay。接口暂时保留；实现迁到 `leveler-vcs`。 |
 
 `list_files` 和 `find_files` **不是**合并候选。它们表达不同的模型意图——「这个目录里有什么」对「仓库里哪里有符合这个模式的文件」。真正该统一的是它们底下的文件系统遍历和 ignore 语义。
@@ -935,54 +937,41 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 ### 18.3 具体工具实现债务
 
-以下每一条，都是工具在自己实现本应调用的能力行为。
+以下每一条，都是工具在自己实现本应调用的能力行为。A–C 和 H 已由核心原语基座这轮工作关闭，条目保留下来写明实际做了什么、以及各自还剩什么；D–G 仍然开着。
 
-#### A. `read_file` 做得太多，其中两条策略本身也不对
+#### A. `read_file` 仍然承担 stale-write 观测（大部分已关闭）
 
-`crates/leveler-tools/src/tools/read_file.rs` 目前拥有：文件读取、分页、二进制检测、全文件指纹、重复读策略、stale-write 前置状态、输出预算、模型引导。
+`crates/leveler-tools/src/tools/read_file.rs` 现在是模型面的适配器：schema、渲染、分页文案。读本身归 `leveler-tools::workspace::WorkspaceReader`，它返回有界内容加一个 `ReadObservation`。
 
-已验证的后果：
+已关闭：
 
-- **窄 range 读仍然扫全文件。** 源码自己写着：「完整流式读一遍文件：这让窄 range 在内存上保持 O(行长)，同时仍产出 stale-write 保护需要的全文件指纹和分页文案要用的总行数。」内存有界，时间是 O(文件)。
-- **超过 10 MB 的文件被直接拒绝**，在考虑 range 之前就拒了，然后告诉模型「用 `grep`……或者 `run_command` 配 sed/head/tail 切片」。对一个 100 MB 文件做有界的 50 行读是合理请求，工具却做不到；而且建议的替代方案不跨平台——考虑到本项目支持 Windows，这个问题是具体的。
-- **非法 UTF-8 被静默改写。** 每行用 `String::from_utf8_lossy` 渲染，非法字节以 `U+FFFD` 到达模型。二进制保护只扫前 8 KB 找 NUL，所以一个「非 UTF-8 但开头 8 KB 没有 NUL」的文件会走 lossy 路径。磁盘上的字节和展示给模型的文本不一致，而且没有任何提示。
-- **重复读策略住在读工具里。** 模型是不是在浪费 round 重复读同一段，这是 harness 的行为策略，不是文件系统读语义。
-- **stale-write 追踪住在读工具里。** `read_file` 把指纹记进 `FileStateTracker`，好让 `apply_patch` 之后能拒绝过期写入。这正是窄读也必须扫全文件的原因：读，为未来可能的编辑承担了前置状态。
+- **体积不再让读失败。** 10 MB 上限已删除，工具也不再把模型推去用 `sed`/`head`/`tail`——对 100 MB 文件做一次有界窗口读就是普通调用，分页规则写在工具自己的契约里。
+- **非法 UTF-8 如实上报，不再改写。** 全文件逐行解码；第一处非法行是显式错误并给出行号，含 NUL 字节的文件报「不是文本文件」。没有任何 `U+FFFD` 冒充文件内容到达模型。
+- **重复读策略已删除。** `RepeatedReadGuard` 及其配置管线一并删除。模型重复读同一段是对它推理的判断，harness 不做这种判断（§1.1）。
+- **结果预算是显式的。** 调用方把「我能渲染多少字节，以及每行装饰要多少字节」告诉 reader，所以渲染后的结果真的装得下预算。
 
-**目标契约**（行为，不是 API）：
+仍然开着：
 
-```text
-读是有界的。
-读语义是确定的。
-窄 range 读不应要求无关的全文件工作，除非机械正确性证明确有必要。
-读不拥有编辑策略。
-读不拥有重复读策略。
-读不拥有结果预算策略。
-非法文本或二进制数据要如实报告，而不是静默改写成另一段文本。
-大文件应当能通过有界读来查看，而不是仅仅因为体积大就必须改用 shell 命令。
-```
+- **窄窗口读仍然流式扫全文件。** 保护后续编辑的指纹覆盖全文件，目前没有同等强度而更便宜的做法。内存是 O(最长行 + 窗口)，时间是 O(文件)。正确性优先于这个优化，在替代方案自证之前保持现状。
 
-**目标 ownership。** `ReadFileTool → WorkspaceReader`，返回有界的结构化读结果。stale-write 保护变成「workspace 读观测」与 `WorkspaceEditor` 之间的显式机制，而不是藏在读工具里的副作用。重复读提醒移交 harness，它本来就看得到工具历史。
+**剩余目标 ownership。** stale-write 保护已经是 `ReadObservation` 与 `WorkspaceEditor` 之间的显式机制，不再是藏起来的副作用；但指纹仍由读工具记进共享的 `FileStateTracker`，而不是随观测一起传递。
 
-**修正风险。** 中。stale-write 保护是真实的安全属性，搬家时必须原样保留，不能为了让读更快而削弱它。
+#### B. Workspace 搜索已经确定（四个读原语已关闭）
 
-#### B. Workspace 搜索的语义随环境变
+`list_files`、`find_files`、`grep` 都是 `leveler-tools::workspace::WorkspaceSearch` 的适配器：一套遍历、一套 ignore 规则、一种 glob 方言、一种正则方言，全部在进程内。
 
-`list_files`、`find_files`、`grep` 和符号回退扫描各自带着一套目录遍历、ignore 规则和结果上限。
+- **不起子进程。** `git ls-files` 和 `rg` 都没了。四个读原语现在都声明 `replay_is_side_effect_free`，这是「不依赖任何外部二进制」的机械证明。
+- **一次调用一个含义。** `grep` 的 pattern 就是正则，`literal` 和 `ignore_case` 是显式参数；不会再因为没装 `rg` 就退化成子串扫描。`find_files` 的 pattern 就是 glob，锚定规则用 gitignore/ripgrep 那一套（不含 `/` 匹配文件名，含 `/` 匹配相对路径）；`auto`/`substring`/`glob` 模式开关已删除。
+- **候选集合不再取决于 Git。** `.gitignore` 和 `.ignore` 由 `ignore` crate 解析，与「是不是仓库」「装没装 Git」无关；用户的全局 gitignore 刻意不读，否则同一个仓库在两台机器上会搜出不同结果。
+- **`list_files` 就是目录检视。** 它只列一个目录的直接子项，并且什么都不隐藏——`max_depth` 没了，构建产物过滤也没了：一层列表本来就不会下钻进 `target/`，藏起来只是让模型少知道一个事实。
 
-更严重的是 `grep` 会随机器改变查询语义：装了 `rg` 时 pattern 是正则；没装时，内置回退把它当字面子串匹配。工具在 pattern 看起来像正则时确实会追加一行 `[note] ripgrep unavailable …`，所以不算静默——但同一个工具调用在不同机器上仍然是不同的意思。
+仍然开着：`locate_hint` 和符号回退扫描各自带着遍历。它们不是读原语，这次没动。
 
-**目标。** 在 macOS、Linux、Windows 上一套确定的 workspace 搜索语义，`list_files`、`find_files`、`grep` 底下共用一套遍历和 ignore 规则。
+#### C. Workspace 编辑只有一个 Owner（已关闭）
 
-**风险。** 中。内置一个正则引擎会改变现有用户的匹配结果，这个变更需要是有意为之并且被公告的。
+`leveler-tools::workspace::WorkspaceEditor` 是工具通往磁盘文件的唯一受保护路径：跨进程 advisory 锁横跨比较与 rename、CAS、不可猜的暂存名、capability/描述符相对写、checkpoint 捕获，以及在锁内重新校验写入范围。`apply_patch`、`replace`、`write_file` 都调它。
 
-#### C. Workspace 编辑逻辑在两个工具里重复
-
-`apply_patch` 和 `replace` 各自带着 stale 保护、CAS、原子修改、回滚和 diff/证据。
-
-**目标。** `ApplyPatchTool` 和 `ReplaceTool` 都调用同一个 `WorkspaceEditor`。CAS、stale 保护、回滚、all-or-nothing 行为原样保留，只换 Owner。
-
-**风险。** 中高。这是一旦有 bug 就会损坏用户文件的路径。只能在现有测试保护下搬，且同一步内不做行为变更。
+代码本身没变——它本来就是共享提交路径，只是住在 `replace` 工具里，于是共享 runtime 被以它的一个调用方命名。这次只搬了 Owner。
 
 #### D. `run_command` 拥有了命令执行的大部分
 
@@ -1018,15 +1007,15 @@ Kernel 和工具边界这两侧是过的。`leveler-agent-core` 只依赖 `level
 
 **风险。** 低。
 
-#### H. `wait_task` 拥有 workspace 结算
+#### H. 后台结算归运行时（已关闭）
 
-`WaitTaskTool` 刻意不是 `RiskLevel::Safe`，因为它在 wait 结束时会跑 `account_background_mutations`，可能把整个 workspace 恢复到快照。它自己的源码注释写明了这一点。
+`WaitTaskTool` 过去在 wait 结束时跑 `account_background_mutations`，可能把整个 workspace 恢复到快照。于是结算取决于模型是否愿意等：回合先结束了、或模型根本没调 wait，一次越权写入就留在磁盘上。
 
-一个名字叫「wait」的模型工具，不应该拥有 workspace 回滚语义。
+现在 `BackgroundTaskRegistry` 在任务进程退出时结算：reaper 取走 `MutationBaseline`，diff workspace，并且**仅在存在显式写入白名单时**恢复该任务无权改动的部分，然后在发布终态之前存下 `BackgroundSettlement`。白名单随 baseline 一起传，因为后台任务运行时依据的授权就是它 spawn 时的那份；它比这一回合活得久，运行时结算时没有「后来的 scope」可查。`wait_task` 只读取这份结算一次并渲染。
 
-**目标。** 由 `BackgroundTaskRuntime` 拥有结算。`get_task` 和 `wait_task` 只读取或等待状态。
+dev-server 安全不变：恢复仍然只在显式白名单下发生，所以默认后台任务只被记账、永不回滚（K17）。
 
-**风险。** 中。后台任务结算和 dev-server 安全规则相互纠缠，那些规则的存在是有原因的。
+`wait_task` 仍然不是 `Safe`。它不再执行结算，但它会消费那份一次性报告，而崩溃重放会阻塞恢复最多两分钟并把报告吞掉。
 
 ### 18.4 Sidecar 进程绕开 CommandRunner
 
@@ -1134,7 +1123,13 @@ pub struct ToolOutcome { pub content: String, pub is_error: bool }
 
 `apply_patch` 是 canonical 结构化编辑，`write_file` 是 canonical 整文件写入，`replace` 与两者都重叠。它当初成立的理由——在 patch 上下文匹配反复失败时给模型一条精确 find/replace 路径——已经撤销（§1.1）。剩下的是一个普通的工具面问题：`replace` 是否表达了 `edit` 和 `write` 覆盖不到的独立模型意图？现在的默认答案是「否」。
 
-### 19.3 模型控制的动态工具扩展划得来吗？
+### 19.3 patch 上下文匹配该松到什么程度？
+
+`seek_sequence` 用五轮逐级放松来定位一个 hunk：精确、去尾部空白、去两端空白、typographic Unicode 折叠、内部空白压缩（`a+b` 匹配 `a + b`）。前三轮是普通的格式容忍。后两轮存在的理由是「模型把刚读过的内容重打一遍时会有空格漂移」，这属于转录补偿而不是机械容忍，§1.1 不认可。
+
+但它们暂时保留，这是有意的。收紧匹配器会改变编辑成功率，而且改的是「一旦有 bug 就会损坏用户文件」的那条路径——这正是 §6.6 所说「该由证据而不是审美来定」的情形。`replace` 里那个可比的机制已经删除：它匹配的是**另一个**字符串，而且连自己写到哪一行都报不出来；一次工具无法定位的变更是不可上报的变更，那是机械缺陷，不是程度问题。
+
+### 19.4 模型控制的动态工具扩展划得来吗？
 
 `expand_tools` 用一个额外 round 加动态 registry 状态去买 schema token。Harness 侧选择用同样的 token 收益换来零动态状态，代价是不能会话中途自适应。只有 Eval 能定哪个更值，而且举证责任在动态方案这一边，因为是它反转了 ownership。
 
@@ -1165,10 +1160,11 @@ CORE_PRIMITIVE_FOUNDATION_DEFINED YES
 
 TOOL_IMPLEMENTATION_ALIGNED       NO
 ENGINE_IMPLEMENTATION_ALIGNED     NO
-CORE_PRIMITIVE_FOUNDATION_ALIGNED NO
+CORE_PRIMITIVE_FOUNDATION_ALIGNED YES
+TOOL_SURFACE_CLOSED               NO
 
 SECOND_HARNESS_TEST               NOT_YET_ENFORCED
 FOUNDATION_FROZEN                 NO
 ```
 
-架构和工具边界已经定了。实现还没对齐，本文写明了差在哪里。没有为了让这张表里任何一行好看而修改源码。
+架构和工具边界已经定了。七个核心原语已经按它实现；更宽的工具面、`ToolContext`、`ToolRegistry` 和 Engine 还没对齐，§18 写明了差在哪里。没有为了让这张表里任何一行好看而修改源码。

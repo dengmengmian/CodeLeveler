@@ -40,7 +40,8 @@ pub use approval::{
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
-    BackgroundTaskRegistry, BackgroundTaskSnapshot, BackgroundTaskStatus, MutationBaseline,
+    BackgroundSettlement, BackgroundTaskRegistry, BackgroundTaskSnapshot, BackgroundTaskStatus,
+    MutationBaseline,
 };
 pub use checkpoint::Checkpoint;
 pub use command::{

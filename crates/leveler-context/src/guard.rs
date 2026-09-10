@@ -1,8 +1,10 @@
-//! Repeated-read guard (spec §28 RepeatedReadHook): detect when a model reads
-//! the same file range over and over so the tool can nudge it to use what it has.
-//!
-//! Plus the stale-write guard: detect that a file changed between the read that
+//! The stale-write guard: detect that a file changed between the read that
 //! shaped the model's patch and the write that applies it.
+//!
+//! There used to be a repeated-read guard here too, which annotated a read
+//! when the model asked for the same unchanged range again. That is a judgement
+//! about the model's reasoning, not a fact about the filesystem, and the
+//! harness does not make it (`docs/ARCHITECTURE.md` §1.1).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,72 +31,6 @@ impl ContentFingerprint {
     /// Final stable 64-bit value.
     pub fn finish(self) -> u64 {
         self.0
-    }
-}
-
-/// Tracks repeated reads of the same (file, range, content version).
-pub struct RepeatedReadGuard {
-    reads: Mutex<HashMap<String, (u64, u32)>>,
-    threshold: u32,
-}
-
-impl Default for RepeatedReadGuard {
-    fn default() -> Self {
-        Self::new(3)
-    }
-}
-
-impl RepeatedReadGuard {
-    /// Create a guard that trips after `threshold` repeats of the same range.
-    pub fn new(threshold: u32) -> Self {
-        Self {
-            reads: Mutex::new(HashMap::new()),
-            threshold: threshold.max(1),
-        }
-    }
-
-    /// Record a read of `key` (e.g. "path:start-end") for the current file
-    /// contents. A changed file starts a fresh count so recovery reads after a
-    /// command, user edit, or sub-agent write are never mistaken for looping.
-    pub fn record(&self, key: &str, content: &[u8]) -> u32 {
-        let fingerprint = FileStateTracker::fingerprint(content);
-        self.record_fingerprint(key, fingerprint)
-    }
-
-    /// Record a fingerprint produced while streaming the file.
-    pub fn record_fingerprint(&self, key: &str, fingerprint: u64) -> u32 {
-        let mut reads = self.reads.lock().unwrap();
-        let entry = reads.entry(key.to_string()).or_insert((fingerprint, 0));
-        if entry.0 != fingerprint {
-            *entry = (fingerprint, 0);
-        }
-        entry.1 += 1;
-        entry.1
-    }
-
-    /// Whether this is a wasteful repeat of an unchanged range. This is a nudge
-    /// signal only: `read_file` still returns the requested content so a failed
-    /// edit can always recover.
-    pub fn tripped(&self, key: &str, content: &[u8]) -> bool {
-        self.record(key, content) > self.threshold
-    }
-
-    /// [`Self::tripped`] for a precomputed streamed fingerprint.
-    pub fn tripped_fingerprint(&self, key: &str, fingerprint: u64) -> bool {
-        self.record_fingerprint(key, fingerprint) > self.threshold
-    }
-
-    /// Total wasteful repeats recorded so far: for every tracked range, how
-    /// many reads exceeded the threshold on unchanged content. This is the
-    /// authoritative re-read-pressure signal C5-S3's expansion decision
-    /// consumes — a rising count after a compaction means the fold dropped
-    /// something the model still needs.
-    pub fn total_trips(&self) -> u32 {
-        let reads = self.reads.lock().unwrap();
-        reads
-            .values()
-            .map(|(_, count)| count.saturating_sub(self.threshold))
-            .sum()
     }
 }
 
@@ -157,30 +93,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trips_after_threshold() {
-        let g = RepeatedReadGuard::new(2);
-        assert!(!g.tripped("a:1-10", b"same")); // 1st
-        assert!(!g.tripped("a:1-10", b"same")); // 2nd
-        assert!(g.tripped("a:1-10", b"same")); // 3rd — over threshold
-    }
-
-    #[test]
-    fn distinct_ranges_are_independent() {
-        let g = RepeatedReadGuard::new(1);
-        assert!(!g.tripped("a:1-10", b"same"));
-        assert!(!g.tripped("b:1-10", b"same"));
-        assert!(g.tripped("a:1-10", b"same"));
-    }
-
-    #[test]
-    fn changed_content_resets_the_repeat_count() {
-        let g = RepeatedReadGuard::new(1);
-        assert!(!g.tripped("a:1-10", b"before"));
-        assert!(g.tripped("a:1-10", b"before"));
-        assert!(!g.tripped("a:1-10", b"after"));
-    }
-
-    #[test]
     fn untracked_file_is_never_stale() {
         let t = FileStateTracker::default();
         assert!(!t.is_stale("never/read.rs", b"anything"));
@@ -209,10 +121,6 @@ mod tests {
         let tracker = FileStateTracker::default();
         tracker.record_fingerprint("a.rs", fingerprint);
         assert!(!tracker.is_stale("a.rs", bytes));
-
-        let reads = RepeatedReadGuard::new(1);
-        assert!(!reads.tripped_fingerprint("a:1-2", fingerprint));
-        assert!(reads.tripped_fingerprint("a:1-2", fingerprint));
     }
 
     #[test]

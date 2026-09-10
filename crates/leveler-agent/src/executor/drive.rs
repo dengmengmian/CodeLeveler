@@ -148,11 +148,12 @@ pub(crate) const PLAN_FRESHNESS_TEXT: &str = "Your active plan has not been upda
 /// semantic judgement the runtime has no authority to make.
 const PLAN_FRESHNESS_AFTER_WORK_ROUNDS: u32 = 6;
 
-/// Bounded recovery from a malformed tool call: a weak model sometimes emits
-/// tool arguments that aren't valid JSON (an unescaped backslash from a regex,
-/// or a raw newline from a multi-line script). Rather than failing the whole
-/// turn on that Decode error, feed the parse error back and let the model
-/// resend. Reset on any clean round so the cap is on *consecutive* failures.
+/// Bounded recovery from a malformed tool call: tool arguments sometimes
+/// arrive as invalid JSON (an unescaped backslash from a regex, a raw newline
+/// from a multi-line script). Rather than failing the whole turn on that Decode
+/// error, feed the parse error back and let the model resend — the error is
+/// reported exactly, and nothing guesses what the arguments meant. Reset on any
+/// clean round so the cap is on *consecutive* failures.
 const MAX_DECODE_RETRIES: u32 = 2;
 
 /// Plain-text output may hit the provider's per-response limit. Continue the

@@ -55,11 +55,13 @@ pub fn builtin_tool_metadata(name: &str) -> Option<BuiltinToolMetadata> {
                 observe_argument: None,
             }
         }
-        "apply_patch" | "replace" | "run_command" | "shell_command" => BuiltinToolMetadata {
-            class: BuiltinToolClass::Write,
-            primary_argument: None,
-            observe_argument: None,
-        },
+        "apply_patch" | "replace" | "write_file" | "run_command" | "shell_command" => {
+            BuiltinToolMetadata {
+                class: BuiltinToolClass::Write,
+                primary_argument: None,
+                observe_argument: None,
+            }
+        }
         _ => return None,
     };
     Some(metadata)

@@ -146,6 +146,14 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         visibility: ActivityVisibility::Important,
     },
     ToolTaxonomyEntry {
+        name: "write_file",
+        kind: ToolKind::Edit,
+        presentation_en: "Write file",
+        presentation_zh: "写入文件",
+        read_only_default: false,
+        visibility: ActivityVisibility::Important,
+    },
+    ToolTaxonomyEntry {
         name: "run_command",
         kind: ToolKind::Execute,
         presentation_en: "Run command",

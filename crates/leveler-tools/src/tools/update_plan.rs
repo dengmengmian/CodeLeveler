@@ -1,7 +1,7 @@
 //! `update_plan` — a lightweight TODO/checklist the model maintains across a
 //! long task. No side effects: it only
-//! records the plan and echoes it back so the model stays oriented and the user
-//! can see progress. Keeps weaker models from drifting on multi-step work.
+//! records the plan and echoes it back, so the plan is durable, visible to the
+//! user, and part of the run's evidence rather than only of the transcript.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;

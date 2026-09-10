@@ -125,7 +125,7 @@ fn write_targets(call: &ToolCall) -> Vec<String> {
                 .unwrap_or("");
             patch_paths(patch)
         }
-        "replace" => call
+        "replace" | "write_file" => call
             .arguments
             .get("path")
             .and_then(|v| v.as_str())
@@ -455,6 +455,32 @@ mod tests {
             write_targets_outside_allowlist(&call, &["src/other/".to_string()]),
             vec!["src/output/mod.rs".to_string()],
             "normalization must not turn a trailing slash into allow-everything"
+        );
+    }
+
+    /// The ownership fence and the per-worker write allowlist read a write
+    /// tool's targets from here. A write tool this function does not know
+    /// reports no target at all, so a sibling agent's file could be
+    /// overwritten without the fence ever seeing it.
+    #[test]
+    fn every_direct_write_tool_declares_its_target() {
+        let call = tool_call(
+            "write_file",
+            serde_json::json!({"path": "src/other/mod.rs", "content": "x\n"}),
+        );
+        assert_eq!(
+            mutation_targets(&call),
+            vec!["src/other/mod.rs".to_string()],
+            "write_file must declare the file it writes"
+        );
+        assert_eq!(
+            write_targets_outside_allowlist(&call, &["src/output/".to_string()]),
+            vec!["src/other/mod.rs".to_string()],
+            "a write_file outside the claimed scope must be caught"
+        );
+        assert!(
+            write_targets_outside_allowlist(&call, &["src/other/".to_string()]).is_empty(),
+            "a write_file inside the claimed scope must be allowed"
         );
     }
 

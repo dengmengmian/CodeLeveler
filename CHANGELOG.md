@@ -6,21 +6,13 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-- **A refused escalation now closes the tool call it announced.** A command
-  whose one-shot elevation the user denied was answered into the model's
-  transcript and nowhere else: the announcing `ToolCallStarted` never got a
-  terminal, so `EventLog::dangling_tool_calls` kept returning it and
-  `recover_crash_window` — which runs first on every `resume` and every
-  interactive chat turn — read it as a call that may have run and left a side
-  effect, blocking the session on `RecoveryConfirmationRequired` until
-  `acknowledge_crash_window` was run by hand. A command the runtime itself
-  refused to run was being reported as one that might have. All three
-  pre-admission refusals (no axis named, an axis already denied, the denial
-  itself) now answer the model *and* record the call's errored terminal.
-  Found by the first run of the Unified Dogfood Acceptance gate.
-
 ### Added
+- **`write_file(path, content)`** — the canonical whole-file write, on the
+  full tool surface. Creating or deliberately replacing a whole file is a
+  different intent from changing part of one. It goes through the same guarded
+  editor as `apply_patch`, so write scope, compare-and-swap, checkpoint and
+  rollback are identical, and overwriting a file that changed since it was
+  read is refused.
 - **Unified Dogfood Acceptance V1** (`docs/evaluations/`) — a thin release
   gate: seven committed cases, one revision, one model, and a list of
   mechanical counters that must be zero before a baseline is frozen. No eval
@@ -28,8 +20,41 @@ All notable changes to CodeLeveler are documented here. The format follows
   `leveler eval run` over case YAML and reads the durable record back. Its
   first run failed on the defect above; the accepted run and the new Beta
   baseline are recorded in `docs/BETA_BASELINE_POST_CLOSURE.md`.
+- **Every model call the runtime makes on its own account is recorded.** The
+  runtime's own calls wrote nothing to `model_requests`, so a goal session's
+  reported cost was short by all of them. They now write the `advisory` lane,
+  including on the paths that spend tokens and then fail — a reply that could
+  not be parsed is still a reply the provider billed. (The two callers that
+  motivated this, contract derivation and the reconciliation judge, were
+  themselves deleted in this release; compaction folds remain.)
 
 ### Changed
+- **The harness exposes capability; it does not emulate intelligence.**
+  Flattening model capability differences is withdrawn as a product goal. The
+  model owns reasoning, the harness owns domain semantics and capability
+  exposure, the runtime owns mechanical correctness — see
+  `docs/ARCHITECTURE.md` §1.1. Runtime reliability and provider compatibility
+  are separate concerns and are unchanged.
+- **The seven core primitives are `read`, `ls`, `find`, `grep`, `edit`,
+  `write`, `bash`,** and the four read primitives now mean the same thing on
+  every machine. `read_file` no longer refuses a file for its size — any file
+  is readable in bounded windows — and reports invalid UTF-8 instead of
+  handing the model replacement characters. `grep`'s pattern is always a
+  regex, with `literal` and `ignore_case` as parameters, and no longer
+  degrades to a substring scan when `rg` is missing. `find_files`'s pattern is
+  always a glob, using the gitignore/ripgrep anchoring rule, and its candidate
+  set no longer changes with whether Git is installed. `list_files` lists the
+  direct children of one directory and hides nothing. None of the four shells
+  out any more; all four are now replay-safe.
+- **`replace` no longer writes text you did not ask for.** Its fuzzy fallback,
+  which matched a near-miss string and could not report where it wrote, is
+  removed: a near miss is refused and the real text at the anchor is shown.
+- **Background tasks are settled by the runtime, not by `wait_task`.** When a
+  background process exits, the runtime diffs the workspace and — only under
+  an explicit write allowlist — restores what the task was not allowed to
+  touch. Enforcement no longer depends on the model choosing to wait.
+  Dev-server safety is unchanged: a default background task is accounted and
+  never rolled back.
 - **The agent loop is a reusable kernel.** `leveler-agent-core` now owns the
   one generic model↔tool loop — rounds, the model round with its retries,
   admission against round/token/cost/duration limits, cancellation, the
@@ -48,38 +73,6 @@ All notable changes to CodeLeveler are documented here. The format follows
   `leveler-client-protocol::session_wire`: it had no independent security,
   process, release, or compatibility boundary, and all four of its consumers
   already depended on the protocol crate.
-
-### Removed
-- **The runtime no longer judges the model's semantic completion.** The
-  Completion Contract (a model call at goal start that turned the task into
-  obligations with proof policies) and the Completion Reconciliation Gate (a
-  second model call at `update_goal(complete)` that judged the first) are
-  deleted, together with their config (`agents.completion_judge_model`,
-  `agents.completion_judge_timeout_seconds` — still accepted, ignored), their
-  ledger fields, their `GoalIntercepted` kinds, and the
-  `runtime_evidence_complete` / `step_receipts` / `complete_step` proof
-  machinery. Default hidden semantic model calls on a coding goal: zero.
-- **Automatic verification repair.** A failed post-edit check is reported as
-  `VerificationStatus::Failed` beside a completed outcome; the engine no
-  longer opens a repair turn on the model's behalf. `RepairStarted` and
-  `TurnKind::Repair` survive only to replay old rows.
-- **The auto-reviewer heuristic.** `independent_review: auto` (security /
-  concurrency path keywords, wide diffs) is gone. The policy is `off`
-  (default) or `required`; legacy `auto` reads as off and `always` as
-  required.
-- **The plan hard gate.** A multi-step task without `update_plan` gets one
-  soft reminder; editing and command tools are never refused for a missing
-  plan.
-- **Keyword task classification** (`classify_task`,
-  `task_looks_like_implementation`). "fix bug" with no mutation completes
-  when the model says so; the delivery gate's "implementation task has no
-  mutation" and "no fresh verification" refusals are gone.
-- **Semantic progress watchdogs.** Closeout thrash, observe thrash, the
-  stagnation streak and the 45-round engagement advisory are deleted. What
-  remains is mechanical: the identical-call loop guard, the all-calls-refused
-  streak, budgets and the absolute round ceiling.
-
-### Changed
 - **Task outcome and verification are orthogonal.** `TaskOutcome` is now
   `completed | blocked | budget_limited | failed | interrupted` (legacy
   `verified` / `completed_unverified` read as `completed`), and a new
@@ -128,8 +121,6 @@ All notable changes to CodeLeveler are documented here. The format follows
   every discovery. A later system message is conversation and stays in place.
 - **An event append no longer reads its own row back.** `append_owned` did an
   INSERT and then a SELECT; the INSERT returns the row.
-
-### Changed
 - **A turn reads the transcript it can reach, not the whole session.** Every
   chat, resume and goal-continuation turn loaded and deserialized the entire
   `session_messages` table, even when a watermarked context snapshot meant
@@ -158,6 +149,18 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **A refused escalation now closes the tool call it announced.** A command
+  whose one-shot elevation the user denied was answered into the model's
+  transcript and nowhere else: the announcing `ToolCallStarted` never got a
+  terminal, so `EventLog::dangling_tool_calls` kept returning it and
+  `recover_crash_window` — which runs first on every `resume` and every
+  interactive chat turn — read it as a call that may have run and left a side
+  effect, blocking the session on `RecoveryConfirmationRequired` until
+  `acknowledge_crash_window` was run by hand. A command the runtime itself
+  refused to run was being reported as one that might have. All three
+  pre-admission refusals (no axis named, an axis already denied, the denial
+  itself) now answer the model *and* record the call's errored terminal.
+  Found by the first run of the Unified Dogfood Acceptance gate.
 - **A budget extension no longer resends the whole raw transcript.** Every
   path that supplies a model with prior context assembled it — snapshot merge,
   checkpoint block, fold if still oversized — except `resume_with_limits`,
@@ -165,16 +168,6 @@ All notable changes to CodeLeveler are documented here. The format follows
   resent its entire history on every budget extension, the one model request
   bounded by nothing. The four paths now share one assembly, so the exception
   cannot come back by omission, and a source tripwire pins it.
-
-### Added
-- **Every model call the runtime makes on its own account is recorded.** The
-  runtime's own calls wrote nothing to `model_requests`, so a goal session's
-  reported cost was short by all of them. They now write the `advisory` lane,
-  including on the paths that spend tokens and then fail — a reply that could
-  not be parsed is still a reply the provider billed. (The two callers that
-  motivated this, contract derivation and the reconciliation judge, were
-  themselves deleted in this release; compaction folds remain.)
-### Fixed
 - **`leveler upgrade` understands pre-releases.** Publishing `0.2.0-beta.1` and
   then running the binary exposed four defects with one root cause: the version
   type discarded any `-suffix` at parse time, and it was used for ordering, for
@@ -198,6 +191,43 @@ All notable changes to CodeLeveler are documented here. The format follows
     provenance line is now `clap`'s own `version`, so `clap` decides which
     `--version` belongs to which command instead of a scan of the raw argument
     list guessing at it.
+
+### Removed
+- **The repeated-read guard.** How often a model re-reads an unchanged range
+  is a judgement about its reasoning, not a fact about the filesystem, so the
+  reader no longer annotates it.
+- **`find_files`'s `mode` and `extension` arguments, and `list_files`'s
+  `max_depth`.** `grep`'s `glob` and `max_results` are accepted as aliases of
+  `include` and `limit`, so calls recorded in an existing event log still
+  replay with their meaning intact.
+- **The runtime no longer judges the model's semantic completion.** The
+  Completion Contract (a model call at goal start that turned the task into
+  obligations with proof policies) and the Completion Reconciliation Gate (a
+  second model call at `update_goal(complete)` that judged the first) are
+  deleted, together with their config (`agents.completion_judge_model`,
+  `agents.completion_judge_timeout_seconds` — still accepted, ignored), their
+  ledger fields, their `GoalIntercepted` kinds, and the
+  `runtime_evidence_complete` / `step_receipts` / `complete_step` proof
+  machinery. Default hidden semantic model calls on a coding goal: zero.
+- **Automatic verification repair.** A failed post-edit check is reported as
+  `VerificationStatus::Failed` beside a completed outcome; the engine no
+  longer opens a repair turn on the model's behalf. `RepairStarted` and
+  `TurnKind::Repair` survive only to replay old rows.
+- **The auto-reviewer heuristic.** `independent_review: auto` (security /
+  concurrency path keywords, wide diffs) is gone. The policy is `off`
+  (default) or `required`; legacy `auto` reads as off and `always` as
+  required.
+- **The plan hard gate.** A multi-step task without `update_plan` gets one
+  soft reminder; editing and command tools are never refused for a missing
+  plan.
+- **Keyword task classification** (`classify_task`,
+  `task_looks_like_implementation`). "fix bug" with no mutation completes
+  when the model says so; the delivery gate's "implementation task has no
+  mutation" and "no fresh verification" refusals are gone.
+- **Semantic progress watchdogs.** Closeout thrash, observe thrash, the
+  stagnation streak and the 45-round engagement advisory are deleted. What
+  remains is mechanical: the identical-call loop guard, the all-calls-refused
+  streak, budgets and the absolute round ceiling.
 
 ## [0.2.0-beta.1] - 2026-08-22
 

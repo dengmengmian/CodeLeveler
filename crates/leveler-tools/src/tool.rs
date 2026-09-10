@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{FileStateTracker, RepeatedReadGuard};
+use leveler_context::FileStateTracker;
 use leveler_execution::{
     Checkpoint, CommandRunner, PermissionProfile, ProcessError, ResolvedExecutionPolicy, RiskLevel,
     SharedPermissionProfile, Workspace, WorkspaceError, WriteScope,
@@ -50,8 +50,6 @@ pub struct ExecutionResources {
     pub environment: Arc<leveler_core::EnvSnapshot>,
     /// Captures original file content before the first write, for rollback.
     pub checkpoint: Arc<Checkpoint>,
-    /// Detects wasteful repeated reads of the same file range.
-    pub read_guard: Arc<RepeatedReadGuard>,
     /// Fingerprints files as they were last read, so `apply_patch` can refuse
     /// to overwrite a file something else changed in the meantime.
     pub file_state: Arc<FileStateTracker>,
@@ -118,7 +116,7 @@ pub struct ToolPolicy {
     pub command_foreign_paths: Arc<Vec<String>>,
     /// Per-model byte budget for a single tool result (the central cap applied
     /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
-    /// weaker models with small reliable contexts may configure less.
+    /// a model with a smaller reliable context may configure less.
     pub tool_output_budget: usize,
 }
 
@@ -273,7 +271,6 @@ impl ToolContext {
                 runner: Arc::new(CommandRunner::with_environment(environment.clone())),
                 environment,
                 checkpoint: Arc::new(Checkpoint::new()),
-                read_guard: Arc::new(RepeatedReadGuard::default()),
                 file_state: Arc::new(FileStateTracker::default()),
                 command_gate: Arc::new(tokio::sync::Mutex::new(())),
             },
@@ -412,17 +409,9 @@ impl ToolContext {
         self
     }
 
-    /// Apply model-policy limits (spec §17): the per-step file cap and whether
-    /// the repeated-read guard is active (weaker models get tighter bounds).
-    pub fn with_policy_limits(
-        mut self,
-        max_files_per_step: usize,
-        repeated_read_guard: bool,
-    ) -> Self {
+    /// Apply the model-policy per-step file cap (spec §17).
+    pub fn with_policy_limits(mut self, max_files_per_step: usize) -> Self {
         self.policy.max_files_per_step = max_files_per_step;
-        // A disabled guard uses an effectively-infinite threshold.
-        let threshold = if repeated_read_guard { 3 } else { u32::MAX };
-        self.execution.read_guard = Arc::new(RepeatedReadGuard::new(threshold));
         self
     }
 }

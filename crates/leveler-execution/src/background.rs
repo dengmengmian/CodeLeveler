@@ -13,11 +13,37 @@ use crate::command::{CommandRunner, ManagedProcess, ProcessIdentity, ProcessRequ
 use crate::snapshot::SnapshotId;
 use crate::windows_sandbox::assert_background_intent_spawn_allowed;
 
-/// Pre-spawn workspace snapshot used for wait-end mutation accounting (PR-3b).
+/// Pre-spawn workspace snapshot and write authority, used to settle a
+/// background task when its process exits.
+///
+/// The allowlist travels with the baseline rather than being read at
+/// settlement time because the authority a task runs under is the one it was
+/// spawned with. A background process outlives the round that started it, so
+/// there is no later scope to consult.
 #[derive(Debug, Clone)]
 pub struct MutationBaseline {
     pub snapshot: SnapshotId,
     pub workspace_root: PathBuf,
+    /// Paths this task was allowed to modify. `None` means unconstrained: the
+    /// task's changes are still accounted, but nothing is restored.
+    pub write_allowlist: Option<Vec<String>>,
+}
+
+/// What the runtime found when the task's process exited.
+///
+/// Produced exactly once per task, by the reaper, without any tool call. A
+/// waiter reads it; it never computes it (`docs/ARCHITECTURE.md` §18.3 H).
+#[derive(Debug, Clone)]
+pub struct BackgroundSettlement {
+    /// Workspace-relative paths the task changed, after any restore.
+    pub modified: Vec<String>,
+    /// The write-scope violation this task committed, and what was done about
+    /// it. `None` when the task stayed inside its authority.
+    pub violation: Option<String>,
+    /// Why the change set is unknown, when the workspace could not be diffed.
+    pub note: Option<String>,
+    /// The snapshot the task was measured against.
+    pub snapshot: SnapshotId,
 }
 
 const MAX_CONCURRENT: usize = 4;
@@ -113,8 +139,11 @@ struct TaskInner {
     done: Arc<Notify>,
     process_done: bool,
     log_pumps_remaining: u8,
-    /// Taken once by wait-end accounting so restore/diff runs at most once.
+    /// Consumed by the reaper when the process exits, so the diff and any
+    /// restore run exactly once and without waiting for a tool call.
     mutation_baseline: Option<MutationBaseline>,
+    /// What the reaper found. Read by a waiter; never produced by one.
+    settlement: Option<BackgroundSettlement>,
     /// Keeps the private scratch (and, on macOS/Linux, its OS lease) alive
     /// until the child and log pumps finish — so a backgrounded command holds
     /// its lease for its whole life. [`finalize_if_drained`] drops it at that
@@ -236,6 +265,7 @@ impl BackgroundTaskRegistry {
                 process_done: false,
                 log_pumps_remaining,
                 mutation_baseline,
+                settlement: None,
                 sandbox_scratch,
             },
         );
@@ -259,11 +289,25 @@ impl BackgroundTaskRegistry {
                     Err(_) => None,
                 }
             };
+            // Settle before publishing the terminal state, so a waiter woken
+            // by `finalize_if_drained` never observes a task that is finished
+            // but not yet accounted for.
+            let baseline = {
+                let mut st = reg.lock().await;
+                st.tasks
+                    .get_mut(&tid)
+                    .and_then(|t| t.mutation_baseline.take())
+            };
+            let settlement = match baseline {
+                Some(baseline) => Some(settle(&baseline).await),
+                None => None,
+            };
             let mut st = reg.lock().await;
             if let Some(task) = st.tasks.get_mut(&tid) {
                 task.process_done = true;
                 task.exit_code = code;
                 task.identity = None;
+                task.settlement = settlement;
                 finalize_if_drained(task);
             }
             if let Some(kod) = kill_on_drop.upgrade() {
@@ -279,14 +323,11 @@ impl BackgroundTaskRegistry {
         st.tasks.get(id).map(snapshot)
     }
 
-    /// Take the pre-spawn mutation baseline exactly once (wait-end accounting).
-    ///
-    /// Subsequent calls return `None` so diff/restore cannot double-apply.
-    pub async fn take_mutation_baseline(&self, id: &str) -> Option<MutationBaseline> {
+    /// Take the settlement exactly once, so a task's file changes are reported
+    /// to the agent loop a single time however often it is waited on.
+    pub async fn take_settlement(&self, id: &str) -> Option<BackgroundSettlement> {
         let mut st = self.inner.lock().await;
-        st.tasks
-            .get_mut(id)
-            .and_then(|t| t.mutation_baseline.take())
+        st.tasks.get_mut(id).and_then(|t| t.settlement.take())
     }
 
     pub async fn wait(
@@ -494,6 +535,68 @@ where
             finalize_if_drained(task);
         }
     });
+}
+
+/// Diff the workspace against the task's baseline and, when the task wrote
+/// outside the authority it was spawned with, restore it.
+///
+/// Restore runs ONLY under an explicit allowlist. A default background task —
+/// a dev server, a watcher — is accounted and never rolled back: it is
+/// supposed to write, and reverting a running server's output is worse than
+/// reporting it (K17).
+async fn settle(baseline: &MutationBaseline) -> BackgroundSettlement {
+    let root = &baseline.workspace_root;
+    let id = &baseline.snapshot;
+
+    let mut modified = Vec::new();
+    let mut note = None;
+    match crate::snapshot::WorkspaceSnapshot::changed_since(root, id).await {
+        Ok(changed) => modified = changed,
+        Err(error) => {
+            note = Some(format!(
+                "could not diff the workspace after this background task ({error}); \
+                 its file changes were not tracked"
+            ));
+        }
+    }
+
+    let mut violation = None;
+    if let Some(allowlist) = baseline.write_allowlist.as_deref() {
+        let outside: Vec<&str> = modified
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !allowlist.iter().any(|allowed| path_allows(allowed, path)))
+            .collect();
+        if !outside.is_empty() {
+            let detail = format!(
+                "background task modified files outside allowed paths: {}",
+                outside.join(", ")
+            );
+            match crate::snapshot::WorkspaceSnapshot::restore(root, id).await {
+                Ok(()) => {
+                    modified.clear();
+                    violation = Some(format!("{detail}; workspace restored"));
+                }
+                Err(error) => {
+                    violation = Some(format!(
+                        "{detail}; automatic workspace restore failed: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    BackgroundSettlement {
+        modified,
+        violation,
+        note,
+        snapshot: id.clone(),
+    }
+}
+
+fn path_allows(allowed: &str, modified: &str) -> bool {
+    let allowed = allowed.trim_end_matches('/');
+    modified == allowed || modified.starts_with(&format!("{allowed}/"))
 }
 
 fn finalize_if_drained(task: &mut TaskInner) {
@@ -740,6 +843,7 @@ mod tests {
                     process_done: true,
                     log_pumps_remaining: 0,
                     mutation_baseline: None,
+                    settlement: None,
                     sandbox_scratch: None,
                 },
             );
@@ -767,6 +871,7 @@ mod tests {
                     process_done: false,
                     log_pumps_remaining: 0,
                     mutation_baseline: None,
+                    settlement: None,
                     sandbox_scratch: None,
                 },
             );
@@ -809,6 +914,7 @@ mod tests {
             process_done: true,
             log_pumps_remaining: 0,
             mutation_baseline: None,
+            settlement: None,
             sandbox_scratch: {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
@@ -828,8 +934,10 @@ mod tests {
         assert!(!scratch_path.exists());
     }
 
+    /// The baseline is consumed by the reaper, so a task is diffed and
+    /// restored at most once however many times it is inspected afterwards.
     #[tokio::test]
-    async fn mutation_baseline_is_taken_once() {
+    async fn a_task_is_settled_at_most_once() {
         use crate::snapshot::WorkspaceSnapshot;
 
         // git repo so we can capture a real SnapshotId
@@ -844,23 +952,98 @@ mod tests {
         let baseline = MutationBaseline {
             snapshot: snap,
             workspace_root: dir.path().to_path_buf(),
+            write_allowlist: None,
         };
 
         let reg = BackgroundTaskRegistry::new();
         let req = ProcessRequest::new("echo", vec!["ok".into()], dir.path().to_path_buf());
         let id = reg.spawn(req, Some(baseline)).await.expect("spawn");
-        let first = reg
-            .take_mutation_baseline(&id)
-            .await
-            .expect("baseline present once");
-        assert_eq!(first.workspace_root, dir.path());
-        assert!(
-            reg.take_mutation_baseline(&id).await.is_none(),
-            "baseline must be consumed on first take"
-        );
         let _ = reg
             .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
             .await;
+        let first = reg.take_settlement(&id).await.expect("settled once");
+        assert!(first.modified.is_empty(), "{:?}", first.modified);
+        assert!(first.violation.is_none(), "{:?}", first.violation);
+        assert!(
+            reg.take_settlement(&id).await.is_none(),
+            "a settlement is reported exactly once"
+        );
+    }
+
+    /// The runtime settles a background task when its process exits, not when
+    /// the model happens to call `wait_task`.
+    ///
+    /// A background process outlives the round that started it. If the write
+    /// allowlist were only enforced at wait-end, a model that never waits —
+    /// or a turn that ends first — would leave an authority violation standing
+    /// on disk. Settlement is a runtime guarantee, so it does not wait for a
+    /// tool call.
+    #[tokio::test]
+    async fn a_background_task_is_settled_on_exit_without_anyone_waiting() {
+        use crate::snapshot::WorkspaceSnapshot;
+
+        let dir = leveler_test_support::git::scratch_repo();
+        std::fs::create_dir_all(dir.path().join("allowed")).expect("mkdir");
+        std::fs::write(dir.path().join("allowed/keep"), "keep\n").expect("seed");
+        std::fs::write(dir.path().join("protected"), "original\n").expect("seed");
+        leveler_test_support::git::run(dir.path(), &["add", "-A"]);
+        leveler_test_support::git::run(dir.path(), &["commit", "-qm", "i"]);
+        let snapshot = WorkspaceSnapshot::capture(dir.path())
+            .await
+            .expect("capture")
+            .expect("git repo");
+
+        let reg = BackgroundTaskRegistry::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo tampered > protected".into()],
+            dir.path().to_path_buf(),
+        );
+        let id = reg
+            .spawn(
+                request,
+                Some(MutationBaseline {
+                    snapshot,
+                    workspace_root: dir.path().to_path_buf(),
+                    write_allowlist: Some(vec!["allowed".to_string()]),
+                }),
+            )
+            .await
+            .expect("spawn");
+
+        // Nobody calls wait_task: this only observes the terminal state. The
+        // reaper stores the settlement in the same lock acquisition that marks
+        // the process done, so a terminal status already implies a settlement.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !reg
+            .get(&id)
+            .await
+            .is_some_and(|snap| snap.status.is_terminal())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "task never reached a terminal state"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let settlement = reg.take_settlement(&id).await.expect("settlement recorded");
+        assert!(
+            settlement
+                .violation
+                .as_deref()
+                .is_some_and(|v| v.contains("protected")),
+            "the violation must name the path: {settlement:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("protected")).expect("read"),
+            "original\n",
+            "the runtime must have restored the file the task was not allowed to touch"
+        );
+        assert!(
+            reg.take_settlement(&id).await.is_none(),
+            "a settlement is reported once"
+        );
     }
 
     /// R004 F7 / T7: session-owned tasks are reaped as a group; tasks owned

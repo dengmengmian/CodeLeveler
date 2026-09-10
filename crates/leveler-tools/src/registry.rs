@@ -92,8 +92,9 @@ impl ToolRegistry {
     ///
     /// An explicit allowlist, NOT derived from `risk() == Safe`: the Safe label
     /// admits side effects that break the subset's guarantee (create_checkpoint
-    /// resets the rollback baseline; wait_task can restore a workspace
-    /// snapshot). A newly added Safe tool stays out until listed here.
+    /// resets the rollback baseline; wait_task consumes a background task's
+    /// one-time settlement report). A newly added Safe tool stays out until
+    /// listed here.
     /// The subset named by `allowed`, intersected with what this registry
     /// actually has.
     ///
@@ -318,6 +319,10 @@ pub fn full_registry() -> ToolRegistry {
     use crate::tools;
     let mut registry = core_registry();
     registry.register(Arc::new(tools::FindFilesTool));
+    // The `write` primitive (§6.3). It joins the full surface here and not
+    // `core_registry()`, because aligning the registry sets to the Core
+    // Primitive Foundation is the separate Tool Surface Closure's job.
+    registry.register(Arc::new(tools::WriteFileTool));
     registry.register(Arc::new(tools::FindSymbolTool));
     registry.register(Arc::new(tools::ReadSymbolTool));
     registry.register(Arc::new(tools::FindReferencesTool));
@@ -520,8 +525,9 @@ mod tests {
         assert!(names.contains(&"browser_snapshot".to_string()));
         assert!(names.contains(&"browser_click".to_string()));
         assert!(names.contains(&"browser_drag".to_string()));
-        // core (13) + full extras (18) + browser (12) = 43
-        assert_eq!(names.len(), 43);
+        assert!(names.contains(&"write_file".to_string()));
+        // core (14) + full extras (18) + browser (12) = 44
+        assert_eq!(names.len(), 44);
     }
 
     #[test]
@@ -532,8 +538,8 @@ mod tests {
             assert!(subset.get(name).is_some(), "{name} must be in the subset");
         }
         // Safe-labeled tools with side effects must NOT ride in on the label:
-        // create_checkpoint resets the rollback baseline; wait_task can restore
-        // a workspace snapshot.
+        // create_checkpoint resets the rollback baseline; wait_task consumes
+        // a background task's one-time settlement report.
         for name in ["create_checkpoint", "wait_task"] {
             assert!(
                 subset.get(name).is_none(),
@@ -859,7 +865,7 @@ mod tests {
     #[test]
     fn builtin_tools_declare_their_effect_class() {
         let reg = default_registry();
-        for name in ["apply_patch", "replace"] {
+        for name in ["apply_patch", "replace", "write_file"] {
             assert!(reg.mutates_files(name), "{name} must declare mutates_files");
             assert!(!reg.runs_command(name), "{name} does not run a command");
         }

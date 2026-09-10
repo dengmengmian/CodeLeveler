@@ -38,11 +38,17 @@ async fn mcp_process_does_not_inherit_credential_like_environment() {
 /// adding a tool here means asserting a replay cannot touch anything.
 #[test]
 fn only_pure_file_readers_claim_replay_safety() {
-    // Deliberately tiny. `grep` shells out to rg and `find_files` to
-    // `git ls-files`, so both were revoked after a review caught the claim
-    // contradicting the trait's own "no subprocess" wording. Verify a
-    // candidate really is in-process before adding it.
-    const EXPECTED: &[&str] = &["list_files", "read_file", "view_image"];
+    // Deliberately tiny. `grep` and `find_files` were once excluded because
+    // they shelled out to `rg` and `git ls-files`; both now search entirely in
+    // process through `WorkspaceSearch`, which is what earns the claim back.
+    // Verify a candidate really is in-process before adding it.
+    const EXPECTED: &[&str] = &[
+        "find_files",
+        "grep",
+        "list_files",
+        "read_file",
+        "view_image",
+    ];
 
     let registry = leveler_tools::full_registry();
     let mut claimed: Vec<&str> = registry

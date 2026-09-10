@@ -6,9 +6,8 @@ use leveler_model::ModelRef;
 
 /// The default system prompt. Lives in `prompts/base.md` rather than a string
 /// literal so it can be edited and diffed as prose — and so a model profile can
-/// ship its own (see `PromptBuilder::base_instructions`): one prompt cannot fit
-/// every model, since a weak model needs the long form with worked examples and
-/// a strong one is degraded by it.
+/// ship its own (see `PromptBuilder::base_instructions`): one prompt does not
+/// fit every model, so the prompt is per-model configuration.
 const BASE_PROMPT: &str = include_str!("../prompts/base.md");
 
 #[derive(Debug, Clone)]
@@ -58,9 +57,9 @@ pub(crate) struct TurnContext {
 /// Name the language of a user request, so the prompt can state it outright.
 ///
 /// "Use the same natural language as the latest user message" asks the model to
-/// infer the language and then police every sentence against it. A weak model
-/// does neither: measured across three real sessions, deepseek-v4-pro broke that
-/// rule in 49% of its user-visible messages — interim notes ("Now let me ...")
+/// infer the language and then police every sentence against it. Measured across
+/// three real sessions, deepseek-v4-pro broke that rule in 49% of its
+/// user-visible messages — interim notes ("Now let me ...")
 /// streamed to a user who was writing Chinese. Resolving the language here and
 /// naming it turns inference into instruction, which the same model follows.
 ///
@@ -554,9 +553,9 @@ mod tests {
         assert!(prompt.contains("network: allowed"));
     }
 
-    /// One hardcoded prompt for every model is wrong in both directions: a weak
-    /// model needs the long form with worked examples, a strong one is degraded
-    /// by it. A model profile may carry its own instructions, which REPLACE the
+    /// One hardcoded prompt for every model is wrong in both directions: the
+    /// length and worked examples that help one model are noise to another.
+    /// A model profile may carry its own instructions, which REPLACE the
     /// base (they are a whole prompt, not an addendum) while the turn context,
     /// project rules, and opt-in sections still apply on top.
     #[test]
@@ -830,8 +829,8 @@ mod tests {
         );
     }
 
-    /// "Keep a short checklist" names the tool but sets no bar, so a weak model
-    /// writes a plan whose steps merely restate the goal ("1. Build the CLI
+    /// "Keep a short checklist" names the tool but sets no bar, and the observed
+    /// failure is a plan whose steps merely restate the goal ("1. Build the CLI
     /// tool") — pure overhead that verifies nothing. The prompt must show the
     /// difference and forbid the degenerate cases.
     #[test]
@@ -858,9 +857,9 @@ mod tests {
         );
     }
 
-    /// Strict status discipline. Without it a weak model batch-completes
-    /// everything at the end (or jumps a step straight to completed), so the
-    /// rendered plan lies about progress; and it keeps coding against a plan
+    /// Strict status discipline. Without it the observed failure is
+    /// batch-completing everything at the end (or jumping a step straight to
+    /// completed), so the rendered plan lies about progress; and it keeps coding against a plan
     /// that no longer matches reality instead of updating it first.
     #[test]
     fn plan_status_discipline_forbids_jumps_batches_and_stale_plans() {
@@ -884,8 +883,8 @@ mod tests {
         );
     }
 
-    /// The Explicit planning gate (weak models) told the model to write a prose
-    /// plan — invisible to the UI and immediately stale. Multi-step plans must
+    /// The Explicit planning gate used to ask for a prose plan — invisible to
+    /// the UI and immediately stale. Multi-step plans must
     /// route into update_plan; single-step work must not grow a plan at all.
     #[test]
     fn explicit_plan_gate_routes_multi_step_plans_into_update_plan() {
@@ -1210,7 +1209,7 @@ mod tests {
         // user-visible messages — every one of them an interim note ("Now let me
         // ...") streamed straight to the TUI, in English, to a user writing
         // Chinese. Resolving the language in code and NAMING it is the reliability
-        // move: a weak model follows "write in Chinese" reliably.
+        // move: "write in Chinese" is an instruction, not an inference.
         let prompt = PromptBuilder::new()
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),

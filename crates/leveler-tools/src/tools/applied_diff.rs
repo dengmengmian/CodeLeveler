@@ -86,6 +86,21 @@ fn shared_ends(old: &[String], new: &[String]) -> (usize, usize) {
     (head, tail)
 }
 
+/// The single hunk a whole-file write produces: the file as it was, and the
+/// file as it now is, both numbered from line 1. There is nothing to locate —
+/// a whole-file write replaces the file from its first line.
+pub fn whole_file_hunks(before: &str, after: &str) -> Vec<AppliedHunk> {
+    if before == after {
+        return Vec::new();
+    }
+    vec![AppliedHunk {
+        old_start: 1,
+        old_lines: before.lines().map(str::to_string).collect(),
+        new_start: 1,
+        new_lines: after.lines().map(str::to_string).collect(),
+    }]
+}
+
 /// Locate every occurrence a literal `old` → `new` replacement changed.
 ///
 /// `replace` rewrites a substring, which may sit mid-line, so each hunk covers

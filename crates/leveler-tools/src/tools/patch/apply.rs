@@ -219,10 +219,10 @@ fn unique_line_containing(file: &[String], label: &str, start: usize) -> Option<
     if hits.len() == 1 { Some(hits[0]) } else { None }
 }
 
-/// Build the error for a `@@` context line that has no exact match. A weak
-/// model's top failure here is giving a PREFIX of the real line (e.g. `func
-/// CountTokens` for `func CountTokens(text string) int {`), or an ambiguous
-/// stem that matches several lines. Both are unrecoverable from a line-1 excerpt.
+/// Build the error for a `@@` context line that has no exact match. The two
+/// observed failures are a PREFIX of the real line (e.g. `func CountTokens` for
+/// `func CountTokens(text string) int {`) and an ambiguous stem that matches
+/// several lines. Both are unrecoverable from a line-1 excerpt.
 /// So scan the whole file for lines that contain the label and echo them with
 /// their real line numbers — the model then copies the exact full line back.
 /// Falls back to the local excerpt when nothing contains the label at all.
@@ -265,8 +265,9 @@ fn context_label_not_found(file: &[String], label: &str, start: usize) -> String
 
 /// Render a windowed excerpt of `file` around 0-based line `around`, with
 /// 1-based line numbers, so a locate failure can show the model what the file
-/// actually contains there — not just the lines it failed to find. This is the
-/// single highest-leverage aid for a weak model's self-correction on retry.
+/// actually contains there — not just the lines it failed to find. Showing the
+/// real bytes is reporting the constraint that was violated, which is what a
+/// locate failure owes its caller.
 fn file_excerpt(file: &[String], around: usize) -> String {
     let lines: Vec<&str> = file.iter().map(String::as_str).collect();
     crate::tools::locate_hint::excerpt(&lines, around, 4)
@@ -492,7 +493,7 @@ mod tests {
     fn locate_failure_echoes_file_content_with_line_numbers() {
         // On a miss the error must show what the file ACTUALLY looks like near
         // the search point (with line numbers), not only the lines we failed to
-        // find — a weak model needs the real content to rewrite the hunk.
+        // find — the caller needs the real content to rewrite the hunk.
         let original = "alpha\nbeta\ngamma\n";
         let err = apply_update(original, &[chunk(&["nonexistent"], &["x"])]).unwrap_err();
         assert!(err.contains("nonexistent"), "names the target: {err}");

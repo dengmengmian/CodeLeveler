@@ -32,8 +32,8 @@ use crate::{EngineError, EngineEvent, ExecutionKind, TaskOutcome, TurnKind};
 ///
 /// This asks the TOOL, never the risk label. `RiskLevel::Safe` answers "does
 /// this need approval" and it admits side effects — `create_checkpoint` resets
-/// the rollback baseline, `wait_task` can restore a workspace snapshot, and
-/// both are Safe. Deriving replay-safety from risk (as this once did) would
+/// the rollback baseline, `wait_task` consumes a background task's one-time
+/// settlement report, and both are Safe. Deriving replay-safety from risk (as this once did) would
 /// silently undo the user's work during recovery.
 ///
 /// A tool this build does not know, or one that never declared itself

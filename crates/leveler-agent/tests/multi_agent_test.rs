@@ -2106,7 +2106,13 @@ mod named_agents {
             child_tools.iter().any(|t| t == "grep"),
             "declared tools must be present: {child_tools:?}"
         );
-        for forbidden in ["apply_patch", "run_command", "shell_command", "replace"] {
+        for forbidden in [
+            "apply_patch",
+            "run_command",
+            "shell_command",
+            "replace",
+            "write_file",
+        ] {
             assert!(
                 !child_tools.iter().any(|t| t == forbidden),
                 "`{forbidden}` was not declared and must not reach the child: {child_tools:?}"

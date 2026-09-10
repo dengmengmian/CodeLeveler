@@ -44,7 +44,7 @@ pub struct ModelLimits {
     pub max_tool_schema_bytes: usize,
     pub max_parallel_tool_calls: usize,
     /// Per-model byte budget for a single tool result (the executor's central
-    /// cap). Omitted → the global default (48 KiB). Configure lower for weak
+    /// cap). Omitted → the global default (48 KiB). Configure lower for
     /// models with small reliable contexts.
     #[serde(default)]
     pub max_tool_output_bytes: Option<usize>,
@@ -376,10 +376,10 @@ pub struct ModelProfile {
     pub reasoning: ReasoningConfig,
     #[serde(default)]
     pub compatibility: CompatibilityConfig,
-    /// This model's own system prompt, replacing the agent's default. One prompt
-    /// cannot serve every model: a weak model needs the long form with worked
-    /// examples, and a strong one is degraded by that same verbosity. Omit to
-    /// use the default.
+    /// This model's own system prompt, replacing the agent's default. One
+    /// prompt does not serve every model equally — the length and the worked
+    /// examples that help one are noise to another — so the prompt is per-model
+    /// configuration. Omit to use the default.
     #[serde(default)]
     pub instructions: Option<String>,
     /// Optional provider pricing for cost accounting. Absent means cost is

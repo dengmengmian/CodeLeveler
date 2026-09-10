@@ -57,9 +57,10 @@ pub enum IndependentReviewPolicy {
 
 /// eval-only injection seam for single-variable ablation. Production assembly
 /// never constructs one; every `None` inherits the resolved default. The
-/// loop-guard rail (`repeated_read_guard`) can ONLY be switched off through
-/// here — that is deliberate: measuring a rail's value is an experiment, not
-/// a configuration.
+/// executor's progress-guard rail (`repeated_read_guard`, kept under that name
+/// because existing experiment configs use it) can ONLY be switched off
+/// through here — that is deliberate: measuring a rail's value is an
+/// experiment, not a configuration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionOverrides {
     pub explicit_plan: Option<bool>,
@@ -104,16 +105,14 @@ fn min_nonzero(caps: &[usize]) -> usize {
     caps.iter().copied().filter(|&c| c > 0).min().unwrap_or(0)
 }
 
-/// The tool-context slice of resolution: per-step modified-files budget and
-/// the repeated-read guard. Split out because the tool context is built once
-/// per engine (before any turn exists), while the executor is resolved per
-/// turn — both must read the SAME defaults or the seam drifts.
-pub fn resolve_tool_limits(overrides: Option<&ExecutionOverrides>) -> (usize, bool) {
-    let o = overrides.cloned().unwrap_or_default();
-    (
-        o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
-        o.repeated_read_guard.unwrap_or(true),
-    )
+/// The tool-context slice of resolution: the per-step modified-files budget.
+/// Split out because the tool context is built once per engine (before any
+/// turn exists), while the executor is resolved per turn — both must read the
+/// SAME defaults or the seam drifts.
+pub fn resolve_tool_limits(overrides: Option<&ExecutionOverrides>) -> usize {
+    overrides
+        .and_then(|o| o.max_files_per_step)
+        .unwrap_or(DEFAULT_FILES_PER_STEP)
 }
 
 /// Resolve the execution configuration for one executor seat. Pure function;
@@ -272,19 +271,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_limits_resolve_to_task_budget_and_always_on_guard() {
+    fn tool_limits_resolve_to_the_task_file_budget() {
         // De-engineering Wave 2 made the per-step file budget unlimited by
         // default: a patch touching nine files is a wide refactor, not a
-        // mistake, and only an explicit caller budget bounds it. The guard
-        // stays on.
-        assert_eq!(resolve_tool_limits(None), (DEFAULT_FILES_PER_STEP, true));
+        // mistake, and only an explicit caller budget bounds it.
+        assert_eq!(resolve_tool_limits(None), DEFAULT_FILES_PER_STEP);
         assert_eq!(DEFAULT_FILES_PER_STEP, 0, "0 means unlimited");
         let o = ExecutionOverrides {
             max_files_per_step: Some(2),
-            repeated_read_guard: Some(false),
             ..ExecutionOverrides::default()
         };
-        assert_eq!(resolve_tool_limits(Some(&o)), (2, false));
+        assert_eq!(resolve_tool_limits(Some(&o)), 2);
     }
 
     #[test]

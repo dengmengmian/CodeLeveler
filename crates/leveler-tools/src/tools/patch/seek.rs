@@ -24,8 +24,13 @@ pub fn seek_sequence(
     };
 
     // Progressive looseness: exact → trailing ws → edge ws → Unicode punctuation
-    // normalize → internal whitespace squash (`a+b` vs `a + b`). Models often
-    // re-type a body they just read with spacing drift; squash recovers that.
+    // normalize → internal whitespace squash (`a+b` vs `a + b`).
+    //
+    // OPEN (docs/ARCHITECTURE.md §1.1): the last two passes exist because a
+    // model re-types a body it just read with spacing drift, which is
+    // transcription compensation rather than a mechanical tolerance. They stay
+    // for now because tightening the matcher changes edit success on the most
+    // dangerous path in the codebase, and that decision is owed evidence.
     let matchers: [fn(&str, &str) -> bool; 5] = [
         |a, b| a == b,
         |a, b| a.trim_end() == b.trim_end(),

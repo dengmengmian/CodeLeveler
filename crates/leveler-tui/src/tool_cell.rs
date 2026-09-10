@@ -280,6 +280,17 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
                 path
             }
         }
+        "write_file" => {
+            let path = first_path_value(
+                &v,
+                &["path", "file", "file_path", "filepath", "target_file"],
+            );
+            if path.is_empty() {
+                t.tool_label_replace.to_string()
+            } else {
+                path
+            }
+        }
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
         "find_files" => leveler_model::builtin_tool_metadata(name)
             .and_then(|metadata| metadata.primary_argument)
@@ -675,7 +686,10 @@ pub(crate) fn tool_lines(
     out.push(Line::from(head));
 
     if block.status != ToolStatus::Failed
-        && matches!(block.name.as_str(), "apply_patch" | "replace")
+        && matches!(
+            block.name.as_str(),
+            "apply_patch" | "replace" | "write_file"
+        )
         && let Some(patch) = edit_patch_for(block)
     {
         push_edit_diff_body(&patch, theme, width, tools_expanded, t, out, true);

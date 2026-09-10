@@ -11,6 +11,7 @@ pub mod recoverable;
 pub mod registry;
 pub mod tool;
 pub mod tools;
+pub(crate) mod workspace;
 
 pub use registry::{
     OBSERVE_CLASS_TOOLS, ToolRegistry, core_registry, default_registry, expand_tool_category,

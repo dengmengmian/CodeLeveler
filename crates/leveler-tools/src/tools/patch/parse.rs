@@ -41,7 +41,7 @@ pub struct UpdateChunk {
 }
 
 fn is_file_header(line: &str) -> bool {
-    // Tolerate leading whitespace: weak models intermittently indent the
+    // Tolerate leading whitespace: models intermittently indent the
     // `*** ...` section headers, and one such line must not wreck the parse.
     let t = line.trim_start();
     t.starts_with(ADD) || t.starts_with(DELETE) || t.starts_with(UPDATE) || is_end(line)
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn merge_conflict_marker_gives_actionable_error() {
-        // Weaker models often reach for a search/replace / merge-conflict layout
+        // Models sometimes reach for a search/replace / merge-conflict layout
         // ("=======" separator) instead of the diff-marker hunk format. The error
         // must name the mistake and say how to fix it, not just "must start with".
         let patch =
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn tolerates_indented_section_headers() {
-        // A weak model indented the section header; the patch must still parse.
+        // The section header arrived indented; the patch must still parse.
         let patch = "*** Begin Patch\n  *** Update File: src/lib.rs\n a\n-b\n+B\n*** End Patch";
         let changes = parse_patch(patch).unwrap();
         let FileChange::Update { path, chunks, .. } = &changes[0] else {

@@ -890,8 +890,8 @@ impl TrendReport {
 ///
 /// `model_gap` is the completion-rate difference. It goes to zero once the case
 /// set is easy enough for both models to pass everything, and then it says
-/// nothing at all — which is exactly when `effort_gap` matters: reaching the
-/// same result in more rounds is what a weaker model actually looks like.
+/// nothing at all — which is exactly when `effort_gap` matters: two models can
+/// reach the same result and differ entirely in what it cost to get there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comparison {
     pub a: String,
@@ -2140,7 +2140,7 @@ mod tests {
     }
 
     /// Once both models pass everything, `model_gap` is 0 and says nothing. The
-    /// effort gap still separates them: the weaker model needs more rounds to
+    /// effort gap still separates them: one of the two took more rounds to
     /// reach the same result.
     #[test]
     fn effort_gap_separates_models_when_completion_saturates() {
