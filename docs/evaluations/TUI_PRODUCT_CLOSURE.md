@@ -149,6 +149,62 @@ modified.
 Not fixed. It needs new persistent chrome rather than a correction, and §59
 puts closure ahead of enhancement. Recorded for Post-Beta.
 
+## 4b. What only a real session showed
+
+> Added after Phase B, on the same day. Two recorded sessions were replayed
+> through the real bridge, reducer and renderer —
+> `crates/leveler-cli/tests/real_session_replay.rs`, which writes no events of
+> its own — and found two defects the hand-written scenarios could not.
+
+### F5 — a large edit lost its filename (P2, TUI, fixed)
+
+A tool call's arguments were bounded by cutting the **serialized** JSON at
+1,200 characters and appending an ellipsis, which leaves text that no longer
+parses. The interface reads those arguments to learn which file an edit
+touched, so the largest edits arrived unparseable and their row fell back to a
+bare `补丁`.
+
+| | tool calls | at the bound | unparseable | degraded rows in sampled frames |
+| --- | ---: | ---: | ---: | ---: |
+| Before, `yq-doc-count` at `98d21bc` | 81 | 3 | 3 | 2 |
+| After, same case at `3ccbe94` | 57 | 1 | 0 | 0 |
+
+All three casualties were `apply_patch`, including both new files the session
+created. `compact_json` now bounds the string **values** and re-serializes, so
+the envelope stays valid and a patch keeps its `*** Add File:` header — the
+bounded call in the verification run reads
+`*** Begin Patch\n*** Add File: cmd/doc_count.go`.
+
+**§4's F-numbers were partly wrong about this.** Phase B saw the same bare
+`补丁`, traced it to a scenario that sent `{"path": …}` where the real tool
+takes `{"patch": …}`, and dismissed it as a harness artefact. The dismissal was
+right about the cause and wrong about the defect: it was real, and a synthetic
+event could not have shown it, because a synthetic event carries whatever shape
+its author believed.
+
+### F6 — a blocked goal wore the success mark (P2, TUI, fixed)
+
+Replaying the honesty run that ended `Blocked`:
+
+```
+✓ 目标收尾  受阻：Requirement conflicts with internal/report/zero_test.go…
+```
+
+`update_goal(blocked)` is a call that ran, so `ToolStatus::Ok` is the correct
+runtime fact — and `status_glyph` turned that into `✓`, the success mark, on
+the one row whose own text says the work could not be done. That is exactly the
+mistake `23afdc8` removed from exploration, still living where a contradiction
+costs most. A blocked goal now carries `⚠`; a completed one still earns `✓`.
+The blocked test comes from the existing taxonomy, not a second tool-name
+table.
+
+### Not defects
+
+A replayed frame shows `· 0s` on the status line because the turn clock is
+driven by wall-time ticks that replay does not produce. And the replay stops at
+the last persisted event, so it never shows the turn-end marker — that comes
+from the run's outcome, which the app sends and the log does not carry.
+
 ## 5. What was deliberately not changed
 
 A passed command shows `✓` while it is the settled tail of an open burst and

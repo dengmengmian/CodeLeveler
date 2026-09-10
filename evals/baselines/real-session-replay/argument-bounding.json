@@ -1,0 +1,23 @@
+{
+  "what": "Tool-call arguments were bounded by cutting the serialized JSON, which left text that no longer parses. The interface reads those arguments to name the file an edit touched.",
+  "before": {
+    "session": "beta-phaseC-98d21bc yq-doc-count r1",
+    "tool_calls": 81,
+    "at_the_bound": 3,
+    "unparseable": 3,
+    "unparseable_tools": [
+      "apply_patch",
+      "apply_patch",
+      "apply_patch"
+    ],
+    "degraded_rows_in_sampled_frames": 2
+  },
+  "after": {
+    "session": "replay-verify-yq yq-doc-count r1",
+    "tool_calls": 57,
+    "at_the_bound": 1,
+    "unparseable": 0,
+    "unparseable_tools": [],
+    "degraded_rows_in_sampled_frames": 0
+  }
+}
