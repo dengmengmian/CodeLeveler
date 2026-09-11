@@ -15,4 +15,4 @@ mod mock_server;
 pub mod shell_fixture;
 
 pub use mock_server::{MockResponse, MockServer};
-pub use shell_fixture::{echo_command, sleep_command, sleep_shell_line};
+pub use shell_fixture::{dual_stream_command, echo_command, sleep_command, sleep_shell_line};

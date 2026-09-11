@@ -475,6 +475,79 @@ mod windows_canaries {
         assert_eq!(before, after, "the write root's label was left behind");
     }
 
+    /// The capability this backend exists for, end to end: a real compile,
+    /// driven by the toolchain the host installed, writing only where the
+    /// command was authorized to write. `cargo --version` proves the binary
+    /// is readable; this proves the build it drives can actually run.
+    #[tokio::test]
+    async fn a_confined_command_builds_a_real_rust_package() {
+        if !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runner = host_runner();
+        let created = runner
+            .run(
+                confined(
+                    "cargo init --bin --name leveler_confine_probe",
+                    workspace.path(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("cargo init must run");
+        assert_eq!(created.exit_code, Some(0), "cargo init: {created:?}");
+
+        let built = runner
+            .run(
+                confined("cargo build --offline", workspace.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("cargo build must run");
+        assert_eq!(
+            built.exit_code,
+            Some(0),
+            "a confined build must compile: {built:?}"
+        );
+        assert!(
+            workspace.path().join("target").is_dir(),
+            "the build must have written its artifacts into the workspace"
+        );
+    }
+
+    /// The read authority comes from the execution environment, not from a
+    /// list of toolchains this crate knows about. Git is the cheapest second
+    /// witness: a different vendor, a different install location, no special
+    /// case anywhere in the backend.
+    #[tokio::test]
+    async fn confinement_is_not_written_around_one_toolchain() {
+        if !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runner = host_runner();
+        let version = runner
+            .run(
+                confined("git --version", workspace.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("confined git must run");
+        assert_eq!(version.exit_code, Some(0), "git --version: {version:?}");
+        assert!(version.stdout.contains("git version"), "{version:?}");
+
+        let initialized = runner
+            .run(
+                confined("git init", workspace.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("confined git init must run");
+        assert_eq!(initialized.exit_code, Some(0), "git init: {initialized:?}");
+        assert!(workspace.path().join(".git").is_dir());
+    }
+
     /// Background used to be the unconfined path. It is the same path now, so
     /// the same canary has to hold for it.
     #[tokio::test]

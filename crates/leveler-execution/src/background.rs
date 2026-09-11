@@ -649,8 +649,11 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::command::prepare_sandbox_paths;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) fn unix_host_registry() -> BackgroundTaskRegistry {
+    /// A registry whose runner sees the real host environment. The default
+    /// `BackgroundTaskRegistry::new()` reads the installed process snapshot,
+    /// which a unit test never installs — so a confined command would resolve
+    /// no home, no PATH and no temp directory.
+    pub(super) fn host_registry() -> BackgroundTaskRegistry {
         BackgroundTaskRegistry::with_environment(Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
             std::env::current_dir().unwrap_or_default(),
@@ -1238,10 +1241,7 @@ mod tests {
         // does not refuse a normal confined command). OS confinement canaries
         // are `background_confined_blocks_write_outside_workspace` below and
         // `windows_confine::windows_canaries`.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let reg = unix_host_registry();
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let reg = BackgroundTaskRegistry::new();
+        let reg = host_registry();
         let ws = tempfile::tempdir().expect("ws");
         let (program, args) = leveler_test_support::echo_command("sandboxed-bg");
         let mut req = ProcessRequest::new(program, args, ws.path().to_path_buf());
@@ -1293,7 +1293,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
 
-        let reg = unix_host_registry();
+        let reg = host_registry();
 
         // Write inside workspace: allowed.
         let mut inside = ProcessRequest::new(
@@ -1478,7 +1478,7 @@ mod unified_runner_tests {
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
-        let reg = super::tests::unix_host_registry();
+        let reg = super::tests::host_registry();
         let runner = reg.runner.clone();
 
         for (label, escape) in [
@@ -1529,7 +1529,7 @@ mod unified_runner_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let reg = super::tests::unix_host_registry();
+        let reg = super::tests::host_registry();
         let runner = reg.runner.clone();
         let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
 

@@ -428,7 +428,15 @@ async fn snapshot_restores_active_shell_with_elapsed() {
         .user_shells
         .iter()
         .find(|s| s.status == "running")
-        .expect("active user shell rides the snapshot");
+        .unwrap_or_else(|| {
+            // Say what the runtime actually held. A shell that died on the way
+            // up looks exactly like one that was never recorded, and the
+            // difference is the whole diagnosis.
+            panic!(
+                "no running user shell in the snapshot; it held: {:?}",
+                snap.user_shells
+            )
+        });
     assert_eq!(shell.command, stay_alive);
     assert!(shell.elapsed_secs >= 1, "elapsed does not reset");
     // Clean up: cancel it.

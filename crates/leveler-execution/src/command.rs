@@ -1776,7 +1776,26 @@ mod tests {
                 .expect("command present");
             assert_eq!(args[cmd + 1], "x", "command args follow the program");
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            // Windows wraps the same way, in `leveler-confine.exe`. The write
+            // roots are not on the command line — they are labelled before the
+            // spawn — so the wrapper carries only the command it confines.
+            match crate::windows_confine::launcher_path() {
+                Some(launcher) => {
+                    assert_eq!(program, launcher.display().to_string());
+                    assert_eq!(
+                        args,
+                        vec!["--".to_string(), "touch".to_string(), "x".to_string()]
+                    );
+                }
+                None => {
+                    assert_eq!(program, "touch", "no launcher installed on this host");
+                    assert_eq!(args, vec!["x".to_string()]);
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             assert_eq!(program, "touch", "no OS confinement backend here");
             assert_eq!(args, vec!["x".to_string()]);

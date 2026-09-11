@@ -622,13 +622,10 @@ mod tests {
         // Mirror the real chain: the registry cap and the tool's own policy
         // budget are the SAME resolved value.
         ctx.policy.tool_output_budget = budget;
-        let script = format!(
-            "awk 'BEGIN {{ for (i = 0; i < {out_lines}; i++) print \"OUT padding padding padding padding padding\" i; \
-             for (j = 0; j < {err_lines}; j++) print \"ERR padding padding padding padding padding\" j > \"/dev/stderr\" }}'"
-        );
+        let (program, args) = leveler_test_support::dual_stream_command(out_lines, err_lines);
         let out = RunCommandTool::new(commands)
             .execute(
-                serde_json::json!({"program": "/bin/sh", "args": ["-c", script]}),
+                serde_json::json!({"program": program, "args": args}),
                 ctx,
                 CancellationToken::new(),
             )
@@ -1541,7 +1538,8 @@ mod contract_tests {
     /// A well-formed call is untouched by any of this.
     #[tokio::test]
     async fn a_valid_call_still_runs() {
-        let out = run(serde_json::json!({"program": "echo", "args": ["contract-ok"]})).await;
+        let (program, args) = leveler_test_support::echo_command("contract-ok");
+        let out = run(serde_json::json!({"program": program, "args": args})).await;
         assert!(out.contains("contract-ok"), "{out}");
         assert!(!out.contains("is_error: true"), "{out}");
     }

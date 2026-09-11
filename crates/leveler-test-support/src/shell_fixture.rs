@@ -39,6 +39,37 @@ pub fn sleep_command(seconds: u32) -> (String, Vec<String>) {
     }
 }
 
+/// A command that writes `out_lines` padded lines to stdout and `err_lines` to
+/// stderr, for tests that need both streams to overflow an output budget.
+///
+/// The Unix spelling is `/bin/sh -c awk`, which says nothing about the
+/// requirement and does not exist on Windows.
+pub fn dual_stream_command(out_lines: usize, err_lines: usize) -> (String, Vec<String>) {
+    const OUT: &str = "OUT padding padding padding padding padding";
+    const ERR: &str = "ERR padding padding padding padding padding";
+    if cfg!(windows) {
+        let script = format!(
+            "for($i=0;$i -lt {out_lines};$i++){{Write-Output ('{OUT}'+$i)}};\
+             for($j=0;$j -lt {err_lines};$j++){{[Console]::Error.WriteLine('{ERR}'+$j)}}"
+        );
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                script,
+            ],
+        )
+    } else {
+        let script = format!(
+            "awk 'BEGIN {{ for (i = 0; i < {out_lines}; i++) print \"{OUT}\" i; \
+             for (j = 0; j < {err_lines}; j++) print \"{ERR}\" j > \"/dev/stderr\" }}'"
+        );
+        ("/bin/sh".to_string(), vec!["-c".to_string(), script])
+    }
+}
+
 /// [`sleep_command`] spelled as one shell line, for tests that drive the user
 /// shell rather than a [`ProcessRequest`].
 pub fn sleep_shell_line(seconds: u32) -> String {
@@ -69,6 +100,14 @@ mod tests {
         let (program, args) = sleep_command(2);
         assert!(!program.is_empty());
         assert!(args.iter().any(|arg| arg.contains('2')));
+    }
+
+    #[test]
+    fn the_dual_stream_fixture_names_both_line_counts() {
+        let (program, args) = dual_stream_command(11, 7);
+        assert!(!program.is_empty());
+        let joined = args.join(" ");
+        assert!(joined.contains("11") && joined.contains('7'), "{joined}");
     }
 
     #[test]
