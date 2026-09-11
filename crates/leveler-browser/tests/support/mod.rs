@@ -5,10 +5,11 @@
 //! parallel in the same workspace test run (§41).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub struct LocalServer {
     pub base: String,
@@ -50,10 +51,35 @@ impl Drop for LocalServer {
 }
 
 fn serve(mut stream: TcpStream, routes: &HashMap<String, String>) {
+    // Windows hands back an accepted socket in the LISTENER's blocking mode,
+    // and this listener is non-blocking so the accept loop can poll its stop
+    // flag. Unix does not do that. Left alone, the first read here returns
+    // WouldBlock, this function gives up, and the connection closes without a
+    // byte of response — which the browser reports as
+    // ERR_SOCKET_NOT_CONNECTED, on whichever test happened to race.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    // And never let a silent peer hold a fixture thread forever.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
+    }
+    // Read the rest of the request head. Closing a socket that still has
+    // unread data resets the connection instead of finishing it, and the
+    // response we just wrote goes with it.
+    loop {
+        let mut header = String::new();
+        match reader.read_line(&mut header) {
+            Ok(0) => break,
+            Ok(_) if header.trim().is_empty() => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
     }
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = path.split('?').next().unwrap_or("/").to_string();
@@ -71,6 +97,10 @@ fn serve(mut stream: TcpStream, routes: &HashMap<String, String>) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+    // `Connection: close` means the peer closes once it has the body. Send the
+    // FIN, then wait for theirs, so the close is graceful on both sides.
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = reader.read_to_end(&mut Vec::new());
 }
 
 /// Pull the ref out of the snapshot line containing `needle`.
