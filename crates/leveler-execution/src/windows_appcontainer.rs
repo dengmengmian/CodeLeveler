@@ -75,7 +75,9 @@ async fn run_appcontainer_windows(
     let program_owned = program.to_string();
     let executable = resolve_windows_executable(program, &request.cwd, &environment);
     let args_owned = args.to_vec();
-    let cwd = request.cwd.clone();
+    // The spawn boundary, so the child gets a spelling `cmd.exe` and the
+    // AppContainer launcher both accept; the workspace keeps the canonical one.
+    let cwd = crate::command::child_working_directory(&request.cwd);
     let timeout = request.timeout;
     let max_output = request.max_output_bytes;
     let deny_env = request.deny_env.clone();

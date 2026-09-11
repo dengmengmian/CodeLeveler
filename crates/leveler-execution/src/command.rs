@@ -714,6 +714,60 @@ pub fn shell_invocation(cmd: &str) -> (String, Vec<String>) {
     }
 }
 
+/// The working directory a spawned command is given.
+///
+/// [`crate::Workspace::new`] canonicalizes, and a canonical Windows path
+/// carries the verbatim prefix (`\\?\C:\…`). Keeping that internally is
+/// correct — path-safety comparisons must be against exactly one spelling of
+/// the tree — but it is not correct to hand to a child process. `cmd.exe`
+/// reads any leading `\\` as UNC, refuses it as a working directory, and
+/// silently starts in `C:\Windows` instead. The command then fails for a
+/// reason that reads like a missing tool, and the transcript never mentions
+/// the path.
+///
+/// Only the verbatim prefix is removed. A real UNC path (`\\server\share`) is
+/// a different thing and passes through untouched, and so does any path that
+/// is not verbatim.
+pub(crate) fn child_working_directory(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        // Rebuilt from components rather than trimmed by string offset: the
+        // prefix is only 4 characters wide, and slicing an `OsStr` would mean
+        // assuming it is UTF-8, which a Windows path is not required to be.
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return path.to_path_buf();
+        };
+        let mut plain = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            // `\\?\UNC\server\share` is the verbatim spelling of the real UNC
+            // share `\\server\share`, and normalizing it must not lose the
+            // share — that is what would turn a UNC path into a local one.
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = PathBuf::from(r"\\");
+                unc.push(server);
+                unc.push(share);
+                unc
+            }
+            _ => return path.to_path_buf(),
+        };
+        for component in components {
+            match component {
+                // The base already carries the root and the prefix does not
+                // want a `.` segment; everything else is a real component.
+                Component::RootDir | Component::CurDir => {}
+                other => plain.push(other.as_os_str()),
+            }
+        }
+        plain
+    }
+}
+
 /// Runs external commands.
 #[derive(Debug, Clone)]
 pub struct CommandRunner {
@@ -1279,7 +1333,7 @@ fn apply_common_command_env(
     environment: &leveler_core::EnvSnapshot,
 ) {
     cmd.args(args)
-        .current_dir(&request.cwd)
+        .current_dir(child_working_directory(&request.cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4260,5 +4314,78 @@ mod managed_runner_tests {
         let _ = waiter.await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(killpg(group, None).is_err(), "group survived identity kill");
+    }
+
+    /// A `Workspace` root is canonical, so on Windows it is spelled verbatim.
+    /// Only the verbatim prefix may be removed: a real UNC share is a
+    /// different path, and turning one into the other would be a scope change
+    /// dressed as a formatting fix.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_workspace_path_becomes_a_working_directory_a_shell_accepts() {
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\ws")),
+            Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\ws")
+        );
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\UNC\server\share\ws")),
+            Path::new(r"\\server\share\ws")
+        );
+        // Spaces are a path's own business; nothing here re-quotes them.
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\C:\Program Files\my repo")),
+            Path::new(r"C:\Program Files\my repo")
+        );
+        // Already-plain paths, including a real UNC share, are left alone.
+        for plain in [r"C:\ws", r"\\server\share\ws", r"\\?\Volume{1}\ws"] {
+            assert_eq!(child_working_directory(Path::new(plain)), Path::new(plain));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_posix_working_directory_is_passed_through_unchanged() {
+        let path = Path::new("/tmp/leveler ws");
+        assert_eq!(child_working_directory(path), path);
+    }
+
+    /// The behavioural half of the same rule, and the shape the leveler-agent
+    /// failures had: a command whose tool exists only relative to the
+    /// workspace reads as a missing tool when `cmd.exe` refuses the directory
+    /// and silently starts somewhere else. A relative `type` is the smallest
+    /// proof the child really began in the canonical workspace root.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_command_runs_in_the_canonicalized_workspace_root() {
+        let dir = tempfile::tempdir().expect("ws");
+        std::fs::write(dir.path().join("marker.txt"), "found-me").unwrap();
+        let workspace = crate::Workspace::new(dir.path()).expect("workspace");
+        assert!(
+            workspace.root().to_string_lossy().starts_with(r"\\?\"),
+            "the workspace root is expected to be verbatim on Windows: {}",
+            workspace.root().display()
+        );
+        let runner =
+            CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )));
+        let req = ProcessRequest::new(
+            "cmd",
+            vec!["/C".into(), "type marker.txt".into()],
+            workspace.root().to_path_buf(),
+        );
+        let out = runner
+            .run(req, CancellationToken::new())
+            .await
+            .expect("spawn");
+        assert!(
+            out.stdout.contains("found-me"),
+            "the child must start in the workspace root: stdout={:?} stderr={:?} exit={:?}",
+            out.stdout,
+            out.stderr,
+            out.exit_code
+        );
     }
 }
