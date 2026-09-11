@@ -6,8 +6,8 @@
 //! directory plus a per-workspace tool cache under Leveler's own home, with
 //! read-only overlays onto the host caches where that is safe.
 //!
-//! The whole module is macOS/Linux-only; [`super`] gates it behind the same
-//! `cfg`, so individual items carry no target attributes.
+//! Every confining host uses it: the private scratch and per-workspace tool
+//! cache are the same idea on macOS, Linux and Windows.
 //!
 //! Entry points: [`prepare_sandbox_paths`] builds the [`SandboxPaths`] handed
 //! to a child, and [`apply_sandbox_environment`] redirects that child's
@@ -129,6 +129,8 @@ impl SandboxPaths {
         SandboxScratch {
             dir: self.scratch,
             _lease: Some(self._lease),
+            #[cfg(windows)]
+            _write_roots: None,
         }
     }
 }
@@ -136,13 +138,26 @@ impl SandboxPaths {
 /// An owned, leased scratch directory whose OS lock is bound to the scratch's
 /// actual lifetime — held while a backgrounded command runs, released (and the
 /// dir removed) only when this is dropped. Field order matters: `dir` drops
-/// first (removes the scratch tree), then `_lease` (removes the sidecar lock).
+/// first (removes the scratch tree), then `_lease` (removes the sidecar lock),
+/// then the Windows write-root labels the command ran under.
 pub(crate) struct SandboxScratch {
     dir: tempfile::TempDir,
     _lease: Option<SandboxLeaseGuard>,
+    #[cfg(windows)]
+    _write_roots: Option<crate::windows_confine::WriteRootLease>,
 }
 
 impl SandboxScratch {
+    /// Carry this command's Low integrity labels for as long as the scratch —
+    /// a backgrounded command must stay able to write where it was authorized.
+    #[cfg(windows)]
+    pub(crate) fn hold_write_roots(
+        &mut self,
+        write_roots: Option<crate::windows_confine::WriteRootLease>,
+    ) {
+        self._write_roots = write_roots;
+    }
+
     /// The scratch path (for symmetry with `SandboxPaths::scratch_path`).
     #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
@@ -152,7 +167,12 @@ impl SandboxScratch {
     /// Test-only: wrap a bare `TempDir` with no lease.
     #[cfg(test)]
     pub(crate) fn unleased(dir: tempfile::TempDir) -> Self {
-        Self { dir, _lease: None }
+        Self {
+            dir,
+            _lease: None,
+            #[cfg(windows)]
+            _write_roots: None,
+        }
     }
 }
 
@@ -508,15 +528,28 @@ fn replace_with_readonly_link(
     source: &Path,
     destination: &str,
 ) -> std::io::Result<()> {
-    match directory.symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            directory.remove_dir_all(destination)?;
-        }
-        Ok(_) => directory.remove_file(destination)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    // Windows never reaches here: an unprivileged process cannot create a
+    // symlink, so the callers return their persistent private cache first.
+    #[cfg(windows)]
+    {
+        let _ = (directory, source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read-only cache overlays need a symlink Windows will not grant",
+        ))
     }
-    directory.symlink_contents(source.canonicalize()?, destination)
+    #[cfg(unix)]
+    {
+        match directory.symlink_metadata(destination) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                directory.remove_dir_all(destination)?;
+            }
+            Ok(_) => directory.remove_file(destination)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        directory.symlink_contents(source.canonicalize()?, destination)
+    }
 }
 
 /// Rustc wrappers that are purely compilation CACHES: they hash the
@@ -677,25 +710,39 @@ fn neutralize_cache_only_wrappers(config: &str) -> String {
     out
 }
 
+/// A host Cargo config we simply do not inherit: it is missing, unreadable, or
+/// (Unix) a symlink `O_NOFOLLOW` refused to traverse.
+fn is_absent_or_unreadable(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result<()> {
     const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
     let host = cap_std::fs::Dir::open_ambient_dir(host, cap_std::ambient_authority())?;
     for name in ["config", "config.toml", "credentials", "credentials.toml"] {
-        use cap_std::fs::OpenOptionsExt as _;
         let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
         let source = match host.open_with(name, &options) {
             Ok(source) => Some(source),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) || error.raw_os_error() == Some(nix::libc::ELOOP) =>
-            {
-                None
-            }
+            Err(error) if is_absent_or_unreadable(&error) => None,
             Err(error) => return Err(error),
         };
         let mut copied = false;
@@ -742,6 +789,29 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
     Ok(())
 }
 
+/// Windows has no unprivileged symlink, so it cannot build the per-command
+/// overlay `CARGO_HOME` the other hosts use. It uses the persistent private one
+/// under the tool cache instead: same isolation from the host's `~/.cargo`,
+/// same write root, without a link.
+#[cfg(windows)]
+fn prepare_cargo_home(
+    environment: &leveler_core::EnvSnapshot,
+    _scratch: &tempfile::TempDir,
+    private_cache_base: &Path,
+    tool_cache: &Path,
+    workspace: &Path,
+    _read_host_cache: bool,
+) -> std::io::Result<PathBuf> {
+    let private = tool_cache.join("cargo");
+    std::fs::create_dir_all(&private)?;
+    let private_dir = cap_std::fs::Dir::open_ambient_dir(&private, cap_std::ambient_authority())?;
+    if let Some(host) = host_cargo_home(environment, workspace, Some(private_cache_base)) {
+        sync_cargo_config(&host, &private_dir)?;
+    }
+    Ok(private)
+}
+
+#[cfg(not(windows))]
 fn prepare_cargo_home(
     environment: &leveler_core::EnvSnapshot,
     scratch: &tempfile::TempDir,
@@ -782,12 +852,14 @@ fn prepare_npm_cache(
     read_host_cache: bool,
 ) -> std::io::Result<PathBuf> {
     let persistent = tool_cache.join("npm");
+    // See `prepare_cargo_home`: the overlay is built from symlinks, which
+    // Windows cannot create unprivileged.
+    if cfg!(windows) || !read_host_cache {
+        return Ok(persistent);
+    }
     let Some(host) = host_npm_cache(environment, workspace) else {
         return Ok(persistent);
     };
-    if !read_host_cache {
-        return Ok(persistent);
-    }
 
     let overlay = scratch.path().join("npm-overlay");
     let scratch_dir =
@@ -944,8 +1016,12 @@ mod tests {
         assert_eq!(neutralize_cache_only_wrappers(config), config);
     }
 
+    #[cfg(unix)]
     use std::time::Duration;
 
+    /// FIFOs and symlinks are the Unix shape of this hazard; Windows has no
+    /// `mkfifo` and no unprivileged symlink to build the fixture from.
+    #[cfg(unix)]
     #[test]
     fn cargo_config_fifo_and_symlink_are_never_followed() {
         let host = tempfile::tempdir().unwrap();

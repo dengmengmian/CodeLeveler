@@ -53,6 +53,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p leveler-cli --target ${{ matrix.target }}
 
+      # Windows confines a command's writes by running it through this
+      # launcher, which `leveler.exe` looks for beside itself. A package
+      # without it fails closed, so it ships in the same archive.
+      - name: Build Windows write-confinement launcher
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p leveler-win-confine --target ${{ matrix.target }}
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -73,6 +80,7 @@ jobs:
           $name = "leveler-v$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/leveler.exe" "dist/$name/"
+          Copy-Item "target/${{ matrix.target }}/release/leveler-confine.exe" "dist/$name/"
           Copy-Item README.md,LICENSE-APACHE,NOTICE "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()

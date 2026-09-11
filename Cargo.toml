@@ -10,6 +10,7 @@ members = [
     "crates/leveler-storage",
     "crates/leveler-project",
     "crates/leveler-execution",
+    "crates/leveler-win-confine",
     "crates/leveler-tools",
     "crates/leveler-agent-core",
     "crates/leveler-agent",
@@ -53,6 +54,7 @@ leveler-provider = { version = "0.2.0-beta.1", path = "crates/leveler-provider" 
 leveler-storage = { version = "0.2.0-beta.1", path = "crates/leveler-storage" }
 leveler-project = { version = "0.2.0-beta.1", path = "crates/leveler-project" }
 leveler-execution = { version = "0.2.0-beta.1", path = "crates/leveler-execution" }
+leveler-win-confine = { version = "0.2.0-beta.1", path = "crates/leveler-win-confine" }
 leveler-tools = { version = "0.2.0-beta.1", path = "crates/leveler-tools" }
 leveler-agent-core = { version = "0.2.0-beta.1", path = "crates/leveler-agent-core" }
 leveler-agent = { version = "0.2.0-beta.1", path = "crates/leveler-agent" }

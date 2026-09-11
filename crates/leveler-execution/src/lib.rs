@@ -28,7 +28,7 @@ pub use shell_ast::{literal_command_words, literal_program_names, proven_execute
 pub mod snapshot;
 pub mod trust;
 pub mod windows_acl;
-pub mod windows_appcontainer;
+pub mod windows_confine;
 pub mod windows_sandbox;
 pub mod workspace;
 
@@ -67,10 +67,10 @@ pub use trust::{
     TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
     read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
 };
+pub use windows_confine::{WriteRootLease, lease_write_roots};
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
-    WindowsSandboxError, assert_background_intent_spawn_allowed, assert_intent_spawn_allowed,
-    doctor_sandbox_line, probe_sandbox_capabilities, process_tree_backend_available,
-    validate_acl_root,
+    WindowsSandboxError, assert_intent_spawn_allowed, doctor_sandbox_line,
+    probe_sandbox_capabilities, process_tree_backend_available, validate_acl_root,
 };
 pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};
