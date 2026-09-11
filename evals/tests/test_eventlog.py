@@ -218,6 +218,46 @@ class CheckAndReviewCountsTests(unittest.TestCase):
     def _timeline(self, events):
         return extract_timeline(_seq(events))
 
+    def test_every_status_in_the_vocabulary_is_counted_as_a_check(self):
+        t = self._timeline(
+            [
+                ("verification_check", {"name": "a", "status": "passed"}),
+                ("verification_check", {"name": "b", "status": "failed"}),
+                ("verification_check", {"name": "c", "status": "skipped"}),
+                ("verification_check", {"name": "d", "status": "tool_missing"}),
+                (
+                    "verification_check",
+                    {"name": "e", "status": "environment_unavailable"},
+                ),
+            ]
+        )
+        self.assertEqual(t["checks_total"], 5)
+        self.assertEqual(t["checks_passed"], 1)
+
+    def test_the_older_spellings_are_counted_and_are_not_passes(self):
+        t = self._timeline(
+            [
+                ("verification_check", {"name": "a", "status": "toolmissing"}),
+                (
+                    "verification_check",
+                    {"name": "b", "status": "environmentunavailable"},
+                ),
+                ("verification_check", {"name": "c", "status": "passed"}),
+            ]
+        )
+        self.assertEqual(t["checks_total"], 3)
+        self.assertEqual(t["checks_passed"], 1)
+
+    def test_a_status_this_build_cannot_read_is_a_check_but_never_a_pass(self):
+        t = self._timeline(
+            [
+                ("verification_check", {"name": "a", "status": "something-else"}),
+                ("verification_check", {"name": "b", "status": None}),
+            ]
+        )
+        self.assertEqual(t["checks_total"], 2)
+        self.assertIsNone(t["checks_passed"])
+
     def test_checks_are_counted_as_checks_with_their_total(self):
         t = self._timeline(
             [

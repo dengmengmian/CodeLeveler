@@ -31,6 +31,7 @@ use leveler_model::{
     ContentPart, Message, ModelError, ModelPricing, ModelRef, ModelRuntime, ReasoningEffort, Role,
 };
 use leveler_tools::{ToolContext, ToolRegistry};
+use leveler_verifier::CheckStatus;
 
 use self::dispatch::text_of;
 use crate::nudges::first_user_text;
@@ -78,14 +79,6 @@ fn render_recall_block(
          apply — use only what is pertinent, and verify against the current code \
          before relying on any of it.\n{body}"
     ))
-}
-
-/// Status of one external verification check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentVerificationStatus {
-    Passed,
-    Failed,
-    Skipped,
 }
 
 /// Events emitted as the loop progresses, for the CLI to render.
@@ -153,9 +146,13 @@ pub enum AgentEvent {
     /// Post-edit verification started.
     VerificationStarted,
     /// One post-edit verification check finished.
+    ///
+    /// Carries the verifier's own [`CheckStatus`] rather than a second enum
+    /// with the same meaning: two spellings of one fact is how `toolmissing`
+    /// reached a durable row whose contract said `tool_missing`.
     VerificationCheck {
         name: String,
-        status: AgentVerificationStatus,
+        status: CheckStatus,
         evidence: Option<String>,
     },
     /// Post-edit verification finished.

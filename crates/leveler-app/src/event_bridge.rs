@@ -7,6 +7,7 @@ use leveler_agent::{AdvisoryKind, AgentError, AgentOutcome, StopReason};
 use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
 use leveler_lifecycle::VerificationStatus;
+use leveler_verifier::CheckStatus;
 
 use leveler_client_protocol::{
     CheckState, ChildContribution, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
@@ -663,12 +664,21 @@ impl EventBridge {
     }
 }
 
-/// Wire status key (`passed | failed | skipped | tool_missing`) → UI state.
+/// Wire status key → UI state, through the vocabulary's own parser.
+///
+/// A check that could not run is not a check that was skipped: collapsing
+/// `tool_missing` and `environment_unavailable` into `Skipped` threw away the
+/// reason the run was unverified, which is the one thing the reader needs.
 fn map_check_status(status: &str) -> CheckState {
-    match status {
-        "passed" => CheckState::Passed,
-        "failed" => CheckState::Failed,
-        _ => CheckState::Skipped,
+    match CheckStatus::from_wire(status) {
+        Some(CheckStatus::Passed) => CheckState::Passed,
+        Some(CheckStatus::Failed) => CheckState::Failed,
+        Some(CheckStatus::Skipped) => CheckState::Skipped,
+        Some(CheckStatus::ToolMissing) => CheckState::ToolMissing,
+        Some(CheckStatus::EnvironmentUnavailable) => CheckState::EnvironmentUnavailable,
+        // A spelling this vocabulary has never had. Not a pass, and not an
+        // invented reason either.
+        None => CheckState::Unknown,
     }
 }
 
@@ -1515,6 +1525,35 @@ mod projection_equivalence {
                 "verify:passed=Some(true):checks=1"
             ]
         );
+    }
+
+    /// §13 C/D: a check that could not run is not a check that was deliberately
+    /// skipped. Both spellings a durable row may carry land on the same state,
+    /// and none of them lands on `Skipped`.
+    #[test]
+    fn a_check_that_could_not_run_is_not_projected_as_a_skip() {
+        for (durable, expected) in [
+            ("passed", CheckState::Passed),
+            ("failed", CheckState::Failed),
+            ("skipped", CheckState::Skipped),
+            ("tool_missing", CheckState::ToolMissing),
+            ("toolmissing", CheckState::ToolMissing),
+            (
+                "environment_unavailable",
+                CheckState::EnvironmentUnavailable,
+            ),
+            ("environmentunavailable", CheckState::EnvironmentUnavailable),
+        ] {
+            assert_eq!(map_check_status(durable), expected, "{durable}");
+        }
+        assert_ne!(map_check_status("tool_missing"), CheckState::Skipped);
+        assert_ne!(
+            map_check_status("environment_unavailable"),
+            CheckState::Skipped
+        );
+        // A status this build cannot read is neither a pass nor an invented
+        // reason.
+        assert_eq!(map_check_status("something-else"), CheckState::Unknown);
     }
 
     /// The defect this split exists for. A run that owed no check has an open

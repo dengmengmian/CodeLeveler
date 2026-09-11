@@ -23,6 +23,11 @@ const CHECK_GLYPH: Record<CheckState, string> = {
   running: '◍',
   failed: '✗',
   skipped: '·',
+  // A check that could not run is not a check that was skipped, so it does
+  // not borrow the skip's mark.
+  tool_missing: '?',
+  environment_unavailable: '!',
+  unknown: '?',
 };
 
 export function Inspector() {

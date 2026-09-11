@@ -449,7 +449,15 @@ pub enum EngineEvent {
     VerificationStarted,
     VerificationCheck {
         name: String,
-        /// passed | failed | skipped | tool_missing
+        /// The verifier's own durable spelling, carried verbatim:
+        /// `passed | failed | skipped | tool_missing | environment_unavailable`.
+        ///
+        /// A `String` on purpose: the engine persists this fact and does not
+        /// interpret it, and must not start depending on the crate that owns
+        /// the statuses in order to do so. Rows written before the vocabulary
+        /// was made explicit also carry `toolmissing` and
+        /// `environmentunavailable`; readers accept both spellings, and
+        /// nothing rewrites a row.
         status: String,
         evidence: Option<String>,
     },

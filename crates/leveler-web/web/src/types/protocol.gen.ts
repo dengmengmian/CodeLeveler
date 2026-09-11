@@ -30,8 +30,17 @@ export interface AttachmentRef {
 /** Identifies a conversation checkpoint (restore point). */
 export type CheckpointId = string;
 
-/** The state of one verification check. */
-export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
+/** The state of one verification check. This is the check-level fact and not the task-level verdict, so the three ways a check can produce no verdict stay distinct. A check whose program is not installed is not a check that was deliberately skipped, and neither is a check the environment refused: each one is the reason a run ended unverified, and the reader is owed that reason rather than a shrug. */
+export type CheckState =
+  | 'running' | 'passed' | 'failed'
+  /** Deliberately not run. */
+  | 'skipped'
+  /** The check's program is not on `PATH`, so it could not run at all. */
+  | 'tool_missing'
+  /** The check ran but the environment refused it (toolchain/MSRV mismatch). */
+  | 'environment_unavailable'
+  /** The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason. */
+  | 'unknown';
 
 /** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. */
 export interface ChildContribution {

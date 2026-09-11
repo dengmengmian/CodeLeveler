@@ -197,6 +197,24 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **A verification check's status is one vocabulary, end to end.** The status
+  reached the durable log through `format!("{:?}").to_lowercase()`, so
+  `CheckStatus::ToolMissing` was written as `toolmissing` — a value the event's
+  own contract (`passed | failed | skipped | tool_missing`) did not contain and
+  no reader recognised. The app projection and the eval reader each filed it
+  under their fallback, so a tool that was not installed was reported as a
+  check that had been deliberately skipped, and the reason the run ended
+  unverified was discarded. `CheckStatus::as_str` now owns the spelling
+  (`passed | failed | skipped | tool_missing | environment_unavailable`), both
+  writers use it, and readers parse through `CheckStatus::from_wire`, which
+  also accepts the two older spellings — a row is read as what it says and is
+  never rewritten. The client's `CheckState` gained `tool_missing`,
+  `environment_unavailable` and `unknown` instead of folding them into
+  `skipped`: the CLI prints a distinct mark per state, the TUI renders them,
+  and `unknown` exists so a status this build cannot read is neither a pass nor
+  an invented reason. `AgentVerificationStatus` — a second enum holding three
+  of the same five values — is gone, and `AgentEvent` carries the verifier's
+  own `CheckStatus`.
 - **Two eval counters were named for facts the log does not hold.** The
   timeline published `tests_passed` from the number of verification *check*
   rows that passed — a check is not a test, and the durable log carries no

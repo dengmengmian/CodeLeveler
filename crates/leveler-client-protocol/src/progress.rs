@@ -35,6 +35,12 @@ pub struct UiPlan {
 }
 
 /// The state of one verification check.
+///
+/// This is the check-level fact and not the task-level verdict, so the three
+/// ways a check can produce no verdict stay distinct. A check whose program is
+/// not installed is not a check that was deliberately skipped, and neither is
+/// a check the environment refused: each one is the reason a run ended
+/// unverified, and the reader is owed that reason rather than a shrug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -42,7 +48,15 @@ pub enum CheckState {
     Running,
     Passed,
     Failed,
+    /// Deliberately not run.
     Skipped,
+    /// The check's program is not on `PATH`, so it could not run at all.
+    ToolMissing,
+    /// The check ran but the environment refused it (toolchain/MSRV mismatch).
+    EnvironmentUnavailable,
+    /// The row carried a status this build does not know. It is not a pass,
+    /// and it is not a skip either — naming it one would invent a reason.
+    Unknown,
 }
 
 /// One verification check (spec §22).

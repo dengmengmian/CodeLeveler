@@ -393,6 +393,75 @@ async fn direct_run_without_gating_verification_is_completed_unverified() {
     );
 }
 
+/// §13 B: the durable check status is the canonical spelling, not a lowercased
+/// `Debug`. `CheckStatus::ToolMissing` used to reach the log as `toolmissing`,
+/// which no reader's vocabulary contained — the app projection and the eval
+/// reader each filed it under their fallback, so a tool that was not installed
+/// was reported as a check that was deliberately skipped.
+#[tokio::test]
+async fn a_verification_tool_that_is_missing_is_written_as_tool_missing() {
+    let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
+    let server = MockServer::start(vec![
+        sse(vec![
+            tool_call_frame("apply_patch", serde_json::json!({ "patch": patch })),
+            finish_frame("tool_calls"),
+        ]),
+        // Chat path: the model ends with prose, and the gate is what decides
+        // the run's verdict.
+        sse(vec![text_frame("done")]),
+    ])
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
+    std::fs::write(
+        tmp.path().join(".leveler/config.yaml"),
+        "verify:\n  test: { program: \"leveler-definitely-not-a-real-program-xyz\", args: [] }\n",
+    )
+    .unwrap();
+    write_config(tmp.path(), &server.base_url());
+
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Application::assemble(layout).unwrap();
+    let session_id = app
+        .create_session(&ModelRef::new("mock", "m"), "edit lib")
+        .await
+        .unwrap();
+
+    let mut statuses: Vec<String> = Vec::new();
+    app.run_in_session_with_content(
+        &session_id,
+        &ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        vec![ContentPart::Text {
+            text: "edit lib".to_string(),
+        }],
+        Arc::new(AutoApprove),
+        Arc::new(AutoClarify),
+        false,
+        &mut |event| {
+            if let leveler_engine::EngineEvent::VerificationCheck { status, .. } = event {
+                statuses.push(status);
+            }
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .expect("a missing tool does not fail the run");
+
+    assert_eq!(
+        statuses,
+        vec!["tool_missing".to_string()],
+        "the durable vocabulary is canonical, never a lowercased Debug"
+    );
+}
+
 #[tokio::test]
 async fn direct_content_run_emits_verification_events() {
     let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";

@@ -102,6 +102,11 @@ pub(super) fn render_verification_screen(frame: &mut Frame, area: Rect, state: &
                     CheckState::Failed => ("✗", theme.status.error),
                     CheckState::Skipped => ("○", theme.text.secondary),
                     CheckState::Running => ("●", theme.accent.primary),
+                    // A check that could not run is not a check that was
+                    // skipped, so it does not borrow the skip's mark.
+                    CheckState::ToolMissing => ("?", theme.status.warning),
+                    CheckState::EnvironmentUnavailable => ("!", theme.status.warning),
+                    CheckState::Unknown => ("?", theme.text.secondary),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
