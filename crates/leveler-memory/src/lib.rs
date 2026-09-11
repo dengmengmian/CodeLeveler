@@ -12,8 +12,8 @@ mod candidates;
 mod pipeline;
 
 pub use candidates::{
-    CandidateKind, CandidateSource, MemoryCandidate, detect_package_manager, fingerprint_of,
-    looks_like_secret, package_manager_from_root, parse_explicit_remember_intent,
+    CandidateKind, CandidateSource, MemoryCandidate, fingerprint_of, looks_like_secret,
+    package_manager_from_root, parse_explicit_remember_intent,
 };
 pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
 
@@ -247,6 +247,54 @@ impl MemoryStore {
     }
 
     /// BM25-ish lexical search over active titles + bodies + tags.
+    /// Active entries that are LASTING PREFERENCES, for unconditional
+    /// injection.
+    ///
+    /// A preference's relevance never depended on this turn's wording, so
+    /// gating it behind lexical overlap is the wrong shape: a saved
+    /// "keep the terminal output compact" is just as true when the user types
+    /// "能不能精简一点", which shares no characters with it and scores zero.
+    ///
+    /// Only entries that SAY they are preferences qualify — `kind` or a
+    /// `preference` tag. An entry with no kind is left to query recall rather
+    /// than promoted on a guess, because older stores predate the label.
+    /// Repository-derived facts never qualify. Order is by `created_at` then
+    /// `id` so the block is deterministic across runs.
+    pub fn standing_preferences(&self, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
+        let mut out: Vec<MemoryEntry> = self
+            .list_active()?
+            .into_iter()
+            .filter(is_standing_preference)
+            .collect();
+        out.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Retrieval for AUTOMATIC injection: `search`, minus repository-derived
+    /// facts.
+    ///
+    /// A derived fact (the package manager, say) is readable from the
+    /// repository itself, so a stored copy is a second source of truth that
+    /// goes stale the moment the project switches tools. Existing entries are
+    /// NOT deleted — a user's active data is theirs — they simply stop being
+    /// injected behind their back. `search` still returns them so `/memory`
+    /// and `doctor` can show what is there.
+    pub fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f64)>, MemoryError> {
+        let mut hits = self.search(query, limit.saturating_add(DERIVED_RECALL_SLACK))?;
+        hits.retain(|(entry, _)| !is_derived_fact(entry));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -365,6 +413,42 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
     entry
 }
 
+/// Kind/key labels that mark an entry as a fact read out of the repository
+/// rather than something a person decided. Kept as data so existing entries
+/// stay readable; excluded from automatic injection so a stale copy can never
+/// contradict the working tree.
+const DERIVED_LABELS: [&str; 1] = ["package_manager"];
+
+/// Over-fetch this many extra hits before filtering, so dropping derived facts
+/// does not silently shrink a full page of results.
+const DERIVED_RECALL_SLACK: usize = 8;
+
+/// Whether this entry declares itself a lasting preference.
+///
+/// A derived fact never counts, even when it carries a `preference` tag: the
+/// repository is the authority for it. An entry with no label at all is not
+/// promoted — older stores predate the label, and guessing would inject
+/// arbitrary history into every turn.
+pub fn is_standing_preference(entry: &MemoryEntry) -> bool {
+    if is_derived_fact(entry) {
+        return false;
+    }
+    entry.kind.as_deref().map(str::trim) == Some("preference")
+        || entry.tags.iter().any(|t| t.trim() == "preference")
+}
+
+/// Whether this entry is a repository-derived fact (see [`DERIVED_LABELS`]).
+/// Matches on `kind` or the structured `key`, because older entries carry the
+/// label in one field or the other.
+pub fn is_derived_fact(entry: &MemoryEntry) -> bool {
+    let labelled = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|v| DERIVED_LABELS.contains(&v.trim()))
+    };
+    labelled(&entry.kind) || labelled(&entry.key)
+}
+
 pub(crate) fn slugify(title: &str) -> String {
     let mut s: String = title
         .chars()
@@ -454,6 +538,102 @@ pub(crate) fn write_atomically_pub(path: &Path, bytes: &[u8]) -> Result<(), Memo
 
 #[cfg(test)]
 mod tests {
+    /// Only entries that declare themselves preferences are injected
+    /// unconditionally; everything else stays query-conditioned.
+    #[test]
+    fn standing_preferences_take_only_declared_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut by_kind = new_entry("Terse output", "keep the terminal compact", vec![]);
+        by_kind.kind = Some("preference".into());
+        store.remember_deduplicated(by_kind).unwrap();
+
+        let by_tag = new_entry(
+            "Review order",
+            "correctness first",
+            vec!["preference".into()],
+        );
+        store.remember_deduplicated(by_tag).unwrap();
+
+        let mut a_fact = new_entry("Decision log", "we chose SQLite in March", vec![]);
+        a_fact.kind = Some("fact".into());
+        store.remember_deduplicated(a_fact).unwrap();
+
+        // No kind at all: an older store predates the label, so it is NOT
+        // promoted on a guess.
+        store
+            .remember_deduplicated(new_entry("Unlabelled", "something older", vec![]))
+            .unwrap();
+
+        let mut derived = new_entry("Package manager", "uses pnpm", vec!["preference".into()]);
+        derived.kind = Some("package_manager".into());
+        store.remember(derived).unwrap();
+
+        let titles: Vec<String> = store
+            .standing_preferences(8)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(titles.contains(&"Terse output".to_string()), "{titles:?}");
+        assert!(titles.contains(&"Review order".to_string()), "{titles:?}");
+    }
+
+    /// The count is bounded and the order is stable, so the injected block is
+    /// the same on every run.
+    #[test]
+    fn standing_preferences_are_bounded_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        for i in 0..12 {
+            let mut e = new_entry(&format!("pref {i:02}"), &format!("body {i}"), vec![]);
+            e.kind = Some("preference".into());
+            store.remember_deduplicated(e).unwrap();
+        }
+        let first: Vec<String> = store
+            .standing_preferences(5)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(first.len(), 5, "bounded");
+        let again: Vec<String> = store
+            .standing_preferences(5)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(first, again, "deterministic");
+    }
+
+    /// Repository-derived facts must stop being injected automatically, and
+    /// must NOT be deleted: a user's active entry is theirs, and silently
+    /// removing it would be the data loss this change exists to avoid.
+    #[test]
+    fn a_legacy_derived_entry_stays_visible_but_never_recalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut derived = new_entry("Package manager", "This project uses pnpm", vec![]);
+        derived.kind = Some("package_manager".into());
+        derived.key = Some("package_manager".into());
+        store.remember(derived).unwrap();
+        let mut real = new_entry("Deploy notes", "Release from pnpm-built artifacts", vec![]);
+        real.kind = Some("preference".into());
+        store.remember_deduplicated(real).unwrap();
+
+        // Still on disk, still listable, still searchable by the user.
+        assert_eq!(store.list_active().unwrap().len(), 2);
+        let searched = store.search("pnpm", 5).unwrap();
+        assert_eq!(searched.len(), 2, "user search still sees it: {searched:?}");
+
+        // But automatic recall skips it.
+        let recalled = store.recall("pnpm", 5).unwrap();
+        assert_eq!(recalled.len(), 1, "recall dropped the derived fact");
+        assert_eq!(recalled[0].0.title, "Deploy notes");
+    }
+
     use super::*;
     use tempfile::tempdir;
 

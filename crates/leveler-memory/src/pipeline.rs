@@ -9,9 +9,7 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::candidates::{
-    CandidateKind, MemoryCandidate, detect_package_manager, parse_explicit_remember_intent,
-};
+use crate::candidates::{CandidateKind, MemoryCandidate, parse_explicit_remember_intent};
 use crate::{
     MemoryEntry, MemoryError, MemoryStore, entry_from_candidate, now_rfc3339, write_atomically_pub,
 };
@@ -96,17 +94,6 @@ impl MemoryStore {
         text: &str,
     ) -> Result<Option<ProposeOutcome>, MemoryError> {
         let Some(c) = parse_explicit_remember_intent(text) else {
-            return Ok(None);
-        };
-        Ok(Some(self.propose(c)?))
-    }
-
-    /// Detect package manager at `repo_root` and propose at most one candidate.
-    pub fn propose_package_manager(
-        &self,
-        repo_root: &std::path::Path,
-    ) -> Result<Option<ProposeOutcome>, MemoryError> {
-        let Some(c) = detect_package_manager(repo_root) else {
             return Ok(None);
         };
         Ok(Some(self.propose(c)?))
@@ -219,13 +206,15 @@ pub fn collect_turn_candidates(
     user_text: &str,
     repo_root: Option<&std::path::Path>,
 ) -> Result<Vec<ProposeOutcome>, MemoryError> {
+    // Repository-derived facts are deliberately NOT proposed here. A lockfile
+    // or `packageManager` field is readable from the working tree on demand, so
+    // storing a copy only creates a second source of truth that goes stale
+    // (a project that moved pnpm -> bun would keep being told `pnpm`).
+    // `candidates::package_manager_from_root` remains for callers that need the
+    // fact — they read it fresh instead of remembering it.
+    let _ = repo_root;
     let mut out = Vec::new();
     if let Some(o) = store.propose_from_user_text(user_text)? {
-        out.push(o);
-    }
-    if let Some(root) = repo_root
-        && let Some(o) = store.propose_package_manager(root)?
-    {
         out.push(o);
     }
     Ok(out)
@@ -234,11 +223,55 @@ pub fn collect_turn_candidates(
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
-    use crate::candidates::{
-        CandidateSource, detect_package_manager, parse_explicit_remember_intent,
-    };
+    use crate::candidates::{CandidateSource, parse_explicit_remember_intent};
     use std::fs;
     use tempfile::tempdir;
+
+    /// A lockfile is a fact about the working tree, not a decision a person
+    /// made. Copying it into durable memory creates a second source of truth
+    /// that goes stale the moment the project switches package managers, so a
+    /// normal turn must propose nothing for it.
+    #[test]
+    fn a_lockfile_proposes_no_memory() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+
+        let outcomes =
+            collect_turn_candidates(&store, "帮我看一下这个组件", Some(repo.path())).unwrap();
+        assert!(
+            outcomes.is_empty(),
+            "an ordinary turn proposes nothing from a lockfile: {outcomes:?}"
+        );
+        assert_eq!(store.list_pending().unwrap().len(), 0);
+        assert_eq!(store.list_active().unwrap().len(), 0);
+
+        // The detector itself is kept — other features may need to know the
+        // package manager, they just read it from the repository each time.
+        assert_eq!(
+            crate::candidates::package_manager_from_root(repo.path()),
+            Some("pnpm")
+        );
+    }
+
+    /// Explicit user intent is still collected in the same turn.
+    #[test]
+    fn user_intent_is_still_collected_alongside_a_lockfile() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+
+        let outcomes =
+            collect_turn_candidates(&store, "记住：提交前先跑 lint", Some(repo.path())).unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "only the user's own intent: {outcomes:?}"
+        );
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
 
     #[test]
     fn accept_explicit_intent_then_search_and_index_hit() {
@@ -297,14 +330,14 @@ mod pipeline_tests {
     #[test]
     fn reject_leaves_active_empty_and_suppresses_repropose() {
         let dir = tempdir().unwrap();
-        let repo = tempdir().unwrap();
-        fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: '9'\n").unwrap();
-
         let store = MemoryStore::open(dir.path()).unwrap();
+        // Any candidate exercises reject/suppress; a user preference is used
+        // because repository-derived facts are no longer proposed at all.
+        let text = "记住：提交前先跑 lint";
         let outcome = store
-            .propose_package_manager(repo.path())
+            .propose_from_user_text(text)
             .unwrap()
-            .expect("pm candidate");
+            .expect("candidate");
         let pending = match outcome {
             ProposeOutcome::Pending(c) => c,
             other => panic!("expected pending: {other:?}"),
@@ -313,14 +346,13 @@ mod pipeline_tests {
         assert_eq!(store.list_active().unwrap().len(), 0);
         assert_eq!(store.list_pending().unwrap().len(), 0);
 
-        let again = store.propose_package_manager(repo.path()).unwrap();
-        match again {
+        match store.propose_from_user_text(text).unwrap() {
             Some(ProposeOutcome::Suppressed { .. }) => {}
             Some(ProposeOutcome::Pending(_)) => panic!("must not re-spam after reject"),
             other => panic!("unexpected {other:?}"),
         }
-        // collect_turn_candidates also respects key suppress.
-        let batch = collect_turn_candidates(&store, "hello", Some(repo.path())).unwrap();
+        // collect_turn_candidates respects the same suppression.
+        let batch = collect_turn_candidates(&store, text, None).unwrap();
         assert!(
             batch
                 .iter()
@@ -345,39 +377,17 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn package_manager_at_most_one_pending() {
-        let dir = tempdir().unwrap();
-        let repo = tempdir().unwrap();
-        fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-        let first = store.propose_package_manager(repo.path()).unwrap();
-        assert!(matches!(first, Some(ProposeOutcome::Pending(_))));
-        let second = store.propose_package_manager(repo.path()).unwrap();
-        assert!(
-            matches!(
-                second,
-                Some(ProposeOutcome::AlreadyPending(_)) | Some(ProposeOutcome::Pending(_))
-            ) || matches!(second, Some(ProposeOutcome::AlreadyPending(_))),
-            "{second:?}"
-        );
-        // Still only one pending file for the package_manager key.
-        let pending = store.list_pending().unwrap();
-        let pm: Vec<_> = pending
-            .iter()
-            .filter(|c| c.key.as_deref() == Some("package_manager"))
-            .collect();
-        assert_eq!(pm.len(), 1, "{pending:?}");
-    }
-
-    #[test]
     fn extractors_drive_real_pipeline_entry_points() {
         // Structural: shipped public functions are what CLI/app should call.
         let c = parse_explicit_remember_intent("记住：用 pnpm").expect("intent");
         assert_eq!(c.source, CandidateSource::UserExplicit);
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
-        let pm = detect_package_manager(dir.path()).expect("yarn");
-        assert!(pm.body.contains("yarn"));
+        // The package manager is READ from the repository, never remembered.
+        assert_eq!(
+            crate::candidates::package_manager_from_root(dir.path()),
+            Some("yarn")
+        );
     }
 
     #[test]

@@ -74,6 +74,13 @@ pub struct ExecutorFactory {
     pub overrides: Option<ExecutionOverrides>,
     /// Short memory INDEX for system injection (titles only).
     pub memory_index: String,
+    /// Whether the memory capability reaches the model at all this turn.
+    ///
+    /// ONE answer for tools, index, recall root and prompt guidance. Without
+    /// it an Economy turn still carried the index, the recall bodies and the
+    /// guidance while the tools were unregistered — telling the model to call
+    /// a `remember` it did not have.
+    pub memory_expose: bool,
     /// Durable project memory root. The RUNTIME reads it for per-turn recall
     /// injection, for parking an unapproved `remember`, and — at terminal
     /// settlement — nothing else; the memory TOOLS get their own handle at
@@ -170,6 +177,7 @@ impl ExecutorFactory {
 
         executor = executor
             .with_memory_index(self.memory_index.clone())
+            .with_memory_expose(self.memory_expose)
             .with_memory_root(self.memory_root.clone());
 
         executor = if profile_enables_goal_mode(&profile) {

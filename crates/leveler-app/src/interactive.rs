@@ -1001,6 +1001,7 @@ impl InProcessRuntimeClient {
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
     ) {
+        self.notify_memory_candidates(&session_id, &content);
         let parts = self.content_parts(&content, &attachments);
         self.spawn_content_turn(session_id, parts, cancel, config);
     }
@@ -1014,6 +1015,7 @@ impl InProcessRuntimeClient {
     ) {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
+        self.notify_memory_candidates(&session_id, &content);
         self.spawn_direct_goal_turn(session_id, content, cancel, config);
     }
 
@@ -1268,6 +1270,32 @@ impl InProcessRuntimeClient {
                     }
                 }
             });
+        });
+    }
+
+    /// Tell the user when a turn's words produced a memory candidate.
+    ///
+    /// A candidate that only exists on disk is indistinguishable from nothing
+    /// happening: the user said "记住 X", the system stored a proposal, and
+    /// said not a word. `/memory accept <id>` could always adopt it — nothing
+    /// ever pointed there. Notifying is this layer's job because this is the
+    /// layer with a client attached.
+    fn notify_memory_candidates(&self, session_id: &SessionId, user_text: &str) {
+        let waiting = self.app.enqueue_memory_candidates(user_text);
+        if waiting.is_empty() {
+            return;
+        }
+        let titles: Vec<String> = waiting
+            .iter()
+            .map(|(id, title)| format!("[{id}] {title}"))
+            .collect();
+        let _ = self.events_for(session_id).send(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: format!(
+                "发现 {} 条可能值得记住的内容，等待确认：{}。用 /memory 查看，/memory accept <id> 采纳。",
+                waiting.len(),
+                titles.join("、")
+            ),
         });
     }
 

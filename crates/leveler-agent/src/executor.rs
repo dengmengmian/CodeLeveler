@@ -53,32 +53,69 @@ const RECALL_K: usize = 4;
 const RECALL_FLOOR: f64 = 0.1;
 /// Total character budget for injected bodies, to keep the tail from bloating.
 const RECALL_CHAR_BUDGET: usize = 1500;
+/// How many lasting preferences ride along unconditionally. Bounded because
+/// they are paid for on EVERY turn, relevant or not.
+const STANDING_PREFERENCE_MAX_ENTRIES: usize = 8;
 
 /// Render scored memory hits into a tail-injection system block, or `None` when
 /// empty. Bodies are included up to `RECALL_CHAR_BUDGET`; the header warns the
 /// model these are retrieved, may not apply, and must be checked against code.
 fn render_recall_block(
-    hits: impl Iterator<Item = (leveler_memory::MemoryEntry, f64)>,
+    standing: Vec<leveler_memory::MemoryEntry>,
+    retrieved: Vec<leveler_memory::MemoryEntry>,
 ) -> Option<String> {
-    let mut body = String::new();
+    // One shared budget across both lanes: the point is a bounded tail, not a
+    // bounded lane. Standing preferences go first because they apply to every
+    // turn, so they are the ones worth the space.
     let mut used = 0usize;
-    for (entry, _score) in hits {
-        let line = format!("- {}: {}\n", entry.title.trim(), entry.body.trim());
-        if used + line.len() > RECALL_CHAR_BUDGET && !body.is_empty() {
-            break;
+    let mut omitted = 0usize;
+    let mut render = |entries: &[leveler_memory::MemoryEntry]| {
+        let mut out = String::new();
+        for entry in entries {
+            // The id is what makes a run auditable: without it no one can say
+            // which memory a turn actually used.
+            let line = format!(
+                "- [{}] {}: {}\n",
+                entry.id.trim(),
+                entry.title.trim(),
+                entry.body.trim()
+            );
+            if used + line.len() > RECALL_CHAR_BUDGET && used > 0 {
+                omitted += 1;
+                continue;
+            }
+            used += line.len();
+            out.push_str(&line);
         }
-        used += line.len();
-        body.push_str(&line);
-    }
-    if body.is_empty() {
+        out
+    };
+    let standing_block = render(&standing);
+    let retrieved_block = render(&retrieved);
+    if standing_block.is_empty() && retrieved_block.is_empty() {
         return None;
     }
-    Some(format!(
-        "## Relevant memory (retrieved for this turn)\n\
-         These were retrieved by relevance to the current request. They may not \
-         apply — use only what is pertinent, and verify against the current code \
-         before relying on any of it.\n{body}"
-    ))
+
+    let mut block = String::from(
+        "## Project memory for this turn\n\
+         Memory is advisory and records what was true when it was written. The \
+         code and the project's own rules win: verify anything it names before \
+         relying on it, and correct it when this turn contradicts it.\n",
+    );
+    if !standing_block.is_empty() {
+        block.push_str("\nLasting preferences (apply unless this turn says otherwise):\n");
+        block.push_str(&standing_block);
+    }
+    if !retrieved_block.is_empty() {
+        block.push_str("\nRetrieved as possibly relevant to this request:\n");
+        block.push_str(&retrieved_block);
+    }
+    if omitted > 0 {
+        // Say what was left out rather than letting the block look complete.
+        block.push_str(&format!(
+            "\n({omitted} more memory entries omitted for space.)\n"
+        ));
+    }
+    Some(block)
 }
 
 /// Events emitted as the loop progresses, for the CLI to render.
@@ -762,6 +799,8 @@ pub struct Executor {
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
     memory_index: String,
+    /// Whether memory reaches the model at all (tools, index, recall, guidance).
+    memory_expose: bool,
     /// Where durable project memory lives, for the RUNTIME's own reads: the
     /// per-turn recall injection, and parking a `remember` proposal that no
     /// human was there to approve. `None` = memory unconfigured.
@@ -872,6 +911,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
+            memory_expose: false,
             memory_root: None,
             step_limits: StepLimits::default(),
             permission_rules: std::sync::RwLock::new(
@@ -944,6 +984,13 @@ impl Executor {
     }
 
     /// Short INDEX lines injected into the system prompt (bodies never go here).
+    /// Whether memory is exposed to the model this turn. Gates the index, the
+    /// prompt guidance and automatic recall together with the tools.
+    pub fn with_memory_expose(mut self, expose: bool) -> Self {
+        self.memory_expose = expose;
+        self
+    }
+
     pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
         self.memory_index = index.into();
         self
@@ -1198,6 +1245,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
+            memory_expose: self.memory_expose,
             // A child inherits the parent's memory location: recall and
             // parking mean the same thing at any depth.
             memory_root: self.memory_root.clone(),
@@ -1325,6 +1373,7 @@ impl Executor {
                 repo_map: workspace_listing(self.tool_context.execution.workspace.root()),
             })
             .memory_index(self.memory_index.clone())
+            .memory_expose(self.memory_expose)
             .build();
         match self.agent_role {
             AgentRole::Explorer => prompt.push_str(
@@ -1553,10 +1602,27 @@ impl Executor {
     /// result as a `Role::System` message immediately before the user message so
     /// the cached prefix is preserved and the block is stripped next turn.
     fn relevant_memory_injection(&self, request: &str) -> Option<String> {
+        if !self.memory_expose {
+            return None;
+        }
         let root = self.memory_root.as_ref()?;
         let store = MemoryStore::open(root).ok()?;
-        let hits = store.search(request, RECALL_K).ok()?;
-        render_recall_block(hits.into_iter().filter(|(_, score)| *score >= RECALL_FLOOR))
+        let standing = store
+            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
+            .unwrap_or_default();
+        // `recall`, not `search`: repository-derived facts are read from the
+        // repository, never injected from a stored copy.
+        let retrieved: Vec<leveler_memory::MemoryEntry> = store
+            .recall(request, RECALL_K)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, score)| *score >= RECALL_FLOOR)
+            .map(|(entry, _)| entry)
+            // A preference already injected unconditionally must not be paid
+            // for twice.
+            .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
+            .collect();
+        render_recall_block(standing, retrieved)
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -1752,7 +1818,10 @@ mod ownership_authority_tests {
 
 #[cfg(test)]
 mod recall_tests {
-    use super::{RECALL_CHAR_BUDGET, RECALL_FLOOR, RECALL_K, render_recall_block};
+    use super::{
+        RECALL_CHAR_BUDGET, RECALL_FLOOR, RECALL_K, STANDING_PREFERENCE_MAX_ENTRIES,
+        render_recall_block,
+    };
     use leveler_memory::{MemoryEntry, MemoryStore};
 
     fn entry(id: &str, title: &str, body: &str) -> MemoryEntry {
@@ -1771,33 +1840,36 @@ mod recall_tests {
 
     #[test]
     fn empty_hits_inject_nothing() {
-        assert!(render_recall_block(std::iter::empty::<(MemoryEntry, f64)>()).is_none());
+        assert!(render_recall_block(Vec::new(), Vec::new()).is_none());
     }
 
     #[test]
     fn block_has_header_titles_and_bodies() {
-        let hits = vec![
-            (entry("a", "Build target", "install to ~/.cargo/bin"), 3.0),
-            (entry("b", "Concurrency", "never git stash"), 2.0),
+        let retrieved = vec![
+            entry("a", "Build target", "install to ~/.cargo/bin"),
+            entry("b", "Concurrency", "never git stash"),
         ];
-        let block = render_recall_block(hits.into_iter()).expect("some block");
-        assert!(block.contains("Relevant memory"), "{block}");
-        assert!(block.contains("verify against the current code"), "{block}");
+        let block = render_recall_block(Vec::new(), retrieved).expect("some block");
+        assert!(block.contains("Project memory for this turn"), "{block}");
+        assert!(block.contains("verify anything it names"), "{block}");
         assert!(
-            block.contains("Build target: install to ~/.cargo/bin"),
+            block.contains("[a] Build target: install to ~/.cargo/bin"),
+            "the entry id makes the turn auditable: {block}"
+        );
+        assert!(
+            block.contains("[b] Concurrency: never git stash"),
             "{block}"
         );
-        assert!(block.contains("Concurrency: never git stash"), "{block}");
     }
 
     #[test]
     fn char_budget_drops_overflow_but_keeps_first() {
         let big = "x".repeat(RECALL_CHAR_BUDGET);
-        let hits = vec![
-            (entry("a", "first", &big), 3.0),
-            (entry("b", "second", "should be dropped"), 2.0),
+        let retrieved = vec![
+            entry("a", "first", &big),
+            entry("b", "second", "should be dropped"),
         ];
-        let block = render_recall_block(hits.into_iter()).expect("some block");
+        let block = render_recall_block(Vec::new(), retrieved).expect("some block");
         assert!(
             block.contains("first"),
             "first must survive: {}",
@@ -1806,6 +1878,10 @@ mod recall_tests {
         assert!(
             !block.contains("should be dropped"),
             "second must be dropped"
+        );
+        assert!(
+            block.contains("1 more memory entries omitted"),
+            "a fold must say what it dropped: {block}"
         );
     }
 
@@ -1824,15 +1900,70 @@ mod recall_tests {
             .remember(entry("cook", "Cooking", "boil pasta for nine minutes"))
             .unwrap();
 
-        let hits = store
-            .search("where does install put the binary", RECALL_K)
-            .unwrap();
-        let block = render_recall_block(hits.into_iter().filter(|(_, s)| *s >= RECALL_FLOOR))
-            .expect("the install memory should be retrieved");
+        let hits: Vec<MemoryEntry> = store
+            .recall("where does install put the binary", RECALL_K)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, s)| *s >= RECALL_FLOOR)
+            .map(|(e, _)| e)
+            .collect();
+        let block =
+            render_recall_block(Vec::new(), hits).expect("the install memory should be retrieved");
         assert!(block.contains("Install target"), "{block}");
         assert!(
             !block.contains("Cooking"),
             "unrelated memory must not leak: {block}"
+        );
+    }
+
+    /// A lasting preference must ride along even when the request shares no
+    /// words with it — the case lexical recall provably misses (`能不能精简一点`
+    /// scores zero against a Chinese verbosity preference).
+    #[test]
+    fn a_standing_preference_is_injected_without_any_lexical_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut pref = entry(
+            "terse",
+            "输出偏好",
+            "用户偏好紧凑的终端信息输出，不希望看到冗长的模型过程。",
+        );
+        pref.kind = Some("preference".into());
+        store.remember(pref).unwrap();
+
+        let query = "能不能精简一点";
+        assert!(
+            store.recall(query, RECALL_K).unwrap().is_empty(),
+            "precondition: lexical recall misses this paraphrase"
+        );
+
+        let standing = store
+            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
+            .unwrap();
+        let block = render_recall_block(standing, Vec::new())
+            .expect("the preference must reach the model anyway");
+        assert!(block.contains("[terse]"), "{block}");
+        assert!(block.contains("紧凑"), "{block}");
+        assert!(block.contains("Lasting preferences"), "{block}");
+    }
+
+    /// An entry selected by both lanes is injected once, not twice.
+    #[test]
+    fn an_entry_in_both_lanes_is_injected_once() {
+        let mut pref = entry("terse", "Terse output", "keep the terminal compact");
+        pref.kind = Some("preference".into());
+        // The executor filters the retrieved lane against standing ids; this
+        // asserts the rendered result of that contract.
+        let standing = vec![pref.clone()];
+        let retrieved: Vec<MemoryEntry> = vec![pref]
+            .into_iter()
+            .filter(|e| !standing.iter().any(|s| s.id == e.id))
+            .collect();
+        let block = render_recall_block(standing, retrieved).expect("block");
+        assert_eq!(
+            block.matches("[terse]").count(),
+            1,
+            "one injection only: {block}"
         );
     }
 }

@@ -646,9 +646,10 @@ impl Application {
             )
             .await?
             .with_steering(steering);
-        // System-side memory candidates (explicit intent + package-manager
-        // signals). Never writes active memory; user accept is separate (K36).
-        self.enqueue_memory_candidates(goal);
+        // Candidate extraction moved to the caller that owns a client
+        // connection (`InteractiveRuntime`), because a pending candidate nobody
+        // is told about is the same as none. Doing it here could only log.
+        let _ = ();
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
@@ -794,9 +795,9 @@ impl Application {
             )
             .await?;
         let goal = goal_from_content(&content);
-        // System-side memory candidates (explicit intent + package-manager
-        // signals). Never writes active memory; user accept is separate (K36).
-        self.enqueue_memory_candidates(&goal);
+        // See the note in `run_in_session_with_policy`: the notice belongs to
+        // the layer with a client to notify.
+        let _ = ();
         let spec = self.direct_spec(goal, mode, sandbox);
         let result = engine
             .chat(session_id, &spec, content, observer, cancellation)

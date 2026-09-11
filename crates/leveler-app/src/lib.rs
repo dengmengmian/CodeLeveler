@@ -620,10 +620,12 @@ impl Application {
         };
         // The model-visible surface is composed here, from what this host can
         // actually do — never from a guess about the task or the model.
-        let mut registry = model_surface(
-            self.exposed_capabilities(work_profile, model).await,
-            &capabilities,
-        );
+        // ONE answer for the whole memory surface. `exposed` decided the tools;
+        // the index, the recall root and the prompt guidance used to bypass it
+        // entirely, so an Economy turn carried every memory body while the
+        // tools were unregistered — two owners for one capability.
+        let exposed = self.exposed_capabilities(work_profile, model).await;
+        let mut registry = model_surface(exposed, &capabilities);
         // Harness controls are not a capability the host can turn off: they
         // steer the harness, so the harness registers them.
         leveler_agent::register_harness_controls(&mut registry);
@@ -631,7 +633,11 @@ impl Application {
         for tool in self.mcp_tools().await {
             registry.register(tool);
         }
-        let memory_index = load_memory_index(&self.layout.memory_dir());
+        let memory_index = if exposed.memory {
+            load_memory_index(&self.layout.memory_dir())
+        } else {
+            String::new()
+        };
         // The global home root (never a cwd-relative `.leveler`, which would
         // read/write user config inside whatever directory we launched from).
         let leveler_home = leveler_core::LevelerHome::resolve(leveler_core::environment())
@@ -661,7 +667,8 @@ impl Application {
                 commit_co_author: self.config.vcs_co_author,
                 overrides: self.execution_overrides.clone(),
                 memory_index,
-                memory_root: Some(self.layout.memory_dir()),
+                memory_expose: exposed.memory,
+                memory_root: exposed.memory.then(|| self.layout.memory_dir()),
                 background_tasks: bg,
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),
@@ -720,29 +727,36 @@ pub(crate) fn load_memory_index(memory_dir: &std::path::Path) -> String {
 }
 
 impl Application {
-    /// Enqueue pending memory candidates from this turn's user text and
-    /// package-manager signals. Never writes `active/` (K36: accept is separate).
-    pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) {
+    /// Enqueue pending memory candidates from this turn's user text and RETURN
+    /// the ones that are newly waiting. Never writes `active/` (K36: accept is
+    /// separate).
+    ///
+    /// Returning them is the point. This used to log `tracing::info!` and stop,
+    /// so a user who said "记住 X" got a stored candidate and no signal
+    /// whatsoever — the adopt path existed (`/memory accept <id>`) but nothing
+    /// ever told them to use it. The caller that owns a client connection
+    /// turns these into a visible notice; a headless caller ignores them,
+    /// which is also why this layer does not send the notice itself.
+    pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) -> Vec<(String, String)> {
         let memory_dir = self.layout.memory_dir();
         let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
-            return;
+            return Vec::new();
         };
         match leveler_memory::collect_turn_candidates(
             &store,
             user_text,
             Some(self.layout.repo_root.as_path()),
         ) {
-            Ok(outcomes) => {
-                let pending = outcomes
-                    .iter()
-                    .filter(|o| matches!(o, leveler_memory::ProposeOutcome::Pending(_)))
-                    .count();
-                if pending > 0 {
-                    tracing::info!(pending, "enqueued memory candidates (await user accept)");
-                }
-            }
+            Ok(outcomes) => outcomes
+                .into_iter()
+                .filter_map(|o| match o {
+                    leveler_memory::ProposeOutcome::Pending(c) => Some((c.id, c.title)),
+                    _ => None,
+                })
+                .collect(),
             Err(err) => {
                 tracing::debug!(error = %err, "memory candidate enqueue skipped");
+                Vec::new()
             }
         }
     }
@@ -772,11 +786,32 @@ mod memory_index_tests {
         assert!(!index.contains("SECRET_BODY"), "{index}");
     }
 
+    /// The enqueue result must name what is waiting, or no caller can tell the
+    /// user anything. A silent `tracing::info!` was the whole bug.
+    #[test]
+    fn enqueue_returns_the_candidates_that_are_waiting() {
+        let mem = tempdir().unwrap();
+        let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
+        let outcomes = collect_turn_candidates(&store, "记住：提交前先跑 lint", None).unwrap();
+        let waiting: Vec<(String, String)> = outcomes
+            .into_iter()
+            .filter_map(|o| match o {
+                ProposeOutcome::Pending(c) => Some((c.id, c.title)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert!(!waiting[0].0.is_empty(), "an id the user can accept");
+        assert!(waiting[0].1.contains("lint"), "{waiting:?}");
+    }
+
     /// Host path used by `Application::enqueue_memory_candidates` — propose only.
     #[test]
     fn turn_candidate_collect_never_writes_active() {
         let mem = tempdir().unwrap();
         let repo = tempdir().unwrap();
+        // The lockfile deliberately proposes nothing now; the user's own words
+        // are what still does.
         fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
         let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
         let outcomes = collect_turn_candidates(&store, "记住：用 pnpm", Some(repo.path())).unwrap();

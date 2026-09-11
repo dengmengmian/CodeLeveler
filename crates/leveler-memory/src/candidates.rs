@@ -243,30 +243,13 @@ fn preference_title(body: &str) -> String {
     }
 }
 
-/// Detect package manager from lockfiles / `package.json#packageManager`.
+/// The package manager this repository uses: `pnpm` / `yarn` / `npm` from a
+/// lockfile (in that order), else `package.json#packageManager`.
 ///
-/// At most one candidate; prefers lockfiles: pnpm → yarn → npm, else
-/// `packageManager` field.
-pub fn detect_package_manager(root: &Path) -> Option<MemoryCandidate> {
-    let pm = package_manager_from_root(root)?;
-    let title = format!("包管理器：{pm}");
-    let body = format!(
-        "This repository uses `{pm}` as its package manager. Prefer `{pm}` \
-         (e.g. `{pm} install`, `{pm} run …`) over other Node package managers \
-         unless the user explicitly overrides for a one-off command."
-    );
-    MemoryCandidate::new(
-        title,
-        body,
-        CandidateKind::PackageManager,
-        Some("package_manager".into()),
-        CandidateSource::SystemPropose,
-        vec!["package_manager".into(), pm.to_string()],
-    )
-    .ok()
-}
-
-/// Return `pnpm` / `yarn` / `npm` when project signals exist.
+/// This is a fact about the working tree, so it is READ on demand and never
+/// remembered. The candidate factory that used to turn it into a durable
+/// memory was removed: a stored copy is a second source of truth, and it would
+/// keep reporting `pnpm` after a project moved to `bun`.
 pub fn package_manager_from_root(root: &Path) -> Option<&'static str> {
     if root.join("pnpm-lock.yaml").is_file() {
         return Some("pnpm");
@@ -348,14 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_lockfile_one_candidate() {
+    fn pnpm_lockfile_is_read_not_remembered() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: '9'\n").unwrap();
-        let c = detect_package_manager(dir.path()).expect("pm");
-        assert_eq!(c.kind, CandidateKind::PackageManager);
-        assert_eq!(c.key.as_deref(), Some("package_manager"));
-        assert!(c.body.contains("pnpm"));
-        // Only one logical candidate from this root.
         assert_eq!(package_manager_from_root(dir.path()), Some("pnpm"));
     }
 
@@ -368,14 +346,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(package_manager_from_root(dir.path()), Some("pnpm"));
-        assert!(detect_package_manager(dir.path()).is_some());
     }
 
     #[test]
-    fn no_signal_no_candidate() {
+    fn no_signal_no_package_manager() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
-        assert!(detect_package_manager(dir.path()).is_none());
+        assert_eq!(package_manager_from_root(dir.path()), None);
     }
 
     #[test]
