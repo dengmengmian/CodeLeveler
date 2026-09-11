@@ -1,304 +1,380 @@
 # CodeLeveler Architecture
 
-This document defines CodeLeveler's long-term architecture model, design principles, ownership boundaries, architecture invariants, allowed and forbidden changes, and evolution direction.
+Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md)
 
-Chinese version: [`ARCHITECTURE.zh-CN.md`](ARCHITECTURE.zh-CN.md). The English and Chinese versions should remain semantically equivalent.
-
-This document answers four questions only:
-
-1. What kind of system is CodeLeveler?
-2. Why are responsibilities and boundaries divided this way?
-3. Under this architecture, what is allowed and what is forbidden?
-4. In what direction should the architecture evolve?
-
-This document does not record implementation status, migration history, known defects, verification results, source locations, or version-specific implementation detail.
-
----
-
-## 1. Architecture Vision
-
-CodeLeveler should not be understood as a Coding Agent that continuously absorbs more capability.
+CodeLeveler is not intended to become a Coding Agent that simply accumulates more and more features.
 
 Its long-term role is:
 
-> **A reusable Agent Runtime / Harness Foundation. The Coding Agent is the first product built on top of it, not the highest abstraction in the system.**
+> **A reusable foundation for running agents. The Coding Agent is the first product built on top of that foundation, not the highest abstraction in the system.**
 
-Different agent products should be able to share the same Runtime, Capability, Authority, and Persistence foundation without inheriting Coding semantics.
-
-The minimal model is:
-
-```text
-Model
-  ↓
-Harness
-  ↓
-Agent Runtime
-  ↓
-Capabilities
-  ↓
-Host Authority
-  ↓
-Operating System
-```
-
-With products included:
-
-```text
-                         Products
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-            Coding        Review        Future
-              │             │             │
-              └─────────────┼─────────────┘
-                            ▼
-                         Harnesses
-                            │
-                            ▼
-                     Agent Runtime
-                            │
-                  ┌─────────┴─────────┐
-                  ▼                   ▼
-             Capabilities        Persistence
-                  │                   │
-                  └─────────┬─────────┘
-                            ▼
-                     Host Authority
-                            │
-                            ▼
-                     Operating System
-```
-
-The purpose of this structure is not to maximize abstraction. It is to give every class of complexity the correct owner.
+The architecture separates concerns deliberately: the model thinks, the domain harness defines what kind of agent this is, the runtime keeps it running reliably, capabilities do real work, host authority controls real side effects, persistence provides continuity, and products turn those pieces into user experience.
 
 ---
 
-## 2. Core Design Model
+## 1. The Whole System at a Glance
 
-The architecture can be compressed into seven principles.
+You can understand the architecture before knowing any implementation detail.
 
 ```text
-Model owns intelligence.
-Harness owns domain semantics.
-Runtime owns lifecycle and mechanical correctness.
-Capability owns reusable domain capability.
-Host Authority owns controlled real side effects.
-Every persistent fact has one authoritative owner.
-Product projects runtime truth; it does not create it.
+                            Model
+                    (reasoning and decisions)
+                              ↕
+User → Product → Domain Harness → Agent Runtime
+                              │
+                   ┌──────────┴──────────┐
+                   ▼                     ▼
+                Capabilities         Persistence
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                         Host Authority
+                              │
+                              ▼
+                       Operating System
 ```
 
-One of the most important boundaries is:
+If you remember only one sentence:
+
+> **The model thinks. The Harness defines how this kind of agent should work. The Runtime keeps it alive and correct. Capabilities define what it can do. Host Authority decides which real-world side effects may actually happen.**
+
+Different products can be built on the same foundation:
+
+```text
+                          Agent Foundation
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+        Coding Harness     Review Harness     Other Harness
+              │                 │                 │
+              ▼                 ▼                 ▼
+        Coding Product     Review Product     Future Product
+```
+
+Products share the runtime foundation without inheriting each other's domain semantics.
+
+---
+
+## 2. Terms and Names
+
+The names in this architecture describe ownership. Each term exists to answer “who is responsible for this?”
+
+| Term | Meaning | Common confusion |
+| --- | --- | --- |
+| **Agent** | A goal-directed running entity that uses a model and capabilities to do work | An agent is not a model; the model is its source of intelligence |
+| **Model** | The reasoning engine: understanding, planning, judgment, generation | The model does not directly own filesystem, process, or task lifecycle |
+| **Harness** | The domain layer that adapts a general model and runtime to a concrete domain such as Coding or Review | It is not the runtime and not a replacement “brain” |
+| **Agent Runtime** | The reusable machinery that lets an agent loop, pause, resume, cancel, persist, and recover | It runs the agent; it does not define domain reasoning |
+| **Agent Kernel** | The smallest generic model↔tool execution loop | It knows no Coding or Review concepts |
+| **Engine** | The long-lived runtime component that owns sessions, tasks, turns, events, recovery, and continuation | **The Engine owns lifecycle, not intelligence** |
+| **Capability** | A reusable system ability such as workspace access, command execution, browser control, or VCS | A capability is not the same thing as a model-visible tool |
+| **Tool** | A model-facing adapter for invoking a capability | A tool should not become the capability runtime itself |
+| **Tool Surface** | The set of tools visible to a model for a particular Harness and product | Owning many capabilities does not mean exposing all of them every round |
+| **Host Authority** | The single boundary with final authority to perform controlled side effects | Authority is stronger than “permission config”; it is who can make the effect real |
+| **Persistence** | Durable state that lets tasks, turns, ownership, events, and work continue across time | It is much more than chat history |
+| **Authority** | The canonical owner of a class of facts or actions | One fact must not have competing authorities |
+| **Product** | The user-facing composition: TUI, Web, Desktop, Mobile, and concrete agent products | A product presents runtime facts; it does not create runtime facts |
+| **Provider / Protocol Layer** | Adapters that normalize model vendors and wire protocols | Protocol adaptation must not silently change domain semantics |
+
+### 2.1 Why “Harness”
+
+A Harness turns a general model and a general runtime into a specific kind of agent:
+
+```text
+General Model + General Runtime
+              ↓
+        Domain Semantics
+              ↓
+ Coding Agent / Review Agent / Other Agent
+```
+
+“What is a coding task?”, “which coding tools should the model see?”, and “what does domain completion mean?” are Coding questions, not Runtime questions.
+
+So:
+
+> **The Harness defines what kind of agent this is. The Runtime defines how that agent runs reliably.**
+
+### 2.2 Why “Authority”
+
+Authority means “who has final say.”
+
+The model may request “modify this file,” but only Host Authority can make the filesystem mutation real.
+
+Likewise, a UI may display “completed,” but the task state must come from the authoritative runtime fact rather than being inferred independently by the UI.
+
+---
+
+## 3. Seven Core Principles
+
+The architecture can be reduced to seven statements:
+
+```text
+The Model owns intelligence.
+The Harness owns domain semantics.
+The Runtime owns lifecycle and mechanical correctness.
+Capabilities own reusable abilities.
+Host Authority owns controlled real side effects.
+Every persistent fact has one authoritative owner.
+Products project Runtime truth; they do not create it.
+```
+
+The central lifecycle boundary is:
 
 > **Engine owns lifecycle, not agent intelligence.**
 
-The Engine runs the system. It does not think for the agent.
+That prevents the Engine from slowly becoming a giant state machine that contains planning, judgment, tool choice, and product-specific semantics.
 
 ---
 
-## 3. Model: Intelligence Belongs to the Model
+## 4. Model: Where Intelligence Comes From
 
 The model owns work that requires reasoning:
 
 ```text
-goal understanding
+understanding the goal
 planning
 investigation
-tool choice
-code and content generation
+choosing tools
+generating code or content
 debugging
 trade-offs
 semantic judgment
-recovery from its own mistakes
+adapting after failure
 ```
 
-Runtime and Harness should provide:
+The system should provide the model with:
 
 ```text
-clear capability
+clear capabilities
 stable semantics
 precise errors
 real environment state
 deterministic mechanical constraints
-reliable execution
+reliable execution results
 ```
 
-They should not build a second hidden reasoning system to compensate for model limitations.
+It should not build a hidden second reasoning system to compensate for model weakness.
 
 Therefore:
 
 ```text
-model capability limit
-    ≠
-runtime defect
+MODEL CAPABILITY LIMIT
+        ≠
+RUNTIME DEFECT
 ```
 
-Model intelligence is an input to the system, not a variable the Runtime must normalize.
+The Runtime fixes engineering problems—failure, concurrency, cancellation, recovery, authority, consistency—not intelligence limits.
 
 ---
 
-## 4. Harness: Domain Semantics Belong to the Harness
+## 5. Harness: Defining What Kind of Agent This Is
 
-The Harness is the domain layer between the Model and the reusable Runtime.
+The Harness sits between model, runtime, and product.
 
-It defines:
+It answers:
 
-> In this product domain, what the agent may do, what it can see, how it interacts with Runtime capability, and what domain completion means.
+> **In this domain, what can the agent see, what can it do, what rules apply, and what does domain completion mean?**
+
+### 5.1 Coding Harness
 
 A Coding Harness may own:
 
 ```text
-Coding domain contract
+coding-domain contract
 repository semantics
-Coding Tool Surface
+coding tool surface
 verification semantics
 delegation semantics
-write-collaboration semantics
-Coding Completion Semantics
+multi-agent write collaboration semantics
+coding completion semantics
 ```
 
-A future Review Harness may own:
+### 5.2 Review Harness
+
+A Review Harness may own:
 
 ```text
-Review Target
-Review Scope
-Finding
-Severity
-Evidence
-Review Verdict
-Review Completion Semantics
+review target
+review scope
+findings
+severity
+evidence
+review verdict
+review completion semantics
 ```
 
-Harnesses are siblings:
+### 5.3 Harnesses Are Siblings
 
 ```text
-                 Agent Runtime
-               /       |        \
-              ▼        ▼         ▼
-           Coding    Review    Research
-           Harness   Harness   Harness
+                     Agent Runtime
+                  /       |        \
+                 ▼        ▼         ▼
+              Coding    Review    Research
+              Harness   Harness   Harness
 ```
 
-One Harness should not inherit another Harness's domain semantics.
+Review is not a “mode” inside Coding, and Research is not an extension pack under Coding.
+
+A new domain reuses the common Runtime and common Capabilities without inheriting another domain's semantic baggage.
+
+### 5.4 What a Harness Owns—and Does Not Own
+
+**Owns:**
+
+```text
+domain vocabulary
+domain constraints
+domain tool selection
+domain completion semantics
+domain collaboration rules
+domain context organization
+```
+
+**Does not own:**
+
+```text
+a second task lifecycle
+a second persistence system
+a path around Host Authority
+hidden reasoning on behalf of the model
+a second permission or ownership system
+```
 
 ---
 
-## 5. Agent Runtime
+## 6. Agent Runtime: Keeping Agents Alive Reliably
 
-Agent Runtime is CodeLeveler's reusable execution foundation.
+The Agent Runtime is the central reusable foundation.
 
-It contains two logical parts:
+Conceptually:
 
 ```text
 Agent Kernel
     +
-Persistent Runtime
+Persistent Engine
     =
-Reusable Agent Runtime
+Agent Runtime
 ```
 
-### 5.1 Agent Kernel
+### 6.1 Agent Kernel
 
-The Agent Kernel owns the generic model interaction loop:
+The Kernel owns the generic model execution loop:
 
 ```text
 model interaction
 tool loop
 streaming
-round lifecycle
-budget
-usage
-retry
-backoff
-deadline
-cancel
-stop
+round progression
+budgets
+usage accounting
+retry and backoff
+timeouts
+cancellation
+stopping
 ```
 
-It should not know:
+It does not know:
 
 ```text
 Coding
 Review
-Repository Workflow
+repository workflow
 product-specific prompts
-domain-specific completion
-UI
+domain completion definitions
+UI behavior
 user acceptance
 ```
 
-The purpose of the Kernel is that any Harness can run on the same agent loop.
+Its value is simple: Coding, Review, and future Harnesses can all run on the same agent loop.
 
-### 5.2 Persistent Runtime / Engine
+### 6.2 Engine
 
-The Engine owns the mechanical lifecycle required for durable execution:
+The Engine owns long-lived lifecycle mechanics:
 
 ```text
-Session
-Task
-Turn
-Event
-Persistence
-Resume
-Recovery
-Cancellation
-Background Lifecycle
-Ownership
-Runtime Outcome
+sessions
+tasks
+turns
+events
+persistence
+pause and resume
+recovery
+cancellation
+background work
+parent-child relationships
+ownership
+runtime outcomes
 ```
 
-The core boundary is:
+The Engine may know:
+
+```text
+a task is running
+a task was cancelled
+a turn ended
+a child task exited
+an event was persisted
+```
+
+But it must not infer from “tests passed” or “the tree changed” that:
+
+```text
+the user's coding request is semantically complete
+```
+
+The boundary is:
 
 ```text
 Engine owns lifecycle.
 Harness owns domain semantics.
-Model owns reasoning.
+Model owns reasoning and judgment.
 ```
-
-The Engine may know whether a Task is running, paused, cancelled, resumed, or ended. It should not define whether a Coding task is semantically complete.
 
 ---
 
-## 6. Capability Architecture
+## 7. Capabilities and Tools: What the System Can Do vs. How the Model Invokes It
 
-Capabilities represent the reusable abilities the system actually possesses.
+This distinction is fundamental.
 
-Typical capabilities include:
+### 7.1 Capability
+
+A Capability is a reusable ability the system actually owns, for example:
 
 ```text
-Workspace
-Command Execution
-Browser
-Search
-Code Intelligence
-Version Control
-Memory
-Media
-Skills
-Remote Execution
-External Services
+workspace access
+command execution
+browser control
+search
+code intelligence
+version control
+memory
+media processing
+skills
+remote execution
+external services
 ```
 
-The core rule is:
+A Capability answers:
 
-> **Capability expresses what the system can do. Tool expresses how the model invokes it.**
+> **What can the system do?**
 
-### 6.1 Capability Is Not Tool
+### 7.2 Tool
 
-For example:
+A Tool is the model-facing interface for requesting a Capability.
 
 ```text
 Model
   ↓
-read_file
+read-file tool
   ↓
 Workspace Capability
   ↓
-Host filesystem authority
+Host filesystem
 ```
 
-`read_file` is a model-facing interface.
+A Tool answers:
 
-Workspace is the reusable capability.
+> **How does the model request that ability?**
 
 Therefore:
 
@@ -306,23 +382,15 @@ Therefore:
 Tool ≠ Capability
 ```
 
-And the architecture does not require:
+One Capability may have multiple Tool adapters. A Capability may also be used directly by a Harness or Runtime when that use belongs to its responsibility.
 
-```text
-One Capability = One Tool
-```
+### 7.3 Tools Stay Thin; Capabilities Have Clear Ownership
 
-A Capability may be exposed through multiple Tools and may also be consumed directly by a Harness, Runtime, or Product at the appropriate boundary.
-
-### 6.2 Tool Thin, Capability Thick
-
-Tools should remain thin.
-
-A Tool owns:
+A Tool primarily owns:
 
 ```text
 model-facing name and description
-schema
+parameter schema
 input decoding
 capability invocation
 result rendering
@@ -334,16 +402,16 @@ A Capability owns:
 ```text
 real domain behavior
 reusable logic
-capability-local state
-capability lifecycle
+its own necessary state
+its own necessary lifecycle
 consistency
 ```
 
-Long-lived state, service discovery, shared runtime machinery, and authority decisions should not be pushed into Tools merely because a Tool needs access to them.
+Long-lived state, global policy, service discovery, permission decisions, and process lifecycle should not be pushed into Tools merely because a Tool needs to access them.
 
-### 6.3 Capability Is a Responsibility, Not a Mandatory Physical Module
+### 7.4 Capability Is a Responsibility, Not a Mandatory Package Boundary
 
-A Capability is first an ownership boundary. It does not imply one crate, one service, one process, or one trait.
+“Capability” first describes ownership, not a required crate, service, process, or trait.
 
 Physical separation should be driven by real boundaries such as:
 
@@ -353,95 +421,105 @@ independent lifecycle
 independent security boundary
 independent protocol boundary
 independent persistence boundary
-remote deployment boundary
+remote deployment need
 ```
 
-Do not split components merely to make an architecture diagram symmetric.
+Do not manufacture abstractions merely to make the architecture diagram symmetric.
 
 ---
 
-## 7. Tool Surface
+## 8. Tool Surface: How Much Should the Model See?
 
-The model should not see every internal capability in the system.
+Owning many capabilities does not mean the model should see every tool in every round.
 
-It should see only the Tool Surface selected and exposed by the current Harness for the current product.
+The Harness selects the tool surface for the current product:
 
 ```text
-Capabilities
-     │
-     ▼
+System Capabilities
+       │
+       ▼
 Harness Selection
-     │
-     ▼
+       │
+       ▼
 Tool Surface
-     │
-     ▼
+       │
+       ▼
 Model
 ```
 
-The goal of a Tool Surface is:
+The goal is:
 
-> Preserve necessary capability while presenting the model with the clearest, most stable, lowest-ambiguity operation surface possible.
+> **Expose the clearest, most stable, least ambiguous interface that still preserves the necessary capability.**
 
-A good model-facing Tool should have:
+A good tool should:
 
 ```text
-a clear intent
-stable semantics
-predictable inputs and outputs
-precise errors
-clear boundaries from neighboring tools
+express one clear intent
+have stable semantics
+have predictable input and output
+report failure precisely
+have a clear boundary from neighboring tools
 ```
 
-The system may enable or disable a Tool based on real mechanical capability. It must not secretly change tool semantics because a model is considered weak or a task looks difficult.
+The system may enable or disable a Tool based on real mechanical capability—for example, whether the host has a browser or the model supports vision.
+
+It must not silently change Tool semantics because:
+
+```text
+“this model is weak”
+“this task looks hard”
+```
 
 ---
 
-## 8. Host Authority
+## 9. Host Authority: Who Is Allowed to Change the Real World?
 
-An Agent may request side effects, but it does not own host power.
-
-The core rule is:
+The model may request a side effect, but it does not own host power directly.
 
 ```text
-Agent proposes.
-Host Authority decides and performs.
+Agent requests
+      ↓
+Host Authority decides and performs
+      ↓
+Operating System changes
 ```
 
-The relationship is:
-
-```text
-Model / Harness
-      ↓
-Side-effect request
-      ↓
-Host Authority
-      ↓
-Operating System
-```
-
-Host Authority owns controlled real side effects such as:
+Host Authority controls:
 
 ```text
 filesystem mutation
 process execution
-network authority
-sandbox
-permission
+network access
+sandboxing
+permissions
 approval
-workspace boundary
+workspace boundaries
 process lifecycle
 ```
 
-This keeps what the Agent wants separate from what the host permits.
+This separates:
 
-No model-facing interface may become a second path around Host Authority.
+```text
+what the agent wants to do
+          ≠
+what the host allows to happen
+```
+
+No Tool, plugin, child agent, or Product may create a second path around Host Authority.
+
+### 9.1 Why There Must Be One Execution Authority
+
+If file mutation follows one authority, commands another, and child agents a third, there is no unified safety boundary.
+
+For controlled real side effects:
+
+> **Requests may come from many places. Final execution authority must remain singular.**
 
 ---
 
-## 9. Authority Model
+## 10. Mechanical Facts, Semantic Completion, and User Acceptance
 
-CodeLeveler distinguishes three levels of truth:
+CodeLeveler explicitly separates “what happened” from “whether the work is truly done.”
 
 ```text
 Mechanical Truth
@@ -451,23 +529,23 @@ Semantic Satisfaction
 User Acceptance
 ```
 
-### 9.1 Runtime Authority
+### 10.1 Mechanical Facts Belong to the Runtime
 
-Runtime may authoritatively record mechanical facts such as:
+The Runtime can authoritatively record facts such as:
 
 ```text
 whether a command ran
-exit status
+its exit status
 whether a file changed
 whether an event occurred
 whether verification ran
 whether an artifact exists
-whether a process ended
+whether a process exited
 ```
 
-### 9.2 Model Semantic Authority
+These are mechanically knowable facts.
 
-The model interprets whether those facts are enough to satisfy the domain goal.
+### 10.2 Semantic Completion Belongs to Model + Domain
 
 For example:
 
@@ -481,73 +559,118 @@ does not automatically imply:
 the requested feature is semantically complete
 ```
 
-### 9.3 User Acceptance
+Whether the available evidence is sufficient to satisfy the domain goal requires semantic interpretation in the context of the Harness.
 
-The user owns final acceptance.
+### 10.3 The User Owns Final Acceptance
 
-Therefore:
+The final relation is:
 
 ```text
 Runtime owns facts.
-Model owns semantic interpretation.
-User owns acceptance.
+Model interprets those facts semantically.
+User owns final acceptance.
 ```
+
+This prevents a green check, successful Tool call, or changed file from becoming an automatic “done” signal.
 
 ---
 
-## 10. Persistence Architecture
+## 11. Persistence: Letting Work Continue Beyond One Conversation
 
-Long-lived agents require reliable persistence.
+Long-lived agents require durable state.
 
 The core rule is:
 
 ```text
 One persistent fact
-      ↓
+        ↓
 One authoritative owner
-      ↓
+        ↓
 One canonical representation
 ```
 
-Task state, Turn state, Ownership, Evidence, Usage, Artifacts, and Background Work all follow this rule.
+Task state, turn state, ownership, evidence, usage, artifacts, and background work all need a clear single source of truth.
 
-### 10.1 Persist Before Forward
+### 11.1 Persist Before Forward
 
-Authoritative Runtime events should follow:
+Authoritative runtime events should flow as:
 
 ```text
 Runtime Fact
     ↓
 Persist
     ↓
-Forward / Project
-    ↓
-Client
+Forward to Clients
 ```
 
-A client should not observe an authoritative Runtime fact before the Runtime has reliably recorded it.
+A client should never observe an authoritative fact before the Runtime has durably recorded it.
 
-### 10.2 Persistence Provides Continuity
+### 11.2 Persistence Provides Continuity
 
-Persistence is not merely chat history. Its long-term purpose is to support:
+Its purpose is much broader than saving chat history:
 
 ```text
-resume
-recovery
-cross-device continuity
+pause and resume
+crash recovery
+cross-device continuation
 background work
 long-running tasks
-child session durability
+durable child sessions
 auditability
 ```
 
+An agent may eventually work for hours or days and continue across devices. Persistence is the foundation of that shape.
+
 ---
 
-## 11. Product Architecture
+## 12. Model Providers and Capability Negotiation
 
-The Product layer owns experience, composition, and delivery.
+CodeLeveler can work with different models and model services without allowing protocol differences to leak into domain architecture.
 
-Examples include:
+The Provider / Protocol layer normalizes:
+
+```text
+request and response protocols
+streaming
+tool calling
+reasoning transport
+structured output
+vision
+context and output limits
+error mapping
+```
+
+### 12.1 Protocol Differences Can Be Adapted; Semantics Cannot Be Faked
+
+If two providers differ only in wire format, the adapter can normalize them.
+
+If a model truly lacks a required mechanical capability, the system should report that capability as absent rather than invent a hidden behavioral path that pretends it exists.
+
+### 12.2 Available Capability Is an Intersection
+
+A capability is actually usable only when multiple conditions agree:
+
+```text
+Model Capability
+      ∩
+Host Capability
+      ∩
+Runtime Capability
+      ∩
+Harness Requirement
+      =
+Available Capability
+```
+
+This is capability negotiation.
+
+It lets the same architecture work across different models, machines, and execution environments.
+
+---
+
+## 13. Product and Clients: Experience Belongs to Product, Truth Belongs to Runtime
+
+The Product layer turns the foundation into something people use:
 
 ```text
 CLI
@@ -558,30 +681,23 @@ Mobile
 Remote Client
 ```
 
-A Product may decide:
+Products may decide:
 
 ```text
 how information is presented
 how interaction is organized
-which capabilities form a product
-default experience
 navigation
-visualization
+default UX
+which capabilities compose a product
 ```
 
-But a Product does not own Runtime Truth.
+But a Product does not redefine Runtime truth.
 
 The core rule is:
 
-> **UI is a projection of Runtime truth.**
+> **The UI is a projection of Runtime truth, not a new source of Runtime truth.**
 
-A Product may own local view state, but authoritative task, execution, permission, tool, and persistent state must come from the proper owner.
-
----
-
-## 12. Client / Runtime Boundary
-
-Clients and Runtime should communicate through a stable protocol rather than shared internal state.
+Clients should connect to the Runtime through a stable command/event boundary:
 
 ```text
 Client Command
@@ -593,757 +709,594 @@ Runtime Event
 Client
 ```
 
-The same Runtime may serve multiple clients:
+One Runtime can therefore serve multiple clients:
 
 ```text
-             Runtime
-          /     |      \
-         ▼      ▼       ▼
-       TUI     Web    Mobile
+                     Runtime
+                 /     |      \
+                ▼      ▼       ▼
+              TUI     Web    Mobile
 ```
 
-A Client and Runtime may also live on different machines:
-
-```text
-Client
-  ↓
-Transport
-  ↓
-Remote Runtime
-```
-
-This gives local, remote, and cloud execution the same client/runtime architecture.
+The client and Runtime do not need to live on the same machine.
 
 ---
 
-## 13. Multi-Agent Architecture
+## 14. How One Task Actually Flows
 
-Multi-Agent is not simply "one Agent calling several models."
+Consider a coding task: “fix this bug and verify the result.”
 
-It is multiple Agent lifecycles collaborating under one Runtime Authority.
+### Step 1: Product Receives the Goal
+
+The Product owns interaction and passes the goal into the Coding Harness.
 
 ```text
-                 Parent Agent
-                /      |      \
-               ▼       ▼       ▼
-          Explorer   Worker   Reviewer
-               │       │       │
-               └───────┼───────┘
-                       ▼
-                 Shared Runtime
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-      Persistence   Ownership   Capabilities
+User
+ ↓
+Product
 ```
 
-Multi-Agent Runtime provides the common mechanical collaboration layer:
+### Step 2: The Harness Establishes Coding Context
+
+The Coding Harness decides:
 
 ```text
-child lifecycle
-session relationship
+this is a coding task
+which coding capabilities the model should see
+what repository and domain rules apply
+how domain completion is expressed
+```
+
+### Step 3: Runtime Starts the Task
+
+The Runtime:
+
+```text
+creates task and turn lifecycle
+maintains state
+records events
+manages budget, cancellation, and recovery
+```
+
+### Step 4: The Model Reasons and Chooses an Action
+
+The model investigates, plans, and requests a Capability through a Tool.
+
+### Step 5: Capabilities Perform the Work
+
+Read, search, code intelligence, and other Capabilities perform their responsibilities.
+
+For real side effects:
+
+```text
+Model Request
+    ↓
+Domain Tool
+    ↓
+Capability
+    ↓
+Host Authority
+    ↓
+File / Process / Network
+```
+
+### Step 6: Runtime Records Mechanical Facts
+
+Examples include process exit status, file changes, verification results, artifacts, and lifecycle events.
+
+### Step 7: The Model Judges Domain Completion
+
+The model combines the goal, domain semantics, and mechanical facts to decide whether more work is needed.
+
+### Step 8: Product Presents the Result; User Accepts or Rejects
+
+Runtime provides authoritative facts, Product presents them, and the user owns acceptance.
+
+The complete flow is:
+
+```text
+User
+ ↓
+Product
+ ↓
+Harness
+ ↓
+Agent Runtime ↔ Model
+ ↓
+Tool Surface
+ ↓
+Capabilities
+ ↓
+Host Authority
+ ↓
+Operating System
+ ↓
+Mechanical Facts
+ ↓
+Persistence
+ ↓
+Product Projection
+ ↓
+User Acceptance
+```
+
+---
+
+## 15. Multi-Agent: More Than “Calling More Models”
+
+Multi-agent architecture is not primarily about model count.
+
+It is:
+
+> **Multiple agent lifecycles collaborating under the same Runtime, ownership model, persistence model, and Host Authority.**
+
+```text
+                    Parent Agent
+                /       |        \
+               ▼        ▼         ▼
+           Explorer    Worker    Reviewer
+               │        │         │
+               └────────┼─────────┘
+                        ▼
+                    Shared Runtime
+              ┌─────────┼─────────┐
+              ▼         ▼         ▼
+          Persistence Ownership Capabilities
+```
+
+Multi-agent collaboration needs one shared mechanical model for:
+
+```text
+lifecycle
+parent-child relationships
 ownership
 write scope
 capability access
 background execution
-settlement
 cancellation
+settlement
 persistence
 result handoff
 ```
 
-Role semantics belong to the Harness. Lifecycle and mechanical correctness belong to Runtime.
-
-Multi-Agent must not create a second lifecycle, authority, or persistence system around the primary Runtime.
+Roles may differ. Domain semantics may differ. But child agents must not invent a second lifecycle, permission system, or persistence system beside the Runtime.
 
 ---
 
-## 14. Provider & Model Boundary
+## 16. Dependency Direction: Lower Means More General
 
-Model Providers differ in protocol and mechanical capability.
-
-Those differences belong to the Provider / Protocol layer, not to a Harness intelligence-compensation layer.
-
-Negotiable facts include:
-
-```text
-tool calling
-streaming
-reasoning transport
-vision
-structured output
-forced tool choice
-context window
-output limit
-wire format
-```
-
-The system should:
-
-```text
-discover capability
-negotiate explicitly
-report honestly
-enable or disable dependent capability from mechanical conditions
-```
-
-It should not:
-
-```text
-change tool semantics to simulate missing provider capability
-add hidden behavior to normalize model intelligence
-```
-
----
-
-## 15. Dependency Direction
-
-Architecture dependencies must remain one-way.
-
-```text
-Foundation
-    ↑
-Runtime / Capabilities
-    ↑
-Harnesses
-    ↑
-Products
-```
-
-From the caller's perspective:
+Dependencies should always point toward more general layers:
 
 ```text
 Product
-   ↓
+  ↓
 Harness
-   ↓
+  ↓
 Runtime / Capabilities
-   ↓
+  ↓
 Foundation
 ```
 
-The core requirements are:
+Another way to read it:
 
 ```text
-Runtime does not depend on a concrete Harness.
-Harness does not depend on a concrete Product UI.
-Foundation does not depend on upper-layer domain concepts.
-Capability does not depend on the specific Tool or Product that invokes it.
+Higher layers: more product- and domain-specific
+Lower layers: more general, stable, and ignorant of upper-layer semantics
+```
+
+Therefore:
+
+```text
+Runtime must not depend on a concrete Harness.
+Harness must not depend on a concrete Product UI.
+Foundation must not know Coding or Review concepts.
+A Capability must not depend backward on the specific Tool or Product consuming it.
 ```
 
 Lower layers provide mechanisms. Upper layers provide composition and semantics.
 
 ---
 
-## 16. Conceptual Task Flow
+## 17. Architecture Guardrails: Allowed and Forbidden
 
-From user request to host side effect:
+This section is the direct decision framework for future design.
 
-```text
-User
-  ↓
-Product
-  ↓
-Harness
-  ↓
-Agent Runtime
-  ↓
-Model
-  ↓
-Tool Intent
-  ↓
-Harness Tool Surface
-  ↓
-Capability
-  ↓
-Host Authority
-  ↓
-Operating System
-```
+### 17.1 Product Layer
 
-The result returns through:
+**Allowed:**
 
 ```text
-Operating System
-  ↓
-Capability Result
-  ↓
-Runtime Fact
-  ↓
-Persistence
-  ↓
-Runtime Event
-  ↓
-Harness / Product
-  ↓
-User
+new UIs
+new clients
+interaction and navigation changes
+new product compositions
+local view state
 ```
 
-This flow encodes three core constraints:
+**Forbidden:**
 
-1. Model does not directly own host side effects.
-2. Runtime records mechanical facts but does not replace domain semantics.
-3. Product presents truth but does not redefine it.
+```text
+independently deriving authoritative task state
+treating Tool success as task completion
+creating a second Runtime truth
+bypassing Runtime to own durable task lifecycle
+```
+
+### 17.2 Harness Layer
+
+**Allowed:**
+
+```text
+new domain rules
+new Coding / Review / Research Harnesses
+tool-surface changes
+domain completion semantics
+domain collaboration semantics
+```
+
+**Forbidden:**
+
+```text
+pushing Coding or Review semantics into generic Runtime
+hidden planning or reasoning on behalf of the model
+a second task lifecycle
+a second permission, ownership, or persistence system
+bypassing Host Authority
+```
+
+### 17.3 Agent Runtime
+
+**Allowed:**
+
+```text
+generic lifecycle mechanisms
+stronger pause / resume / cancellation
+background lifecycle
+parent-child session relationships
+resource budgets
+events and persistence
+crash recovery
+```
+
+Only when the mechanism remains valid across multiple domains.
+
+**Forbidden:**
+
+```text
+understanding product-specific completion semantics
+deciding how the model should investigate or plan
+changing runtime rules by model “strength”
+embedding a product workflow
+becoming a giant Agent Brain
+```
+
+### 17.4 Capability Layer
+
+**Allowed:**
+
+```text
+new reusable capabilities
+capability-owned lifecycle where necessary
+consolidating shared behavior under a clear capability owner
+local and remote implementations
+```
+
+**Forbidden:**
+
+```text
+product UI logic inside a Capability
+a Capability depending backward on a specific Tool
+multiple competing owners for the same capability
+splitting components only for architectural symmetry
+```
+
+### 17.5 Tool Layer
+
+**Allowed:**
+
+```text
+new model intent entry points
+clear parameter schemas
+invoking existing capabilities
+rendering capability results to the model
+precise errors
+```
+
+**Forbidden:**
+
+```text
+becoming a global service locator
+owning long-lived global state
+owning permission policy
+owning process lifecycle
+reimplementing the capability runtime
+silently changing operation semantics
+```
+
+### 17.6 Host Authority
+
+**Allowed:**
+
+```text
+controlling real side effects
+permissions and approvals
+workspace enforcement
+sandbox and process constraints
+local, remote, or cloud execution backends
+```
+
+**Forbidden:**
+
+```text
+judging whether a domain goal is semantically complete
+changing facts based on Product UI state
+allowing a bypass execution authority beside it
+```
+
+### 17.7 Provider / Protocol Layer
+
+**Allowed:**
+
+```text
+protocol adaptation
+request / response normalization
+model capability normalization
+wire compatibility
+mechanical capability negotiation
+```
+
+**Forbidden:**
+
+```text
+changing domain semantics to pretend a capability exists
+injecting hidden behavior because a model is weak
+allowing different providers to imply different task meanings
+```
+
+### 17.8 Multi-Agent
+
+**Allowed:**
+
+```text
+role-specialized child agents
+durable child sessions
+background work
+capability negotiation
+result handoff
+remote workers
+```
+
+**Forbidden:**
+
+```text
+child agents bypassing Runtime
+child agents bypassing shared ownership
+child agents creating a second filesystem authority
+child agents creating a second persistence truth
+```
+
+### 17.9 New Abstractions
+
+A new crate, trait, manager, registry, adapter layer, or generic framework is justified when at least one real driver exists:
+
+```text
+two real implementations or consumers
+a real dependency-inversion need
+an independent security boundary
+an independent protocol boundary
+an independent persistence boundary
+an independent lifecycle boundary
+a remote deployment boundary
+an observed ownership or coupling problem
+```
+
+It is not justified merely because:
+
+```text
+“we may need it later”
+“it is more generic”
+“it looks cleaner”
+“a second implementation may exist someday”
+“the diagram becomes more symmetric”
+```
 
 ---
 
-## 17. Architecture Invariants
+## 18. Architecture Invariants
 
-These rules are CodeLeveler's long-term architecture constitution.
+These rules should remain true over the long term.
 
-### 17.1 Intelligence Boundary
-
-```text
-Model owns intelligence.
-Runtime must not simulate agent intelligence.
-```
-
-### 17.2 Harness Boundary
+### 18.1 Intelligence Boundary
 
 ```text
-Harness owns domain semantics.
-Runtime must not define Coding, Review, or other product semantics.
+The Model owns intelligence.
+The Runtime does not emulate agent intelligence.
 ```
 
-### 17.3 Lifecycle Boundary
+### 18.2 Domain Boundary
+
+```text
+The Harness owns domain semantics.
+Generic Runtime does not define Coding, Review, or other product semantics.
+```
+
+### 18.3 Lifecycle Boundary
 
 ```text
 Engine owns lifecycle, not agent intelligence.
 ```
 
-### 17.4 Capability Boundary
+### 18.4 Capability Boundary
 
 ```text
-Tool is an adapter.
-Capability is the reusable ability.
+A Tool is an adapter.
+A Capability is the reusable ability.
 ```
 
-### 17.5 Authority Boundary
+### 18.5 Execution Authority Boundary
 
 ```text
-Agent proposes.
-Host Authority decides and performs.
+The Agent requests.
+Host Authority decides and performs real side effects.
 ```
 
-### 17.6 Persistence Boundary
+### 18.6 Persistence Boundary
 
 ```text
 One persistent fact, one authoritative owner.
 ```
 
-### 17.7 Product Boundary
+### 18.7 Product Boundary
 
 ```text
-Product projects truth.
-Product does not create runtime truth.
+Products project truth; they do not create Runtime truth.
 ```
 
-### 17.8 Dependency Boundary
+### 18.8 Dependency Boundary
 
 ```text
-Dependencies point downward toward more general layers.
-Lower layers do not depend on product-specific layers.
+Dependencies point toward more general layers.
+General layers do not depend backward on product-specific layers.
 ```
 
-### 17.9 Multi-Harness Boundary
+### 18.9 Multi-Harness Boundary
 
 ```text
-A new Harness must not require redesigning Agent Runtime.
+Adding a semantically different Harness must not require redesigning the Agent Kernel.
 ```
 
-### 17.10 Reliability Boundary
+### 18.10 Reliability Boundary
 
 ```text
-Moving responsibility between layers must not weaken mechanical correctness,
-authority, persistence, cancellation, recovery, or safety guarantees.
+Moving responsibility between layers must not weaken
+mechanical correctness, authority, persistence, cancellation, recovery, or safety.
 ```
-
----
-
-## 18. Architecture Guardrails: Allowed and Forbidden
-
-This section is the direct decision rule for architecture changes.
-
-These are not suggestions. They define the allowed design space.
-
-### 18.1 Allowed
-
-#### A. Add Domain Capability Above Runtime
-
-Allowed:
-
-```text
-new Coding workflows
-new Review semantics
-new Research or other Harnesses
-changes to a product's Tool Surface
-new domain Completion Semantics
-```
-
-As long as those semantics remain in the owning Harness / Product and do not leak downward into reusable Runtime.
-
-#### B. Extend Domain-Neutral Runtime Mechanisms
-
-Runtime may gain genuinely reusable mechanical capability such as:
-
-```text
-new lifecycle states
-stronger resume / recovery
-stronger cancellation
-generic background lifecycle
-generic parent / child session relationships
-generic resource budgets
-generic event and persistence mechanisms
-```
-
-The mechanism must not require Coding, Review, or another domain vocabulary.
-
-#### C. Add Reusable Capabilities
-
-New Capabilities are allowed, for example:
-
-```text
-Browser
-Remote Execution
-Search
-External Service
-New Code Intelligence
-New Workspace Ability
-```
-
-when they represent real reusable ability with a clear ownership boundary.
-
-#### D. Add Tool Adapters for Capabilities
-
-A new Tool may expose a new model intent.
-
-The conditions are:
-
-```text
-Tool remains an adapter
-semantics are stable
-Capability Runtime is not duplicated
-no new Authority is created
-Tool does not become a persistent-state owner
-```
-
-#### E. Extend Provider / Protocol Adapters
-
-New models, protocols, and wire formats may be supported.
-
-Provider differences may be normalized mechanically, but Agent behavior semantics must not be changed to fake a mechanical capability the provider does not have.
-
-#### F. Add Products and Clients
-
-Allowed:
-
-```text
-new TUI / Web / Desktop / Mobile clients
-remote controllers
-new Agent products
-new domain Harnesses
-```
-
-as long as they consume Runtime Truth rather than create a second Runtime Truth.
-
-#### G. Add Local / Remote / Cloud Execution Backends
-
-Host Authority may support different execution locations:
-
-```text
-Local Host
-Remote Host
-Container
-VM
-Cloud Worker
-```
-
-Execution location may change. Authority and Agent semantic boundaries remain the same.
-
-#### H. Introduce an Abstraction When There Is Real Evidence
-
-A new crate, trait, registry, manager, adapter layer, or generic framework may be introduced when at least one real driver exists:
-
-```text
-two real implementations or consumers
-real dependency inversion
-independent security boundary
-independent protocol boundary
-independent persistence boundary
-independent lifecycle
-remote deployment boundary
-observed ownership or coupling defect
-```
-
-Abstraction follows real boundaries, not imagined futures.
-
----
-
-### 18.2 Forbidden
-
-#### A. Do Not Push Product Semantics Into Reusable Runtime
-
-Kernel, Engine, and Foundation must not learn:
-
-```text
-Coding Prompt
-Review Finding
-Repository Workflow
-product-specific Tool Preference
-domain-specific Done definitions
-```
-
-Those belong to Harnesses.
-
-#### B. Do Not Make Runtime Think for the Model
-
-Do not add hidden reasoning compensation because a model is weak, such as:
-
-```text
-deciding when the model should plan
-deciding what it should investigate next
-automatically replacing a badly chosen Tool with another Tool
-hidden task-solving retries
-duplicate tool semantics for weaker models
-changing domain behavior by model intelligence class
-```
-
-Mechanical retry, network recovery, protocol adaptation, and schema validation are engineering reliability and are not prohibited by this rule.
-
-#### C. Do Not Create a Second Host Side-effect Authority
-
-Tool, Harness, Product, or extension code must not bypass the common Authority by creating a parallel:
-
-```text
-filesystem mutation path
-process execution path
-permission path
-approval path
-sandbox path
-workspace write authority
-```
-
-One controlled side effect must not have competing Authorities.
-
-#### D. Do Not Turn Tools Into Runtime or Service Locators
-
-Do not place universal service collections, long-lived state, permission decisions, process lifecycle, or global policy into every Tool.
-
-A Tool should not receive a universal context that gives it unrelated capabilities.
-
-#### E. Do Not Create Multiple Sources of Persistent Truth
-
-Forbidden:
-
-```text
-UI deriving authoritative Task state
-Harness and Engine each storing authoritative versions of the same fact
-event stream and database becoming independent authorities
-multiple components overwriting one canonical fact
-```
-
-One fact must have one canonical owner.
-
-#### F. Do Not Introduce Reverse Dependencies
-
-Forbidden:
-
-```text
-Foundation → Harness
-Runtime → concrete Product
-Capability → concrete UI
-generic Harness → another domain Harness
-```
-
-Lower layers must not depend on higher product layers for convenience.
-
-#### G. Do Not Use Semantic-Changing Fallbacks to Pretend Capability Exists
-
-Forbidden:
-
-```text
-regex search silently becoming literal search
-structured edit silently becoming another edit meaning
-provider missing a capability but another behavior path pretending it exists
-```
-
-A fallback may replace an implementation only if the contract and meaning remain the same.
-
-#### H. Do Not Change Mechanical Capability Boundaries Based on Task or Model "Intelligence"
-
-Capability availability should come from real mechanical conditions such as:
-
-```text
-model protocol capability
-host capability
-runtime capability
-harness requirement
-user configuration
-```
-
-It must not come from:
-
-```text
-the task looks difficult
-the model looks weak
-the model performed poorly this round
-```
-
-#### I. Do Not Pre-build Frameworks for Hypothetical Futures
-
-Do not add generic abstractions only because:
-
-```text
-we may need it later
-it is more generic
-Clean Architecture looks more complete
-there may be a second implementation someday
-```
-
-The architecture must allow future extension. That does not mean implementing the future in advance.
-
-#### J. Do Not Let Multi-Agent Bypass the Shared Runtime
-
-Child Agents, Reviewers, and Workers must not create separate systems for:
-
-```text
-lifecycle
-permission
-ownership
-persistence
-cancellation
-settlement
-```
-
-Roles may differ. Mechanical runtime rules remain shared.
-
-#### K. Do Not Encode Local-only Assumptions Into Agent Semantics
-
-Agent, Harness, and Runtime semantics should not assume execution always happens on the current machine.
-
-Local, remote, container, and cloud are deployment choices of Execution Authority, not four different Agent architectures.
-
----
-
-### 18.3 Architecture Change Test
-
-Before a change enters Foundation, Runtime, or a Capability layer, it should answer:
-
-```text
-Who owns it?
-Is it domain semantics or mechanical mechanism?
-Could a second Harness reasonably reuse it?
-Does it create a new Authority?
-Does it create a second source of persistent truth?
-Does it introduce a reverse dependency?
-Does it change the meaning of an existing capability?
-Is it abstracting an imagined future rather than a real boundary?
-```
-
-If a feature can naturally remain in a Harness, it should not be pushed into Foundation merely to make it "generic."
-
-If a new Harness requires redesigning the Agent Kernel before it can exist, suspect the boundary design before assuming the Kernel needs more domain concepts.
 
 ---
 
 ## 19. Evolution Direction
 
-CodeLeveler's long-term evolution is not about making one Coding Agent increasingly large. It is about allowing this Foundation to support more agent products and more execution forms.
+CodeLeveler should evolve by broadening the foundation, not by piling every feature into one Coding Agent.
 
-These are architecture directions, not a version roadmap.
-
-### 19.1 Multi-Harness
-
-Evolve from one Coding product to multiple domain Harnesses:
+### 19.1 Single Domain → Multiple Domains
 
 ```text
-                    Agent Runtime
-                 /       |        \
-                ▼        ▼         ▼
-             Coding    Review    Research
-             Harness   Harness   Harness
+                     Agent Runtime
+                  /       |        \
+                 ▼        ▼         ▼
+              Coding    Review    Research
 ```
 
-Each Harness:
+Each Harness owns its own semantics and Tool Surface while sharing Runtime, Capabilities, Persistence, and Host Authority.
 
-```text
-owns its domain semantics
-selects its Capabilities
-defines its Tool Surface
-owns its Completion Semantics
-```
-
-Runtime remains domain-neutral.
-
-### 19.2 Multi-Agent Runtime
-
-Evolve from a single Agent lifecycle into an Agent collaboration graph:
+### 19.2 Single Agent → Multi-Agent Runtime
 
 ```text
 Single Agent
     ↓
-Parent / Child
+Parent / Child Agents
     ↓
-Role-based Agents
+Role-specialized Agents
     ↓
 Multi-Agent Runtime
 ```
 
-Future roles may include:
+Explorer, Worker, Reviewer, Specialist, and other roles can emerge without creating parallel lifecycle systems.
+
+### 19.3 Tool Collection → Capability Platform
+
+Capabilities become a composable platform:
 
 ```text
-Planner
-Explorer
-Worker
-Reviewer
-Specialist
+                      Capability Platform
+                    /        |        \
+                   ▼         ▼         ▼
+                Coding     Review     Other
 ```
 
-But they share one mechanical foundation:
-
-```text
-lifecycle
-persistence
-ownership
-authority
-capability negotiation
-cancellation
-settlement
-```
-
-Multi-Agent is an extension of Runtime capability, not a second system.
-
-### 19.3 Capability Platform
-
-Capabilities evolve from "backends used by the Coding Agent" into an independently composable capability platform.
-
-```text
-                  Capabilities
-              /        |         \
-             ▼         ▼          ▼
-          Coding     Review      Other
-```
-
-Long-term capability families may include:
-
-```text
-Workspace
-Execution
-Browser
-Search
-Memory
-VCS
-Code Intelligence
-Media
-Remote Compute
-External Services
-```
-
-Harnesses compose what they need instead of inheriting one giant tool set.
+Workspace, Execution, Browser, Search, Memory, VCS, Code Intelligence, Media, and external services become reusable across domains.
 
 ### 19.4 Local → Remote → Cloud
 
-Runtime and Host Authority should not be bound to one local machine.
-
-The long-term shape is:
+Runtime semantics should be independent of execution location:
 
 ```text
 Harness
    ↓
 Agent Runtime
    ↓
-Execution Authority
+Host Authority
    ├── Local Host
    ├── Remote Host
    ├── Container
-   ├── VM / Isolated Worker
+   ├── Isolated VM
    └── Cloud Worker
 ```
 
-Only execution location changes. Core Agent semantics do not.
+What changes is *where* the work executes, not what the Agent means.
 
-### 19.5 Durable Agents
+### 19.5 Request-Scoped Agents → Durable Agents
 
-Agent lifecycles will become longer.
-
-Runtime should naturally support:
+Agents increasingly become durable work entities:
 
 ```text
 long-running goals
 pause / resume
 background execution
 cross-device continuation
-child session durability
-recoverable work
-persistent context
+durable child sessions
+recovery
+long-lived context
 ```
 
-An Agent is no longer equivalent to one chat request. It becomes a durable, recoverable task entity.
+A single chat request is only the shortest lifecycle, not the architectural ceiling.
 
-### 19.6 Capability Negotiation
+### 19.6 Capability Negotiation as a First-Class Mechanism
 
-Models, hosts, and workers expose different mechanical capabilities.
+Different models, hosts, and remote workers expose different capabilities.
 
-The system should explicitly negotiate:
+The system should negotiate those capabilities explicitly instead of relying on hidden semantic fallback.
+
+### 19.7 Final Shape: Agent Platform
+
+The long-term structure is:
 
 ```text
-model capabilities
-host capabilities
-runtime capabilities
-harness requirements
-user configuration
+                              Products
+                  ┌────────────┼────────────┐
+                  ▼            ▼            ▼
+               Coding        Review       Others
+                  │            │            │
+                  └────────────┼────────────┘
+                               ▼
+                          Harnesses
+                               │
+                               ▼
+                         Agent Runtime
+                               │
+                    ┌──────────┴──────────┐
+                    ▼                     ▼
+             Capability Platform     Persistence
+                    │                     │
+                    └──────────┬──────────┘
+                               ▼
+                         Host Authority
+                               │
+                   ┌───────────┼───────────┐
+                   ▼           ▼           ▼
+                 Local       Remote       Cloud
 ```
 
-Available capability comes from the intersection of those facts, not hidden guesses.
+The final mental model is simple:
 
 ```text
-Available Capability
-    =
-Model ∩ Host ∩ Runtime ∩ Harness ∩ Configuration
-```
-
-If a required mechanical capability is absent, disable the dependent feature honestly rather than change semantics and pretend it exists.
-
-### 19.7 Agent Platform
-
-The final shape is not "a more complex Coding Agent." It is a runtime platform for building different Agent products.
-
-```text
-                         Products
-             ┌─────────────┼─────────────┐
-             ▼             ▼             ▼
-          Coding         Review         Others
-             │             │             │
-             └─────────────┼─────────────┘
-                           ▼
-                        Harnesses
-                           │
-                           ▼
-                     Agent Runtime
-                           │
-                 ┌─────────┴─────────┐
-                 ▼                   ▼
-          Capability Platform    Persistence
-                 │                   │
-                 └─────────┬─────────┘
-                           ▼
-                     Host Authority
-                           │
-                ┌──────────┼──────────┐
-                ▼          ▼          ▼
-              Local      Remote      Cloud
-```
-
-In this model:
-
-```text
-Model provides intelligence.
-Harness provides domain semantics.
-Runtime provides lifecycle and mechanical correctness.
-Capability provides reusable ability.
-Authority provides controlled real execution.
+The Model provides intelligence.
+The Harness defines the domain.
+The Runtime provides lifecycle.
+Capabilities provide abilities.
+Host Authority provides controlled execution.
 Persistence provides continuity.
-Product provides experience.
+Products provide experience.
 ```
 
-That is CodeLeveler's long-term architecture direction.
+When a new domain, client, model, or execution environment appears, the architecture should let it extend the correct layer without forcing the whole system to be redesigned.
