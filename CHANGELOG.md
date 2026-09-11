@@ -197,6 +197,40 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **Windows confines what a command writes, not what it reads.** AppContainer
+  denies reads by default, so a confined Windows command resolved `cargo` on
+  `PATH` and then could not open it — and the fix would have been an
+  ever-growing read allowlist for Cargo, Rustup, Git, Node and every
+  user-installed tool after them. That is a second permission model, not a
+  Windows backend. Windows now uses Mandatory Integrity Control, which denies
+  write-up and never denies read-up: the child runs at Low integrity and each
+  authorized write root carries a Low label for the life of the command.
+  `leveler-confine.exe` is the argv wrapper that lowers the token, the Windows
+  counterpart of `sandbox-exec` and `bwrap`, so foreground and background share
+  one confining spawn instead of the background registry refusing every
+  confined command. Measured on a real runner: cargo, rustc and git all run,
+  pipes and `NUL` work, `cargo build` drives rustc as a child, and writes to
+  the user profile, `TEMP` and `C:\` are denied while the workspace succeeds.
+  The Windows suite went from fourteen failures to none.
+  **Windows has no CodeLeveler backend for per-command network denial.** The
+  platform has the machinery — the Windows Filtering Platform filters at the
+  ALE layer by application identity, and firewall rules can block outbound
+  traffic per program path — but this execution backend implements no
+  per-command denial on it. The capability probe reports `network_deny=false`
+  and a request for one is refused rather than run with the network open.
+- **A write root left at Low integrity by a killed run is put back.** The
+  destructor that restores a lowered label does not run when the process is
+  killed, and the record describing the previous label held no root path, so
+  nothing could act on it without already knowing which repository to repair.
+  A record now names its root and is synced to disk before the label moves;
+  recovery runs at assembly and again before the first root is leased, and
+  refuses confined execution rather than proceeding over label state it could
+  not put straight. A record it cannot read is refused, not guessed at.
+- **`cmd.exe` parses its own tail again.** `cmd /C <tail>` is parsed by cmd,
+  which does not read a backslash as a quote escape. Both spawn paths quoted
+  that tail the way Win32 argv is quoted, so a shell command carrying its own
+  quotes arrived with them intact as characters and
+  `powershell -Command "Start-Sleep -Seconds 5"` was printed rather than run.
 - **A refused escalation now closes the tool call it announced.** A command
   whose one-shot elevation the user denied was answered into the model's
   transcript and nowhere else: the announcing `ToolCallStarted` never got a

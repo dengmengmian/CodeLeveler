@@ -299,6 +299,25 @@ impl Application {
             std::env::temp_dir(),
         ));
         let _ = leveler_core::install_environment((*environment).clone());
+
+        // A Windows run killed with a write root still lowered leaves that
+        // directory at Low integrity, and no destructor is left to put it
+        // back. Repair it here, at the first point the environment is known,
+        // rather than waiting for the same repository to be opened again.
+        //
+        // A failure does not fail assembly, for the same reason a missing API
+        // key does not: it would block every command over something only
+        // confined execution depends on. `lease_write_roots` retries this and
+        // refuses the command outright if it still cannot be done, so nothing
+        // runs confined over label state we could not put straight.
+        if let Err(error) = leveler_execution::recover_stale_write_roots(&environment) {
+            tracing::warn!(
+                %error,
+                "could not restore write-root integrity labels left by an earlier run; \
+                 confined execution will refuse until this is resolved"
+            );
+        }
+
         let config = Self::load_config(&layout)?;
 
         let providers = config

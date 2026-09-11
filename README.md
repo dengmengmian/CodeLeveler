@@ -30,12 +30,15 @@ the code does not meet yet.
 CodeLeveler is in public beta: **`0.2.0-beta.1`**, published as a pre-release
 (see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
 
-**The beta ships macOS and Linux binaries only.** Windows, macOS and Linux all
-run the suite in CI; macOS and Linux are green, and the Windows job compiles,
-lints and passes its security canaries but still has three failing tests
-([`CHANGELOG.md`](CHANGELOG.md)). Rather than hand out a binary whose suite is
-red, the beta leaves Windows on stable `0.1.4` — which does ship a Windows
-build — until those three are diagnosed on a real Windows machine.
+**The published beta carries macOS and Linux binaries only.** All three
+platforms run the suite in CI and all three are green: the Windows job
+compiles, lints, passes its security canaries and its Edge browser acceptance,
+and runs the workspace tests. `0.2.0-beta.1` was tagged before that work
+landed, so the binaries attached to it predate it; `0.1.4` remains the release
+that ships a Windows build. Windows currently has no CodeLeveler backend for
+per-command network denial: the capability reports `network_deny=false`, and a
+command that requires network isolation is refused rather than run with the
+network open ([`CHANGELOG.md`](CHANGELOG.md)).
 
 ## Three focused tools, one workflow
 
@@ -247,7 +250,7 @@ is explicit rather than implicit.
 
 | Platform | Process control | Restricted command execution |
 | --- | --- | --- |
-| Windows | Job Objects | AppContainer and ACL restrictions when available |
+| Windows | Job Objects | A Low-integrity child; authorized write roots labelled Low |
 | macOS | Process-group cancellation | Seatbelt profiles |
 | Linux | Process-group cancellation | Bubblewrap |
 

@@ -16,10 +16,13 @@
 //! - Low-integrity write confinement (`windows_confine`): reads unrestricted,
 //!   writes only where a root carries a Low mandatory label
 //!
-//! Windows has no per-process network deny outside AppContainer, and
-//! AppContainer cannot give a coding agent readable toolchains. The probe
-//! therefore reports `network_deny=false` and a request that asks for one is
-//! refused rather than run with the network open.
+//! Windows has no CodeLeveler backend for per-command network denial. The
+//! platform has the machinery — the Windows Filtering Platform filters at the
+//! ALE layer by application identity, and firewall rules can block outbound
+//! traffic per program path — but this execution backend implements no
+//! per-command denial on it. The probe therefore reports `network_deny=false`
+//! and a request that asks for one is refused rather than run with the network
+//! open.
 //!
 //! Doctor never reports `sandbox=yes` or “full FS”.
 
@@ -438,8 +441,8 @@ mod tests {
         {
             // Write confinement is claimed exactly when the launcher that
             // performs it is installed, and network deny is never claimed:
-            // nothing outside AppContainer can enforce it, and AppContainer
-            // cannot leave a coding agent's toolchain readable.
+            // this backend implements no per-command network denial, so a
+            // request for one fails closed instead of running open.
             assert_eq!(
                 caps.write == FsCapability::WriteRestricted,
                 crate::windows_confine::launcher_path().is_some()
