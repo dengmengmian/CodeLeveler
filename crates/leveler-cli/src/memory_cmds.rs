@@ -103,8 +103,7 @@ pub(crate) fn cmd_memory(
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Remember { title, body, tags } => {
-            let entry = new_entry(&title, &body, tags);
-            let saved = store.remember(entry)?;
+            let saved = remember_direct(&store, &title, &body, tags)?;
             println!(
                 "{}",
                 Line::ok(&format!("remembered [{}]: {}", saved.id, saved.title))
@@ -219,6 +218,24 @@ pub(crate) fn memory_round_trip_via_store(root: &std::path::Path) -> anyhow::Res
     Ok(())
 }
 
+/// A user-authoritative direct write (`leveler memory remember`).
+///
+/// Uses `remember_deduplicated`, NOT `remember`: the latter is an upsert by id
+/// and is reserved for the accept-by-key path, where replacing the previous
+/// entry IS the intent. Using it here silently replaced a memory the user had
+/// already saved whenever the new title slugged to the same id — which a
+/// repeated title always does, and which every CJK-only title does via the
+/// timestamp fallback. `base.md` promises the opposite: remember never
+/// overwrites, and a second entry competes in recall.
+fn remember_direct(
+    store: &MemoryStore,
+    title: &str,
+    body: &str,
+    tags: Vec<String>,
+) -> Result<leveler_memory::MemoryEntry, leveler_memory::MemoryError> {
+    store.remember_deduplicated(new_entry(title, body, tags))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +259,41 @@ mod tests {
             "memory_dir should end with memory: {}",
             mem.display()
         );
+    }
+
+    /// A direct write must never replace a memory the user already saved.
+    /// `base.md` promises remember does not overwrite; the CLI used the upsert
+    /// path instead, so saving a second note under a title that slugs to the
+    /// same id silently destroyed the first one. A CJK-only title hits this
+    /// every time: it slugs to empty and falls back to a second-precision
+    /// timestamp, so two notes written in the same second collided.
+    #[test]
+    fn a_direct_write_never_replaces_an_existing_memory() {
+        let root =
+            std::env::temp_dir().join(format!("leveler-memory-cli-nodup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = MemoryStore::open(&root).unwrap();
+
+        let first = remember_direct(&store, "Deploy notes", "第一版正文", vec![]).unwrap();
+        let second = remember_direct(&store, "Deploy notes", "第二版正文完全不同", vec![]).unwrap();
+        assert_ne!(first.id, second.id, "a second note needs its own id");
+        assert_eq!(store.list_active().unwrap().len(), 2, "neither is lost");
+        assert!(
+            store
+                .read_active(&first.id)
+                .unwrap()
+                .body
+                .contains("第一版"),
+            "the first body survived"
+        );
+
+        // Two CJK-only titles in the same second both slug to empty and share
+        // the timestamp fallback; both must still land.
+        let a = remember_direct(&store, "状态色约定", "映射表实现", vec![]).unwrap();
+        let b = remember_direct(&store, "搜索框过滤范围", "只按 payer 过滤", vec![]).unwrap();
+        assert_ne!(a.id, b.id, "same-second CJK titles must not collide");
+        assert_eq!(store.list_active().unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// User-authoritative accept path used by `leveler memory accept` (not agent AutoApprove).

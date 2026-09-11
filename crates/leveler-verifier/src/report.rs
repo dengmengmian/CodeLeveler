@@ -24,6 +24,44 @@ pub enum CheckStatus {
     EnvironmentUnavailable,
 }
 
+impl CheckStatus {
+    /// The durable spelling of this status.
+    ///
+    /// Explicit, and deliberately not `Debug`: a record's vocabulary must not
+    /// move because a variant was renamed or a derive was added, and
+    /// `format!("{:?}").to_lowercase()` wrote `toolmissing` where the event's
+    /// own contract said `tool_missing`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::ToolMissing => "tool_missing",
+            Self::EnvironmentUnavailable => "environment_unavailable",
+        }
+    }
+
+    /// Read a durable check status, accepting every spelling this vocabulary
+    /// has had.
+    ///
+    /// `toolmissing` and `environmentunavailable` are what the Debug-derived
+    /// writer produced before [`Self::as_str`] existed. They are read and
+    /// never re-written: a row is a fact about what happened, and rewriting
+    /// one to tidy its spelling would be editing the record.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "passed" => Some(Self::Passed),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            "tool_missing" | "toolmissing" => Some(Self::ToolMissing),
+            "environment_unavailable" | "environmentunavailable" => {
+                Some(Self::EnvironmentUnavailable)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The three-way completion verdict. `Unverified` is not a failure — the task
 /// may still complete — but callers must not report it as verified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +331,60 @@ mod tests {
     fn non_gating_only_is_unverified() {
         let r = report(vec![check("fmt", false, CheckStatus::Passed)]);
         assert!(matches!(r.verdict(), Verdict::Unverified(_)));
+    }
+
+    /// The durable vocabulary is explicit, complete, and not Debug.
+    #[test]
+    fn the_durable_vocabulary_is_explicit_and_not_derived_from_debug() {
+        for (status, wire) in [
+            (CheckStatus::Passed, "passed"),
+            (CheckStatus::Failed, "failed"),
+            (CheckStatus::Skipped, "skipped"),
+            (CheckStatus::ToolMissing, "tool_missing"),
+            (
+                CheckStatus::EnvironmentUnavailable,
+                "environment_unavailable",
+            ),
+        ] {
+            assert_eq!(status.as_str(), wire, "{status:?}");
+            assert_eq!(CheckStatus::from_wire(wire), Some(status), "{wire}");
+        }
+        // The two the Debug-derived writer spelled without a separator, named
+        // so the mapper cannot be "simplified" back into a lowercase Debug
+        // without a test going red.
+        assert_eq!(
+            format!("{:?}", CheckStatus::ToolMissing).to_lowercase(),
+            "toolmissing"
+        );
+        assert_ne!(CheckStatus::ToolMissing.as_str(), "toolmissing");
+        assert_ne!(
+            CheckStatus::EnvironmentUnavailable.as_str(),
+            "environmentunavailable"
+        );
+    }
+
+    /// Rows written before the explicit vocabulary still read back.
+    #[test]
+    fn every_spelling_this_vocabulary_has_had_reads_back() {
+        for (wire, status) in [
+            ("passed", CheckStatus::Passed),
+            ("failed", CheckStatus::Failed),
+            ("skipped", CheckStatus::Skipped),
+            ("tool_missing", CheckStatus::ToolMissing),
+            ("toolmissing", CheckStatus::ToolMissing),
+            (
+                "environment_unavailable",
+                CheckStatus::EnvironmentUnavailable,
+            ),
+            (
+                "environmentunavailable",
+                CheckStatus::EnvironmentUnavailable,
+            ),
+        ] {
+            assert_eq!(CheckStatus::from_wire(wire), Some(status), "{wire}");
+        }
+        assert_eq!(CheckStatus::from_wire("nonsense"), None);
+        assert_eq!(CheckStatus::from_wire(""), None);
     }
 
     #[test]

@@ -192,6 +192,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             commit_co_author: false,
             overrides: None,
             memory_index: String::new(),
+            memory_expose: true,
             memory_root: None,
             background_tasks: registry.clone(),
             permission_rules: leveler_execution::PermissionRuleSet::default(),

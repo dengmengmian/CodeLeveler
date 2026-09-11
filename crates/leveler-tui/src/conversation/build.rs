@@ -141,8 +141,15 @@ pub fn build_conversation_lines_with_hits(
                     ]));
                 }
             }
-            TranscriptItem::Assistant(_) => {
-                out.extend(item_render(item, theme, width, state.tools_expanded, t));
+            TranscriptItem::Assistant(block) => {
+                // Interim prose is held to a visual-line bound; when it folds,
+                // its LAST emitted row is the clickable `▸` disclosure. A Final
+                // answer never folds and so contributes no hit row.
+                let (lines, disclosure) = crate::render::assistant_render(block, theme, width, t);
+                if let Some(offset) = disclosure {
+                    hits.push((out.len() + offset, idx));
+                }
+                out.extend(lines);
             }
             TranscriptItem::ToolGroup(group) => {
                 // Product activity stream — not a raw tool trace:

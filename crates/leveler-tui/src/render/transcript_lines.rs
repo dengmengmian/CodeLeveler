@@ -6,7 +6,9 @@ use leveler_client_protocol::UiCompletionReport;
 
 use crate::i18n::{Locale, UiText};
 use crate::theme::Theme;
-use crate::transcript::{AssistantBlock, ToolStatus, TranscriptItem, TurnEndBlock, TurnEndStatus};
+use crate::transcript::{
+    AssistantBlock, AssistantKind, ToolStatus, TranscriptItem, TurnEndBlock, TurnEndStatus,
+};
 
 use super::text::wrap;
 
@@ -16,6 +18,22 @@ use super::text::wrap;
 /// done, every line is stable. The live tail (last block + streaming "▌" cursor)
 /// is everything at or after the returned index.
 pub fn assistant_split(
+    block: &AssistantBlock,
+    theme: &Theme,
+    wrap_width: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let (lines, stable) = assistant_body(block, theme, wrap_width);
+    // Bulleting maps lines 1:1, so the stable boundary is preserved.
+    let bulleted = bulleted(lines, "●", Style::default().fg(theme.accent.primary));
+    (bulleted, stable)
+}
+
+/// The message's own wrapped rows, before the bullet gutter: every VISUAL line
+/// the text occupies at this width, plus the live "▌" cursor while streaming
+/// (which is one of those rows, and so counts against the bound). This is the
+/// unit the presentation bound is measured in — never Markdown blocks, never
+/// paragraphs, never `\n` counts.
+fn assistant_body(
     block: &AssistantBlock,
     theme: &Theme,
     wrap_width: usize,
@@ -43,9 +61,124 @@ pub fn assistant_split(
             Style::default().fg(theme.text.secondary),
         )));
     }
-    // Bulleting maps lines 1:1, so the stable boundary is preserved.
-    let bulleted = bulleted(lines, "●", Style::default().fg(theme.accent.primary));
-    (bulleted, stable)
+    (lines, stable)
+}
+
+/// The hard presentation bound on a non-final assistant message: at most this
+/// many VISUAL (post-wrap) rows on screen, disclosure row included. Prompt
+/// wording is a soft constraint; this one the model cannot exceed.
+pub const PROGRESS_VISUAL_LINES: usize = 3;
+
+/// Render an assistant message for the conversation, plus the index (within
+/// the returned lines) of its clickable disclosure row when it folded.
+///
+/// An answer renders in full, always. Bounded prose is held to
+/// [`PROGRESS_VISUAL_LINES`]: the first rows stay visible and the last row
+/// becomes the disclosure that names what is behind it. The original text is
+/// never touched — folding is a presentation decision the reader can undo.
+pub fn assistant_render(
+    block: &AssistantBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &UiText,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    if !is_bounded(block) {
+        return (assistant_split(block, theme, wrap_width).0, None);
+    }
+    let (body, _) = assistant_body(block, theme, wrap_width);
+    if body.len() <= PROGRESS_VISUAL_LINES {
+        // It already fits: no fold, no disclosure, nothing hidden.
+        return (
+            bulleted(body, "●", Style::default().fg(theme.accent.primary)),
+            None,
+        );
+    }
+    // How long the prose actually is, named on the row so a fold is never a
+    // silent truncation.
+    let total = body.len();
+    let row = progress_disclosure_row(block.expanded, total, theme, wrap_width, t);
+    if block.expanded {
+        // Open, the row LEADS — the same place a tool group keeps it. Trailing
+        // it would push the way back off screen the moment the block is taller
+        // than the viewport, which is exactly when the reader wants it.
+        let mut out = vec![row];
+        out.extend(bulleted(
+            body,
+            "●",
+            Style::default().fg(theme.accent.primary),
+        ));
+        return (out, Some(0));
+    }
+    // Folded, the row TRAILS: read the summary, then learn what is behind it.
+    // It occupies one of the bounded rows, so the content keeps the rest.
+    let mut out = bulleted(
+        body.into_iter().take(PROGRESS_VISUAL_LINES - 1).collect(),
+        "●",
+        Style::default().fg(theme.accent.primary),
+    );
+    out.push(row);
+    let at = out.len() - 1;
+    (out, Some(at))
+}
+
+/// Whether this block currently renders a disclosure row at this width — the
+/// fact keyboard disclosure needs to pick its target. Derived from the same
+/// measurement [`assistant_render`] makes, so the two cannot disagree.
+pub fn assistant_folds(block: &AssistantBlock, theme: &Theme, wrap_width: usize) -> bool {
+    is_bounded(block) && assistant_body(block, theme, wrap_width).0.len() > PROGRESS_VISUAL_LINES
+}
+
+/// Whether this block is subject to the presentation bound.
+///
+/// A [`AssistantKind::Progress`] block is, by definition. A still-streaming
+/// [`AssistantKind::Pending`] one is too, so live prose can never grow up the
+/// screen and so that the moment a tool call classifies it nothing moves.
+///
+/// A *finished* Pending block is NOT: the model stopped without calling a
+/// tool, which in this loop means the answer, and the turn marker that proves
+/// it can be a whole verification run away. Bounding it would fold the answer
+/// for as long as `cargo test` takes. When a tool call does follow, it arrives
+/// in the same model response — microseconds, well inside one 150 ms paint —
+/// so the fold lands in the same frame rather than as a visible jump.
+fn is_bounded(block: &AssistantBlock) -> bool {
+    match block.kind {
+        AssistantKind::Final => false,
+        AssistantKind::Progress => true,
+        AssistantKind::Pending => !block.done,
+    }
+}
+
+/// The folded block's own `▸ / ▾` row, reusing the shared disclosure language
+/// tool groups and user shells already speak — indented two columns so it sits
+/// under the `●` gutter rather than looking like a new activity.
+fn progress_disclosure_row(
+    expanded: bool,
+    total_lines: usize,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &UiText,
+) -> Line<'static> {
+    let label = if expanded {
+        t.assistant_progress_collapse.to_string()
+    } else {
+        t.assistant_progress_expand
+            .replace("{}", &total_lines.to_string())
+    };
+    let presentation = crate::presentation::disclosure::DisclosurePresentation {
+        label,
+        failed: 0,
+        failed_suffix: None,
+        expanded,
+        duration_ms: None,
+        first_error: None,
+    };
+    let mut line = crate::presentation::disclosure::header_line(
+        &presentation,
+        theme,
+        wrap_width.saturating_sub(2).max(1),
+    );
+    line.spans.insert(0, Span::raw("  "));
+    line
 }
 
 /// Render one transcript item to styled lines (no leading separator).
@@ -80,7 +213,7 @@ pub fn item_render(
             }
         }
         TranscriptItem::Assistant(block) => {
-            out.extend(assistant_split(block, theme, wrap_width).0);
+            out.extend(assistant_render(block, theme, wrap_width, t).0);
         }
         TranscriptItem::ToolGroup(group) => {
             // Same product surface as workbench Conversation: Silent tools
@@ -1150,6 +1283,236 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    // ---- Assistant progress presentation bound ----
+
+    fn block(text: &str, kind: AssistantKind, expanded: bool) -> AssistantBlock {
+        AssistantBlock {
+            id: leveler_client_protocol::MessageId::new("m1"),
+            text: text.to_string(),
+            done: true,
+            rendered: Some(crate::markdown::MdDoc::parse(text)),
+            kind,
+            expanded,
+        }
+    }
+
+    fn rows(block: &AssistantBlock, width: usize) -> (Vec<String>, Option<usize>) {
+        let (lines, at) = assistant_render(block, &Theme::no_color(), width, Locale::Zh.text());
+        (lines.iter().map(line_text).collect(), at)
+    }
+
+    /// Prose that already fits the bound is shown whole — no disclosure row,
+    /// nothing hidden, no reason to click anything.
+    #[test]
+    fn progress_within_the_bound_renders_whole_without_a_disclosure() {
+        let (lines, at) = rows(
+            &block(
+                "找到 status token 的既有实现，可以直接复用。",
+                AssistantKind::Progress,
+                false,
+            ),
+            60,
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(at, None);
+        assert!(lines[0].contains("既有实现"));
+    }
+
+    /// Long progress prose is bounded to PROGRESS_VISUAL_LINES visual rows —
+    /// post-wrap rows, not Markdown blocks — with the last row a disclosure
+    /// that names how many lines are behind it.
+    #[test]
+    fn long_progress_is_bounded_and_says_what_it_hid() {
+        let text = "关键判断：用户说优化
+
+方案：把 PaymentRecords 的状态色收敛
+
+其实更稳妥：先查一下同域页面
+
+先查一下现有 token
+
+再决定 scope";
+        let (lines, at) = rows(&block(text, AssistantKind::Progress, false), 60);
+        assert_eq!(lines.len(), PROGRESS_VISUAL_LINES, "{lines:?}");
+        assert_eq!(at, Some(lines.len() - 1));
+        let row = &lines[lines.len() - 1];
+        assert!(row.contains('▸'), "folded marker: {row:?}");
+        assert!(
+            row.contains("行"),
+            "a fold must name the hidden line count: {row:?}"
+        );
+        // Nothing beyond the bound may appear while folded.
+        assert!(
+            !lines.iter().any(|l| l.contains("再决定 scope")),
+            "hidden content leaked: {lines:?}"
+        );
+    }
+
+    /// Folding is never a silent truncation: expanding shows the original
+    /// Markdown in full, and offers the way back.
+    #[test]
+    fn expanding_progress_restores_the_whole_original_text() {
+        let text = "关键判断：用户说优化
+
+方案：把 PaymentRecords 的状态色收敛
+
+其实更稳妥：先查一下同域页面
+
+先查一下现有 token
+
+再决定 scope";
+        let (folded, _) = rows(&block(text, AssistantKind::Progress, false), 60);
+        let (open, at) = rows(&block(text, AssistantKind::Progress, true), 60);
+        assert!(open.len() > folded.len());
+        assert_eq!(at, Some(0), "the open block leads with its collapse row");
+        for fragment in ["关键判断", "方案", "其实更稳妥", "再决定 scope"] {
+            assert!(
+                open.iter().any(|l| l.contains(fragment)),
+                "{fragment} missing from the expanded block: {open:?}"
+            );
+        }
+        assert!(open[0].contains('▾'), "{open:?}");
+    }
+
+    /// Folded, the row belongs at the END: read the summary, then learn how
+    /// much is behind it. Expanded, it belongs at the TOP — the same place a
+    /// tool group keeps it — or a long block pushes the way back off screen
+    /// and the reader has to go looking for it.
+    #[test]
+    fn the_disclosure_row_leads_when_open_and_trails_when_folded() {
+        let text = "一\n\n二\n\n三\n\n四\n\n五\n\n六\n\n七";
+        let (folded, folded_at) = rows(&block(text, AssistantKind::Progress, false), 60);
+        assert_eq!(folded_at, Some(folded.len() - 1), "folded: trailing row");
+        assert!(folded[folded.len() - 1].contains('▸'));
+
+        let (open, open_at) = rows(&block(text, AssistantKind::Progress, true), 60);
+        assert_eq!(open_at, Some(0), "expanded: leading row");
+        assert!(open[0].contains('▾'), "{:?}", open[0]);
+        assert!(
+            open[0].contains("收起"),
+            "the way back reads as a way back: {:?}",
+            open[0]
+        );
+        // Nothing is lost by moving the row.
+        for fragment in ["一", "四", "七"] {
+            assert!(open.iter().any(|l| l.contains(fragment)), "{open:?}");
+        }
+    }
+
+    /// The answer is never compacted, however long it is.
+    #[test]
+    fn a_long_final_answer_is_never_folded() {
+        let text = (1..=20)
+            .map(|i| format!("第 {i} 行结论"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (lines, at) = rows(&block(&text, AssistantKind::Final, false), 60);
+        assert_eq!(at, None, "a Final answer has no disclosure row");
+        assert!(lines.len() > PROGRESS_VISUAL_LINES, "{}", lines.len());
+        assert!(
+            lines.iter().any(|l| l.contains("第 20 行结论")),
+            "{lines:?}"
+        );
+    }
+
+    /// A streaming block is bounded exactly like Progress, so the moment a
+    /// tool call classifies it nothing on screen moves.
+    #[test]
+    fn streaming_is_bounded_like_progress_so_classification_does_not_jump() {
+        let text = "关键判断：用户说优化
+
+方案：收敛状态色
+
+其实更稳妥：先查一下
+
+先看主题";
+        let mut streaming = block(text, AssistantKind::Pending, false);
+        streaming.done = false;
+        streaming.rendered = None;
+        let (live, live_at) = rows(&streaming, 60);
+        let (progress, progress_at) = rows(&block(text, AssistantKind::Progress, false), 60);
+        assert_eq!(live.len(), progress.len(), "{live:?} vs {progress:?}");
+        assert_eq!(live_at, progress_at);
+        assert!(live.len() <= PROGRESS_VISUAL_LINES);
+    }
+
+    /// A message the model finished without calling a tool is the answer in
+    /// this loop, and the turn marker proving it can be a whole verification
+    /// run away. It must not sit folded in the meantime.
+    #[test]
+    fn a_finished_but_unclassified_message_is_shown_in_full() {
+        let text =
+            "改完了。\n\n状态色已统一到 semantic token。\n\n搜索过滤已修复。\n\npnpm lint 通过。";
+        let (lines, at) = rows(&block(text, AssistantKind::Pending, false), 60);
+        assert_eq!(at, None, "no fold on a finished, unclassified message");
+        assert!(lines.len() > PROGRESS_VISUAL_LINES, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("pnpm lint")), "{lines:?}");
+    }
+
+    /// A message still streaming inside the bound keeps its live cursor: the
+    /// bound must not cost the only "still typing" cue.
+    #[test]
+    fn a_short_streaming_block_keeps_its_cursor_inside_the_bound() {
+        let mut streaming = block("正在分析", AssistantKind::Pending, false);
+        streaming.done = false;
+        streaming.rendered = None;
+        let (lines, at) = rows(&streaming, 60);
+        assert!(lines.len() <= PROGRESS_VISUAL_LINES, "{lines:?}");
+        assert_eq!(at, None);
+        assert!(lines.iter().any(|l| l.contains('▌')), "{lines:?}");
+    }
+
+    /// The bound counts VISUAL rows: one long paragraph that wraps past the
+    /// bound folds just like several short ones.
+    #[test]
+    fn the_bound_counts_wrapped_rows_not_markdown_blocks() {
+        let text = "这是一个很长的单段说明，它本身只有一个 Markdown 块，但在窄终端里会折行成很多视觉行，因此同样必须被压缩，否则一个段落就能吃掉半屏。";
+        let (lines, at) = rows(&block(text, AssistantKind::Progress, false), 30);
+        assert_eq!(lines.len(), PROGRESS_VISUAL_LINES, "{lines:?}");
+        assert_eq!(at, Some(lines.len() - 1));
+    }
+
+    /// `assistant_folds` is what keyboard disclosure targets on, so it must
+    /// agree with what was actually rendered.
+    #[test]
+    fn assistant_folds_agrees_with_the_rendered_disclosure() {
+        let theme = Theme::no_color();
+        let long = "一
+
+二
+
+三
+
+四
+
+五";
+        let mut streaming = block(long, AssistantKind::Pending, false);
+        streaming.done = false;
+        streaming.rendered = None;
+        for (b, expected) in [
+            (block(long, AssistantKind::Progress, false), true),
+            (block(long, AssistantKind::Progress, true), true),
+            (block(long, AssistantKind::Final, false), false),
+            (block(long, AssistantKind::Pending, false), false),
+            (streaming, true),
+            (block("短", AssistantKind::Progress, false), false),
+        ] {
+            assert_eq!(
+                assistant_folds(&b, &theme, 60),
+                expected,
+                "kind {:?} text {:?}",
+                b.kind,
+                b.text
+            );
+            assert_eq!(
+                assistant_render(&b, &theme, 60, Locale::Zh.text())
+                    .1
+                    .is_some(),
+                expected
+            );
+        }
     }
 
     #[test]

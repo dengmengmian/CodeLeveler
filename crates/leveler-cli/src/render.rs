@@ -1,7 +1,8 @@
 //! Event rendering for the CLI: agent events in text or JSONL form.
 
-use leveler_agent::{AdvisoryKind, AgentEvent, AgentVerificationStatus};
+use leveler_agent::{AdvisoryKind, AgentEvent};
 use leveler_lifecycle::VerificationStatus;
+use leveler_verifier::CheckStatus;
 
 use crate::cli::OutputFormat;
 pub(crate) fn render_event(event: AgentEvent, output: OutputFormat) {
@@ -78,9 +79,14 @@ fn render_event_text(event: AgentEvent) {
             evidence,
         } => {
             let mark = match status {
-                AgentVerificationStatus::Passed => console::style("✓").green(),
-                AgentVerificationStatus::Failed => console::style("✗").red(),
-                AgentVerificationStatus::Skipped => console::style("–").dim(),
+                CheckStatus::Passed => console::style("✓").green(),
+                CheckStatus::Failed => console::style("✗").red(),
+                CheckStatus::Skipped => console::style("–").dim(),
+                // The two ways a check produced no verdict show as themselves.
+                // A single "not run" mark for all three is what told a reader
+                // a missing toolchain was a deliberate skip.
+                CheckStatus::ToolMissing => console::style("?").yellow(),
+                CheckStatus::EnvironmentUnavailable => console::style("!").yellow(),
             };
             println!("  {mark} verification {name}");
             if let Some(evidence) = evidence {
@@ -297,11 +303,9 @@ fn render_event_jsonl(event: AgentEvent) {
         } => serde_json::json!({
             "type": "verification_check",
             "name": name,
-            "status": match status {
-                AgentVerificationStatus::Passed => "passed",
-                AgentVerificationStatus::Failed => "failed",
-                AgentVerificationStatus::Skipped => "skipped",
-            },
+            // The durable vocabulary, from its owner — the CLI writes the same
+            // spelling the runtime did, and never a second one.
+            "status": status.as_str(),
             "evidence": evidence,
         }),
         AgentEvent::VerificationFinished {

@@ -11,15 +11,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::{TaskReport, TaskSpec, mode_str};
-use leveler_agent::{
-    AdvisoryKind, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify, Clarifier,
-    StopReason,
-};
+use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier, StopReason};
 use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 use leveler_execution::{Approver, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
 use leveler_storage::{SessionRecord, SessionRepository};
-use leveler_verifier::{Verdict, VerificationReport};
+use leveler_verifier::{CheckStatus, Verdict, VerificationReport};
 
 use crate::{AppError, Application};
 
@@ -230,11 +227,10 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             evidence,
         } => AgentEvent::VerificationCheck {
             name,
-            status: match status.as_str() {
-                "passed" => AgentVerificationStatus::Passed,
-                "failed" => AgentVerificationStatus::Failed,
-                _ => AgentVerificationStatus::Skipped,
-            },
+            // Parsed by the vocabulary's owner. A spelling this build cannot
+            // read is not renderable as a check, and filing it under `Skipped`
+            // would invent the reason it did not run.
+            status: CheckStatus::from_wire(&status)?,
             evidence,
         },
         EngineEvent::VerificationFinished {
@@ -650,9 +646,10 @@ impl Application {
             )
             .await?
             .with_steering(steering);
-        // System-side memory candidates (explicit intent + package-manager
-        // signals). Never writes active memory; user accept is separate (K36).
-        self.enqueue_memory_candidates(goal);
+        // Candidate extraction moved to the caller that owns a client
+        // connection (`InteractiveRuntime`), because a pending candidate nobody
+        // is told about is the same as none. Doing it here could only log.
+        let _ = ();
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
@@ -798,9 +795,9 @@ impl Application {
             )
             .await?;
         let goal = goal_from_content(&content);
-        // System-side memory candidates (explicit intent + package-manager
-        // signals). Never writes active memory; user accept is separate (K36).
-        self.enqueue_memory_candidates(&goal);
+        // See the note in `run_in_session_with_policy`: the notice belongs to
+        // the layer with a client to notify.
+        let _ = ();
         let spec = self.direct_spec(goal, mode, sandbox);
         let result = engine
             .chat(session_id, &spec, content, observer, cancellation)
@@ -1097,6 +1094,52 @@ mod tests {
             out.stop_detail.as_deref(),
             Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION)
         );
+    }
+
+    /// §13 C: the durable spelling reaches the harness event as the status it
+    /// means, in the canonical spelling and in the older one.
+    #[test]
+    fn a_durable_check_status_projects_to_the_status_it_means() {
+        for (durable, expected) in [
+            ("passed", leveler_verifier::CheckStatus::Passed),
+            ("failed", leveler_verifier::CheckStatus::Failed),
+            ("skipped", leveler_verifier::CheckStatus::Skipped),
+            ("tool_missing", leveler_verifier::CheckStatus::ToolMissing),
+            ("toolmissing", leveler_verifier::CheckStatus::ToolMissing),
+            (
+                "environment_unavailable",
+                leveler_verifier::CheckStatus::EnvironmentUnavailable,
+            ),
+            (
+                "environmentunavailable",
+                leveler_verifier::CheckStatus::EnvironmentUnavailable,
+            ),
+        ] {
+            let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
+                name: "test".to_string(),
+                status: durable.to_string(),
+                evidence: None,
+            });
+            match projected {
+                Some(AgentEvent::VerificationCheck { status, .. }) => {
+                    assert_eq!(status, expected, "{durable}")
+                }
+                other => panic!("{durable}: expected a check event, got {other:?}"),
+            }
+        }
+    }
+
+    /// A spelling this build cannot read is dropped rather than filed as a
+    /// skip: the CLI cannot render a status it does not know, and calling it
+    /// `Skipped` would invent the reason it did not run.
+    #[test]
+    fn a_check_status_this_build_cannot_read_is_not_projected_as_a_skip() {
+        let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
+            name: "test".to_string(),
+            status: "something-else".to_string(),
+            evidence: None,
+        });
+        assert!(projected.is_none(), "{projected:?}");
     }
 
     #[test]

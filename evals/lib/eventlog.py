@@ -19,6 +19,31 @@ from value import child_result_used, classify_child_contributions, profile_effec
 EDIT_TOOLS = {"apply_patch", "replace"}
 CLAIM_TOOL = "claim_write_scope"
 
+# Canonical check statuses, as `CheckStatus::as_str` writes them. The two
+# long forms are what a row written by the older Debug-derived writer says.
+CHECK_STATUSES = frozenset(
+    {"passed", "failed", "skipped", "tool_missing", "environment_unavailable"}
+)
+CHECK_STATUS_ALIASES = {
+    "pass": "passed",
+    "toolmissing": "tool_missing",
+    "environmentunavailable": "environment_unavailable",
+}
+
+
+def normalize_check_status(status: Any) -> str | None:
+    """The canonical spelling of a durable check status, or `None`.
+
+    A legacy spelling normalizes to its canonical value rather than to
+    unknown: the row means the same thing, and only its separator changed.
+    """
+    if status is True:
+        return "passed"
+    if not isinstance(status, str):
+        return None
+    canonical = CHECK_STATUS_ALIASES.get(status, status)
+    return canonical if canonical in CHECK_STATUSES else None
+
 
 def verification_truth(
     event_verification: str | None,
@@ -241,7 +266,7 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
                 legacy_gate = body.get("passed")
         elif etype == "verification_check":
             checks_total += 1
-            if body.get("status") in ("passed", "pass", True):
+            if normalize_check_status(body.get("status")) == "passed":
                 checks_passed = (checks_passed or 0) + 1
         elif etype == "review_stage" and body.get("action") == "finished_ok":
             review_stages_ok += 1

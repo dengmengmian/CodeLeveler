@@ -1064,6 +1064,10 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     for recap in recaps {
         state.transcript.push_goal_recap(recap);
     }
+    // Replayed history carries no tool-call ordering, so the live classifier
+    // never fires for it. Decide it from the turn shape instead, or every
+    // restored answer would render as undecided (and therefore bounded) prose.
+    state.transcript.classify_replayed_history();
     // User shell executions (history + a still-running one) survive
     // reconnect via the snapshot; blocks are rebuilt in order.
     state.shell_screen_item = None;

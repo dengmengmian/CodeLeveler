@@ -188,13 +188,44 @@
       "type": "string"
     },
     "CheckState": {
-      "description": "The state of one verification check.",
-      "type": "string",
-      "enum": [
-        "running",
-        "passed",
-        "failed",
-        "skipped"
+      "description": "The state of one verification check.\n\nThis is the check-level fact and not the task-level verdict, so the three ways a check can produce no verdict stay distinct. A check whose program is not installed is not a check that was deliberately skipped, and neither is a check the environment refused: each one is the reason a run ended unverified, and the reader is owed that reason rather than a shrug.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "running",
+            "passed",
+            "failed"
+          ]
+        },
+        {
+          "description": "Deliberately not run.",
+          "type": "string",
+          "enum": [
+            "skipped"
+          ]
+        },
+        {
+          "description": "The check's program is not on `PATH`, so it could not run at all.",
+          "type": "string",
+          "enum": [
+            "tool_missing"
+          ]
+        },
+        {
+          "description": "The check ran but the environment refused it (toolchain/MSRV mismatch).",
+          "type": "string",
+          "enum": [
+            "environment_unavailable"
+          ]
+        },
+        {
+          "description": "The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason.",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        }
       ]
     },
     "CheckpointId": {

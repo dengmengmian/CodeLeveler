@@ -133,6 +133,49 @@ impl Approver for EvalApprove {
 /// promotion goes through user-authoritative CLI (`leveler memory accept`) or a
 /// future UI consent surface that calls `MemoryStore::accept` after a human
 /// click. AutoApprove therefore cannot silently activate candidates.
+/// Whether this command would invoke CodeLeveler's OWN user-consent surface.
+///
+/// `leveler memory accept|reject|remember|forget` IS the user's consent that
+/// K36 requires — it is the human acting, not a capability the agent holds. A
+/// model able to run it signs its own approval, which defeats the whole point
+/// of gating the `remember` tool.
+///
+/// This is not hypothetical. In a real assisted run the gate worked: `remember`
+/// was refused and parked as a pending candidate. The model then ran
+/// `leveler memory accept <id>` through `run_command`, was denied by the
+/// sandbox, retried the same command with `escalate.filesystem =
+/// unrestricted`, and adopted its own candidate.
+///
+/// Shell wrappers are unwrapped first (`sh -c "leveler memory accept x"` and a
+/// `&&` chain both count), because a gate a wrapper can launder is not a gate.
+pub fn is_self_consent_command(program: &str, args: &[String]) -> bool {
+    const CONSENT_VERBS: [&str; 4] = ["accept", "reject", "remember", "forget"];
+    crate::shell_ast::proven_executed_commands(program, args)
+        .iter()
+        .any(|words| {
+            let Some((cmd, rest)) = words.split_first() else {
+                return false;
+            };
+            let base = basename(cmd).to_ascii_lowercase();
+            if base != "leveler" && base != "leveler.exe" {
+                return false;
+            }
+            // The verb must be the SUBCOMMAND of `memory`, not merely present:
+            // `memory search accept` searches for the word "accept" and is an
+            // ordinary read. Options may precede `memory` (`--repo X memory
+            // accept id`), so skip flags rather than fixing positions.
+            let words: Vec<String> = rest.iter().map(|w| w.to_ascii_lowercase()).collect();
+            let Some(at) = words.iter().position(|w| w == "memory") else {
+                return false;
+            };
+            words
+                .iter()
+                .skip(at + 1)
+                .find(|w| !w.starts_with('-'))
+                .is_some_and(|verb| CONSENT_VERBS.contains(&verb.as_str()))
+        })
+}
+
 pub fn is_memory_write_tool(tool: &str) -> bool {
     matches!(tool, "remember" | "forget")
 }
@@ -671,6 +714,53 @@ impl ApprovalPolicy {
 
 #[cfg(test)]
 mod tests {
+    /// The agent must not be able to sign its own memory consent, however it
+    /// dresses up the call.
+    #[test]
+    fn self_consent_commands_are_recognised_through_any_wrapper() {
+        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (program, args) in [
+            ("leveler", words(&["memory", "accept", "cand-x"])),
+            ("leveler", words(&["memory", "reject", "cand-x"])),
+            ("leveler", words(&["memory", "remember", "t", "b"])),
+            ("leveler", words(&["memory", "forget", "id"])),
+            ("/usr/local/bin/leveler", words(&["memory", "accept", "x"])),
+            (
+                "leveler",
+                words(&["--repo", "/tmp/p", "memory", "accept", "x"]),
+            ),
+            ("sh", words(&["-c", "leveler memory accept cand-x"])),
+            (
+                "bash",
+                words(&["-c", "cd /tmp && leveler memory accept cand-x"]),
+            ),
+        ] {
+            assert!(
+                super::is_self_consent_command(program, &args),
+                "must be caught: {program} {args:?}"
+            );
+        }
+    }
+
+    /// Reading memory is not consent, and neither is anything else the agent
+    /// legitimately runs. Over-blocking would break ordinary work.
+    #[test]
+    fn ordinary_commands_are_not_self_consent() {
+        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (program, args) in [
+            ("leveler", words(&["memory", "list"])),
+            ("leveler", words(&["memory", "search", "accept"])),
+            ("leveler", words(&["doctor"])),
+            ("git", words(&["accept"])),
+            ("npm", words(&["run", "memory:accept"])),
+            ("cargo", words(&["test", "-p", "leveler-memory"])),
+        ] {
+            assert!(
+                !super::is_self_consent_command(program, &args),
+                "must not be caught: {program} {args:?}"
+            );
+        }
+    }
 
     /// C2.3C-S P2 — the invariant this whole round exists for. An eval must
     /// never be able to approve its own way out of containment.

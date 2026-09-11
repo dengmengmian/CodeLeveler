@@ -177,6 +177,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             commit_co_author: true,
             overrides: None,
             memory_index: String::new(),
+            memory_expose: true,
             memory_root: None,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),

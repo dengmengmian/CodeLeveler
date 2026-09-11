@@ -6,7 +6,7 @@
 
 use leveler_engine::EngineEvent;
 
-use crate::{AgentEvent, AgentVerificationStatus};
+use crate::AgentEvent;
 
 /// Convert the executor's event stream 1:1. `Finished` becomes the transient
 /// [`EngineEvent::RunFinished`]; the turn runner emits the real
@@ -89,11 +89,9 @@ impl From<AgentEvent> for EngineEvent {
                 evidence,
             } => EngineEvent::VerificationCheck {
                 name,
-                status: match status {
-                    AgentVerificationStatus::Passed => "passed".to_string(),
-                    AgentVerificationStatus::Failed => "failed".to_string(),
-                    AgentVerificationStatus::Skipped => "skipped".to_string(),
-                },
+                // The same durable vocabulary the verifier's own writer uses,
+                // through the same mapper.
+                status: status.as_str().to_string(),
                 evidence,
             },
             A::VerificationFinished {

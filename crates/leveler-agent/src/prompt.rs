@@ -10,6 +10,16 @@ use leveler_model::ModelRef;
 /// fit every model, so the prompt is per-model configuration.
 const BASE_PROMPT: &str = include_str!("../prompts/base.md");
 
+/// The memory section of the system prompt, shipped only when the
+/// capability is exposed (see [`PromptBuilder::memory_expose`]).
+const MEMORY_GUIDANCE: &str = "\n\n## Memory\n\
+\n\
+Project memory is consent-gated: `remember` raises an approval prompt, and that prompt is how the user consents — propose it rather than asking in prose first. Report the outcome from the tool result; a denied `remember` did not save anything.\n\
+\n\
+- What earns one: a lasting preference, a decision or project convention, a non-obvious constraint. What does not: secrets, one-off trivia, or anything already in the code, the git history, or AGENTS.md.\n\
+- `remember` does not overwrite. Superseding a fact means `forget` on the stale id first, then `remember` the corrected version; re-proposing the same title stores a second entry and leaves both to compete in recall.\n\
+- A recalled memory records what was true when it was written and can be stale or out of date. Confirm that a file, flag or command it names still exists before acting on it, and correct it when this turn's evidence contradicts it.\n";
+
 #[derive(Debug, Clone)]
 pub(crate) struct PromptBuilder {
     turn_context: Option<TurnContext>,
@@ -17,6 +27,10 @@ pub(crate) struct PromptBuilder {
     commit_co_author: bool,
     /// Short memory INDEX (titles only). Empty = omit segment.
     memory_index: String,
+    /// Whether the memory capability reaches the model this turn. Gates the
+    /// guidance AND the index together: guidance for tools the model was not
+    /// given tells it to call something that is not there.
+    memory_expose: bool,
 }
 
 impl Default for PromptBuilder {
@@ -26,6 +40,7 @@ impl Default for PromptBuilder {
             base_instructions: None,
             commit_co_author: true,
             memory_index: String::new(),
+            memory_expose: false,
         }
     }
 }
@@ -138,14 +153,26 @@ impl PromptBuilder {
         self
     }
 
+    pub(crate) fn memory_expose(mut self, expose: bool) -> Self {
+        self.memory_expose = expose;
+        self
+    }
+
     pub(crate) fn build(&self) -> String {
         let mut prompt = match &self.base_instructions {
             Some(custom) => custom.clone(),
             None => String::from(BASE_PROMPT),
         };
+        // Memory guidance ships only when the capability actually reaches the
+        // model. It used to be hard-coded in `base.md`, so an Economy turn — no
+        // memory tools registered — still instructed the model to propose a
+        // `remember` it could not call.
+        if self.memory_expose {
+            prompt.push_str(MEMORY_GUIDANCE);
+        }
         // Memory INDEX is part of the cache-stable prefix when present: titles
         // only, fixed template, no bodies (K37).
-        if !self.memory_index.trim().is_empty() {
+        if self.memory_expose && !self.memory_index.trim().is_empty() {
             prompt.push_str(
                 "\n\n## Project memory index\n\
                  Durable user-approved notes (titles only). Use the `memory` tool \
@@ -852,12 +879,13 @@ mod tests {
         assert!(!a.contains("Constraints:"));
     }
 
-    /// Regression lock on `base.md`'s proactive-memory section: it must reach
-    /// the model even with an empty store, or a fresh project can never record
-    /// its first memory. Only the index segment is conditional.
+    /// The proactive-memory section must reach the model even with an empty
+    /// store, or a fresh project can never record its first memory. What IS
+    /// conditional is the capability: guidance for tools the model was not
+    /// given would tell it to call something that is not there.
     #[test]
     fn memory_guidance_ships_even_with_an_empty_store() {
-        let prompt = PromptBuilder::new().build();
+        let prompt = PromptBuilder::new().memory_expose(true).build();
         assert!(
             prompt.contains("remember"),
             "an empty store must still tell the model how to record one"
@@ -868,7 +896,7 @@ mod tests {
     /// only thing standing between a useful store and a pile of trivia.
     #[test]
     fn memory_guidance_says_what_is_worth_keeping_and_what_is_not() {
-        let prompt = PromptBuilder::new().build();
+        let prompt = PromptBuilder::new().memory_expose(true).build();
         let lowered = prompt.to_lowercase();
         assert!(
             lowered.contains("preference") || lowered.contains("constraint"),
@@ -884,7 +912,7 @@ mod tests {
     /// correction duty turns a stale note into a confident wrong answer.
     #[test]
     fn memory_guidance_requires_correcting_what_went_stale() {
-        let prompt = PromptBuilder::new().build();
+        let prompt = PromptBuilder::new().memory_expose(true).build();
         let lowered = prompt.to_lowercase();
         assert!(
             lowered.contains("out of date") || lowered.contains("stale"),
@@ -902,11 +930,28 @@ mod tests {
     /// it claims to prevent. See `MemoryStore::remember_deduplicated`.
     #[test]
     fn memory_guidance_never_calls_remember_an_upsert() {
-        let lowered = PromptBuilder::new().build().to_lowercase();
+        let lowered = PromptBuilder::new()
+            .memory_expose(true)
+            .build()
+            .to_lowercase();
         assert!(
             !lowered.contains("upsert"),
             "remember replaces nothing; correcting a memory is forget-then-remember"
         );
+    }
+
+    /// With the capability off, NOTHING about memory reaches the model: no
+    /// guidance, no index. An Economy turn used to carry both while the tools
+    /// were unregistered, instructing the model to propose a `remember` it
+    /// could not call.
+    #[test]
+    fn an_unexposed_memory_capability_ships_no_guidance_and_no_index() {
+        let index = "1. [pref] Prefer workspace-write";
+        let prompt = PromptBuilder::new().memory_index(index).build();
+        let lowered = prompt.to_lowercase();
+        assert!(!lowered.contains("remember"), "no guidance: {prompt}");
+        assert!(!prompt.contains("Project memory index"), "no index");
+        assert!(!prompt.contains("[pref]"), "no titles");
     }
 
     #[test]
@@ -917,8 +962,14 @@ mod tests {
     #[test]
     fn memory_index_is_stable_and_excludes_bodies() {
         let index = "1. [pref] Prefer workspace-write\n2. [style] Use tables in reviews";
-        let a = PromptBuilder::new().memory_index(index).build();
-        let b = PromptBuilder::new().memory_index(index).build();
+        let a = PromptBuilder::new()
+            .memory_expose(true)
+            .memory_index(index)
+            .build();
+        let b = PromptBuilder::new()
+            .memory_expose(true)
+            .memory_index(index)
+            .build();
         assert_eq!(a, b);
         assert!(a.contains("Project memory index"));
         assert!(a.contains("[pref] Prefer workspace-write"));

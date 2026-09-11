@@ -1265,7 +1265,10 @@ impl CodingRuntime {
                 None,
                 EngineEvent::VerificationCheck {
                     name: check.name.clone(),
-                    status: format!("{:?}", check.status).to_lowercase(),
+                    // The durable vocabulary, from the owner of the type.
+                    // `format!("{:?}").to_lowercase()` wrote `toolmissing`,
+                    // which this event's own contract spells `tool_missing`.
+                    status: check.status.as_str().to_string(),
                     evidence: matches!(
                         check.status,
                         leveler_verifier::CheckStatus::Failed
