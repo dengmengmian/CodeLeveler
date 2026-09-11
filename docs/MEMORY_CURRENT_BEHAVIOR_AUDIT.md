@@ -70,23 +70,38 @@ if pending > 0 {
 `AcceptMemory` 都已就位，只需在 `enqueue_memory_candidates` 产生 pending 时
 发一个已有的 `RuntimeEvent::Notification`。
 
-### D2. AutoApprove 直接批准了模型的 `remember` 写入
+### D2. 模型用 `run_command` 绕过了记忆同意门（原判断已修正）
 
-`prompts/base.md:46` 声明 "Project memory is consent-gated: `remember` raises an
-approval prompt"。`executor/host.rs:291` 也为 `DeniedUnattended` 准备了把提案
-park 到 `pending/` 的路径。
+**先修正一处错误归因。** 本文档初版写的是"AutoApprove 直接批准了 `remember`"，
+那是错的：`AutoApprove::decide` 本来就对 memory 写入返回 `Deny`
+（`leveler-execution/src/approval.rs:83`），而我当时的观测用的是
+`--permission full-access`，那条路径由一处**有意的设计决定**放行：
 
-但真实运行（`leveler run --permission full-access --auto-approve`）观测到：
+```rust
+// 完全访问 means no prompts at all — the user has explicitly opted into
+// an unrestricted session, including destructive commands and durable
+// memory writes/deletes. Check it first so nothing below can re-gate.
+if profile == PermissionProfile::FullAccess { return Requirement::Auto; }
+```
+
+full-access 下不提示是产品取舍，不是缺陷。
+
+**真正的缺陷在 assisted 下，而且更严重。** 同一个任务换成
+`--permission assisted --auto-approve`，同意门确实生效了，然后被绕过：
 
 ```
-→ remember {"body":"本项目所有金额展示必须通过 formatAmount 工具函数渲染…","title":"金额渲染一律用 formatAmount"}
-  ✓ remember: Remembered [formatamount]
+seq 4   remember →
+seq 7   is_error: true "action not permitted: no approver was available…"  ← 正确 park 成 pending
+seq 13  run_command  leveler memory accept cand-formatamount               ← 沙箱拒绝
+seq 19  run_command  同一命令 + escalate{filesystem: unrestricted}          ← 成功
+seq 23  "✓ accepted [formatamount]"
 ```
 
-写入直接成功进入 `active/`，`leveler memory list` 随后确认 `active` 增加一条。
-park 路径没有被走到，因为 AutoApprove 在它之前就返回了 `Allowed`。
+模型读到 park 消息里的 `run `leveler memory accept <id>`` —— 那句话是写给人的 ——
+然后自己提权执行，把自己的候选采纳成了 active。K36 的同意门被 `run_command`
+完整绕过，而且是系统自己的错误消息教会了它这条路。
 
-**后果**：无人值守运行可以在没有任何人同意的情况下写入 durable memory。
+**后果**：任何能跑 shell 的 agent 都能给自己的记忆签名。
 
 ### D3. capability gating 有两个 owner
 
@@ -204,23 +219,32 @@ store.propose_package_manager(root)?          // 仓库派生事实
 推断，产生 `CandidateKind::PackageManager` 候选。包管理器可以从当前仓库机械读出，
 把它固化成 durable memory 会形成第二事实源，并在仓库从 pnpm 换成 bun 之后过期。
 
-### D8. 纯中文标题的记忆 id 会碰撞并静默覆盖
+### D8. 直接写入会静默覆盖已有记忆（原根因已修正）
 
-`slugify`（`leveler-memory/src/lib.rs:368`）只保留 ASCII 字母数字，其余字符
-一律替换成 `-`；纯中文标题因此被压成空串，退化到
-`format!("mem-{}", now_rfc3339())`，而 `now_rfc3339` 用的是
-`SecondsFormat::Secs`（`lib.rs:447`）—— 秒精度。
+**先修正根因。** 本文档初版归因于 `slugify` 把纯中文标题压成空串、退化到秒精度
+时间戳。那只是让碰撞容易触发，不是根因。真根因是**调用方选错了写入方法**：
 
-**已复现**：同一秒内写两条纯中文标题的记忆，两条拿到同一个 id
-`mem-2026-09-11T111559Z`，后写覆盖前写，`active=1`，无任何提示。
-间隔 1.2 秒重写同样两条则得到 `…651Z` / `…652Z`，`active=2`。
+| 调用方 | 用的方法 | 是否覆盖 |
+| --- | --- | --- |
+| CLI `leveler memory remember`（`memory_cmds.rs:107`） | `store.remember` | 会 |
+| 模型 `remember` 工具（`tools/memory.rs:221`） | `store.remember_deduplicated` | 不会 |
 
-ASCII 标题不受影响（id 为 `a`/`b`）；中英混合标题也安全
-（`金额渲染一律用 formatAmount` → `formatamount`）。
+`remember` 是按 id 的 upsert，本是给 accept-by-key 路径用的。
 
-这不是"不支持中文"的设计取舍：同一文件里的 `tokenize`（`lib.rs:405`）专门为
-中文做了 bigram 分词，注释写明 "Chinese queries actually match（recall +
-`/memory` 都曾因此坏掉）"。slugify 是遗漏的那一处。
+**已复现，ASCII 标题同样中招**：
+
+```
+✓ remembered [deploy-notes]: Deploy notes    ← 第一版
+✓ remembered [deploy-notes]: Deploy notes    ← 第二版，同 id
+active=1，正文只剩第二版
+```
+
+这与 `base.md` 的声明直接矛盾："`remember` does not overwrite …
+re-proposing the same title stores a second entry"。
+
+纯中文标题额外踩一层：slug 为空 → `mem-<秒>` → 同秒两条相撞。同一文件里的
+`tokenize`（`lib.rs:405`）专门为中文做过 bigram 分词，注释写明 "Chinese queries
+actually match"，所以这是遗漏，不是"不支持中文"的取舍。
 
 ---
 
