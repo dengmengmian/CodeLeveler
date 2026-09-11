@@ -385,6 +385,21 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // CodeLeveler's own consent surface is not a capability the agent
+        // holds. `leveler memory accept|reject|remember|forget` IS the human
+        // acting (K36), so running it from a tool would let the model sign its
+        // own approval — which a real run did, after `remember` was correctly
+        // parked for consent. Refused here, BEFORE permission rules, because a
+        // standing allow rule for `run_command` must not reopen it either.
+        if let Some(program) = program.as_deref()
+            && leveler_execution::is_self_consent_command(program, &args)
+        {
+            return deny(format!(
+                "`{}` would run CodeLeveler's own consent command. Adopting or                  discarding a memory is the user's decision, not an action this                  run can take — leave the pending candidate for them to review.",
+                call.name
+            ));
+        }
+
         // A tool's declared risk is static: `run_command` carries the same level
         // whether it runs `ls` or `rm -rf`. Name the deletion in the prompt, so
         // it does not read as harmless as a listing.
@@ -612,10 +627,17 @@ impl Executor {
                 store.propose(candidate).map_err(|e| e.to_string())
             });
         match parked {
+            // Deliberately NOT "run `leveler memory accept <id>`": this text is
+            // a tool result the MODEL reads, and a real run followed that
+            // instruction — escalating the filesystem to adopt its own
+            // candidate. The gate in `resolve_policy` now refuses that command,
+            // and this message no longer suggests it either. Telling the USER
+            // how to adopt it belongs on a user-facing channel.
             Ok(leveler_memory::ProposeOutcome::Pending(candidate)) => format!(
-                "{UNATTENDED}; kept as a pending candidate [{}] — run `leveler memory accept {}` \
-                 to make it durable",
-                candidate.id, candidate.id
+                "{UNATTENDED}; kept as a pending candidate [{}] for the user to review. \
+                 Adopting a memory is their decision, not this run's — report that it is \
+                 waiting and move on.",
+                candidate.id
             ),
             // Already pending or suppressed: nothing lost either way.
             Ok(_) => format!("{UNATTENDED}; this memory is already awaiting your review"),
@@ -1331,9 +1353,19 @@ mod authorize_tests {
             .authorize(&remember_call(), &mut session)
             .await
             .expect_err("the call itself still does not store active memory");
+        // The message must let the model TELL the user something is waiting —
+        // hence the candidate id — without handing it a command to adopt the
+        // memory itself. The previous wording spelled out
+        // `leveler memory accept <id>`, and a real run executed it.
+        let store_peek = leveler_memory::MemoryStore::open(&memory_root).unwrap();
+        let candidate_id = store_peek.list_pending().unwrap()[0].id.clone();
         assert!(
-            err.contains("accept"),
-            "the message must point at how to adopt it later: {err}"
+            err.contains(&candidate_id),
+            "the message must name the waiting candidate: {err}"
+        );
+        assert!(
+            !err.contains("leveler memory"),
+            "the message must not hand the model a way to adopt it: {err}"
         );
 
         let store = leveler_memory::MemoryStore::open(&memory_root).unwrap();

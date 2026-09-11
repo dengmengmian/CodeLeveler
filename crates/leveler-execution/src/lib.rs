@@ -36,8 +36,8 @@ pub use approval::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, Approver, AutoApprove, AutoDeny,
     AutoReviewer, CommandClass, CommandView, EvalApprove, NeedUserReviewer, Requirement,
     ReviewVerdict, classify_command, command_is_destructive, command_needs_host_escape,
-    is_host_escape_program, is_memory_write_tool, is_remote_publish_command, is_shell_c_flag,
-    is_shell_wrapper_program, shell_c_script,
+    is_host_escape_program, is_memory_write_tool, is_remote_publish_command,
+    is_self_consent_command, is_shell_c_flag, is_shell_wrapper_program, shell_c_script,
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
