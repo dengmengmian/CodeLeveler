@@ -422,15 +422,15 @@ def value_experiment_report(batch: dict[str, Any], *, experiment: dict[str, Any]
         ]
     else:
         lines += [
-            "| profile | role | spawned | completed | findings gen/acc/ver | bugs found/confirmed | changes acc | verification passed |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| profile | role | spawned | completed | findings gen/acc/ver | bugs found/confirmed | changes acc |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
         for pid, b in profiles.items():
             findings = f"{b['findings_generated']}/{b['findings_accepted']}/{b['findings_verified']}"
             bugs = f"{b['bugs_found']}/{b['bugs_confirmed']}"
             lines.append(
                 f"| `{pid}` | {b.get('profile_role')} | {b['spawned']} | {b['completed']} | "
-                f"{findings} | {bugs} | {b['changes_accepted']} | {b['verification_passed']} |"
+                f"{findings} | {bugs} | {b['changes_accepted']} |"
             )
         lines.append("")
     lines += [

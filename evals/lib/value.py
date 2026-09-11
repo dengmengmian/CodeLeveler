@@ -246,7 +246,11 @@ def profile_effectiveness(spawn: dict[str, Any]) -> dict[str, Any]:
                 "bugs_found": 0,
                 "bugs_confirmed": 0,
                 "changes_accepted": 0,
-                "verification_passed": 0,
+                # Nothing here counts "verification passed" per child. The
+                # runtime records whether a child reached the end of its task
+                # (`completed`), and nothing about whether what it produced was
+                # verified. A column derived from the completion bit would
+                # claim a check that never ran.
             },
         )
         if not b["capabilities"] and child.get("capabilities"):
@@ -259,8 +263,8 @@ def profile_effectiveness(spawn: dict[str, Any]) -> dict[str, Any]:
         contrib = fin.get("contribution")
         measured = isinstance(contrib, dict)
         # `null` means not measured, not "contributed nothing". Only the
-        # finding sums are gated on it — `completed`, `changes_accepted` and
-        # `verification_passed` are measured by other means and stay counted.
+        # finding sums are gated on it — `completed` and `changes_accepted` are
+        # facts the runtime recorded and stay counted.
         b["measured" if measured else "unmeasured"] += 1
         gen = acc = ver = 0
         if measured:
@@ -274,11 +278,8 @@ def profile_effectiveness(spawn: dict[str, Any]) -> dict[str, Any]:
         if role == "reviewer" and measured:
             b["bugs_found"] += gen
             b["bugs_confirmed"] += acc
-        if role == "worker":
-            if cid is not None and str(cid) in useful:
-                b["changes_accepted"] += 1
-            if fin.get("ok"):
-                b["verification_passed"] += 1
+        if role == "worker" and cid is not None and str(cid) in useful:
+            b["changes_accepted"] += 1
     return buckets
 
 
@@ -296,7 +297,6 @@ def aggregate_profile_effectiveness(runs: list[dict[str, Any]]) -> dict[str, Any
         "bugs_found",
         "bugs_confirmed",
         "changes_accepted",
-        "verification_passed",
     )
     for run in runs:
         buckets = (_ma(run).get("profile_effectiveness")

@@ -197,6 +197,17 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **The eval profile table no longer reports a verification result nobody
+  measured.** `verification_passed` was derived from a child's terminal `ok`,
+  which the runtime sets from `ChildStatus::completed()` — "the child reached
+  the end of its task". The same bit therefore incremented both `completed`
+  and a column headed `verification passed`, so the Multi-Agent report
+  claimed a check that never ran. The count is removed rather than renamed:
+  `completed` already reports that fact, and the runtime records nothing
+  about whether a child's work was verified, so there is no honest second
+  column to print. `changes_accepted`, `completed` and the finding sums are
+  untouched, and a regression test pins the key as absent rather than
+  silently zero.
 - **A run that was never verified is no longer recorded, rendered or counted
   as a passing one.** `VerificationReport::passed()` is the *completion gate*:
   it answers "may this run end", and it is true for a run that owed no check —

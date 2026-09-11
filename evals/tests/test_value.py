@@ -434,7 +434,7 @@ class ProfileEffectivenessTests(unittest.TestCase):
         self.assertEqual(r["bugs_found"], 3)
         self.assertEqual(r["bugs_confirmed"], 2)
 
-    def test_worker_changes_and_verification(self):
+    def test_worker_changes_and_completion(self):
         con = fixture_db(
             [
                 ("sub_agent_started", {"id": "w1", "role": "worker", "profile_id": "worker"}),
@@ -445,7 +445,11 @@ class ProfileEffectivenessTests(unittest.TestCase):
         )
         w = profile_effectiveness(extract_con(con))["worker"]
         self.assertEqual(w["changes_accepted"], 1)
-        self.assertEqual(w["verification_passed"], 1)
+        # The terminal `ok` is a completion fact, and it is reported as one.
+        # It is not evidence that anything the child produced was verified, so
+        # this table has no per-child verification column to assert on.
+        self.assertEqual(w["completed"], 1)
+        self.assertNotIn("verification_passed", w)
 
     def test_legacy_event_without_profile_id_falls_back_to_role(self):
         con = fixture_db(

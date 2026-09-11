@@ -90,10 +90,13 @@ if __name__ == "__main__":
 
 
 class UnmeasuredDoesNotEraseOtherMetrics(unittest.TestCase):
-    """`changes_accepted` and `verification_passed` do not read the projection.
+    """`changes_accepted` and `completed` do not read the projection.
 
     They come from `useful_child_ids` and the terminal `ok`. An absent
     contribution must not erase facts that were measured by other means.
+
+    There is deliberately no per-child "verification passed": the terminal
+    `ok` says the child reached the end of its task, which is `completed`.
     """
 
     def test_worker_without_a_projection_still_counts_its_accepted_change(self):
@@ -107,7 +110,8 @@ class UnmeasuredDoesNotEraseOtherMetrics(unittest.TestCase):
         self.assertEqual(
             b["changes_accepted"], 1, "the parent used this child's change"
         )
-        self.assertEqual(b["verification_passed"], 1)
+        self.assertEqual(b["completed"], 1)
+        self.assertNotIn("verification_passed", b)
 
     def test_completed_is_counted_without_a_projection(self):
         spawn = {
