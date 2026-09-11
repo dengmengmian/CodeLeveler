@@ -326,27 +326,35 @@ mod tests {
         assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
     }
 
+    /// Both confined intents are allowed on Windows exactly when the launcher
+    /// that confines them is installed — never on a claim that some backend
+    /// was linked into the build.
     #[cfg(windows)]
     #[test]
-    fn windows_restricted_write_allowed_when_appcontainer_linked() {
-        let intent = FilesystemIntent::from_write_scope(
+    fn windows_confined_intents_track_the_installed_launcher() {
+        let installed = crate::windows_confine::launcher_path().is_some();
+        let workspace_write = FilesystemIntent::from_write_scope(
             &crate::WriteScope::Workspace {
                 root: PathBuf::from("C:\\ws"),
             },
             Path::new("C:\\ws"),
         );
-        assert!(matches!(intent, FilesystemIntent::WorkspaceWrite { .. }));
-        // WS3-B linked: WorkspaceWrite is allowed (deny_network still ok).
-        assert!(assert_intent_spawn_allowed(&intent, false).is_ok());
-    }
+        assert!(matches!(
+            workspace_write,
+            FilesystemIntent::WorkspaceWrite { .. }
+        ));
+        assert_eq!(
+            assert_intent_spawn_allowed(&workspace_write, false).is_ok(),
+            installed
+        );
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_readonly_intent_allowed_when_appcontainer_linked() {
-        let intent = FilesystemIntent::ReadOnly {
+        let read_only = FilesystemIntent::ReadOnly {
             read_roots: vec![PathBuf::from(r"C:\ws")],
         };
-        assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
+        assert_eq!(
+            assert_intent_spawn_allowed(&read_only, false).is_ok(),
+            installed
+        );
     }
 
     #[cfg(not(windows))]

@@ -226,18 +226,25 @@ fn write_label(path: &Path, label: Option<(&str, u8, u32)>) -> io::Result<()> {
 }
 
 pub(crate) fn apply_low(path: &Path) -> io::Result<IntegrityLabel> {
-    let previous = read_label(path)?;
     // Inheritable so files and directories created inside the write root are
     // writable by the same confined child. Windows propagates an inheritable
-    // SACL entry to existing children that are not protected.
-    write_label(
-        path,
-        Some((
-            LOW_INTEGRITY_SID,
-            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
-            SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
-        )),
-    )?;
+    // SACL entry to existing children that are not protected — which is also
+    // why a root that already carries exactly this label is left alone:
+    // rewriting it would walk a whole Cargo registry to no effect.
+    let desired = (
+        LOW_INTEGRITY_SID,
+        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+        SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+    );
+    let previous = read_label(path)?;
+    let already = matches!(
+        &previous,
+        IntegrityLabel::Explicit { sid, ace_flags, mask }
+            if sid == desired.0 && *ace_flags == desired.1 && *mask == desired.2
+    );
+    if !already {
+        write_label(path, Some(desired))?;
+    }
     Ok(previous)
 }
 

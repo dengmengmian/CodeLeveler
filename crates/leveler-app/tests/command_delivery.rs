@@ -37,9 +37,19 @@ fn write_config(root: &std::path::Path, base_url: &str) {
     isolate_global_config();
     std::fs::create_dir_all(root.join("configs/providers")).unwrap();
     std::fs::create_dir_all(root.join("configs/models")).unwrap();
+    // The tests that use an unreachable `base_url` need the model call to
+    // FAIL, not to spend the production retry schedule doing it. Windows takes
+    // about two seconds to refuse a connection to a closed local port where
+    // Unix takes none, so four attempts plus backoff is the difference between
+    // a turn settling in a second and a turn outliving the test's patience.
     std::fs::write(
         root.join("configs/providers/mock.yaml"),
-        format!("id: mock\nprotocol: openai_chat\nbase_url: {base_url}\n"),
+        format!(
+            "id: mock\nprotocol: openai_chat\nbase_url: {base_url}\n\
+             timeouts:\n  connect_seconds: 5\n  request_seconds: 30\n  \
+             idle_stream_seconds: 30\nretry:\n  max_attempts: 1\n  \
+             initial_backoff_ms: 10\n  max_backoff_ms: 10\n"
+        ),
     )
     .unwrap();
     std::fs::write(

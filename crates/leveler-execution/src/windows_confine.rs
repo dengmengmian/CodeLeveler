@@ -106,21 +106,36 @@ impl Drop for WriteRootLease {
 /// Label every root in `roots` Low so a Low-integrity child may write there.
 /// Fails closed: if any root cannot be labelled, the ones already taken are
 /// released and the command does not run.
+///
+/// Only the user's own roots are restored afterwards. CodeLeveler's private
+/// scratch and per-workspace tool cache exist to be written by confined
+/// commands and nothing else, so they keep their label — relabelling a Cargo
+/// registry twice per command would cost far more than it protects.
 pub fn lease_write_roots(
     environment: &leveler_core::EnvSnapshot,
     roots: &[PathBuf],
 ) -> io::Result<WriteRootLease> {
     let records = records_dir(environment);
     std::fs::create_dir_all(&records)?;
+    let home = leveler_core::LevelerHome::resolve(environment);
     let mut lease = WriteRootLease {
         roots: Vec::new(),
         records: records.clone(),
     };
     for root in roots {
         acquire_root(root, &records)?;
-        lease.roots.push(root.clone());
+        if !is_leveler_owned(root, home.root()) {
+            lease.roots.push(root.clone());
+        }
     }
     Ok(lease)
+}
+
+/// Whether `root` is one of CodeLeveler's own directories rather than the
+/// user's. Compared component-wise on the normalized keys, so a symlinked or
+/// differently-cased home matches and `<home>-old` does not.
+fn is_leveler_owned(root: &Path, home: &Path) -> bool {
+    Path::new(&root_key(root)).starts_with(Path::new(&root_key(home)))
 }
 
 /// Where a root's pre-label state is parked while it is labelled. Not in the
@@ -239,6 +254,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_users_own_roots_are_restored() {
+        let home = Path::new("/leveler-home");
+        assert!(is_leveler_owned(
+            Path::new("/leveler-home/cache/tools/abc"),
+            home
+        ));
+        assert!(is_leveler_owned(Path::new("/leveler-home"), home));
+        assert!(!is_leveler_owned(Path::new("/Users/me/project"), home));
+        // A sibling that merely starts with the same characters is not inside.
+        assert!(!is_leveler_owned(Path::new("/leveler-home-old"), home));
+    }
+
+    #[test]
     fn each_root_gets_its_own_record_file() {
         let records = Path::new("/records");
         let one = record_path(records, Path::new("/a"));
@@ -289,6 +317,27 @@ mod windows_canaries {
         request
     }
 
+    /// A runner that sees the real host environment. `CommandRunner::new()`
+    /// reads the installed process snapshot, which a unit test never installs —
+    /// it would resolve no home, no PATH and no temp directory.
+    fn host_runner() -> CommandRunner {
+        CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )))
+    }
+
+    fn host_registry() -> crate::background::BackgroundTaskRegistry {
+        crate::background::BackgroundTaskRegistry::with_environment(std::sync::Arc::new(
+            leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            ),
+        ))
+    }
+
     fn launcher_or_skip() -> bool {
         if super::launcher_path().is_none() {
             eprintln!(
@@ -308,7 +357,7 @@ mod windows_canaries {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
-        let runner = CommandRunner::new();
+        let runner = host_runner();
         let output = runner
             .run(
                 confined("cargo --version", workspace.path()),
@@ -333,7 +382,7 @@ mod windows_canaries {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
-        let runner = CommandRunner::new();
+        let runner = host_runner();
         let output = runner
             .run(
                 confined("echo inside> inside.txt", workspace.path()),
@@ -345,6 +394,40 @@ mod windows_canaries {
         assert!(workspace.path().join("inside.txt").is_file());
     }
 
+    /// A real repository is not an empty directory. The label has to reach the
+    /// files and subdirectories that were already there, or the agent can
+    /// create new files and edit nothing it was asked to edit.
+    #[tokio::test]
+    async fn a_confined_command_edits_files_that_were_already_in_the_workspace() {
+        if !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nested = workspace.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let existing = nested.join("existing.txt");
+        std::fs::write(&existing, "before\n").expect("seed");
+
+        let runner = host_runner();
+        let output = runner
+            .run(
+                confined(
+                    "echo after>> src\\deep\\existing.txt && echo new> src\\deep\\new.txt",
+                    workspace.path(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("confined edit must run");
+        assert_eq!(output.exit_code, Some(0), "{output:?}");
+        let body = std::fs::read_to_string(&existing).expect("read back");
+        assert!(
+            body.contains("before") && body.contains("after"),
+            "a pre-existing file must stay editable under confinement: {body:?}"
+        );
+        assert!(nested.join("new.txt").is_file());
+    }
+
     #[tokio::test]
     async fn a_confined_command_cannot_write_outside_its_workspace() {
         if !launcher_or_skip() {
@@ -353,7 +436,7 @@ mod windows_canaries {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::tempdir().expect("outside");
         let target = outside.path().join("escape.txt");
-        let runner = CommandRunner::new();
+        let runner = host_runner();
         let output = runner
             .run(
                 confined(
@@ -380,7 +463,7 @@ mod windows_canaries {
         }
         let workspace = tempfile::tempdir().expect("workspace");
         let before = leveler_win_confine::integrity_label(workspace.path()).expect("label before");
-        let runner = CommandRunner::new();
+        let runner = host_runner();
         runner
             .run(
                 confined("echo done> done.txt", workspace.path()),
@@ -402,7 +485,7 @@ mod windows_canaries {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::tempdir().expect("outside");
         let target = outside.path().join("escape.txt");
-        let registry = crate::background::BackgroundTaskRegistry::new();
+        let registry = host_registry();
 
         let id = registry
             .spawn(

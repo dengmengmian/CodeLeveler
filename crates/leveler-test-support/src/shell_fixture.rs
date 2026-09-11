@@ -39,6 +39,24 @@ pub fn sleep_command(seconds: u32) -> (String, Vec<String>) {
     }
 }
 
+/// [`sleep_command`] spelled as one shell line, for tests that drive the user
+/// shell rather than a [`ProcessRequest`].
+pub fn sleep_shell_line(seconds: u32) -> String {
+    let (program, args) = sleep_command(seconds);
+    let mut line = program;
+    for argument in args {
+        line.push(' ');
+        if argument.contains(' ') {
+            line.push('"');
+            line.push_str(&argument);
+            line.push('"');
+        } else {
+            line.push_str(&argument);
+        }
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +69,13 @@ mod tests {
         let (program, args) = sleep_command(2);
         assert!(!program.is_empty());
         assert!(args.iter().any(|arg| arg.contains('2')));
+    }
+
+    #[test]
+    fn the_shell_line_carries_the_same_command() {
+        let line = sleep_shell_line(7);
+        let (program, _) = sleep_command(7);
+        assert!(line.starts_with(&program), "{line}");
+        assert!(line.contains('7'), "{line}");
     }
 }

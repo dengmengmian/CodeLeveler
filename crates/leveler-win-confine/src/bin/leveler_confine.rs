@@ -35,7 +35,9 @@ mod windows_main {
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetLengthSid, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
@@ -125,10 +127,18 @@ mod windows_main {
         unsafe { ExitProcess(code) }
     }
 
+    /// One of this process's standard handles, marked inheritable so the child
+    /// gets the same pipe. A handle that arrived here by inheritance usually is
+    /// already, but "usually" is how a command silently loses its output.
     fn std_handle(id: i32) -> HANDLE {
         // SAFETY: GetStdHandle takes a well-known constant and returns a handle
         // this process already owns.
-        unsafe { GetStdHandle(id as u32) }
+        let handle = unsafe { GetStdHandle(id as u32) };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: `handle` is a live handle owned by this process.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+        }
+        handle
     }
 
     fn fail(message: &str) -> ! {

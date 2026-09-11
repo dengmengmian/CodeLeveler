@@ -59,10 +59,12 @@ pub struct ProcessRequest {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub timeout: Duration,
-    /// Deny network access for this process (macOS seatbelt; no-op elsewhere).
+    /// Deny network access for this process. macOS seatbelt and Linux bwrap
+    /// enforce it; Windows cannot, and refuses the request rather than running
+    /// it with the network open.
     pub deny_network: bool,
     /// The one write boundary this process runs under. The OS wrappers
-    /// (seatbelt / bwrap / AppContainer) enforce it: `Workspace` confines
+    /// (seatbelt / bwrap / `leveler-confine.exe`) enforce it: `Workspace` confines
     /// writes to that root plus temp/toolchain caches, `None` mounts the
     /// workspace read-only (scratch and caches stay writable so builds run),
     /// `Unrestricted` applies no write fence. Reads are never confined.
@@ -102,11 +104,6 @@ impl ProcessRequest {
 impl ProcessRequest {
     /// The Windows backend contract for this request, derived from the write
     /// scope. Never model-chosen: the scope comes from host policy.
-    ///
-    /// Known limitation: AppContainer allowlists *reads* to its write roots,
-    /// so on Windows "read anything" does not hold yet — the Restricted
-    /// Token + ACL write-confinement backend the migration plan calls for
-    /// must be built and verified on a Windows host.
     pub fn filesystem_intent(&self) -> crate::windows_sandbox::FilesystemIntent {
         crate::windows_sandbox::FilesystemIntent::from_write_scope(&self.write_scope, &self.cwd)
     }
@@ -862,16 +859,8 @@ impl CommandRunner {
         cancellation: CancellationToken,
         chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
     ) -> Result<ProcessOutput, ProcessError> {
-        // WS0/WS2: the Windows contract, derived from the write scope. On
-        // Windows, restricted intents fail closed when FS backends are missing.
-        let intent = request.filesystem_intent();
-        if let Err(err) =
-            crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
-        {
-            return Err(ProcessError::SandboxPolicy(err.to_string()));
-        }
-        let _ = intent;
-
+        // `spawn` is where a request that cannot be confined fails closed —
+        // one gate, whichever read mode the caller wanted.
         let process = self.spawn(&request).await?;
         drive_to_completion(process, &request, cancellation, chunks).await
     }

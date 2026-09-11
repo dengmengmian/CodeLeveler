@@ -405,15 +405,11 @@ async fn busy_agent_turn_rejects_a_user_shell_without_side_effects() {
 async fn snapshot_restores_active_shell_with_elapsed() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
-    // Something that stays alive for a few seconds on either platform. cmd has
-    // no `sleep`, and `ping` needs a network the confined profile does not
-    // grant; `waitfor` blocks on a signal that never arrives and needs neither
-    // a console nor a socket.
-    let stay_alive = if cfg!(windows) {
-        "waitfor /t 5 LevelerUserShellTest"
-    } else {
-        "sleep 5"
-    };
+    // Something that stays alive for a few seconds on either platform. The
+    // requirement is a blocking process, not `sleep`, so the spelling lives in
+    // one place rather than in every test that needs one.
+    let stay_alive = leveler_test_support::sleep_shell_line(5);
+    let stay_alive = stay_alive.as_str();
     h.client.send(run_shell(&h, stay_alive)).await.unwrap();
     // Started…
     loop {
