@@ -1821,6 +1821,52 @@ session row.
 relying on the transcript being empty. A regression test
 (`resume_refuses_a_parallel_parent_session`) pins the refusal to the kind.
 
+### 18.12 The engine read Coding semantics to run its own mechanics (closed)
+
+**Was.** `leveler-engine` named no harness crate and no harness type — §18.1
+was honestly closed — and still made three Coding judgements, each reached
+through `leveler-lifecycle`, which both sides legitimately share. A dependency
+direction can be clean while the semantics flow the wrong way.
+
+1. **Fresh-turn inheritance.** `should_seed_task_state` called
+   `PlanState::is_fully_completed` and
+   `ProgressLedger::is_terminal_for_inheritance` to decide whether a new turn
+   inherited the prior plan, ledger and progress. "Is the previous epoch
+   finished?" is a question in the Coding vocabulary; the engine answered it.
+2. **The outstanding-child record.** `leveler-agent` wrote its outstanding
+   children as `id|nickname|role|files`, and the engine pulled them apart with
+   `splitn` to reconcile them against durable terminals. That is a private
+   harness encoding, decoded in the engine.
+3. **What a lost child contributed.** When the engine settled a ghost child it
+   called `ChildResultProjection::from_findings` over the child's role and the
+   evidence ledger, and wrote the resulting contribution and summary itself.
+   Role meaning and findings are Coding semantics.
+
+**Now.** Each judgement sits with its owner and the engine keeps the mechanics.
+
+1. `leveler-agent::coding::run::prior_epoch_open` computes the answer and
+   passes it as `SeedRequest::Fresh { prior_epoch_open }`. The engine's rule is
+   `continues_active_goal || prior_epoch_open` and nothing else.
+2. The engine carries `FinishedChildFact` verbatim in `TurnSeeds`;
+   `leveler-agent::coding::turn::reconcile_outstanding_children` decodes,
+   prunes and re-delivers. No engine source parses the entry format.
+3. The engine detects the ghost, orders its terminal before the turn's own,
+   attributes it to the turn the child STARTED in, stamps `ok: false` and
+   appends it through the fenced log — all unchanged. What the child
+   contributed it asks for, through the `LostChildVoice` port that
+   `CodingLostChildVoice` implements. A harness with no answer supplies no
+   voice and still gets a truthful terminal; `ok: false` is not delegable, so
+   no harness can turn a lost child into a successful one.
+
+**Closed by.** One new port (`LostChildVoice`, with `LostChild` and
+`LostChildNote`) and two booleans. No new crate, no framework, no event
+renamed. Three tripwires in
+`crates/leveler-engine/tests/ownership_direction.rs` hold the line: the engine
+source may not name `is_fully_completed`, `is_terminal_for_inheritance` or
+`from_findings`. The second harness proves the other half — it has no roles,
+no findings and no voice, and the engine still settles its ghosts
+(`the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics`).
+
 ---
 
 ## 19. Open design questions
@@ -1934,6 +1980,8 @@ TOOLREGISTRY_CLOSED               YES
 TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
+ENGINE_LIFECYCLE_ONLY             YES
+HARNESS_OWNS_CODING_SEMANTICS     YES
 
 BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
@@ -1955,6 +2003,14 @@ implemented against them. The engine was the last of it, and W3 closed it:
 change argued from architecture alone. A real run that exposes an ownership,
 safety or reliability defect reopens it; an aesthetic reading of the crate
 graph does not.
+
+The freeze has survived one such reopening. A re-audit found that the engine
+still made three Coding judgements through the shared `leveler-lifecycle`
+types even though it named no harness crate — a real ownership defect, so the
+rule applied and the boundary work was done. §18.12 records all three and how
+each closed. `ENGINE_LIFECYCLE_ONLY` and `HARNESS_OWNS_CODING_SEMANTICS` are
+the two lines that reopening added, and each is held by a source tripwire
+rather than by this paragraph.
 
 The freeze rests on its own acceptance, run at that commit. A harness that is
 not this product ran a full session — create, turn, persist, crash, reap,

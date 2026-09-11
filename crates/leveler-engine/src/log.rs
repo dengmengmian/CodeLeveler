@@ -381,8 +381,8 @@ pub struct UnfinishedChild {
     pub turn_id: Option<String>,
     pub id: String,
     pub nickname: String,
-    /// Role label from `SubAgentStarted`. A lost Worker is original-goal debt
-    /// (its scoped work is unfinished); other roles are knowledge loss only.
+    /// Role label as recorded on `SubAgentStarted`, carried verbatim. What a
+    /// given role means for the task is the harness's reading, not the log's.
     pub role: String,
 }
 

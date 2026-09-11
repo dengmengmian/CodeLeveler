@@ -870,13 +870,9 @@ mod multi_turn_session_tests {
         progress.accumulate_drive_rounds(5);
         progress.accumulate_drive_rounds(3);
         assert_eq!(progress.cumulative_rounds, 8);
-        // A fresh Content turn with terminal progress must not seed (epoch gate).
-        progress.enter_terminal();
-        assert!(progress.is_terminal_for_inheritance());
-        assert!(!crate::turn::should_seed_task_state(
-            None,
-            Some(&progress),
-            false
-        ));
+        // The engine's mechanical seed gate: a fresh turn whose harness reports
+        // a closed prior epoch does not seed. The domain answer ("is the prior
+        // epoch open?") is the harness's and arrives as a bool.
+        assert!(!crate::turn::should_seed_task_state(false, false));
     }
 }

@@ -132,6 +132,7 @@ async fn run_one(
         log: &log,
         approver: Arc::new(NoHuman),
         clarifier: Arc::new(AutoClarify),
+        lost_child_voice: None,
     };
     let cancellation = CancellationToken::new();
     let mut events = Vec::new();
@@ -166,6 +167,7 @@ async fn the_engine_runs_a_turn_for_a_harness_that_is_not_the_coding_agent() {
         "alpha",
         SeedRequest::Fresh {
             continues_active_goal: false,
+            prior_epoch_open: true,
         },
     )
     .await;
@@ -234,6 +236,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
         "alpha",
         SeedRequest::Fresh {
             continues_active_goal: false,
+            prior_epoch_open: true,
         },
     )
     .await;
@@ -322,4 +325,106 @@ fn the_second_harness_does_not_reach_for_the_coding_harness() {
              harness, it is the coding harness wearing a smaller name"
         );
     }
+}
+
+/// H6 (F9.3): a harness with no child semantics still gets its ghosts closed.
+///
+/// The second harness has no roles, no findings and no `LostChildVoice`. A
+/// child a dead window started and never finished must STILL receive a
+/// truthful terminal — attributed to the turn it started in, `ok: false`, and
+/// with no contribution, because nobody here can compute one.
+///
+/// This is the F9.3 proof read from the other side: settling a lost child is
+/// engine mechanics, and only what the child CONTRIBUTED needs a harness.
+#[tokio::test]
+async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::connect(&dir.path().join("minimal.sqlite"))
+        .await
+        .unwrap();
+    let session = open_session(&db).await;
+
+    // A dead window: a turn that opened a child and never reported it.
+    let lost_in = TurnRepository::new(&db)
+        .start(&session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    let lost_in = leveler_core::TurnId::new(lost_in.id);
+    EventLog::new(&db, session.clone())
+        .append(
+            Some(&lost_in),
+            EngineEvent::SubAgentStarted {
+                id: "ghost-1".into(),
+                nickname: "Helper".into(),
+                // A role label this harness never assigns meaning to.
+                role: "whatever".into(),
+                task: "something".into(),
+                profile_id: None,
+                profile_role: None,
+                read_only: false,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    let (_, events) = run_one(
+        &db,
+        &session,
+        "alpha",
+        SeedRequest::Fresh {
+            continues_active_goal: false,
+            prior_epoch_open: true,
+        },
+    )
+    .await;
+
+    let settled = events
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::SubAgentFinished {
+                id,
+                ok,
+                contribution,
+                summary,
+                ..
+            } if id == "ghost-1" => Some((*ok, contribution.clone(), summary.clone())),
+            _ => None,
+        })
+        .expect("the engine settles a ghost with no harness help at all");
+    assert!(!settled.0, "a child that never reported did not succeed");
+    assert!(
+        settled.1.is_none(),
+        "no voice, no contribution: the engine must not invent one"
+    );
+    assert!(
+        settled.2.contains("Helper") && settled.2.contains("lost"),
+        "the terminal states the lifecycle fact: {}",
+        settled.2
+    );
+
+    // R2: attributed to the turn the child STARTED in, not the turn that
+    // happened to reconcile it.
+    let rows = leveler_storage::EventStore::load(&db, &session)
+        .await
+        .unwrap();
+    let attributed = rows
+        .iter()
+        .find(|r| r.payload.contains("ghost-1") && r.payload.contains("sub_agent_finished"))
+        .expect("the terminal is durable");
+    assert_eq!(
+        attributed.turn_id.as_deref(),
+        Some(lost_in.as_str()),
+        "a recovered terminal belongs to the turn that lost the child"
+    );
+
+    // R1 + R3: reconciled once. A second turn finds no ghost and writes no
+    // second terminal.
+    let (_, again) = run_one(&db, &session, "beta", SeedRequest::Resume).await;
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "ghost-1")),
+        "the first terminal fact wins; the engine must not settle it twice"
+    );
 }

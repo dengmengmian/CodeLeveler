@@ -346,6 +346,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
         log: &log,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        lost_child_voice: None,
     };
 
     let recorded = runner
@@ -353,6 +354,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
             TurnKind::Chat,
             leveler_engine::SeedRequest::Fresh {
                 continues_active_goal: false,
+                prior_epoch_open: true,
             },
             None,
             &mut |_| {},

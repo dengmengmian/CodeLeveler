@@ -1212,6 +1212,22 @@ pub struct ToolOutput {
 
 **已关闭。** engine 注释改成实话；`CodingRuntime::resume` 现在直接拒绝 `ExecutionKind::Parallel`，不再依赖 transcript 恰好为空。回归测试 `resume_refuses_a_parallel_parent_session` 把这次拒绝钉在 kind 上。
 
+### 18.12 Engine 读 Coding 语义来跑自己的机械流程（已关闭）
+
+**曾经。** `leveler-engine` 不点名任何 harness crate、也不点名任何 harness 类型——§18.1 是诚实关闭的——但它仍然做了三个 Coding 判断，每一个都借道双方都合法共享的 `leveler-lifecycle`。依赖方向可以是干净的，语义却往反方向流。
+
+1. **新 turn 的继承。** `should_seed_task_state` 调 `PlanState::is_fully_completed` 和 `ProgressLedger::is_terminal_for_inheritance`，来决定新 turn 是否继承上一轮的 plan、ledger 和 progress。「上一个 epoch 结束了吗」是 Coding 词汇里的问题，engine 却在回答它。
+2. **未结子 agent 记录。** `leveler-agent` 把未结子 agent 写成 `id|nickname|role|files`，engine 用 `splitn` 把它拆开，再和持久终态事实对账。那是 harness 的私有编码，在 engine 里被解码。
+3. **丢失的子 agent 贡献了什么。** Engine 结算 ghost child 时会拿 role 和 evidence ledger 调 `ChildResultProjection::from_findings`，自己写出 contribution 和 summary。Role 的含义和 findings 都是 Coding 语义。
+
+**现在。** 每个判断回到它的归属方，engine 保留全部机械部分。
+
+1. `leveler-agent::coding::run::prior_epoch_open` 算出答案，经 `SeedRequest::Fresh { prior_epoch_open }` 传进来。Engine 的规则就是 `continues_active_goal || prior_epoch_open`，没有别的。
+2. Engine 在 `TurnSeeds` 里原样携带 `FinishedChildFact`；解码、剪枝、重投递由 `leveler-agent::coding::turn::reconcile_outstanding_children` 完成。Engine 源码里没有一处解析这个条目格式。
+3. Engine 仍然负责发现 ghost、把它的终态排在本 turn 终态之前、归属到子 agent **启动**的那个 turn、盖上 `ok: false`、经受 ownership 围栏的日志落盘——这些一点没动。它只把「这个子 agent 贡献了什么」问出去，问的是 `LostChildVoice` 端口，由 `CodingLostChildVoice` 实现。没有答案的 harness 不提供 voice，照样拿到一条真实的终态；而 `ok: false` 不可委托，任何 harness 都无法把一个丢失的子 agent 变成成功。
+
+**由谁关闭。** 一个新端口（`LostChildVoice`，带 `LostChild` 和 `LostChildNote`）加两个 bool。没有新 crate、没有框架、没有重命名任何事件。`crates/leveler-engine/tests/ownership_direction.rs` 里三条 tripwire 守住这条线：engine 源码不得出现 `is_fully_completed`、`is_terminal_for_inheritance`、`from_findings`。另一半由第二个 harness 证明——它没有 role、没有 findings、也没有 voice，engine 照样把它的 ghost 结算掉（`the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics`）。
+
 ---
 
 ## 19. 开放设计问题
@@ -1288,6 +1304,8 @@ TOOLREGISTRY_CLOSED               YES
 TOOLCONTEXT_CLOSED                YES
 FOUNDATION_TOOL_NAME_LEAKAGE      NONE
 WORK_PROFILE_AUTHORITY            SESSION_ROW
+ENGINE_LIFECYCLE_ONLY             YES
+HARNESS_OWNS_CODING_SEMANTICS     YES
 
 BROWSER_IMPLEMENTATION            CLOSED_BY_REPLACEMENT
 
@@ -1300,6 +1318,8 @@ FOUNDATION_FROZEN                 YES
 架构、工具边界和模型可见的工具面都已经定了；七个核心原语、能力 ownership 和组合方式也按它实现了。Engine 是最后一块，W3 把它关掉了：`leveler-engine` 不点名任何 harness crate、任何 Coding 类型（§18.1），所以 `SECOND_HARNESS_TEST` 是被一个测试强制成立的，不是在文字里论证出来的（§17）。
 
 `FOUNDATION_FROZEN` 的基线是 `70e63900`。这条冻结是什么意思，写在 §20 规则 8：Foundation 不是禁止改动，是禁止只凭架构论述去改动。真实运行暴露 ownership / 安全 / 可靠性缺陷，就重新打开它；对 crate 图的审美判断，不行。
+
+这条冻结已经被这样重新打开过一次。一次复审发现：engine 虽然不点名任何 harness crate，却仍然借道共享的 `leveler-lifecycle` 做了三个 Coding 判断——这是真实的 ownership 缺陷，规则生效，边界该修就修了。三个发现和各自的关闭方式记在 §18.12。`ENGINE_LIFECYCLE_ONLY` 和 `HARNESS_OWNS_CODING_SEMANTICS` 就是这次重开加上的两行，各自由源码 tripwire 守着，而不是由这段话守着。
 
 冻结依据的是它自己在那个 commit 上的验收。一个不是本产品的 harness 在 engine 上跑完了一整个会话——建会话、跑 turn、持久化、崩溃、reap、resume、终态——没有新增任何 engine API、trait、crate 或抽象。随后真实 Coding harness 端到端跑了三个真任务：一个改完验证转绿的小改动；一个被 `kill -9` 打断、resume 后跑到完成、丢失的那个 turn 被如实记为 `interrupted` 的运行；以及一次经浏览器驱动的前端改动。`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets` 干净，workspace 套件连续三次 3599 通过、0 失败。
 

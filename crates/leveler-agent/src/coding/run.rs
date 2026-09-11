@@ -16,7 +16,9 @@ use leveler_engine::{
     TaskOutcome, TurnKind, TurnRunner,
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
-use leveler_lifecycle::{AgentState, SessionStatus, StopReason, VerificationStatus};
+use leveler_lifecycle::{
+    AgentState, PlanState, ProgressLedger, SessionStatus, StopReason, VerificationStatus,
+};
 use leveler_storage::EventStore;
 use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
@@ -104,6 +106,31 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
         limits: spec.runtime.limits,
         continues_active_goal: false,
     }
+}
+
+/// The Coding harness's answer to "is the prior domain state still open?".
+///
+/// This is the harness's judgement over its own vocabulary: a finished epoch is
+/// a fully completed plan, or progress that reached Closing/Terminal. The
+/// engine never computes it — it receives the bool in
+/// `SeedRequest::Fresh::prior_epoch_open` and applies one mechanical rule.
+///
+/// Absence of prior state is OPEN, not closed: an empty epoch seeds harmlessly.
+pub(crate) fn prior_epoch_open(
+    plan: Option<&PlanState>,
+    progress: Option<&ProgressLedger>,
+) -> bool {
+    if let Some(progress) = progress
+        && progress.is_terminal_for_inheritance()
+    {
+        return false;
+    }
+    if let Some(plan) = plan
+        && plan.is_fully_completed()
+    {
+        return false;
+    }
+    true
 }
 
 /// The session's lifecycle columns for a finished task.
@@ -240,6 +267,29 @@ pub(crate) fn bound_goal_history(
     messages[messages.len() - max..].to_vec()
 }
 impl CodingRuntime {
+    /// Load the session's prior Coding domain state and answer whether it is
+    /// still open.
+    ///
+    /// The engine loads the same durable rows again when it actually seeds; the
+    /// decision is the harness's, because forming it requires reading Coding
+    /// semantics — which is exactly what F9.1 moved out of the engine.
+    async fn prior_epoch_open(&self, session_id: &SessionId) -> Result<bool, EngineError> {
+        let events = self.engine.stores.events.as_ref();
+        let progress = leveler_engine::last_persisted_progress(events, session_id).await?;
+        let plan = leveler_engine::last_persisted_plan(events, session_id).await?;
+        Ok(prior_epoch_open(plan.as_ref(), progress.as_ref()))
+    }
+
+    /// Who speaks for a child this session lost. The engine settles the ghost
+    /// either way; this is what lets the terminal also say what the child
+    /// contributed (§F9.3).
+    fn lost_child_voice(&self, session_id: &SessionId) -> Arc<dyn leveler_engine::LostChildVoice> {
+        Arc::new(crate::coding::turn::CodingLostChildVoice {
+            events: self.engine.stores.events.clone(),
+            session_id: session_id.clone(),
+        })
+    }
+
     /// Create the session a Coding task runs in.
     ///
     /// The harness is what knows a Coding task has a repository, a permission
@@ -430,6 +480,7 @@ impl CodingRuntime {
             log: &log,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
         log.append(
             None,
@@ -580,13 +631,16 @@ impl CodingRuntime {
             log: &log,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
+        let prior_epoch_open = self.prior_epoch_open(session_id).await?;
         let result = async {
             let recorded = runner
                 .run_turn(
                     TurnKind::Chat,
                     SeedRequest::Fresh {
                         continues_active_goal: false,
+                        prior_epoch_open,
                     },
                     Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
                     observer,
@@ -707,6 +761,7 @@ impl CodingRuntime {
             log: &log,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
 
         // Reconcile the crash window before continuing: a tool that started but
@@ -914,11 +969,13 @@ impl CodingRuntime {
                 observer,
             )
             .await?;
+        let prior_epoch_open = self.prior_epoch_open(&runner.session_id).await?;
         let recorded = runner
             .run_turn(
                 TurnKind::User,
                 SeedRequest::Fresh {
                     continues_active_goal: false,
+                    prior_epoch_open,
                 },
                 Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
                 observer,
@@ -2118,5 +2175,52 @@ mod goal_history_tests {
             bound.last().unwrap().text_content(),
             raw.last().unwrap().text_content()
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use leveler_lifecycle::{PlanOrigin, PlanStep};
+
+    fn plan_with(status: &str) -> PlanState {
+        PlanState {
+            steps: vec![PlanStep {
+                step: "step".into(),
+                status: status.into(),
+                id: Some("1".into()),
+                origin: PlanOrigin::ModelExplicit,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_fully_completed_plan_is_a_closed_epoch() {
+        assert!(!prior_epoch_open(Some(&plan_with("completed")), None));
+    }
+
+    #[test]
+    fn an_incomplete_plan_is_an_open_epoch() {
+        assert!(prior_epoch_open(Some(&plan_with("pending")), None));
+    }
+
+    #[test]
+    fn closing_or_terminal_progress_is_a_closed_epoch() {
+        let mut closing = ProgressLedger::default();
+        closing.enter_closing();
+        assert!(!prior_epoch_open(None, Some(&closing)));
+        let mut terminal = ProgressLedger::default();
+        terminal.enter_terminal();
+        assert!(!prior_epoch_open(None, Some(&terminal)));
+    }
+
+    #[test]
+    fn active_progress_is_an_open_epoch() {
+        assert!(prior_epoch_open(None, Some(&ProgressLedger::default())));
+    }
+
+    #[test]
+    fn absent_prior_state_is_an_open_epoch() {
+        assert!(prior_epoch_open(None, None));
     }
 }

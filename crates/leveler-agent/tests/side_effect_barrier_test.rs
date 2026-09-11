@@ -222,6 +222,7 @@ async fn run_chat_turn(
         log,
         approver,
         clarifier: Arc::new(AutoClarify),
+        lost_child_voice: None,
     };
     let cancellation = CancellationToken::new();
     runner
@@ -229,6 +230,7 @@ async fn run_chat_turn(
             TurnKind::Chat,
             leveler_engine::SeedRequest::Fresh {
                 continues_active_goal: false,
+                prior_epoch_open: true,
             },
             None,
             &mut |_| {},

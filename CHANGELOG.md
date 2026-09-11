@@ -311,6 +311,16 @@ All notable changes to CodeLeveler are documented here. The format follows
   evidence a task outcome is judged against, not the runtime deciding the
   request was satisfied. Code was already correct; the comment was not
   (§18.8).
+- **The engine no longer reads Coding semantics to run its own mechanics.**
+  It named no harness crate, and still answered three questions in the Coding
+  vocabulary through the shared `leveler-lifecycle` types: whether a prior
+  epoch was still open, how to decode the harness's outstanding-child entries,
+  and what a lost child had contributed. The first two now arrive as facts the
+  harness computes, and the third is asked for through a new `LostChildVoice`
+  port. The engine keeps every mechanical part of settling a lost child —
+  detection, ordering, origin-turn attribution, `ok: false`, the fenced
+  append — and a harness with no child semantics still gets truthful terminals.
+  See `docs/ARCHITECTURE.md` §18.12.
 
 ## [0.2.0-beta.1] - 2026-08-22
 
