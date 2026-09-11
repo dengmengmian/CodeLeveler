@@ -24,6 +24,7 @@ use leveler_execution::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, StopReason,
+    VerificationStatus,
 };
 use leveler_memory::MemoryStore;
 use leveler_model::{
@@ -158,7 +159,16 @@ pub enum AgentEvent {
         evidence: Option<String>,
     },
     /// Post-edit verification finished.
-    VerificationFinished { passed: bool },
+    ///
+    /// `passed` is the completion gate, not a verification result: it is
+    /// `true` for a run that owed no check and therefore proved nothing.
+    /// `verification` is what the checks actually said, and any consumer
+    /// answering "did this pass" must read that. `None` on rows written
+    /// before the split, where only the gate was recorded.
+    VerificationFinished {
+        passed: bool,
+        verification: Option<VerificationStatus>,
+    },
     /// A sub-agent was spawned and began working (concurrent delegation).
     SubAgentStarted {
         id: String,

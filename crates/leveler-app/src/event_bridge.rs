@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use leveler_agent::{AdvisoryKind, AgentError, AgentOutcome, StopReason};
 use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
+use leveler_lifecycle::VerificationStatus;
 
 use leveler_client_protocol::{
     CheckState, ChildContribution, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
@@ -515,7 +516,13 @@ impl EventBridge {
                 });
                 self.emit_verification(None);
             }
-            EngineEvent::VerificationFinished { passed } => self.emit_verification(Some(passed)),
+            // A client is told the verification truth, not the completion
+            // gate: `UiVerification::passed` answers "did verification pass",
+            // and a run that was not verified has not passed.
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => self.emit_verification(verification_outcome(verification, passed)),
             EngineEvent::SubAgentStarted {
                 id,
                 nickname,
@@ -662,6 +669,24 @@ fn map_check_status(status: &str) -> CheckState {
         "passed" => CheckState::Passed,
         "failed" => CheckState::Failed,
         _ => CheckState::Skipped,
+    }
+}
+
+/// What `UiVerification::passed` may say, given the verdict and the gate.
+///
+/// `None` is "nothing was proven". It is deliberately not `Some(false)`
+/// either: "not verified" and "failed" are different facts, and clients
+/// render them differently (`incomplete` versus `failed`).
+fn verification_outcome(verification: Option<VerificationStatus>, passed: bool) -> Option<bool> {
+    match verification {
+        Some(VerificationStatus::Passed) => Some(true),
+        Some(VerificationStatus::Failed) => Some(false),
+        Some(VerificationStatus::NotRun | VerificationStatus::Unavailable) => None,
+        // A row written before the split. A closed gate that failed can only
+        // mean the checks failed; a closed gate that passed cannot say whether
+        // anything was proven, so it says nothing.
+        None if !passed => Some(false),
+        None => None,
     }
 }
 
@@ -1477,7 +1502,10 @@ mod projection_equivalence {
                 status: "passed".into(),
                 evidence: None,
             },
-            EngineEvent::VerificationFinished { passed: true },
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: Some(VerificationStatus::Passed),
+            },
         ]);
         assert_eq!(
             shapes,
@@ -1487,6 +1515,27 @@ mod projection_equivalence {
                 "verify:passed=Some(true):checks=1"
             ]
         );
+    }
+
+    /// The defect this split exists for. A run that owed no check has an open
+    /// completion gate — it must still complete — and the projection must not
+    /// turn that into a pass for a client to render.
+    #[test]
+    fn a_run_that_was_not_verified_never_projects_as_passed() {
+        for verification in [VerificationStatus::NotRun, VerificationStatus::Unavailable] {
+            let shapes = project(vec![
+                EngineEvent::VerificationStarted,
+                EngineEvent::VerificationFinished {
+                    passed: true,
+                    verification: Some(verification),
+                },
+            ]);
+            assert_eq!(
+                shapes,
+                ["verify:passed=None:checks=0", "verify:passed=None:checks=0"],
+                "{verification:?} is not a pass"
+            );
+        }
     }
 
     /// The projection is what every client renders. Facts the runtime already

@@ -1281,7 +1281,11 @@ impl CodingRuntime {
         log.append(
             None,
             EngineEvent::VerificationFinished {
+                // The completion gate, which is deliberately true for a run
+                // that owed no check.
                 passed: report.passed(),
+                // The fact, mapped by the one mapper every consumer shares.
+                verification: Some(verification_status_of(&report)),
             },
             observer,
         )
@@ -1735,10 +1739,21 @@ fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
 }
 
 /// The mechanical verdict of the project's own checks, as a status.
+///
+/// THE single `VerificationReport` → `VerificationStatus` mapping. Every
+/// surface reads this one: the `verification_finished` event, the task report,
+/// and through it `task_finished.verification`. Two mappings is how an event
+/// log ends up saying `passed` while the terminal row says `unavailable`.
+///
+/// The rule is the status enum's own definition, not a new one: a gate that
+/// failed is `Failed`; nothing configured to run is `NotRun` ("no checks are
+/// configured"); checks that were configured but could not speak — tool
+/// missing, environment mismatch, skipped — are `Unavailable`.
 fn verification_status_of(report: &VerificationReport) -> VerificationStatus {
     match report.verdict() {
         Verdict::Verified => VerificationStatus::Passed,
         Verdict::Failed => VerificationStatus::Failed,
+        Verdict::Unverified(_) if !report.has_gating_checks() => VerificationStatus::NotRun,
         Verdict::Unverified(_) => VerificationStatus::Unavailable,
     }
 }
@@ -1913,9 +1928,45 @@ mod verification_status_tests {
             verification_status_of(&report(CheckStatus::Failed)),
             VerificationStatus::Failed
         );
+        // Configured but unable to speak: the checks exist, so this is
+        // `Unavailable` and not "nothing to verify".
         assert_eq!(
             verification_status_of(&report(CheckStatus::ToolMissing)),
             VerificationStatus::Unavailable
+        );
+        assert_eq!(
+            verification_status_of(&report(CheckStatus::EnvironmentUnavailable)),
+            VerificationStatus::Unavailable
+        );
+    }
+
+    /// The one case where the gate and the truth must not be read the same
+    /// way: a run with nothing configured to run. Its gate is open, and it
+    /// proved nothing.
+    #[test]
+    fn a_report_with_no_gates_is_not_run_rather_than_unavailable() {
+        let no_gates = VerificationReport {
+            checks: vec![],
+            scope_ok: true,
+            scope_violations: vec![],
+            baseline_failures: Vec::new(),
+        };
+        assert!(
+            no_gates.passed(),
+            "the gate is open for a run that owes nothing"
+        );
+        assert_eq!(
+            verification_status_of(&no_gates),
+            VerificationStatus::NotRun
+        );
+
+        // A non-gating check is still nothing to verify against.
+        let mut advisory = report(CheckStatus::Passed);
+        advisory.checks[0].gating = false;
+        assert!(advisory.passed());
+        assert_eq!(
+            verification_status_of(&advisory),
+            VerificationStatus::NotRun
         );
     }
 }

@@ -454,7 +454,20 @@ pub enum EngineEvent {
         evidence: Option<String>,
     },
     VerificationFinished {
+        /// The completion gate: whether the report blocked completion. It is
+        /// `true` for a run that was not verified, because a run that owed no
+        /// check must still complete. A reader answering "did this pass" must
+        /// read `verification`, not this.
         passed: bool,
+        /// What the project's own checks actually said.
+        ///
+        /// `None` on rows written before the gate and the truth were split:
+        /// those rows carry `passed` alone, and `passed: true` cannot say
+        /// whether the run was `Passed` or `NotRun`. Absent is the honest
+        /// answer, and it is deliberately an `Option` — a default would
+        /// manufacture a verdict nobody recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationStatus>,
     },
     /// One acceptance criterion's command-backed evidence.
     /// `status`: met | unmet | unverifiable.
@@ -723,9 +736,13 @@ impl EngineEvent {
                 PublicEvent::ClarificationAnswered { id: id.clone() }
             }
             EngineEvent::VerificationStarted => PublicEvent::VerificationStarted,
-            EngineEvent::VerificationFinished { passed } => {
-                PublicEvent::VerificationFinished { passed: *passed }
-            }
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => PublicEvent::VerificationFinished {
+                passed: *passed,
+                verification: *verification,
+            },
             EngineEvent::AcceptanceEvidence {
                 required, status, ..
             } => PublicEvent::AcceptanceEvidence {
@@ -855,6 +872,8 @@ pub enum PublicEvent {
     VerificationStarted,
     VerificationFinished {
         passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationStatus>,
     },
     AcceptanceEvidence {
         required: bool,
@@ -1042,7 +1061,11 @@ mod contract_tests {
             DataClass::Projectable
         );
         assert_eq!(
-            EngineEvent::VerificationFinished { passed: true }.data_class(),
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: None,
+            }
+            .data_class(),
             DataClass::Projectable
         );
     }

@@ -468,7 +468,10 @@ async fn direct_content_run_emits_verification_events() {
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            leveler_engine::EngineEvent::VerificationFinished { passed: true }
+            leveler_engine::EngineEvent::VerificationFinished {
+                passed: true,
+                verification: Some(leveler_lifecycle::VerificationStatus::Passed),
+            }
         )
     }));
 }

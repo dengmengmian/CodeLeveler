@@ -55,7 +55,12 @@ pub struct UiCheck {
     pub evidence: Option<String>,
 }
 
-/// The verification result. `passed` is `None` while still running.
+/// The verification result.
+///
+/// `passed` is `None` while a check is still running, and it is also `None`
+/// when nothing was proven. It is never `Some(true)` for a run that was not
+/// verified — "not verified" and "failed" are different facts, and clients
+/// render them differently (`incomplete` versus `failed`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiVerification {

@@ -468,7 +468,7 @@ export interface UiUserShell {
   status: string;
 }
 
-/** The verification result. `passed` is `None` while still running. */
+/** The verification result. `passed` is `None` while a check is still running, and it is also `None` when nothing was proven. It is never `Some(true)` for a run that was not verified — "not verified" and "failed" are different facts, and clients render them differently (`incomplete` versus `failed`). */
 export interface UiVerification {
   checks: UiCheck[];
   passed?: boolean | null;

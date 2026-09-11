@@ -71,6 +71,21 @@ describe('completionTruth', () => {
     expect(t?.facts).toContain('验证通过');
   });
 
+  it('checks that proved nothing are incomplete, never passed', () => {
+    // What the runtime sends for a run whose checks could not speak: the
+    // completion gate is open (it must be — the run is over) and
+    // `passed` is null, with the checks it tried. Reading the gate here used
+    // to render this as a pass.
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'unverified', detail: 'verification unavailable', ms: 10 },
+        verification: { passed: null, checks: [{ name: 'cargo test', status: 'skipped' }] },
+      }),
+    );
+    expect(t?.verify).toBe('incomplete');
+    expect(t?.trust).not.toBe('verified');
+  });
+
   it('unverified is never success and never uses live tools', () => {
     const t = completionTruth(
       session({

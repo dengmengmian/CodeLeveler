@@ -11,6 +11,7 @@ use leveler_client_protocol::{
 };
 use leveler_core::SessionId;
 use leveler_engine::EngineEvent;
+use leveler_lifecycle::VerificationStatus;
 use leveler_storage::{
     Database, EventRecord, EventStore, ModelRequestStore, SessionRepository, TurnRepository,
 };
@@ -329,13 +330,32 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
                 ("Status".into(), status.clone()),
             ],
         ),
-        EngineEvent::VerificationFinished { passed } => (
-            ObservationClass::Verify,
-            "verify finished".into(),
-            String::new(),
-            if *passed { "ok" } else { "fail" }.into(),
-            vec![("Passed".into(), passed.to_string())],
-        ),
+        EngineEvent::VerificationFinished {
+            passed,
+            verification,
+        } => {
+            // The completion gate is not a result. A run that proved nothing
+            // is not "ok", and it has not "passed".
+            let recorded = row_verification(*verification, *passed);
+            (
+                ObservationClass::Verify,
+                "verify finished".into(),
+                String::new(),
+                match recorded {
+                    Some(VerificationStatus::Passed) => "ok",
+                    Some(VerificationStatus::Failed) => "fail",
+                    _ => "info",
+                }
+                .into(),
+                vec![(
+                    "Verification".into(),
+                    recorded
+                        .map(|status| status.as_str())
+                        .unwrap_or("unavailable")
+                        .to_string(),
+                )],
+            )
+        }
         EngineEvent::SubAgentStarted {
             id,
             nickname,
@@ -784,11 +804,29 @@ fn lanes_for(rows: &[leveler_storage::ModelRequestRecord]) -> Vec<UiLaneAccounti
     ]
 }
 
+/// What one `verification_finished` row says about verification.
+///
+/// `None` is "this row does not say", and it is returned for exactly one
+/// case: a row written before the gate and the truth were split, whose gate
+/// was open. `passed: true` cannot distinguish `Passed` from `NotRun`, so
+/// nothing is claimed. A closed gate that failed can only mean the checks
+/// failed, which is why that one case is derived.
+fn row_verification(
+    verification: Option<VerificationStatus>,
+    passed: bool,
+) -> Option<VerificationStatus> {
+    match verification {
+        Some(status) => Some(status),
+        None if passed => None,
+        None => Some(VerificationStatus::Failed),
+    }
+}
+
 /// The latest verdict the runtime recorded, never a count of attempts.
 /// `not_run` means nothing started; `unavailable` means something started and
-/// never reached a verdict.
+/// the log records no verdict for it.
 fn verification_verdict(decoded: &[(EventRecord, EngineEvent)]) -> &'static str {
-    let mut verdict = None;
+    let mut verdict: Option<VerificationStatus> = None;
     let mut started = false;
     for (_, ev) in decoded {
         match ev {
@@ -796,17 +834,19 @@ fn verification_verdict(decoded: &[(EventRecord, EngineEvent)]) -> &'static str 
                 started = true;
                 verdict = None;
             }
-            EngineEvent::VerificationFinished { passed } => {
-                verdict = Some(*passed);
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => {
+                verdict = row_verification(*verification, *passed);
             }
             _ => {}
         }
     }
     match (started, verdict) {
-        (_, Some(true)) => "passed",
-        (_, Some(false)) => "failed",
-        (true, None) => "unavailable",
-        (false, None) => "not_run",
+        (_, Some(status)) => status.as_str(),
+        (true, None) => VerificationStatus::Unavailable.as_str(),
+        (false, None) => VerificationStatus::NotRun.as_str(),
     }
 }
 
@@ -930,7 +970,10 @@ mod tests {
         persist(
             &db,
             &sid,
-            EngineEvent::VerificationFinished { passed: false },
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: Some(VerificationStatus::Failed),
+            },
         )
         .await;
         persist(
@@ -1659,7 +1702,10 @@ mod accounting_tests {
         persist(
             &db,
             &sid,
-            EngineEvent::VerificationFinished { passed: false },
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: Some(VerificationStatus::Failed),
+            },
         )
         .await;
         let failed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
@@ -1669,7 +1715,10 @@ mod accounting_tests {
         persist(
             &db,
             &sid,
-            EngineEvent::VerificationFinished { passed: true },
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: Some(VerificationStatus::Passed),
+            },
         )
         .await;
         let passed = query_observability(&db, &sid, None, 0, 80).await.unwrap();

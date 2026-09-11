@@ -197,6 +197,31 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **A run that was never verified is no longer recorded, rendered or counted
+  as a passing one.** `VerificationReport::passed()` is the *completion gate*:
+  it answers "may this run end", and it is true for a run that owed no check —
+  a `git pull` owes nothing, and its gate must open. The runtime wrote that
+  same boolean to the `verification_finished` event under the name `passed`,
+  where the CLI printed it as `verification passed`, the Inspector reported
+  the session as `passed`, and `evals/lib/eventlog.py` counted it as
+  `verification_passed`. So an unverified run read as a verified one on every
+  surface at once, and the evaluation metric was built on it.
+
+  The gate and the truth are now separate fields on the event: `passed` keeps
+  its completion meaning, and `verification` carries the verdict
+  (`passed` / `failed` / `not_run` / `unavailable`) through one mapper shared
+  by the event and the terminal `task_finished` row, so the two cannot
+  disagree. It is an `Option` and not a defaulted value on purpose: rows
+  written before this split carry `passed` alone, and `passed: true` cannot
+  say whether the checks ran and passed or simply had nothing to run — an
+  absence a reader must not turn into a verdict. Every consumer now reads the
+  verdict: the CLI prints `unverified` where it used to print `passed`, both
+  clients are handed `UiVerification::passed = None` for a run that proved
+  nothing, and the eval reader takes the fact from
+  `verification_finished.verification`, then `task_finished.verification`, and
+  only then a pre-split row — where `passed: false` derives a failure and
+  `passed: true` yields `legacy_unknown` with `verification_passed = None`.
+  `VerificationReport::passed()` is unchanged.
 - **Windows confines what a command writes, not what it reads.** AppContainer
   denies reads by default, so a confined Windows command resolved `cargo` on
   `PATH` and then could not open it — and the fix would have been an

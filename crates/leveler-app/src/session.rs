@@ -237,7 +237,13 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             },
             evidence,
         },
-        EngineEvent::VerificationFinished { passed } => AgentEvent::VerificationFinished { passed },
+        EngineEvent::VerificationFinished {
+            passed,
+            verification,
+        } => AgentEvent::VerificationFinished {
+            passed,
+            verification,
+        },
         // Engine lifecycle & strategy events: persisted; engine-aware
         // consumers surface them directly.
         _ => return None,

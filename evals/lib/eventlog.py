@@ -20,6 +20,34 @@ EDIT_TOOLS = {"apply_patch", "replace"}
 CLAIM_TOOL = "claim_write_scope"
 
 
+def verification_truth(
+    event_verification: str | None,
+    terminal_verification: str | None,
+    legacy_gate: bool | None,
+) -> tuple[str | None, str | None]:
+    """The verification fact, and where it came from.
+
+    Priority: the row that ran the checks, then the terminal row that recorded
+    the outcome, then — only for logs written before the two were split — the
+    completion gate.
+
+    A pre-split row carries `passed` alone, and that is the completion gate:
+    it is open for a run that owed no check. `passed: false` can only mean the
+    checks failed, so that one derives. `passed: true` cannot say whether the
+    run was `passed` or simply had nothing to run, so it claims neither — the
+    status is `legacy_unknown` and the run is never counted as verified.
+    """
+    if event_verification:
+        return event_verification, "verification_finished"
+    if terminal_verification:
+        return terminal_verification, "task_finished"
+    if legacy_gate is False:
+        return "failed", "legacy_completion_gate"
+    if legacy_gate is True:
+        return "legacy_unknown", "legacy_completion_gate"
+    return None, None
+
+
 def extract_usage(con: sqlite3.Connection) -> dict[str, int | None]:
     """Sum provider usage from `model_requests`. Missing table → null, not 0."""
     cur = con.cursor()
@@ -181,20 +209,46 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
     first_spawn_round = round_at.get(first_spawn_seq) if isinstance(first_spawn_seq, int) else None
 
     task_outcome = None
-    verification_passed = None
     tests_passed: int | None = None
     review_findings = 0
+    # Read the fact a row records, never the completion gate. The gate is open
+    # for a run that proved nothing, and reading it is how an unverified run
+    # came to be counted as a passing one.
+    event_verification = None
+    terminal_verification = None
+    legacy_gate = None
     for _seq, etype, body in events:
         if etype == "task_finished":
             task_outcome = body.get("outcome")
+            recorded = body.get("verification")
+            if recorded:
+                terminal_verification = recorded
         elif etype == "verification_finished":
-            verification_passed = body.get("passed")
+            recorded = body.get("verification")
+            if recorded:
+                event_verification = recorded
+            else:
+                legacy_gate = body.get("passed")
         elif etype == "verification_check":
             status = body.get("status")
             if status in ("passed", "pass", True):
                 tests_passed = (tests_passed or 0) + 1
         elif etype == "review_stage" and body.get("action") == "finished_ok":
             review_findings += 1
+
+    verification_status, verification_truth_source = verification_truth(
+        event_verification, terminal_verification, legacy_gate
+    )
+    # `verification_passed` is True only for a recorded pass. `not_run`,
+    # `unavailable` and an unreadable legacy row are None rather than False:
+    # "not measured" and "failed" are different facts, and
+    # `verification_status` above says which one it was.
+    if verification_status == "passed":
+        verification_passed = True
+    elif verification_status == "failed":
+        verification_passed = False
+    else:
+        verification_passed = None
 
     usage = extract_usage(con)
     wall_ms = extract_wall_time_ms(con)
@@ -235,6 +289,8 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
         "wall_time_ms": wall_ms,
         "task_outcome": task_outcome,
         "verification_passed": verification_passed,
+        "verification_status": verification_status,
+        "verification_truth_source": verification_truth_source,
         "tests_passed": tests_passed,
         "review_findings": review_findings if review_findings else None,
         "regressions": None,

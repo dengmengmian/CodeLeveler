@@ -1,6 +1,7 @@
 //! Event rendering for the CLI: agent events in text or JSONL form.
 
 use leveler_agent::{AdvisoryKind, AgentEvent, AgentVerificationStatus};
+use leveler_lifecycle::VerificationStatus;
 
 use crate::cli::OutputFormat;
 pub(crate) fn render_event(event: AgentEvent, output: OutputFormat) {
@@ -89,8 +90,23 @@ fn render_event_text(event: AgentEvent) {
                 }
             }
         }
-        AgentEvent::VerificationFinished { passed } => {
-            let label = if passed { "passed" } else { "failed" };
+        AgentEvent::VerificationFinished {
+            passed,
+            verification,
+        } => {
+            // Only `Passed` may be printed as a pass. `passed` is the
+            // completion gate, and it is true for a run that proved nothing.
+            let label = match verification {
+                Some(VerificationStatus::Passed) => "passed",
+                Some(VerificationStatus::Failed) => "failed",
+                Some(VerificationStatus::NotRun) => "not run",
+                Some(VerificationStatus::Unavailable) => "unavailable",
+                // Written before the split: a closed gate that failed is a
+                // failure; a closed gate that passed says nothing about
+                // whether anything was proven.
+                None if !passed => "failed",
+                None => "unverified (legacy row)",
+            };
             println!("{} verification {label}", console::style("•").cyan());
         }
         AgentEvent::SubAgentStarted {
@@ -288,9 +304,25 @@ fn render_event_jsonl(event: AgentEvent) {
             },
             "evidence": evidence,
         }),
-        AgentEvent::VerificationFinished { passed } => serde_json::json!({
-            "type": "verification_finished", "passed": passed,
-        }),
+        AgentEvent::VerificationFinished {
+            passed,
+            verification,
+        } => {
+            let mut row = serde_json::json!({
+                "type": "verification_finished",
+                // The completion gate. Kept under this name for readers
+                // written before the split, and it is `true` for a run that
+                // was not verified — so it is not the field to count a pass
+                // from.
+                "passed": passed,
+            });
+            // The fact, when the row carries it. Absent means "not recorded",
+            // and a reader must not turn an absence into a verdict.
+            if let Some(verification) = verification {
+                row["verification"] = serde_json::json!(verification.as_str());
+            }
+            row
+        }
         AgentEvent::SubAgentStarted {
             id,
             nickname,

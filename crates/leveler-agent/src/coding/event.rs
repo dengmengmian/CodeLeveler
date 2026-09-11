@@ -96,7 +96,13 @@ impl From<AgentEvent> for EngineEvent {
                 },
                 evidence,
             },
-            A::VerificationFinished { passed } => EngineEvent::VerificationFinished { passed },
+            A::VerificationFinished {
+                passed,
+                verification,
+            } => EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            },
             A::SubAgentStarted {
                 id,
                 nickname,
