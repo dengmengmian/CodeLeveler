@@ -39,14 +39,14 @@ build — until those three are diagnosed on a real Windows machine.
 
 ## Three focused tools, one workflow
 
-**CodeLeveler writes the code. ReviewGate reviews it. AgentGate connects both
+**CodeLeveler writes the code. ReviewGate reviews it. MuxLayer connects both
 to your model APIs.** Each tool works independently, or they can be used
 together:
 
 | Tool | Focus |
 | --- | --- |
 | **CodeLeveler** | Inspect, edit, run, and verify code via a persistent local runtime (TUI, Web, CLI) |
-| [AgentGate](https://github.com/dengmengmian/agentgate-ai) | Adapt model APIs behind one local gateway |
+| [MuxLayer](https://github.com/dengmengmian/muxlayer) | Adapt model APIs behind one local gateway |
 | [ReviewGate](https://github.com/dengmengmian/ReviewGate) | Review code changes and surface high-confidence issues |
 
 ## Why CodeLeveler

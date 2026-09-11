@@ -34,13 +34,13 @@ Windows 留在 stable `0.1.4`（它有 Windows 构建），等这三个失败在
 
 ## 三个专注的工具，一套工作流
 
-**CodeLeveler 负责写代码，ReviewGate 负责代码 Review，AgentGate 负责连接和
+**CodeLeveler 负责写代码，ReviewGate 负责代码 Review，MuxLayer 负责连接和
 适配模型 API。** 三个工具都可以独立使用，也可以配合工作：
 
 | 工具 | 专注于 |
 | --- | --- |
 | **CodeLeveler** | 通过可持久化的本地 runtime 理解、修改、运行并验证代码（TUI / Web / CLI） |
-| [AgentGate](https://github.com/dengmengmian/agentgate-ai) | 通过一个本地网关适配不同模型 API |
+| [MuxLayer](https://github.com/dengmengmian/muxlayer) | 通过一个本地网关适配不同模型 API |
 | [ReviewGate](https://github.com/dengmengmian/ReviewGate) | 审查代码改动并筛出高置信问题 |
 
 ## 为什么选择 CodeLeveler
