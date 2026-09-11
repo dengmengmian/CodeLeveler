@@ -236,9 +236,10 @@ def make_run(
         quality = timeline.get("quality")
         if not isinstance(quality, dict):
             quality = {
-                "tests_passed": timeline.get("tests_passed"),
+                "checks_passed": timeline.get("checks_passed"),
+                "checks_total": timeline.get("checks_total"),
                 "regressions": timeline.get("regressions"),
-                "review_findings": timeline.get("review_findings"),
+                "review_stages_ok": timeline.get("review_stages_ok"),
                 "missed_issues": timeline.get("missed_issues"),
             }
         doc["quality"] = quality

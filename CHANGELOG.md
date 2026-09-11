@@ -197,6 +197,17 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **Two eval counters were named for facts the log does not hold.** The
+  timeline published `tests_passed` from the number of verification *check*
+  rows that passed — a check is not a test, and the durable log carries no
+  per-test result — and `review_findings` from the number of closure review
+  *stages* that finished, which says nothing about what a review found.
+  Findings already have an owner, in the sub-agent contribution projection and
+  in `reviewer.py`. The counters now read `checks_passed` with `checks_total`
+  beside it, so three-of-three is distinguishable from three-of-forty, and
+  `review_stages_ok`. The old keys are gone from the record, the result schema
+  and the experiment metric lists, and the tests pin them as absent rather
+  than reinterpreted.
 - **The eval profile table no longer reports a verification result nobody
   measured.** `verification_passed` was derived from a child's terminal `ok`,
   which the runtime sets from `ChildStatus::completed()` — "the child reached

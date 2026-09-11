@@ -209,8 +209,18 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
     first_spawn_round = round_at.get(first_spawn_seq) if isinstance(first_spawn_seq, int) else None
 
     task_outcome = None
-    tests_passed: int | None = None
-    review_findings = 0
+    # What the product's own checks did, counted as the log actually records
+    # it: one row per CHECK (`passed | failed | skipped | …`), never a
+    # per-test result. A field named `tests_passed` claimed a granularity the
+    # record does not have, and left a reader unable to tell three-of-three
+    # from three-of-forty.
+    checks_passed: int | None = None
+    checks_total = 0
+    # The closure review's lifecycle, not its findings. A `review_stage` row
+    # says the review launched and how it ended; the findings themselves are
+    # owned by the sub-agent contribution projection and by `reviewer.py`,
+    # which is the only thing that measures them.
+    review_stages_ok = 0
     # Read the fact a row records, never the completion gate. The gate is open
     # for a run that proved nothing, and reading it is how an unverified run
     # came to be counted as a passing one.
@@ -230,11 +240,11 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
             else:
                 legacy_gate = body.get("passed")
         elif etype == "verification_check":
-            status = body.get("status")
-            if status in ("passed", "pass", True):
-                tests_passed = (tests_passed or 0) + 1
+            checks_total += 1
+            if body.get("status") in ("passed", "pass", True):
+                checks_passed = (checks_passed or 0) + 1
         elif etype == "review_stage" and body.get("action") == "finished_ok":
-            review_findings += 1
+            review_stages_ok += 1
 
     verification_status, verification_truth_source = verification_truth(
         event_verification, terminal_verification, legacy_gate
@@ -291,8 +301,9 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
         "verification_passed": verification_passed,
         "verification_status": verification_status,
         "verification_truth_source": verification_truth_source,
-        "tests_passed": tests_passed,
-        "review_findings": review_findings if review_findings else None,
+        "checks_passed": checks_passed,
+        "checks_total": checks_total or None,
+        "review_stages_ok": review_stages_ok or None,
         "regressions": None,
         "missed_issues": None,
         "child_result_used": child_result_used(spawn),

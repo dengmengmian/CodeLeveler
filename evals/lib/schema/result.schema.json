@@ -167,9 +167,10 @@
     "quality": {
       "type": "object",
       "properties": {
-        "tests_passed": { "type": ["integer", "null"] },
+        "checks_passed": { "type": ["integer", "null"] },
+        "checks_total": { "type": ["integer", "null"] },
         "regressions": { "type": ["integer", "null"] },
-        "review_findings": { "type": ["integer", "null"] },
+        "review_stages_ok": { "type": ["integer", "null"] },
         "missed_issues": { "type": ["integer", "null"] }
       }
     }

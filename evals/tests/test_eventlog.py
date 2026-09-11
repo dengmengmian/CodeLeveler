@@ -206,5 +206,60 @@ class VerificationTruthTests(unittest.TestCase):
         self.assertIsNone(t["verification_truth_source"])
 
 
+class CheckAndReviewCountsTests(unittest.TestCase):
+    """The ruler names what it counted.
+
+    The durable log holds one row per verification CHECK and one per closure
+    review STAGE. A check is not a test, and a finished stage says nothing
+    about what a review found, so the record carries the counts it can
+    support and no others.
+    """
+
+    def _timeline(self, events):
+        return extract_timeline(_seq(events))
+
+    def test_checks_are_counted_as_checks_with_their_total(self):
+        t = self._timeline(
+            [
+                ("verification_check", {"name": "cargo fmt", "status": "passed"}),
+                ("verification_check", {"name": "cargo test", "status": "passed"}),
+                ("verification_check", {"name": "cargo clippy", "status": "failed"}),
+            ]
+        )
+        self.assertEqual(t["checks_passed"], 2)
+        self.assertEqual(t["checks_total"], 3)
+        self.assertNotIn("tests_passed", t)
+
+    def test_a_check_that_did_not_run_is_not_counted_as_passed(self):
+        t = self._timeline(
+            [
+                ("verification_check", {"name": "cargo test", "status": "skipped"}),
+                ("verification_check", {"name": "cargo build", "status": "toolmissing"}),
+            ]
+        )
+        self.assertIsNone(t["checks_passed"])
+        self.assertEqual(t["checks_total"], 2)
+
+    def test_no_checks_means_not_measured(self):
+        t = self._timeline([("task_started", {"goal": "g", "model": "m"})])
+        self.assertIsNone(t["checks_passed"])
+        self.assertIsNone(t["checks_total"])
+
+    def test_a_finished_review_is_counted_as_a_stage_not_as_findings(self):
+        t = self._timeline(
+            [
+                ("review_stage", {"action": "launching", "detail": "required"}),
+                ("review_stage", {"action": "finished_ok", "detail": "required"}),
+                ("review_stage", {"action": "finished_incomplete", "detail": "required"}),
+            ]
+        )
+        self.assertEqual(t["review_stages_ok"], 1)
+        self.assertNotIn("review_findings", t)
+
+    def test_no_review_means_not_measured(self):
+        t = self._timeline([("task_started", {"goal": "g", "model": "m"})])
+        self.assertIsNone(t["review_stages_ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

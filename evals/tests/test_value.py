@@ -41,7 +41,8 @@ def _run(
     spawn: bool,
     child_used: bool,
     tool_calls: int = 10,
-    tests_passed: int | None = None,
+    checks_passed: int | None = None,
+    checks_total: int | None = None,
     regressions: int | None = None,
 ) -> dict:
     timeline = {
@@ -86,9 +87,10 @@ def _run(
     )
     run["task_success"] = success
     run["quality"] = {
-        "tests_passed": tests_passed,
+        "checks_passed": checks_passed,
+        "checks_total": checks_total,
         "regressions": regressions,
-        "review_findings": None,
+        "review_stages_ok": None,
         "missed_issues": None,
     }
     return run

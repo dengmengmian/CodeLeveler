@@ -32,7 +32,8 @@ metrics:
   - task_success
   - useful_findings
   - findings_verified
-  - tests_passed
+  - checks_passed
+  - checks_total
   - turns
   - tokens
   - wall_time

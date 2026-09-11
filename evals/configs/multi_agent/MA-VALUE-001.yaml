@@ -38,8 +38,9 @@ metrics:
   - child_completed
   - child_result_consumed
   - child_contribution
-  - tests_passed
+  - checks_passed
+  - checks_total
   - regressions
-  - review_findings
+  - review_stages_ok
   - missed_issues
 output: evals/reports/multi_agent/MA-VALUE-001
