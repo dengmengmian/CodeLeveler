@@ -30,9 +30,9 @@ CodeLeveler 目前处于 public beta：**`0.2.0-beta.1`**，以 pre-release 形�
 **已发布的 beta 只带 macOS 与 Linux 二进制。** 三个平台都在 CI 里跑完整测试，而且
 三个都是绿的：Windows 的编译、lint、安全 canary、Edge 浏览器验收与 workspace 测试
 全部通过。`0.2.0-beta.1` 的 tag 打在这部分工作落地之前，所以挂在它下面的二进制早于
-这些改动；需要 Windows 构建目前仍看 `0.1.4`。Windows 无法按进程断网——AppContainer
-之外没有这个机制，而 AppContainer 会让工具链读不到——所以要求断网的命令会被拒绝，
-不会放开网络偷跑（见 [`CHANGELOG.md`](CHANGELOG.md)）。
+这些改动；需要 Windows 构建目前仍看 `0.1.4`。CodeLeveler 当前尚未实现 Windows 下按
+单次命令生效的网络隔离后端，因此 `network_deny` 能力如实报告为 false；要求断网的
+命令会被拒绝，而不会在网络仍开放的情况下继续执行（见 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ## 三个专注的工具，一套工作流
 

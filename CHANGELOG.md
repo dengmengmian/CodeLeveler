@@ -212,9 +212,12 @@ All notable changes to CodeLeveler are documented here. The format follows
   pipes and `NUL` work, `cargo build` drives rustc as a child, and writes to
   the user profile, `TEMP` and `C:\` are denied while the workspace succeeds.
   The Windows suite went from fourteen failures to none.
-  **Windows can no longer deny a process the network** — nothing outside
-  AppContainer can — so the capability probe reports `network_deny=false` and a
-  request for one is refused rather than run with the network open.
+  **Windows has no CodeLeveler backend for per-command network denial.** The
+  platform has the machinery — the Windows Filtering Platform filters at the
+  ALE layer by application identity, and firewall rules can block outbound
+  traffic per program path — but this execution backend implements no
+  per-command denial on it. The capability probe reports `network_deny=false`
+  and a request for one is refused rather than run with the network open.
 - **A write root left at Low integrity by a killed run is put back.** The
   destructor that restores a lowered label does not run when the process is
   killed, and the record describing the previous label held no root path, so

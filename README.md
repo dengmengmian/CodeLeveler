@@ -35,10 +35,10 @@ platforms run the suite in CI and all three are green: the Windows job
 compiles, lints, passes its security canaries and its Edge browser acceptance,
 and runs the workspace tests. `0.2.0-beta.1` was tagged before that work
 landed, so the binaries attached to it predate it; `0.1.4` remains the release
-that ships a Windows build. Windows cannot deny a command the network — no
-Windows mechanism outside AppContainer can, and AppContainer cannot leave a
-toolchain readable — so a command that asks for that is refused rather than run
-with the network open ([`CHANGELOG.md`](CHANGELOG.md)).
+that ships a Windows build. Windows currently has no CodeLeveler backend for
+per-command network denial: the capability reports `network_deny=false`, and a
+command that requires network isolation is refused rather than run with the
+network open ([`CHANGELOG.md`](CHANGELOG.md)).
 
 ## Three focused tools, one workflow
 
