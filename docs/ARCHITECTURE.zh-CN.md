@@ -1,129 +1,150 @@
 # CodeLeveler 架构
 
-本文描述 CodeLeveler 的长期架构模型、核心设计思想、职责边界、架构不变量、允许与禁止的架构变化，以及未来演进方向。
+英文版：[`ARCHITECTURE.md`](ARCHITECTURE.md)
 
-英文版：[`ARCHITECTURE.md`](ARCHITECTURE.md)。中英文版本应保持语义一致。
+CodeLeveler 的长期定位不是“一个功能越来越多的编程智能体”，而是：
 
-本文只回答四个问题：
+> **一套可复用的智能体运行基础。编程智能体是建立在它之上的第一个产品，而不是系统的最高抽象。**
 
-1. CodeLeveler 是什么样的系统？
-2. 为什么要这样划分职责与边界？
-3. 在这套架构下，什么可以做，什么不可以做？
-4. 未来应该沿什么架构方向演进？
-
-本文不记录阶段性实现状态、迁移历史、已知缺陷、验证结果、具体源码位置或某一版本的实现细节。
+它要解决的核心问题是：模型负责思考，领域层负责定义规则，运行时负责可靠地运行，能力层负责真正做事，宿主负责控制真实副作用，产品负责把这一切变成用户体验。
 
 ---
 
-## 1. 架构愿景
+## 1. 先看全图
 
-CodeLeveler 不应被理解成一个不断堆叠能力的 Coding Agent。
-
-它的长期定位是：
-
-> **一个可复用的 Agent Runtime / Harness Foundation。Coding Agent 是建立在它之上的第一个产品，而不是系统的最高抽象。**
-
-系统应该允许不同领域的 Agent 产品建立在同一套 Runtime、Capability、Authority 与 Persistence 基础之上，而不要求这些产品继承 Coding 语义。
-
-最简模型如下：
+先不用关心任何代码。CodeLeveler 最核心的结构只有这一张图：
 
 ```text
-Model
-  ↓
-Harness
-  ↓
-Agent Runtime
-  ↓
-Capabilities
-  ↓
-Host Authority
-  ↓
-Operating System
+                            模型
+                     （理解、推理、决策）
+                              ↕
+用户 → 产品 → 领域适配层 → 智能体运行时
+                              │
+                   ┌──────────┴──────────┐
+                   ▼                     ▼
+                 能力层                 持久化
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                         宿主执行权威
+                              │
+                              ▼
+                            操作系统
 ```
 
-加入产品层后：
+如果只记住一句话：
+
+> **模型负责想，领域适配层负责“这类智能体应该怎么工作”，运行时负责“让它可靠地活着”，能力层负责“它能做什么”，宿主执行权威负责“哪些真实动作允许发生”。**
+
+CodeLeveler 可以在这套基础上构建不同产品：
 
 ```text
-                         Products
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-            Coding        Review        Future
-              │             │             │
-              └─────────────┼─────────────┘
-                            ▼
-                         Harnesses
-                            │
-                            ▼
-                     Agent Runtime
-                            │
-                  ┌─────────┴─────────┐
-                  ▼                   ▼
-             Capabilities        Persistence
-                  │                   │
-                  └─────────┬─────────┘
-                            ▼
-                     Host Authority
-                            │
-                            ▼
-                     Operating System
+                         智能体运行基础
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+          编程领域层       代码评审领域层       其他领域层
+              │               │               │
+              ▼               ▼               ▼
+          编程产品          评审产品          未来产品
 ```
 
-这套结构的目标不是追求抽象数量，而是让每一类复杂度拥有正确的 Owner。
+不同产品共享运行基础，但不互相继承领域语义。
 
 ---
 
-## 2. 核心设计思想
+## 2. 术语与命名
 
-CodeLeveler 的架构可以压缩为七条原则。
+这套架构里有几个名字非常重要。名字不是为了显得抽象，而是为了明确“谁负责什么”。
+
+| 名称 | 英文 | 它是什么 | 最容易混淆的地方 |
+| --- | --- | --- | --- |
+| **智能体** | Agent | 以目标为中心，持续调用模型和能力完成工作的运行实体 | 智能体不等于模型；模型只是它的智能来源 |
+| **模型** | Model | 负责理解、推理、规划、判断和生成 | 模型不直接拥有文件系统、进程或任务生命周期 |
+| **领域适配层** | Harness | 把通用运行时和模型适配到某个具体领域，例如编程、评审 | 它不是运行时，也不是模型“大脑” |
+| **智能体运行时** | Agent Runtime | 让智能体能够循环执行、暂停、恢复、取消、持久化和恢复故障的通用运行基础 | 它负责运行，不负责领域思考 |
+| **智能体内核** | Agent Kernel | 运行时中负责“模型 ↔ 工具”循环的最小通用内核 | 不知道编程、评审等领域概念 |
+| **引擎** | Engine | 运行时中负责会话、任务、回合、事件、恢复等长期生命周期的部分 | **引擎管理生命周期，不管理智能** |
+| **能力** | Capability | 系统真正拥有的可复用能力，例如工作区、命令执行、浏览器、版本控制 | 能力不等于模型看到的工具 |
+| **工具** | Tool | 能力面向模型的调用接口 | 工具是适配器，不应成为能力本身 |
+| **工具面** | Tool Surface | 某个领域适配层选择后，当前模型实际能看到的一组工具 | 系统拥有很多能力，不代表模型每轮都要看到全部能力 |
+| **宿主执行权威** | Host Authority | 对文件、进程、网络、沙箱等真实副作用拥有最终执行权的唯一边界 | “权威”不是普通权限配置，而是谁最终有资格让动作真实发生 |
+| **持久化** | Persistence | 保存任务、回合、事件、所有权等长期事实，使智能体可以恢复和继续 | 不只是保存聊天记录 |
+| **权威源** | Authority | 某类事实唯一可信的最终来源 | 同一个事实不能有两个互相竞争的权威源 |
+| **产品** | Product | TUI、Web、桌面端、移动端以及具体智能体产品的体验与组合 | 产品展示运行时事实，但不能自己创造运行时事实 |
+| **模型接入层** | Provider / Protocol | 把不同模型服务和协议转换成统一模型能力 | 协议适配不能偷偷改变智能体的领域语义 |
+
+### 2.1 为什么叫“领域适配层”
+
+`Harness` 直译并不自然。这里称为“领域适配层”，是因为它做的是：
 
 ```text
-Model owns intelligence.
-Harness owns domain semantics.
-Runtime owns lifecycle and mechanical correctness.
-Capability owns reusable domain capability.
-Host Authority owns controlled real side effects.
-Every persistent fact has one authoritative owner.
-Product projects runtime truth; it does not create it.
+通用模型 + 通用运行时
+          ↓
+      加入领域语义
+          ↓
+编程智能体 / 评审智能体 / 其他智能体
 ```
 
-中文表达：
+例如“什么是一个代码任务”“模型应该看到哪些编程工具”“什么叫编程任务在语义上完成”，都属于编程领域，而不属于通用运行时。
+
+所以：
+
+> **领域适配层定义“这是什么智能体”，运行时定义“这个智能体怎么可靠地运行”。**
+
+### 2.2 为什么强调“权威”
+
+架构里的“权威”表示：**最终谁说了算**。
+
+例如模型可以说“我要修改这个文件”，但真正让磁盘发生变化的只能是宿主执行权威。
+
+同样，界面可以显示“任务完成”，但任务真实状态必须来自运行时的权威事实，而不能由界面自己猜。
+
+---
+
+## 3. 七条核心原则
+
+整套架构可以压缩成七句话：
 
 ```text
 模型拥有智能。
-Harness 拥有领域语义。
-Runtime 拥有生命周期与机械正确性。
-Capability 拥有可复用的领域能力。
-Host Authority 拥有受控真实副作用。
-每一个持久事实只有一个权威 Owner。
-Product 只投影视图，不创造 Runtime 真相。
+领域适配层拥有领域语义。
+运行时拥有生命周期与机械正确性。
+能力层拥有可复用能力。
+宿主执行权威拥有受控的真实副作用。
+每一个持久事实只有一个权威源。
+产品展示运行时事实，不创造运行时事实。
 ```
 
-其中最重要的边界之一是：
+其中最重要的生命周期边界是：
 
-> **Engine owns lifecycle, not agent intelligence.**
+> **引擎管理生命周期，不管理智能。**
+>
+> Engine owns lifecycle, not agent intelligence.
 
-也就是：Engine 管运行，不替 Agent 思考。
+这句话决定了 CodeLeveler 不会逐渐变成一个把规划、判断、工具选择、领域语义都塞进引擎的大型状态机。
 
 ---
 
-## 3. Model：智能属于模型
+## 4. 模型：智能从哪里来
 
-模型负责需要推理的部分：
+模型是系统的智能来源。
+
+它负责：
 
 ```text
-理解目标
-规划
-调查
-工具选择
-代码与内容生成
+理解用户目标
+规划下一步
+调查与搜索
+选择工具
+生成代码或内容
 调试
-权衡
-语义判断
-从失败中恢复
+权衡方案
+判断已有证据是否足够
+从失败中调整策略
 ```
 
-Runtime 和 Harness 应该给模型提供：
+系统应该给模型提供：
 
 ```text
 清晰的能力
@@ -131,217 +152,255 @@ Runtime 和 Harness 应该给模型提供：
 精确的错误
 真实的环境状态
 确定性的机械约束
-可靠的执行
+可靠的执行结果
 ```
 
-但不应该因为模型能力不足而额外模拟一套“替模型思考”的系统。
+系统不应该再造一套隐藏逻辑去替模型完成这些推理工作。
 
-因此：
+因此必须区分：
 
 ```text
 模型能力上限
     ≠
-Runtime 缺陷
+运行时缺陷
 ```
 
-模型智能是系统输入，不是 Runtime 必须拉平的变量。
+运行时应该修复工程问题，例如故障、并发、取消、恢复、权限和一致性；它不负责“把较弱模型变聪明”。
 
 ---
 
-## 4. Harness：领域属于 Harness
+## 5. 领域适配层：定义“这是什么智能体”
 
-Harness 是 Model 与通用 Runtime 之间的领域层。
+领域适配层位于模型、运行时和产品之间。
 
-它负责解释：
+它负责回答：
 
-> 在这个产品领域里，Agent 可以做什么、看到什么、如何与 Runtime 交互，以及什么叫领域上的完成。
+> **在这个领域里，智能体看到什么、能做什么、遵守什么规则，以及什么叫领域上的完成。**
 
-例如 Coding Harness 可以拥有：
+### 5.1 编程领域适配层
+
+编程智能体可以拥有：
 
 ```text
-Coding 领域契约
+编程领域契约
 仓库语义
-Coding Tool Surface
+编程工具面
 验证语义
 委派语义
-写入协作语义
-Coding Completion Semantics
+多智能体写入协作语义
+编程任务的完成语义
 ```
 
-未来 Review Harness 可以拥有：
+### 5.2 评审领域适配层
+
+代码评审智能体可以拥有：
 
 ```text
-Review Target
-Review Scope
-Finding
-Severity
-Evidence
-Review Verdict
-Review Completion Semantics
+评审目标
+评审范围
+问题发现
+严重等级
+证据
+评审结论
+评审任务的完成语义
 ```
 
-这些 Harness 是兄弟关系：
+### 5.3 领域之间是兄弟关系
 
 ```text
-                 Agent Runtime
-               /       |        \
-              ▼        ▼         ▼
-           Coding    Review    Research
-           Harness   Harness   Harness
+                    智能体运行时
+                 /       |        \
+                ▼        ▼         ▼
+             编程领域   评审领域    研究领域
 ```
 
-一个 Harness 不应继承另一个 Harness 的领域语义。
+评审不是编程智能体的“子模式”，研究也不是编程领域的扩展包。
+
+一个新领域应该复用通用运行时和通用能力，而不是继承另一个领域的语义包袱。
+
+### 5.4 领域适配层负责什么、不负责什么
+
+**负责：**
+
+```text
+领域词汇
+领域约束
+领域工具选择
+领域完成语义
+领域协作规则
+领域上下文组织
+```
+
+**不负责：**
+
+```text
+重新实现任务生命周期
+重新实现持久化
+绕过宿主执行权威
+替模型隐藏推理
+创建第二套权限或所有权系统
+```
 
 ---
 
-## 5. Agent Runtime
+## 6. 智能体运行时：让智能体可靠地活着
 
-Agent Runtime 是 CodeLeveler 的通用运行基础。
+智能体运行时是 CodeLeveler 最核心的通用基础。
 
-它由两个逻辑部分组成：
+逻辑上可以理解为两部分：
 
 ```text
-Agent Kernel
+智能体内核
     +
-Persistent Runtime
+持久化引擎
     =
-Reusable Agent Runtime
+智能体运行时
 ```
 
-### 5.1 Agent Kernel
+### 6.1 智能体内核
 
-Agent Kernel 负责 Agent 与模型交互的通用循环：
+智能体内核负责通用的模型执行循环：
 
 ```text
-model interaction
-tool loop
-streaming
-round lifecycle
-budget
-usage
-retry
-backoff
-deadline
-cancel
-stop
+与模型交互
+工具调用循环
+流式输出
+回合推进
+资源预算
+使用量统计
+重试与退避
+超时
+取消
+停止
 ```
 
-它不应该知道：
+它不理解：
 
 ```text
-Coding
-Review
-Repository Workflow
-某种产品 Prompt
-某种领域的完成定义
-UI
+编程
+评审
+仓库工作流
+某一种产品提示词
+某个领域什么叫“完成”
+界面体验
 用户验收
 ```
 
-Kernel 的价值在于：任何 Harness 都可以在同一 Agent Loop 上工作。
+它的价值是：**无论上面接的是编程、评审还是未来其他领域，都可以使用同一套智能体循环。**
 
-### 5.2 Persistent Runtime / Engine
+### 6.2 引擎
 
-Engine 负责长期运行需要的机械生命周期：
-
-```text
-Session
-Task
-Turn
-Event
-Persistence
-Resume
-Recovery
-Cancellation
-Background Lifecycle
-Ownership
-Runtime Outcome
-```
-
-核心边界：
+引擎负责长期生命周期：
 
 ```text
-Engine owns lifecycle.
-Harness owns domain semantics.
-Model owns reasoning.
+会话
+任务
+回合
+事件
+持久化
+暂停与继续
+故障恢复
+取消
+后台工作
+父子任务关系
+所有权
+运行结果
 ```
 
-Engine 可以知道一个 Task 是否运行、暂停、取消、恢复或结束，但不应该自己定义 Coding 任务“是否真正完成”。
+引擎可以知道：
+
+```text
+任务正在运行
+任务已取消
+某个回合结束
+某个子任务已退出
+某个事件已经持久化
+```
+
+但它不能因为“测试通过了”或者“文件改了”就自行判断：
+
+```text
+这个编程需求在语义上已经完成
+```
+
+这就是：
+
+```text
+引擎负责生命周期。
+领域适配层负责领域语义。
+模型负责推理与判断。
+```
 
 ---
 
-## 6. Capability Architecture
+## 7. 能力与工具：真正会做什么，与模型怎么调用
 
-Capability 表达系统真正拥有的可复用能力。
+这是最容易被混淆的一层。
 
-典型能力包括：
+### 7.1 能力是什么
+
+能力表示系统真正拥有的可复用本领，例如：
 
 ```text
-Workspace
-Command Execution
-Browser
-Search
-Code Intelligence
-Version Control
-Memory
-Media
-Skills
-Remote Execution
-External Services
+工作区读写
+命令执行
+浏览器
+搜索
+代码理解
+版本控制
+记忆
+媒体处理
+技能加载
+远程执行
+外部服务
 ```
 
-Capability 的核心原则是：
+能力回答：
 
-> **Capability 表达系统会做什么，Tool 表达模型如何调用它。**
+> **系统会做什么？**
 
-### 6.1 Capability 不等于 Tool
+### 7.2 工具是什么
+
+工具是能力面向模型的调用接口。
 
 例如：
 
 ```text
-Model
+模型
   ↓
-read_file
+“读取文件”工具
   ↓
-Workspace Capability
+工作区能力
   ↓
-Host filesystem authority
+宿主文件系统
 ```
 
-`read_file` 是模型接口。
+工具回答：
 
-Workspace 才是真正的可复用能力。
+> **模型怎样请求这个能力？**
 
 因此：
 
 ```text
-Tool ≠ Capability
+工具 ≠ 能力
 ```
 
-也不要求：
+一个能力可以有多个工具入口；一个能力也可以被领域适配层或运行时在自己的职责范围内直接使用。
+
+### 7.3 工具应该薄，能力应该有明确归属
+
+工具主要负责：
 
 ```text
-One Capability = One Tool
-```
-
-一个 Capability 可以被多个 Tool 暴露，也可以被 Harness、Runtime 或 Product 在适当边界直接使用。
-
-### 6.2 Tool thin, Capability thick
-
-Tool 应尽量薄。
-
-Tool 负责：
-
-```text
-模型可见的名称与描述
-schema
+模型可理解的名称和说明
+参数定义
 输入解码
-能力调用
-结果渲染
+调用能力
+结果表达
 精确错误
 ```
 
-Capability 负责：
+能力负责：
 
 ```text
 真实领域行为
@@ -351,13 +410,13 @@ Capability 负责：
 一致性
 ```
 
-长期状态、服务发现、共享 Runtime、权限裁决不应该因为“工具需要”而被塞进 Tool。
+长期状态、全局策略、服务发现、权限裁决、进程生命周期，不应该因为“某个工具要用”就塞进工具本身。
 
-### 6.3 Capability 是职责，不是强制物理模块
+### 7.4 能力是职责，不等于物理模块
 
-Capability 首先是职责边界，不代表必须拥有一个独立 crate、服务、进程或 trait。
+“能力”首先是架构职责，不要求每个能力都拆成一个独立包、服务、进程或接口。
 
-物理拆分应该由真实边界驱动，例如：
+只有出现真实边界时才值得进一步拆分，例如：
 
 ```text
 多个真实消费者
@@ -365,121 +424,135 @@ Capability 首先是职责边界，不代表必须拥有一个独立 crate、服
 独立安全边界
 独立协议边界
 独立持久化边界
-远程部署需求
+需要远程部署
 ```
 
-而不是为了让架构图对称。
+不要为了架构图看起来整齐而制造抽象。
 
 ---
 
-## 7. Tool Surface
+## 8. 工具面：模型应该看到多少能力
 
-模型不应该看到系统中所有内部能力。
+系统拥有很多能力，不意味着模型每一轮都应该看到所有工具。
 
-模型只应该看到当前 Harness 为当前产品选择并暴露的 Tool Surface。
+领域适配层负责选择当前产品真正需要暴露的工具面：
 
 ```text
-Capabilities
-     │
-     ▼
-Harness Selection
-     │
-     ▼
-Tool Surface
-     │
-     ▼
-Model
+系统能力
+   │
+   ▼
+领域选择
+   │
+   ▼
+工具面
+   │
+   ▼
+模型
 ```
 
-Tool Surface 的目标是：
+工具面的目标是：
 
-> 在不损失必要能力的前提下，提供尽可能清晰、稳定、低歧义的模型操作面。
+> **在不损失必要能力的前提下，让模型看到尽可能清晰、稳定、低歧义的操作面。**
 
-好的模型工具应该：
+好的工具应该：
 
 ```text
-表达清晰意图
-具有稳定语义
+表达一个清楚的意图
+语义稳定
 输入输出可预测
-错误精确
+失败原因明确
 与其他工具边界清楚
 ```
 
-系统可以根据真实机械能力决定某个 Tool 是否可用，但不能根据“这个模型比较弱”或“这个任务看起来比较难”偷偷切换工具语义。
+系统可以根据真实机械能力决定一个工具是否可用，例如宿主是否具备浏览器或某种模型能力。
+
+系统不能因为：
+
+```text
+“这个模型比较弱”
+“这个任务看起来很难”
+```
+
+就偷偷改变同一个工具的含义。
 
 ---
 
-## 8. Host Authority
+## 9. 宿主执行权威：谁真正有资格改变世界
 
-Agent 可以提出副作用请求，但不拥有真实宿主权力。
+模型可以提出请求，但不能直接拥有宿主机器的真实权力。
 
-核心原则：
-
-```text
-Agent proposes.
-Host Authority decides and performs.
-```
-
-逻辑关系：
+核心关系是：
 
 ```text
-Model / Harness
+智能体提出请求
       ↓
-Side-effect request
+宿主执行权威判断并执行
       ↓
-Host Authority
-      ↓
-Operating System
+操作系统发生真实变化
 ```
 
-Host Authority 统一拥有受控真实副作用，例如：
+宿主执行权威统一控制：
 
 ```text
-filesystem mutation
-process execution
-network authority
-sandbox
-permission
-approval
-workspace boundary
-process lifecycle
+文件系统修改
+进程执行
+网络访问
+沙箱
+权限
+审批
+工作区边界
+进程生命周期
 ```
 
-这使“Agent 想做什么”和“宿主允许发生什么”保持分离。
+这层边界把两件事彻底分开：
 
-任何模型可见接口都不能成为绕开 Authority 的第二条执行路径。
+```text
+智能体想做什么
+        ≠
+宿主允许发生什么
+```
+
+任何工具、插件、子智能体或产品，都不能建立第二条路径绕开宿主执行权威。
+
+### 9.1 为什么只有一个执行权威
+
+如果文件修改由一套规则控制、命令执行由另一套规则控制、子智能体又有第三套规则，那么系统实际上没有统一安全边界。
+
+因此对受控真实副作用：
+
+> **请求可以来自很多地方，最终执行权只能有一个。**
 
 ---
 
-## 9. Authority Model
+## 10. 事实、语义完成与用户验收
 
-CodeLeveler 区分三种不同层级的真相：
-
-```text
-Mechanical Truth
-      ≠
-Semantic Satisfaction
-      ≠
-User Acceptance
-```
-
-### 9.1 Runtime Authority
-
-Runtime 可以权威记录机械事实，例如：
+CodeLeveler 把“发生了什么”和“事情是否做对了”明确分开。
 
 ```text
-某个命令是否执行
-退出状态
-某个文件是否变化
-某个事件是否发生
-某项验证是否运行
-某个 artifact 是否存在
-某个进程是否结束
+机械事实
+   ≠
+语义完成
+   ≠
+用户验收
 ```
 
-### 9.2 Model Semantic Authority
+### 10.1 机械事实属于运行时
 
-模型负责解释这些事实是否足以满足当前领域目标。
+运行时可以权威记录：
+
+```text
+命令是否执行
+退出状态是什么
+文件是否发生变化
+事件是否发生
+验证是否运行
+产物是否存在
+进程是否结束
+```
+
+这些都是可以被机器确定的事实。
+
+### 10.2 语义完成属于模型与领域
 
 例如：
 
@@ -490,876 +563,747 @@ Runtime 可以权威记录机械事实，例如：
 不能自动推出：
 
 ```text
-用户要的功能已经语义完整
+用户需要的功能已经完整实现
 ```
 
-### 9.3 User Acceptance
+“这些机械证据是否足够说明领域目标已经满足”，需要模型结合领域语义判断。
 
-用户拥有最终验收权。
+### 10.3 用户拥有最终验收权
 
-因此：
+最终关系是：
 
 ```text
-Runtime owns facts.
-Model owns semantic interpretation.
-User owns acceptance.
+运行时拥有事实。
+模型负责语义解释。
+用户拥有最终验收权。
 ```
+
+这条边界可以避免系统因为某个绿色状态、某次工具成功或某个文件变化，就过早宣布任务完成。
 
 ---
 
-## 10. Persistence Architecture
+## 11. 持久化：让任务可以持续，而不是只活在一次对话里
 
-长生命周期 Agent 必须建立在可靠持久化之上。
+长生命周期智能体必须建立在可靠持久化之上。
 
 核心原则：
 
 ```text
-One persistent fact
+一个持久事实
       ↓
-One authoritative owner
+一个权威源
       ↓
-One canonical representation
+一种规范表示
 ```
 
-Task 状态、Turn 状态、Ownership、Evidence、Usage、Artifact、Background Work 等持久事实都遵守这一原则。
+例如任务状态、回合状态、所有权、证据、使用量、产物和后台工作，都应该有明确且唯一的事实来源。
 
-### 10.1 Persist Before Forward
+### 11.1 先持久化，再对外传播
 
-Runtime 产生的权威事件应遵循：
+权威事件应该遵循：
 
 ```text
-Runtime Fact
-    ↓
-Persist
-    ↓
-Forward / Project
-    ↓
-Client
+运行时产生事实
+      ↓
+先持久化
+      ↓
+再传播给客户端
 ```
 
-客户端不应先看到一个 Runtime 自己还没有可靠记录的权威事实。
+客户端不应该先看到一个运行时自己还没有可靠记录的“事实”。
 
-### 10.2 Persistence 提供连续性
+### 11.2 持久化真正提供的是连续性
 
-Persistence 的长期目的不仅是“保存聊天记录”，而是提供：
+它的目的远不只是保存聊天记录，而是支持：
 
 ```text
-resume
-recovery
-cross-device continuity
-background work
-long-running tasks
-child session durability
-auditability
+暂停后继续
+崩溃恢复
+跨设备继续
+后台工作
+长任务
+子智能体会话持续化
+审计与追踪
 ```
+
+未来一个智能体可能运行数小时、数天，甚至跨设备继续工作；持久化是这种形态的基础。
 
 ---
 
-## 11. Product Architecture
+## 12. 模型接入与能力协商
 
-Product 层负责体验、组合与交付。
+CodeLeveler 可以接入不同模型和模型服务，但协议差异不应该污染领域架构。
 
-例如：
+模型接入层负责统一：
 
 ```text
-CLI
-TUI
-Web
-Desktop
-Mobile
-Remote Client
+请求与响应协议
+流式传输
+工具调用协议
+推理内容传输
+结构化输出
+视觉能力
+上下文与输出限制
+错误映射
 ```
 
-Product 可以决定：
+### 12.1 协议差异可以适配，语义不能伪造
+
+如果两个模型服务只是传输格式不同，可以在接入层统一。
+
+但如果某个模型根本不具备某项机械能力，就应该如实表达能力缺失，而不是通过另一套隐藏行为假装它支持。
+
+### 12.2 可用能力来自多方交集
+
+一个能力真正可用，取决于多个条件：
+
+```text
+模型能力
+   ∩
+宿主能力
+   ∩
+运行时能力
+   ∩
+领域需求
+   =
+当前可用能力
+```
+
+这叫“能力协商”。
+
+它让同一个架构可以自然运行在不同模型、不同机器和不同执行环境上。
+
+---
+
+## 13. 产品与客户端：体验属于产品，事实属于运行时
+
+产品层负责把底层能力组织成用户真正使用的东西，例如：
+
+```text
+命令行客户端
+终端界面
+Web 客户端
+桌面客户端
+移动客户端
+远程控制端
+```
+
+产品可以决定：
 
 ```text
 信息如何展示
 交互如何组织
+导航如何设计
+默认体验是什么
 哪些能力组合成一个产品
-默认体验
-导航
-可视化
 ```
 
-但 Product 不拥有 Runtime Truth。
+但产品不能重新定义运行时事实。
 
 核心原则：
 
-> **UI is a projection of Runtime truth.**
+> **界面是运行时事实的投影，不是新的事实来源。**
 
-Product 可以拥有本地视图状态，但任务、运行、权限、工具执行、持久化事实等权威状态必须来自对应 Owner。
+客户端之间也应该通过稳定协议连接运行时：
+
+```text
+客户端命令
+    ↓
+运行时
+    ↓
+运行时事件
+    ↓
+客户端
+```
+
+因此同一个运行时可以服务多个客户端：
+
+```text
+                    运行时
+                /     |      \
+               ▼      ▼       ▼
+             TUI     Web     移动端
+```
+
+客户端和运行时也不必在同一台机器上。
 
 ---
 
-## 12. Client / Runtime Boundary
+## 14. 一次任务到底怎么跑
 
-客户端与 Runtime 之间应该通过稳定协议连接，而不是共享内部状态。
+以一个编程任务为例：用户要求“修复这个缺陷并验证”。
+
+### 第一步：产品接收用户目标
+
+产品负责交互，把目标交给编程领域适配层。
 
 ```text
-Client Command
-      ↓
-Runtime
-      ↓
-Runtime Event
-      ↓
-Client
+用户
+ ↓
+产品
 ```
 
-同一个 Runtime 可以拥有多个客户端：
+### 第二步：领域适配层建立编程语境
+
+编程领域适配层决定：
 
 ```text
-             Runtime
-          /     |      \
-         ▼      ▼       ▼
-       TUI     Web    Mobile
+这是一个编程任务
+模型应该看到哪些编程能力
+当前仓库和领域规则是什么
+怎样表达领域完成
 ```
 
-客户端也可以和 Runtime 位于不同机器：
+### 第三步：运行时启动任务
+
+运行时负责：
 
 ```text
-Client
+建立任务与回合
+维护生命周期
+记录事件
+管理预算、取消和恢复
+```
+
+### 第四步：模型思考并选择动作
+
+模型理解目标、调查代码、决定下一步，并通过工具请求能力。
+
+### 第五步：能力执行实际工作
+
+读取、搜索、代码理解等能力执行对应行为。
+
+如果动作涉及真实副作用：
+
+```text
+模型请求
   ↓
-Transport
+领域工具
   ↓
-Remote Runtime
+能力
+  ↓
+宿主执行权威
+  ↓
+文件 / 进程 / 网络
 ```
 
-这使本地、远程和云端运行共享同一套产品协议思想。
+### 第六步：运行时记录机械事实
+
+例如命令退出状态、文件变化、验证结果、产物和事件。
+
+### 第七步：模型判断领域目标是否满足
+
+模型结合用户目标、领域规则和机械证据判断是否还需要继续工作。
+
+### 第八步：产品展示结果，用户验收
+
+运行时提供事实，产品负责展示，用户最终决定是否接受结果。
+
+完整链路是：
+
+```text
+用户
+ ↓
+产品
+ ↓
+领域适配层
+ ↓
+智能体运行时 ↔ 模型
+ ↓
+工具面
+ ↓
+能力
+ ↓
+宿主执行权威
+ ↓
+操作系统
+ ↓
+机械事实
+ ↓
+持久化
+ ↓
+产品展示
+ ↓
+用户验收
+```
 
 ---
 
-## 13. Multi-Agent Architecture
+## 15. 多智能体：不是“多调几个模型”
 
-Multi-Agent 不是简单的“一个 Agent 再调用几个模型”。
+多智能体的核心不是模型数量，而是：
 
-它是多个 Agent 生命周期在统一 Runtime Authority 下协作。
+> **多个智能体生命周期在同一个运行时、所有权和执行权威下协作。**
 
 ```text
-                 Parent Agent
-                /      |      \
-               ▼       ▼       ▼
-          Explorer   Worker   Reviewer
-               │       │       │
-               └───────┼───────┘
+                    主智能体
+                /      |       \
+               ▼       ▼        ▼
+            探索者    执行者    评审者
+               │       │        │
+               └───────┼────────┘
                        ▼
-                 Shared Runtime
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-      Persistence   Ownership   Capabilities
+                   共享运行时
+              ┌────────┼────────┐
+              ▼        ▼        ▼
+            持久化    所有权     能力
 ```
 
-Multi-Agent Runtime 负责统一的机械协作基础：
+多智能体需要共享统一的机械规则：
 
 ```text
-child lifecycle
-session relationship
-ownership
-write scope
-capability access
-background execution
-settlement
-cancellation
-persistence
-result handoff
+生命周期
+父子关系
+所有权
+写入范围
+能力访问
+后台执行
+取消
+结算
+持久化
+结果交接
 ```
 
-角色语义属于 Harness；生命周期与机械正确性属于 Runtime。
-
-Multi-Agent 不应建立一套绕开主 Runtime 的第二套生命周期、权限或持久化系统。
+角色可以不同，领域语义可以不同，但不能每个子智能体自己再造一套生命周期、权限或持久化系统。
 
 ---
 
-## 14. Provider & Model Boundary
+## 16. 依赖方向：越往下越通用
 
-不同模型 Provider 具有不同协议和机械能力。
-
-这些差异属于 Provider / Protocol 层，而不是 Harness 智能补偿层。
-
-可协商的事实包括：
+CodeLeveler 的依赖方向应该始终朝向更通用的层：
 
 ```text
-tool calling
-streaming
-reasoning transport
-vision
-structured output
-forced tool choice
-context window
-output limit
-wire format
+产品
+ ↓
+领域适配层
+ ↓
+运行时 / 能力
+ ↓
+基础层
 ```
 
-系统应该：
+也可以理解为：
 
 ```text
-发现能力
-显式协商
-如实上报
-根据机械条件启用或关闭依赖能力
+越靠上：越接近具体产品和领域
+越靠下：越通用、越稳定、越不应该知道上层业务
 ```
 
-而不是：
+因此：
 
 ```text
-为了模拟缺失能力而改变工具语义
-为了拉平模型水平而增加隐藏行为
+运行时不能依赖具体领域适配层。
+领域适配层不能依赖具体产品界面。
+基础层不能知道编程、评审等产品概念。
+能力层不能反向依赖调用它的某个具体工具或产品。
 ```
+
+下层提供机制，上层提供组合和语义。
 
 ---
 
-## 15. Dependency Direction
+## 17. 什么可以做，什么不可以做
 
-架构依赖方向必须保持单向。
+这一章是后续架构设计的直接判断标准。
+
+### 17.1 产品层
+
+**可以：**
 
 ```text
-Foundation
-    ↑
-Runtime / Capabilities
-    ↑
-Harnesses
-    ↑
-Products
+增加新的界面
+增加新的客户端
+改变交互与导航
+组合不同能力形成新产品
+增加本地视图状态
 ```
 
-换一个角度：
+**不可以：**
 
 ```text
-Product
-   ↓
-Harness
-   ↓
-Runtime / Capabilities
-   ↓
-Foundation
+自己推导任务真实状态
+把工具成功直接当成任务完成
+创建第二套运行时事实
+绕过运行时直接管理长期任务生命周期
 ```
 
-核心要求：
+### 17.2 领域适配层
+
+**可以：**
 
 ```text
-Runtime 不依赖具体 Harness。
-Harness 不依赖具体 Product UI。
-Foundation 不依赖上层领域概念。
-Capability 不依赖调用它的具体 Tool 或 Product。
+增加领域规则
+增加编程、评审、研究等新领域
+调整领域工具面
+定义领域完成语义
+定义领域协作方式
 ```
 
-下层可以提供机制，上层负责组合与语义。
-
----
-
-## 16. 一次任务的概念运行流
-
-从用户请求到宿主副作用：
+**不可以：**
 
 ```text
-User
-  ↓
-Product
-  ↓
-Harness
-  ↓
-Agent Runtime
-  ↓
-Model
-  ↓
-Tool Intent
-  ↓
-Harness Tool Surface
-  ↓
-Capability
-  ↓
-Host Authority
-  ↓
-Operating System
+把编程或评审语义下沉进通用运行时
+替模型隐藏规划和推理
+创建第二套任务生命周期
+创建第二套权限、所有权或持久化系统
+绕过宿主执行权威
 ```
 
-结果返回：
+### 17.3 智能体运行时
+
+**可以：**
 
 ```text
-Operating System
-  ↓
-Capability Result
-  ↓
-Runtime Fact
-  ↓
-Persistence
-  ↓
-Runtime Event
-  ↓
-Harness / Product
-  ↓
-User
+增加通用生命周期能力
+加强暂停、恢复和取消
+加强后台任务管理
+支持通用父子会话
+加强资源预算
+加强事件与持久化
+加强故障恢复
 ```
 
-这条链路体现三个核心约束：
+前提是这些能力对编程、评审等不同领域都成立。
 
-1. Model 不直接拥有宿主副作用。
-2. Runtime 记录机械事实，但不取代领域语义。
-3. Product 展示事实，但不重新定义事实。
-
----
-
-## 17. 架构不变量
-
-以下规则是 CodeLeveler 的长期架构宪法。
-
-### 17.1 Intelligence Boundary
+**不可以：**
 
 ```text
-Model owns intelligence.
-Runtime must not simulate agent intelligence.
+理解某个具体领域的完成语义
+决定模型应该怎样调查或规划
+根据模型“强弱”改变运行规则
+内置某个产品的工作流
+成为一个巨大的 Agent Brain
 ```
 
-### 17.2 Harness Boundary
+### 17.4 能力层
+
+**可以：**
 
 ```text
-Harness owns domain semantics.
-Runtime must not define Coding, Review, or other product semantics.
+增加新的可复用能力
+让能力拥有自己的必要生命周期
+把多个调用方共享的真实逻辑收敛到能力 Owner
+支持本地或远程实现
 ```
 
-### 17.3 Lifecycle Boundary
+**不可以：**
 
 ```text
-Engine owns lifecycle, not agent intelligence.
+把产品界面逻辑放进能力层
+让能力反向依赖某个具体 Tool
+同时存在多个相互竞争的能力 Owner
+为了架构图对称强行拆模块
 ```
 
-### 17.4 Capability Boundary
+### 17.5 工具层
+
+**可以：**
 
 ```text
-Tool is an adapter.
-Capability is the reusable ability.
+增加新的模型意图入口
+定义清晰参数
+调用已有能力
+把能力结果表达给模型
+返回精确错误
 ```
 
-### 17.5 Authority Boundary
+**不可以：**
 
 ```text
-Agent proposes.
-Host Authority decides and performs.
+成为全局服务定位器
+拥有长期全局状态
+拥有权限裁决
+拥有进程生命周期
+重新实现能力 Runtime
+偷偷改变一次调用的语义
 ```
 
-### 17.6 Persistence Boundary
+### 17.6 宿主执行权威
+
+**可以：**
 
 ```text
-One persistent fact, one authoritative owner.
+统一控制真实副作用
+执行权限与审批
+强制工作区边界
+执行沙箱与进程约束
+支持本地、远程或云端执行后端
 ```
 
-### 17.7 Product Boundary
+**不可以：**
 
 ```text
-Product projects truth.
-Product does not create runtime truth.
+替模型判断领域目标是否完成
+根据产品 UI 状态改变事实
+允许另一个模块建立旁路执行权威
 ```
 
-### 17.8 Dependency Boundary
+### 17.7 模型接入层
+
+**可以：**
 
 ```text
-Dependencies point downward toward more general layers.
-Lower layers do not depend on product-specific layers.
+适配不同协议
+统一请求与响应
+统一模型能力描述
+处理协议兼容
+协商机械能力
 ```
 
-### 17.9 Multi-Harness Boundary
+**不可以：**
 
 ```text
-A new Harness must not require redesigning Agent Runtime.
+为了假装模型拥有某种能力而改变领域语义
+因为模型较弱而注入另一套隐藏行为
+让不同 Provider 形成不同的任务含义
 ```
 
-### 17.10 Reliability Boundary
+### 17.8 多智能体
+
+**可以：**
 
 ```text
-Moving responsibility between layers must not weaken mechanical correctness,
-authority, persistence, cancellation, recovery, or safety guarantees.
+增加不同角色的子智能体
+持久化子会话
+后台运行
+能力协商
+结果交接
+远程 Worker
 ```
 
----
-
-## 18. 架构允许与禁止
-
-这一章是架构变更的直接判定规则。
-
-不是“建议”，而是对后续设计与实现的边界约束。
-
-### 18.1 可以做
-
-#### A. 在 Product / Harness 层增加领域能力
-
-允许：
+**不可以：**
 
 ```text
-增加 Coding 专属工作流
-增加 Review 语义
-增加 Research 等新 Harness
-调整某个产品的 Tool Surface
-增加领域 Completion Semantics
+子智能体绕过统一运行时
+子智能体绕过统一所有权
+子智能体拥有第二套文件写入权威
+子智能体建立第二套持久化事实
 ```
 
-前提是这些语义留在对应 Harness / Product，不向通用 Runtime 下沉。
+### 17.9 新抽象
 
-#### B. 扩展领域中立的 Runtime 机制
-
-允许 Runtime 增加真正通用的机械能力，例如：
+可以增加新的包、接口、管理器、注册表或通用框架，但应该至少存在一个真实原因：
 
 ```text
-新的生命周期状态
-更可靠的 resume / recovery
-更好的 cancellation
-通用 background lifecycle
-通用 parent / child session 关系
-通用资源预算
-通用事件与持久化机制
-```
-
-前提是能力不需要理解 Coding、Review 或其他具体领域语义。
-
-#### C. 增加可复用 Capability
-
-允许增加新的 Capability，例如：
-
-```text
-Browser
-Remote Execution
-Search
-External Service
-New Code Intelligence
-New Workspace Ability
-```
-
-当它代表真实可复用能力，并拥有明确职责边界时，可以独立演进。
-
-#### D. 为 Capability 增加新的 Tool Adapter
-
-允许针对新的模型意图暴露 Tool。
-
-前提是：
-
-```text
-Tool 只是适配器
-语义稳定
-不复制 Capability Runtime
-不拥有新的 Authority
-不成为持久状态 Owner
-```
-
-#### E. 扩展 Provider / Protocol Adapter
-
-允许适配新的模型、协议和 wire format。
-
-Provider 差异可以被规范化，但不能通过改变 Agent 行为语义来伪造模型不存在的机械能力。
-
-#### F. 增加新的 Product / Client
-
-允许构建：
-
-```text
-新的 TUI / Web / Desktop / Mobile 客户端
-远程控制端
-新的 Agent 产品
-新的领域 Harness
-```
-
-只要它们消费已有 Runtime Truth，而不是创建第二套 Runtime Truth。
-
-#### G. 增加 Local / Remote / Cloud 执行后端
-
-允许 Host Authority 支持不同执行位置：
-
-```text
-Local Host
-Remote Host
-Container
-VM
-Cloud Worker
-```
-
-执行位置可以变化，但 Authority 与 Agent 语义边界保持一致。
-
-#### H. 在有真实证据时引入新抽象
-
-新的 crate、trait、registry、manager、adapter layer、通用 framework 可以出现，但至少应该存在一种真实驱动力：
-
-```text
-两个真实实现或消费者
-真实 dependency inversion
+两个真实实现或真实消费者
+真实的依赖倒置需求
 独立安全边界
 独立协议边界
 独立持久化边界
 独立生命周期
 远程部署边界
-已观察到的 ownership / coupling 问题
+已经观察到的所有权或耦合问题
 ```
 
-抽象来自真实边界，不来自想象中的未来。
+不应该因为：
+
+```text
+“以后可能有用”
+“这样更通用”
+“看起来更像 Clean Architecture”
+“未来也许会有第二个实现”
+“架构图更对称”
+```
+
+就提前制造抽象。
 
 ---
 
-### 18.2 不可以做
+## 18. 架构不变量
 
-#### A. 不得把产品语义下沉进通用 Runtime
+下面这些规则应该长期成立。任何重大设计都可以用它们快速检查。
 
-禁止让 Kernel、Engine 或 Foundation 理解：
-
-```text
-Coding Prompt
-Review Finding
-Repository Workflow
-某种产品的 Tool Preference
-某种领域的 Done 定义
-```
-
-这些属于 Harness。
-
-#### B. 不得让 Runtime 替模型思考
-
-禁止因为模型能力不足而在 Runtime / Harness 中加入隐藏推理补偿，例如：
+### 18.1 智能边界
 
 ```text
-替模型决定什么时候规划
-替模型决定下一步调查什么
-因为模型选错 Tool 自动换另一个 Tool
-隐藏的任务级解题重试
-为了弱模型复制第二套工具语义
-根据模型强弱改变领域行为
+模型拥有智能。
+运行时不模拟智能体智能。
 ```
 
-机械重试、网络恢复、协议适配、schema 校验等工程可靠性不属于此禁令。
-
-#### C. 不得建立第二条 Host Side-effect Authority
-
-禁止 Tool、Harness、Product 或插件绕开统一 Authority，直接建立平行的：
+### 18.2 领域边界
 
 ```text
-filesystem mutation path
-process execution path
-permission path
-approval path
-sandbox path
-workspace write authority
+领域适配层拥有领域语义。
+通用运行时不定义编程、评审等产品语义。
 ```
 
-同一种受控副作用不能存在多个互相竞争的 Authority。
-
-#### D. 不得让 Tool 成为 Runtime 或 Service Locator
-
-禁止把通用服务集合、长期状态、权限决策、进程生命周期、全局策略塞进每一个 Tool。
-
-Tool 不应该因为拿到一个万能 Context 就能访问所有 Capability。
-
-#### E. 不得建立多个持久事实真相源
-
-禁止：
+### 18.3 生命周期边界
 
 ```text
-UI 自己推导 Task 真状态
-Harness 和 Engine 各保存一份权威状态
-事件流和数据库分别成为独立权威
-多个组件互相覆盖同一个事实
+引擎管理生命周期，不管理智能。
 ```
 
-一个事实必须有一个 canonical Owner。
-
-#### F. 不得产生反向依赖
-
-禁止：
+### 18.4 能力边界
 
 ```text
-Foundation → Harness
-Runtime →具体 Product
-Capability →具体 UI
-通用 Harness →另一个领域 Harness
+工具是适配器。
+能力是真正可复用的本领。
 ```
 
-下层不能为了方便直接依赖上层产品。
-
-#### G. 不得用改变语义的 fallback 假装能力存在
-
-禁止：
+### 18.5 执行权威边界
 
 ```text
-正则搜索失败后悄悄变成字面量搜索
-结构化编辑失败后偷偷执行另一种编辑语义
-Provider 不支持某能力却通过另一条行为路径假装支持
+智能体提出请求。
+宿主执行权威决定并执行真实副作用。
 ```
 
-Fallback 可以替换实现，但必须保持同一个契约和同一个含义。
-
-#### H. 不得根据任务或模型“聪明程度”动态改变机械能力边界
-
-Capability 是否可用应该由真实机械条件决定，例如：
+### 18.6 持久化边界
 
 ```text
-模型协议能力
-宿主能力
-Runtime 能力
-Harness 要求
-用户配置
+一个持久事实，一个权威源。
 ```
 
-不能由：
+### 18.7 产品边界
 
 ```text
-任务看起来很难
-模型看起来比较弱
-模型这轮表现不好
+产品展示事实，不创造运行时事实。
 ```
 
-来决定系统悄悄换一套语义。
-
-#### I. 不得为假想未来预建框架
-
-禁止仅因为：
+### 18.8 依赖边界
 
 ```text
-以后可能需要
-更通用
-Clean Architecture 看起来更完整
-未来也许有第二个实现
+依赖朝向更通用的层。
+通用层不反向依赖产品层。
 ```
 
-就增加新的通用抽象。
-
-架构必须允许未来扩展，但不等于提前实现未来。
-
-#### J. 不得让 Multi-Agent 绕开统一 Runtime
-
-禁止为 Child Agent / Reviewer / Worker 单独建立另一套：
+### 18.9 多领域边界
 
 ```text
-生命周期
-权限
-Ownership
-Persistence
-Cancellation
-Settlement
+增加一个全新领域，不应该要求重写智能体内核。
 ```
 
-角色可以不同，机械运行规则必须统一。
+### 18.10 可靠性边界
 
-#### K. 不得把 Local-only 假设写进 Agent 语义
-
-Agent、Harness 与 Runtime 的核心语义不应该假设执行一定发生在当前机器。
-
-本地、远程、容器与云端应该是 Execution Authority 的部署差异，而不是四种不同 Agent 架构。
+```text
+重新分配职责不能削弱：
+机械正确性、权限、安全、持久化、取消、恢复和一致性。
+```
 
 ---
 
-### 18.3 架构变更判定
+## 19. 后续演进方向
 
-一个改动进入 Foundation / Runtime / Capability 前，应能回答：
+CodeLeveler 的演进目标不是继续把所有功能堆到一个编程智能体里，而是让这套基础支撑更多智能体产品和更多运行形态。
 
-```text
-它的 Owner 是谁？
-它是领域语义还是机械机制？
-它是否能被第二个 Harness 合理复用？
-它是否创造了新的 Authority？
-它是否创造了新的持久事实真相源？
-它是否产生反向依赖？
-它是否改变已有能力语义？
-它是否只是为了假想未来而抽象？
-```
-
-如果一个功能可以自然留在 Harness，就不应该为了“通用”而下沉到 Foundation。
-
-如果一个新 Harness 需要先修改 Agent Kernel 才能成立，应首先怀疑边界设计，而不是默认 Kernel 需要继续吸收领域概念。
-
----
-
-## 19. 演进方向
-
-CodeLeveler 的未来演进重点不是继续扩大单个 Coding Agent，而是让这套 Foundation 支撑更广泛的 Agent 产品与运行形态。
-
-这些是长期架构方向，不是具体版本 Roadmap。
-
-### 19.1 Multi-Harness
-
-从单一 Coding 产品演进到多领域 Harness：
+### 19.1 从单领域到多领域
 
 ```text
-                    Agent Runtime
+                    智能体运行时
                  /       |        \
                 ▼        ▼         ▼
-             Coding    Review    Research
-             Harness   Harness   Harness
+             编程领域   评审领域    研究领域
 ```
 
-每个 Harness：
+每个领域拥有自己的语义和工具面，共享运行时、能力、持久化和执行权威。
+
+### 19.2 从单智能体到多智能体运行时
 
 ```text
-拥有自己的领域语义
-选择自己的 Capability
-定义自己的 Tool Surface
-拥有自己的 Completion Semantics
-```
-
-Runtime 保持领域中立。
-
-### 19.2 Multi-Agent Runtime
-
-从单 Agent 生命周期扩展到 Agent 协作图：
-
-```text
-Single Agent
-    ↓
-Parent / Child
-    ↓
-Role-based Agents
-    ↓
-Multi-Agent Runtime
-```
-
-未来角色可以包括：
-
-```text
-Planner
-Explorer
-Worker
-Reviewer
-Specialist
-```
-
-但统一共享：
-
-```text
-lifecycle
-persistence
-ownership
-authority
-capability negotiation
-cancellation
-settlement
-```
-
-Multi-Agent 是 Runtime 能力的扩展，而不是第二套系统。
-
-### 19.3 Capability Platform
-
-Capability 将从“Coding Agent 使用的一组后端”演进为独立可组合的平台能力。
-
-```text
-                  Capabilities
-              /        |         \
-             ▼         ▼          ▼
-          Coding     Review      Other
-```
-
-长期覆盖：
-
-```text
-Workspace
-Execution
-Browser
-Search
-Memory
-VCS
-Code Intelligence
-Media
-Remote Compute
-External Services
-```
-
-Harness 根据领域需要组合能力，而不是让所有 Agent 继承一个巨大工具集合。
-
-### 19.4 Local → Remote → Cloud
-
-Runtime 与 Host Authority 不绑定在同一台机器。
-
-长期结构：
-
-```text
-Harness
+单智能体
    ↓
-Agent Runtime
+父子智能体
    ↓
-Execution Authority
-   ├── Local Host
-   ├── Remote Host
-   ├── Container
-   ├── VM / Isolated Worker
-   └── Cloud Worker
+角色化智能体协作
+   ↓
+多智能体运行时
 ```
 
-区别只在执行位置，不在 Agent 核心语义。
+未来可以自然出现探索者、执行者、评审者、专家等角色，但仍然共享统一生命周期和权威模型。
 
-### 19.5 Durable Agents
+### 19.3 从工具集合到能力平台
 
-Agent 生命周期会越来越长。
-
-Runtime 应天然支持：
+能力层会逐渐成为可组合的平台：
 
 ```text
-long-running goals
-pause / resume
-background execution
-cross-device continuation
-child session durability
-recoverable work
-persistent context
+                        能力平台
+                  /        |        \
+                 ▼         ▼         ▼
+              编程领域    评审领域    其他领域
 ```
 
-Agent 不再等价于一次聊天请求，而是可持续运行、可恢复的任务实体。
+工作区、执行、浏览器、搜索、记忆、版本控制、代码理解、媒体和外部服务都可以成为不同领域复用的能力。
 
-### 19.6 Capability Negotiation
+### 19.4 从本地到远程与云端
 
-不同模型、宿主和 Worker 拥有不同机械能力。
-
-系统应该显式协商：
+运行时和执行位置应该解耦：
 
 ```text
-model capabilities
-host capabilities
-runtime capabilities
-harness requirements
-user configuration
+领域适配层
+    ↓
+智能体运行时
+    ↓
+宿主执行权威
+    ├── 本机
+    ├── 远程主机
+    ├── 容器
+    ├── 隔离虚拟机
+    └── 云端 Worker
 ```
 
-最终能力来自这些条件的交集，而不是隐藏猜测。
+变化的是“在哪里执行”，而不是智能体的领域语义。
+
+### 19.5 从一次请求到持久智能体
+
+未来智能体会越来越像一个可以持续工作的任务实体：
 
 ```text
-Available Capability
-    =
-Model ∩ Host ∩ Runtime ∩ Harness ∩ Configuration
+长目标
+暂停 / 继续
+后台执行
+跨设备继续
+持久子会话
+故障恢复
+长期上下文
 ```
 
-缺少某项机械能力时，诚实关闭依赖它的功能，而不是改变语义假装能力存在。
+一次聊天请求只是最短生命周期，不应成为架构上限。
 
-### 19.7 Agent Platform
+### 19.6 能力协商成为基础机制
 
-最终形态不是“更复杂的 Coding Agent”，而是一套可以构建不同 Agent 产品的运行平台。
+不同模型、不同宿主、不同远程 Worker 拥有不同能力。
+
+系统通过显式能力协商确定当前真正可用的能力，而不是依赖隐藏 fallback。
+
+### 19.7 最终形态：智能体平台
+
+长期结构可以理解为：
 
 ```text
-                         Products
-             ┌─────────────┼─────────────┐
-             ▼             ▼             ▼
-          Coding         Review         Others
-             │             │             │
-             └─────────────┼─────────────┘
-                           ▼
-                        Harnesses
-                           │
-                           ▼
-                     Agent Runtime
-                           │
-                 ┌─────────┴─────────┐
-                 ▼                   ▼
-          Capability Platform    Persistence
-                 │                   │
-                 └─────────┬─────────┘
-                           ▼
-                     Host Authority
-                           │
-                ┌──────────┼──────────┐
-                ▼          ▼          ▼
-              Local      Remote      Cloud
+                              产品
+                  ┌────────────┼────────────┐
+                  ▼            ▼            ▼
+               编程产品      评审产品      其他产品
+                  │            │            │
+                  └────────────┼────────────┘
+                               ▼
+                         多领域适配层
+                               │
+                               ▼
+                         智能体运行时
+                               │
+                    ┌──────────┴──────────┐
+                    ▼                     ▼
+                  能力平台               持久化
+                    │                     │
+                    └──────────┬──────────┘
+                               ▼
+                          宿主执行权威
+                               │
+                   ┌───────────┼───────────┐
+                   ▼           ▼           ▼
+                  本机         远程         云端
 ```
 
-在这个模型里：
+这套架构最终希望做到：
 
 ```text
-Model 提供智能。
-Harness 提供领域。
-Runtime 提供生命周期与机械正确性。
-Capability 提供可复用能力。
-Authority 提供受控真实执行。
-Persistence 提供连续性。
-Product 提供体验。
+模型提供智能。
+领域适配层定义领域。
+运行时提供生命周期。
+能力层提供本领。
+宿主执行权威提供安全执行。
+持久化提供连续性。
+产品提供体验。
 ```
 
-这就是 CodeLeveler 长期架构的核心方向。
+当一个新领域、新客户端、新模型或新执行环境出现时，系统应该能够在正确的层扩展，而不需要推翻整个架构。
