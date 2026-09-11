@@ -3937,9 +3937,9 @@ mod tests {
     #[tokio::test]
     async fn windows_job_timeout_kills_grandchildren() {
         let (dir, mut request, pidfile) = windows_grandchild_request("timeout");
-        // Leave enough time for PowerShell cold-start on hosted runners and to
-        // prove the grandchild exists before exercising the timeout kill path.
-        request.timeout = Duration::from_secs(8);
+        // The grandchild must be proven to exist before the timeout kills it,
+        // so the command outlasts the pid-file wait rather than racing it.
+        request.timeout = GRANDCHILD_TIMEOUT;
         let runner = windows_host_runner();
         let handle =
             tokio::spawn(async move { runner.run(request, CancellationToken::new()).await });
@@ -4032,18 +4032,36 @@ mod tests {
         (dir, request, pidfile)
     }
 
+    /// How long a grandchild fixture's command is given before it is killed.
+    ///
+    /// It has to outlast [`GRANDCHILD_PIDFILE_WAIT`] with room to spare. The
+    /// two were 8s and 10s, so a PowerShell cold start on a loaded runner
+    /// outlived the command that was supposed to outlive it: the timeout killed
+    /// the tree before the grandchild had written its pid, and the wait then
+    /// failed reporting a missing file rather than the slowness that caused it.
+    #[cfg(windows)]
+    const GRANDCHILD_TIMEOUT: Duration = Duration::from_secs(20);
+
+    #[cfg(windows)]
+    const GRANDCHILD_PIDFILE_WAIT: Duration = Duration::from_secs(10);
+
     #[cfg(windows)]
     async fn wait_windows_pidfile(pidfile: &std::path::Path) -> u32 {
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + GRANDCHILD_PIDFILE_WAIT;
+        loop {
             if let Ok(s) = std::fs::read_to_string(pidfile)
                 && let Ok(pid) = s.trim().parse::<u32>()
                 && pid > 0
             {
                 return pid;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid file missing after {GRANDCHILD_PIDFILE_WAIT:?}: {}",
+                pidfile.display()
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("grandchild pid file missing: {}", pidfile.display());
     }
 
     #[cfg(windows)]
