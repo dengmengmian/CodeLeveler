@@ -172,6 +172,10 @@ pub struct UiText {
     pub footer_cache: &'static str,
     pub recap_label: &'static str,
     pub recap_next_step: &'static str,
+    /// Assistant progress disclosure: "{} 行" carries the hidden visual-line
+    /// count, so a folded block never hides content silently.
+    pub assistant_progress_expand: &'static str,
+    pub assistant_progress_collapse: &'static str,
     pub goal_recap_label: &'static str,
     pub goal_recap_phase: &'static str,
     pub goal_recap_completed: &'static str,
@@ -725,6 +729,8 @@ static ZH: UiText = UiText {
     footer_cache: "缓存 {}%",
     recap_label: "回顾",
     recap_next_step: "下一步：",
+    assistant_progress_expand: "展开过程说明 · {} 行",
+    assistant_progress_collapse: "收起过程说明",
     goal_recap_label: "阶段回顾",
     goal_recap_phase: "当前阶段",
     goal_recap_completed: "已完成",
@@ -1183,6 +1189,8 @@ static EN: UiText = UiText {
     footer_cache: "cache {}%",
     recap_label: "recap",
     recap_next_step: "Next step: ",
+    assistant_progress_expand: "Show notes · {} lines",
+    assistant_progress_collapse: "Hide notes",
     goal_recap_label: "Recap",
     goal_recap_phase: "Phase",
     goal_recap_completed: "Completed",

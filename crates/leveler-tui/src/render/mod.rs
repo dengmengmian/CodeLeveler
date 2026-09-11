@@ -303,7 +303,8 @@ mod transcript_lines;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub use transcript_lines::{
-    assistant_split, item_is_final, item_render, items_need_gap, sub_agent_tree_lines,
+    PROGRESS_VISUAL_LINES, assistant_folds, assistant_render, assistant_split, item_is_final,
+    item_render, items_need_gap, sub_agent_tree_lines,
 };
 pub(crate) use transcript_lines::{
     btw_card_lines, sub_agent_detail, sub_agent_display_name, sub_agent_status, sub_agent_usage,
@@ -830,6 +831,8 @@ mod tests {
                 text: text.to_string(),
                 done,
                 rendered: done.then(|| crate::markdown::MdDoc::parse(text)),
+                kind: crate::transcript::AssistantKind::Final,
+                expanded: false,
             };
             let (full, stable) = assistant_split(&block, &theme, width);
             let upto = if done { full.len() } else { stable };
@@ -864,6 +867,8 @@ mod tests {
             text: final_text.to_string(),
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
+            kind: crate::transcript::AssistantKind::Final,
+            expanded: false,
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0
@@ -893,6 +898,8 @@ mod tests {
             text: final_text.to_string(),
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
+            kind: crate::transcript::AssistantKind::Final,
+            expanded: false,
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0
@@ -918,6 +925,8 @@ mod tests {
             text: final_text.to_string(),
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
+            kind: crate::transcript::AssistantKind::Final,
+            expanded: false,
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0

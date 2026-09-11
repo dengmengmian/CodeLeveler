@@ -8,6 +8,34 @@ use leveler_client_protocol::{MessageId, ToolCallId, UiCompletionReport};
 
 use crate::markdown::MdDoc;
 
+/// What one assistant message IS in the turn, decided by event order alone.
+///
+/// The classifier never reads the prose: a message followed by a tool call was
+/// demonstrably not the answer, and a message the turn ended on was. Nothing
+/// here is a guess about wording, length, or Markdown shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantKind {
+    /// Streaming, or complete but the turn has not yet shown which it is.
+    /// Presented under the same bound as [`Self::Progress`] so classification
+    /// never moves the rows already on screen.
+    Pending,
+    /// Interim narration: a tool call followed it. Compacted by default, full
+    /// text kept and one click away.
+    Progress,
+    /// The turn's answer: the turn ended on it with no tool call after. Always
+    /// rendered in full, never folded.
+    Final,
+}
+
+/// What [`TranscriptState::toggle_last_collapsible`] flipped. The caller needs
+/// the distinction because the workbench's tool-expand flag must not follow an
+/// assistant disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggledBlock {
+    Tool(bool),
+    AssistantProgress(bool),
+}
+
 /// A streaming assistant message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantBlock {
@@ -16,6 +44,12 @@ pub struct AssistantBlock {
     pub done: bool,
     /// Parsed markdown, computed once when the message completes (spec §62).
     pub rendered: Option<MdDoc>,
+    /// Progress vs. answer, assigned retroactively from event order.
+    pub kind: AssistantKind,
+    /// Per-block disclosure for a folded [`AssistantKind::Progress`] message.
+    /// Every historical block owns its own flag — there is no global
+    /// "assistant expanded" mode.
+    pub expanded: bool,
 }
 
 /// The lifecycle state of a tool call.
@@ -341,6 +375,10 @@ impl TranscriptState {
         summary: Option<String>,
         detail: Option<String>,
     ) {
+        // The turn ended with nothing acting on the last prose: that prose is
+        // the answer. Runs before the duplicate guard so a suppressed second
+        // marker still cannot leave a block undecided.
+        self.decide_pending_assistants(AssistantKind::Final);
         let already_ended = matches!(self.items.last(), Some(TranscriptItem::TurnEnd(_)))
             || matches!(
                 self.items.as_slice(),
@@ -424,6 +462,28 @@ impl TranscriptState {
         None
     }
 
+    /// Decide every still-undecided assistant block, from event order alone.
+    ///
+    /// Called at the two mechanical moments that carry the fact: a tool call
+    /// starting proves the prose before it was not the answer, and a turn
+    /// ending on prose proves it was. Idempotent — a block already decided
+    /// keeps its kind, so a duplicate or replayed event cannot reclassify
+    /// history.
+    fn decide_pending_assistants(&mut self, kind: AssistantKind) {
+        let mut changed = false;
+        for item in &mut self.items {
+            if let TranscriptItem::Assistant(block) = item
+                && block.kind == AssistantKind::Pending
+            {
+                block.kind = kind;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+    }
+
     /// Begin a new assistant message that deltas will target.
     pub fn begin_assistant(&mut self, id: MessageId) {
         self.bump();
@@ -435,6 +495,8 @@ impl TranscriptState {
                 text: String::new(),
                 done: false,
                 rendered: None,
+                kind: AssistantKind::Pending,
+                expanded: false,
             }));
         }
     }
@@ -466,6 +528,8 @@ impl TranscriptState {
                     text: delta.to_string(),
                     done: false,
                     rendered: None,
+                    kind: AssistantKind::Pending,
+                    expanded: false,
                 }));
             }
         }
@@ -535,6 +599,14 @@ impl TranscriptState {
             && starts_new_activity(group, &call)
         {
             self.close_tool_group();
+        }
+        // Visible work acting on the prose is the proof that the prose was not
+        // the answer. Silent bookkeeping is NOT that proof: a real run ends
+        // `answer → update_goal(complete) → turn end`, and counting that as a
+        // boundary folded the answer away. Same rule the activity stream uses
+        // to decide what is work at all.
+        if is_grouping_visible(&call) {
+            self.decide_pending_assistants(AssistantKind::Progress);
         }
         match self.items.last_mut() {
             Some(TranscriptItem::ToolGroup(group)) if group.open => group.calls.push(call),
@@ -666,6 +738,12 @@ impl TranscriptState {
                 block.expanded = !block.expanded;
                 Some(block.expanded)
             }
+            // A folded progress block toggles exactly itself. A Final answer
+            // has no disclosure row, so it is not a toggle target at all.
+            TranscriptItem::Assistant(block) if block.kind != AssistantKind::Final => {
+                block.expanded = !block.expanded;
+                Some(block.expanded)
+            }
             _ => None,
         };
         if toggled.is_some() {
@@ -676,25 +754,64 @@ impl TranscriptState {
 
     /// Toggle expand/collapse on whichever collapsible block came last.
     ///
-    /// Tool groups and sub-agents both fold their detail away once finished, so
-    /// one key opens whichever one you are looking at. Returns the new expanded
-    /// state, or `None` when there is nothing collapsible.
-    pub fn toggle_last_tool_group(&mut self) -> Option<bool> {
+    /// Tool groups, sub-agents and folded progress prose all hide detail once
+    /// finished, so one key opens whichever one you are looking at. The
+    /// transcript knows nothing about widths or themes, so `assistant_folds`
+    /// supplies the one fact it cannot derive: whether that block actually has
+    /// a disclosure row on screen right now. Returns what was toggled, or
+    /// `None` when there is nothing collapsible.
+    pub fn toggle_last_collapsible(
+        &mut self,
+        assistant_folds: impl Fn(&AssistantBlock) -> bool,
+    ) -> Option<ToggledBlock> {
         self.bump();
         for item in self.items.iter_mut().rev() {
             match item {
                 TranscriptItem::ToolGroup(group) => {
                     group.expanded = !group.expanded;
-                    return Some(group.expanded);
+                    return Some(ToggledBlock::Tool(group.expanded));
                 }
                 TranscriptItem::SubAgent(block) => {
                     block.expanded = !block.expanded;
-                    return Some(block.expanded);
+                    return Some(ToggledBlock::Tool(block.expanded));
+                }
+                TranscriptItem::Assistant(block)
+                    if block.kind == AssistantKind::Progress && assistant_folds(block) =>
+                {
+                    block.expanded = !block.expanded;
+                    return Some(ToggledBlock::AssistantProgress(block.expanded));
                 }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Classify replayed history, where no live event order survives: inside
+    /// each user-delimited turn the LAST assistant message is the answer and
+    /// every earlier one was interim narration. Only touches still-unclassified
+    /// blocks, so replaying over a live transcript cannot demote an answer.
+    pub fn classify_replayed_history(&mut self) {
+        let mut answer_seen = false;
+        for index in (0..self.items.len()).rev() {
+            match &self.items[index] {
+                TranscriptItem::User(_) => answer_seen = false,
+                TranscriptItem::Assistant(block) if block.kind == AssistantKind::Pending => {
+                    let kind = if answer_seen {
+                        AssistantKind::Progress
+                    } else {
+                        AssistantKind::Final
+                    };
+                    answer_seen = true;
+                    if let TranscriptItem::Assistant(block) = &mut self.items[index] {
+                        block.kind = kind;
+                    }
+                    self.version = self.version.wrapping_add(1);
+                }
+                TranscriptItem::Assistant(_) => answer_seen = true,
+                _ => {}
+            }
+        }
     }
 
     /// Dismiss the latest finished `/btw` card (done or failed). Returns true
@@ -1084,6 +1201,246 @@ mod tests {
         assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
     }
 
+    // ---- Assistant progress / final classification (event order only) ----
+
+    fn kinds(t: &TranscriptState) -> Vec<AssistantKind> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Assistant(b) => Some(b.kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn say(t: &mut TranscriptState, id: &str, text: &str) {
+        let id = MessageId::new(id);
+        t.begin_assistant(id.clone());
+        t.append_assistant(&id, text);
+        t.finish_assistant(&id);
+    }
+
+    /// An assistant message a tool call followed was demonstrably not the
+    /// answer. Nothing about its wording is consulted.
+    #[test]
+    fn a_tool_call_makes_the_preceding_message_progress() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "先查一下现有实现");
+        assert_eq!(kinds(&t), vec![AssistantKind::Pending], "not yet decided");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        assert_eq!(kinds(&t), vec![AssistantKind::Progress]);
+    }
+
+    /// The message a turn ended on, with no tool call after it, is the answer.
+    #[test]
+    fn the_message_a_turn_ends_on_is_final() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "先查一下");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut t, "m2", "改完了。");
+        t.push_turn_end(TurnEndStatus::Completed, 1, 3, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Progress, AssistantKind::Final]
+        );
+    }
+
+    /// Classification is retroactive and per-block: a long turn alternating
+    /// prose and tools ends with exactly one Final.
+    #[test]
+    fn only_the_last_message_of_a_turn_is_final() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "a");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut t, "m2", "b");
+        settled(&mut t, "e1", "apply_patch", r#"{"patch":"p"}"#);
+        say(&mut t, "m3", "c");
+        t.push_turn_end(TurnEndStatus::Completed, 2, 5, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![
+                AssistantKind::Progress,
+                AssistantKind::Progress,
+                AssistantKind::Final
+            ]
+        );
+    }
+
+    /// Goal bookkeeping is not acting on the prose. The real dogfood run
+    /// ended `answer → update_goal(complete) → turn_finished`, and treating
+    /// that silent call as a tool boundary folded the actual answer away.
+    /// Only conversation-visible work decides that prose was interim.
+    #[test]
+    fn silent_bookkeeping_after_the_answer_does_not_demote_it() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "两处都改好了。");
+        settled(
+            &mut t,
+            "g1",
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#,
+        );
+        t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// A silent exploration probe is not a boundary either — the prose stays
+    /// undecided until real work or the turn marker settles it.
+    #[test]
+    fn a_silent_probe_leaves_the_prose_undecided() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "先看看目录");
+        settled(&mut t, "l1", "list_files", r#"{"path":"."}"#);
+        assert_eq!(kinds(&t), vec![AssistantKind::Pending]);
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        assert_eq!(kinds(&t), vec![AssistantKind::Progress]);
+    }
+
+    /// `update_goal(blocked)` IS user-facing work — it is why the run stopped —
+    /// so prose in front of it was narration, not the answer.
+    #[test]
+    fn a_blocked_goal_update_is_visible_work_and_does_demote() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "卡住了，先说明");
+        settled(
+            &mut t,
+            "g1",
+            "update_goal",
+            r#"{"status":"blocked","summary":"缺少凭据"}"#,
+        );
+        assert_eq!(kinds(&t), vec![AssistantKind::Progress]);
+    }
+
+    /// A cancelled or failed turn still classifies: the marker is the same
+    /// mechanical signal, so no block is left Pending forever.
+    #[test]
+    fn a_cancelled_turn_still_classifies_its_last_message() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "正在改");
+        t.push_turn_end(TurnEndStatus::Cancelled, 0, 1, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// Replayed history carries no event order, so the turn shape decides:
+    /// the last assistant message before the next user turn is that turn's
+    /// answer, every earlier one was narration.
+    #[test]
+    fn replayed_history_classifies_by_turn_shape() {
+        let mut t = TranscriptState::new();
+        t.push_user("第一个需求".into());
+        say(&mut t, "m1", "先看代码");
+        say(&mut t, "m2", "改好了");
+        t.push_user("第二个需求".into());
+        say(&mut t, "m3", "又改好了");
+        t.classify_replayed_history();
+        assert_eq!(
+            kinds(&t),
+            vec![
+                AssistantKind::Progress,
+                AssistantKind::Final,
+                AssistantKind::Final
+            ]
+        );
+    }
+
+    /// Replay must never demote an answer that live events already proved.
+    #[test]
+    fn replay_classification_leaves_decided_blocks_alone() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "答案");
+        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
+        say(&mut t, "m2", "后续");
+        t.classify_replayed_history();
+        assert_eq!(kinds(&t), vec![AssistantKind::Final, AssistantKind::Final]);
+    }
+
+    /// Each historical progress block owns its disclosure: expanding one
+    /// leaves the others exactly as they were.
+    #[test]
+    fn expanding_one_progress_block_leaves_the_others_folded() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "一");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut t, "m2", "二");
+        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
+        let first = t
+            .items()
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::Assistant(_)))
+            .expect("first progress block");
+        t.toggle_tool_group_at(first);
+        let flags: Vec<bool> = t
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Assistant(b) => Some(b.expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![true, false]);
+    }
+
+    /// A Final answer has no disclosure, so nothing can fold it — not a
+    /// click on its rows, not Ctrl+O.
+    #[test]
+    fn a_final_answer_can_never_be_folded() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "答案");
+        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
+        let at = t
+            .items()
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::Assistant(_)))
+            .expect("the answer");
+        assert_eq!(t.toggle_tool_group_at(at), None);
+        assert_eq!(t.toggle_last_collapsible(|_| true), None);
+    }
+
+    /// Ctrl+O reaches a folded progress block, and reports it as an assistant
+    /// toggle so the workbench tool flag does not follow.
+    #[test]
+    fn ctrl_o_reaches_a_folded_progress_block() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "过程");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        // The tool group is latest, so it wins — unchanged behaviour.
+        assert_eq!(
+            t.toggle_last_collapsible(|_| true),
+            Some(ToggledBlock::Tool(true))
+        );
+        say(&mut t, "m2", "更多过程");
+        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
+        say(&mut t, "m3", "过程三");
+        t.items_mut().iter_mut().for_each(|i| {
+            if let TranscriptItem::Assistant(b) = i {
+                b.kind = AssistantKind::Progress;
+            }
+        });
+        assert_eq!(
+            t.toggle_last_collapsible(|_| true),
+            Some(ToggledBlock::AssistantProgress(true))
+        );
+    }
+
+    /// A progress block short enough to render whole has no disclosure row,
+    /// so Ctrl+O must skip it and keep reaching the tool group behind it.
+    #[test]
+    fn ctrl_o_skips_a_progress_block_that_did_not_fold() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut t, "m1", "短");
+        t.items_mut().iter_mut().for_each(|i| {
+            if let TranscriptItem::Assistant(b) = i {
+                b.kind = AssistantKind::Progress;
+            }
+        });
+        assert_eq!(
+            t.toggle_last_collapsible(|_| false),
+            Some(ToggledBlock::Tool(true)),
+            "an unfolded progress block must not swallow the key"
+        );
+    }
+
     fn group(expanded: bool) -> ToolGroupBlock {
         ToolGroupBlock {
             calls: vec![ToolCallBlock {
@@ -1103,13 +1460,13 @@ mod tests {
     }
 
     #[test]
-    fn toggle_last_tool_group_only_flips_latest() {
+    fn toggle_last_collapsible_only_flips_latest() {
         let mut ts = TranscriptState::default();
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
 
-        let new = ts.toggle_last_tool_group();
-        assert_eq!(new, Some(true));
+        let new = ts.toggle_last_collapsible(|_| false);
+        assert_eq!(new, Some(ToggledBlock::Tool(true)));
 
         let groups: Vec<_> = ts
             .items
@@ -1121,8 +1478,8 @@ mod tests {
             .collect();
         assert_eq!(groups, vec![false, true], "only latest group expands");
 
-        let new = ts.toggle_last_tool_group();
-        assert_eq!(new, Some(false));
+        let new = ts.toggle_last_collapsible(|_| false);
+        assert_eq!(new, Some(ToggledBlock::Tool(false)));
         let groups: Vec<_> = ts
             .items
             .iter()

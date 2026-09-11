@@ -772,13 +772,21 @@ fn navigate_user_turn(state: &mut AppState, delta: i32) {
     }
 }
 
-/// Ctrl+O (undocumented fallback): toggle only the latest tool group.
+/// Ctrl+O (undocumented fallback): toggle the latest collapsible block —
+/// a tool group, a sub-agent, or folded progress prose.
 ///
-/// Analysis is visible conversation content and has no disclosure to toggle;
-/// the primary product interaction for tool detail is clicking the ▸ row.
+/// The primary product interaction is still clicking the ▸ row; this only
+/// reaches whatever is latest, so it can never touch a Final answer (which
+/// has no disclosure) or an older block.
 fn toggle_current_expand(state: &mut AppState) {
-    if let Some(expanded) = state.transcript.toggle_last_tool_group() {
-        // Mirror into the workbench flag used to render the focused group.
+    let width = crate::conversation::geometry::content_width(state);
+    let theme = &state.theme;
+    let toggled = state
+        .transcript
+        .toggle_last_collapsible(|block| crate::render::assistant_folds(block, theme, width));
+    // Only a tool disclosure mirrors into the workbench tool flag; an
+    // assistant's own `expanded` is the whole truth for its block.
+    if let Some(crate::transcript::ToggledBlock::Tool(expanded)) = toggled {
         state.tools_expanded = expanded;
     }
 }
@@ -1096,6 +1104,130 @@ mod disclosure_tests {
         );
     }
 
+    /// Two folded progress blocks in one turn: clicking one expands exactly
+    /// that one, and clicking again folds it back. The other block, and the
+    /// tool groups around them, are untouched.
+    #[test]
+    fn clicking_one_progress_row_expands_only_that_block() {
+        let mut s = test_state();
+        let long = "关键判断：状态色没走 token\n\n方案：局部收敛\n\n其实更稳妥：先查同域页面\n\n先看白黑主题";
+        s.transcript.push_user("优化一下".into());
+        for (message, tool) in [("m1", "r1"), ("m2", "r2")] {
+            let id = leveler_client_protocol::MessageId::new(message);
+            s.transcript.begin_assistant(id.clone());
+            s.transcript.append_assistant(&id, long);
+            s.transcript.finish_assistant(&id);
+            finished_tool(&mut s, tool, "read_file", r#"{"path":"a.rs"}"#);
+        }
+        let progress: Vec<usize> = s
+            .transcript
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                TranscriptItem::Assistant(b) => {
+                    (b.kind == crate::transcript::AssistantKind::Progress).then_some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progress.len(),
+            2,
+            "both messages are progress: {progress:?}"
+        );
+
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line, _) = *hits
+            .iter()
+            .find(|(_, item)| *item == progress[0])
+            .expect("the first progress block owns a disclosure row");
+        let row = screen_row_of(&s, line);
+        click(&mut s, 3, row);
+
+        let flags: Vec<bool> = s
+            .transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Assistant(b) => Some(b.expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![true, false], "only the clicked block opened");
+        let tools: Vec<bool> = s
+            .transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::ToolGroup(g) => Some(g.expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, vec![false, false], "no tool group was touched");
+
+        // The expanded block shows the whole original text...
+        let plain: String = s
+            .conversation_lines_and_hits(80)
+            .0
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect();
+        assert!(plain.contains("先看白黑主题"), "{plain}");
+
+        // ...and the same row folds it back.
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line, _) = *hits
+            .iter()
+            .find(|(_, item)| *item == progress[0])
+            .expect("the open block keeps its row");
+        let row = screen_row_of(&s, line);
+        click(&mut s, 3, row);
+        let flags: Vec<bool> = s
+            .transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Assistant(b) => Some(b.expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![false, false]);
+    }
+
+    /// A Final answer contributes no disclosure row, so no cell inside it can
+    /// fold the answer away.
+    #[test]
+    fn a_final_answer_owns_no_disclosure_row() {
+        let mut s = test_state();
+        s.transcript.push_user("优化一下".into());
+        let id = leveler_client_protocol::MessageId::new("m1");
+        s.transcript.begin_assistant(id.clone());
+        s.transcript.append_assistant(
+            &id,
+            "改完了。\n\n状态色已统一。\n\n搜索已修复。\n\npnpm lint 通过。",
+        );
+        s.transcript.finish_assistant(&id);
+        s.transcript.push_turn_end(
+            crate::transcript::TurnEndStatus::Completed,
+            0,
+            3,
+            None,
+            None,
+        );
+        let answer = s
+            .transcript
+            .items()
+            .iter()
+            .position(|item| matches!(item, TranscriptItem::Assistant(_)))
+            .unwrap();
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        assert!(
+            !hits.iter().any(|(_, item)| *item == answer),
+            "the answer must not be foldable: {hits:?}"
+        );
+    }
+
     #[test]
     fn user_shell_row_click_opens_its_details_not_a_toggle() {
         let mut s = test_state();
@@ -1183,6 +1315,176 @@ mod disclosure_tests {
         assert!(
             flags.iter().all(|(i, e)| *e == (*i == item_b)),
             "mid-scroll click toggles the painted group: {flags:?}"
+        );
+    }
+
+    /// Scrolled deep into history, a click on a folded progress row must
+    /// toggle THAT block. An assistant's hit row is the LAST line it emits
+    /// (a tool group's is its first), so an off-by-one in that offset is how
+    /// "click A, B expands" would come back.
+    #[test]
+    fn scrolled_click_on_a_folded_progress_row_lands_on_that_block() {
+        let mut s = test_state();
+        let long = "关键判断：状态色没走 token\n\n方案：局部收敛\n\n其实更稳妥：先查同域页面\n\n先看白黑主题";
+        // Ten turns of prose/tool so the content is far taller than the
+        // viewport and every progress block folds.
+        for turn in 0..10 {
+            s.transcript.push_user(format!("需求 {turn}"));
+            for round in 0..2 {
+                let id = leveler_client_protocol::MessageId::new(format!("m{turn}_{round}"));
+                s.transcript.begin_assistant(id.clone());
+                s.transcript.append_assistant(&id, long);
+                s.transcript.finish_assistant(&id);
+                finished_tool(
+                    &mut s,
+                    &format!("t{turn}_{round}"),
+                    "read_file",
+                    r#"{"path":"a.rs"}"#,
+                );
+            }
+            s.transcript.push_turn_end(
+                crate::transcript::TurnEndStatus::Completed,
+                2,
+                3,
+                None,
+                None,
+            );
+        }
+        let (lines, hits) = s.conversation_lines_and_hits(80);
+        let (_, ry, _, rh) = s.conv.rect.unwrap();
+        assert!(
+            lines.len() > rh as usize * 2,
+            "the fixture must not fit the viewport: {} lines",
+            lines.len()
+        );
+        let progress_hits: Vec<(usize, usize)> = hits
+            .iter()
+            .copied()
+            .filter(|(_, item)| {
+                matches!(
+                    s.transcript.items().get(*item),
+                    Some(TranscriptItem::Assistant(_))
+                )
+            })
+            .collect();
+        assert_eq!(progress_hits.len(), 20, "every progress block folds");
+
+        // Click each folded progress row from a scroll position that paints
+        // it mid-viewport — the real "read history, open one note" gesture.
+        for (line, item) in progress_hits {
+            let max_scroll = lines.len().saturating_sub(rh as usize);
+            let scroll = line.saturating_sub(rh as usize / 2).min(max_scroll);
+            s.conv.auto_scroll = false;
+            s.conv.scroll = scroll;
+            s.conv.plain.clear();
+            let row = ry + (line - scroll) as u16;
+            click(&mut s, 4, row);
+            let opened: Vec<usize> = s
+                .transcript
+                .items()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, it)| match it {
+                    TranscriptItem::Assistant(b) => b.expanded.then_some(i),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                opened,
+                vec![item],
+                "scrolled click at line {line} must open item {item} alone"
+            );
+            // Fold it back so the next iteration starts from a known layout.
+            s.transcript.toggle_tool_group_at(item);
+        }
+    }
+
+    /// Expanding a folded block mid-history grows the content below the
+    /// viewport, not above it: the rows the reader is looking at must not
+    /// slide out from under them.
+    #[test]
+    fn expanding_a_scrolled_progress_block_keeps_the_row_under_the_cursor() {
+        let mut s = test_state();
+        let long = "关键判断：状态色没走 token\n\n方案：局部收敛\n\n其实更稳妥：先查同域页面\n\n先看白黑主题";
+        for turn in 0..8 {
+            s.transcript.push_user(format!("需求 {turn}"));
+            let id = leveler_client_protocol::MessageId::new(format!("m{turn}"));
+            s.transcript.begin_assistant(id.clone());
+            s.transcript.append_assistant(&id, long);
+            s.transcript.finish_assistant(&id);
+            finished_tool(
+                &mut s,
+                &format!("t{turn}"),
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+            );
+        }
+        s.transcript.push_turn_end(
+            crate::transcript::TurnEndStatus::Completed,
+            8,
+            9,
+            None,
+            None,
+        );
+        let (lines, hits) = s.conversation_lines_and_hits(80);
+        let (_, ry, _, rh) = s.conv.rect.unwrap();
+        let (line, item) = *hits
+            .iter()
+            .find(|(_, it)| {
+                matches!(
+                    s.transcript.items().get(*it),
+                    Some(TranscriptItem::Assistant(_))
+                )
+            })
+            .expect("a folded progress block");
+        let max_scroll = lines.len().saturating_sub(rh as usize);
+        let scroll = line.saturating_sub(rh as usize / 2).min(max_scroll);
+        s.conv.auto_scroll = false;
+        s.conv.scroll = scroll;
+        s.conv.plain.clear();
+        let row = ry + (line - scroll) as u16;
+
+        let scroll_before = s.conv.scroll;
+
+        click(&mut s, 4, row);
+        let opened: Vec<usize> = s
+            .transcript
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                TranscriptItem::Assistant(b) => b.expanded.then_some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec![item], "the scrolled click opened that block");
+        crate::conversation::sync_scroll(&mut s);
+        let (after, _) = s.conversation_lines_and_hits(80);
+        assert!(after.len() > lines.len(), "expanding adds rows");
+
+        // The disclosure row sits at the END of the block, so it legitimately
+        // moves down. What must NOT move is everything ABOVE the block: the
+        // folded block is exactly PROGRESS_VISUAL_LINES tall, so its first row
+        // is the reference point.
+        let block_start = line + 1 - crate::render::PROGRESS_VISUAL_LINES;
+        let plain = |ls: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            ls.iter().map(crate::selection::line_to_plain).collect()
+        };
+        assert_eq!(
+            plain(&lines[..block_start]),
+            plain(&after[..block_start]),
+            "rows above the expanded block must be identical"
+        );
+        // The viewport is not yanked, and the newly revealed text is in it.
+        assert_eq!(s.conv.scroll, scroll_before, "expanding must not scroll");
+        let visible = plain(&after[s.conv.scroll..(s.conv.scroll + rh as usize).min(after.len())]);
+        assert!(
+            visible.iter().any(|l| l.contains("先看白黑主题")),
+            "the revealed text is on screen: {visible:?}"
+        );
+        assert!(
+            visible.iter().any(|l| l.contains("收起过程说明")),
+            "the way back is on screen: {visible:?}"
         );
     }
 
