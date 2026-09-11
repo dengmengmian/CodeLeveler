@@ -548,6 +548,50 @@ mod windows_canaries {
         assert!(workspace.path().join(".git").is_dir());
     }
 
+    /// The bug this rule exists for: a shell command whose own argument is
+    /// quoted has to reach the program as the user wrote it. `cmd /C` parses
+    /// its tail itself and does not read a backslash as a quote escape, so
+    /// quoting that tail the Win32 way delivered the quotes as characters and
+    /// PowerShell printed the command instead of running it. Confined and
+    /// unconfined must agree, so both are checked here.
+    #[tokio::test]
+    async fn a_quoted_shell_argument_reaches_the_program_as_written() {
+        if !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runner = host_runner();
+        let line = "powershell -NoProfile -NonInteractive -Command \"Write-Output 'quoting-ok'\"";
+        let (program, args) = crate::command::shell_invocation(line);
+
+        for scope in [
+            WriteScope::Workspace {
+                root: workspace.path().to_path_buf(),
+            },
+            WriteScope::Unrestricted,
+        ] {
+            let mut request = ProcessRequest::new(
+                program.clone(),
+                args.clone(),
+                workspace.path().to_path_buf(),
+            );
+            request.write_scope = scope.clone();
+            let output = runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("the shell command must run");
+            assert_eq!(output.exit_code, Some(0), "{scope:?}: {output:?}");
+            assert!(
+                output.stdout.contains("quoting-ok"),
+                "{scope:?}: the command must run, not be echoed: {output:?}"
+            );
+            assert!(
+                !output.stdout.contains("Write-Output"),
+                "{scope:?}: the command text leaked into its own output: {output:?}"
+            );
+        }
+    }
+
     /// Background used to be the unconfined path. It is the same path now, so
     /// the same canary has to hold for it.
     #[tokio::test]

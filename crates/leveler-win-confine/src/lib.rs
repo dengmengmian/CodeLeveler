@@ -99,6 +99,33 @@ pub fn restore_integrity_label(path: &Path, previous: &IntegrityLabel) -> io::Re
     }
 }
 
+/// Where `cmd.exe`'s own parsing takes over.
+///
+/// `cmd /C <tail>` hands everything after the switch to cmd, which parses it
+/// with its own rules — and a backslash is not a quote escape there. Quoting
+/// that tail the way Win32 argv is quoted turns
+/// `powershell -Command "Start-Sleep -Seconds 5"` into
+/// `powershell -Command \"Start-Sleep -Seconds 5\"`, and the quotes arrive at
+/// the program as characters: PowerShell printed the command instead of
+/// running it. The tail has to reach cmd exactly as the caller wrote it.
+///
+/// Returns the index of the first argument cmd parses itself, when there is
+/// one.
+pub fn cmd_tail_start(program: &str, args: &[String]) -> Option<usize> {
+    let basename = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if !matches!(basename.as_str(), "cmd" | "cmd.exe") {
+        return None;
+    }
+    let switch = args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/C") || arg.eq_ignore_ascii_case("/K"))?;
+    (switch + 1 < args.len()).then_some(switch + 1)
+}
+
 /// Whether this build can launch a Low-integrity child at all.
 pub fn low_integrity_supported() -> bool {
     cfg!(windows)
@@ -127,6 +154,34 @@ mod tests {
             }
             .is_low()
         );
+    }
+
+    #[test]
+    fn cmd_parses_its_own_tail_and_nothing_else_does() {
+        let args = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        };
+        assert_eq!(
+            cmd_tail_start("cmd", &args(&["/C", "echo hi"])),
+            Some(1),
+            "everything after /C belongs to cmd"
+        );
+        assert_eq!(
+            cmd_tail_start(r"C:\Windows\System32\cmd.exe", &args(&["/k", "dir"])),
+            Some(1),
+            "the switch and the program name are matched case-insensitively"
+        );
+        assert_eq!(
+            cmd_tail_start("cmd", &args(&["/C"])),
+            None,
+            "a switch with nothing after it has no tail"
+        );
+        assert_eq!(
+            cmd_tail_start("powershell", &args(&["-Command", "x"])),
+            None,
+            "only cmd parses its own tail"
+        );
+        assert_eq!(cmd_tail_start("cmd", &args(&["echo", "hi"])), None);
     }
 
     #[test]

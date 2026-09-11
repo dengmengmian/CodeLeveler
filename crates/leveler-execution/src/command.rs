@@ -933,7 +933,7 @@ impl CommandRunner {
         );
 
         let mut cmd = Command::new(&program);
-        apply_common_command_env(&mut cmd, request, &args, &self.environment);
+        apply_common_command_env(&mut cmd, request, &program, &args, &self.environment);
         if let Some(paths) = sandbox_paths.as_ref() {
             apply_sandbox_environment(&mut cmd, paths);
         }
@@ -1293,14 +1293,41 @@ pub(crate) fn map_windows_job_spawn_error(program: &str, source: std::io::Error)
     ))
 }
 
+/// Attach `args` to the child.
+///
+/// `cmd.exe` is the one program that parses part of its own command line, and
+/// it does not treat a backslash as a quote escape. Quoting its tail the way
+/// Win32 argv is quoted delivers the quotes to the program as characters —
+/// `powershell -Command "Start-Sleep -Seconds 5"` becomes a string PowerShell
+/// prints rather than a command it runs. The tail goes through verbatim; every
+/// other argument is quoted normally. The confined path does the same thing one
+/// hop later, in `leveler-confine.exe`.
+fn apply_arguments(cmd: &mut Command, program: &str, args: &[String]) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        if let Some(tail) = leveler_win_confine::cmd_tail_start(program, args) {
+            for argument in &args[..tail] {
+                cmd.arg(argument);
+            }
+            cmd.as_std_mut().raw_arg(args[tail..].join(" "));
+            return;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    cmd.args(args);
+}
+
 fn apply_common_command_env(
     cmd: &mut Command,
     request: &ProcessRequest,
+    program: &str,
     args: &[String],
     environment: &leveler_core::EnvSnapshot,
 ) {
-    cmd.args(args)
-        .current_dir(child_working_directory(&request.cwd))
+    apply_arguments(cmd, program, args);
+    cmd.current_dir(child_working_directory(&request.cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

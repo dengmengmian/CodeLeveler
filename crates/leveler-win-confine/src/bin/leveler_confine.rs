@@ -282,14 +282,28 @@ mod windows_main {
     }
 
     /// MSVC argv quoting — the same rules `std::process::Command` applies, so a
-    /// confined command line is byte-identical to the unconfined one.
+    /// confined command line is byte-identical to the unconfined one. The one
+    /// departure is `cmd.exe`'s own tail, which
+    /// [`leveler_win_confine::cmd_tail_start`] identifies and which is emitted
+    /// exactly as the caller wrote it.
     fn build_command_line(command: &[OsString]) -> Vec<u16> {
+        let lossy: Vec<String> = command[1..]
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let tail = leveler_win_confine::cmd_tail_start(&command[0].to_string_lossy(), &lossy)
+            .map(|index| index + 1);
+
         let mut line: Vec<u16> = Vec::new();
         for (index, argument) in command.iter().enumerate() {
             if index > 0 {
                 line.push(u16::from(b' '));
             }
-            append_argument(&mut line, argument, index == 0);
+            if tail.is_some_and(|tail| index >= tail) {
+                line.extend(argument.encode_wide());
+            } else {
+                append_argument(&mut line, argument, index == 0);
+            }
         }
         line.push(0);
         line
