@@ -67,7 +67,7 @@ pub use trust::{
     TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
     read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
 };
-pub use windows_confine::{WriteRootLease, lease_write_roots};
+pub use windows_confine::{WriteRootLease, lease_write_roots, recover_stale_write_roots};
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
     WindowsSandboxError, assert_intent_spawn_allowed, doctor_sandbox_line,
