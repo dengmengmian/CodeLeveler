@@ -1,305 +1,629 @@
-# Working on CodeLeveler
+# CodeLeveler 开发规则
 
-Notes for an AI agent (or a new contributor) changing this repository.
+本文件面向修改 CodeLeveler 的 AI Agent 和贡献者。
 
-This file is two things and nothing else: the **architecture constitution**
-that every change is judged against, and an **index** of the working rules
-that live elsewhere. Where a rule already lives in code or in another
-document, the pointer is the authority and this file is not.
+它是一份**执行指南**，不是第二份架构文档。
 
-The full architecture is `docs/ARCHITECTURE.md` (Chinese:
-`docs/ARCHITECTURE.zh-CN.md`). This file does not duplicate it.
+CodeLeveler 的架构权威是：
 
-## Read first
+- [`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md)
+- 英文版：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
-| Document | Covers |
-| --- | --- |
-| `docs/ARCHITECTURE.md` | Layers, boundaries, dependency direction, known debt — the canonical architecture |
-| `CONTRIBUTING.md` | PR expectations, the exact check commands, error-type and dependency-direction rules |
-| `evals/README.md` | Required before adding evaluation cases |
+如果本文件与架构文档冲突，以架构文档为准，并修正本文件。
 
-The mobile client is frozen at tag `mobile-beta-mvp` — no Push / fleet / voice /
-rewrite until real Beta users.
+这份规则分两层：
 
-`CONTRIBUTING.md` already states the three rules most often gotten wrong:
-library crates expose typed errors, `anyhow` stays at application boundaries
-(`leveler-cli` / `leveler-app` only), and no lower-level crate may take a
-dependency edge back to a user-facing layer. Those are not repeated here.
+1. **通用工程规则**：适用于日常开发、修复、重构和协作。
+2. **CodeLeveler 专属规则**：约束本项目的智能体运行时、领域适配层、能力、工具、执行权威和多智能体设计。
 
 ---
 
-# Architecture constitution
+# 一、通用核心原则
 
-CodeLeveler is not "a coding agent and everything under it". It is a
-foundation, with the coding agent as its first product on top:
+## 1. 第一性原理
 
-```text
-                     Leveler Foundation
-                            │
-          ┌─────────────────┼─────────────────┐
-          ▼                 ▼                 ▼
-    Coding Harness     Review Harness    Future Harness
-          ▼                 ▼                 ▼
-      CodeLeveler       Review Product     Future Product
-```
+先判断用户真正要解决的问题，而不是机械执行表面指令。
 
-The Foundation provides reusable agent-runtime capability. A Harness defines
-domain semantics. A Product defines experience, composition and delivery.
+如果需求方向明显错误、成本过高、会引入更大问题，直接指出，并给出更简单或更正确的路径。
 
-## The seven sentences
+不要为了“完成请求”而实现一个明知不合理的方案。
 
-```text
-The Kernel does not know the product.
+## 2. 极简沟通
 
-The Harness defines domain semantics.
+默认使用中文。
 
-The Harness exposes capability; it does not emulate intelligence.
+结论先行，语言简单直接。
 
-The Engine owns lifecycle, not agent intelligence.
+不要：
 
-The Host Authority exclusively owns controlled side effects.
+- 复读用户背景；
+- 写大段过程性流水账；
+- 用 P0 / P1 / P2 代替真实判断；
+- 为简单问题套复杂模板。
 
-Every durable fact has one authoritative owner.
+## 3. 简单优先
 
-Mechanical Truth is not Semantic Satisfaction and is not User Acceptance.
-```
+能用小改解决，不做大重构。
 
-## The twelve rules
+能用直观实现解决，不做提前抽象。
 
-1. **The kernel is product-neutral.** `leveler-agent-core` owns the model↔tool
-   loop, streaming, retry, rounds, budgets, usage, deadlines, cancellation and
-   stop reasons. It owns no coding, review, repository, prompt, permission,
-   persistence or UI concept.
-2. **Harnesses are siblings.** A future `leveler-review` sits beside
-   `leveler-agent`, not under it. A harness never depends on another harness.
-3. **Tools are adapters; capabilities are implementations.** A tool renders a
-   capability to the model. It does not implement the capability, and it does
-   not own policy. See the tool rules below.
-4. **Host side effects have one authority.** `leveler-execution` owns workspace
-   path enforcement, permission, approval, process execution, sandboxing and
-   cancellation. An agent *requests* a side effect; the host authority
-   *performs* it. Do not build a second path to the filesystem or to a process.
-5. **The engine owns runtime mechanics, not product semantics.** Task/turn
-   lifecycle, event ordering, the append-only log, checkpoint, resume,
-   recovery, ownership, reaping. Not prompts, not tool selection, not what
-   "done" means.
-6. **Mechanical Truth ≠ Semantic Satisfaction ≠ User Acceptance.** The runtime
-   proves what ran and what changed. The model interprets whether the goal is
-   met. The user accepts. A green check is not proof that a request was
-   satisfied, and observing a changed tree is not proof that the work is done.
-7. **Every durable fact has one authoritative owner.** No parallel source of
-   truth for task status, turn status, evidence, ownership, usage or artifacts.
-8. **UI and protocol layers project truth; they do not invent it.** A tool
-   returning `Ok` does not let a client decide the task is complete.
-9. **Dependency direction is part of correctness.** Foundation ← capabilities
-   and runtime ← harnesses ← products. No lower layer may depend on a
-   user-facing one.
-10. **New abstractions require evidence.** See the next section.
-11. **Foundation changes carry a higher bar than product changes.** Extend
-    above the foundation before you modify it.
-12. **A second product harness must not require modifying the agent kernel.**
-    It builds its own tool host and its own tool surface over the same kernel;
-    reusing the Coding tool plumbing is not required. This is the *Second
-    Harness Test*, defined in `docs/ARCHITECTURE.md`.
+能复用现有边界，不新增 manager、registry、factory、framework。
 
-## Model capability policy
+复杂度只有在真实问题要求时才增加。
+
+## 4. 只改必要范围
+
+每一处修改都必须能直接对应到本次需求。
+
+不要顺手：
+
+- 重构无关代码；
+- 格式化无关文件；
+- 改命名风格；
+- 清理历史死代码；
+- 添加用户没有要求的能力。
+
+## 5. 暴露问题
+
+发现风险、冲突、不可验证点、环境限制或架构矛盾，必须明确说明。
+
+禁止：
+
+- 用猜测替代事实；
+- 用补丁掩盖根因；
+- 把失败包装成成功；
+- 静默跳过关键验证。
+
+## 6. 禁止擅自开分支
+
+不得私自：
+
+- 创建 Git 分支；
+- checkout 到新分支；
+- 创建 worktree；
+- 删除 worktree。
+
+如确实需要，先说明原因并等待用户确认。
+
+如果用户在当前任务中已经明确要求“创建分支 / 提交 / 推送 / 远程修改”，视为对该操作的确认，不需要重复询问。
+
+## 7. 改后自检
+
+每次修改后至少检查：
 
 ```text
-Model intelligence is not a Harness responsibility.
+是否改多了？
+是否让代码更复杂了？
+是否漏了验证？
+是否引入新的真相源或隐式状态？
+是否有更简单的方案？
+是否留下自己造成的无用代码？
 ```
-
-The Harness exposes deterministic capability and product semantics. It does
-not emulate reasoning, compensate for a weak model, or grow a second behaviour
-whose purpose is to normalize model intelligence across models. CodeLeveler
-accepts model intelligence as an input, not a deficiency the runtime must
-correct.
-
-Concretely, the system prompt carries identity, the authority boundary, runtime
-state, harness protocol and product constraints — and no method. It does not
-say when to plan, how to investigate, which tool to prefer, or when to stop
-retrying. An advisory injected mid-turn repairs a protocol state and names the
-operation that resolves it; it never reads the model's reasoning back to it.
-`docs/ARCHITECTURE.md` §12.1.
-
-The line is ownership, not effort:
-
-```text
-ENGINEERING FAILURE   → the Runtime handles it.
-MODEL CAPABILITY LIMIT → the model owns it.
-```
-
-Runtime reliability and provider compatibility are separate concerns and stay
-fully mandatory. `persist-before-forward`, F7 Grounded Authority, ToolHost
-admission, permission, approval, the ownership fence, sandboxing, path safety,
-CAS, stale-write protection, atomic mutation, rollback, crash recovery,
-cancellation and the EvidenceLedger compensate for machines, concurrency and
-attackers — never for reasoning. Provider capability differences (tool calling,
-streaming, reasoning transport, structured output, context and output limits,
-wire format) are protocol facts owned by `leveler-model` / `leveler-protocol` /
-`leveler-provider`; negotiate and report them, do not grow a second behavioural
-path from them.
-
-"a weaker model needs this" is not a reason to add or keep anything.
-`docs/ARCHITECTURE.md` §1.1 carries the detail and the decision test.
-
-## The tool rules
-
-```text
-Tools are adapters, not runtimes.
-
-The Foundation tool boundary is leveler-agent-core::ToolRuntime.
-
-Tool dependencies are explicit; tools do not receive a universal service
-locator.
-
-ToolHost admits; Host Execution performs.
-
-Policy belongs to the Harness and the ToolHost, not to ToolRegistry or to
-individual tools.
-
-Capability complexity belongs to the capability owner.
-
-Authoritative runtime facts do not hide in arbitrary JSON metadata.
-
-Do not introduce a generic Tool Core without demonstrated need.
-```
-
-Three more, on what the model sees:
-
-- **The harness decides the tool surface.** Expose the smallest surface that
-  preserves capability. Many capabilities is not many tools per round.
-- **A tool earns its place by expressing a distinct model intent**, exposing a
-  distinct capability, having deterministic semantics, or removing round trips
-  a competent model would otherwise pay. Not by rescuing a weak one.
-- **Architecture correctness is settled by mechanical evidence; product-surface
-  value is settled by evaluation.** A proven implementation defect — wrong
-  ownership, non-deterministic semantics, a duplicate runtime path, platform
-  divergence, runtime capability living in a tool adapter — is fixed directly.
-  Removing a *capability* the product may depend on is where measurement is
-  owed.
-- **The surface is composed, not inherited.** Every model-visible tool is in
-  one category — core primitive, optional pack, harness control, extension —
-  and every pack's condition is a mechanical fact about the host. A condition
-  may never read the task or the model. `docs/ARCHITECTURE.md` §6.2.
-
-`docs/ARCHITECTURE.md` §5 and §6 carry the detail. Do not copy it here.
-
-## Anti-overengineering rule
-
-Do not add a crate, trait, manager, coordinator, supervisor, factory, adapter
-layer or generic framework because of "future extensibility", "clean
-architecture", "maybe useful later" or "more generic".
-
-A new abstraction needs at least one of:
-
-- two real implementations that need it;
-- a real dependency-inversion boundary;
-- an observed coupling or ownership defect;
-- an independent protocol, security, persistence or runtime boundary.
-
-Otherwise prefer the concrete implementation. In particular: do **not**
-pre-build interfaces for a Review or multi-agent product that does not exist
-yet. The architecture must *allow* them to appear. That is not the same as
-implementing them now.
-
-Two proposals are already rejected, not deferred. Do not revive either without
-new evidence: a generic `leveler-tool-core` crate (the foundation tool
-boundary already exists, `docs/ARCHITECTURE.md` §5.1), and a replacement
-container for `ToolContext` designed before the capability extraction it is
-meant to serve (§5.5).
-
-Simplify by moving complexity to its correct owner. Never by deleting
-reliability: `persist-before-forward`, the ownership fence, compare-and-swap
-edits, stale-write protection, sandboxing, approval and crash recovery all
-survive every move intact.
-
-## Architecture decision test
-
-Before changing anything in the foundation, answer:
-
-- Why does this belong in this layer?
-- Is this runtime mechanism, or product semantics?
-- Does this introduce a new source of truth?
-- Does this create a reverse dependency?
-- Could it stay in the harness instead?
-- Would a Review harness need this too?
-- Would implementing Review require changing the agent kernel?
-- Is this abstracting a real duplication, or an imagined future?
 
 ---
 
-# Working rules
+# 二、执行边界
 
-## Documentation ownership
+不同风险等级的任务采用不同执行方式。
 
-One rule, one canonical owner. Everywhere else links or summarizes.
-
-| Concern | Owner |
+| 任务类型 | 执行方式 |
 | --- | --- |
-| Architecture | `docs/ARCHITECTURE.md` |
-| Agent / contributor constitution | this file |
-| Contribution workflow and checks | `CONTRIBUTING.md` |
-| Released changes | `CHANGELOG.md` |
-| Security policy | `SECURITY.md` |
-| Evaluation | `evals/README.md` |
+| 文案、颜色、图标、间距、小样式 | 可直接修改并验证 |
+| 小 Bug 修复 | 先定位根因，再最小修改 |
+| 表单校验、错误提示、交互优化 | 可直接修改，但不要扩大范围 |
+| 数据库结构变更 | 必须先给方案并等待确认 |
+| 权限模型变更 | 必须先给方案并等待确认 |
+| API 契约变更 | 必须先给方案并等待确认 |
+| 部署脚本、线上服务变更 | 必须先给方案并等待确认 |
+| 大范围重构 | 必须先给方案并等待确认 |
+| 新增核心模块 | 必须先给方案并等待确认 |
+| 架构边界变化 | 必须先说明 Owner、影响范围和替代方案，并等待确认 |
 
-Do not copy a rule set from one of these into another. Two documents stating
-the same rule is how they start disagreeing.
+判断标准不是“代码量”，而是是否改变长期契约、状态、数据、Authority 或模块责任。
 
-## The unsafe policy has exactly one exception
+---
 
-Every crate but one carries `#![forbid(unsafe_code)]`. `leveler-execution` is
-deliberately different: `crates/leveler-execution/src/lib.rs` uses
-`#![deny(unsafe_code)]`, because `forbid` cannot be relaxed by a scoped
-`allow`, and this crate needs exactly one — the Linux `PR_SET_PDEATHSIG`
-pre-exec hook in `command.rs` / `background.rs`, the only way to guarantee
-grandchildren die when the parent is force-killed.
+# 三、开发工作流
 
-**Do not "fix" that `deny` into a `forbid`.** It will not compile, and the
-reason is documented at the declaration. In the production crates covered by
-these crate-level attributes, a new `unsafe` block still fails the build unless
-it is explicitly allowed and justified the same way.
+## 1. 小任务
 
-## Language conventions
+小任务不要走重流程，按最短闭环执行：
 
-- **Code comments and doc comments: English.**
-- **User-visible strings and TUI copy: Chinese is expected** where the product
-  surface is Chinese (see `crates/leveler-execution/src/risk.rs`, where
-  permission-profile names carry their Chinese label).
-- **Test fixtures: either**, as the case requires.
-- Top-level docs that need a Chinese version use the `.zh-CN.md` suffix
-  alongside the English original, not a mixed-language file.
+```text
+明确目标
+  ↓
+定位相关文件
+  ↓
+最小修改
+  ↓
+运行验证
+  ↓
+自检是否改多
+```
 
-## Tests
+不要为了两行修改先写一份十步计划。
 
-- Integration tests go in `crates/<crate>/tests/`.
-- Unit tests are inline `#[cfg(test)] mod tests` in the file under test. Keep a
-  test next to what it covers rather than inventing a parallel structure.
-- A test needing an OS capability that may be absent must use the project's
-  existing capability checks, not assume the feature exists.
+## 2. 复杂任务
 
-## Before you propose a refactor
+复杂任务才进入规划流程：
 
-This codebase has several files over 2000 lines, and they attract mechanical
-"split this up" suggestions. Two failure modes to avoid:
+```text
+分析问题
+  ↓
+拆解任务
+  ↓
+给出方案
+  ↓
+用户确认
+  ↓
+执行修改
+  ↓
+验证结果
+  ↓
+必要时归档记录
+```
 
-1. **Do not infer a file's contents from its line count.** Command
-   classification lives in `approval.rs`, shell-AST danger analysis in
-   `shell_ast.rs`, risk vocabulary in `risk.rs` — not in `command.rs`, which
-   is what a line-count-driven reading tends to assume. Read the file.
-2. **Line counts include inline tests.** `command.rs` measures 2649 lines when
-   ~1501 of them are `mod tests`. Compare production code, not totals.
+复杂任务通常包括：
 
-Also note: in Rust 2018+, `foo.rs` and a `foo/` directory coexist. Adding a
-submodule does not require renaming the parent to `foo/mod.rs`.
+- 多模块联动；
+- 架构变化；
+- 数据模型变化；
+- 权限模型变化；
+- API 契约变化；
+- 大范围迁移；
+- 线上风险操作。
 
-Splitting a file inside one crate does **not** reduce incremental compile time
-— rustc's unit is the crate. Split for readability, and say so; do not claim a
-build-time benefit that will not materialize.
+## 3. OpenSpec
 
-## Verifying a change
+只有项目本身已经使用 OpenSpec 时才遵循 OpenSpec 流程，不为了流程完整临时引入 OpenSpec。
 
-The commands are in `CONTRIBUTING.md`. Run them; do not report a change as
-working on the strength of a successful `cargo build` alone. When a test fails
-for an environment reason rather than the change, say which test and why —
-silently skipping is worse than a documented gap.
+如果项目使用 OpenSpec：
+
+| 场景 | 是否走 OpenSpec |
+| --- | --- |
+| 架构变化 | 是 |
+| 数据模型变化 | 是 |
+| 权限模型变化 | 是 |
+| API 契约变化 | 是 |
+| 多模块联动改造 | 是 |
+| 普通 UI 调整 | 否 |
+| 小 Bug 修复 | 否 |
+| 文案调整 | 否 |
+
+---
+
+# 四、粒度控制
+
+动手前按四个维度收口：
+
+| 维度 | 要求 |
+| --- | --- |
+| 文件 | 预计修改哪些文件 |
+| 动作 | 每个文件具体做什么 |
+| 验证 | 用什么命令、测试或页面验证 |
+| 完成 | 什么客观结果算完成 |
+
+复杂任务需要明确这四项。
+
+简单任务可以在脑中完成，不必为了形式额外输出。
+
+---
+
+# 五、工程规范
+
+1. 不捏造数据、接口行为、测试结果或运行结果。
+2. 生产代码禁止 Mock。
+3. Mock 只允许用于测试或本地调试，不能混入真实业务逻辑。
+4. 不写用户没有要求的功能。
+5. 不做单次使用的抽象。
+6. 不重构无关代码。
+7. 不格式化无关文件。
+8. 不删除原本存在的死代码，除非用户明确要求。
+9. 自己造成的 unused import、unused variable、孤儿代码必须清理。
+10. 不因为“未来可能会用”提前建设框架。
+11. 不为了架构图对称而拆 crate、加 trait 或加层。
+12. 一个事实、一个责任、一个权威 Owner。
+
+---
+
+# 六、错误处理原则
+
+## 禁止
+
+| 禁止项 | 说明 |
+| --- | --- |
+| 静默吞错 | catch 后不处理、不记录、不返回 |
+| 假成功 | 实际失败却返回成功 |
+| 猜测式修复 | 不定位根因，只靠 if / else 糊住 |
+| 启发式补丁 | 用不严谨规则修补数据、状态或语义 |
+| 掩盖根因的兜底 | 让问题暂时不报错，但真实原因仍然存在 |
+| 偷换语义的 fallback | 原操作失败后悄悄换成另一种含义不同的操作 |
+
+## 允许
+
+| 允许项 | 说明 |
+| --- | --- |
+| 参数校验 | 明确拒绝非法输入 |
+| 明确错误返回 | 让调用方知道什么失败、为什么失败 |
+| 超时控制 | 避免请求无限卡死 |
+| 可观测日志 | 方便定位问题 |
+| 有边界的重试 | 只用于网络抖动等明确的暂态故障 |
+| 等价实现 fallback | 只有在语义完全等价时才允许 |
+
+错误处理的目标不是“不报错”，而是**真实、可定位、可恢复**。
+
+---
+
+# 七、命令执行规则
+
+## 可直接执行
+
+| 类型 | 示例 |
+| --- | --- |
+| 查看文件 | `cat`、`sed`、`rg`、`grep` |
+| 查看状态 | `git status`、`git diff` |
+| 本地测试 | `npm test`、`go test`、`cargo test` |
+| 本地检查 | `lint`、`typecheck`、`cargo check`、`cargo clippy` |
+| 本地请求 | `curl localhost` |
+| 只读 Git 查询 | `git log`、`git show`、`git branch --show-current` |
+
+## 必须先确认
+
+除非用户在本次任务中已经明确要求，否则以下操作必须先确认：
+
+| 类型 | 示例 |
+| --- | --- |
+| 删除文件 | `rm`、清空目录 |
+| 数据库高风险写操作 | `drop`、`truncate`、批量 `update` |
+| Git 写操作 | `commit`、`push`、`reset`、创建 / checkout 新分支 |
+| worktree 操作 | 创建、删除 worktree |
+| 线上操作 | deploy、restart、reload 线上服务 |
+| 不可逆迁移 | 数据重写、历史重写、大规模删除 |
+
+禁止把高风险命令拆成多个“小命令”来规避确认。
+
+---
+
+# 八、子代理与上下文
+
+复杂问题优先拆成独立边界清楚的子任务。
+
+如果当前工具支持子代理，可以把真正独立的工作分出去，例如：
+
+- 一边审查架构；
+- 一边定位具体实现；
+- 一边检查测试覆盖。
+
+如果不支持子代理，就在主流程里保持任务边界清晰，不强行依赖子代理。
+
+子代理不能创建第二套事实、权限、生命周期或任务管理体系。
+
+---
+
+# 九、lessons.md
+
+如果仓库存在 `lessons.md`，开始新任务前应快速查看与当前任务相关的内容。
+
+只有出现可复用教训时才更新：
+
+| 应该记录 | 不必记录 |
+| --- | --- |
+| 用户明确纠正了工程规范 | 单次文案偏好 |
+| 某类 Bug 反复出现 | 临时调试过程 |
+| 项目存在固定实现方式 | 一次性需求 |
+| 重要架构约束 | 已经解决的普通问题 |
+| 容易重复踩坑的环境约束 | 某一次命令输出 |
+
+不要为了“有记录”而写流水账。
+
+---
+
+# 十、输出规范
+
+1. 结论先行。
+2. 默认中文输出。
+3. 多项对比、评审、任务拆解优先用 Markdown 表格。
+4. 简单问题直接回答，不强行表格。
+5. 不复读用户背景。
+6. 不做陈述式流水账。
+7. 不使用 P0 / P1 / P2。
+8. 对风险、失败、未验证项明确说明。
+9. 如果使用了特定 skill、工具或特殊流程，最后简单说明；没用就不写。
+10. 修改代码后说明“改了什么 + 怎么验证 + 是否存在剩余风险”，不要复制大段代码差异。
+
+---
+
+# 十一、CodeLeveler 文档入口
+
+修改本项目之前，按任务需要阅读对应权威文档：
+
+| 文档 | 负责内容 |
+| --- | --- |
+| `docs/ARCHITECTURE.zh-CN.md` | 系统架构、职责边界、允许与禁止、演进方向 |
+| `docs/ARCHITECTURE.md` | 英文等价架构文档 |
+| `CONTRIBUTING.md` | 贡献流程、检查命令、代码约定 |
+| `evals/README.md` | Eval 设计与新增评测规则 |
+| `SECURITY.md` | 安全规则 |
+| `CHANGELOG.md` | 已发布变化 |
+
+不要在 `AGENTS.md` 再复制完整架构。
+
+---
+
+# 十二、CodeLeveler 架构门禁
+
+CodeLeveler 最短的架构模型是：
+
+```text
+模型拥有智能。
+领域适配层拥有领域语义。
+运行时拥有生命周期与机械正确性。
+能力层拥有可复用能力。
+宿主执行权威拥有受控真实副作用。
+每一个持久事实只有一个权威源。
+产品展示运行时事实，不创造运行时事实。
+```
+
+最核心的生命周期原则：
+
+> **引擎管理生命周期，不管理智能。**
+>
+> Engine owns lifecycle, not agent intelligence.
+
+任何修改只要破坏这条边界，就不是局部实现问题，而是架构问题。
+
+## 可以做
+
+允许：
+
+- 在对应领域适配层增加领域语义；
+- 给运行时增加真正领域中立的生命周期机制；
+- 增加职责明确、可复用的能力；
+- 用薄工具把能力暴露给模型；
+- 增加新的模型服务与协议适配；
+- 增加新的客户端、领域适配层和执行后端；
+- 在真实第二消费者或真实边界出现后增加抽象；
+- 持续加强可靠性、恢复、取消、持久化和执行权威。
+
+完整规则以 `docs/ARCHITECTURE.zh-CN.md` 的“什么可以做，什么不能做”为准。
+
+## 不能做
+
+禁止：
+
+- 把编程、评审或产品完成语义下沉到智能体内核、引擎或基础层；
+- 让运行时替较弱模型规划、调查、决定下一步；
+- 根据模型强弱改变机械能力语义；
+- 在宿主执行权威之外建立第二套文件、进程、权限、审批、沙箱或写入路径；
+- 让工具成为 Service Locator、全局策略中心、持久状态 Owner 或进程生命周期 Owner；
+- 为同一个持久事实建立两个权威源；
+- 让通用层反向依赖具体产品；
+- 通过 fallback 偷换一次操作的含义；
+- 为假想未来提前建设 crate、trait、manager、registry、framework；
+- 让 Child Agent / Worker / Reviewer 建立第二套生命周期、权限、Ownership 或持久化体系；
+- 把本地机器假设写进核心智能体语义。
+
+---
+
+# 十三、CodeLeveler 架构决策检查
+
+改 Foundation、Runtime、Capability、Authority 或跨层代码前，先回答：
+
+```text
+这件事的 Owner 是谁？
+
+它是领域语义，还是机械机制？
+
+它能不能留在领域适配层？
+
+一个完全不同领域的智能体也需要它吗？
+
+它是否引入新的 Authority？
+
+它是否制造第二个持久真相源？
+
+它是否产生反向依赖？
+
+它是否改变现有能力的语义？
+
+这个抽象是在解决真实边界，还是假想未来？
+```
+
+如果 Owner 说不清，不要先写代码。
+
+如果为了新增一个领域适配层必须教智能体内核认识这个领域的词汇，边界就是错的。
+
+---
+
+# 十四、反过度设计
+
+CodeLeveler 特别强调：**允许未来演进，不等于提前实现未来。**
+
+不要因为以下理由增加抽象：
+
+```text
+以后可能扩展
+看起来更干净
+以后也许会复用
+更通用
+和另一块更对称
+```
+
+新的 crate、trait、manager、coordinator、supervisor、registry、factory、adapter layer 或通用 framework，至少需要一个真实驱动力：
+
+- 两个真实实现或消费者；
+- 真实依赖倒置边界；
+- 独立安全边界；
+- 独立协议边界；
+- 独立持久化边界；
+- 独立生命周期或远程部署边界；
+- 已观察到的 Ownership / 耦合问题。
+
+否则优先保留具体实现。
+
+架构必须允许未来的 Review、Multi-Agent、Remote、Cloud，但不要在真实产品需求出现之前为它们造框架。
+
+---
+
+# 十五、模型与 Provider 规则
+
+不同模型和 Provider 的差异，首先是协议与机械能力差异，不是智能策略差异。
+
+新增或修改模型接入时：
+
+- 如实表达真实机械能力；
+- wire format 差异在 Provider / Protocol 层适配；
+- 显式做 Capability Negotiation；
+- 缺少必需机械能力时关闭依赖功能；
+- 不为了让不同模型“看起来一样”增加第二套领域行为；
+- 不因为模型更弱，就让 Runtime 偷偷替它思考。
+
+模型能力不足不是 Runtime Bug。
+
+---
+
+# 十六、工具与能力规则
+
+加 Tool 之前先问：
+
+> 系统缺的是一个新的真实能力，还是只是模型需要一个新的调用入口？
+
+关系应该保持：
+
+```text
+模型意图
+  ↓
+工具
+  ↓
+能力
+  ↓
+宿主执行权威（涉及真实副作用时）
+```
+
+工具应该是薄适配器。
+
+不要：
+
+- 在 Tool 内复制通用 Runtime；
+- 给所有 Tool 一个装着所有服务的万能 Context；
+- 把权限、审批、全局策略放进 Tool dispatch；
+- 把持久真相藏进任意 JSON metadata；
+- 因为某个模型不会用已有工具就复制一个语义重叠的新工具。
+
+---
+
+# 十七、多智能体规则
+
+Multi-Agent 是共享 Runtime 上的多个智能体生命周期协作，不是第二套 Agent 系统。
+
+Explorer、Worker、Reviewer、Specialist 等角色可以拥有不同领域语义和能力集合，但必须共享 Runtime 的机械规则：
+
+```text
+生命周期
+持久化
+Ownership
+Authority
+取消
+结算
+```
+
+禁止把角色语义写进通用 Engine。
+
+禁止 Child Agent 绕开父任务的权限、Ownership 或持久化规则。
+
+---
+
+# 十八、Unsafe 规则
+
+生产代码应拒绝未经审查的 `unsafe`。
+
+`leveler-execution` 是宿主执行权威边界，可能存在为 OS 级进程语义所需的极小范围 `unsafe`。
+
+不要机械地把已有 `deny` 改成 `forbid`，也不要因为方便新增 `unsafe`。
+
+新增 `unsafe` 必须满足：
+
+- 有明确 OS / Runtime 必要性；
+- 无安全的等价方案；
+- 范围最小；
+- 附带清楚的安全理由；
+- 不扩大到其他 crate。
+
+---
+
+# 十九、语言与文档规则
+
+- 代码注释和 Rust doc comment：英文。
+- 用户可见文案：根据产品界面语言决定，可使用中文。
+- 测试数据：按场景选择中文或英文。
+- 顶层双语文档：英文原版 + `.zh-CN.md` 中文版，不混写成一份。
+- 架构中英文任一版本发生语义变化，同一任务内同步另一版。
+- 中文架构文档以中文概念为主，必要时首次出现括注英文术语。
+
+---
+
+# 二十、测试与验证
+
+Canonical 验证命令以 `CONTRIBUTING.md` 为准。
+
+基本要求：
+
+- 单元测试尽量靠近实现；
+- 集成测试放在 `crates/<crate>/tests/`；
+- 可选 OS 能力必须先检测，不能假定存在；
+- 架构边界如果能机械验证，就应该有边界测试；
+- 不为了文件结构对称而增加测试；
+- 测试行为、契约、Ownership 和边界，而不是测试实现细节。
+
+不要因为 `cargo build` 成功就宣称修改完成。
+
+如果某项验证因环境无法执行，明确写出：
+
+```text
+哪项没有跑
+为什么不能跑
+因此还不能证明什么
+```
+
+不得静默跳过。
+
+---
+
+# 二十一、重构前检查
+
+不要根据文件名或行数推断架构。
+
+提重构前：
+
+1. 先读真实生产代码。
+2. 区分生产代码和 inline tests。
+3. 确认当前责任 Owner。
+4. 明确真实的耦合、维护或正确性问题。
+5. 判断问题是在 crate 内部，还是确实需要新的架构边界。
+6. 再决定是否拆文件、拆模块或拆 crate。
+
+Rust 的编译单元是 crate。
+
+把一个 Rust 文件拆成多个文件，并不会因为“文件更小”自动提升增量编译速度。
+
+拆文件是可读性决策；拆 crate 才是编译与依赖边界决策。
+
+---
+
+# 二十二、完成定义
+
+一次修改只有同时满足以下条件才算完成：
+
+```text
+需求目标已满足
+改动范围没有扩大
+根因而不是症状被处理
+相关验证已执行
+失败和未验证项已明确说明
+没有自己造成的无用代码
+没有破坏架构边界
+没有引入第二个权威源
+没有明显更简单但被忽略的方案
+```
+
+完成不是“代码写完”，而是**目标、范围、正确性和边界同时闭环**。
