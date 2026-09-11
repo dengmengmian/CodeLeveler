@@ -27,10 +27,12 @@ bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Ex
 CodeLeveler 目前处于 public beta：**`0.2.0-beta.1`**，以 pre-release 形式发布
 （见[安装 beta](#1-安装)）。最新 stable 版本是 `0.1.4`。
 
-**beta 只提供 macOS 与 Linux 二进制。** Windows、macOS 和 Linux 都在 CI 里跑完整
-测试；macOS 与 Linux 全绿，Windows 编译、lint 与安全 canary 通过，但仍有三个测试
-失败（见 [`CHANGELOG.md`](CHANGELOG.md)）。与其发一个测试没全绿的二进制，不如让
-Windows 留在 stable `0.1.4`（它有 Windows 构建），等这三个失败在真机上诊断清楚。
+**已发布的 beta 只带 macOS 与 Linux 二进制。** 三个平台都在 CI 里跑完整测试，而且
+三个都是绿的：Windows 的编译、lint、安全 canary、Edge 浏览器验收与 workspace 测试
+全部通过。`0.2.0-beta.1` 的 tag 打在这部分工作落地之前，所以挂在它下面的二进制早于
+这些改动；需要 Windows 构建目前仍看 `0.1.4`。Windows 无法按进程断网——AppContainer
+之外没有这个机制，而 AppContainer 会让工具链读不到——所以要求断网的命令会被拒绝，
+不会放开网络偷跑（见 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ## 三个专注的工具，一套工作流
 
@@ -214,7 +216,7 @@ CodeLeveler 可以修改文件和执行本地命令，因此安全边界会明�
 
 | 平台 | 进程控制 | 受限命令执行 |
 | --- | --- | --- |
-| Windows | Job Objects | 能力可用时使用 AppContainer 和 ACL 限制 |
+| Windows | Job Objects | 子进程降到 Low integrity，授权写入 root 打 Low 标签 |
 | macOS | 进程组取消 | Seatbelt profile |
 | Linux | 进程组取消 | Bubblewrap |
 
