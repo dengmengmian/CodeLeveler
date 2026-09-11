@@ -20,6 +20,7 @@ import type {
   PermissionProfile,
   RuntimeEvent,
   SessionId,
+  UiMemoryKind,
   UiSessionSnapshot,
 } from '../types/protocol';
 
@@ -710,10 +711,32 @@ export class RuntimeBridge {
     this.listMemory();
   }
 
+  /** 归档一条已保存的记忆。只对 active 条目有效。 */
   forgetMemory(id: string): void {
     const current = this.getState().current;
     if (!current) return;
     this.deliver({ type: 'forget_memory', session_id: current.id, id });
+    this.listMemory();
+  }
+
+  /** 拒绝一条待确认候选，并压制同一信号再次提议。
+   *
+   * 不能用 forgetMemory 代替：forget 只处理 active/archive，把 pending 的 id
+   * 发给它什么也不会发生 —— 这正是 pending 行「忽略」按钮原来的 bug。 */
+  rejectMemory(id: string): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'reject_memory', session_id: current.id, id });
+    this.listMemory();
+  }
+
+  /** 用户自己直接写入一条记忆：不经过模型，也不产生待确认候选。 */
+  rememberMemory(body: string, kind: UiMemoryKind): void {
+    const current = this.getState().current;
+    if (!current) return;
+    const text = body.trim();
+    if (!text) return;
+    this.deliver({ type: 'remember_memory', session_id: current.id, body: text, kind });
     this.listMemory();
   }
 

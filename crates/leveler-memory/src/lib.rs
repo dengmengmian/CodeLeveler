@@ -13,7 +13,8 @@ mod pipeline;
 
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, fingerprint_of, looks_like_secret,
-    package_manager_from_root, parse_explicit_remember_intent,
+    package_manager_from_root, parse_direct_memory_command, parse_inferred_preference,
+    title_from_body,
 };
 pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
 
@@ -247,6 +248,93 @@ impl MemoryStore {
     }
 
     /// BM25-ish lexical search over active titles + bodies + tags.
+    /// THE way a new active memory comes into being.
+    ///
+    /// Every caller that creates active memory goes through here — `/remember`,
+    /// the Web panel, the CLI, an approved agent proposal, and accepting a
+    /// candidate. Before this existed each one picked between `remember`
+    /// (upsert by id) and `remember_deduplicated` and decided overwrite,
+    /// dedup and pending cleanup for itself; the CLI picked the upsert and
+    /// silently destroyed same-titled notes.
+    ///
+    /// Guarantees: never overwrites; identical title+body returns the
+    /// entry that already exists (so a retry is idempotent); the same title
+    /// with different content gets its own id; secrets are refused here rather
+    /// than in each UI; and an equivalent pending candidate is cleaned up once
+    /// the active copy is durable — a failure to clean up leaves the active
+    /// entry in place rather than rolling it back.
+    pub fn activate(
+        &self,
+        title: &str,
+        body: &str,
+        kind: MemoryKind,
+        tags: Vec<String>,
+    ) -> Result<MemoryEntry, MemoryError> {
+        let mut entry = new_entry(title, body, tags);
+        entry.kind = Some(kind.as_str().to_string());
+        // `remember_deduplicated` already owns the hard parts: a hard-link
+        // reservation so concurrent writers cannot claim one id, an identical
+        // title+body returning what is there, and a `-N` suffix otherwise.
+        // `validate_entry` inside it is where a credential is refused.
+        let saved = self.remember_deduplicated(entry)?;
+        // Best effort, deliberately after the active copy is durable: a
+        // candidate left behind would ask the user to approve what is already
+        // stored, but failing to remove it is not a reason to lose the write.
+        // The domain deliberately takes no logger; a failure here is healed by
+        // `list_pending`, which drops covered candidates on the next read.
+        let _ = self.clear_equivalent_pending(&saved);
+        Ok(saved)
+    }
+
+    /// Drop pending candidates whose content this active entry now covers.
+    ///
+    /// Also run from [`Self::list_pending`], so a crash between the two steps
+    /// heals on the next read instead of leaving a permanent duplicate.
+    fn clear_equivalent_pending(&self, active: &MemoryEntry) -> Result<(), MemoryError> {
+        for candidate in self.list_pending_raw()? {
+            if candidate.body.trim() == active.body.trim() {
+                let _ = fs::remove_file(self.pending_path(&candidate.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Titles the model may ask about but which are NOT injected every turn.
+    ///
+    /// Replaces the old "all active titles" index. Its one job is discovery:
+    /// when query recall misses on wording, a decision or note can still be
+    /// found by title and read with the `memory` tool. Preferences are excluded
+    /// because they are already injected in full, derived and sensitive entries
+    /// because they must never reach the model this way.
+    pub fn catalog_lines(&self, max_entries: usize) -> Result<String, MemoryError> {
+        let mut entries: Vec<MemoryEntry> = self
+            .list_active()?
+            .into_iter()
+            .filter(|e| {
+                !is_sensitive(e)
+                    && matches!(
+                        MemoryKind::of(e),
+                        MemoryKind::Decision | MemoryKind::Note | MemoryKind::LegacyUnknown
+                    )
+            })
+            .collect();
+        // Newest first: a cap that dropped the most recent decisions would
+        // hide exactly the ones a turn is most likely to need.
+        entries.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        entries.truncate(max_entries);
+        Ok(entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| format!("{}. [{}] {}", i + 1, e.id, e.title))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     /// Active entries that are LASTING PREFERENCES, for unconditional
     /// injection.
     ///
@@ -264,7 +352,7 @@ impl MemoryStore {
         let mut out: Vec<MemoryEntry> = self
             .list_active()?
             .into_iter()
-            .filter(is_standing_preference)
+            .filter(|e| is_standing_preference(e) && !is_sensitive(e))
             .collect();
         out.sort_by(|a, b| {
             a.created_at
@@ -290,7 +378,7 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, f64)>, MemoryError> {
         let mut hits = self.search(query, limit.saturating_add(DERIVED_RECALL_SLACK))?;
-        hits.retain(|(entry, _)| !is_derived_fact(entry));
+        hits.retain(|(entry, _)| !is_derived_fact(entry) && !is_sensitive(entry));
         hits.truncate(limit);
         Ok(hits)
     }
@@ -360,6 +448,15 @@ fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
     if entry.id.contains('/') || entry.id.contains('\\') || entry.id.contains("..") {
         return Err(MemoryError::Invalid("id must be a plain slug".to_string()));
     }
+    // The ONE place a credential is refused. Putting it in each UI, CLI and
+    // tool would mean four copies of the rule and four chances to forget it.
+    // Entries already on disk are not touched here — they are withheld from
+    // every automatic path instead (see `is_sensitive`).
+    if looks_like_secret(&entry.title) || looks_like_secret(&entry.body) {
+        return Err(MemoryError::Invalid(
+            "refusing to store what looks like a credential".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -423,6 +520,62 @@ const DERIVED_LABELS: [&str; 1] = ["package_manager"];
 /// does not silently shrink a full page of results.
 const DERIVED_RECALL_SLACK: usize = 8;
 
+/// What a memory IS, which decides how it reaches the model.
+///
+/// Stored as the existing free-form `kind` string so old JSON keeps loading;
+/// this type is the parse boundary, not a schema change. `LegacyUnknown` is
+/// deliberately distinct from `Note`: an entry written before the label
+/// existed must not be promoted to a standing preference on a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// Injected every turn while it is active.
+    Preference,
+    /// A decision worth keeping; reachable by query recall and the catalog.
+    Decision,
+    /// Everything else worth keeping; same reach as a decision.
+    Note,
+    /// Pre-dates the label. Query-only.
+    LegacyUnknown,
+    /// A fact read out of the repository. Kept, never injected.
+    Derived,
+}
+
+impl MemoryKind {
+    /// The wire/disk label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preference => "preference",
+            Self::Decision => "decision",
+            Self::Note => "note",
+            Self::LegacyUnknown => "unknown",
+            Self::Derived => "package_manager",
+        }
+    }
+
+    /// Parse a stored entry's labels. `key` is consulted because older derived
+    /// entries carry the marker there and not in `kind`.
+    pub fn of(entry: &MemoryEntry) -> Self {
+        if is_derived_fact(entry) {
+            return Self::Derived;
+        }
+        match entry.kind.as_deref().map(str::trim) {
+            Some("preference") => Self::Preference,
+            Some("decision") => Self::Decision,
+            Some("note") => Self::Note,
+            _ if entry.tags.iter().any(|t| t.trim() == "preference") => Self::Preference,
+            _ => Self::LegacyUnknown,
+        }
+    }
+}
+
+/// Whether this entry holds something that looks like a credential.
+///
+/// Legacy stores may already contain one: it is NOT deleted, but it is held
+/// back from every automatic path and from the model's own memory tools.
+pub fn is_sensitive(entry: &MemoryEntry) -> bool {
+    looks_like_secret(&entry.title) || looks_like_secret(&entry.body)
+}
+
 /// Whether this entry declares itself a lasting preference.
 ///
 /// A derived fact never counts, even when it carries a `preference` tag: the
@@ -465,10 +618,33 @@ pub(crate) fn slugify(title: &str) -> String {
     }
     let s = s.trim_matches('-').to_string();
     if s.is_empty() {
-        format!("mem-{}", now_rfc3339().replace([':', '+'], ""))
+        // A title with no ASCII at all — every CJK title — used to fall back to
+        // a SECOND-precision timestamp. That made the id depend on when the
+        // write happened: the same note saved twice across a second boundary
+        // got two ids (so re-saving duplicated instead of being idempotent),
+        // and two different notes inside one second got the SAME id (so one
+        // silently replaced the other). Derive it from the title instead, so
+        // the id is a function of the content and nothing else.
+        format!("mem-{}", short_hash(&s_for_hash(title)))
     } else {
         s.chars().take(48).collect()
     }
+}
+
+/// What the fallback id hashes. Split out so the test can state the rule.
+fn s_for_hash(title: &str) -> String {
+    title.trim().to_string()
+}
+
+/// Short stable hex hash (FNV-1a 64), the same family `fingerprint_of` uses.
+/// Not cryptographic — it only has to be stable and collision-shy for titles.
+fn short_hash(raw: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in raw.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
 }
 
 /// True for ideographic / kana / hangul scripts that write without spaces.
@@ -538,6 +714,284 @@ pub(crate) fn write_atomically_pub(path: &Path, bytes: &[u8]) -> Result<(), Memo
 
 #[cfg(test)]
 mod tests {
+    /// One fact must not end up as a direct write AND a candidate awaiting
+    /// consent: the user would be asked to approve what is already saved.
+    #[test]
+    fn one_fact_yields_one_active_and_no_pending_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let body = "提交前先运行 pnpm lint";
+
+        // A soft signal proposed it first.
+        let candidate = match store
+            .propose_from_user_text(&format!("我通常希望{body}"))
+            .unwrap()
+            .unwrap()
+        {
+            ProposeOutcome::Pending(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+
+        // Then the same content is activated (an approved agent proposal, or
+        // the user writing it directly).
+        store
+            .activate(
+                &candidate.title,
+                &candidate.body,
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+
+        assert_eq!(store.list_active().unwrap().len(), 1, "one active");
+        assert_eq!(
+            store.list_pending().unwrap().len(),
+            0,
+            "no residue asking to approve what is stored"
+        );
+    }
+
+    /// Crash residue heals on read: an activation that died before clearing
+    /// the candidate must not leave a permanent duplicate.
+    #[test]
+    fn list_pending_heals_residue_left_by_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let body = "提交前先运行 pnpm lint";
+        let candidate = match store
+            .propose_from_user_text(&format!("我通常希望{body}"))
+            .unwrap()
+            .unwrap()
+        {
+            ProposeOutcome::Pending(c) => c,
+            other => panic!("{other:?}"),
+        };
+        // Active copy written directly, simulating a crash before cleanup.
+        let mut entry = new_entry(&candidate.title, &candidate.body, vec![]);
+        entry.kind = Some("preference".into());
+        store.remember(entry).unwrap();
+        assert_eq!(
+            store.list_pending_raw().unwrap().len(),
+            1,
+            "residue present"
+        );
+
+        assert_eq!(
+            store.list_pending().unwrap().len(),
+            0,
+            "the next read reconciles it away"
+        );
+    }
+
+    /// The fallback id must come from the content, never from the clock: a
+    /// second-precision timestamp made the same note duplicate across a second
+    /// boundary and two different notes collide inside one.
+    #[test]
+    fn a_cjk_title_gets_a_content_derived_id() {
+        let a = slugify("状态色约定");
+        let b = slugify("状态色约定");
+        let c = slugify("搜索框过滤范围");
+        assert_eq!(a, b, "same title, same id, whatever the clock says");
+        assert_ne!(a, c, "different titles must not collide");
+        assert!(a.starts_with("mem-"), "{a}");
+        assert!(!a.contains(':') && !a.contains('T'), "not a timestamp: {a}");
+    }
+
+    // ---- canonical activation ----
+
+    /// Retrying the same direct write must not pile up copies.
+    #[test]
+    fn activating_identical_content_returns_the_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let a = store
+            .activate("终端输出", "保持紧凑", MemoryKind::Preference, vec![])
+            .unwrap();
+        let b = store
+            .activate("终端输出", "保持紧凑", MemoryKind::Preference, vec![])
+            .unwrap();
+        assert_eq!(a.id, b.id, "idempotent");
+        assert_eq!(store.list_active().unwrap().len(), 1);
+    }
+
+    /// The same title with different content is a second memory, never a
+    /// replacement — the bug that destroyed a user's earlier note.
+    #[test]
+    fn activating_a_repeated_title_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let a = store
+            .activate("部署说明", "第一版", MemoryKind::Note, vec![])
+            .unwrap();
+        let b = store
+            .activate("部署说明", "第二版完全不同", MemoryKind::Note, vec![])
+            .unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(store.list_active().unwrap().len(), 2);
+        assert!(store.read_active(&a.id).unwrap().body.contains("第一版"));
+    }
+
+    /// Two CJK-only titles written in the same second must both land.
+    #[test]
+    fn cjk_titles_do_not_collide_on_a_second_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let a = store
+            .activate("状态色约定", "用映射表", MemoryKind::Decision, vec![])
+            .unwrap();
+        let b = store
+            .activate("搜索框范围", "只按 payer", MemoryKind::Decision, vec![])
+            .unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(store.list_active().unwrap().len(), 2);
+    }
+
+    /// Secrets are refused at the domain boundary, so no UI, CLI or tool has
+    /// to remember to check — and none can forget to.
+    #[test]
+    fn activation_refuses_a_secret_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let err = store.activate(
+            "provider key",
+            "OPENAI_API_KEY=sk-live-abcdefghijklmnopqrstuvwxyz0123456789",
+            MemoryKind::Note,
+            vec![],
+        );
+        assert!(err.is_err(), "a credential must not become memory");
+        assert_eq!(store.list_active().unwrap().len(), 0);
+    }
+
+    /// Activating content a candidate already proposed clears that candidate:
+    /// leaving it would ask the user to approve what is already stored.
+    #[test]
+    fn activation_clears_an_equivalent_pending_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let text = "我通常希望提交前先跑 lint";
+        let candidate = match store.propose_from_user_text(text).unwrap().unwrap() {
+            ProposeOutcome::Pending(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+        store
+            .activate(
+                &candidate.title,
+                &candidate.body,
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(store.list_active().unwrap().len(), 1);
+        assert_eq!(
+            store.list_pending().unwrap().len(),
+            0,
+            "no residue asking for consent to what is already active"
+        );
+    }
+
+    // ---- catalog ----
+
+    /// The catalog exists for discovery of things NOT already injected.
+    #[test]
+    fn the_catalog_excludes_preferences_derived_and_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .activate("紧凑输出", "保持紧凑", MemoryKind::Preference, vec![])
+            .unwrap();
+        store
+            .activate("选了 SQLite", "三月的决定", MemoryKind::Decision, vec![])
+            .unwrap();
+        store
+            .activate("一条笔记", "随手记的", MemoryKind::Note, vec![])
+            .unwrap();
+        let mut derived = new_entry("Package manager", "uses pnpm", vec![]);
+        derived.kind = Some("package_manager".into());
+        store.remember(derived).unwrap();
+        // Legacy data predates the write boundary, so it is placed as a file
+        // rather than written through the API that now refuses it.
+        let mut secret = new_entry(
+            "legacy token",
+            "token=ghp_abcdefghijklmnopqrstuvwxyz0123",
+            vec![],
+        );
+        secret.kind = Some("note".into());
+        std::fs::write(
+            dir.path()
+                .join("active")
+                .join(format!("{}.json", secret.id)),
+            serde_json::to_string_pretty(&secret).unwrap(),
+        )
+        .unwrap();
+
+        let catalog = store.catalog_lines(16).unwrap();
+        assert!(catalog.contains("选了 SQLite"), "{catalog}");
+        assert!(catalog.contains("一条笔记"), "{catalog}");
+        assert!(
+            !catalog.contains("紧凑输出"),
+            "preference is already injected: {catalog}"
+        );
+        assert!(!catalog.contains("Package manager"), "{catalog}");
+        assert!(!catalog.contains("legacy token"), "{catalog}");
+        assert!(
+            !catalog.contains("随手记的"),
+            "no bodies in the catalog: {catalog}"
+        );
+    }
+
+    /// Newest first, so a cap can never hide the decisions just made.
+    #[test]
+    fn the_catalog_is_newest_first_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        for i in 0..6 {
+            let mut e = new_entry(&format!("决定 {i:02}"), "body", vec![]);
+            e.kind = Some("decision".into());
+            e.created_at = format!("2026-09-{:02}T00:00:00Z", i + 1);
+            e.updated_at = e.created_at.clone();
+            store.remember_deduplicated(e).unwrap();
+        }
+        let catalog = store.catalog_lines(3).unwrap();
+        assert_eq!(catalog.lines().count(), 3, "capped: {catalog}");
+        assert!(catalog.contains("决定 05"), "newest present: {catalog}");
+        assert!(!catalog.contains("决定 00"), "oldest dropped: {catalog}");
+    }
+
+    // ---- sensitive withheld from every automatic path ----
+
+    #[test]
+    fn a_sensitive_legacy_entry_is_kept_but_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut secret = new_entry(
+            "deploy token",
+            "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123",
+            vec!["preference".into()],
+        );
+        secret.kind = Some("preference".into());
+        // Legacy on-disk data: the write boundary would refuse it today.
+        std::fs::write(
+            dir.path()
+                .join("active")
+                .join(format!("{}.json", secret.id)),
+            serde_json::to_string_pretty(&secret).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(store.list_active().unwrap().len(), 1, "not deleted");
+        assert!(
+            store.standing_preferences(8).unwrap().is_empty(),
+            "never injected every turn"
+        );
+        assert!(
+            store.recall("deploy token", 4).unwrap().is_empty(),
+            "never query-recalled"
+        );
+        assert!(!store.catalog_lines(16).unwrap().contains("deploy token"));
+    }
+
     /// Only entries that declare themselves preferences are injected
     /// unconditionally; everything else stays query-conditioned.
     #[test]

@@ -436,7 +436,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 lines.push("  (none)".into());
             } else {
                 for e in &active {
-                    lines.push(format!("  [{}] {}", e.id, e.title));
+                    // A sensitive entry is kept but withheld from the model;
+                    // saying so is the difference between "stored" and "used".
+                    let mut row = format!("  [{}] {}", e.id, e.title);
+                    if let Some(kind) = &e.kind {
+                        row.push_str(&format!(" ({})", memory_kind_label(*kind)));
+                    }
+                    if e.sensitive {
+                        row.push_str(" · 敏感内容，不提供给模型");
+                    }
+                    lines.push(row);
                 }
             }
             lines.push(format!("archived ({})", archived.len()));
@@ -456,14 +465,34 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 for e in &pending {
                     lines.push(format!("  [{}] {}", e.id, e.title));
+                    // Approving a title alone is not informed consent: show a
+                    // compact preview of what would actually be stored.
+                    let body = e.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let preview: String = body.chars().take(160).collect();
+                    if !preview.is_empty() {
+                        let ellipsis = if body.chars().count() > 160 {
+                            "…"
+                        } else {
+                            ""
+                        };
+                        lines.push(format!("      {preview}{ellipsis}"));
+                    }
+                    lines.push(format!("      kind={} source={}", e.kind, e.source));
                 }
             }
             lines.push(if pending.is_empty() {
-                "hint: /memory forget <id>".into()
+                "hint: /remember <内容> · /memory forget <id>".into()
             } else {
-                "hint: /memory accept <id> · /memory forget <id>".to_string()
+                "hint: /memory accept <id> · /memory reject <id> · /memory forget <id>".to_string()
             });
             state.transcript.push_note(lines.join("\n"));
+            // A listing summary must not overwrite a specific message that
+            // just landed ("已保存记忆 [id]…"). The refresh follows the write,
+            // and on a one-line status bar it would erase the only
+            // confirmation the user gets.
+            if state.notification.is_some() {
+                return;
+            }
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
                 message: format!(
@@ -664,6 +693,17 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
 
 /// Drop any parked interaction the predicate matches — used when a resolution
 /// event names a request that is queued behind the active overlay rather than
+/// Short label for a memory kind, so a listing says how an entry reaches the
+/// model instead of making the reader remember the rules.
+fn memory_kind_label(kind: leveler_client_protocol::UiMemoryKind) -> &'static str {
+    use leveler_client_protocol::UiMemoryKind;
+    match kind {
+        UiMemoryKind::Preference => "长期偏好",
+        UiMemoryKind::Decision => "决策",
+        UiMemoryKind::Note => "笔记",
+    }
+}
+
 /// showing on screen.
 fn dismiss_resolved_interaction(
     state: &mut AppState,

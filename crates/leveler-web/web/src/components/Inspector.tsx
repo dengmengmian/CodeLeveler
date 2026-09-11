@@ -16,7 +16,9 @@ import {
 import { presentTurnEnd } from '../lib/turn';
 import { useBridge } from '../state/bridge';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
-import type { CheckState, UiApprovalRequest, UiClarificationRequest } from '../types/protocol';
+import type { CheckState, UiApprovalRequest, UiClarificationRequest,
+  UiMemoryKind,
+} from '../types/protocol';
 
 const CHECK_GLYPH: Record<CheckState, string> = {
   passed: '✓',
@@ -498,6 +500,51 @@ function MemoryTab({ current }: { current: SessionView }) {
     if (sessionId) bridge.listMemory();
   }, [sessionId, bridge]);
 
+/** 记忆类型的中文标签：说明这条记忆怎样到达模型，而不是让读者自己记规则。 */
+const MEMORY_KIND_LABEL: Record<string, string> = {
+  preference: '长期偏好',
+  decision: '决策',
+  note: '笔记',
+};
+
+/** 用户自己直写一条记忆。不经过模型，也不产生待确认候选 —— 命令本身就是授权。 */
+function MemoryComposer(): ReactNode {
+  const bridge = useBridge();
+  const [body, setBody] = useState('');
+  const [kind, setKind] = useState<UiMemoryKind>('preference');
+  const save = (): void => {
+    if (!body.trim()) return;
+    bridge.rememberMemory(body, kind);
+    setBody('');
+  };
+  return (
+    <div className="mem-compose">
+      <div className="insp-sec">直接保存一条记忆</div>
+      <textarea
+        className="mem-input"
+        rows={2}
+        placeholder="例如：终端输出保持紧凑，不要展示冗长过程"
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+      />
+      <div className="mem-ops">
+        <select
+          className="mem-kind"
+          value={kind}
+          onChange={(e) => setKind(e.target.value as UiMemoryKind)}
+        >
+          <option value="preference">长期偏好（每轮注入）</option>
+          <option value="decision">决策（按需召回）</option>
+          <option value="note">笔记（按需召回）</option>
+        </select>
+        <button className="mem-btn" disabled={!body.trim()} onClick={save}>
+          保存
+        </button>
+      </div>
+    </div>
+  );
+}
+
   if (!memory) return <div className="insp-empty">读取项目记忆中…</div>;
 
   return (
@@ -511,17 +558,26 @@ function MemoryTab({ current }: { current: SessionView }) {
         <dd>{memory.archived.length}</dd>
       </dl>
 
+      <MemoryComposer />
+
       {memory.pending.length > 0 && (
         <>
           <div className="insp-sec">待采纳（需要你的同意）</div>
           {memory.pending.map((m) => (
             <div className="mem-row pending" key={m.id}>
               <span className="mem-title">○ {m.title}</span>
+              {/* 正文必须可见：只看标题就点“接受”不算知情同意。 */}
+              <div className="mem-body">{m.body}</div>
+              <div className="mem-meta">
+                kind={m.kind} · 来源={m.source}
+              </div>
               <span className="mem-ops">
                 <button className="mem-btn" onClick={() => bridge.acceptMemory(m.id)}>
                   接受
                 </button>
-                <button className="mem-btn ghost" onClick={() => bridge.forgetMemory(m.id)}>
+                {/* reject，不是 forget：forget 只处理 active/archive，
+                    把 pending 的 id 发给它什么也不会发生。 */}
+                <button className="mem-btn ghost" onClick={() => bridge.rejectMemory(m.id)}>
                   忽略
                 </button>
               </span>
@@ -534,7 +590,16 @@ function MemoryTab({ current }: { current: SessionView }) {
       {memory.active.length > 0 ? (
         memory.active.map((m) => (
           <div className="mem-row" key={m.id}>
-            <span className="mem-title">✓ {m.title}</span>
+            <span className="mem-title">
+              ✓ {m.title}
+              {m.kind ? <span className="mem-meta"> · {MEMORY_KIND_LABEL[m.kind]}</span> : null}
+              {m.sensitive ? (
+                <span className="mem-meta" title="内容疑似凭据，已保留但不提供给模型">
+                  {' '}
+                  · 敏感，不提供给模型
+                </span>
+              ) : null}
+            </span>
             <span className="mem-ops">
               <button
                 className="mem-btn ghost"

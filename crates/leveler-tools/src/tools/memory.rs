@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_memory::{MemoryStore, new_entry};
+use leveler_memory::MemoryStore;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -164,8 +164,34 @@ impl Tool for MemoryTool {
 struct RememberArgs {
     title: String,
     body: String,
+    /// How this memory should reach future turns. Required of the model
+    /// rather than defaulted silently: `preference` is paid for on EVERY
+    /// later turn, so it must be a choice, not an accident.
+    kind: ToolMemoryKind,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+/// The kinds a proposal may claim.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ToolMemoryKind {
+    /// Injected into every future turn. Only for lasting how-to-work rules.
+    Preference,
+    /// A decision worth keeping; found by relevance or by title.
+    Decision,
+    /// Anything else worth keeping; same reach as a decision.
+    Note,
+}
+
+impl From<ToolMemoryKind> for leveler_memory::MemoryKind {
+    fn from(value: ToolMemoryKind) -> Self {
+        match value {
+            ToolMemoryKind::Preference => Self::Preference,
+            ToolMemoryKind::Decision => Self::Decision,
+            ToolMemoryKind::Note => Self::Note,
+        }
+    }
 }
 
 pub struct RememberTool {
@@ -185,15 +211,20 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &'static str {
-        "Propose a durable project memory (title + body). Use it when the user \
-         states a lasting preference, a decision or project convention, or a \
-         non-obvious fact worth carrying into later sessions. Requires user \
-         approval before it is stored; the approval prompt IS the user's \
-         consent, so propose rather than asking in prose. This does NOT \
-         overwrite: re-proposing an existing title with different content stores \
-         a second entry, so to correct a superseded memory call `forget` on the \
-         old id first. Not for one-off trivia, secrets, raw transcripts, or \
-         anything already in the code, git history, or AGENTS.md."
+        "Propose a durable project memory (title + body + kind). Use it when \
+         the user states a lasting preference, a decision or project \
+         convention, or a non-obvious fact worth carrying into later sessions. \
+         This is a PROPOSAL: a reachable human must approve it in every \
+         permission profile, full access included, and the approval prompt IS \
+         the user's consent — so propose rather than asking in prose. If the \
+         user already saved it themselves with `/remember`, do not propose it \
+         again. Pick `kind` deliberately: `preference` is injected into every \
+         future turn, while `decision` and `note` are retrieved when relevant, \
+         which is the right choice for most facts. This does NOT overwrite: \
+         re-proposing an existing title with different content stores a second \
+         entry, so correct a superseded memory with `forget` on the old id \
+         first. Not for one-off trivia, secrets, raw transcripts, or anything \
+         already in the code, git history, lockfiles, or AGENTS.md."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -216,9 +247,10 @@ impl Tool for RememberTool {
             return Ok(ToolOutput::error("title and body are required"));
         }
         let store = self.root.open()?;
-        let entry = new_entry(&args.title, &args.body, args.tags);
+        // One activation entry point for every writer, so overwrite, dedup,
+        // secret refusal and pending cleanup cannot differ by caller.
         let saved = store
-            .remember_deduplicated(entry)
+            .activate(&args.title, &args.body, args.kind.into(), args.tags)
             .map_err(|e| ToolError::Io(e.to_string()))?;
         Ok(ToolOutput::ok(format!(
             "Remembered [{}]: {}",
@@ -303,10 +335,7 @@ mod tests {
         let ctx = ctx_in(dir.path());
         let out = RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({
-                    "title": "Prefer workspace-write",
-                    "body": "Use PermissionProfile::Assisted for edits."
-                }),
+                serde_json::json!({"title": "Prefer workspace-write", "body": "Use PermissionProfile::Assisted for edits.", "kind": "note"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -337,7 +366,7 @@ mod tests {
             async move {
                 RememberTool::new(root)
                     .execute(
-                        serde_json::json!({ "title": "Deploy notes", "body": body }),
+                        serde_json::json!({"title": "Deploy notes", "body": body, "kind": "note"}),
                         ctx,
                         CancellationToken::new(),
                     )
@@ -402,10 +431,7 @@ mod tests {
         let ctx = ctx_in(dir.path());
         RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({
-                    "title": "Workspace write",
-                    "body": "Prefer PermissionProfile::Assisted for file edits."
-                }),
+                serde_json::json!({"title": "Workspace write", "body": "Prefer PermissionProfile::Assisted for file edits.", "kind": "note"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -413,10 +439,7 @@ mod tests {
             .unwrap();
         RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({
-                    "title": "Unrelated",
-                    "body": "The sky is blue on clear days."
-                }),
+                serde_json::json!({"title": "Unrelated", "body": "The sky is blue on clear days.", "kind": "note"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )

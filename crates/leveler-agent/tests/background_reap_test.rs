@@ -191,7 +191,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             model: ModelRef::new("mock", "m"),
             commit_co_author: false,
             overrides: None,
-            memory_index: String::new(),
+            memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
             background_tasks: registry.clone(),

@@ -10,7 +10,7 @@ use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, Session
 use leveler_model::ModelRef;
 
 use super::media::AttachmentRef;
-use super::{ApprovalDecision, PermissionProfile};
+use super::{ApprovalDecision, PermissionProfile, UiMemoryKind};
 
 /// Why a runtime is being asked to retire.
 ///
@@ -126,6 +126,23 @@ pub enum ClientCommand {
     /// Promote one pending candidate to durable memory. User-authoritative:
     /// this IS the consent K36 requires, so it is never model-callable.
     AcceptMemory { session_id: SessionId, id: String },
+    /// Decline one pending candidate and suppress the same signal from being
+    /// re-proposed. Distinct from [`Self::ForgetMemory`], which archives an
+    /// ACTIVE entry: sending a pending id to forget did nothing at all, which
+    /// is what the Web "忽略" button was doing.
+    RejectMemory { session_id: SessionId, id: String },
+    /// Create a durable memory directly. The user's own command IS the
+    /// authorization, so this never reaches the model and never becomes a
+    /// pending candidate — it is the deterministic counterpart to the
+    /// natural-language path, which can only propose.
+    RememberMemory {
+        session_id: SessionId,
+        body: String,
+        /// Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for
+        /// "apply this from now on", which is what a preference is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<UiMemoryKind>,
+    },
     /// Recompute and push the working-tree diff.
     RequestDiff { session_id: SessionId },
     /// Summarize and compact the conversation history (spec §28, §53).
@@ -280,6 +297,8 @@ impl ClientCommand {
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
             | ClientCommand::ListMemory { session_id, .. }
             | ClientCommand::AcceptMemory { session_id, .. }
+            | ClientCommand::RejectMemory { session_id, .. }
+            | ClientCommand::RememberMemory { session_id, .. }
             | ClientCommand::ForgetMemory { session_id, .. }
             | ClientCommand::RequestDiff { session_id }
             | ClientCommand::CompactContext { session_id }

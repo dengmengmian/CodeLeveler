@@ -419,6 +419,63 @@
       }
     },
     {
+      "description": "Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web \"忽略\" button was doing.",
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "reject_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose.",
+      "type": "object",
+      "required": [
+        "body",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for \"apply this from now on\", which is what a preference is.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMemoryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "remember_memory"
+          ]
+        }
+      }
+    },
+    {
       "description": "Recompute and push the working-tree diff.",
       "type": "object",
       "required": [
@@ -1053,6 +1110,32 @@
     "SessionId": {
       "description": "Identifies a single agent session (one user goal end to end).",
       "type": "string"
+    },
+    "UiMemoryKind": {
+      "description": "What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret.",
+      "oneOf": [
+        {
+          "description": "Injected into every turn while active.",
+          "type": "string",
+          "enum": [
+            "preference"
+          ]
+        },
+        {
+          "description": "Reachable by query recall and the catalog, never auto-injected.",
+          "type": "string",
+          "enum": [
+            "decision"
+          ]
+        },
+        {
+          "description": "Same reach as a decision.",
+          "type": "string",
+          "enum": [
+            "note"
+          ]
+        }
+      ]
     },
     "UserShellId": {
       "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",

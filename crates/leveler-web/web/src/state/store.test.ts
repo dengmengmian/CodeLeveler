@@ -525,7 +525,7 @@ describe('memory', () => {
       dir: '/repo/.leveler/memory',
       active: [{ id: 'a1', title: 'prefer nextest' }],
       archived: [],
-      pending: [{ id: 'p1', title: 'rust workspace' }],
+      pending: [{ id: 'p1', title: 'rust workspace', body: '正文', kind: 'preference', source: 'user_explicit' }],
     });
     expect(state.current?.memory?.dir).toBe('/repo/.leveler/memory');
     expect(state.current?.memory?.active).toHaveLength(1);

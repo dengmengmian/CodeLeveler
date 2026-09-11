@@ -60,7 +60,7 @@ pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
 pub use event::{
     ChildContribution, NotificationLevel, REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES,
-    RuntimeEvent, UiMemoryEntry, parse_runtime_event,
+    RuntimeEvent, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind, parse_runtime_event,
 };
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};

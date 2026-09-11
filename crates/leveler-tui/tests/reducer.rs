@@ -2775,10 +2775,14 @@ fn memory_list_event_pushes_multiline_transcript_note() {
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "prefer-ws".into(),
                 title: "prefer workspace write".into(),
+                kind: None,
+                sensitive: false,
             }],
             archived: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "old-fact".into(),
                 title: "old".into(),
+                kind: None,
+                sensitive: false,
             }],
             pending: vec![],
         }),
@@ -4836,9 +4840,12 @@ fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
             memory_dir: "/tmp/mem".into(),
             active: vec![],
             archived: vec![],
-            pending: vec![leveler_client_protocol::UiMemoryEntry {
+            pending: vec![leveler_client_protocol::UiMemoryCandidate {
                 id: "use-pnpm".into(),
                 title: "本仓库用 pnpm".into(),
+                body: "安装与脚本一律用 pnpm，不要默认 npm。".into(),
+                kind: "preference".into(),
+                source: "user_explicit".into(),
             }],
         }),
     );
@@ -4848,6 +4855,161 @@ fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
     assert!(
         text.contains("/memory accept"),
         "the way to adopt it must be shown: {text}"
+    );
+    assert!(
+        text.contains("/memory reject"),
+        "declining must be offered too, not only adopting: {text}"
+    );
+    assert!(
+        text.contains("不要默认 npm"),
+        "consent needs the body, not just the title: {text}"
+    );
+}
+
+/// `/remember` is the user's own write: one command out, no model request, no
+/// agent turn, and no pending candidate to approve afterwards.
+#[test]
+fn remember_slash_sends_one_direct_write_and_nothing_else() {
+    let mut s = state();
+    s.composer.replace("/remember 终端输出保持紧凑");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::RememberMemory {
+            session_id: SessionId::new("s1"),
+            body: "终端输出保持紧凑".to_string(),
+            kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
+        })],
+        "exactly one direct write, defaulting to a lasting preference"
+    );
+}
+
+/// A decision is stored but must NOT become standing context, so the kind has
+/// to survive the command rather than being inferred later.
+#[test]
+fn remember_slash_carries_an_explicit_kind() {
+    for (input, kind) in [
+        (
+            "/remember --kind decision 选用 SQLite",
+            leveler_client_protocol::UiMemoryKind::Decision,
+        ),
+        (
+            "/remember --kind note 顺手记一下",
+            leveler_client_protocol::UiMemoryKind::Note,
+        ),
+        (
+            "/remember --kind preference 保持紧凑",
+            leveler_client_protocol::UiMemoryKind::Preference,
+        ),
+    ] {
+        let mut s = state();
+        s.composer.replace(input);
+        let effects = reduce(&mut s, key(KeyCode::Enter));
+        match effects.as_slice() {
+            [
+                Effect::Send(ClientCommand::RememberMemory {
+                    kind: got, body, ..
+                }),
+            ] => {
+                assert_eq!(*got, Some(kind), "{input}");
+                assert!(
+                    !body.starts_with("--kind"),
+                    "the flag must be consumed: {body}"
+                );
+            }
+            other => panic!("{input}: {other:?}"),
+        }
+    }
+}
+
+/// Empty content is a usage error, not an empty memory.
+#[test]
+fn remember_slash_refuses_empty_content() {
+    let mut s = state();
+    s.composer.replace("/remember   ");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "nothing is sent: {effects:?}");
+    assert!(s.notification.is_some(), "the user is told how to use it");
+}
+
+/// A direct write during a running turn must not become steering, and must
+/// not be sent to the model: it is a control-plane command, not a message.
+#[test]
+fn remember_while_busy_is_a_write_not_steering() {
+    let mut s = busy_state();
+    s.composer.replace("/remember 输出保持紧凑");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::RememberMemory {
+            session_id: SessionId::new("s1"),
+            body: "输出保持紧凑".to_string(),
+            kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
+        })],
+        "a write, not SteerCurrentTurn and not SubmitMessage"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(ClientCommand::SteerCurrentTurn { .. })
+                | Effect::Send(ClientCommand::SubmitMessage { .. })
+        )),
+        "{effects:?}"
+    );
+}
+
+/// The listing must say what the model will never see, or "stored" reads as
+/// "in use".
+#[test]
+fn the_listing_marks_a_sensitive_entry_as_withheld() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryList {
+            memory_dir: "/tmp/mem".into(),
+            active: vec![leveler_client_protocol::UiMemoryEntry {
+                id: "legacy".into(),
+                title: "deploy token".into(),
+                kind: Some(leveler_client_protocol::UiMemoryKind::Note),
+                sensitive: true,
+            }],
+            archived: vec![],
+            pending: vec![],
+        }),
+    );
+    let text = format!("{:?}", s.transcript.items());
+    assert!(text.contains("敏感内容"), "{text}");
+    assert!(text.contains("笔记"), "the kind is shown too: {text}");
+}
+
+/// `/memory reject` must send reject, not forget. Sending a pending id to
+/// forget did nothing at all — the bug the Web button shipped with.
+#[test]
+fn memory_reject_sends_reject_not_forget() {
+    let mut s = state();
+    s.composer.replace("/memory reject cand-x");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::RejectMemory {
+            session_id: SessionId::new("s1"),
+            id: "cand-x".to_string(),
+        })]
+    );
+}
+
+/// Forget still means archive-an-active-entry; the two stay distinct.
+#[test]
+fn memory_forget_still_targets_active_entries() {
+    let mut s = state();
+    s.composer.replace("/memory forget mem-1");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::ForgetMemory {
+            session_id: SessionId::new("s1"),
+            id: "mem-1".to_string(),
+        })]
     );
 }
 
