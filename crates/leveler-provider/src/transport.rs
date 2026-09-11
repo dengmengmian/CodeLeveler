@@ -318,7 +318,11 @@ mod tests {
             "no caller budget: the configured timeout applies to each attempt"
         );
 
-        let deadline = RequestBudget::Deadline(Instant::now() + Duration::from_millis(200));
+        // The budget is seconds, not milliseconds, on purpose: the property
+        // under test is that time spent is deducted, and a loaded runner can
+        // lose a couple of hundred milliseconds to scheduling between these
+        // two reads. A tight budget turns that into a flake about nothing.
+        let deadline = RequestBudget::Deadline(Instant::now() + Duration::from_secs(5));
         let first = deadline.remaining().expect("budget left").expect("bounded");
         std::thread::sleep(Duration::from_millis(50));
         let second = deadline.remaining().expect("budget left").expect("bounded");
@@ -327,7 +331,7 @@ mod tests {
             "a retry may only spend what is left: {first:?} then {second:?}"
         );
         assert!(
-            second <= Duration::from_millis(160),
+            second <= Duration::from_millis(4_960),
             "and not a fresh full budget: {second:?}"
         );
     }
