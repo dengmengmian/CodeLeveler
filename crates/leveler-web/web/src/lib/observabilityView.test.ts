@@ -50,6 +50,7 @@ function loaded(over: Partial<UiObservabilityLoaded> = {}): UiObservabilityLoade
       tool_started: 21,
       tool_finished: 21,
       verification_runs: 1,
+      verification: 'passed',
       compact_count: 0,
       subagent_started: 0,
     },

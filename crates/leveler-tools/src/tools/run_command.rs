@@ -952,6 +952,7 @@ mod snapshot_tests {
     /// write-protects the `.git` tree, so every repository operation
     /// (`switch`, `pull`, `reset`) runs only after the user approves an
     /// unrestricted elevation — which is the shape these tests reproduce.
+    #[cfg(unix)]
     fn git_ctx(dir: &std::path::Path) -> ToolContext {
         super::super::test_ctx_in(dir, PermissionProfile::FullAccess)
     }
@@ -1005,6 +1006,7 @@ mod snapshot_tests {
         );
     }
 
+    #[cfg(unix)]
     fn modified_of(out: &crate::tool::ToolOutput) -> Vec<String> {
         let mut v: Vec<String> = out
             .metadata

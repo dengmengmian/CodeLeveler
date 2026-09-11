@@ -626,8 +626,8 @@ impl CodingRuntime {
 
     /// Resume an interrupted direct task from its persisted transcript. The
     /// caller builds `spec` FROM the persisted execution config (see
-    /// `SessionRepository::execution`); the engine refuses a kind mismatch and
-    /// a session that already ended successfully.
+    /// `SessionRepository::execution`); this refuses a parallel parent session,
+    /// a kind mismatch, and a session that already ended successfully.
     pub async fn resume(
         &self,
         session_id: &SessionId,
@@ -642,6 +642,16 @@ impl CodingRuntime {
             .execution(session_id)
             .await?
             .ok_or_else(|| EngineError::Config(format!("no session {session_id}")))?;
+        // A parallel multi-agent PARENT session is written by
+        // `leveler-app::parallel`, not run by the engine: it has no transcript
+        // and is not resumable here. Refuse it by its kind, rather than relying
+        // on its transcript happening to be empty (§18.11).
+        if kind == ExecutionKind::Parallel.as_str() {
+            return Err(EngineError::Config(format!(
+                "session {session_id} is a parallel parent session; \
+                 its lifecycle is owned by the launcher and it is not resumable"
+            )));
+        }
         if kind != spec.runtime.kind.as_str() {
             return Err(EngineError::Config(format!(
                 "session {session_id} is `{kind}`, not `{}`",

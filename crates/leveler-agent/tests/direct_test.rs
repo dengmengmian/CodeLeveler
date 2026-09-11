@@ -1434,6 +1434,33 @@ async fn resume_refuses_a_successfully_completed_session() {
     assert!(err.to_string().contains("already completed"), "{err}");
 }
 
+/// A parallel multi-agent parent session is written by the launcher, not run by
+/// the engine. Resume must refuse it by its kind, not incidentally because its
+/// transcript is empty (§18.11).
+#[tokio::test]
+async fn resume_refuses_a_parallel_parent_session() {
+    let h = harness(patch_then_resolve()).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+    SessionRepository::new(&h.db)
+        .set_execution(
+            &session,
+            "assisted",
+            false,
+            ExecutionKind::Parallel.as_str(),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    let err = h
+        .engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("a parallel parent session must not be resumable");
+    assert!(err.to_string().contains("parallel parent"), "{err}");
+}
+
 /// Quiet text without `update_goal` must not read as a successful task finish.
 ///
 /// Headless `engine.run` always uses the Goal turn profile (direct tool loop).

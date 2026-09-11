@@ -216,8 +216,11 @@ pub struct NewSession {
 impl TaskEngine {
     /// Commit the canonical terminal event and every session lifecycle column
     /// (outcome + status + state) atomically, then forward the event. The
-    /// engine is the ONE writer of the session lifecycle — no app layer stamps
-    /// a second copy — and an observer can never see an uncommitted fact.
+    /// engine is the one writer of the lifecycle for every session it runs —
+    /// no app layer stamps a second copy there — and an observer can never see
+    /// an uncommitted fact. The one session the engine does not run is the
+    /// parallel multi-agent PARENT, whose lifecycle `leveler-app::parallel`
+    /// owns; the two writers own disjoint sessions (§18.11).
     pub async fn finish_task(
         &self,
         token: &leveler_core::OwnershipToken,

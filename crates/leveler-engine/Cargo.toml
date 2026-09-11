@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "The persistent task/turn engine: one execution kernel with Direct/Plan strategies, an append-only event log, and resume."
+description = "The persistent task/turn engine: session, task and turn lifecycle, an append-only event log with persist-before-forward, ownership fencing, checkpoint/resume, and crash recovery."
 
 [dependencies]
 leveler-context = { workspace = true }

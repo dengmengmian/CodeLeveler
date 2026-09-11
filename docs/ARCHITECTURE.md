@@ -192,16 +192,17 @@ existing architecture either.
                     Operating System
 ```
 
-Two places where the running code does not match this picture yet:
+The diagram is the real dependency shape. Two boundaries were open when this
+document was first written; both have since closed, and §18 records how:
 
-- **The engine sits above the harness, not beside it.** `leveler-engine`
-  depends on `leveler-agent` and its public API names Coding concepts. See
-  §18.1.
-- **Tool adapters and capability implementations are one crate.**
-  `leveler-tools` holds both, and several tools implement capability behavior
-  themselves. See §5 and §18.
-
-Everything else in the diagram is the real dependency shape.
+- **The engine sits below the harness, not above it.** The edge is
+  `leveler-agent → leveler-engine`, and `leveler-engine` names no harness crate
+  at all. See §14 and §18.1.
+- **A tool is an adapter; it does not implement the capability.** Every tool
+  now calls a named capability owner (`WorkspaceReader`, `WorkspaceEditor`,
+  `CommandExecution`, `LspSessions`, …). `leveler-tools` still holds both
+  halves, which §5.3 says is correct — capability is a responsibility, not
+  necessarily a crate. See §5.2 and §18.3.
 
 ---
 
@@ -1029,7 +1030,8 @@ pub struct TaskSpec {
 ```
 
 The crate's own comment calls this "the migration seam toward a domain-neutral
-engine". It does not yet remove the Coding dependency — see §18.1.
+engine". W3 completed that migration: the edge is reversed and the engine
+names no harness crate — see §14 and §18.1.
 
 ---
 
@@ -1075,8 +1077,9 @@ This is why `TaskOutcome` and `VerificationStatus` are separate axes in
 complete; `VerificationStatus` says what the project's own checks reported.
 The runtime reports both and never folds them into one word.
 
-The crate-level doc comment in `leveler-verifier/src/lib.rs` still says
-otherwise. See §18.7.
+The crate-level doc comment in `leveler-verifier/src/lib.rs` said otherwise
+until it was rewritten to match the axes the code already separates. See
+§18.8.
 
 ---
 
@@ -1358,8 +1361,8 @@ Coding tool plumbing: a harness registers its own tools, and
 What closed the last of it:
 
 - W3 put the harness above the engine. `leveler-engine` depends on no harness
-  crate, and its public API names no Coding type: a turn is a closure over
-  `TurnPorts` that returns `TurnFacts<T>`, and `T` is whatever the harness
+  crate, and its public API names no type defined by one: a turn is a closure
+  over `TurnPorts` that returns `TurnFacts<T>`, and `T` is whatever the harness
   returns. The engine records the mechanical facts beside it and reads none of
   it (§18.1).
 - The engine's own `git` spawns went with it. Repository facts arrive through
@@ -1740,17 +1743,17 @@ extraction, not precede it.
 **Risk.** Medium. It touches every tool and the dispatch path at once, so it
 wants to be the last step, not the first.
 
-### 18.8 The verifier's doc comment claims completion authority
+### 18.8 The verifier's doc comment claims completion authority (closed)
 
-**Current.** `crates/leveler-verifier/src/lib.rs` opens with "Only the
+**Was.** `crates/leveler-verifier/src/lib.rs` opened with "Only the
 verifier can mark a task complete".
 
-**Desired.** The verifier is the authority for verification verdicts.
+**Now.** The comment states what the code always did: the verifier is the
+authority for verification verdicts, not for completion. A passing verdict is
+mechanical evidence a task outcome is judged against, not the runtime deciding
+the request was satisfied.
 
-**Minimal correction.** Rewrite the doc comment. The code already separates
-the axes; the comment predates the split.
-
-**Risk.** None. It is a comment.
+**Closed by.** Rewriting the doc comment; the code already separated the axes.
 
 ### 18.9 The engine shelled out to git for the baseline (closed)
 
@@ -1788,7 +1791,7 @@ page-scoped loopback grant it belonged to: the browser is network-authorised,
 so there is no per-request loopback decision left to race. The finding is
 closed by deletion, not by a fix.
 
-### 18.11 The parallel parent session has a second lifecycle writer
+### 18.11 The parallel parent session has a second lifecycle writer (closed)
 
 **Current.** `TaskEngine::finish_task` says the engine is the one writer of
 the session lifecycle and that no app layer stamps a second copy. That is
@@ -1813,11 +1816,10 @@ incidental — an empty transcript — rather than an explicit refusal to run a
 cannot fire, because both sides of its comparison are read from the same
 session row.
 
-**Minimal correction.** Say what is true in the engine's comment, and make
-the resume path refuse `ExecutionKind::Parallel` outright instead of relying
-on the transcript being empty.
-
-**Risk.** Low. Nothing observed has reached the overlap.
+**Closed.** The engine's comment now says what is true, and
+`CodingRuntime::resume` refuses `ExecutionKind::Parallel` outright instead of
+relying on the transcript being empty. A regression test
+(`resume_refuses_a_parallel_parent_session`) pins the refusal to the kind.
 
 ---
 

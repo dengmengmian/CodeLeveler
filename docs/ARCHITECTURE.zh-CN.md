@@ -134,12 +134,10 @@ CodeLeveler 不试图拉平模型智能。
                        操作系统
 ```
 
-有两处，运行中的代码还对不上这张图：
+图就是真实的依赖形状。这里曾经有两处代码对不上这张图，现在都已关闭，§18 记录了过程：
 
-- **Engine 在 Harness 之上，不在它旁边。** `leveler-engine` 依赖 `leveler-agent`，公开 API 里直接出现 Coding 概念。见 §18.1。
-- **Tool 适配器与能力实现在同一个 crate。** `leveler-tools` 两者都装，而且好几个工具自己实现了能力行为。见 §5 与 §18。
-
-图里其余部分就是真实依赖形状。
+- **Engine 在 Harness 之下，不在它之上。** 两者之间只剩 `leveler-agent → leveler-engine` 一条边，`leveler-engine` 不点名任何 harness crate。见 §14 与 §18.1。
+- **Tool 是适配器，不实现能力。** 每个工具现在都调用一个具名的能力所有者（`WorkspaceReader`、`WorkspaceEditor`、`CommandExecution`、`LspSessions`……）。`leveler-tools` 仍同时装着两半，而 §5.3 说这是对的——能力是一种责任，不一定是 crate。见 §5.2 与 §18.3。
 
 ---
 
@@ -736,7 +734,7 @@ pub struct TaskSpec {
 }
 ```
 
-源码里自己把这称为「通往领域中立 engine 的迁移接缝」。它还没有消除对 Coding 的依赖——见 §18.1。
+源码里自己把这称为「通往领域中立 engine 的迁移接缝」。W3 完成了这次迁移：边反过来了，engine 不点名任何 harness crate——见 §14 与 §18.1。
 
 ---
 
@@ -771,7 +769,7 @@ Verifier 不是「语义任务完成」的权威。
 
 这就是为什么 `TaskOutcome` 和 `VerificationStatus` 在 `leveler-lifecycle` 里是两条正交的轴。Runtime 两个都报，绝不合成一个词。
 
-`leveler-verifier/src/lib.rs` 的 crate 级注释目前还是相反的说法。见 §18.8。
+`leveler-verifier/src/lib.rs` 的 crate 级注释曾经是相反的说法，已改写为代码本就分开的那两条轴。见 §18.8。
 
 ---
 
@@ -1001,7 +999,7 @@ Kernel 和工具边界这两侧早就是过的。`leveler-agent-core` 只依赖 
 
 把最后一段补上的是：
 
-- W3 把 harness 放到了 engine 之上。`leveler-engine` 不依赖任何 harness crate，公开 API 也不点名任何 Coding 类型：一个 turn 就是一个吃 `TurnPorts`、吐 `TurnFacts<T>` 的闭包，`T` 是 harness 自己的返回类型。Engine 只在它旁边记录机械事实，一个字都不读（§18.1）。
+- W3 把 harness 放到了 engine 之上。`leveler-engine` 不依赖任何 harness crate，公开 API 也不点名任何由 harness crate 定义的类型：一个 turn 就是一个吃 `TurnPorts`、吐 `TurnFacts<T>` 的闭包，`T` 是 harness 自己的返回类型。Engine 只在它旁边记录机械事实，一个字都不读（§18.1）。
 - Engine 自己的 `git` 进程也一并没了。仓库事实通过 `WorkspaceFacts` 端口进来，Coding harness 用 `GitWorkspace` 实现它（§18.9）。
 
 证明是机械的，不是架构论述。`crates/leveler-engine/tests/minimal_harness.rs` 用一个不是本产品的 harness 跑完一整个会话：建会话、跑 turn、持久化、崩溃、reap、resume、终态。它的 payload 是一个字符串，不拥有仓库，不跑任何工具，而且它的测试二进制根本链接不到 `leveler-agent`——engine 的 dev-dependency 里没有这条路。把它立起来没有新增任何 engine API、任何 trait、任何 crate、任何抽象，这一条才是真正吃重的：一个需要为第二个消费者现造接缝的 engine，不叫通用，只叫将就。
@@ -1178,15 +1176,13 @@ pub struct ToolOutput {
 
 **风险。** 中。它一次性触及每一个工具和 dispatch 路径，所以应该是最后一步而不是第一步。
 
-### 18.8 Verifier 的注释宣称拥有完成权
+### 18.8 Verifier 的注释宣称拥有完成权（已关闭）
 
-**当前。** `crates/leveler-verifier/src/lib.rs` 开头写着「只有 verifier 能标记任务完成」。
+**曾经。** `crates/leveler-verifier/src/lib.rs` 开头写着「只有 verifier 能标记任务完成」。
 
-**期望。** Verifier 是验证结论的权威。
+**现在。** 注释说的是代码一直的做法：verifier 是验证结论的权威，不是完成权的权威。一次通过的验证结论是任务结局据以判断的机械证据，不是 runtime 宣布用户请求已被满足。
 
-**最小修正。** 改写这段注释。代码早就把两条轴分开了，注释停留在拆分之前。
-
-**风险。** 无。它只是注释。
+**由谁关闭。** 改写这段注释；代码本就分开了两条轴。
 
 ### 18.9 Engine 曾直接 shell 调 git（已关闭）
 
@@ -1206,7 +1202,7 @@ pub struct ToolOutput {
 
 **跟着一起关闭的。** 之前挂起的 `loopback_ws_from_a_granted_dev_page_connects` 抖动，是关于桥里那个 JavaScript WebSocket gate 的发现。那个 gate 连同它所属的整套 page-scoped loopback grant 都已删除：浏览器是被授权联网的，已经不存在需要逐请求做的 loopback 判定，也就没有可竞态的东西。这条发现是被删除关闭的，不是被修复关闭的。
 
-### 18.11 并行父 session 有第二个生命周期写者
+### 18.11 并行父 session 有第二个生命周期写者（已关闭）
 
 **当前。** `TaskEngine::finish_task` 的注释说 engine 是 session 生命周期的唯一写者、没有任何 app 层会盖第二份。对每一个由 engine 跑的 session 这是真的，对它不跑的那个就不是：并行多 agent 的**父** session 由 `leveler-app/src/parallel.rs` 创建、置 `Running`、并写终态行，它直接调 `SessionStore::update_status_owned` 和 `TerminalStore::finish_task_owned`。
 
@@ -1214,9 +1210,7 @@ pub struct ToolOutput {
 
 **真正错的地方。** Engine 的注释宣称了一份代码并不具备的排他性；而让这个宣称成立的屏障是偶然的——transcript 为空——而不是一次对 `Parallel` session 的明确拒绝。`CodingRuntime::resume` 里那个 `kind` 守卫也永远不会触发，因为比较的两边读自同一行 session。
 
-**最小修正。** 把 engine 注释改成实话；并让 resume 路径直接拒绝 `ExecutionKind::Parallel`，而不是依赖 transcript 恰好为空。
-
-**风险。** 低。目前没有任何观察到的路径触到这个重叠。
+**已关闭。** engine 注释改成实话；`CodingRuntime::resume` 现在直接拒绝 `ExecutionKind::Parallel`，不再依赖 transcript 恰好为空。回归测试 `resume_refuses_a_parallel_parent_session` 把这次拒绝钉在 kind 上。
 
 ---
 

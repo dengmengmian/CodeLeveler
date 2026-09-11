@@ -223,6 +223,16 @@ export interface UiGoalRecap {
   verification_detail?: string | null;
 }
 
+/** What one lane of a session spent. `lane` is `main`, `children` or `total`. */
+export interface UiLaneAccounting {
+  cached_input_tokens?: number | null;
+  cost_usd_micros?: number | null;
+  input_tokens: number;
+  lane: string;
+  output_tokens: number;
+  requests: number;
+}
+
 /** Compact durable-memory row for TUI list surfaces. */
 export interface UiMemoryEntry {
   id: string;
@@ -306,6 +316,10 @@ export interface UiRecoveryObservation {
 
 /** One durable model-request row (no prompt/body). */
 export interface UiRequestObservation {
+  /** The sub-agent that made the call; absent for the root session's own. */
+  agent_id?: string | null;
+  cached_input_tokens?: number | null;
+  cost_usd_micros?: number | null;
   created_at: string;
   error_kind?: string | null;
   finish_reason?: string | null;
@@ -324,11 +338,19 @@ export type UiRole = 'user' | 'assistant' | 'system' | 'tool';
 /** Session-level observation header + aggregates from durable stores. */
 export interface UiSessionObservation {
   avg_latency_ms?: number | null;
+  /** Prompt tokens the provider served from cache — a SUBSET of `input_tokens`. `None` when no request recorded the figure at all; that is an absence of measurement, and summing it as zero would report a cache miss nobody observed. */
+  cached_input_tokens?: number | null;
   collaboration: string;
   compact_count: number;
+  /** Summed over the requests that carry a price. `None` when none does. */
+  cost_usd_micros?: number | null;
   created_at: string;
+  /** Wall clock from the session's first to its latest durable timestamp. `None` when either end is unparseable. */
+  duration_ms?: number | null;
   goal: string;
   input_tokens: number;
+  /** Spend split by who did it: the root session, its children, and the total. Present whenever there is a request to attribute. */
+  lanes?: UiLaneAccounting[];
   last_latency_ms?: number | null;
   last_sequence?: number | null;
   model: string;
@@ -343,6 +365,8 @@ export interface UiSessionObservation {
   tool_finished: number;
   tool_started: number;
   updated_at: string;
+  /** The latest verdict the runtime actually recorded: `passed`, `failed`, `not_run` (nothing ever started), or `unavailable` (started and never reached a verdict). A count of runs is not a verdict. */
+  verification: string;
   verification_runs: number;
   work_profile: string;
 }
@@ -579,7 +603,7 @@ export type RuntimeEvent =
   /** A tool call started . */
   | { type: 'tool_call_started'; arguments: string; id: ToolCallId; name: string; parallel?: boolean }
   /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
-  | { type: 'tool_call_completed'; duration_ms: number; id: ToolCallId; ok: boolean; preview: string }
+  | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; id: ToolCallId; ok: boolean; preview: string }
   /** The execution plan was created or a step's status changed (spec §20). */
   | { type: 'plan_updated'; plan: UiPlan }
   /** Verification progress: a check finished or the run concluded (spec §22). */

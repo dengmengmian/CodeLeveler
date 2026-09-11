@@ -300,6 +300,18 @@ All notable changes to CodeLeveler are documented here. The format follows
   remains is mechanical: the identical-call loop guard, the all-calls-refused
   streak, budgets and the absolute round ceiling.
 
+### Fixed
+- **`resume` refuses a parallel parent session by its kind.** The engine's
+  single-writer claim held only because the parallel parent's transcript
+  happened to be empty; `resume` now refuses `ExecutionKind::Parallel`
+  outright, and the engine comment says what is true — the launcher owns that
+  one session's lifecycle. See `docs/ARCHITECTURE.md` §18.11.
+- **The verifier's doc comment no longer claims completion authority.** The
+  verifier owns verification verdicts; a passing verdict is mechanical
+  evidence a task outcome is judged against, not the runtime deciding the
+  request was satisfied. Code was already correct; the comment was not
+  (§18.8).
+
 ## [0.2.0-beta.1] - 2026-08-22
 
 First public pre-release. Published as a GitHub **pre-release**, so `brew`,
