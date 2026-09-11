@@ -1940,6 +1940,29 @@ mod verification_status_tests {
         );
     }
 
+    /// A failure the baseline already had does not gate, and this mapper must
+    /// not decide that for itself by reading the check rows: the report
+    /// decides (`verdict()` reports it as unverified, with the reason naming
+    /// the pre-existing failure), and the status follows the report exactly as
+    /// it did before the split.
+    #[test]
+    fn a_baseline_attributed_failure_keeps_the_canonical_status() {
+        let mut pre_existing = report(CheckStatus::Failed);
+        pre_existing.baseline_failures = vec!["test".into()];
+        assert!(matches!(pre_existing.verdict(), Verdict::Unverified(_)));
+        assert_eq!(
+            verification_status_of(&pre_existing),
+            VerificationStatus::Unavailable
+        );
+
+        // The same rows WITHOUT the attribution are a failure. The rows are
+        // identical in both cases, so nothing here can be reading them.
+        assert_eq!(
+            verification_status_of(&report(CheckStatus::Failed)),
+            VerificationStatus::Failed
+        );
+    }
+
     /// The one case where the gate and the truth must not be read the same
     /// way: a run with nothing configured to run. Its gate is open, and it
     /// proved nothing.
