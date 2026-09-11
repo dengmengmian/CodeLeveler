@@ -1,0 +1,23 @@
+[package]
+name = "leveler-win-confine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Windows write confinement: Low-integrity process launch and mandatory-label write roots."
+
+[[bin]]
+name = "leveler-confine"
+path = "src/bin/leveler_confine.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

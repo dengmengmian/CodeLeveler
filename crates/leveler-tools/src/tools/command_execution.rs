@@ -172,8 +172,8 @@ impl CommandExecution {
         request.deny_network = context.policy.network_denied();
         request.deny_env = context.policy.deny_env.as_ref().clone();
         // OS confinement from the one write boundary (`WriteScope`):
-        // - `Workspace`: macOS/Linux broad reads, writes limited to workspace +
-        //   temp + toolchain; Windows AppContainer write-restricted.
+        // - `Workspace`: broad reads on every host, writes limited to
+        //   workspace + temp + toolchain caches.
         // - `None` (pre-claim child): the workspace is mounted read-only, so
         //   observation works while every mutation — rmdir, redirection, sed -i,
         //   a Python script — fails in the kernel. Enforcing the EFFECT beats

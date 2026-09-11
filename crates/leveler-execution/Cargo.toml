@@ -11,6 +11,10 @@ description = "Workspace path safety, risk levels, and process execution."
 [dependencies]
 sha2 = { workspace = true }
 leveler-core = { workspace = true }
+# The audited `unsafe` boundary for Windows write confinement. Depended on
+# unconditionally so `windows_confine`'s bookkeeping compiles and is tested on
+# every host; off Windows the crate is honest stubs.
+leveler-win-confine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -31,14 +35,15 @@ tree-sitter-bash = "=0.25.1"
 nix = { version = "0.29", features = ["signal", "process", "user"] }
 rustix = { workspace = true }
 
-# Job Object + AppContainer via audited safe wrappers (no in-crate unsafe).
+# Job Object and Low-integrity launch via audited safe wrappers (no in-crate
+# unsafe): `process-wrap` owns the process tree, `leveler-win-confine` owns the
+# token and the write-root labels.
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "8.2", default-features = false, features = [
     "tokio1",
     "job-object",
     "kill-on-drop",
 ] }
-rappct = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

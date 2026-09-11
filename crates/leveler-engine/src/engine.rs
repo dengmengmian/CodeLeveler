@@ -216,8 +216,11 @@ pub struct NewSession {
 impl TaskEngine {
     /// Commit the canonical terminal event and every session lifecycle column
     /// (outcome + status + state) atomically, then forward the event. The
-    /// engine is the ONE writer of the session lifecycle — no app layer stamps
-    /// a second copy — and an observer can never see an uncommitted fact.
+    /// engine is the one writer of the lifecycle for every session it runs —
+    /// no app layer stamps a second copy there — and an observer can never see
+    /// an uncommitted fact. The one session the engine does not run is the
+    /// parallel multi-agent PARENT, whose lifecycle `leveler-app::parallel`
+    /// owns; the two writers own disjoint sessions (§18.11).
     pub async fn finish_task(
         &self,
         token: &leveler_core::OwnershipToken,
@@ -867,13 +870,9 @@ mod multi_turn_session_tests {
         progress.accumulate_drive_rounds(5);
         progress.accumulate_drive_rounds(3);
         assert_eq!(progress.cumulative_rounds, 8);
-        // A fresh Content turn with terminal progress must not seed (epoch gate).
-        progress.enter_terminal();
-        assert!(progress.is_terminal_for_inheritance());
-        assert!(!crate::turn::should_seed_task_state(
-            None,
-            Some(&progress),
-            false
-        ));
+        // The engine's mechanical seed gate: a fresh turn whose harness reports
+        // a closed prior epoch does not seed. The domain answer ("is the prior
+        // epoch open?") is the harness's and arrives as a bool.
+        assert!(!crate::turn::should_seed_task_state(false, false));
     }
 }

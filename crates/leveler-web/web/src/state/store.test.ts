@@ -35,6 +35,7 @@ function observation(over: Partial<UiObservabilityLoaded> = {}): UiObservability
       tool_started: 21,
       tool_finished: 21,
       verification_runs: 1,
+      verification: 'passed',
       compact_count: 0,
       subagent_started: 0,
       last_sequence: 12,

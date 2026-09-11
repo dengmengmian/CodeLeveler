@@ -58,3 +58,42 @@ fn no_engine_source_reaches_for_a_harness_crate() {
         }
     }
 }
+
+/// F9.1: fresh-turn inheritance is a HARNESS decision. The engine applies one
+/// mechanical rule over the bool the harness computes; if it reads a Coding
+/// domain predicate itself, one harness's semantics are baked into the engine
+/// again and a second harness inherits them by accident.
+#[test]
+fn the_engine_does_not_interpret_plan_or_progress_semantics() {
+    for (path, text) in engine_src() {
+        for forbidden in ["is_fully_completed", "is_terminal_for_inheritance"] {
+            assert!(
+                !text.contains(forbidden),
+                "{path} calls `{forbidden}`; whether a prior epoch is still \
+                 open is the harness's judgement. Pass the answer in \
+                 `SeedRequest::Fresh::prior_epoch_open` instead of deciding it \
+                 here."
+            );
+        }
+    }
+}
+
+/// F9.3: what a lost child CONTRIBUTED is harness judgement. The engine finds
+/// the ghost, orders its terminal, attributes it to the originating turn and
+/// stamps `ok: false`; if it also projects the child's role over an evidence
+/// ledger, it is reading one harness's findings vocabulary again — and a
+/// second harness gets a contribution computed under semantics it never had.
+///
+/// `ChildResultProjection` itself stays in the event payload: carrying a
+/// harness's answer is not the same as computing one.
+#[test]
+fn the_engine_does_not_compute_a_child_contribution() {
+    for (path, text) in engine_src() {
+        assert!(
+            !text.contains("from_findings"),
+            "{path} projects a child's contribution out of ledger findings; \
+             that reading needs the harness's role vocabulary. Ask through \
+             `LostChildVoice` instead of computing it here."
+        );
+    }
+}

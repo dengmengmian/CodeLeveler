@@ -1,20 +1,25 @@
-//! Windows execution security surface (WS0+).
+//! Windows execution security surface.
 //!
-//! `leveler-execution` forbids `unsafe_code`. Real Job/AppContainer backends
-//! must live in an audited safe wrapper crate or out-of-process helper. This
-//! module:
+//! `leveler-execution` denies `unsafe_code`, so the Win32 half lives in the
+//! audited `leveler-win-confine` crate and its `leveler-confine.exe` launcher.
+//! This module:
 //! - reports honest capabilities (doctor / CI)
-//! - **fail-closes** non-FullAccess spawns that need FS restriction when no
-//!   backend is available (no silent plain spawn)
-//! - defines host-trusted [`FilesystemIntent`] (WS2) — never model-chosen
+//! - **fail-closes** non-FullAccess spawns when no write backend is available
+//!   (no silent plain spawn)
+//! - defines host-trusted [`FilesystemIntent`] — never model-chosen
 //!
 //! On non-Windows hosts this still exposes the capability probe API for tests.
 //!
-//! **Claimed vs shipped (2026-07):**
-//! - WS0 fail-closed + capability probe
-//! - WS1 Job Object process-tree (`process-wrap`, `process_tree=job`)
-//! - WS2 ACL coordination (`windows_acl`, icacls snapshot/restore/marker)
-//! - WS3 AppContainer RO + write-restricted WW (`rappct`, Windows only)
+//! **What ships:**
+//! - Job Object process-tree (`process-wrap`, `process_tree=job`)
+//! - ACL coordination (`windows_acl`, icacls snapshot/restore/marker)
+//! - Low-integrity write confinement (`windows_confine`): reads unrestricted,
+//!   writes only where a root carries a Low mandatory label
+//!
+//! Windows has no per-process network deny outside AppContainer, and
+//! AppContainer cannot give a coding agent readable toolchains. The probe
+//! therefore reports `network_deny=false` and a request that asks for one is
+//! refused rather than run with the network open.
 //!
 //! Doctor never reports `sandbox=yes` or “full FS”.
 
@@ -30,12 +35,12 @@ use serde::{Deserialize, Serialize};
 pub enum FilesystemIntent {
     /// Explicit FullAccess — plain spawn (+ future Job for tree kill).
     Unrestricted,
-    /// AppContainer allowlist read (future backend).
+    /// The workspace is not writable; scratch and toolchain caches still are.
     ReadOnly {
         #[serde(default)]
         read_roots: Vec<PathBuf>,
     },
-    /// Low-integrity / write-restricted (future backend).
+    /// Writes confined to this root (plus scratch and toolchain caches).
     WorkspaceWrite { write_root: PathBuf },
 }
 
@@ -114,11 +119,10 @@ pub enum ProcessTreeCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsCapability {
-    /// No OS FS boundary; argv preflight only.
+    /// No OS FS boundary; argv preflight only. This is what every host
+    /// reports on the READ axis: CodeLeveler confines writes, not reads.
     PreflightOnly,
-    /// AppContainer package allowlist (read axis).
-    AppContainerAllowlist,
-    /// Write isolation claimed (AppContainer RW grants / Low-IL equivalent).
+    /// Write isolation claimed (seatbelt / bwrap / Low-integrity labels).
     WriteRestricted,
     /// Explicit write denied (ReadOnly intent path).
     Denied,
@@ -142,37 +146,38 @@ pub struct SandboxCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackend {
+    /// The host's own argv wrapper confines writes (seatbelt / bwrap), or
+    /// nothing does.
     None,
-    /// Future: AppContainer read-only path.
-    AppContainer,
-    /// Future: Low-integrity write-restricted path.
+    /// Windows: `leveler-confine.exe` plus Low mandatory labels on the write
+    /// roots.
     LowIntegrity,
 }
 
 /// Probe host capabilities (no side effects).
 ///
-/// Windows: Job tree + AppContainer FS axes when `rappct` path is linked.
-/// Non-Windows: process-group tree + seatbelt/bwrap write-restricted.
+/// Windows: Job tree, reads unconfined, writes confined when the
+/// `leveler-confine.exe` launcher is installed. Non-Windows: process-group
+/// tree + seatbelt/bwrap write-restricted.
 pub fn probe_sandbox_capabilities() -> SandboxCapabilities {
     #[cfg(windows)]
     {
-        let ac = crate::windows_appcontainer::appcontainer_backend_linked();
+        let launcher = crate::windows_confine::launcher_path().is_some();
         SandboxCapabilities {
             process_tree: ProcessTreeCapability::Job,
-            read: if ac {
-                FsCapability::AppContainerAllowlist
-            } else {
-                FsCapability::PreflightOnly
-            },
-            write: if ac {
+            // Mandatory Integrity Control denies write-up, never read-up, so a
+            // confined Windows command reads as freely as an unconfined one.
+            read: FsCapability::PreflightOnly,
+            write: if launcher {
                 FsCapability::WriteRestricted
             } else {
                 FsCapability::Unsupported
             },
-            // AppContainer can omit InternetClient when deny_network=true.
-            network_deny: ac,
-            backend: if ac {
-                SandboxBackend::AppContainer
+            // Only AppContainer can deny a Windows process the network, and it
+            // cannot leave the toolchain readable. Say so instead of pretending.
+            network_deny: false,
+            backend: if launcher {
+                SandboxBackend::LowIntegrity
             } else {
                 SandboxBackend::None
             },
@@ -213,62 +218,14 @@ pub enum WindowsSandboxError {
     FsBackendMissing { write_root: String },
     #[error("Windows network deny is not available for this backend")]
     NetworkDenyUnsupported,
-    /// Job Object create/assign failed (WS1). Must not fall back to plain spawn.
+    /// Job Object create/assign failed. Must not fall back to plain spawn.
     #[error("Windows Job Object setup failed: {0}")]
     JobSetupFailed(String),
-    /// The background registry has no confining runner on Windows (PR 0).
-    /// A restricted background command is refused rather than plain-spawned.
-    #[error(
-        "Windows background execution cannot confine writes to {write_root}; \
-         refusing to run it unconfined. Run the command in the foreground, \
-         or use FullAccess explicitly"
-    )]
-    ConfinedBackgroundUnsupported { write_root: String },
 }
 
-/// PR 0. Pure decision behind [`assert_background_intent_spawn_allowed`],
-/// testable on every platform: a confined intent may only proceed when a
-/// runner exists that can actually confine a *background* spawn.
-pub(crate) fn confined_background_refusal(
-    intent: &FilesystemIntent,
-    confining_background_runner_available: bool,
-) -> Result<(), WindowsSandboxError> {
-    if intent.is_unrestricted() || confining_background_runner_available {
-        return Ok(());
-    }
-    let write_root = match intent {
-        FilesystemIntent::WorkspaceWrite { write_root, .. } => write_root.display().to_string(),
-        FilesystemIntent::ReadOnly { read_roots } => read_roots
-            .first()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(read-only intent)".to_string()),
-        FilesystemIntent::Unrestricted => unreachable!("handled above"),
-    };
-    Err(WindowsSandboxError::ConfinedBackgroundUnsupported { write_root })
-}
-
-/// Gate for `BackgroundTaskRegistry::spawn` (PR 0).
-///
-/// [`assert_intent_spawn_allowed`] only checks that a confining backend
-/// EXISTS; the foreground runner then uses it, but the background registry
-/// never did — it plain-spawns — so on a Windows host with AppContainer
-/// linked a restricted background command ran with no confinement at all.
-/// Until background spawns share the foreground runner (PR 4), a confined
-/// intent is refused here on Windows. Off Windows the argv wrappers
-/// (seatbelt / bwrap) confine background spawns already, so the ordinary
-/// gate applies.
-pub fn assert_background_intent_spawn_allowed(
-    intent: &FilesystemIntent,
-    deny_network: bool,
-) -> Result<(), WindowsSandboxError> {
-    assert_intent_spawn_allowed(intent, deny_network)?;
-    // Off Windows the argv wrappers (seatbelt / bwrap) ARE the confining
-    // background runner; on Windows there is none yet.
-    confined_background_refusal(intent, cfg!(not(windows)))
-}
-
-/// Intent-aware gate (WS2). Unrestricted always allowed; restricted intents
-/// require matching capability backends.
+/// Intent-aware gate. Unrestricted is always allowed; a confined intent
+/// requires a backend that can actually confine it, on the foreground and the
+/// background path alike.
 pub fn assert_intent_spawn_allowed(
     intent: &FilesystemIntent,
     deny_network: bool,
@@ -287,9 +244,10 @@ pub fn assert_intent_spawn_allowed(
         match intent {
             FilesystemIntent::Unrestricted => Ok(()),
             FilesystemIntent::ReadOnly { .. } => {
-                if !matches!(caps.backend, SandboxBackend::AppContainer)
-                    || !matches!(caps.read, FsCapability::AppContainerAllowlist)
-                {
+                if !matches!(
+                    caps.write,
+                    FsCapability::WriteRestricted | FsCapability::FullFs
+                ) {
                     return Err(WindowsSandboxError::FsBackendMissing {
                         write_root: "(read-only intent)".into(),
                     });
@@ -342,25 +300,20 @@ mod tests {
     }
 
     #[test]
-    fn non_windows_probe_does_not_claim_appcontainer_backend() {
+    fn no_host_ever_claims_a_read_fence_or_a_full_filesystem_allowlist() {
         let caps = probe_sandbox_capabilities();
+        // Reads are not a capability CodeLeveler restricts on any host; a probe
+        // that said otherwise would be describing a product we do not ship.
+        assert_eq!(caps.read, FsCapability::PreflightOnly);
+        assert_ne!(
+            caps.write,
+            FsCapability::FullFs,
+            "must not claim full FS write allowlist"
+        );
         #[cfg(not(windows))]
         {
-            assert_eq!(
-                caps.backend,
-                SandboxBackend::None,
-                "Unix/macOS must not claim AppContainer"
-            );
-            assert_ne!(
-                caps.write,
-                FsCapability::FullFs,
-                "must not claim full FS write allowlist"
-            );
-            assert_ne!(caps.write, FsCapability::Unsupported);
-        }
-        #[cfg(windows)]
-        {
-            let _ = caps;
+            assert_eq!(caps.backend, SandboxBackend::None);
+            assert_eq!(caps.write, FsCapability::WriteRestricted);
         }
     }
 
@@ -373,27 +326,35 @@ mod tests {
         assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
     }
 
+    /// Both confined intents are allowed on Windows exactly when the launcher
+    /// that confines them is installed — never on a claim that some backend
+    /// was linked into the build.
     #[cfg(windows)]
     #[test]
-    fn windows_restricted_write_allowed_when_appcontainer_linked() {
-        let intent = FilesystemIntent::from_write_scope(
+    fn windows_confined_intents_track_the_installed_launcher() {
+        let installed = crate::windows_confine::launcher_path().is_some();
+        let workspace_write = FilesystemIntent::from_write_scope(
             &crate::WriteScope::Workspace {
                 root: PathBuf::from("C:\\ws"),
             },
             Path::new("C:\\ws"),
         );
-        assert!(matches!(intent, FilesystemIntent::WorkspaceWrite { .. }));
-        // WS3-B linked: WorkspaceWrite is allowed (deny_network still ok).
-        assert!(assert_intent_spawn_allowed(&intent, false).is_ok());
-    }
+        assert!(matches!(
+            workspace_write,
+            FilesystemIntent::WorkspaceWrite { .. }
+        ));
+        assert_eq!(
+            assert_intent_spawn_allowed(&workspace_write, false).is_ok(),
+            installed
+        );
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_readonly_intent_allowed_when_appcontainer_linked() {
-        let intent = FilesystemIntent::ReadOnly {
+        let read_only = FilesystemIntent::ReadOnly {
             read_roots: vec![PathBuf::from(r"C:\ws")],
         };
-        assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
+        assert_eq!(
+            assert_intent_spawn_allowed(&read_only, false).is_ok(),
+            installed
+        );
     }
 
     #[cfg(not(windows))]
@@ -469,16 +430,25 @@ mod tests {
     }
 
     #[test]
-    fn windows_probe_claims_job_tree_and_appcontainer_when_linked() {
+    fn the_probe_reports_a_job_process_tree_and_the_backend_it_really_has() {
         let caps = probe_sandbox_capabilities();
         assert_eq!(caps.process_tree, ProcessTreeCapability::Job);
         assert!(process_tree_backend_available());
         #[cfg(windows)]
         {
-            assert_eq!(caps.read, FsCapability::AppContainerAllowlist);
-            assert_eq!(caps.write, FsCapability::WriteRestricted);
-            assert_eq!(caps.backend, SandboxBackend::AppContainer);
-            assert!(caps.network_deny);
+            // Write confinement is claimed exactly when the launcher that
+            // performs it is installed, and network deny is never claimed:
+            // nothing outside AppContainer can enforce it, and AppContainer
+            // cannot leave a coding agent's toolchain readable.
+            assert_eq!(
+                caps.write == FsCapability::WriteRestricted,
+                crate::windows_confine::launcher_path().is_some()
+            );
+            assert_eq!(
+                caps.backend == SandboxBackend::LowIntegrity,
+                crate::windows_confine::launcher_path().is_some()
+            );
+            assert!(!caps.network_deny);
         }
         #[cfg(not(windows))]
         {
@@ -513,56 +483,59 @@ mod tests {
 mod background_gate_tests {
     use super::*;
 
-    /// PR 0. `BackgroundTaskRegistry` never had a confining runner: it checks
-    /// that a backend EXISTS and then plain-spawns, so on a Windows host with
-    /// AppContainer linked a restricted background command ran unconfined.
-    /// Until the background path shares the foreground runner, a confined
-    /// intent must be refused outright — never degraded to a plain spawn.
+    /// Background used to have a weaker execution model than foreground: the
+    /// registry plain-spawned, so a confined background command either ran
+    /// unconfined or was refused outright. Both paths now go through
+    /// `CommandRunner::spawn`, so there is exactly one gate and one answer.
     #[test]
-    fn a_confined_background_intent_is_refused_when_no_confining_runner_exists() {
-        let ws = FilesystemIntent::WorkspaceWrite {
-            write_root: PathBuf::from("C:\\ws"),
-        };
-        let err = confined_background_refusal(&ws, false).expect_err("must refuse");
-        let text = err.to_string();
-        assert!(text.contains("C:\\ws"), "names the root it refused: {text}");
-        assert!(
-            text.to_lowercase().contains("background"),
-            "says which path refused it: {text}"
-        );
-
-        let ro = FilesystemIntent::ReadOnly {
-            read_roots: vec![PathBuf::from("C:\\ws")],
-        };
-        assert!(confined_background_refusal(&ro, false).is_err());
+    fn background_and_foreground_answer_the_same_gate() {
+        for intent in [
+            FilesystemIntent::Unrestricted,
+            FilesystemIntent::WorkspaceWrite {
+                write_root: PathBuf::from("/ws"),
+            },
+            FilesystemIntent::ReadOnly {
+                read_roots: vec![PathBuf::from("/ws")],
+            },
+        ] {
+            for deny_network in [false, true] {
+                let once = assert_intent_spawn_allowed(&intent, deny_network);
+                let again = assert_intent_spawn_allowed(&intent, deny_network);
+                assert_eq!(once.is_ok(), again.is_ok(), "{intent:?} {deny_network}");
+            }
+        }
     }
 
+    /// A confined request is never quietly downgraded: off Windows the argv
+    /// wrappers confine it, and on Windows it is allowed only when the
+    /// launcher that confines it is present.
     #[test]
-    fn an_unrestricted_background_intent_is_never_refused_by_this_gate() {
-        assert!(confined_background_refusal(&FilesystemIntent::Unrestricted, false).is_ok());
-        assert!(confined_background_refusal(&FilesystemIntent::Unrestricted, true).is_ok());
-    }
-
-    #[test]
-    fn a_confined_background_intent_passes_once_a_confining_runner_exists() {
-        let ws = FilesystemIntent::WorkspaceWrite {
-            write_root: PathBuf::from("C:\\ws"),
-        };
-        assert!(confined_background_refusal(&ws, true).is_ok());
-    }
-
-    /// The public gate the background registry calls. Off Windows the
-    /// Unix sandbox wrappers confine background spawns already, so it must
-    /// stay permissive there or every macOS/Linux background task breaks.
-    #[test]
-    fn background_gate_is_permissive_off_windows_and_closed_on_windows() {
-        let ws = FilesystemIntent::WorkspaceWrite {
+    fn a_confined_intent_is_allowed_only_where_something_can_confine_it() {
+        let confined = FilesystemIntent::WorkspaceWrite {
             write_root: PathBuf::from("/ws"),
         };
-        let result = assert_background_intent_spawn_allowed(&ws, false);
+        let allowed = assert_intent_spawn_allowed(&confined, false).is_ok();
         #[cfg(not(windows))]
-        assert!(result.is_ok(), "{result:?}");
+        assert!(allowed);
         #[cfg(windows)]
-        assert!(result.is_err(), "{result:?}");
+        assert_eq!(allowed, crate::windows_confine::launcher_path().is_some());
+    }
+
+    /// Windows cannot deny a process the network without AppContainer, and
+    /// AppContainer cannot leave the toolchain readable. A request that asks
+    /// for a network deny is refused rather than run with the network open.
+    #[cfg(windows)]
+    #[test]
+    fn a_network_deny_request_is_refused_on_windows_rather_than_run_open() {
+        let confined = FilesystemIntent::WorkspaceWrite {
+            write_root: PathBuf::from("C:\\ws"),
+        };
+        let error = assert_intent_spawn_allowed(&confined, true)
+            .expect_err("network deny must fail closed on Windows");
+        assert!(
+            matches!(error, WindowsSandboxError::NetworkDenyUnsupported)
+                || matches!(error, WindowsSandboxError::FsBackendMissing { .. }),
+            "{error:?}"
+        );
     }
 }

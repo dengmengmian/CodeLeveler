@@ -224,3 +224,49 @@ pub enum ModelCallKind {
 pub trait WorkspaceFacts: Send + Sync {
     async fn capture(&self) -> CheckpointWorkspace;
 }
+
+/// A child this runtime durably STARTED that never produced a terminal fact.
+///
+/// Every field is a mechanical fact the engine read off the event log. The
+/// engine passes them along; it does not interpret them.
+#[derive(Debug, Clone)]
+pub struct LostChild {
+    pub id: String,
+    pub nickname: String,
+    /// The role label recorded on `SubAgentStarted`, carried verbatim.
+    pub role: String,
+}
+
+/// What a harness has to say about one lost child.
+#[derive(Debug, Clone, Default)]
+pub struct LostChildNote {
+    /// A clause appended to the engine's own sentence, after "; ". The engine
+    /// states the lifecycle fact; this states what it meant for the task.
+    pub detail: Option<String>,
+    /// What the child contributed before it was lost. The engine cannot
+    /// compute this: it would have to read the harness's role vocabulary and
+    /// its evidence record.
+    pub contribution: Option<leveler_lifecycle::ChildResultProjection>,
+}
+
+/// Speaks for the children a runtime lost.
+///
+/// The engine owns the whole mechanism: detecting the loss, ordering the
+/// terminal before the turn's own, attributing it to the turn the child
+/// STARTED in, stamping `ok: false`, and writing it durably. None of that is
+/// delegated, and a harness cannot turn a lost child into a successful one.
+///
+/// What the child CONTRIBUTED is the one thing the engine cannot know, so a
+/// harness that has an answer supplies it here. One with none — the engine's
+/// own tests, another product built on this kernel — supplies no voice at all
+/// and still gets a truthful terminal; it just says less.
+///
+/// Infallible on purpose. A harness that cannot read its own evidence returns
+/// no note for that child: a ghost left running forever is worse than a terse
+/// terminal, so nothing a harness does here may block the settlement.
+#[async_trait]
+pub trait LostChildVoice: Send + Sync {
+    /// A note per child the harness can speak for, keyed by child id. Children
+    /// left unnamed get the engine's mechanical terminal.
+    async fn speak_for(&self, lost: &[LostChild]) -> Vec<(String, LostChildNote)>;
+}

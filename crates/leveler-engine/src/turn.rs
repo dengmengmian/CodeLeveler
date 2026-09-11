@@ -34,10 +34,17 @@ use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
 pub enum SeedRequest {
     /// A resumed turn: always seed, the task epoch is unchanged.
     Resume,
-    /// A fresh request. Seeds only when the prior state is still open —
-    /// `continues_active_goal` marks a turn the runtime issued after a refused
-    /// close, which continues the SAME goal rather than opening a new one.
-    Fresh { continues_active_goal: bool },
+    /// A fresh request. The engine owns one mechanical rule over two facts the
+    /// HARNESS supplies; it does not read `PlanState` or `ProgressLedger`.
+    Fresh {
+        /// A turn the runtime issued after a refused close, which continues the
+        /// SAME goal rather than opening a new one.
+        continues_active_goal: bool,
+        /// The Coding harness's answer to "is the prior domain state still
+        /// open?" — computed from its own `PlanState` / `ProgressLedger`. The
+        /// engine applies the rule; it does not make this judgement.
+        prior_epoch_open: bool,
+    },
 }
 
 /// The durable state a fresh execution resumes from. Every field is read off
@@ -47,19 +54,11 @@ pub struct TurnSeeds {
     pub plan: Option<PlanState>,
     pub ledger: Option<EvidenceLedger>,
     pub progress: Option<ProgressLedger>,
-    /// Children whose outstanding entry is contradicted by a durable terminal
-    /// fact: they finished, and the settlement raced the window's end.
-    pub settled_children: Vec<SettledChild>,
-}
-
-/// A child whose recorded settlement has to be re-delivered after a restart.
-#[derive(Debug, Clone)]
-pub struct SettledChild {
-    pub id: String,
-    pub nickname: String,
-    pub role: String,
-    pub ok: bool,
-    pub summary: String,
+    /// The durable terminal facts of children that finished. Whether a given
+    /// child's settlement was already delivered — and what role it played — is
+    /// the harness's reading of its own `outstanding_children` record; the
+    /// engine carries the fact and nothing else.
+    pub finished_children: Vec<crate::log::FinishedChildFact>,
 }
 
 /// Everything the engine offers the harness for one turn.
@@ -289,6 +288,12 @@ pub struct TurnRunner<'a> {
     pub log: &'a EventLog<'a>,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
+    /// Who speaks for a child this runtime lost. The engine detects the loss
+    /// and writes the terminal either way; a harness supplies one so the
+    /// terminal can also say what the child contributed (§F9.3). `None` is a
+    /// harness with no child semantics at all — the engine's own tests, or
+    /// another product on this kernel.
+    pub lost_child_voice: Option<Arc<dyn crate::LostChildVoice>>,
 }
 
 impl TurnRunner<'_> {
@@ -630,100 +635,60 @@ impl TurnRunner<'_> {
 
     /// The durable state a fresh execution should resume from.
     ///
-    /// Resume always seeds. A fresh request seeds only when the prior state is
-    /// still open: a new task epoch must NOT inherit a terminal
-    /// Closing/Completed plan, or the harness reads the previous task's
-    /// conclusion as this one's.
+    /// Resume always seeds. A fresh request seeds when the runtime is
+    /// continuing the active goal, or when the harness reports the prior epoch
+    /// still open. Whether the prior epoch IS open is Coding domain judgement
+    /// and lives in `leveler-agent`: the engine applies that mechanical rule
+    /// and does not read `PlanState` or `ProgressLedger` to form its own.
     async fn turn_seeds(
         &self,
         seed: SeedRequest,
         finished_children: &[crate::log::FinishedChildFact],
     ) -> Result<Option<TurnSeeds>, EngineError> {
-        // Load the last persisted plan/progress once and reuse them for both
-        // the seed decision and the seeding itself. Each `last_persisted_*`
-        // call scans the full event log, so loading plan/progress twice (as
-        // this did) doubled that cost every Content/Goal turn.
-        let mut progress =
-            last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
-        // MA-RT-3 C10/C11: an outstanding entry whose child durably FINISHED
-        // is not lost — the settlement raced the window's end. Prune it (the
-        // lost note must never contradict a terminal fact) and re-deliver the
-        // recorded outcome instead. Genuine ghosts were already settled by the
-        // caller and stay listed for the lost note.
-        let mut settled_children: Vec<SettledChild> = Vec::new();
-        if let Some(p) = progress.as_mut() {
-            p.outstanding_children.retain(|entry| {
-                let mut parts = entry.splitn(4, '|');
-                let id = parts.next().unwrap_or("");
-                let role = parts.nth(1).unwrap_or("?");
-                match finished_children.iter().find(|f| f.id == id) {
-                    Some(fact) => {
-                        settled_children.push(SettledChild {
-                            id: fact.id.clone(),
-                            nickname: fact.nickname.clone(),
-                            role: role.to_string(),
-                            ok: fact.ok,
-                            summary: fact.summary.clone(),
-                        });
-                        false
-                    }
-                    None => true,
-                }
-            });
-        }
-        let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
+        // The engine applies ONE mechanical lifecycle rule over two facts the
+        // harness supplies. Whether the prior Coding epoch is still open is the
+        // harness's judgement (`prior_epoch_open`); the engine never reads
+        // `PlanState`/`ProgressLedger` to decide it.
         let seeding = match seed {
             SeedRequest::Resume => true,
             SeedRequest::Fresh {
                 continues_active_goal,
-            } => should_seed_task_state(plan.as_ref(), progress.as_ref(), continues_active_goal),
+                prior_epoch_open,
+            } => should_seed_task_state(continues_active_goal, prior_epoch_open),
         };
         if !seeding {
             return Ok(None);
         }
+        // Only a seeding turn loads prior state. The direct durable facts —
+        // plan, ledger, progress and the children that finished — are carried
+        // verbatim; reconciling the harness's own `outstanding_children`
+        // encoding against those terminal facts is the harness's job.
+        let progress =
+            last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
+        let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
         let ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?;
         Ok(Some(TurnSeeds {
             plan,
             ledger,
             progress,
-            settled_children,
+            finished_children: finished_children.to_vec(),
         }))
     }
 }
 
-/// Whether a fresh Content/Goal turn should inherit Plan/Ledger/Progress.
+/// The engine's mechanical lifecycle rule for a fresh turn.
 ///
-/// The ledger a verification-repair window starts from.
-///
-/// Resume always seeds (caller uses `TurnInput::Resume`). For Content/Goal we
-/// seed only when the prior task is still open — never Closing/Terminal or a
-/// fully completed plan (that would be a finished epoch).
+/// Pure booleans: `prior_epoch_open` is the HARNESS's judgement over its own
+/// `PlanState`/`ProgressLedger`, and a goal continuation is always open by
+/// construction.
 ///
 /// A continuation of the active goal seeds unconditionally. `closing` and a
 /// fully completed plan both describe the previous WINDOW; neither says the
 /// GOAL is done, and the runtime only issues a continuation because it is
 /// not. Whether the carried evidence is still valid is then the workspace
 /// revision's question, never the epoch's.
-pub(crate) fn should_seed_task_state(
-    plan: Option<&PlanState>,
-    progress: Option<&leveler_lifecycle::ProgressLedger>,
-    continues_active_goal: bool,
-) -> bool {
-    if continues_active_goal {
-        return true;
-    }
-    if let Some(p) = progress
-        && p.is_terminal_for_inheritance()
-    {
-        return false;
-    }
-    if let Some(plan) = plan
-        && plan.is_fully_completed()
-    {
-        return false;
-    }
-    // Seed when there is unfinished work to carry, or no terminal signal.
-    true
+pub(crate) fn should_seed_task_state(continues_active_goal: bool, prior_epoch_open: bool) -> bool {
+    continues_active_goal || prior_epoch_open
 }
 
 /// Seed loaders: indexed single-row lookups (never full-log scans), and a
@@ -760,20 +725,25 @@ impl TurnRunner<'_> {
     /// Settle durable ghosts — children with a persisted `SubAgentStarted` and
     /// no terminal — into truthful terminal facts under CURRENT lost-child
     /// semantics: the activation is gone, the work is not done, the child is
-    /// NOT resumed. Mirrors `fold_child_settlement`'s truth rules for a child
-    /// that never reported:
+    /// NOT resumed.
     ///
-    /// - findings the child ALREADY durably reported stay adopted, and its
-    ///   terminal carries a projection over them (C9: the synthetic finish
-    ///   must not contradict durable evidence);
+    /// The engine owns every mechanical part of that and delegates none of it:
+    ///
     /// - the terminal says `ok: false` — the mechanical fact that this child
     ///   started and never reported. It used to also write a host-authored
     ///   BLOCKING finding so a completion could be refused over it; a lost
     ///   child is a fact to report, not a gate to hold;
-    /// - the terminal is attributed to the turn the child STARTED in.
+    /// - the terminal is attributed to the turn the child STARTED in;
+    /// - it is appended through the same persist-before-forward log, fenced on
+    ///   this runtime's ownership like every other authoritative write.
+    ///
+    /// What the child CONTRIBUTED is the one thing the engine cannot know: it
+    /// would have to read the harness's role vocabulary and its evidence
+    /// record. That answer comes from [`LostChildVoice`], and a runner without
+    /// one still settles every ghost — its terminals just say less.
     ///
     /// `desc` finishes the sentence "[sub-agent {nickname}] …" on the terminal
-    /// event.
+    /// event; a harness note extends it after "; ".
     async fn settle_ghost_children(
         &self,
         open: Vec<crate::log::UnfinishedChild>,
@@ -784,30 +754,33 @@ impl TurnRunner<'_> {
         if open.is_empty() {
             return Ok(());
         }
-        let ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
-            .await?
-            .unwrap_or_default();
+        let notes = match &self.lost_child_voice {
+            Some(voice) => {
+                let lost: Vec<crate::LostChild> = open
+                    .iter()
+                    .map(|child| crate::LostChild {
+                        id: child.id.clone(),
+                        nickname: child.nickname.clone(),
+                        role: child.role.clone(),
+                    })
+                    .collect();
+                voice.speak_for(&lost).await
+            }
+            None => Vec::new(),
+        };
         for child in open {
-            let projection = leveler_lifecycle::ChildResultProjection::from_findings(
-                &child.id,
-                &child.role,
-                &ledger.findings,
-            );
-            let preserved = projection.findings_total;
-            let summary = if preserved > 0 {
-                format!(
-                    "[sub-agent {}] {desc}; {preserved} finding(s) on its ledger record \
-                     remain adopted",
-                    child.nickname
-                )
-            } else {
-                format!("[sub-agent {}] {desc}", child.nickname)
+            let note = notes.iter().find(|(id, _)| *id == child.id).map(|(_, n)| n);
+            let summary = match note.and_then(|note| note.detail.as_deref()) {
+                Some(detail) => format!("[sub-agent {}] {desc}; {detail}", child.nickname),
+                None => format!("[sub-agent {}] {desc}", child.nickname),
             };
             let event = EngineEvent::SubAgentFinished {
                 id: child.id.clone(),
                 nickname: child.nickname.clone(),
+                // Never negotiable: a child that started and never reported did
+                // not succeed, whatever a harness says about it.
                 ok: false,
-                contribution: (preserved > 0).then_some(projection),
+                contribution: note.and_then(|note| note.contribution.clone()),
                 summary,
             };
             let origin = child.turn_id.clone().map(TurnId::new);
@@ -847,67 +820,24 @@ pub async fn last_persisted_progress(
 #[cfg(test)]
 mod seed_gate_tests {
     use super::*;
-    use leveler_lifecycle::{PlanOrigin, PlanState, PlanStep, ProgressLedger, TurnPhase};
 
-    fn completed_plan() -> PlanState {
-        PlanState {
-            steps: vec![PlanStep {
-                step: "done".into(),
-                status: "completed".into(),
-                id: Some("1".into()),
-                origin: PlanOrigin::ModelExplicit,
-            }],
-        }
+    #[test]
+    fn a_fresh_turn_does_not_seed_a_closed_epoch() {
+        assert!(!should_seed_task_state(false, false));
     }
 
     #[test]
-    fn fresh_content_does_not_seed_closing_progress() {
-        let mut progress = ProgressLedger::default();
-        progress.enter_closing();
-        assert!(!should_seed_task_state(None, Some(&progress), false));
-    }
-
-    #[test]
-    fn fresh_content_does_not_seed_fully_completed_plan() {
-        assert!(!should_seed_task_state(
-            Some(&completed_plan()),
-            None,
-            false
-        ));
-    }
-
-    #[test]
-    fn open_progress_still_seeds() {
-        let progress = ProgressLedger {
-            phase: TurnPhase::Active,
-            closing: false,
-            ..Default::default()
-        };
-        assert!(should_seed_task_state(None, Some(&progress), false));
+    fn a_fresh_turn_seeds_an_open_epoch() {
+        assert!(should_seed_task_state(false, true));
     }
 
     /// A refused close is the opposite of a finished epoch: the goal is
     /// explicitly still open, and the runtime itself is continuing it. The
-    /// `closing` flag only records that a close was ATTEMPTED. Treating it as
-    /// terminal dropped every mutation and verification a Phase C run had —
-    /// the next window then told its own judge no test had run since the last
-    /// edit, and refused a truthful claim as a contradiction.
+    /// harness's closed-epoch answer (`prior_epoch_open == false`) must not be
+    /// able to drop a continuation.
     #[test]
-    fn a_goal_continuation_seeds_even_after_a_refused_close() {
-        let mut progress = ProgressLedger::default();
-        progress.enter_closing();
-        assert!(should_seed_task_state(None, Some(&progress), true));
-    }
-
-    /// Plan steps all done is not the goal done. On a continuation of the
-    /// same goal the evidence must carry regardless of plan state.
-    #[test]
-    fn a_goal_continuation_seeds_even_when_the_plan_is_fully_completed() {
-        assert!(should_seed_task_state(Some(&completed_plan()), None, true));
-    }
-
-    #[test]
-    fn empty_prior_state_seeds_harmlessly() {
-        assert!(should_seed_task_state(None, None, false));
+    fn a_goal_continuation_seeds_even_when_the_harness_reports_closed() {
+        assert!(should_seed_task_state(true, false));
+        assert!(should_seed_task_state(true, true));
     }
 }

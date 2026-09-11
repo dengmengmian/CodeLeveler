@@ -300,6 +300,28 @@ All notable changes to CodeLeveler are documented here. The format follows
   remains is mechanical: the identical-call loop guard, the all-calls-refused
   streak, budgets and the absolute round ceiling.
 
+### Fixed
+- **`resume` refuses a parallel parent session by its kind.** The engine's
+  single-writer claim held only because the parallel parent's transcript
+  happened to be empty; `resume` now refuses `ExecutionKind::Parallel`
+  outright, and the engine comment says what is true — the launcher owns that
+  one session's lifecycle. See `docs/ARCHITECTURE.md` §18.11.
+- **The verifier's doc comment no longer claims completion authority.** The
+  verifier owns verification verdicts; a passing verdict is mechanical
+  evidence a task outcome is judged against, not the runtime deciding the
+  request was satisfied. Code was already correct; the comment was not
+  (§18.8).
+- **The engine no longer reads Coding semantics to run its own mechanics.**
+  It named no harness crate, and still answered three questions in the Coding
+  vocabulary through the shared `leveler-lifecycle` types: whether a prior
+  epoch was still open, how to decode the harness's outstanding-child entries,
+  and what a lost child had contributed. The first two now arrive as facts the
+  harness computes, and the third is asked for through a new `LostChildVoice`
+  port. The engine keeps every mechanical part of settling a lost child —
+  detection, ordering, origin-turn attribution, `ok: false`, the fenced
+  append — and a harness with no child semantics still gets truthful terminals.
+  See `docs/ARCHITECTURE.md` §18.12.
+
 ## [0.2.0-beta.1] - 2026-08-22
 
 First public pre-release. Published as a GitHub **pre-release**, so `brew`,

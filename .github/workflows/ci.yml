@@ -44,7 +44,7 @@ jobs:
           fi
           bwrap --ro-bind / / true
 
-      # Windows uses its own execution backends; tests assert fail-closed
+      # Windows confines writes with its own backend; tests assert fail-closed
       # filesystem behavior and honest capability probes.
       - name: Format
         run: cargo fmt --all -- --check
@@ -54,16 +54,19 @@ jobs:
 
       # Keep Windows security boundaries visible as their own required step.
       # These exercise real NTFS directory sharing/junction behavior, real
-      # AppContainer ACLs, and Job Object descendant termination on the runner.
+      # integrity-labelled write roots, and Job Object descendant termination
+      # on the runner. `leveler-confine.exe` is the launcher the confined path
+      # runs through, so it is built before anything asks for confinement — a
+      # per-crate `cargo test -p ...` does not build another package's binary.
       - name: Windows security canaries
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          cargo build -p leveler-win-confine --all-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p leveler-tools windows_ --all-features -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p leveler-execution windows_appcontainer::tests::canaries --all-features -- --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p leveler-execution windows_job_ --all-features -- --nocapture
+          cargo test -p leveler-execution windows_ --all-features -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Installer checksum canaries

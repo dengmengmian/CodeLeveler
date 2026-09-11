@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::{CommandRunner, ManagedProcess, ProcessIdentity, ProcessRequest};
 use crate::snapshot::SnapshotId;
-use crate::windows_sandbox::assert_background_intent_spawn_allowed;
 
 /// Pre-spawn workspace snapshot and write authority, used to settle a
 /// background task when its process exits.
@@ -144,14 +143,11 @@ struct TaskInner {
     mutation_baseline: Option<MutationBaseline>,
     /// What the reaper found. Read by a waiter; never produced by one.
     settlement: Option<BackgroundSettlement>,
-    /// Keeps the private scratch (and, on macOS/Linux, its OS lease) alive
-    /// until the child and log pumps finish — so a backgrounded command holds
-    /// its lease for its whole life. [`finalize_if_drained`] drops it at that
-    /// point. On other platforms there is no lease, just the temp tree.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// Keeps the private scratch, its OS lease and (on Windows) the write-root
+    /// labels alive until the child and log pumps finish — so a backgrounded
+    /// command holds its whole confinement for its whole life.
+    /// [`finalize_if_drained`] drops it at that point.
     sandbox_scratch: Option<crate::command::SandboxScratch>,
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    sandbox_scratch: Option<tempfile::TempDir>,
 }
 
 /// Process-backed background task registry shared via [`Arc`] on tool context.
@@ -217,14 +213,10 @@ impl BackgroundTaskRegistry {
         st.next += 1;
         let id = format!("bg-{}", st.next);
 
-        let intent = request.filesystem_intent();
-        // PR 0: this registry has no confining runner on Windows — the spawn
-        // below is a plain one — so a restricted intent must be refused here,
-        // never run unconfined.
-        if let Err(err) = assert_background_intent_spawn_allowed(&intent, request.deny_network) {
-            return Err(err.to_string());
-        }
-
+        // `CommandRunner::spawn` is the one confining spawn on every host, so a
+        // background command is confined exactly like a foreground one and
+        // fails closed in exactly the same place. This registry adds no policy
+        // of its own.
         let mut process = self
             .runner
             .spawn(&request)
@@ -233,10 +225,7 @@ impl BackgroundTaskRegistry {
         let identity = process.identity();
         let stdout = process.take_stdout();
         let stderr = process.take_stderr();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let sandbox_scratch = process.take_sandbox_scratch();
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_scratch: Option<tempfile::TempDir> = None;
         let log_pumps_remaining = u8::from(stdout.is_some()) + u8::from(stderr.is_some());
         let done = Arc::new(Notify::new());
         let reg = self.inner.clone();
@@ -660,8 +649,11 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::command::prepare_sandbox_paths;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) fn unix_host_registry() -> BackgroundTaskRegistry {
+    /// A registry whose runner sees the real host environment. The default
+    /// `BackgroundTaskRegistry::new()` reads the installed process snapshot,
+    /// which a unit test never installs — so a confined command would resolve
+    /// no home, no PATH and no temp directory.
+    pub(super) fn host_registry() -> BackgroundTaskRegistry {
         BackgroundTaskRegistry::with_environment(Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
             std::env::current_dir().unwrap_or_default(),
@@ -915,16 +907,7 @@ mod tests {
             log_pumps_remaining: 0,
             mutation_baseline: None,
             settlement: None,
-            sandbox_scratch: {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                {
-                    Some(crate::command::SandboxScratch::unleased(scratch))
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                {
-                    Some(scratch)
-                }
-            },
+            sandbox_scratch: Some(crate::command::SandboxScratch::unleased(scratch)),
         };
 
         finalize_if_drained(&mut task);
@@ -1255,16 +1238,17 @@ mod tests {
     #[tokio::test]
     async fn spawn_honors_sandbox_fields_on_process_request() {
         // Smoke: confined ProcessRequest spawns and produces stdout (wrap path
-        // does not refuse a normal confined command). OS confinement canary is
-        // `background_confined_blocks_write_outside_workspace` below.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let reg = unix_host_registry();
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let reg = BackgroundTaskRegistry::new();
+        // does not refuse a normal confined command). OS confinement canaries
+        // are `background_confined_blocks_write_outside_workspace` below and
+        // `windows_confine::windows_canaries`.
+        let reg = host_registry();
         let ws = tempfile::tempdir().expect("ws");
-        let mut req =
-            ProcessRequest::new("echo", vec!["sandboxed-bg".into()], ws.path().to_path_buf());
-        req.deny_network = true;
+        let (program, args) = leveler_test_support::echo_command("sandboxed-bg");
+        let mut req = ProcessRequest::new(program, args, ws.path().to_path_buf());
+        // Ask for a network deny only where the host can actually enforce one.
+        // Windows cannot outside AppContainer, and a request for one there is
+        // refused rather than run open — asserted in `windows_sandbox`.
+        req.deny_network = crate::windows_sandbox::probe_sandbox_capabilities().network_deny;
         req.write_scope = crate::WriteScope::Workspace {
             root: ws.path().to_path_buf(),
         };
@@ -1309,7 +1293,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
 
-        let reg = unix_host_registry();
+        let reg = host_registry();
 
         // Write inside workspace: allowed.
         let mut inside = ProcessRequest::new(
@@ -1494,7 +1478,7 @@ mod unified_runner_tests {
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
-        let reg = super::tests::unix_host_registry();
+        let reg = super::tests::host_registry();
         let runner = reg.runner.clone();
 
         for (label, escape) in [
@@ -1545,7 +1529,7 @@ mod unified_runner_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let reg = super::tests::unix_host_registry();
+        let reg = super::tests::host_registry();
         let runner = reg.runner.clone();
         let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
 

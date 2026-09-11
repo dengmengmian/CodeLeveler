@@ -278,7 +278,7 @@ async fn run_one(
 
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .current_dir(cwd)
+        .current_dir(crate::command::child_working_directory(cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

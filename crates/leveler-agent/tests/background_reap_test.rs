@@ -123,16 +123,25 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     }
 }
 
+/// A model turn that backgrounds a long-lived process. The requirement is "a
+/// process that stays alive", not `sleep` — Windows has no such program.
 fn spawn_sleep_server() -> ModelResponse {
+    let (program, args) = leveler_test_support::sleep_command(300);
     tool_call(
         "bg1",
         "run_command",
         serde_json::json!({
-            "program": "sleep",
-            "args": ["300"],
+            "program": program,
+            "args": args,
             "background": true
         }),
     )
+}
+
+/// The same long-lived process as a direct [`ProcessRequest`].
+fn sleep_request(cwd: &std::path::Path) -> ProcessRequest {
+    let (program, args) = leveler_test_support::sleep_command(300);
+    ProcessRequest::new(program, args, cwd.to_path_buf())
 }
 
 struct Harness {
@@ -304,7 +313,7 @@ async fn daemon_scoped_tasks_survive_session_terminal() {
     let daemon_task = h
         .registry
         .spawn_owned(
-            ProcessRequest::new("sleep", vec!["300".into()], h.dir.path().to_path_buf()),
+            sleep_request(h.dir.path()),
             None,
             None, // daemon-scoped: no owner
         )
@@ -347,11 +356,7 @@ async fn interrupted_turn_keeps_session_owned_tasks_alive() {
     let s = spec(&h, "long task");
     let owned = h
         .registry
-        .spawn_owned(
-            ProcessRequest::new("sleep", vec!["300".into()], h.dir.path().to_path_buf()),
-            None,
-            Some(SESSION_SCOPE),
-        )
+        .spawn_owned(sleep_request(h.dir.path()), None, Some(SESSION_SCOPE))
         .await
         .expect("session-owned spawn");
     let session = h.engine.create_task(&s).await.unwrap();

@@ -59,10 +59,12 @@ pub struct ProcessRequest {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub timeout: Duration,
-    /// Deny network access for this process (macOS seatbelt; no-op elsewhere).
+    /// Deny network access for this process. macOS seatbelt and Linux bwrap
+    /// enforce it; Windows cannot, and refuses the request rather than running
+    /// it with the network open.
     pub deny_network: bool,
     /// The one write boundary this process runs under. The OS wrappers
-    /// (seatbelt / bwrap / AppContainer) enforce it: `Workspace` confines
+    /// (seatbelt / bwrap / `leveler-confine.exe`) enforce it: `Workspace` confines
     /// writes to that root plus temp/toolchain caches, `None` mounts the
     /// workspace read-only (scratch and caches stay writable so builds run),
     /// `Unrestricted` applies no write fence. Reads are never confined.
@@ -102,11 +104,6 @@ impl ProcessRequest {
 impl ProcessRequest {
     /// The Windows backend contract for this request, derived from the write
     /// scope. Never model-chosen: the scope comes from host policy.
-    ///
-    /// Known limitation: AppContainer allowlists *reads* to its write roots,
-    /// so on Windows "read anything" does not hold yet — the Restricted
-    /// Token + ACL write-confinement backend the migration plan calls for
-    /// must be built and verified on a Windows host.
     pub fn filesystem_intent(&self) -> crate::windows_sandbox::FilesystemIntent {
         crate::windows_sandbox::FilesystemIntent::from_write_scope(&self.write_scope, &self.cwd)
     }
@@ -115,7 +112,6 @@ impl ProcessRequest {
 /// The directory a confined request's private scratch and tool caches are
 /// keyed on: the write root when there is one, else the cwd (a `None` scope
 /// still needs caches to build against).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn sandbox_anchor(request: &ProcessRequest) -> &Path {
     request.write_scope.root().unwrap_or(&request.cwd)
 }
@@ -125,9 +121,8 @@ pub(crate) fn sandbox_anchor(request: &ProcessRequest) -> &Path {
 /// token check also covers explicit `cargo --offline`/`npm --offline`, including
 /// commands carried inside a shell `-c` argument.
 ///
-/// Only the macOS/Linux sandbox paths consult this; Windows has no host-cache
-/// overlay, so the function is gated to avoid a dead-code warning there.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Windows has no host-cache overlay (it would need a symlink), so the answer
+/// is only consulted there to be discarded — see `prepare_cargo_home`.
 pub(crate) fn should_read_host_caches(request: &ProcessRequest) -> bool {
     request.deny_network
         || request.args.iter().any(|arg| {
@@ -298,14 +293,40 @@ pub(crate) fn sandbox_command_with_read_denials(
             cache_write_roots,
         )
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
     {
-        // Windows confines through AppContainer (see `windows_sandbox`), not
-        // through an argv wrapper, so every confinement input is consumed
-        // there and none of them shape the command line here.
+        // Windows confines writes with Mandatory Integrity Control: the roots
+        // are labelled by the caller (see `windows_confine::lease_write_roots`)
+        // and `leveler-confine.exe` drops the child to Low integrity. Reads are
+        // not confined on any host, so the read denials shape nothing here —
+        // the macOS seatbelt profile is the only place that can honor them.
+        let _ = (scratch_root, cache_write_roots, read_denied_roots);
+        windows_sandbox_command(program, args, scope)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
         let _ = (scope, scratch_root, cache_write_roots);
         (program.to_string(), args.to_vec())
     }
+}
+
+/// Wrap a command in `leveler-confine.exe`, the Windows write-confinement
+/// launcher. An unconfined scope is left alone, and a missing launcher cannot
+/// reach here: [`crate::windows_sandbox::probe_sandbox_capabilities`] reports
+/// no write backend without one, so the spawn is refused before this point.
+#[cfg(windows)]
+fn windows_sandbox_command(
+    program: &str,
+    args: &[String],
+    scope: &WriteScope,
+) -> (String, Vec<String>) {
+    let Some(launcher) = crate::windows_confine::launcher_path().filter(|_| scope.confines())
+    else {
+        return (program.to_string(), args.to_vec());
+    };
+    let mut wrapped = vec!["--".to_string(), program.to_string()];
+    wrapped.extend(args.iter().cloned());
+    (launcher.display().to_string(), wrapped)
 }
 
 #[cfg(target_os = "macos")]
@@ -352,11 +373,11 @@ fn macos_sandbox_command(
     // attempts it.
     let (write_roots, protected) = match scope {
         WriteScope::Workspace { root } => (
-            writable_roots(root, scratch_root, cache_write_roots),
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
         ),
         _ => (
-            writable_roots_without_workspace(scratch_root, cache_write_roots),
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             Vec::new(),
         ),
     };
@@ -453,7 +474,6 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// host processes and turn a cache compatibility allowance into persistence.
 /// Writable roots for a pre-claim (read-only-workspace) process: scratch and
 /// toolchain caches only — deliberately never the workspace itself.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn writable_roots_without_workspace(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
@@ -477,7 +497,6 @@ fn writable_roots_without_workspace(
     roots
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn writable_roots(
     root: &Path,
     scratch_root: Option<&Path>,
@@ -503,9 +522,22 @@ fn writable_roots(
     roots
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// The write roots one [`WriteScope`] authorizes. `Unrestricted` authorizes
+/// nothing here because it is not confined at all; `None` is the pre-claim
+/// scope, which may write to scratch and caches but not to the workspace.
+fn writable_roots_for_scope(
+    scope: &WriteScope,
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    match scope {
+        WriteScope::Unrestricted => Vec::new(),
+        WriteScope::None => writable_roots_without_workspace(scratch_root, cache_write_roots),
+        WriteScope::Workspace { root } => writable_roots(root, scratch_root, cache_write_roots),
+    }
+}
+
 mod host_cache;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use host_cache::{
     SandboxPaths, SandboxScratch, apply_sandbox_environment, prepare_sandbox_paths,
 };
@@ -584,11 +616,11 @@ fn linux_sandbox_command(
     // scratch and toolchain caches stay usable.
     let (roots, protected) = match scope {
         WriteScope::Workspace { root } => (
-            writable_roots(root, scratch_root, cache_write_roots),
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
         ),
         _ => (
-            writable_roots_without_workspace(scratch_root, cache_write_roots),
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             Vec::new(),
         ),
     };
@@ -714,6 +746,60 @@ pub fn shell_invocation(cmd: &str) -> (String, Vec<String>) {
     }
 }
 
+/// The working directory a spawned command is given.
+///
+/// [`crate::Workspace::new`] canonicalizes, and a canonical Windows path
+/// carries the verbatim prefix (`\\?\C:\…`). Keeping that internally is
+/// correct — path-safety comparisons must be against exactly one spelling of
+/// the tree — but it is not correct to hand to a child process. `cmd.exe`
+/// reads any leading `\\` as UNC, refuses it as a working directory, and
+/// silently starts in `C:\Windows` instead. The command then fails for a
+/// reason that reads like a missing tool, and the transcript never mentions
+/// the path.
+///
+/// Only the verbatim prefix is removed. A real UNC path (`\\server\share`) is
+/// a different thing and passes through untouched, and so does any path that
+/// is not verbatim.
+pub(crate) fn child_working_directory(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        // Rebuilt from components rather than trimmed by string offset: the
+        // prefix is only 4 characters wide, and slicing an `OsStr` would mean
+        // assuming it is UTF-8, which a Windows path is not required to be.
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return path.to_path_buf();
+        };
+        let mut plain = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            // `\\?\UNC\server\share` is the verbatim spelling of the real UNC
+            // share `\\server\share`, and normalizing it must not lose the
+            // share — that is what would turn a UNC path into a local one.
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = PathBuf::from(r"\\");
+                unc.push(server);
+                unc.push(share);
+                unc
+            }
+            _ => return path.to_path_buf(),
+        };
+        for component in components {
+            match component {
+                // The base already carries the root and the prefix does not
+                // want a `.` segment; everything else is a real component.
+                Component::RootDir | Component::CurDir => {}
+                other => plain.push(other.as_os_str()),
+            }
+        }
+        plain
+    }
+}
+
 /// Runs external commands.
 #[derive(Debug, Clone)]
 pub struct CommandRunner {
@@ -773,42 +859,8 @@ impl CommandRunner {
         cancellation: CancellationToken,
         chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
     ) -> Result<ProcessOutput, ProcessError> {
-        // WS0/WS2: the Windows contract, derived from the write scope. On
-        // Windows, restricted intents fail closed when FS backends are missing.
-        let intent = request.filesystem_intent();
-        if let Err(err) =
-            crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
-        {
-            return Err(ProcessError::SandboxPolicy(err.to_string()));
-        }
-        // Confined Windows commands run through the AppContainer launcher,
-        // which hands back synchronous readers rather than a process handle —
-        // the one path that does not go through `spawn` (foreground only;
-        // the background registry refuses it, PR 0).
-        #[cfg(windows)]
-        if !intent.is_unrestricted() {
-            let (program, args) = sandbox_command(
-                &request.program,
-                &request.args,
-                request.deny_network,
-                &request.write_scope,
-                None,
-                &[],
-            );
-            return run_windows_appcontainer(
-                request,
-                intent,
-                &program,
-                &args,
-                cancellation,
-                self.environment.clone(),
-                chunks,
-            )
-            .await;
-        }
-        #[cfg(not(windows))]
-        let _ = intent;
-
+        // `spawn` is where a request that cannot be confined fails closed —
+        // one gate, whichever read mode the caller wanted.
         let process = self.spawn(&request).await?;
         drive_to_completion(process, &request, cancellation, chunks).await
     }
@@ -816,9 +868,10 @@ impl CommandRunner {
     /// The one spawn path (PR 4). Every command — foreground, background,
     /// verification — is confined, environment-scrubbed and process-grouped
     /// here, and comes back as a [`ManagedProcess`] the caller waits on or
-    /// terminates as a tree. Windows: Unrestricted only (Job Object); a
-    /// confined Windows request is refused because the AppContainer launcher
-    /// cannot yield a process handle (see [`Self::run`] for its foreground use).
+    /// terminates as a tree. All three hosts confine the same way: an argv
+    /// wrapper (`sandbox-exec`, `bwrap`, `leveler-confine.exe`) over one
+    /// ordinary spawn, so a background command is no less confined than a
+    /// foreground one.
     pub async fn spawn(&self, request: &ProcessRequest) -> Result<ManagedProcess, ProcessError> {
         let intent = request.filesystem_intent();
         if let Err(err) =
@@ -826,18 +879,7 @@ impl CommandRunner {
         {
             return Err(ProcessError::SandboxPolicy(err.to_string()));
         }
-        #[cfg(windows)]
-        if !intent.is_unrestricted() {
-            return Err(ProcessError::SandboxPolicy(
-                "confined Windows commands run only through the foreground AppContainer \
-                 launcher; no confining spawn is available for them"
-                    .into(),
-            ));
-        }
-        #[cfg(not(windows))]
-        let _ = intent;
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let sandbox_paths = request
             .write_scope
             .confines()
@@ -854,17 +896,33 @@ impl CommandRunner {
                     "create private sandbox scratch directory: {source}"
                 ))
             })?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_scratch_root: Option<&Path> = None;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let sandbox_cache_write_roots = sandbox_paths
             .as_ref()
             .map(SandboxPaths::cache_write_roots)
             .unwrap_or(&[]);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let sandbox_cache_write_roots: &[PathBuf] = &[];
+
+        // Windows has no per-process filesystem view to confine writes with, so
+        // the authorized write roots carry a Low integrity label for exactly as
+        // long as this command runs. The lease rides the `ManagedProcess`.
+        #[cfg(windows)]
+        let write_roots = request
+            .write_scope
+            .confines()
+            .then(|| {
+                let roots = writable_roots_for_scope(
+                    &request.write_scope,
+                    sandbox_scratch_root,
+                    sandbox_cache_write_roots,
+                );
+                crate::windows_confine::lease_write_roots(&self.environment, &roots)
+            })
+            .transpose()
+            .map_err(|source| {
+                ProcessError::SandboxPolicy(format!(
+                    "label the authorized Windows write roots: {source}"
+                ))
+            })?;
         let (program, args) = sandbox_command(
             &request.program,
             &request.args,
@@ -875,8 +933,7 @@ impl CommandRunner {
         );
 
         let mut cmd = Command::new(&program);
-        apply_common_command_env(&mut cmd, request, &args, &self.environment);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        apply_common_command_env(&mut cmd, request, &program, &args, &self.environment);
         if let Some(paths) = sandbox_paths.as_ref() {
             apply_sandbox_environment(&mut cmd, paths);
         }
@@ -902,7 +959,6 @@ impl CommandRunner {
                 identity: ProcessIdentity { pgid: pid as i32 },
                 stdout,
                 stderr,
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 sandbox_paths,
             })
         }
@@ -928,6 +984,8 @@ impl CommandRunner {
                 identity: ProcessIdentity { pid },
                 stdout,
                 stderr,
+                sandbox_paths,
+                write_roots,
             })
         }
     }
@@ -1008,8 +1066,11 @@ pub struct ManagedProcess {
     identity: ProcessIdentity,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     sandbox_paths: Option<SandboxPaths>,
+    /// Windows only: the Low integrity labels on this command's write roots,
+    /// released when the process is dropped.
+    #[cfg(windows)]
+    write_roots: Option<crate::windows_confine::WriteRootLease>,
 }
 
 impl ManagedProcess {
@@ -1072,11 +1133,15 @@ impl ManagedProcess {
         reap_process_group(Some(self.identity.pgid as u32));
     }
 
-    /// Hand the scratch/cache lease to a longer-lived owner (the background
-    /// registry keeps it until the log pumps drain).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// Hand the scratch/cache lease — and, on Windows, the write-root labels —
+    /// to a longer-lived owner (the background registry keeps them until the
+    /// log pumps drain).
     pub(crate) fn take_sandbox_scratch(&mut self) -> Option<SandboxScratch> {
-        self.sandbox_paths.take().map(SandboxPaths::into_scratch)
+        #[allow(unused_mut)]
+        let mut scratch = self.sandbox_paths.take().map(SandboxPaths::into_scratch)?;
+        #[cfg(windows)]
+        scratch.hold_write_roots(self.write_roots.take());
+        Some(scratch)
     }
 }
 
@@ -1165,50 +1230,6 @@ async fn drive_to_completion(
     })
 }
 
-/// Windows confined path: the AppContainer launcher. `chunks` is the live-output
-/// sender that `run_observed` (the user shell's `!command` view) passes down.
-///
-/// The Job Object path reads its pipes exactly like Unix does, so it streams.
-/// This path cannot: `rappct` hands back synchronous readers, and giving it a
-/// live view means restructuring that launcher rather than threading one
-/// argument. It therefore emits the whole output **once, at the end** — a
-/// consumer of this channel builds what the user reads from chunks alone, so
-/// a confined command that sent none would print nothing at all.
-#[cfg(windows)]
-async fn run_windows_appcontainer(
-    request: ProcessRequest,
-    intent: crate::windows_sandbox::FilesystemIntent,
-    program: &str,
-    args: &[String],
-    cancellation: CancellationToken,
-    environment: std::sync::Arc<leveler_core::EnvSnapshot>,
-    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
-) -> Result<ProcessOutput, ProcessError> {
-    let result = crate::windows_appcontainer::run_appcontainer(
-        request,
-        intent,
-        program,
-        args,
-        cancellation,
-        environment,
-    )
-    .await;
-    if let (Some(tx), Ok(output)) = (chunks.as_ref(), result.as_ref()) {
-        for (stream, text) in [
-            (OutputStream::Stdout, &output.stdout),
-            (OutputStream::Stderr, &output.stderr),
-        ] {
-            if !text.is_empty() {
-                let _ = tx.send(OutputChunk {
-                    stream,
-                    text: text.clone(),
-                });
-            }
-        }
-    }
-    result
-}
-
 /// Linux: deliver SIGTERM to the child when this (parent) process dies — the
 /// timeout/cancel paths already `killpg`, but a force-quit (`process::exit`,
 /// SIGKILL, third Ctrl-C) runs no destructors and would orphan grandchildren
@@ -1272,14 +1293,41 @@ pub(crate) fn map_windows_job_spawn_error(program: &str, source: std::io::Error)
     ))
 }
 
+/// Attach `args` to the child.
+///
+/// `cmd.exe` is the one program that parses part of its own command line, and
+/// it does not treat a backslash as a quote escape. Quoting its tail the way
+/// Win32 argv is quoted delivers the quotes to the program as characters —
+/// `powershell -Command "Start-Sleep -Seconds 5"` becomes a string PowerShell
+/// prints rather than a command it runs. The tail goes through verbatim; every
+/// other argument is quoted normally. The confined path does the same thing one
+/// hop later, in `leveler-confine.exe`.
+fn apply_arguments(cmd: &mut Command, program: &str, args: &[String]) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        if let Some(tail) = leveler_win_confine::cmd_tail_start(program, args) {
+            for argument in &args[..tail] {
+                cmd.arg(argument);
+            }
+            cmd.as_std_mut().raw_arg(args[tail..].join(" "));
+            return;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    cmd.args(args);
+}
+
 fn apply_common_command_env(
     cmd: &mut Command,
     request: &ProcessRequest,
+    program: &str,
     args: &[String],
     environment: &leveler_core::EnvSnapshot,
 ) {
-    cmd.args(args)
-        .current_dir(&request.cwd)
+    apply_arguments(cmd, program, args);
+    cmd.current_dir(child_working_directory(&request.cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1755,7 +1803,26 @@ mod tests {
                 .expect("command present");
             assert_eq!(args[cmd + 1], "x", "command args follow the program");
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            // Windows wraps the same way, in `leveler-confine.exe`. The write
+            // roots are not on the command line — they are labelled before the
+            // spawn — so the wrapper carries only the command it confines.
+            match crate::windows_confine::launcher_path() {
+                Some(launcher) => {
+                    assert_eq!(program, launcher.display().to_string());
+                    assert_eq!(
+                        args,
+                        vec!["--".to_string(), "touch".to_string(), "x".to_string()]
+                    );
+                }
+                None => {
+                    assert_eq!(program, "touch", "no launcher installed on this host");
+                    assert_eq!(args, vec!["x".to_string()]);
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             assert_eq!(program, "touch", "no OS confinement backend here");
             assert_eq!(args, vec!["x".to_string()]);
@@ -4260,5 +4327,78 @@ mod managed_runner_tests {
         let _ = waiter.await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(killpg(group, None).is_err(), "group survived identity kill");
+    }
+
+    /// A `Workspace` root is canonical, so on Windows it is spelled verbatim.
+    /// Only the verbatim prefix may be removed: a real UNC share is a
+    /// different path, and turning one into the other would be a scope change
+    /// dressed as a formatting fix.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_workspace_path_becomes_a_working_directory_a_shell_accepts() {
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\ws")),
+            Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\ws")
+        );
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\UNC\server\share\ws")),
+            Path::new(r"\\server\share\ws")
+        );
+        // Spaces are a path's own business; nothing here re-quotes them.
+        assert_eq!(
+            child_working_directory(Path::new(r"\\?\C:\Program Files\my repo")),
+            Path::new(r"C:\Program Files\my repo")
+        );
+        // Already-plain paths, including a real UNC share, are left alone.
+        for plain in [r"C:\ws", r"\\server\share\ws", r"\\?\Volume{1}\ws"] {
+            assert_eq!(child_working_directory(Path::new(plain)), Path::new(plain));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_posix_working_directory_is_passed_through_unchanged() {
+        let path = Path::new("/tmp/leveler ws");
+        assert_eq!(child_working_directory(path), path);
+    }
+
+    /// The behavioural half of the same rule, and the shape the leveler-agent
+    /// failures had: a command whose tool exists only relative to the
+    /// workspace reads as a missing tool when `cmd.exe` refuses the directory
+    /// and silently starts somewhere else. A relative `type` is the smallest
+    /// proof the child really began in the canonical workspace root.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_command_runs_in_the_canonicalized_workspace_root() {
+        let dir = tempfile::tempdir().expect("ws");
+        std::fs::write(dir.path().join("marker.txt"), "found-me").unwrap();
+        let workspace = crate::Workspace::new(dir.path()).expect("workspace");
+        assert!(
+            workspace.root().to_string_lossy().starts_with(r"\\?\"),
+            "the workspace root is expected to be verbatim on Windows: {}",
+            workspace.root().display()
+        );
+        let runner =
+            CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )));
+        let req = ProcessRequest::new(
+            "cmd",
+            vec!["/C".into(), "type marker.txt".into()],
+            workspace.root().to_path_buf(),
+        );
+        let out = runner
+            .run(req, CancellationToken::new())
+            .await
+            .expect("spawn");
+        assert!(
+            out.stdout.contains("found-me"),
+            "the child must start in the workspace root: stdout={:?} stderr={:?} exit={:?}",
+            out.stdout,
+            out.stderr,
+            out.exit_code
+        );
     }
 }

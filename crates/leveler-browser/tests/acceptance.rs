@@ -524,14 +524,38 @@ async fn killing_the_browser_is_reported_as_a_disconnect() {
         leveler_browser::BrowserStatus::Live { .. }
     ));
 
-    kill_browser_processes(product, &profile);
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // The kill has to be REAL before the contract below means anything. When
+    // the kill silently matched nothing, this test used to report "a killed
+    // browser must not answer a snapshot" — a true statement about a browser
+    // nobody had killed, and a false one about the product.
+    let killed = kill_browser_processes(product, &profile);
+    assert!(
+        !killed.is_empty(),
+        "the external kill matched no process, so nothing was killed; {} is not how \
+         this run's browser is found",
+        process_marker(product, &profile)
+    );
+    wait_until_no_browser_process(
+        product,
+        &profile,
+        "the external kill did not end the browser",
+    );
+
+    // Death is observed through the protocol connection, and the socket takes
+    // a moment to report it. Poll the mechanical fact with a deadline instead
+    // of assuming a duration: a browser that was never killed keeps answering
+    // and fails here.
+    wait_for_disconnect(&b, &s, "a killed browser").await;
 
     let err = b
         .snapshot(&s, None)
         .await
         .expect_err("a killed browser must not answer a snapshot");
     println!("after kill: {err}");
+    assert!(
+        matches!(err, leveler_browser::BrowserError::Disconnected(_)),
+        "a killed browser must report a disconnect, got: {err}"
+    );
     assert!(
         matches!(
             b.status().await,
@@ -568,15 +592,28 @@ async fn shutdown_leaves_no_process_behind() {
     let before = count_browser_processes(product, &profile);
     assert!(before > 0, "expected a running browser to count");
 
+    // Something this run does NOT own, alive across the shutdown. Cleanup is
+    // scoped by the ownership marker, so it must not reach this — the same
+    // rule that keeps the developer's own browser out of it.
+    let mut decoy = Decoy::start();
+
     b.shutdown().await;
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    let after = count_browser_processes(product, &profile);
-    assert_eq!(after, 0, "{after} browser processes outlived the session");
-    println!("PASS process-cleanup {product} ({before} → 0)");
+    wait_until_no_browser_process(product, &profile, "browser processes outlived the session");
+    assert!(
+        decoy.still_running(),
+        "shutdown ended a process this run does not own"
+    );
+    println!("PASS process-cleanup {product} ({before} → 0, unrelated process untouched)");
     let _ = std::fs::remove_dir_all(&profile);
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+// ── helpers: what this run owns, and what it may end ────────────────────────
+
+/// One process on this machine, as the operating system reports it.
+struct Proc {
+    pid: u32,
+    command: String,
+}
 
 /// How this test recognises the processes it started.
 ///
@@ -592,24 +629,243 @@ fn process_marker(product: BrowserProduct, profile: &std::path::Path) -> String 
     }
 }
 
-fn count_browser_processes(product: BrowserProduct, profile: &std::path::Path) -> usize {
-    let needle = process_marker(product, profile);
+/// The pids whose command line carries `marker`. This is the whole ownership
+/// test, and it is deliberately about the COMMAND LINE rather than the image
+/// name: "end every msedge.exe" would reach a browser this run never started,
+/// and nothing downstream can undo that. Pure, so it is checked on every
+/// platform rather than only where a browser can be driven.
+fn owned_pids(table: &[Proc], marker: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = table
+        .iter()
+        .filter(|p| p.command.contains(marker))
+        .map(|p| p.pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Every process, with its command line.
+///
+/// Failing to look is NOT an empty machine. Answering `0` when the listing
+/// tool was missing is how these assertions stayed quietly satisfied on a
+/// platform where nothing was ever actually observed, so every path here
+/// either returns a real table or panics naming what was unavailable.
+#[cfg(unix)]
+fn process_table() -> Vec<Proc> {
     let out = std::process::Command::new("ps")
-        .args(["-Ao", "args="])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| l.contains(&needle))
-            .count(),
-        Err(_) => 0,
+        .args(["-Ao", "pid=,args="])
+        .output()
+        .unwrap_or_else(|e| panic!("ps is required to see this run's browser processes: {e}"));
+    assert!(
+        out.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let (pid, command) = l.split_once(char::is_whitespace)?;
+            Some(Proc {
+                pid: pid.parse().ok()?,
+                command: command.trim_start().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Every process, with its command line.
+///
+/// `powershell` rather than `pwsh` (5.1 ships with Windows, PowerShell 7 does
+/// not) and `Get-CimInstance Win32_Process` rather than `wmic` (removed from
+/// current Windows). A process's own user can read its command line without
+/// elevation, which is all this run ever needs. The script carries no double
+/// quote, so Rust's Windows argument quoting cannot collide with it.
+#[cfg(windows)]
+fn process_table() -> Vec<Proc> {
+    const SCRIPT: &str = "Get-CimInstance Win32_Process | \
+        Where-Object { $_.CommandLine } | \
+        ForEach-Object { $_.ProcessId.ToString() + [char]9 + $_.CommandLine }";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("powershell is required to see this run's browser processes: {e}")
+        });
+    assert!(
+        out.status.success(),
+        "Get-CimInstance Win32_Process failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (pid, command) = l.split_once('\t')?;
+            Some(Proc {
+                pid: pid.trim().parse().ok()?,
+                command: command.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn count_browser_processes(product: BrowserProduct, profile: &std::path::Path) -> usize {
+    owned_pids(&process_table(), &process_marker(product, profile)).len()
+}
+
+/// End every process this run owns, and report which pids that was.
+fn kill_browser_processes(product: BrowserProduct, profile: &std::path::Path) -> Vec<u32> {
+    let pids = owned_pids(&process_table(), &process_marker(product, profile));
+    kill_pids(&pids);
+    pids
+}
+
+/// End `pids`. Ending a process that has already exited is not a failure;
+/// a kill facility that does not exist is. The kill's own output is captured
+/// rather than printed: "No such process" is the expected race here, and
+/// whether the browser is really gone is decided by the caller's re-check,
+/// not by this command's exit status.
+#[cfg(unix)]
+fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+            .unwrap_or_else(|e| panic!("kill is required to end this run's browser: {e}"));
     }
 }
 
-fn kill_browser_processes(product: BrowserProduct, profile: &std::path::Path) {
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", &process_marker(product, profile)])
-        .status();
+#[cfg(windows)]
+fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output()
+            .unwrap_or_else(|e| panic!("taskkill is required to end this run's browser: {e}"));
+    }
+}
+
+/// Wait until no process this run owns remains, or fail naming the survivors.
+fn wait_until_no_browser_process(product: BrowserProduct, profile: &std::path::Path, what: &str) {
+    let marker = process_marker(product, profile);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let left = owned_pids(&process_table(), &marker);
+        if left.is_empty() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{what}: {} browser process(es) still alive: {left:?}",
+                left.len()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Wait until the session reports the drop, or fail saying it never did.
+///
+/// `status` is passive — only a call that observes the closed socket records
+/// the disconnect — so the wait has to probe, and the probe is also what makes
+/// the failure loud: a browser that is still alive answers every probe and
+/// never reaches the deadline's condition.
+async fn wait_for_disconnect(b: &Browser, s: &BrowserSessionId, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if matches!(
+            b.status().await,
+            leveler_browser::BrowserStatus::Disconnected { .. }
+        ) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{what} never reported a disconnect: the status stayed Live over a dead connection"
+            );
+        }
+        let _ = b.snapshot(s, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A process this run does not own, kept alive across a cleanup.
+struct Decoy {
+    child: std::process::Child,
+}
+
+impl Decoy {
+    fn start() -> Self {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            c
+        };
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a decoy process is required to prove cleanup is scoped");
+        Self { child }
+    }
+
+    fn still_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for Decoy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The ownership decision, against a process table holding BOTH this run's
+/// browser and a browser this run does not own.
+#[test]
+fn only_processes_carrying_the_owned_profile_are_selected() {
+    let ours = "/tmp/leveler-browser-acceptance-4711-crash";
+    let table = vec![
+        Proc {
+            pid: 11,
+            command: format!("/opt/msedge/msedge --headless=new --user-data-dir={ours}"),
+        },
+        Proc {
+            pid: 12,
+            command: format!("/opt/msedge/msedge --type=renderer --user-data-dir={ours}"),
+        },
+        // A developer's own Edge: same executable, no ownership marker.
+        Proc {
+            pid: 13,
+            command: "/opt/msedge/msedge --user-data-dir=/home/dev/.config/microsoft-edge".into(),
+        },
+        // The same image name with no profile at all.
+        Proc {
+            pid: 14,
+            command: "msedge.exe --type=crashpad-handler".into(),
+        },
+        Proc {
+            pid: 15,
+            command: "unrelated-daemon --serve".into(),
+        },
+    ];
+    assert_eq!(owned_pids(&table, ours), vec![11, 12]);
+    assert!(owned_pids(&table, "/tmp/nothing-started-here").is_empty());
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {

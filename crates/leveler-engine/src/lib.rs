@@ -32,17 +32,17 @@ pub use checkpoint::{
     project_goal_checkpoint, resume_prior_from_checkpoint,
 };
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
-pub use log::{DanglingCall, EventLog, SnapshotView};
+pub use log::{DanglingCall, EventLog, FinishedChildFact, SnapshotView};
 pub use ports::{
-    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind,
-    ModelRequestRecord, PortError, TranscriptSink, WorkspaceFacts,
+    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, LostChild, LostChildNote,
+    LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, TranscriptSink, WorkspaceFacts,
 };
 pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{
-    SeedRequest, SettledChild, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner,
-    TurnSeeds, TurnSink, last_persisted_ledger, last_persisted_plan, last_persisted_progress,
+    SeedRequest, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner, TurnSeeds,
+    TurnSink, last_persisted_ledger, last_persisted_plan, last_persisted_progress,
     storage_model_request,
 };
 
