@@ -3,25 +3,6 @@
 use leveler_tui::composer::Composer;
 
 #[test]
-fn typing_replaces_a_prefilled_suggestion() {
-    let mut composer = Composer::new();
-    composer.replace_suggestion("运行完整测试");
-
-    composer.insert_str("/help");
-
-    assert_eq!(composer.text(), "/help");
-}
-
-#[test]
-fn submitting_without_editing_accepts_the_prefilled_suggestion() {
-    let mut composer = Composer::new();
-    composer.replace_suggestion("继续");
-
-    assert_eq!(composer.take(), "继续");
-    assert!(composer.is_empty());
-}
-
-#[test]
 fn inserts_cjk_by_grapheme() {
     let mut c = Composer::new();
     c.insert_str("你好");

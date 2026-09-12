@@ -11,16 +11,27 @@ use super::overlay_keys::{
 use super::runtime_apply::start_turn;
 use super::screen_nav::{open_diff_screen, open_sessions_screen, open_trace, toggle_screen};
 
-/// Composer text changed: re-enable the slash popup and reset its highlight.
+/// "The composer text just changed" hook: re-arm the slash popup and drop any
+/// contextual next-step ghost, because the user has now said something with
+/// their own hands. Every editing path (typing, paste, delete, kill, `$EDITOR`
+/// result, completion) funnels through here, which is why the ghost is
+/// destroyed in one place instead of at two dozen call sites.
 pub(super) fn touch_slash_filter(state: &mut AppState) {
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
+    crate::suggestion::clear(state);
     if state.composer.text().starts_with('/') {
         refresh_skill_catalog(state);
     }
 }
 
 pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
+    // Submitting real input spends the ghost. An Enter on an EMPTY composer
+    // submits nothing and must leave the offer standing: the ghost is not
+    // input, so that keystroke is a no-op, not a rejection of the suggestion.
+    if !state.composer.is_empty() {
+        crate::suggestion::clear(state);
+    }
     // User shell escape: the RAW composer's first character is `!` — no
     // leading-whitespace trim, so " !cargo test" stays a normal message and
     // ordinary prose can never execute. Never reaches the model.

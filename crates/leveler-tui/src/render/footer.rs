@@ -276,6 +276,10 @@ struct ComposerVisRow {
     placeholder: bool,
     /// Slash-arg ghost after caret (visual only).
     ghost: Option<&'static str>,
+    /// Contextual next-step suggestion, rendered as `Tab: <step>` on the empty
+    /// first row. DISPLAY ONLY — it is not in the composer, not in its
+    /// canonical form, and adds no visual row.
+    suggestion: Option<String>,
 }
 
 /// Soft-wrap the composer buffer into visual rows for a content width of
@@ -334,8 +338,14 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 None
             };
 
+            let first_row = li == 0 && first_of_logical;
+            // The ghost owns the empty first row when it is showing; the
+            // first-run hint stands down rather than stacking behind it.
+            let suggestion = (first_row && crate::suggestion::is_visible(state))
+                .then(|| state.prompt_suggestion.clone())
+                .flatten();
             let placeholder =
-                show_placeholder && li == 0 && first_of_logical && state.composer.is_empty();
+                show_placeholder && first_row && state.composer.is_empty() && suggestion.is_none();
             let ghost = if li == crow
                 && first_of_logical
                 && li == 0
@@ -353,6 +363,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 caret_col: caret,
                 placeholder,
                 ghost,
+                suggestion,
             });
 
             rest = next;
@@ -371,6 +382,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             caret_col: Some(0),
             placeholder: show_placeholder,
             ghost: None,
+            suggestion: None,
         });
     }
 
@@ -464,6 +476,26 @@ pub(crate) fn composer_box_lines(
             let hint = truncate_display(state.t().composer_placeholder, room);
             used += UnicodeWidthStr::width(hint.as_str());
             spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
+        }
+
+        // `Tab: <next step>` — muted label first so a very narrow terminal
+        // keeps the affordance and shortens the body instead.
+        if let Some(suggestion) = &row.suggestion {
+            let room = content_w.saturating_sub(used);
+            if room > 0 {
+                let label = truncate_display(state.t().suggestion_tab, room);
+                used += UnicodeWidthStr::width(label.as_str());
+                spans.push(Span::styled(label, Style::default().fg(theme.text.muted)));
+            }
+            let room = content_w.saturating_sub(used);
+            if room > 0 {
+                let body = truncate_display(suggestion, room);
+                used += UnicodeWidthStr::width(body.as_str());
+                spans.push(Span::styled(
+                    body,
+                    Style::default().fg(theme.text.secondary),
+                ));
+            }
         }
 
         if let Some(ghost) = row.ghost {

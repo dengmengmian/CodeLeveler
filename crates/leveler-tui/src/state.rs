@@ -155,6 +155,11 @@ pub struct AppState {
     /// resume is a policy the runtime has not decided.
     pub unfinished_goals: Vec<leveler_client_protocol::UiUnfinishedGoal>,
     pub composer: Composer,
+    /// The structured next step offered as ghost text after a turn ends, or
+    /// `None`. Presentation state only: see [`crate::suggestion`] — it is not
+    /// composer content, not a draft, not history, and never submitted on its
+    /// own. Ephemeral and never persisted.
+    pub prompt_suggestion: Option<String>,
     pub theme: Theme,
     /// Terminal size (cols, rows).
     pub size: (u16, u16),
@@ -347,6 +352,7 @@ impl AppState {
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),
             composer: Composer::new(),
+            prompt_suggestion: None,
             theme,
             size: (80, 24),
             active_screen: Screen::default(),

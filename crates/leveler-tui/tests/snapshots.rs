@@ -916,6 +916,10 @@ fn completed_turn_omits_recap_and_does_not_guess_input_suggestion() {
         state.composer.is_empty(),
         "freeform next-step prose must not prefill the composer"
     );
+    assert_eq!(
+        state.prompt_suggestion, None,
+        "freeform prose must not become a next-step ghost either"
+    );
     let text = render_at(100, 24, &mut state);
     assert!(
         !text.contains("recap:"),

@@ -101,6 +101,13 @@ pub struct UiText {
     pub send: &'static str,
     pub newline: &'static str,
     pub composer_placeholder: &'static str,
+    /// Ghost-text hint in front of a contextual next-step suggestion.
+    /// The key name itself is universal; it still lives here so no
+    /// renderer hardcodes UI chrome.
+    pub suggestion_tab: &'static str,
+    /// Fallback suggestion for an Incomplete turn with no structured
+    /// next step. Structured `next_step` text is never translated.
+    pub suggestion_continue: &'static str,
     pub cancel: &'static str,
     pub quit: &'static str,
     pub jump_bottom: &'static str,
@@ -686,6 +693,8 @@ static ZH: UiText = UiText {
     send: "发送",
     newline: "换行",
     composer_placeholder: "输入消息，/ 查看命令",
+    suggestion_tab: "Tab: ",
+    suggestion_continue: "继续",
     cancel: "取消",
     quit: "退出",
     jump_bottom: "回底",
@@ -1151,6 +1160,8 @@ static EN: UiText = UiText {
     send: "send",
     newline: "newline",
     composer_placeholder: "Type a message, / for commands",
+    suggestion_tab: "Tab: ",
+    suggestion_continue: "Continue",
     cancel: "cancel",
     quit: "quit",
     jump_bottom: "bottom",

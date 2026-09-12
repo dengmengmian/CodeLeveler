@@ -594,7 +594,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Tab if file_popup_len > 0 => complete_file_mention(state),
         KeyCode::Tab if popup_len > 0 => complete_slash(state),
-        // No completion popup: Tab switches Input ↔ Conversation focus.
+        // A visible next-step ghost claims Tab before focus switching: the
+        // suggestion becomes real text and nothing is sent. Enter still has to
+        // be pressed. Shift+Tab is untouched — it cycles permissions above.
+        KeyCode::Tab if crate::suggestion::is_visible(state) => {
+            crate::suggestion::accept(state);
+            touch_slash_filter(state);
+        }
+        // No completion popup and no ghost: Tab switches Input ↔ Conversation.
         KeyCode::Tab => {
             state.workbench_focus = match state.workbench_focus {
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
@@ -683,8 +690,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             interaction::scroll_by(state, 1);
         }
         // Input focus: ↑/↓ = history only (never steal for conversation scroll).
-        KeyCode::Up if popup_len == 0 => state.composer.up(),
-        KeyCode::Down if popup_len == 0 => state.composer.down(),
+        KeyCode::Up if popup_len == 0 => {
+            state.composer.up();
+            dismiss_suggestion_on_history_browse(state);
+        }
+        KeyCode::Down if popup_len == 0 => {
+            state.composer.down();
+            dismiss_suggestion_on_history_browse(state);
+        }
         KeyCode::Char('p') if !ctrl && state.composer.is_empty() => {
             // Toggle plan panel when not typing.
             state.plan_collapsed = !state.plan_collapsed;
@@ -708,6 +721,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 level: NotificationLevel::Info,
                 message: state.t().turn_nav_live.to_string(),
             });
+        }
+        // Dismissing the next-step ghost is the narrowest undo on this screen,
+        // so it wins while it is showing — and it does nothing else.
+        KeyCode::Esc if crate::suggestion::is_visible(state) => {
+            crate::suggestion::clear(state);
         }
         // Esc is the interrupt every other coding-agent CLI uses. It escalates
         // cancel → force-cancel like Ctrl+C does, but stops there: quitting on
@@ -857,9 +875,21 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
 
 /// Hand the current draft to `$EDITOR` (Ctrl+X Ctrl+E, or `/editor`).
 pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
+    // The seed is the REAL buffer. A ghost suggestion is not a draft and must
+    // not travel into `$EDITOR`, so it is dropped rather than hidden.
+    crate::suggestion::clear(state);
     vec![Effect::OpenExternalEditor {
         text: state.composer.canonical_text(),
     }]
+}
+
+/// Entering history browse spends the ghost. Hiding it would not be enough:
+/// stepping back past the newest entry restores an empty draft, and a
+/// suggestion the user has already scrolled away from must not reappear.
+fn dismiss_suggestion_on_history_browse(state: &mut AppState) {
+    if state.composer.is_browsing_history() {
+        crate::suggestion::clear(state);
+    }
 }
 
 /// Cycle the permission profile (Shift+Tab), least → most privileged.

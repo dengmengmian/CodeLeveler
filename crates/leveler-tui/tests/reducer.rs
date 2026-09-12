@@ -3292,6 +3292,10 @@ fn completed_turn_does_not_guess_input_suggestion_from_freeform_answer() {
         s.composer.is_empty(),
         "freeform assistant text must not be promoted into user input"
     );
+    assert_eq!(
+        s.prompt_suggestion, None,
+        "freeform prose is not a structured next step"
+    );
 }
 
 #[test]
@@ -3320,6 +3324,10 @@ fn turn_handoff_never_overwrites_a_draft_typed_while_busy() {
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
 
     assert_eq!(s.composer.text(), "我自己的下一条消息");
+    assert_eq!(
+        s.prompt_suggestion, None,
+        "a draft wins: no ghost is parked to ambush the user later"
+    );
     assert!(matches!(
         s.transcript.items().last(),
         Some(TranscriptItem::TurnEnd(_))
@@ -3327,7 +3335,7 @@ fn turn_handoff_never_overwrites_a_draft_typed_while_busy() {
 }
 
 #[test]
-fn incomplete_turn_prefills_continue_when_no_specific_next_step_exists() {
+fn incomplete_turn_suggests_continue_when_no_specific_next_step_exists() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -3336,7 +3344,12 @@ fn incomplete_turn_prefills_continue_when_no_specific_next_step_exists() {
         }),
     );
 
-    assert_eq!(s.composer.text(), "继续");
+    assert_eq!(s.prompt_suggestion.as_deref(), Some("继续"));
+    assert!(
+        s.composer.is_empty(),
+        "the suggestion is ghost text, never buffer content"
+    );
+    assert!(leveler_tui::suggestion::is_visible(&s));
     assert!(matches!(
         s.transcript.items().last(),
         Some(TranscriptItem::TurnEnd(end))
@@ -3380,7 +3393,8 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
         Some(TranscriptItem::Recap(block))
             if block.next_step == "提交当前改动"
     ));
-    assert_eq!(s.composer.text(), "提交当前改动");
+    assert_eq!(s.prompt_suggestion.as_deref(), Some("提交当前改动"));
+    assert!(s.composer.is_empty());
 }
 
 #[test]
@@ -3414,6 +3428,7 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
 
     assert!(s.composer.is_empty());
+    assert_eq!(s.prompt_suggestion, None);
 }
 
 #[test]

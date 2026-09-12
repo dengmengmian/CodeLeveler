@@ -755,11 +755,15 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
             state.context_tokens = estimated;
         }
     }
+    // Read BEFORE `push_turn_end`: a TurnEnd marker is the scan boundary, so
+    // the handoff has to be taken while this turn is still the latest one.
     let handoff = state.transcript.latest_turn_handoff();
     let suggestion = handoff
         .as_ref()
         .map(|handoff| handoff.next_step.clone())
-        .or_else(|| (status == TurnEndStatus::Incomplete).then(|| "继续".to_string()));
+        .or_else(|| {
+            (status == TurnEndStatus::Incomplete).then(|| state.t().suggestion_continue.to_string())
+        });
     let summary = turn_end_summary(state, status);
     state.transcript.push_turn_end(
         status,
@@ -773,11 +777,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     {
         state.transcript.push_recap(handoff);
     }
-    if status != TurnEndStatus::Cancelled
-        && state.composer.is_empty()
-        && let Some(suggestion) = suggestion
-    {
-        state.composer.replace_suggestion(suggestion);
+    // Ghost text, not input: the composer buffer stays exactly as the user
+    // left it, and Tab is what moves the suggestion into it.
+    match suggestion.filter(|_| status != TurnEndStatus::Cancelled) {
+        Some(text) => crate::suggestion::offer(state, &text),
+        None => crate::suggestion::clear(state),
     }
     seal_analysis_segment(state);
 }
@@ -936,6 +940,8 @@ pub(super) fn start_turn(state: &mut AppState) {
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
     state.project_rule_sources.clear();
+    // The previous turn's next step is spent — a new turn is under way.
+    crate::suggestion::clear(state);
     seal_analysis_segment(state);
 }
 
@@ -995,8 +1001,10 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
     // Snapshot is runtime truth. A pending Shift+Tab from the previous
-    // connection must not keep driving the cycle.
+    // connection must not keep driving the cycle, and a next-step ghost from
+    // the transcript this snapshot is about to replace no longer applies.
     state.pending_permission = None;
+    crate::suggestion::clear(state);
     state.status = match session.status.as_str() {
         "running" => RuntimeStatus::Busy,
         "failed" => RuntimeStatus::Error,

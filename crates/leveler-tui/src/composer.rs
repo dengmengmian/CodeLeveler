@@ -38,9 +38,6 @@ pub struct Composer {
     /// The live draft, stashed while browsing history so it can be restored.
     stash: Option<String>,
     pending_pastes: Vec<PendingPaste>,
-    /// Whether the whole buffer is an auto-filled next-step suggestion. The
-    /// first edit replaces it; submitting without editing accepts it.
-    suggested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +365,6 @@ impl Composer {
         self.cursor = 0;
         self.history_index = None;
         self.stash = None;
-        self.suggested = false;
         let trimmed = text.trim();
         if !trimmed.is_empty() && self.history.last().map(|h| h.as_str()) != Some(text.as_str()) {
             self.history.push(text.clone());
@@ -413,21 +409,14 @@ impl Composer {
         self.stash = None;
     }
 
-    /// Start editing the live buffer. Auto-filled suggestions behave like a
-    /// selected completion: the first edit replaces the whole suggestion.
+    /// Start editing the live buffer.
     fn begin_edit(&mut self) {
         self.commit_history_browse();
-        if self.suggested {
-            self.buffer.clear();
-            self.cursor = 0;
-            self.suggested = false;
-        }
     }
 
     fn set_buffer(&mut self, s: String) {
         self.cursor = grapheme_count(&s);
         self.buffer = s;
-        self.suggested = false;
     }
 
     /// Seed history (e.g. from a persisted store).
@@ -447,14 +436,6 @@ impl Composer {
         self.pending_pastes.clear();
         self.buffer = text.into();
         self.cursor = grapheme_count(&self.buffer);
-        self.suggested = false;
-    }
-
-    /// Fill the composer with an actionable next step. Enter accepts it;
-    /// typing or deleting first replaces it as one selected unit.
-    pub fn replace_suggestion(&mut self, text: impl Into<String>) {
-        self.replace(text);
-        self.suggested = true;
     }
 }
 

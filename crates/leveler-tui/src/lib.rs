@@ -37,6 +37,7 @@ mod selection;
 mod splash;
 pub mod state;
 mod status_line;
+pub mod suggestion;
 pub mod terminal;
 mod terminal_title;
 pub mod theme;
