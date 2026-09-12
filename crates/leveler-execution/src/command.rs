@@ -3917,14 +3917,26 @@ mod tests {
     async fn windows_job_cancellation_kills_grandchildren() {
         let (dir, request, pidfile) = windows_grandchild_request("cancel");
         let token = CancellationToken::new();
-        let run_token = token.clone();
         let runner = windows_host_runner();
-        let handle = tokio::spawn(async move { runner.run(request, run_token).await });
+        let context = FixtureContext {
+            test: "windows_job_cancellation_kills_grandchildren",
+            dir: dir.clone(),
+            program: request.program.clone(),
+            args: request.args.clone(),
+            timeout: request.timeout,
+            started: std::time::Instant::now(),
+        };
+        let (handle, outcome) = spawn_windows_grandchild(runner, request, token.clone());
 
-        let gc_pid = wait_windows_pidfile(&pidfile).await;
+        let gc_pid = wait_windows_pidfile(&pidfile, &outcome, &context).await;
         // The target has to be observed alive before the kill. The pid file
         // says the fixture ran; it does not say that process is still there.
         let witness = require_windows_grandchild_alive(gc_pid);
+        println!(
+            "{}: alive witness established after {:?}",
+            context.test,
+            context.started.elapsed()
+        );
         token.cancel();
         let result = handle.await.unwrap();
         assert!(
@@ -3944,13 +3956,25 @@ mod tests {
         // so the command outlasts the pid-file wait rather than racing it.
         request.timeout = GRANDCHILD_TIMEOUT;
         let runner = windows_host_runner();
-        let handle =
-            tokio::spawn(async move { runner.run(request, CancellationToken::new()).await });
+        let context = FixtureContext {
+            test: "windows_job_timeout_kills_grandchildren",
+            dir: dir.clone(),
+            program: request.program.clone(),
+            args: request.args.clone(),
+            timeout: request.timeout,
+            started: std::time::Instant::now(),
+        };
+        let (handle, outcome) = spawn_windows_grandchild(runner, request, CancellationToken::new());
 
-        let gc_pid = wait_windows_pidfile(&pidfile).await;
+        let gc_pid = wait_windows_pidfile(&pidfile, &outcome, &context).await;
         // Observed alive before the timeout fires: a pid file that outlived
         // its process would make the assertion below vacuous.
         let witness = require_windows_grandchild_alive(gc_pid);
+        println!(
+            "{}: alive witness established after {:?}",
+            context.test,
+            context.started.elapsed()
+        );
         let result = handle.await.unwrap().expect("timeout returns Ok timed_out");
         assert!(
             result.timed_out,
@@ -4051,21 +4075,161 @@ mod tests {
     #[cfg(windows)]
     const GRANDCHILD_PIDFILE_WAIT: Duration = Duration::from_secs(10);
 
+    /// What the fixture's own run reported, readable without consuming the
+    /// join handle.
+    ///
+    /// The readiness wait polls a file, and a file has a producer. If that
+    /// producer already died, "the file is missing" is the least useful thing
+    /// that can be said about it: the fixture's own error is the diagnosis.
     #[cfg(windows)]
-    async fn wait_windows_pidfile(pidfile: &std::path::Path) -> u32 {
-        let deadline = std::time::Instant::now() + GRANDCHILD_PIDFILE_WAIT;
-        loop {
-            if let Ok(s) = std::fs::read_to_string(pidfile)
-                && let Ok(pid) = s.trim().parse::<u32>()
-                && pid > 0
-            {
-                return pid;
+    type FixtureOutcome = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+    /// Run a grandchild fixture, recording its outcome as it finishes.
+    #[cfg(windows)]
+    fn spawn_windows_grandchild(
+        runner: CommandRunner,
+        request: ProcessRequest,
+        token: CancellationToken,
+    ) -> (
+        tokio::task::JoinHandle<Result<ProcessOutput, ProcessError>>,
+        FixtureOutcome,
+    ) {
+        let outcome: FixtureOutcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = std::sync::Arc::clone(&outcome);
+        let handle = tokio::spawn(async move {
+            let result = runner.run(request, token).await;
+            let note = match &result {
+                Ok(o) => format!(
+                    "Ok(exit={:?} timed_out={} stdout={:?} stderr={:?})",
+                    o.exit_code,
+                    o.timed_out,
+                    bounded_excerpt(o.stdout.as_bytes()),
+                    bounded_excerpt(o.stderr.as_bytes()),
+                ),
+                Err(e) => format!("Err({e:?})"),
+            };
+            *recorded.lock().unwrap() = Some(note);
+            result
+        });
+        (handle, outcome)
+    }
+
+    /// Everything needed to explain a readiness failure without re-deriving it.
+    #[cfg(windows)]
+    struct FixtureContext {
+        test: &'static str,
+        dir: std::path::PathBuf,
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+        started: std::time::Instant,
+    }
+
+    #[cfg(windows)]
+    impl FixtureContext {
+        /// A safe rendering of the fixture command. The arguments are literal
+        /// paths and a script this test wrote, so there is nothing to redact,
+        /// but they are bounded rather than pasted whole.
+        fn command(&self) -> String {
+            let args: Vec<String> = self
+                .args
+                .iter()
+                .map(|a| bounded_excerpt(a.as_bytes()))
+                .collect();
+            format!("{} {:?}", self.program, args)
+        }
+
+        fn listing(&self) -> String {
+            match std::fs::read_dir(&self.dir) {
+                Ok(entries) => {
+                    let mut names: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| {
+                            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            format!("{} ({len} bytes)", e.file_name().to_string_lossy())
+                        })
+                        .collect();
+                    names.sort();
+                    if names.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                }
+                Err(e) => format!("<unreadable: {e}>"),
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "grandchild pid file missing after {GRANDCHILD_PIDFILE_WAIT:?}: {}",
-                pidfile.display()
-            );
+        }
+    }
+
+    /// Wait for the fixture to declare its grandchild, or say why it never did.
+    ///
+    /// Two ways out, and both are answers. The pid arrives, or the wait ends —
+    /// and the wait ends as soon as the FIXTURE ends, because a producer that
+    /// has exited will never write the file and waiting out the rest of the
+    /// budget only delays the same failure with less information. A missing
+    /// pid is always a failure: it is never a pass and never a skip.
+    #[cfg(windows)]
+    async fn wait_windows_pidfile(
+        pidfile: &std::path::Path,
+        outcome: &FixtureOutcome,
+        context: &FixtureContext,
+    ) -> u32 {
+        let deadline = context.started + GRANDCHILD_PIDFILE_WAIT;
+        let mut unparsable: Option<String> = None;
+        loop {
+            match std::fs::read_to_string(pidfile) {
+                Ok(text) => match text.trim().parse::<u32>() {
+                    Ok(pid) if pid > 0 => {
+                        println!(
+                            "{}: pid file readable after {:?} (pid {pid})",
+                            context.test,
+                            context.started.elapsed()
+                        );
+                        return pid;
+                    }
+                    // The file exists but does not yet hold a pid. Keep the
+                    // text: "missing" and "half-written" are different faults.
+                    _ => unparsable = Some(bounded_excerpt(text.as_bytes())),
+                },
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    unparsable = Some(format!("<read error: {e}>"));
+                }
+                Err(_) => {}
+            }
+
+            let fixture = outcome.lock().unwrap().clone();
+            let expired = std::time::Instant::now() >= deadline;
+            if fixture.is_some() || expired {
+                let elapsed = context.started.elapsed();
+                panic!(
+                    "{test}: grandchild pid never became readable.\n\
+                     reason:        {reason}\n\
+                     elapsed:       {elapsed:?} (budget {budget:?})\n\
+                     fixture:       {fixture}\n\
+                     command:       {command}\n\
+                     request cwd:   {dir}\n\
+                     dir contents:  {listing}\n\
+                     pidfile:       {pidfile}\n\
+                     pidfile state: {state}\n\
+                     request timeout: {timeout:?}",
+                    test = context.test,
+                    reason = if fixture.is_some() {
+                        "the fixture finished before it declared a grandchild"
+                    } else {
+                        "the readiness budget expired while the fixture was still running"
+                    },
+                    budget = GRANDCHILD_PIDFILE_WAIT,
+                    fixture = fixture.unwrap_or_else(|| "<still running>".to_string()),
+                    command = context.command(),
+                    dir = context.dir.display(),
+                    listing = context.listing(),
+                    pidfile = pidfile.display(),
+                    state = unparsable
+                        .clone()
+                        .unwrap_or_else(|| "<never appeared>".to_string()),
+                    timeout = context.timeout,
+                );
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
