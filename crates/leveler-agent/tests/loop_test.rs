@@ -3774,6 +3774,104 @@ async fn unknown_dollar_skill_does_not_inject_fake_body() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// §10.7: the user's answer has to become history.
+///
+/// A clarification used to run entirely off the event stream: the executor
+/// called the clarifier and fed the answer back to the model without emitting
+/// either a `ToolCall` or a `ToolResult`. The question and the decision existed
+/// only inside the overlay, so the moment the user pressed Enter both vanished
+/// — from the screen, from the session log, and from any replay. A decision the
+/// user was asked to make is exactly the thing a transcript must keep.
+#[tokio::test]
+async fn a_clarification_and_its_answer_reach_the_event_stream() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-clar-evt-{}",
+        std::process::id() as u64 * 67 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let responses = vec![
+        assistant_tool_call(
+            "q1",
+            "request_user_input",
+            serde_json::json!({
+                "question": "light_group 未配置时该怎么办?",
+                "options": ["回退到主组", "启动失败"]
+            }),
+        ),
+        assistant_text("got it"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_clarifier(Arc::new(RecordingClarifier {
+        asked: Arc::new(Mutex::new(Vec::new())),
+    }));
+
+    let seen: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    executor
+        .run(
+            "how should we ship?",
+            &mut |event| match event {
+                leveler_agent::AgentEvent::ToolCall {
+                    name, arguments, ..
+                } => {
+                    sink.lock()
+                        .unwrap()
+                        .push(("call".into(), format!("{name}|{arguments}"), false))
+                }
+                leveler_agent::AgentEvent::ToolResult {
+                    name,
+                    preview,
+                    is_error,
+                    ..
+                } => sink.lock().unwrap().push((
+                    "result".into(),
+                    format!("{name}|{preview}"),
+                    is_error,
+                )),
+                _ => {}
+            },
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = seen.lock().unwrap().clone();
+    let call = events
+        .iter()
+        .find(|(kind, body, _)| kind == "call" && body.starts_with("request_user_input|"))
+        .expect("the question the user was asked must be announced");
+    assert!(
+        call.1.contains("light_group"),
+        "the announcement carries the question: {:?}",
+        call.1
+    );
+    let result = events
+        .iter()
+        .find(|(kind, body, _)| kind == "result" && body.starts_with("request_user_input|"))
+        .expect("the answer the user gave must be recorded");
+    assert!(
+        result.1.contains("拒绝"),
+        "the record carries what the user chose: {:?}",
+        result.1
+    );
+    assert!(
+        !result.2,
+        "an answered question is not an error: {result:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn request_user_input_routes_to_clarifier_like_ask_user() {
     // The primary name must hit the same Clarifier path as legacy ask_user.

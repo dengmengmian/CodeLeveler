@@ -1305,8 +1305,30 @@ impl AgentHarness for Drive<'_> {
 
             // Clarification tools (request_user_input / ask_user) are answered
             // by the clarifier (the UI), not the tool registry (spec §35 / B7).
+            //
+            // Announced and settled like any other call. A decision the user
+            // was asked to make is history: without these two events the
+            // question and the answer lived only inside the overlay, so both
+            // disappeared the moment the user pressed Enter — absent from the
+            // screen, the session log, and every later replay.
             if is_user_input_tool(&call.name) {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: call.name.clone(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                });
                 let answer = self.executor.handle_ask_user(&call, &cancellation).await?;
+                (self.observer)(AgentEvent::ToolResult {
+                    id: call.id.as_str().to_string(),
+                    name: call.name.clone(),
+                    // The answer IS the result. It is short, user-written, and
+                    // the only thing worth reading — never truncated to a
+                    // preview budget meant for command output.
+                    preview: answer.clone(),
+                    is_error: false,
+                    applied_diff: None,
+                });
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
                         call_id: call.id,
