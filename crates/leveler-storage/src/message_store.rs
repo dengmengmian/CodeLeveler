@@ -78,6 +78,19 @@ pub trait MessageStore: Send + Sync {
         payloads: &[String],
         now: Timestamp,
     ) -> Result<(), crate::OwnershipError>;
+
+    /// Ensure a crashed turn's initiating user message exists in the
+    /// transcript. The existence check and optional insert share one fenced
+    /// transaction and use `turn_id` as identity; message text is never used
+    /// for deduplication. Returns `true` when recovery inserted the row.
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError>;
 }
 
 /// The engine-facing model-request telemetry contract.
@@ -138,6 +151,19 @@ impl MessageStore for Database {
             .append_in_turn_owned(token, session_id, turn_id, payloads, now)
             .await
     }
+
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError> {
+        MessageRepository::new(self)
+            .ensure_initiating_message_owned(token, session_id, turn_id, payload, now)
+            .await
+    }
 }
 
 #[async_trait]
@@ -162,8 +188,8 @@ impl ModelRequestStore for Database {
 /// per-session isolation, and write-time secret redaction.
 #[derive(Default)]
 pub struct MemoryMessageStore {
-    /// `(session_id, payload)` in append order.
-    rows: Mutex<Vec<(String, String)>>,
+    /// `(session_id, turn_id, payload)` in append order.
+    rows: Mutex<Vec<(String, String, String)>>,
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
 
@@ -182,6 +208,7 @@ impl MemoryMessageStore {
     fn append_records(
         &self,
         session_id: &SessionId,
+        turn_id: &TurnId,
         payloads: &[String],
     ) -> Result<(), StorageError> {
         // Redact+validate every payload BEFORE touching the rows, so a refused
@@ -198,7 +225,11 @@ impl MemoryMessageStore {
             .collect::<Result<_, _>>()?;
         let mut rows = self.rows.lock().unwrap();
         for payload in redacted {
-            rows.push((session_id.as_str().to_string(), payload));
+            rows.push((
+                session_id.as_str().to_string(),
+                turn_id.as_str().to_string(),
+                payload,
+            ));
         }
         Ok(())
     }
@@ -209,18 +240,18 @@ impl MessageStore for MemoryMessageStore {
     async fn append_in_turn(
         &self,
         session_id: &SessionId,
-        _turn_id: &TurnId,
+        turn_id: &TurnId,
         payloads: &[String],
         _now: Timestamp,
     ) -> Result<(), StorageError> {
-        self.append_records(session_id, payloads)
+        self.append_records(session_id, turn_id, payloads)
     }
 
     async fn append_in_turn_owned(
         &self,
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
-        _turn_id: &TurnId,
+        turn_id: &TurnId,
         payloads: &[String],
         _now: Timestamp,
     ) -> Result<(), crate::OwnershipError> {
@@ -230,7 +261,53 @@ impl MessageStore for MemoryMessageStore {
             )));
         };
         ownership
-            .with_current(token, || self.append_records(session_id, payloads))
+            .with_current(token, || self.append_records(session_id, turn_id, payloads))
+            .and_then(|r| r.map_err(crate::OwnershipError::Storage))
+    }
+
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        _now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory message store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let redacted = crate::redact_json_payload_for_session(
+                    "session message",
+                    payload,
+                    Some(session_id.as_str()),
+                )?;
+                let mut rows = self.rows.lock().unwrap();
+                if rows
+                    .iter()
+                    .any(|(stored_session, stored_turn, stored_payload)| {
+                        stored_session == session_id.as_str()
+                            && stored_turn == turn_id.as_str()
+                            && serde_json::from_str::<serde_json::Value>(stored_payload)
+                                .ok()
+                                .and_then(|value| value.get("role").cloned())
+                                .and_then(|role| role.as_str().map(str::to_owned))
+                                .as_deref()
+                                == Some("user")
+                    })
+                {
+                    return Ok(false);
+                }
+                rows.push((
+                    session_id.as_str().to_string(),
+                    turn_id.as_str().to_string(),
+                    redacted,
+                ));
+                Ok(true)
+            })
             .and_then(|r| r.map_err(crate::OwnershipError::Storage))
     }
 
@@ -240,8 +317,8 @@ impl MessageStore for MemoryMessageStore {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(s, _)| s == session_id.as_str())
-            .map(|(_, p)| p.clone())
+            .filter(|(s, _, _)| s == session_id.as_str())
+            .map(|(_, _, p)| p.clone())
             .collect())
     }
 
@@ -255,9 +332,9 @@ impl MessageStore for MemoryMessageStore {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(sid, _)| sid == session_id.as_str())
+            .filter(|(sid, _, _)| sid == session_id.as_str())
             .skip(from as usize)
-            .map(|(_, payload)| payload.clone())
+            .map(|(_, _, payload)| payload.clone())
             .collect())
     }
 
@@ -268,8 +345,8 @@ impl MessageStore for MemoryMessageStore {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(sid, _)| sid == session_id.as_str())
-            .map(|(_, payload)| payload.len() as u64)
+            .filter(|(sid, _, _)| sid == session_id.as_str())
+            .map(|(_, _, payload)| payload.len() as u64)
             .sum())
     }
 }

@@ -684,6 +684,26 @@ auditability
 
 An agent may eventually work for hours or days and continue across devices. Persistence is the foundation of that shape.
 
+### 11.3 Durable Turn Admission
+
+A fresh user or chat turn may become durably `running` only when the same turn
+row already contains a versioned, replayable initiating user message. That
+write-ahead payload is the canonical recovery input; `session_messages` is the
+ordered transcript projection used by clients and future model requests.
+
+```text
+durable running turn
+        ⇒
+durable replayable initiating input
+```
+
+The daemon's wire ACK is emitted only after this boundary commits. If the
+process dies before the normal transcript append, restart recovery projects the
+initiating message exactly once under the current ownership token, using the
+turn id rather than message content as identity, and only then settles the
+orphan turn. `UserMessageAdded` is an optimistic client notification; it is
+neither the canonical input, a persistence command, nor a durability witness.
+
 ---
 
 ## 12. Model Providers and Capability Negotiation

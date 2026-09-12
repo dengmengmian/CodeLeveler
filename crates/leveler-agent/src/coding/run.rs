@@ -19,6 +19,7 @@ use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{
     AgentState, PlanState, ProgressLedger, SessionStatus, StopReason, VerificationStatus,
 };
+use leveler_model::{Message, Role};
 use leveler_storage::EventStore;
 use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
@@ -634,6 +635,10 @@ impl CodingRuntime {
             lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
         let prior_epoch_open = self.prior_epoch_open(session_id).await?;
+        let initiating_message = Message {
+            role: Role::User,
+            content: content.clone(),
+        };
         let result = async {
             let recorded = runner
                 .run_turn(
@@ -642,6 +647,7 @@ impl CodingRuntime {
                         continues_active_goal: false,
                         prior_epoch_open,
                     },
+                    Some(initiating_message),
                     Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
                     observer,
                     cancellation.clone(),
@@ -930,6 +936,7 @@ impl CodingRuntime {
             .run_turn(
                 TurnKind::User,
                 SeedRequest::Resume,
+                None,
                 Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
                 observer,
                 cancellation.clone(),
@@ -977,6 +984,7 @@ impl CodingRuntime {
                     continues_active_goal: false,
                     prior_epoch_open,
                 },
+                Some(Message::text(Role::User, spec.runtime.goal.clone())),
                 Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
                 observer,
                 cancellation.clone(),

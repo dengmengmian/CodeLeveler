@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "The `leveler` command-line interface."
 
+[features]
+default = []
+test-crash-barrier = ["leveler-app/test-crash-barrier"]
+
 [[bin]]
 name = "leveler"
 path = "src/main.rs"

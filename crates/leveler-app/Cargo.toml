@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Composition root: config loading, registry assembly, database, doctor checks."
 
+[features]
+default = []
+test-crash-barrier = []
+
 [dependencies]
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }

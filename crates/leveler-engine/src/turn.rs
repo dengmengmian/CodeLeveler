@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::{Approver, Clarifier};
 use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger, StopReason};
-use leveler_model::Message;
+use leveler_model::{Message, Role};
 use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore};
 
 use crate::log::EventLog;
@@ -45,6 +45,48 @@ pub enum SeedRequest {
         /// engine applies the rule; it does not make this judgement.
         prior_epoch_open: bool,
     },
+}
+
+/// Versioned write-ahead record for the input that initiated a fresh user
+/// turn. It lives in the same row that makes the turn `running`, so a crash
+/// can leave the transcript projection behind but can never lose the accepted
+/// request itself.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct TurnInitiationPayload {
+    version: u8,
+    initiating_message: Message,
+}
+
+impl TurnInitiationPayload {
+    const VERSION: u8 = 1;
+
+    fn encode(message: Message) -> Result<String, EngineError> {
+        if message.role != Role::User {
+            return Err(EngineError::Config(
+                "a turn initiating message must have the user role".to_string(),
+            ));
+        }
+        Ok(serde_json::to_string(&Self {
+            version: Self::VERSION,
+            initiating_message: message,
+        })?)
+    }
+
+    pub(crate) fn decode(payload: &str) -> Result<Message, EngineError> {
+        let decoded: Self = serde_json::from_str(payload)?;
+        if decoded.version != Self::VERSION {
+            return Err(EngineError::Corrupt(format!(
+                "unsupported turn initiation payload version {}",
+                decoded.version
+            )));
+        }
+        if decoded.initiating_message.role != Role::User {
+            return Err(EngineError::Corrupt(
+                "turn initiation payload is not a user message".to_string(),
+            ));
+        }
+        Ok(decoded.initiating_message)
+    }
 }
 
 /// The durable state a fresh execution resumes from. Every field is read off
@@ -321,6 +363,7 @@ impl TurnRunner<'_> {
         &self,
         kind: TurnKind,
         seed: SeedRequest,
+        initiating_message: Option<Message>,
         workspace: Option<Arc<dyn WorkspaceFacts>>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
@@ -330,15 +373,34 @@ impl TurnRunner<'_> {
         F: FnOnce(TurnPorts) -> Fut,
         Fut: std::future::Future<Output = Result<TurnFacts<T>, TurnFailure>>,
     {
-        let payload = match &kind {
-            TurnKind::Node { node_id } => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
-            TurnKind::Repair { attempt } => Some(format!(r#"{{"attempt":{attempt}}}"#)),
-            _ => None,
+        let payload = match (&kind, seed, initiating_message) {
+            (TurnKind::User | TurnKind::Chat, SeedRequest::Fresh { .. }, Some(message)) => {
+                Some(TurnInitiationPayload::encode(message)?)
+            }
+            (TurnKind::User | TurnKind::Chat, SeedRequest::Fresh { .. }, None) => {
+                return Err(EngineError::Config(
+                    "a fresh user turn requires a durable initiating message".to_string(),
+                ));
+            }
+            (TurnKind::User | TurnKind::Chat, SeedRequest::Resume, None) => None,
+            (TurnKind::User | TurnKind::Chat, SeedRequest::Resume, Some(_)) => {
+                return Err(EngineError::Config(
+                    "a resume turn cannot carry a new initiating message".to_string(),
+                ));
+            }
+            (TurnKind::Node { node_id }, _, None) => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
+            (TurnKind::Repair { attempt }, _, None) => Some(format!(r#"{{"attempt":{attempt}}}"#)),
+            (TurnKind::Node { .. } | TurnKind::Repair { .. }, _, Some(_)) => {
+                return Err(EngineError::Config(
+                    "internal turns cannot carry a user initiating message".to_string(),
+                ));
+            }
         };
         // Reap zombies left by kill -9 / unclean TUI exit so a new turn never
         // coexists with a permanent `running` sibling on the same session.
         let reaped_events = crate::reap_running_turns_owned(
             self.stores.turns.as_ref(),
+            self.stores.messages.as_ref(),
             self.stores.terminal.as_ref(),
             &self.token,
             Some(&self.session_id),

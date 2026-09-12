@@ -20,7 +20,9 @@ pub struct TurnRecord {
     pub ordinal: i64,
     /// user | chat | node | repair
     pub kind: String,
-    /// Kind-specific JSON (e.g. `{"node_id":…,"attempt":…}`).
+    /// Kind-specific JSON. Fresh user/chat turns store the versioned
+    /// write-ahead initiating message; legacy internal turns store node or
+    /// repair metadata.
     pub payload: Option<String>,
     /// running | completed | failed | interrupted
     pub status: String,

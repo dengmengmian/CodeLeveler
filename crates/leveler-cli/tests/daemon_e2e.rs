@@ -96,6 +96,28 @@ fn spawn_serve(env: &TestEnv, ready: &Path) -> Child {
         .expect("spawn leveler serve")
 }
 
+#[cfg(feature = "test-crash-barrier")]
+fn spawn_serve_with_after_turn_started_barrier(
+    env: &TestEnv,
+    ready: &Path,
+    barrier: &Path,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_leveler"))
+        .arg("--repo")
+        .arg(&env.repo)
+        .arg("serve")
+        .arg("--ready-json")
+        .arg(ready)
+        .env("LEVELER_HOME", &env.home)
+        .env("LEVELER_CONFIG_DIR", &env.config_dir)
+        .env("LEVELER_TEST_AFTER_TURN_STARTED_BARRIER", barrier)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn leveler serve with crash barrier")
+}
+
 /// Wait for the daemon's ready file; panics with the child's status on
 /// premature exit so a startup failure is diagnosable.
 fn wait_ready(ready: &Path, child: &mut Child, timeout: Duration) -> serde_json::Value {
@@ -322,24 +344,26 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
         .await
         .unwrap();
 
-    // Wait until the turn's row is durably `running` — admission alone is
-    // in-memory and precedes persistence, so killing on the busy signal
-    // could land before the turn row exists. WAL allows this concurrent
-    // read while the daemon owns the database.
+    // `send` ACKs only after the running turn and its write-ahead initiating
+    // input are durable. A one-shot read immediately after ACK locks that
+    // contract; no polling is allowed to hide an early ACK.
     let db_path = find_state_dir(&env).join("sessions.db");
     let db = leveler_storage::Database::connect(&db_path).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let turns = leveler_storage::TurnRepository::new(&db)
-            .list(&session)
-            .await
-            .unwrap();
-        if turns.iter().any(|t| t.status == "running") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn never became durable");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    let running = turns
+        .iter()
+        .find(|turn| turn.status == "running")
+        .expect("ACK must follow the durable running turn");
+    assert!(
+        running
+            .payload
+            .as_deref()
+            .is_some_and(|payload| payload.contains("MARKER_BEFORE_CRASH")),
+        "the running row must carry replayable initiating input: {running:?}"
+    );
     drop(client);
     drop(db);
 
@@ -395,6 +419,139 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
     );
 
     drop(client);
+    stop_daemon(&mut daemon);
+}
+
+/// Deterministic C2/C5/C8 boundary: ACK has been returned and the running turn
+/// carries its canonical input, while the transcript append is held behind an
+/// exact test barrier. SIGKILL there must reconstruct one user message; a
+/// second restart must remain a no-op.
+#[cfg(feature = "test-crash-barrier")]
+#[tokio::test]
+async fn sigkill_after_durable_ack_before_transcript_append_recovers_once() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready-barrier-1.json");
+    let barrier = env.home.join(format!(
+        ".test-crash-barrier-{}",
+        leveler_core::new_uuid_string()
+    ));
+    let mut daemon = spawn_serve_with_after_turn_started_barrier(&env, &ready1, &barrier);
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "deterministic crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "DETERMINISTIC_CRASH_MARKER".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .expect("ACK follows durable turn input");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reached the exact post-TurnStarted barrier"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited before the crash barrier"
+        );
+        std::thread::yield_now();
+    }
+
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    let running = turns
+        .iter()
+        .find(|turn| turn.status == "running")
+        .expect("barrier requires a durable running turn");
+    assert!(
+        running
+            .payload
+            .as_deref()
+            .is_some_and(|payload| payload.contains("DETERMINISTIC_CRASH_MARKER")),
+        "running turn must carry canonical input"
+    );
+    let before = leveler_storage::MessageRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert!(
+        before
+            .iter()
+            .all(|payload| !payload.contains("DETERMINISTIC_CRASH_MARKER")),
+        "barrier must stop before the transcript projection"
+    );
+    drop(client);
+    drop(db);
+
+    daemon.kill().expect("SIGKILL at exact crash barrier");
+    let _ = daemon.wait();
+
+    let ready2 = env.home.join("ready-barrier-2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let messages = leveler_storage::MessageRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|payload| payload.contains("DETERMINISTIC_CRASH_MARKER"))
+            .count(),
+        1,
+        "restart must project the accepted input exactly once"
+    );
+    assert!(
+        leveler_storage::TurnRepository::new(&db)
+            .list(&session)
+            .await
+            .unwrap()
+            .iter()
+            .all(|turn| turn.status != "running"),
+        "restart recovery is complete only after the turn is terminal"
+    );
+    drop(db);
+    stop_daemon(&mut daemon);
+
+    let ready3 = env.home.join("ready-barrier-3.json");
+    let mut daemon = spawn_serve(&env, &ready3);
+    wait_ready(&ready3, &mut daemon, Duration::from_secs(30));
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let messages = leveler_storage::MessageRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|payload| payload.contains("DETERMINISTIC_CRASH_MARKER"))
+            .count(),
+        1,
+        "repeated restart must not duplicate recovery"
+    );
     stop_daemon(&mut daemon);
 }
 

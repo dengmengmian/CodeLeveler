@@ -818,6 +818,19 @@ impl leveler_storage::MessageStore for CountingMessageStore {
             .await
     }
 
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<bool, leveler_storage::OwnershipError> {
+        self.inner
+            .ensure_initiating_message_owned(token, session_id, turn_id, payload, now)
+            .await
+    }
+
     async fn load(
         &self,
         session_id: &leveler_core::SessionId,

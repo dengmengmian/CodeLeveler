@@ -158,6 +158,23 @@ async fn assert_fencing_contract(
         )
         .await
         .unwrap();
+    let recovered_user = r#"{"role":"user","content":[{"type":"text","text":"recovered-once"}]}"#;
+    assert!(
+        ports
+            .messages
+            .ensure_initiating_message_owned(current, session, &turn_id, recovered_user, now(),)
+            .await
+            .unwrap(),
+        "the missing initiating projection is inserted"
+    );
+    assert!(
+        !ports
+            .messages
+            .ensure_initiating_message_owned(current, session, &turn_id, recovered_user, now(),)
+            .await
+            .unwrap(),
+        "the same turn identity cannot project twice"
+    );
 
     // Scenario G: stale transcript append → nothing stored.
     assert_stale(
@@ -174,10 +191,14 @@ async fn assert_fencing_contract(
         "transcript append",
     );
     let transcript = ports.messages.load(session).await.unwrap();
-    assert_eq!(
-        transcript,
-        vec![r#""msg-1""#],
-        "stale transcript writes must not land"
+    assert_eq!(transcript.len(), 2);
+    assert_eq!(transcript[0], r#""msg-1""#);
+    assert!(
+        transcript[1].contains("recovered-once")
+            && !transcript
+                .iter()
+                .any(|payload| payload.contains("SHOULD_NOT_LAND")),
+        "stale transcript writes must not land and recovery must stay idempotent: {transcript:?}"
     );
 
     // Stale Running transition refused.

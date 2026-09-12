@@ -137,10 +137,15 @@ async fn run_one(
     let cancellation = CancellationToken::new();
     let mut events = Vec::new();
     let input = input.to_string();
+    let initiating_message = leveler_model::Message::text(leveler_model::Role::User, input.clone());
     let recorded = runner
         .run_turn(
             TurnKind::User,
             seed,
+            match seed {
+                SeedRequest::Fresh { .. } => Some(initiating_message),
+                SeedRequest::Resume => None,
+            },
             // No `WorkspaceFacts`: the engine must not require a repository.
             None,
             &mut |event| events.push(event),
@@ -244,10 +249,21 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     // The crash: a turn row opened by a runtime that never came back.
     let crashing = engine(&db);
     let token = crashing.mark_running(&session).await.unwrap();
+    let crash_payload = serde_json::json!({
+        "version": 1,
+        "initiating_message": Message::text(Role::User, "crash-marker"),
+    })
+    .to_string();
     crashing
         .stores
         .turns
-        .start_owned(&token, &session, "user", None, leveler_core::now())
+        .start_owned(
+            &token,
+            &session,
+            "user",
+            Some(&crash_payload),
+            leveler_core::now(),
+        )
         .await
         .expect("a turn row opens");
     drop(crashing);
@@ -269,6 +285,22 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     assert_eq!(
         turns[1].status, "interrupted",
         "the lost turn is interrupted, not silently completed or still running"
+    );
+    let transcript = leveler_engine::RawTranscript::load_strict(
+        restarted.stores.messages.as_ref(),
+        &session,
+        "recovered transcript",
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message.text_content() == "crash-marker")
+            .count(),
+        1,
+        "restart must project the accepted input exactly once"
     );
 
     // The next turn resumes the same session.
