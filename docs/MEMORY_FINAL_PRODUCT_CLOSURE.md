@@ -149,3 +149,41 @@ Memory（`MemoryScope::User` 只是记下的 extension seam）。
 见本文件末尾的最终报告字段。所有 PASS 由真实二进制、真实 PTY、真实 runtime、
 真实模型与真实浏览器支撑，取证自 memory store 文件、`sessions.db` 的
 `model_requests` / `turns` / `context_snapshot`，以及 WebSocket 实际发出的帧。
+
+### 11.1 八项 Dogfood 逐项证据
+
+| # | 断言 | 真实取证 | 结论 |
+| --- | --- | --- | --- |
+| D1 | `记住：…` 直写 active，零模型请求 | active +1、pending +0、`model_requests` +0、`turns` +0、TUI 回显确认、kind=preference | PASS |
+| D2 | 英文 `remember: …` 同语义 | active +1、pending +0、`model_requests` +0、`turns` +0 | PASS |
+| D3 | 软信号只进 pending，拒绝后不再复提 | pending +1、`source=system_inferred`、正文在 TUI 可见；拒绝后 suppress +1，重说同一句 pending 仍为 0 | PASS |
+| D4 | 记忆句式夹带任务时不直写 | 直写 0、pending +0、`model_requests` +6、编码任务真实执行、原始消息未被改写 | PASS |
+| D5 | 召回块有硬预算且不入历史 | 召回块存在且位于 user 消息之前、无 id 无标题、正文截断、持久化 transcript 中 memory 块 0 | PASS |
+| D6 | FullAccess 下 agent 写入仍需人 | 有人时：`remember` 调用 1 次、审批浮层出现、批准前 active +0、批准后 +1；无人值守：active +0、pending +1 | PASS |
+| D7 | 真实浏览器点「忽略」走 RejectMemory | 真实 Chromium + 真实 runtime：`reject_memory` 帧 1、`forget_memory` 帧 0、pending −1、suppress +1、active/archive 不变 | PASS |
+| D8 | Economy 不携带任何 memory 上下文 | 真实模型请求发生的前提下 guidance/catalog/召回块/记忆 id/工具提及全部为 0；同一 profile 下用户 CLI 直写仍成功（rc=0，active 5→6） | PASS |
+
+D7 的落盘证据是 `memory/suppress/<fingerprint>.json`，内容只有
+`fingerprint` / `rejected_at` / `candidate_id` —— 拒绝是拒绝，不是把候选搬进
+archive，也没有复用 forget 路径。UI 上 `Pending` 由 1 变 0，会话流里出现
+「已拒绝候选 […]，不再重复提示」。
+
+D8 曾有一次 `USER_DIRECT_WRITE_UNDER_ECONOMY=False`，根因在夯具而非产品：
+`activate` 是幂等的，那一版驱动复用了同一条正文，所以计数本就不该变。改为唯一
+正文后复跑为 True。
+
+## 12. 终局字段
+
+```
+DOGFOOD_D1_DIRECT_WRITE=PASS
+DOGFOOD_D2_ENGLISH_PREFIX=PASS
+DOGFOOD_D3_SOFT_SIGNAL=PASS
+DOGFOOD_D4_TASK_CARRIER=PASS
+DOGFOOD_D5_RECALL_BUDGET=PASS
+DOGFOOD_D6_FULLACCESS_CONSENT=PASS
+DOGFOOD_D7_WEB_REJECT=PASS
+DOGFOOD_D8_ECONOMY=PASS
+DOGFOOD_REAL_WEB=YES
+DOGFOOD=PASS
+MEMORY_FINAL_PRODUCT_CLOSURE=PASS
+```
