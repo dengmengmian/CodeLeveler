@@ -102,12 +102,9 @@ RuntimeEvent
 
 ## 6. 尚未解决 / 已知限制
 
-- **§5 真实并行批在本机无法用真流量触发。** 唯一可用的 provider（DeepSeek）配置为
-  `parallel_tool_calls = false` / `max_parallel_tool_calls = 1`；Kimi k3 支持 16 路
-  并发，但 Moonshot 的 schema 校验拒绝 `update_plan` 的工具定义
-  （`At path 'properties.plan.items': detected infinite recursion without
-  termination condition`），整轮开局即失败。该 schema 问题是既有缺陷，不在本任务
-  范围内。并行批逻辑由确定性 reducer + renderer 测试覆盖。
+- **§5 真实并行批已用真流量关闭。** 见 §11。此前写"本机无法触发"是配置读成了能力：
+  DeepSeek 的 `parallel_tool_calls = false` 只是往线上发 `parallel_tool_calls:
+  false`，把并发关掉了，不是 provider 不支持。
 - **§6.6 Partial Apply 在本 runtime 不存在。** `tools/patch/apply.rs` 明确
   "returns an error and makes no partial change"，apply_patch 是全有全无。没有为它
   造 UI 状态。
@@ -198,12 +195,186 @@ Lab 仓库是一个单组消费信号量的 Go worker，任务要求读两个文
   实时活动行恢复——缓存确实随批准状态失效了。
 - **决策真的流到了 runtime**：`stale/` 目录在文件系统上确实被删除，不是只改了颜色。
 
-### 未能用真流量覆盖的一项
+## 11. 真实并行工具批次（REAL PARALLEL TOOL BATCH DOGFOOD）
 
-§5 的真实并行批。见 §6 已知限制：唯一可用 provider 不做并发工具调用，支持 16 路并发
-的 Kimi k3 在 `update_plan` 的 schema 校验上开局即失败。并行批的身份判定与树渲染由
-上表 13 个确定性测试覆盖。
+上一轮把这一项记成"本机无法用真流量触发"。那是把配置读成了能力：DeepSeek 的
+`parallel_tool_calls = false` 只是让 `openai_chat` 适配器往线上发
+`parallel_tool_calls: false`（`openai_chat/mod.rs`：只有模型不能并行时才发这个字段），
+主动把并发关掉了。把它在**一份隔离的 `LEVELER_HOME`** 里改成 `true` 之后，
+provider 一次响应就返回了三个 tool call。仓库产品代码一行没动。
 
+另一个关键事实：执行器的批宽**不由**模型 profile 决定。`coding/policy.rs` 的
+`DEFAULT_PARALLEL_TOOLS = 4` 是唯一来源，注释写明 profile 的
+`max_parallel_tool_calls` 是"conservative placeholder"，折进来会把 4 悄悄降成 1。所以
+只要 provider 肯一次给多个调用，运行时就会真并发跑。
+
+### 11.1 正向：一次响应 → 一个并发批
+
+| 项 | 值 |
+| --- | --- |
+| Provider / 模型 | `deepseek` / `deepseek-v4-flash`（`reasoning_effort=max`） |
+| 网关 | `https://taotoken.net/api/v1` |
+| 模型请求数 | 2（一次给出三个 grep，一次 `update_goal`） |
+| Session | `30fabaa1-4749-4e8e-8e24-9962d5b3dc4c` |
+
+一次响应里的三个 provider call ID（`events` 表原文）：
+
+```
+call_bfl3we8eusd3q3fzxjmnf9pc  grep  parallel=true  {"path":"mod_a","pattern":"ZZQQ_ABSENT_TOKEN_9137"}
+call_azczs6qyxrvt7m060guyl24j  grep  parallel=true  {"path":"mod_b","pattern":"ZZQQ_ABSENT_TOKEN_9137"}
+call_on19wvaat7qlri3910w8v8u7  grep  parallel=true  {"path":"mod_c","pattern":"ZZQQ_ABSENT_TOKEN_9137"}
+```
+
+Runtime 批次身份来自持久化事件的顺序本身——三个 `tool_call_started` 全部先于任何
+`tool_call_finished`：
+
+```
+seq 3  tool_call_started   2026-09-12T08:28:41.217802Z
+seq 4  tool_call_started   2026-09-12T08:28:41.218755Z
+seq 5  tool_call_started   2026-09-12T08:28:41.219230Z
+seq 6  tool_call_finished  2026-09-12T08:28:41.780373Z
+seq 7  tool_call_finished  2026-09-12T08:28:41.780373Z
+seq 8  tool_call_finished  2026-09-12T08:28:41.780373Z
+```
+
+对照顺序路径（§11.3 seq 3→4）是"宣告一个、跑完一个、再宣告下一个"。三个 started 先
+于全部 finished，只有 `parallel_jobs` 那条路径会产生。
+
+### 11.2 时间区间重叠的量化证明
+
+只有相同 batch ID 不算证据，所以用同一 corpus、同一模型做了 A/B 计时。语料是三份各
+50MB 的 Go 文件；pattern 取一个**不存在的 token**，让 grep 无法提前退出，必须整份扫完。
+
+**Arm B（线上能力关掉 → 一轮一个调用）**，每个调用的 start/finish 落在不同的持久化批
+次里，所以单次全量扫描的真实成本可读：
+
+| 调用 | start → finish | 耗时 |
+| --- | --- | --- |
+| grep mod_a | 08:26:52.915968 → 08:26:53.006406 | 90.4 ms |
+| grep mod_b | 08:26:55.881433 → 08:26:55.965954 | 84.5 ms |
+| grep mod_c | 08:26:58.337549 → 08:26:58.416832 | 79.3 ms |
+| **合计扫描工作量** | | **254.2 ms** |
+
+**Arm A（同一任务，能力打开 → 一轮三个调用）**：
+
+```
+第一个 start → finish   114.3 ms
+最后一个 start → finish 113.7 ms
+```
+
+254.2 ms 的扫描工作在 114.3 ms 的窗口里做完了。**至少 139.9 ms 的工作必须是并发的**；
+三个各约 85 ms 的区间挤进 113.7 ms 的窗口，两两重叠至少 55.8 ms。顺序执行不可能得到
+这个数。
+
+放大到每份 200MB 之后（PTY 那一程），批次跨度 562.6 ms，而 TUI 自己测得的
+`duration_ms` 三条都是 **0.6s**：1.8 s 的工具时间落在 0.56 s 的跨度里。TUI 的独立测量
+和事件日志的时间戳互相印证。
+
+### 11.3 执行中与冻结后的画面
+
+真实 PTY，真实 TUI，binary `32f8d5e700a9`。截图 `tui_closure_parallel_live.txt` /
+`tui_closure_parallel_frozen.txt`。执行中的形态被抓到 10 帧。
+
+执行中：
+
+```
+    ◌ 并行处理 3 项
+    ├ ◌ 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_a …
+    ├ ◌ 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_b …
+    └ ◌ 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_c …
+```
+
+完成后冻结：
+
+```
+    ▸ 搜索代码库
+    · 并行处理 3 项
+    ├ · 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_a · 0.6s · 1 行
+    ├ · 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_b · 0.6s · 1 行
+    └ · 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_c · 0.6s · 1 行
+
+  ● 三处均无命中
+
+  ── ✓ 任务已完成 · 3 次工具 · 9s ──────────────────────────────
+```
+
+每个子工具都写明自己作用的对象（`in mod_a` / `in mod_b` / `in mod_c`）和自己的结果
+（`0.6s · 1 行`），表头计数等于子行数。Completion Footer 在最终回答 `● 三处均无命中`
+之后才出现。无 panic，无 DIFF 或 Transcript 丢失。
+
+### 11.4 反向：两个顺序轮次不得合并
+
+任务要求分两步：第一步同时读两个文件，第二步等结果回来后再同时发两个 grep。两轮都是
+可并发的，所以只按 `parallel` 标志分组的 UI 会显示一个"并行处理 4 项"。
+
+事件日志（session `cf00331d-7215-417d-bfa5-ccc45b6ffb45`，3 次模型请求）：
+
+```
+seq  3  tool_call_started   08:30:00.452350   ┐ 批次一
+seq  4  tool_call_started   08:30:00.452780   │
+seq  5  tool_call_finished  08:30:00.457020   │
+seq  6  tool_call_finished  08:30:00.457020   ┘
+                     ── 间隔 2.54 s ──
+seq  9  tool_call_started   08:30:02.995596   ┐ 批次二
+seq 10  tool_call_started   08:30:02.996209   │
+seq 11  tool_call_finished  08:30:04.029031   │
+seq 12  tool_call_finished  08:30:04.029031   ┘
+```
+
+TUI 的画面（`sequential_out/01_final.txt`）：
+
+```
+    ▸ 检查代码库
+    · 并行处理 2 项
+    ├ · 读取文件  mod_a/round1_a.txt · 1 行
+    └ · 读取文件  mod_b/round1_b.txt · 1 行
+    · 并行处理 2 项
+    ├ · 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_a · 1.0s · 1 行
+    └ · 搜索代码  "ZZQQ_ABSENT_TOKEN_9137" in mod_b · 1.0s · 1 行
+```
+
+同一个工具组里两个独立批次，各带自己的两个子项。全程没有出现"并行处理 4 项"。
+
+### 11.5 Kimi / Moonshot：根因已定位，按独立缺陷记录
+
+因为 DeepSeek 已经完成真实并行验收，本轮**不修 Kimi**。但根因是量测出来的，不是照
+错误信息猜的——直接对 Moonshot 端点提交四种 schema 变体：
+
+| schema 形态 | 结果 |
+| --- | --- |
+| 出厂原样（`$defs` + `allOf[$ref]` + 兄弟 `description` + nullable） | **REJECTED** |
+| `allOf: [{$ref}]`，无兄弟键 | **REJECTED** |
+| 裸 `$ref` + 兄弟 `description` | ACCEPTED |
+| 裸 `$ref`，无兄弟键 | ACCEPTED |
+| 完全内联（保留 / 去掉 nullable） | ACCEPTED |
+
+五个问题的答案：
+
+1. **拒的是哪个字段组合？** 是 `$ref` 被包在 `allOf` 里。`$defs` / `$ref` / nullable
+   `type: [string, null]` / `$ref` 旁边挂 `description` 全都能过。唯一触发条件是
+   `allOf: [{"$ref": …}]`，出现在 `PlanItem.status`。报错里的路径
+   （`properties.plan.items`）指的是外层那个裸 `$ref`，比真正的位置浅一层，所以照报错
+   文字猜会猜错地方。
+2. **是通用 JSON Schema 违规还是只违 Moonshot 子集？** 只违 Moonshot 子集。该 schema
+   是合法的 draft 2020-12，而且**无环**：`Args` → `PlanItem` → `StepStatus`（纯枚举）。
+   "infinite recursion" 这个判断本身是错的；Moonshot 的校验器只在节点层解析 `$ref`，
+   遇到组合关键字里的 `$ref` 就当成解析不出来。`allOf` 包 `$ref` 是 schemars 的
+   draft-07 惯用写法：字段同时有 `$ref` 和文档注释时，它用 `allOf` 腾出位置放
+   `description`。
+3. **已有 provider capability / schema 规范化层吗？** 没有按 provider 的。
+   `leveler-tools` 的 `normalize_to_draft_2020_12` 是对所有 provider 一视同仁的
+   draft-07 → 2020-12 改写；`openai_chat` 适配器把 `input_schema` **原样**送上线，还有
+   `tool_schema_required_reaches_the_outbound_request_verbatim` 这条契约测试守着。
+4. **修复该落在哪一层？** provider / protocol 适配层，不是通用工具定义。通用 schema
+   本身是对的，别的 provider 都收。最小边界是一个按 profile 开关的 compatibility 变换：
+   把单元素 `allOf` 折叠回裸 `$ref`（语义等价），只对声明了该 compatibility 的 profile
+   生效。
+5. **会削弱其他 provider 的工具契约吗？** 折叠单元素 `allOf` 语义等价，不会。但必须按
+   profile 收口：无条件全局改写会动到每个 provider 的线上字节，也会和上面那条"原样送
+   达"的契约测试冲突。
+
+记录为独立缺陷：**Moonshot 端点拒绝 `allOf` 包裹的 `$ref`，使 Kimi 模型无法加载
+`update_plan`**。本轮未改动任何 provider 代码。
 ## 9. 判定
 
 ```
@@ -215,17 +386,37 @@ TUI_INTERACTION_STATE=PASS
 TUI_LIVE_ACTIVITY=PASS
 TUI_COMPLETION_TRUTH=PASS
 TUI_SCROLL_ACCEPTANCE=PASS
+TUI_PARALLEL_DETERMINISTIC_ACCEPTANCE=PASS
+TUI_PARALLEL_REAL_TRAFFIC=PASS
 TUI_REAL_DOGFOOD=PASS
 TUI_EXECUTION_PRESENTATION_CLOSURE=PASS
 ```
 
-判定的限定条件写在 §6 与 §8 最后一节，不在这十行里省略：真实并行批未经真流量验证，
-Partial Apply 在本 runtime 不存在。除此之外每一项都有真实 TUI 截图或确定性测试。
+`TUI_PARALLEL_REAL_TRAFFIC=PASS` 立在三类证据同时具备之上，缺一不给：
+
+1. **Runtime batch identity** — 三个 provider call ID，`parallel=true`，三个
+   `tool_call_started` 全部先于任何 `tool_call_finished`（§11.1）。
+2. **时间区间重叠** — 同 corpus 的 A/B 计时：254.2 ms 的扫描工作在 114.3 ms 的窗口内
+   完成，至少 139.9 ms 必须并发；放大后 1.8 s 工具时间落在 0.56 s 跨度内（§11.2）。
+3. **TUI 画面** — 执行中 `◌ 并行处理 3 项` 带三个 `├`/`└` 子项，完成后冻结为
+   `· 并行处理 3 项`，三行各带自己的对象与结果（§11.3）。
+
+外加反向样例：两个都可并发的顺序轮次保持成两个批次，从未出现"并行处理 4 项"（§11.4）。
+
+仍写在限定条件里的只剩 §6.6：Partial Apply 在本 runtime 不存在，没有为它造 UI 状态。
+
+Kimi / Moonshot 的 schema 不兼容按独立缺陷记录（§11.5），不构成本轮验收阻塞——真实并行
+验收已由 DeepSeek 完成。因此不写 `ACCEPTANCE_BLOCKER=PROVIDER_SCHEMA_COMPATIBILITY`。
 
 ## 10. 产品代码之外的额外改动
 
-- 本文档与同目录七张 dogfood 截图。
-- `testdata/session_transcript.golden.json` 按新增的可选字段重新生成。
+- 本文档与同目录十张 dogfood 截图。
+- `testdata/session_transcript.golden.json` 按新增的可选字段重新生成（上一轮）。
 
-没有新建分支，没有 push，没有提交产品代码。`crates/leveler-execution/src/command.rs`
-的既有未提交改动未被触碰（它在本轮进行中由别处提交为 `0f901f0`）。
+并行验收这一轮**没有改动任何产品代码**：`git diff --stat` 为空，HEAD 停在
+`ac40def`。`parallel_tool_calls = true` 只写在一份隔离的 `LEVELER_HOME`（scratch
+目录）里，用户的 `~/.leveler/config.toml` 未被触碰，仓库里的 provider capability
+声明也未改动。诊断 Moonshot 时临时加过一个打印 schema 的测试，已 `git checkout` 还原。
+
+没有新建分支。`crates/leveler-execution/src/command.rs` 的既有未提交改动未被触碰
+（它在上一轮进行中由别处提交为 `0f901f0`）。
