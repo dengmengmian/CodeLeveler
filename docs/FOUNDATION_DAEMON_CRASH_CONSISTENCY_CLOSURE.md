@@ -5,8 +5,8 @@
 ```text
 LOCAL_IMPLEMENTATION=COMPLETE
 LOCAL_ACCEPTANCE=PASS
-CI_ACCEPTANCE=PENDING
-DAEMON_CRASH_CONSISTENCY_CLOSURE=PENDING_CI
+CI_ACCEPTANCE=PASS
+DAEMON_CRASH_CONSISTENCY_CLOSURE=PASS
 ```
 
 This gate starts from `667ef326373d4117e47d76dd584546a8f04158a4`
@@ -228,17 +228,19 @@ committed. Remote acceptance remains pending until the exact PR and main runs
 complete on their first attempts.
 
 ```text
-PR_CI_RUN_ID=PENDING
-PR_CI_ATTEMPT=PENDING
-PR_CI_FIRST_ATTEMPT_STABLE=PENDING
-MAIN_CI_RUN_ID=PENDING
-MAIN_CI_COMMIT=PENDING
-MAIN_CI_ATTEMPT=PENDING
-MAIN_CI_FIRST_ATTEMPT_STABLE=PENDING
+PRODUCT_COMMIT=f628c168f5c42ba6288a1a36387fa1c941e0dbc2
+PR_NUMBER=18
+PR_CI_RUN_ID=34710983155
+PR_CI_ATTEMPT=1
+PR_CI_FIRST_ATTEMPT_STABLE=YES
+MAIN_CI_RUN_ID=34711668562
+MAIN_CI_COMMIT=38e6a0304f8c38b65fe940853079e9fabadb3840
+MAIN_CI_ATTEMPT=1
+MAIN_CI_FIRST_ATTEMPT_STABLE=YES
 ```
 
-This section must be completed from exact commit/run identities before the gate
-is marked closed.
+Both runs completed successfully with all six jobs green: deny/audit, Web,
+Mobile, and the Ubuntu, macOS, and Windows Rust matrices. No job was rerun.
 
 ## 14. Scope
 
@@ -288,8 +290,8 @@ NO_ASSERTION_WEAKENING=YES
 ACTUAL_DIFF_REVIEWED=YES
 INDEPENDENT_REVIEW=APPROVE
 NO_SCOPE_EXPANSION=YES
-DAEMON_CRASH_CONSISTENCY_CLOSURE=PENDING_CI
-READY_FOR_WINDOWS_CANARY_SAMPLE_REVIEW=NO
+DAEMON_CRASH_CONSISTENCY_CLOSURE=PASS
+READY_FOR_WINDOWS_CANARY_SAMPLE_REVIEW=YES
 READY_FOR_W3=NO
 W3_STARTED=NO
 FOUNDATION_FROZEN=NO
@@ -297,6 +299,6 @@ FOUNDATION_FROZEN=NO
 
 ## 17. Handoff
 
-After exact PR and main CI pass on their first attempts, update the CI evidence
-and final gates, then perform the read-only Windows Canary Accumulated Evidence
-Review. W3-A starts only if that review does not block.
+The exact PR and main CI passed on their first attempts. The next gate is the
+read-only Windows Canary Accumulated Evidence Review. W3-A starts only if that
+review does not block.
