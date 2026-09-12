@@ -4,7 +4,7 @@
 //! require interactive approval (K36). These subcommands are **user-authoritative**
 //! writes — the human is managing memory directly (including pending accept).
 
-use leveler_memory::{MemoryStore, ProposeOutcome, collect_turn_candidates, new_entry};
+use leveler_memory::{MemoryStore, ProposeOutcome, collect_turn_candidates};
 use leveler_project::Layout;
 
 use crate::cli::MemoryCommand;
@@ -102,8 +102,13 @@ pub(crate) fn cmd_memory(
             println!("{}", Line::ok(&format!("archived [{}]: {}", e.id, e.title)));
             Ok(std::process::ExitCode::SUCCESS)
         }
-        MemoryCommand::Remember { title, body, tags } => {
-            let saved = remember_direct(&store, &title, &body, tags)?;
+        MemoryCommand::Remember {
+            title,
+            body,
+            kind,
+            tags,
+        } => {
+            let saved = remember_direct(&store, &title, &body, kind, tags)?;
             println!(
                 "{}",
                 Line::ok(&format!("remembered [{}]: {}", saved.id, saved.title))
@@ -160,17 +165,11 @@ pub(crate) fn cmd_memory(
             }
             Err(e) => Err(e.into()),
         },
-        MemoryCommand::Propose { text, scan_pm } => {
-            if text.is_none() && !scan_pm {
-                println!(
-                    "{}",
-                    Line::warn("provide --text and/or --scan-pm (no-op otherwise)")
-                );
-                return Ok(std::process::ExitCode::FAILURE);
-            }
-            let repo = scan_pm.then(|| layout.repo_root.clone());
-            let outcomes =
-                collect_turn_candidates(&store, text.as_deref().unwrap_or(""), repo.as_deref())?;
+        MemoryCommand::Propose { text } => {
+            // Repository signals are no longer scanned into candidates: a
+            // lockfile is read from the working tree when needed, never
+            // remembered, so `--scan-pm` had nothing left to do.
+            let outcomes = collect_turn_candidates(&store, &text, None)?;
             if outcomes.is_empty() {
                 println!("{}", Line::warn("No candidates extracted."));
                 return Ok(std::process::ExitCode::SUCCESS);
@@ -201,7 +200,7 @@ pub(crate) fn cmd_memory(
 #[cfg(test)]
 pub(crate) fn memory_round_trip_via_store(root: &std::path::Path) -> anyhow::Result<()> {
     let store = MemoryStore::open(root)?;
-    let e = new_entry(
+    let e = leveler_memory::new_entry(
         "use-workspace-write-default",
         "Prefer WorkspaceWrite for routine edits.",
         vec!["preference".into()],
@@ -231,15 +230,27 @@ fn remember_direct(
     store: &MemoryStore,
     title: &str,
     body: &str,
+    kind: crate::cli::MemoryKindArg,
     tags: Vec<String>,
 ) -> Result<leveler_memory::MemoryEntry, leveler_memory::MemoryError> {
-    store.remember_deduplicated(new_entry(title, body, tags))
+    use crate::cli::MemoryKindArg;
+    use leveler_memory::MemoryKind;
+    store.activate(
+        title,
+        body,
+        match kind {
+            MemoryKindArg::Preference => MemoryKind::Preference,
+            MemoryKindArg::Decision => MemoryKind::Decision,
+            MemoryKindArg::Note => MemoryKind::Note,
+        },
+        tags,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_memory::{ProposeOutcome, parse_explicit_remember_intent};
+    use leveler_memory::{ProposeOutcome, parse_inferred_preference};
     use std::path::PathBuf;
 
     #[test]
@@ -274,8 +285,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let store = MemoryStore::open(&root).unwrap();
 
-        let first = remember_direct(&store, "Deploy notes", "第一版正文", vec![]).unwrap();
-        let second = remember_direct(&store, "Deploy notes", "第二版正文完全不同", vec![]).unwrap();
+        let first = remember_direct(
+            &store,
+            "Deploy notes",
+            "第一版正文",
+            crate::cli::MemoryKindArg::Note,
+            vec![],
+        )
+        .unwrap();
+        let second = remember_direct(
+            &store,
+            "Deploy notes",
+            "第二版正文完全不同",
+            crate::cli::MemoryKindArg::Note,
+            vec![],
+        )
+        .unwrap();
         assert_ne!(first.id, second.id, "a second note needs its own id");
         assert_eq!(store.list_active().unwrap().len(), 2, "neither is lost");
         assert!(
@@ -289,8 +314,22 @@ mod tests {
 
         // Two CJK-only titles in the same second both slug to empty and share
         // the timestamp fallback; both must still land.
-        let a = remember_direct(&store, "状态色约定", "映射表实现", vec![]).unwrap();
-        let b = remember_direct(&store, "搜索框过滤范围", "只按 payer 过滤", vec![]).unwrap();
+        let a = remember_direct(
+            &store,
+            "状态色约定",
+            "映射表实现",
+            crate::cli::MemoryKindArg::Note,
+            vec![],
+        )
+        .unwrap();
+        let b = remember_direct(
+            &store,
+            "搜索框过滤范围",
+            "只按 payer 过滤",
+            crate::cli::MemoryKindArg::Note,
+            vec![],
+        )
+        .unwrap();
         assert_ne!(a.id, b.id, "same-second CJK titles must not collide");
         assert_eq!(store.list_active().unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(&root);
@@ -303,7 +342,7 @@ mod tests {
             std::env::temp_dir().join(format!("leveler-memory-cli-accept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = MemoryStore::open(&root).unwrap();
-        let c = parse_explicit_remember_intent("remember: prefer gated memory writes").unwrap();
+        let c = parse_inferred_preference("我通常希望 prefer gated memory writes").unwrap();
         let pending = match store.propose(c).unwrap() {
             ProposeOutcome::Pending(c) => c,
             other => panic!("{other:?}"),

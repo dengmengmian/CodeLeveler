@@ -615,6 +615,8 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::ListMemory { .. } => "list_memory",
         ClientCommand::ForgetMemory { .. } => "forget_memory",
         ClientCommand::AcceptMemory { .. } => "accept_memory",
+        ClientCommand::RejectMemory { .. } => "reject_memory",
+        ClientCommand::RememberMemory { .. } => "remember_memory",
         ClientCommand::RequestDiff { .. } => "request_diff",
         ClientCommand::CompactContext { .. } => "compact_context",
         ClientCommand::ClearConversation { .. } => "clear_conversation",

@@ -281,6 +281,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
+        "remember" => remember_slash(state, command),
         "skill" => skill_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
@@ -705,6 +706,22 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             id: id.to_string(),
         })];
     }
+    // Rejecting a candidate is consent WITHHELD. It is a different operation
+    // from forgetting an active entry, and conflating them meant a pending id
+    // sent to forget did nothing at all.
+    if let Some(id) = rest.strip_prefix("reject").map(str::trim) {
+        if id.is_empty() {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().memory_reject_usage.to_string(),
+            });
+            return Vec::new();
+        }
+        return vec![Effect::Send(ClientCommand::RejectMemory {
+            session_id: state.session_id.clone(),
+            id: id.to_string(),
+        })];
+    }
     if let Some(id) = rest.strip_prefix("forget").map(str::trim) {
         if id.is_empty() {
             state.notification = Some(Notification {
@@ -723,6 +740,66 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         message: state.t().memory_usage.to_string(),
     });
     Vec::new()
+}
+
+/// `/remember <text>` — the user's own direct write.
+///
+/// It never reaches the model and never starts a turn: the command IS the
+/// authorization. That is the whole reason it exists next to the
+/// natural-language path, which can only ever propose, because a prefix parser
+/// must not silently rewrite someone's long-term state.
+///
+/// Defaults to `preference` because "remember this" almost always means "apply
+/// it from now on", and only preferences are injected every turn.
+fn remember_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let rest = command.strip_prefix("remember").unwrap_or(command).trim();
+    let (kind, body) = parse_remember_kind(rest);
+    let body = body.trim();
+    if body.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().remember_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    // A write mid-turn is accepted, but the running turn's context was already
+    // assembled, so say when it actually takes effect rather than implying now.
+    if state.is_busy() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: state.t().remember_busy_hint.to_string(),
+        });
+    }
+    vec![Effect::Send(ClientCommand::RememberMemory {
+        session_id: state.session_id.clone(),
+        body: body.to_string(),
+        kind: Some(kind),
+    })]
+}
+
+/// Split an optional leading `--kind <k>` off the body. Unknown kinds are a
+/// usage error rather than a silent fallback, so a typo cannot quietly store a
+/// note as a standing preference.
+fn parse_remember_kind(rest: &str) -> (leveler_client_protocol::UiMemoryKind, &str) {
+    use leveler_client_protocol::UiMemoryKind;
+    let Some(after) = rest.strip_prefix("--kind") else {
+        return (UiMemoryKind::Preference, rest);
+    };
+    let after = after.trim_start();
+    let (word, tail) = match after.split_once(char::is_whitespace) {
+        Some((w, t)) => (w, t),
+        None => (after, ""),
+    };
+    let kind = match word.trim() {
+        "decision" => UiMemoryKind::Decision,
+        "note" => UiMemoryKind::Note,
+        // Includes an explicit "preference" and anything unrecognised; an
+        // unrecognised word stays part of the body so the usage hint fires
+        // instead of storing it under a guessed kind.
+        "preference" => UiMemoryKind::Preference,
+        _ => return (UiMemoryKind::Preference, rest),
+    };
+    (kind, tail)
 }
 
 /// `/goal <task>` starts a goal turn; `/goal status` and `/goal clear` manage it.

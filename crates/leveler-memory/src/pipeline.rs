@@ -9,7 +9,7 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::candidates::{CandidateKind, MemoryCandidate, parse_explicit_remember_intent};
+use crate::candidates::{CandidateKind, MemoryCandidate, parse_inferred_preference};
 use crate::{
     MemoryEntry, MemoryError, MemoryStore, entry_from_candidate, now_rfc3339, write_atomically_pub,
 };
@@ -93,13 +93,34 @@ impl MemoryStore {
         &self,
         text: &str,
     ) -> Result<Option<ProposeOutcome>, MemoryError> {
-        let Some(c) = parse_explicit_remember_intent(text) else {
+        let Some(c) = parse_inferred_preference(text) else {
             return Ok(None);
         };
         Ok(Some(self.propose(c)?))
     }
 
+    /// Candidates awaiting consent.
+    ///
+    /// Heals crash residue first: a candidate whose content an active entry
+    /// already covers is removed, so a crash between activating and clearing
+    /// cannot leave the user approving something already stored.
     pub fn list_pending(&self) -> Result<Vec<MemoryCandidate>, MemoryError> {
+        let covered: Vec<String> = self
+            .list_active()?
+            .into_iter()
+            .map(|e| e.body.trim().to_string())
+            .collect();
+        for candidate in self.list_pending_raw()? {
+            if covered.iter().any(|b| b == candidate.body.trim()) {
+                let _ = fs::remove_file(self.pending_path(&candidate.id));
+            }
+        }
+        self.list_pending_raw()
+    }
+
+    /// Every pending candidate on disk, with no reconciliation. The internal
+    /// read [`Self::list_pending`] and activation build on.
+    pub(crate) fn list_pending_raw(&self) -> Result<Vec<MemoryCandidate>, MemoryError> {
         let dir = self.root.join("pending");
         let mut out = Vec::new();
         if !dir.exists() {
@@ -223,7 +244,7 @@ pub fn collect_turn_candidates(
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
-    use crate::candidates::{CandidateSource, parse_explicit_remember_intent};
+    use crate::candidates::{CandidateSource, parse_inferred_preference};
     use std::fs;
     use tempfile::tempdir;
 
@@ -264,7 +285,8 @@ mod pipeline_tests {
         fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
 
         let outcomes =
-            collect_turn_candidates(&store, "记住：提交前先跑 lint", Some(repo.path())).unwrap();
+            collect_turn_candidates(&store, "我通常希望提交前先跑 lint", Some(repo.path()))
+                .unwrap();
         assert_eq!(
             outcomes.len(),
             1,
@@ -278,7 +300,7 @@ mod pipeline_tests {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         // Explicit-intent extractor is the public entry; then accept → recall/index.
-        let extracted = parse_explicit_remember_intent("记住：用 pnpm").expect("intent");
+        let extracted = parse_inferred_preference("我通常希望用 pnpm").expect("intent");
         let outcome = store.propose(extracted).unwrap();
         let pending = match outcome {
             ProposeOutcome::Pending(c) => c,
@@ -333,7 +355,7 @@ mod pipeline_tests {
         let store = MemoryStore::open(dir.path()).unwrap();
         // Any candidate exercises reject/suppress; a user preference is used
         // because repository-derived facts are no longer proposed at all.
-        let text = "记住：提交前先跑 lint";
+        let text = "我通常希望提交前先跑 lint";
         let outcome = store
             .propose_from_user_text(text)
             .unwrap()
@@ -366,7 +388,7 @@ mod pipeline_tests {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         let _ = store
-            .propose_from_user_text("remember: always use gated writes")
+            .propose_from_user_text("我通常希望用 gated writes")
             .unwrap();
         assert_eq!(
             store.counts().unwrap(),
@@ -379,8 +401,8 @@ mod pipeline_tests {
     #[test]
     fn extractors_drive_real_pipeline_entry_points() {
         // Structural: shipped public functions are what CLI/app should call.
-        let c = parse_explicit_remember_intent("记住：用 pnpm").expect("intent");
-        assert_eq!(c.source, CandidateSource::UserExplicit);
+        let c = parse_inferred_preference("我通常希望用 pnpm").expect("intent");
+        assert_eq!(c.source, CandidateSource::SystemInferred);
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
         // The package manager is READ from the repository, never remembered.
@@ -392,8 +414,6 @@ mod pipeline_tests {
 
     #[test]
     fn secret_body_never_accepted_via_extractor() {
-        assert!(
-            parse_explicit_remember_intent("记住：api_key=sk-live-secret-value-here").is_none()
-        );
+        assert!(parse_inferred_preference("记住：api_key=sk-live-secret-value-here").is_none());
     }
 }

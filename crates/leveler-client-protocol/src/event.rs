@@ -328,7 +328,7 @@ pub enum RuntimeEvent {
         /// listing the TUI cannot show that anything is waiting, and the only
         /// way to adopt a memory is the CLI — the last mile of the feature.
         #[serde(default)]
-        pending: Vec<UiMemoryEntry>,
+        pending: Vec<UiMemoryCandidate>,
     },
     /// Side-question (`/btw`) started; not persisted to session history.
     BtwStarted { question: String },
@@ -385,6 +385,45 @@ pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_jso
 pub struct UiMemoryEntry {
     pub id: String,
     pub title: String,
+    /// What this memory is, which decides how it reaches the model. Additive:
+    /// absent on older runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<UiMemoryKind>,
+    /// Held back from every automatic path because it looks like a credential.
+    /// Kept in the listing so the user can find and archive it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
+}
+
+/// What a durable memory IS. Strongly typed so no client invents its own
+/// strings for a field the domain has to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiMemoryKind {
+    /// Injected into every turn while active.
+    Preference,
+    /// Reachable by query recall and the catalog, never auto-injected.
+    Decision,
+    /// Same reach as a decision.
+    Note,
+}
+
+/// A candidate awaiting consent, with enough to decide on.
+///
+/// Deliberately NOT [`UiMemoryEntry`]: approving something shown only as a
+/// title is not informed consent, so the body, kind and source ride along.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryCandidate {
+    pub id: String,
+    pub title: String,
+    /// The text that would be stored. Already length-bounded by the domain.
+    pub body: String,
+    /// Free-form label as stored (`preference`, `package_manager`, …).
+    pub kind: String,
+    /// Who proposed it (`user_explicit`, `system_propose`, …).
+    pub source: String,
 }
 
 #[cfg(test)]

@@ -73,7 +73,7 @@ pub struct ExecutorFactory {
     pub commit_co_author: bool,
     pub overrides: Option<ExecutionOverrides>,
     /// Short memory INDEX for system injection (titles only).
-    pub memory_index: String,
+    pub memory_catalog: String,
     /// Whether the memory capability reaches the model at all this turn.
     ///
     /// ONE answer for tools, index, recall root and prompt guidance. Without
@@ -176,7 +176,7 @@ impl ExecutorFactory {
         .with_step_limits(profile_step_limits(&profile));
 
         executor = executor
-            .with_memory_index(self.memory_index.clone())
+            .with_memory_catalog(self.memory_catalog.clone())
             .with_memory_expose(self.memory_expose)
             .with_memory_root(self.memory_root.clone());
 

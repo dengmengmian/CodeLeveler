@@ -21,6 +21,7 @@ import type {
   UiClarificationRequest,
   UiCompletionReport,
   UiDiff,
+  UiMemoryCandidate,
   UiMemoryEntry,
   UiPlan,
   UiRole,
@@ -111,12 +112,15 @@ export interface BackgroundTaskView {
   startedAt: number;
 }
 
-/** 项目记忆（memory_list）：active / pending（待用户采纳）/ archived。 */
+/** 项目记忆（memory_list）：active / pending（待用户采纳）/ archived。
+ *
+ * pending 用 UiMemoryCandidate 而不是 UiMemoryEntry：只凭标题批准一条记忆
+ * 不算知情同意，正文、kind 和来源都要跟着一起到前端。 */
 export interface MemoryView {
   dir: string;
   active: UiMemoryEntry[];
   archived: UiMemoryEntry[];
-  pending: UiMemoryEntry[];
+  pending: UiMemoryCandidate[];
 }
 
 export interface SessionView {
@@ -281,7 +285,7 @@ export type Action =
   | { type: 'sub_agent_activity'; id: string; step: string }
   | { type: 'background_started'; taskId: string; program: string; args: string[] }
   | { type: 'background_exited'; taskId: string; exitCode: number | null; durationMs: number; ok: boolean }
-  | { type: 'memory_list'; dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; pending: UiMemoryEntry[] }
+  | { type: 'memory_list'; dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; pending: UiMemoryCandidate[] }
   | { type: 'approval_requested'; request: UiApprovalRequest }
   | { type: 'approval_resolved'; requestId: string }
   | { type: 'clarification_requested'; request: UiClarificationRequest }

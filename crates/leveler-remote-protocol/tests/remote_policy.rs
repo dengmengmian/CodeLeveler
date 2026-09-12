@@ -159,6 +159,25 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             },
             false,
         ),
+        // Withholding consent is consent handling too, and a direct write is
+        // the strongest memory mutation there is. Neither travels.
+        (
+            "reject_memory",
+            ClientCommand::RejectMemory {
+                session_id: session(),
+                id: "cand-1".to_string(),
+            },
+            false,
+        ),
+        (
+            "remember_memory",
+            ClientCommand::RememberMemory {
+                session_id: session(),
+                body: "keep it compact".to_string(),
+                kind: None,
+            },
+            false,
+        ),
         (
             "steer_current_turn",
             ClientCommand::SteerCurrentTurn {

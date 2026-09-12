@@ -633,8 +633,8 @@ impl Application {
         for tool in self.mcp_tools().await {
             registry.register(tool);
         }
-        let memory_index = if exposed.memory {
-            load_memory_index(&self.layout.memory_dir())
+        let memory_catalog = if exposed.memory {
+            load_memory_catalog(&self.layout.memory_dir())
         } else {
             String::new()
         };
@@ -666,7 +666,7 @@ impl Application {
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
                 overrides: self.execution_overrides.clone(),
-                memory_index,
+                memory_catalog,
                 memory_expose: exposed.memory,
                 memory_root: exposed.memory.then(|| self.layout.memory_dir()),
                 background_tasks: bg,
@@ -715,12 +715,23 @@ pub(crate) fn axes_from_session_record(
     (work, collab)
 }
 
-/// Load short memory INDEX for system injection (titles only; empty if none).
-pub(crate) fn load_memory_index(memory_dir: &std::path::Path) -> String {
+/// How many catalog titles reach the system prefix.
+///
+/// Smaller than the old all-active index: the catalog is a discovery aid for
+/// decisions and notes whose wording a request might miss, not an inventory.
+/// It is paid for on every request of every turn, so it stays short.
+const MEMORY_CATALOG_MAX_ENTRIES: usize = 16;
+
+/// Titles of stored decisions/notes for system injection (no bodies, no
+/// preferences — those are injected in full in the turn tail — and nothing
+/// derived or sensitive). Empty when there is nothing to offer.
+pub(crate) fn load_memory_catalog(memory_dir: &std::path::Path) -> String {
     match leveler_memory::MemoryStore::open(memory_dir) {
-        Ok(store) => store.index_lines(32).unwrap_or_default(),
+        Ok(store) => store
+            .catalog_lines(MEMORY_CATALOG_MAX_ENTRIES)
+            .unwrap_or_default(),
         Err(err) => {
-            tracing::debug!(error = %err, "memory index unavailable");
+            tracing::debug!(error = %err, "memory catalog unavailable");
             String::new()
         }
     }
@@ -763,14 +774,14 @@ impl Application {
 }
 
 #[cfg(test)]
-mod memory_index_tests {
+mod memory_catalog_tests {
     use super::*;
     use leveler_memory::{ProposeOutcome, collect_turn_candidates};
     use std::fs;
     use tempfile::tempdir;
 
     #[test]
-    fn index_lists_titles_not_bodies() {
+    fn the_catalog_lists_titles_not_bodies() {
         let dir = tempdir().unwrap();
         let mem = dir.path().join("memory");
         let store = leveler_memory::MemoryStore::open(&mem).unwrap();
@@ -781,7 +792,7 @@ mod memory_index_tests {
                 vec![],
             ))
             .unwrap();
-        let index = load_memory_index(&mem);
+        let index = load_memory_catalog(&mem);
         assert!(index.contains("Use workspace write"), "{index}");
         assert!(!index.contains("SECRET_BODY"), "{index}");
     }
@@ -792,7 +803,9 @@ mod memory_index_tests {
     fn enqueue_returns_the_candidates_that_are_waiting() {
         let mem = tempdir().unwrap();
         let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
-        let outcomes = collect_turn_candidates(&store, "记住：提交前先跑 lint", None).unwrap();
+        // A soft signal is what produces a candidate now. A commanding
+        // "记住：…" is a direct write handled before the turn is staged.
+        let outcomes = collect_turn_candidates(&store, "我通常希望提交前先跑 lint", None).unwrap();
         let waiting: Vec<(String, String)> = outcomes
             .into_iter()
             .filter_map(|o| match o {
@@ -814,7 +827,8 @@ mod memory_index_tests {
         // are what still does.
         fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
         let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
-        let outcomes = collect_turn_candidates(&store, "记住：用 pnpm", Some(repo.path())).unwrap();
+        let outcomes =
+            collect_turn_candidates(&store, "我通常希望用 pnpm", Some(repo.path())).unwrap();
         assert!(
             outcomes
                 .iter()
@@ -826,10 +840,10 @@ mod memory_index_tests {
     }
 
     #[test]
-    fn missing_store_yields_empty_index() {
+    fn a_missing_store_yields_an_empty_catalog() {
         let dir = tempdir().unwrap();
         // path does not exist yet — open creates it empty
-        let index = load_memory_index(&dir.path().join("nope-yet"));
+        let index = load_memory_catalog(&dir.path().join("nope-yet"));
         assert!(index.is_empty() || !index.contains("SECRET"));
     }
 }

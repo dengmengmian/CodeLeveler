@@ -649,17 +649,23 @@ impl ApprovalPolicy {
         risk: RiskLevel,
         command: Option<CommandView>,
     ) -> Requirement {
-        // 完全访问 means no prompts at all — the user has explicitly opted into
-        // an unrestricted session, including destructive commands and durable
-        // memory writes/deletes. Check it first so nothing below can re-gate.
-        if profile == PermissionProfile::FullAccess {
-            return Requirement::Auto;
-        }
-
-        // Under assisted / request-approval, durable memory writes still need a
-        // human decision (K36): a wrong long-term memory is worse than none.
+        // Durable memory writes need a human in EVERY profile, full-access
+        // included, so this is checked before the full-access shortcut.
+        //
+        // Full access is authority over this machine and this workspace: run
+        // any command, write any file, reach the network. It is not authority
+        // to change what future sessions will believe. A wrong long-term
+        // memory is read back silently, turn after turn, long after the run
+        // that wrote it is forgotten — so the user confirms it, whatever they
+        // opted into for execution.
         if is_memory_write_tool(tool) {
             return Requirement::NeedApproval;
+        }
+
+        // 完全访问 means no prompts for execution — the user has explicitly
+        // opted into an unrestricted session, destructive commands included.
+        if profile == PermissionProfile::FullAccess {
+            return Requirement::Auto;
         }
 
         // MCP tools bypass the execution sandbox entirely (external process);
@@ -738,6 +744,18 @@ mod tests {
             assert!(
                 super::is_self_consent_command(program, &args),
                 "must be caught: {program} {args:?}"
+            );
+        }
+    }
+
+    /// "Approve always" must not turn a memory write into a standing rule:
+    /// the next write would then skip the human entirely.
+    #[test]
+    fn approve_always_derives_no_rule_for_a_memory_write() {
+        for tool in ["remember", "forget"] {
+            assert!(
+                crate::permission_rules::always_rules_for(tool, None, &[]).is_empty(),
+                "{tool} must not become a standing allow"
             );
         }
     }
@@ -923,16 +941,31 @@ mod tests {
         assert!(AutoDeny.has_human());
     }
 
+    /// Full access is execution authority, not authority over what future
+    /// sessions believe. Memory writes are confirmed in every profile.
     #[test]
-    fn memory_writes_auto_under_full_access_but_gated_otherwise() {
+    fn memory_writes_need_a_human_in_every_profile() {
         let policy = ApprovalPolicy {
             network_allowed: true,
         };
-        // FullAccess bypasses every prompt, memory writes included.
+        for profile in [
+            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
+            PermissionProfile::RequestApproval,
+        ] {
+            for tool in ["remember", "forget"] {
+                assert_eq!(
+                    policy.evaluate(profile, tool, RiskLevel::WorkspaceWrite, None),
+                    Requirement::NeedApproval,
+                    "{profile:?} / {tool}"
+                );
+            }
+        }
+        // Ordinary execution under full access still prompts for nothing.
         assert_eq!(
             policy.evaluate(
                 PermissionProfile::FullAccess,
-                "remember",
+                "apply_patch",
                 RiskLevel::WorkspaceWrite,
                 None
             ),

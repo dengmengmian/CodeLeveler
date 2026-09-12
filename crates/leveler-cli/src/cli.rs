@@ -428,12 +428,19 @@ pub enum MemoryCommand {
         /// Memory id.
         id: String,
     },
-    /// Create/update an active memory (user-authoritative write; no model round).
+    /// Create a new active memory (user-authoritative write; no model round).
+    ///
+    /// Never overwrites: saving the same title again with different text keeps
+    /// both, so nothing you wrote earlier disappears.
     Remember {
         /// Short title.
         title: String,
         /// Body text.
         body: String,
+        /// How it reaches the model. `preference` is injected into every turn;
+        /// `decision` and `note` are found by relevance or by title.
+        #[arg(long, value_enum, default_value_t = MemoryKindArg::Note)]
+        kind: MemoryKindArg,
         /// Optional tags (repeatable).
         #[arg(long = "tag")]
         tags: Vec<String>,
@@ -450,15 +457,23 @@ pub enum MemoryCommand {
         /// Pending candidate id.
         id: String,
     },
-    /// Extract candidates from text and/or package-manager signals (no active write).
+    /// Extract candidates from text (no active write).
     Propose {
-        /// Explicit user text (e.g. "记住：用 pnpm"). Optional if `--scan-pm`.
+        /// Explicit user text (e.g. "记住：用 pnpm").
         #[arg(long)]
-        text: Option<String>,
-        /// Scan the current repo for package-manager lockfile / packageManager.
-        #[arg(long)]
-        scan_pm: bool,
+        text: String,
     },
+}
+
+/// The `--kind` values `leveler memory remember` accepts.
+///
+/// `note` is the CLI default deliberately: a scripted or ad-hoc write should
+/// not silently become something injected into every future turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryKindArg {
+    Preference,
+    Decision,
+    Note,
 }
 
 #[derive(Debug, Subcommand)]

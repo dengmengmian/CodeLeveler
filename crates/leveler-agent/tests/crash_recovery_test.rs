@@ -167,7 +167,7 @@ async fn harness(
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_index: String::new(),
+            memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),

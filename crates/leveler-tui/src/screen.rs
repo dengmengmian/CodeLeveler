@@ -195,6 +195,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // The user's own direct write. `BusyPolicy::Always` because it touches no
+    // turn state: it is a control-plane command, not a message to the model.
+    slash(
+        "/remember",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // `/rewind` is what every other agent CLI calls this.
     slash(
         "/restore",
@@ -337,6 +346,7 @@ pub const SLASH_NAMES: &[&str] = &[
     "/tools",
     "/sessions",
     "/memory",
+    "/remember",
     "/restore",
     "/fork",
     "/compact",
@@ -416,6 +426,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/collab" => s.collab,
         "/plan" => s.plan_collab,
         "/memory" => s.memory,
+        "/remember" => s.remember,
         "/skill" => s.skill,
         "/feature-dev" => s.feature_dev,
         "/diff" => s.diff,

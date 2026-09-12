@@ -12,13 +12,34 @@ const BASE_PROMPT: &str = include_str!("../prompts/base.md");
 
 /// The memory section of the system prompt, shipped only when the
 /// capability is exposed (see [`PromptBuilder::memory_expose`]).
-const MEMORY_GUIDANCE: &str = "\n\n## Memory\n\
+const MEMORY_GUIDANCE: &str = "\n\n\
+## Memory\n\
 \n\
-Project memory is consent-gated: `remember` raises an approval prompt, and that prompt is how the user consents — propose it rather than asking in prose first. Report the outcome from the tool result; a denied `remember` did not save anything.\n\
+Durable project memory is advisory and user-owned. Project rules (AGENTS.md and \
+the project's own instructions) and the current code both outrank it.\n\
 \n\
-- What earns one: a lasting preference, a decision or project convention, a non-obvious constraint. What does not: secrets, one-off trivia, or anything already in the code, the git history, or AGENTS.md.\n\
-- `remember` does not overwrite. Superseding a fact means `forget` on the stale id first, then `remember` the corrected version; re-proposing the same title stores a second entry and leaves both to compete in recall.\n\
-- A recalled memory records what was true when it was written and can be stale or out of date. Confirm that a file, flag or command it names still exists before acting on it, and correct it when this turn's evidence contradicts it.\n";
+- `/remember` is the user's OWN command. It writes directly and never reaches \
+you, so when a user says they have saved something, do not call `remember` to \
+save it again.\n\
+- Your `remember` / `forget` calls are PROPOSALS. Every permission profile, \
+full access included, needs a reachable human to approve them: full access is \
+authority over this machine, not over what future sessions will believe.\n\
+- With nobody to ask, a `remember` may be kept as a pending candidate for the \
+user to review later. Report that it is waiting. Do NOT try to adopt it \
+yourself through a shell command, the CLI, or by editing state files.\n\
+- Choose a kind. `preference` is injected into every future turn, so it is for \
+lasting how-to-work instructions; `decision` and `note` are found by relevance \
+or by title, and are the right default for anything else.\n\
+- What earns a memory: a lasting preference, a decision, a non-obvious \
+constraint. What does not: secrets, one-off trivia, or anything readable from \
+the code, git history, lockfiles or AGENTS.md — those are re-read, not \
+remembered.\n\
+- `remember` does not overwrite. Correcting a fact means `forget` on the stale \
+id, then `remember` the new one.\n\
+- A recalled memory records what was true when it was written. Confirm that a \
+file, flag or command it names still exists before acting on it, and correct it \
+when this turn's evidence contradicts it.\n\
+";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PromptBuilder {
@@ -26,7 +47,7 @@ pub(crate) struct PromptBuilder {
     base_instructions: Option<String>,
     commit_co_author: bool,
     /// Short memory INDEX (titles only). Empty = omit segment.
-    memory_index: String,
+    memory_catalog: String,
     /// Whether the memory capability reaches the model this turn. Gates the
     /// guidance AND the index together: guidance for tools the model was not
     /// given tells it to call something that is not there.
@@ -39,7 +60,7 @@ impl Default for PromptBuilder {
             turn_context: None,
             base_instructions: None,
             commit_co_author: true,
-            memory_index: String::new(),
+            memory_catalog: String::new(),
             memory_expose: false,
         }
     }
@@ -148,8 +169,11 @@ impl PromptBuilder {
     }
 
     /// Inject a short memory INDEX (titles/ids only — never entry bodies).
-    pub(crate) fn memory_index(mut self, index: impl Into<String>) -> Self {
-        self.memory_index = index.into();
+    /// Titles the model can ASK about, for the case query recall misses on
+    /// wording. Never bodies, and never the preferences that are already
+    /// injected in full.
+    pub(crate) fn memory_catalog(mut self, catalog: impl Into<String>) -> Self {
+        self.memory_catalog = catalog.into();
         self
     }
 
@@ -170,15 +194,19 @@ impl PromptBuilder {
         if self.memory_expose {
             prompt.push_str(MEMORY_GUIDANCE);
         }
-        // Memory INDEX is part of the cache-stable prefix when present: titles
-        // only, fixed template, no bodies (K37).
-        if self.memory_expose && !self.memory_index.trim().is_empty() {
+        // The CATALOG is part of the cache-stable prefix: titles only, fixed
+        // template, no bodies (K37). It is deliberately not "every active
+        // title" — lasting preferences are injected in full in the turn tail,
+        // and listing them here as well paid twice for the same memory.
+        if self.memory_expose && !self.memory_catalog.trim().is_empty() {
             prompt.push_str(
-                "\n\n## Project memory index\n\
-                 Durable user-approved notes (titles only). Use the `memory` tool \
-                 to read bodies. Do not invent memories not listed here.\n",
+                "\n\n## Project memory catalog\n\
+                 Titles of stored decisions and notes, for when this request's \
+                 wording does not match them. Read one with the `memory` tool. \
+                 Lasting preferences are not listed: they are already provided \
+                 each turn. Do not invent entries that are not here.\n",
             );
-            prompt.push_str(self.memory_index.trim());
+            prompt.push_str(self.memory_catalog.trim());
             prompt.push('\n');
         }
         if let Some(context) = &self.turn_context {
@@ -947,10 +975,10 @@ mod tests {
     #[test]
     fn an_unexposed_memory_capability_ships_no_guidance_and_no_index() {
         let index = "1. [pref] Prefer workspace-write";
-        let prompt = PromptBuilder::new().memory_index(index).build();
+        let prompt = PromptBuilder::new().memory_catalog(index).build();
         let lowered = prompt.to_lowercase();
         assert!(!lowered.contains("remember"), "no guidance: {prompt}");
-        assert!(!prompt.contains("Project memory index"), "no index");
+        assert!(!prompt.contains("Project memory catalog"), "no catalog");
         assert!(!prompt.contains("[pref]"), "no titles");
     }
 
@@ -960,18 +988,18 @@ mod tests {
     }
 
     #[test]
-    fn memory_index_is_stable_and_excludes_bodies() {
+    fn the_catalog_is_stable_and_excludes_bodies() {
         let index = "1. [pref] Prefer workspace-write\n2. [style] Use tables in reviews";
         let a = PromptBuilder::new()
             .memory_expose(true)
-            .memory_index(index)
+            .memory_catalog(index)
             .build();
         let b = PromptBuilder::new()
             .memory_expose(true)
-            .memory_index(index)
+            .memory_catalog(index)
             .build();
         assert_eq!(a, b);
-        assert!(a.contains("Project memory index"));
+        assert!(a.contains("Project memory catalog"));
         assert!(a.contains("[pref] Prefer workspace-write"));
         assert!(!a.contains("PermissionProfile")); // body text must not appear
     }

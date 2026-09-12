@@ -242,11 +242,36 @@ export interface UiLaneAccounting {
   requests: number;
 }
 
+/** A candidate awaiting consent, with enough to decide on. Deliberately NOT [`UiMemoryEntry`]: approving something shown only as a title is not informed consent, so the body, kind and source ride along. */
+export interface UiMemoryCandidate {
+  /** The text that would be stored. Already length-bounded by the domain. */
+  body: string;
+  id: string;
+  /** Free-form label as stored (`preference`, `package_manager`, …). */
+  kind: string;
+  /** Who proposed it (`user_explicit`, `system_propose`, …). */
+  source: string;
+  title: string;
+}
+
 /** Compact durable-memory row for TUI list surfaces. */
 export interface UiMemoryEntry {
   id: string;
+  /** What this memory is, which decides how it reaches the model. Additive: absent on older runtimes. */
+  kind?: UiMemoryKind | null;
+  /** Held back from every automatic path because it looks like a credential. Kept in the listing so the user can find and archive it. */
+  sensitive?: boolean;
   title: string;
 }
+
+/** What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret. */
+export type UiMemoryKind =
+  /** Injected into every turn while active. */
+  | 'preference'
+  /** Reachable by query recall and the catalog, never auto-injected. */
+  | 'decision'
+  /** Same reach as a decision. */
+  | 'note';
 
 /** A rendered message in the transcript. */
 export interface UiMessage {
@@ -527,6 +552,10 @@ export type ClientCommand =
   | { type: 'forget_memory'; id: string; session_id: SessionId }
   /** Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable. */
   | { type: 'accept_memory'; id: string; session_id: SessionId }
+  /** Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web "忽略" button was doing. */
+  | { type: 'reject_memory'; id: string; session_id: SessionId }
+  /** Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose. */
+  | { type: 'remember_memory'; body: string; kind?: UiMemoryKind | null; session_id: SessionId }
   /** Recompute and push the working-tree diff. */
   | { type: 'request_diff'; session_id: SessionId }
   /** Summarize and compact the conversation history (spec §28, §53). */
@@ -674,7 +703,7 @@ export type RuntimeEvent =
   /** A background task finished (exit or kill). */
   | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; task_id: string }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
-  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryEntry[] }
+  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
   /** Side-question (`/btw`) started; not persisted to session history. */
   | { type: 'btw_started'; question: string }
   /** Side-question answer chunk (often one full answer in MVP). */

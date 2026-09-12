@@ -417,6 +417,9 @@ pub struct UiText {
     pub memory_usage: &'static str,
     pub memory_forget_usage: &'static str,
     pub memory_accept_usage: &'static str,
+    pub memory_reject_usage: &'static str,
+    pub remember_usage: &'static str,
+    pub remember_busy_hint: &'static str,
     /// Shown when text is injected into the running turn.
     pub steering_sent: &'static str,
     pub theme_dark: &'static str,
@@ -609,6 +612,8 @@ pub struct UiText {
 #[derive(Debug)]
 pub struct SlashText {
     pub model: &'static str,
+    /// `/remember` — the user's own direct memory write.
+    pub remember: &'static str,
     /// `/permission` (alias `/mode`)
     pub permission: &'static str,
     pub goal: &'static str,
@@ -891,6 +896,7 @@ static ZH: UiText = UiText {
     thinking_lines: " · {} 行",
     slash: SlashText {
         model: "切换使用的 AI 模型",
+        remember: "记住一条长期偏好（--kind decision|note 可改类型）",
         permission: "权限：逐步批准 / 辅助放行 / 全权（别名 /mode）",
         goal: "目标：/goal <任务> · status 状态 · clear 结束目标",
         btw: "临时提问（不写入主对话）",
@@ -924,6 +930,7 @@ static ZH: UiText = UiText {
     },
     slash_brief: SlashText {
         model: "切换模型",
+        remember: "保存记忆",
         permission: "权限审批",
         goal: "设置目标",
         btw: "临时提问",
@@ -981,9 +988,12 @@ static ZH: UiText = UiText {
     goal_status_waiting: "空闲，可继续 /goal <任务>",
     goal_cleared: "已结束目标模式",
     goal_cleared_and_cancel: "已结束目标模式，并取消当前任务",
-    memory_usage: "用法: /memory  或  /memory forget <id>",
-    memory_forget_usage: "用法: /memory forget <id>",
+    memory_usage: "用法: /memory · /memory accept <id> · /memory reject <id> · /memory forget <id>",
+    memory_forget_usage: "用法: /memory forget <id>（归档已保存的记忆）",
     memory_accept_usage: "用法: /memory accept <id>（采纳待确认的记忆）",
+    memory_reject_usage: "用法: /memory reject <id>（拒绝待确认的候选）",
+    remember_usage: "用法: /remember <内容>  或  /remember --kind decision|note <内容>",
+    remember_busy_hint: "已保存，从下一轮开始对模型生效",
     steering_sent: "已发给正在运行的任务",
     theme_dark: "已切换到暗色主题",
     theme_light: "已切换到亮色主题",
@@ -1351,6 +1361,7 @@ static EN: UiText = UiText {
     thinking_lines: " · {} lines",
     slash: SlashText {
         model: "switch AI model",
+        remember: "save a memory of your own (--kind decision|note to change type)",
         permission: "permission: request-approval / assisted / full (alias /mode)",
         goal: "goal: /goal <task> · status · clear",
         btw: "side question (not in main history)",
@@ -1384,6 +1395,7 @@ static EN: UiText = UiText {
     },
     slash_brief: SlashText {
         model: "Switch model",
+        remember: "save a memory",
         permission: "permission approval",
         goal: "set goal",
         btw: "quick question",
@@ -1441,9 +1453,12 @@ static EN: UiText = UiText {
     goal_status_waiting: "idle — /goal <task> to continue",
     goal_cleared: "goal mode cleared",
     goal_cleared_and_cancel: "goal mode cleared; cancelled the current turn",
-    memory_usage: "usage: /memory  or  /memory forget <id>",
-    memory_forget_usage: "usage: /memory forget <id>",
+    memory_usage: "usage: /memory · /memory accept <id> · /memory reject <id> · /memory forget <id>",
+    memory_forget_usage: "usage: /memory forget <id> (archive a saved memory)",
     memory_accept_usage: "usage: /memory accept <id> (adopt a pending memory)",
+    memory_reject_usage: "usage: /memory reject <id> (decline a pending candidate)",
+    remember_usage: "usage: /remember <text>  or  /remember --kind decision|note <text>",
+    remember_busy_hint: "saved; it reaches the model from the next turn",
     steering_sent: "sent to the running task",
     theme_dark: "switched to dark theme",
     theme_light: "switched to light theme",

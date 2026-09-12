@@ -203,7 +203,11 @@ impl RemotePolicy {
             // phone is the wrong place to give it.
             ClientCommand::ListMemory { .. }
             | ClientCommand::ForgetMemory { .. }
-            | ClientCommand::AcceptMemory { .. } => RemoteVerdict::Deny {
+            | ClientCommand::AcceptMemory { .. }
+            // Same reasoning, more so: rejecting a candidate is consent
+            // withheld, and `RememberMemory` writes durable memory outright.
+            | ClientCommand::RejectMemory { .. }
+            | ClientCommand::RememberMemory { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
                 reason: "memory is not reachable remotely",
             },

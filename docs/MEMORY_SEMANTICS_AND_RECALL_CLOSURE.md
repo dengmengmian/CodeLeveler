@@ -1,5 +1,23 @@
 # Memory Semantics & Recall Closure
 
+> **状态：Phase 1 / Partial Closure（已被后续工作取代）**
+>
+> 这份文档当时给出的整体 PASS 过早了。它修好的部分仍然成立（capability 单一
+> gate、standing preference、query recall、仓库派生事实退出自动路径、CLI 覆盖、
+> 官方同意命令的自签防护），但后续自审与真实 dogfood 又发现：
+>
+> - 没有用户直写入口（`/remember` 与协议层的直写命令都不存在）；
+> - 没有真正的 `RejectMemory`，Web 的「忽略」按钮调的是 `forget`，对 pending
+>   什么也不做；
+> - 自然语言「记住：…」的 consent 分类不准确 —— 用户明确下达的命令被当成需要
+>   二次批准的候选；
+> - 召回没有结构化 trace，也无法回答"这一轮用了哪几条"；
+> - prompt 声称 `remember` 一定触发审批，而 FullAccess 当时直接放行；
+> - dogfood 没有覆盖最终控制面。
+>
+> 最终状态见 `docs/MEMORY_FINAL_PRODUCT_CLOSURE.md`。
+
+
 配套阅读 `docs/MEMORY_CURRENT_BEHAVIOR_AUDIT.md`（修改前的只读审计）。
 本文件记录这次收口做了什么、为什么，以及证据。
 

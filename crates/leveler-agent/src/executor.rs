@@ -41,81 +41,162 @@ use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOT
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.
 ///
-/// Query-conditioned memory recall (tail injection). Each turn we retrieve the
-/// top-scoring memories for the current request and inject their bodies as a
-/// system block right before the (always-new) user message. This keeps the
-/// cached system+history prefix untouched — the block rides the uncached tail —
-/// and is never persisted (see `run_conversation` filtering out `System` roles),
-/// so it stays fresh and never accumulates.
+/// Memory recall (tail injection). Each turn the lasting preferences plus the
+/// memories matching this request are rendered as one system block right before
+/// the (always-new) user message. The cached system+history prefix stays
+/// untouched — the block rides the uncached tail — and it is never persisted
+/// (`run_conversation` filters `System` roles), so it stays fresh and never
+/// accumulates.
 const RECALL_K: usize = 4;
 /// Minimum BM25 score to inject a hit — `search` only returns positive matches,
 /// so this just drops the weakest ties.
 const RECALL_FLOOR: f64 = 0.1;
-/// Total character budget for injected bodies, to keep the tail from bloating.
-const RECALL_CHAR_BUDGET: usize = 1500;
+/// Hard ceiling on the WHOLE rendered block: header, labels, ids, titles,
+/// bodies and the omission marker.
+///
+/// Named in bytes because that is what is actually counted and what the
+/// previous `CHAR_BUDGET` was measuring anyway. It is a ceiling, not a target:
+/// the old check exempted the first entry (`&& used > 0`), so one long memory
+/// could push the block past any limit on its own.
+const RECALL_BLOCK_MAX_BYTES: usize = 2048;
 /// How many lasting preferences ride along unconditionally. Bounded because
 /// they are paid for on EVERY turn, relevant or not.
 const STANDING_PREFERENCE_MAX_ENTRIES: usize = 8;
 
-/// Render scored memory hits into a tail-injection system block, or `None` when
-/// empty. Bodies are included up to `RECALL_CHAR_BUDGET`; the header warns the
-/// model these are retrieved, may not apply, and must be checked against code.
-fn render_recall_block(
-    standing: Vec<leveler_memory::MemoryEntry>,
-    retrieved: Vec<leveler_memory::MemoryEntry>,
-) -> Option<String> {
-    // One shared budget across both lanes: the point is a bounded tail, not a
-    // bounded lane. Standing preferences go first because they apply to every
-    // turn, so they are the ones worth the space.
-    let mut used = 0usize;
-    let mut omitted = 0usize;
-    let mut render = |entries: &[leveler_memory::MemoryEntry]| {
-        let mut out = String::new();
-        for entry in entries {
-            // The id is what makes a run auditable: without it no one can say
-            // which memory a turn actually used.
-            let line = format!(
-                "- [{}] {}: {}\n",
-                entry.id.trim(),
-                entry.title.trim(),
-                entry.body.trim()
-            );
-            if used + line.len() > RECALL_CHAR_BUDGET && used > 0 {
-                omitted += 1;
-                continue;
-            }
-            used += line.len();
-            out.push_str(&line);
-        }
-        out
-    };
-    let standing_block = render(&standing);
-    let retrieved_block = render(&retrieved);
-    if standing_block.is_empty() && retrieved_block.is_empty() {
-        return None;
-    }
+/// What recall decided for one turn, and what it cost.
+///
+/// Built so the decision can be inspected instead of inferred from a string:
+/// before this the selection happened inline while rendering, and nothing
+/// could answer "which memories did that turn actually use, and what was
+/// dropped for space".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct MemoryRecallPlan {
+    /// Lasting preferences, newest first, injected whatever the request says.
+    pub standing: Vec<leveler_memory::MemoryEntry>,
+    /// Matches for this request, best score first, already free of anything
+    /// standing covers.
+    pub queried: Vec<leveler_memory::MemoryEntry>,
+    /// Ids in the order they were rendered.
+    pub selected: Vec<String>,
+    /// Entries the byte ceiling left out entirely.
+    pub omitted: usize,
+    /// Entries whose body was cut to fit.
+    pub truncated: usize,
+    /// Size of the rendered block, or 0 when nothing was injected.
+    pub rendered_bytes: usize,
+}
 
-    let mut block = String::from(
-        "## Project memory for this turn\n\
-         Memory is advisory and records what was true when it was written. The \
-         code and the project's own rules win: verify anything it names before \
-         relying on it, and correct it when this turn contradicts it.\n",
-    );
-    if !standing_block.is_empty() {
-        block.push_str("\nLasting preferences (apply unless this turn says otherwise):\n");
-        block.push_str(&standing_block);
+impl MemoryRecallPlan {
+    /// Select and render. Selection order IS the priority: standing
+    /// preferences first because they apply to every turn, then query hits by
+    /// score.
+    fn build(
+        standing: Vec<leveler_memory::MemoryEntry>,
+        queried: Vec<leveler_memory::MemoryEntry>,
+    ) -> (Self, Option<String>) {
+        let mut plan = Self {
+            standing: standing.clone(),
+            queried: queried.clone(),
+            ..Default::default()
+        };
+        const HEADER: &str = "## Project memory for this turn\nMemory is advisory and records \
+             what was true when it was written. The code and the project's own rules win: verify \
+             anything it names before relying on it, and correct it when this turn contradicts \
+             it.\n";
+        const STANDING_LABEL: &str =
+            "\nLasting preferences (apply unless this turn says otherwise):\n";
+        const QUERY_LABEL: &str = "\nRetrieved as possibly relevant to this request:\n";
+
+        let mut budget = RECALL_BLOCK_MAX_BYTES.saturating_sub(HEADER.len());
+        // Reserve room for the omission marker up front, so admitting a final
+        // entry can never make the truthful "N omitted" line unaffordable.
+        budget = budget.saturating_sub(48);
+        let mut standing_body = String::new();
+        let mut query_body = String::new();
+
+        for (entries, out, label) in [
+            (standing, &mut standing_body, STANDING_LABEL),
+            (queried, &mut query_body, QUERY_LABEL),
+        ] {
+            let mut label_paid = false;
+            for entry in entries {
+                let label_cost = if label_paid { 0 } else { label.len() };
+                let (line, was_truncated) =
+                    render_entry_line(&entry, budget.saturating_sub(label_cost));
+                match line {
+                    Some(line) => {
+                        if !label_paid {
+                            budget = budget.saturating_sub(label.len());
+                            label_paid = true;
+                        }
+                        budget = budget.saturating_sub(line.len());
+                        plan.selected.push(entry.id.clone());
+                        plan.truncated += usize::from(was_truncated);
+                        out.push_str(&line);
+                    }
+                    // Not even a truncated form fits: leave it out and say so.
+                    None => plan.omitted += 1,
+                }
+            }
+        }
+
+        if standing_body.is_empty() && query_body.is_empty() {
+            return (plan, None);
+        }
+        let mut block = String::from(HEADER);
+        if !standing_body.is_empty() {
+            block.push_str(STANDING_LABEL);
+            block.push_str(&standing_body);
+        }
+        if !query_body.is_empty() {
+            block.push_str(QUERY_LABEL);
+            block.push_str(&query_body);
+        }
+        if plan.omitted > 0 {
+            block.push_str(&format!("\n({} more omitted for space.)\n", plan.omitted));
+        }
+        plan.rendered_bytes = block.len();
+        (plan, Some(block))
     }
-    if !retrieved_block.is_empty() {
-        block.push_str("\nRetrieved as possibly relevant to this request:\n");
-        block.push_str(&retrieved_block);
+}
+
+/// One rendered entry line within `budget` bytes, plus whether its body was
+/// cut. `None` when even the shortest useful form does not fit.
+///
+/// The id is what makes a turn auditable: without it nobody can say which
+/// memory was used.
+fn render_entry_line(entry: &leveler_memory::MemoryEntry, budget: usize) -> (Option<String>, bool) {
+    let prefix = format!("- [{}] {}: ", entry.id.trim(), entry.title.trim());
+    let body = entry.body.trim();
+    let full = format!("{prefix}{body}\n");
+    if full.len() <= budget {
+        return (Some(full), false);
     }
-    if omitted > 0 {
-        // Say what was left out rather than letting the block look complete.
-        block.push_str(&format!(
-            "\n({omitted} more memory entries omitted for space.)\n"
-        ));
+    // Keep the id and title, cut the body — an entry the model can look up is
+    // worth more than a silent omission. `…\n` needs 4 bytes.
+    let room = budget.saturating_sub(prefix.len() + 4);
+    if room == 0 {
+        return (None, false);
     }
-    Some(block)
+    // Cut on a char boundary: half a UTF-8 sequence is not a shorter string,
+    // it is a corrupt one.
+    let mut cut = room.min(body.len());
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut == 0 {
+        return (None, false);
+    }
+    (Some(format!("{prefix}{}…\n", &body[..cut])), true)
+}
+
+/// Ids for a trace line: bounded in count and length so one oversized legacy
+/// id cannot turn a debug line into a dump.
+fn trace_ids(ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .take(12)
+        .map(|id| id.chars().take(40).collect())
+        .collect()
 }
 
 /// Events emitted as the loop progresses, for the CLI to render.
@@ -798,7 +879,7 @@ pub struct Executor {
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
-    memory_index: String,
+    memory_catalog: String,
     /// Whether memory reaches the model at all (tools, index, recall, guidance).
     memory_expose: bool,
     /// Where durable project memory lives, for the RUNTIME's own reads: the
@@ -910,7 +991,7 @@ impl Executor {
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             seeded_objective: None,
-            memory_index: String::new(),
+            memory_catalog: String::new(),
             memory_expose: false,
             memory_root: None,
             step_limits: StepLimits::default(),
@@ -991,8 +1072,8 @@ impl Executor {
         self
     }
 
-    pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
-        self.memory_index = index.into();
+    pub fn with_memory_catalog(mut self, catalog: impl Into<String>) -> Self {
+        self.memory_catalog = catalog.into();
         self
     }
 
@@ -1244,7 +1325,7 @@ impl Executor {
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             seeded_objective: None,
-            memory_index: String::new(),
+            memory_catalog: String::new(),
             memory_expose: self.memory_expose,
             // A child inherits the parent's memory location: recall and
             // parking mean the same thing at any depth.
@@ -1372,7 +1453,7 @@ impl Executor {
                 user_language: crate::prompt::user_language(request),
                 repo_map: workspace_listing(self.tool_context.execution.workspace.root()),
             })
-            .memory_index(self.memory_index.clone())
+            .memory_catalog(self.memory_catalog.clone())
             .memory_expose(self.memory_expose)
             .build();
         match self.agent_role {
@@ -1595,34 +1676,65 @@ impl Executor {
         leveler_skills::render_turn_injection(&resolution)
     }
 
-    /// Retrieve memories relevant to THIS turn and render them as a tail-injected
-    /// system block, or `None` when memory is unconfigured or nothing matches.
+    /// The memory block for THIS turn, or `None` when memory is not exposed,
+    /// unconfigured, or nothing was selected.
     ///
-    /// Uses the real BM25 `search` (not the pseudo-vector path). Callers push the
-    /// result as a `Role::System` message immediately before the user message so
-    /// the cached prefix is preserved and the block is stripped next turn.
+    /// Owns the whole decision: capability gate, standing selection, query
+    /// recall, derived/sensitive exclusion, dedup, ordering, the byte ceiling
+    /// and the trace. Callers push the result as a `Role::System` message
+    /// immediately before the user message, so the cached prefix survives and
+    /// the block is stripped next turn.
     fn relevant_memory_injection(&self, request: &str) -> Option<String> {
         if !self.memory_expose {
+            tracing::debug!(memory_exposed = false, "memory recall skipped");
             return None;
         }
         let root = self.memory_root.as_ref()?;
-        let store = MemoryStore::open(root).ok()?;
+        let store = match MemoryStore::open(root) {
+            Ok(store) => store,
+            Err(error) => {
+                // Never silently swallowed: a store that cannot be opened is
+                // the difference between "no memories" and "memory broken".
+                tracing::debug!(error = %error, "memory store unavailable for recall");
+                return None;
+            }
+        };
         let standing = store
             .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                tracing::debug!(error = %error, "standing preferences unavailable");
+                Vec::new()
+            });
         // `recall`, not `search`: repository-derived facts are read from the
-        // repository, never injected from a stored copy.
-        let retrieved: Vec<leveler_memory::MemoryEntry> = store
+        // repository, and sensitive entries are withheld from the model.
+        let queried: Vec<leveler_memory::MemoryEntry> = store
             .recall(request, RECALL_K)
-            .unwrap_or_default()
+            .unwrap_or_else(|error| {
+                tracing::debug!(error = %error, "query recall unavailable");
+                Vec::new()
+            })
             .into_iter()
             .filter(|(_, score)| *score >= RECALL_FLOOR)
             .map(|(entry, _)| entry)
-            // A preference already injected unconditionally must not be paid
-            // for twice.
+            // A preference injected unconditionally is not paid for twice.
             .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
             .collect();
-        render_recall_block(standing, retrieved)
+
+        let (plan, block) = MemoryRecallPlan::build(standing, queried);
+        // Ids and counts only. Titles and bodies stay out: a trace is not a
+        // place to spill what the store was careful about.
+        tracing::debug!(
+            memory_exposed = true,
+            standing_count = plan.standing.len(),
+            query_hit_count = plan.queried.len(),
+            selected_count = plan.selected.len(),
+            omitted_count = plan.omitted,
+            truncated_count = plan.truncated,
+            rendered_bytes = plan.rendered_bytes,
+            selected_ids = ?trace_ids(&plan.selected),
+            "memory recall"
+        );
+        block
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -1819,10 +1931,10 @@ mod ownership_authority_tests {
 #[cfg(test)]
 mod recall_tests {
     use super::{
-        RECALL_CHAR_BUDGET, RECALL_FLOOR, RECALL_K, STANDING_PREFERENCE_MAX_ENTRIES,
-        render_recall_block,
+        MemoryRecallPlan, RECALL_BLOCK_MAX_BYTES, RECALL_FLOOR, RECALL_K,
+        STANDING_PREFERENCE_MAX_ENTRIES,
     };
-    use leveler_memory::{MemoryEntry, MemoryStore};
+    use leveler_memory::{MemoryEntry, MemoryKind, MemoryStore};
 
     fn entry(id: &str, title: &str, body: &str) -> MemoryEntry {
         MemoryEntry {
@@ -1838,68 +1950,168 @@ mod recall_tests {
         }
     }
 
-    #[test]
-    fn empty_hits_inject_nothing() {
-        assert!(render_recall_block(Vec::new(), Vec::new()).is_none());
+    fn render(
+        standing: Vec<MemoryEntry>,
+        queried: Vec<MemoryEntry>,
+    ) -> (super::MemoryRecallPlan, Option<String>) {
+        MemoryRecallPlan::build(standing, queried)
     }
 
     #[test]
-    fn block_has_header_titles_and_bodies() {
-        let retrieved = vec![
-            entry("a", "Build target", "install to ~/.cargo/bin"),
-            entry("b", "Concurrency", "never git stash"),
-        ];
-        let block = render_recall_block(Vec::new(), retrieved).expect("some block");
+    fn nothing_selected_injects_nothing() {
+        let (plan, block) = render(Vec::new(), Vec::new());
+        assert!(block.is_none());
+        assert_eq!(plan.rendered_bytes, 0);
+        assert!(plan.selected.is_empty());
+    }
+
+    /// The block carries entry ids, which is what makes a turn auditable.
+    #[test]
+    fn the_block_carries_ids_titles_and_bodies() {
+        let (plan, block) = render(
+            Vec::new(),
+            vec![
+                entry("a", "Build target", "install to ~/.cargo/bin"),
+                entry("b", "Concurrency", "never git stash"),
+            ],
+        );
+        let block = block.expect("some block");
         assert!(block.contains("Project memory for this turn"), "{block}");
         assert!(block.contains("verify anything it names"), "{block}");
         assert!(
             block.contains("[a] Build target: install to ~/.cargo/bin"),
-            "the entry id makes the turn auditable: {block}"
+            "{block}"
         );
         assert!(
             block.contains("[b] Concurrency: never git stash"),
             "{block}"
         );
+        assert_eq!(plan.selected, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(plan.omitted, 0);
+        assert_eq!(plan.truncated, 0);
     }
 
+    /// The ceiling binds even on the FIRST entry. The old check exempted it
+    /// (`&& used > 0`), so one long memory could blow past any limit alone.
     #[test]
-    fn char_budget_drops_overflow_but_keeps_first() {
-        let big = "x".repeat(RECALL_CHAR_BUDGET);
-        let retrieved = vec![
-            entry("a", "first", &big),
-            entry("b", "second", "should be dropped"),
-        ];
-        let block = render_recall_block(Vec::new(), retrieved).expect("some block");
+    fn a_single_oversized_entry_cannot_exceed_the_ceiling() {
+        let huge = "x".repeat(RECALL_BLOCK_MAX_BYTES * 3);
+        let (plan, block) = render(Vec::new(), vec![entry("big", "first", &huge)]);
+        let block = block.expect("a truncated form still reaches the model");
         assert!(
-            block.contains("first"),
-            "first must survive: {}",
-            &block[..80]
+            block.len() <= RECALL_BLOCK_MAX_BYTES,
+            "block was {} bytes",
+            block.len()
         );
-        assert!(
-            !block.contains("should be dropped"),
-            "second must be dropped"
-        );
-        assert!(
-            block.contains("1 more memory entries omitted"),
-            "a fold must say what it dropped: {block}"
-        );
+        assert_eq!(plan.rendered_bytes, block.len());
+        assert_eq!(plan.truncated, 1, "the cut is reported, not hidden");
+        assert!(block.contains('…'), "a cut must be visible: {block}");
+        assert!(block.contains("[big]"), "the id survives so it can be read");
     }
 
+    /// Cutting must not split a UTF-8 sequence.
     #[test]
-    fn retrieval_then_render_surfaces_the_relevant_entry() {
+    fn truncation_never_splits_a_character() {
+        let body = "紧凑输出".repeat(RECALL_BLOCK_MAX_BYTES);
+        let (_, block) = render(Vec::new(), vec![entry("cjk", "中文", &body)]);
+        let block = block.expect("block");
+        assert!(block.len() <= RECALL_BLOCK_MAX_BYTES);
+        // Rust strings cannot hold invalid UTF-8, so the real check is that no
+        // replacement character was produced and the text still ends cleanly.
+        assert!(!block.contains('\u{FFFD}'), "corrupt character in {block}");
+        assert!(block.contains('…'));
+    }
+
+    /// Entries that do not fit are counted, not quietly dropped.
+    #[test]
+    fn overflow_is_reported_truthfully() {
+        let big = "y".repeat(RECALL_BLOCK_MAX_BYTES - 200);
+        let (plan, block) = render(
+            Vec::new(),
+            vec![
+                entry("first", "first", &big),
+                entry("second", "second", &"z".repeat(4000)),
+                entry("third", "third", &"w".repeat(4000)),
+            ],
+        );
+        let block = block.expect("block");
+        assert!(block.len() <= RECALL_BLOCK_MAX_BYTES);
+        assert!(plan.omitted + plan.truncated >= 1);
+        if plan.omitted > 0 {
+            assert!(
+                block.contains(&format!("({} more omitted for space.)", plan.omitted)),
+                "{block}"
+            );
+        }
+    }
+
+    /// Standing preferences are rendered before query hits: they apply to
+    /// every turn, so they are the ones worth the space.
+    #[test]
+    fn standing_preferences_come_first() {
+        let (plan, block) = render(
+            vec![entry("pref", "偏好", "保持紧凑")],
+            vec![entry("hit", "命中", "与本轮相关")],
+        );
+        let block = block.expect("block");
+        assert_eq!(plan.selected, vec!["pref".to_string(), "hit".to_string()]);
+        assert!(
+            block.find("[pref]").unwrap() < block.find("[hit]").unwrap(),
+            "{block}"
+        );
+        assert!(block.contains("Lasting preferences"), "{block}");
+        assert!(block.contains("Retrieved as possibly relevant"), "{block}");
+    }
+
+    /// A lasting preference must reach the model even when the request shares
+    /// no characters with it — the case lexical recall provably misses.
+    #[test]
+    fn a_standing_preference_is_injected_without_any_lexical_overlap() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         store
-            .remember(entry(
-                "install",
-                "Install target",
-                "cargo bin at ~/.cargo/bin/leveler",
-            ))
-            .unwrap();
-        store
-            .remember(entry("cook", "Cooking", "boil pasta for nine minutes"))
+            .activate(
+                "输出偏好",
+                "用户偏好紧凑的终端信息输出，不希望看到冗长的模型过程。",
+                MemoryKind::Preference,
+                vec![],
+            )
             .unwrap();
 
+        let query = "能不能精简一点";
+        assert!(
+            store.recall(query, RECALL_K).unwrap().is_empty(),
+            "precondition: lexical recall misses this paraphrase"
+        );
+        let standing = store
+            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
+            .unwrap();
+        let (_, block) = render(standing, Vec::new());
+        let block = block.expect("the preference must reach the model anyway");
+        assert!(block.contains("紧凑"), "{block}");
+    }
+
+    /// Retrieval still finds a relevant entry and leaves the rest alone.
+    #[test]
+    fn retrieval_surfaces_the_relevant_entry_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .activate(
+                "Install target",
+                "cargo bin at ~/.cargo/bin/leveler",
+                MemoryKind::Note,
+                vec![],
+            )
+            .unwrap();
+        store
+            .activate(
+                "Cooking",
+                "boil pasta for nine minutes",
+                MemoryKind::Note,
+                vec![],
+            )
+            .unwrap();
         let hits: Vec<MemoryEntry> = store
             .recall("where does install put the binary", RECALL_K)
             .unwrap()
@@ -1907,64 +2119,28 @@ mod recall_tests {
             .filter(|(_, s)| *s >= RECALL_FLOOR)
             .map(|(e, _)| e)
             .collect();
-        let block =
-            render_recall_block(Vec::new(), hits).expect("the install memory should be retrieved");
+        let (_, block) = render(Vec::new(), hits);
+        let block = block.expect("the install memory should be retrieved");
         assert!(block.contains("Install target"), "{block}");
         assert!(
             !block.contains("Cooking"),
-            "unrelated memory must not leak: {block}"
+            "unrelated memory leaked: {block}"
         );
     }
 
-    /// A lasting preference must ride along even when the request shares no
-    /// words with it — the case lexical recall provably misses (`能不能精简一点`
-    /// scores zero against a Chinese verbosity preference).
-    #[test]
-    fn a_standing_preference_is_injected_without_any_lexical_overlap() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-        let mut pref = entry(
-            "terse",
-            "输出偏好",
-            "用户偏好紧凑的终端信息输出，不希望看到冗长的模型过程。",
-        );
-        pref.kind = Some("preference".into());
-        store.remember(pref).unwrap();
-
-        let query = "能不能精简一点";
-        assert!(
-            store.recall(query, RECALL_K).unwrap().is_empty(),
-            "precondition: lexical recall misses this paraphrase"
-        );
-
-        let standing = store
-            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
-            .unwrap();
-        let block = render_recall_block(standing, Vec::new())
-            .expect("the preference must reach the model anyway");
-        assert!(block.contains("[terse]"), "{block}");
-        assert!(block.contains("紧凑"), "{block}");
-        assert!(block.contains("Lasting preferences"), "{block}");
-    }
-
-    /// An entry selected by both lanes is injected once, not twice.
+    /// An entry chosen by both lanes is injected once.
     #[test]
     fn an_entry_in_both_lanes_is_injected_once() {
-        let mut pref = entry("terse", "Terse output", "keep the terminal compact");
-        pref.kind = Some("preference".into());
-        // The executor filters the retrieved lane against standing ids; this
-        // asserts the rendered result of that contract.
+        let pref = entry("terse", "Terse output", "keep the terminal compact");
         let standing = vec![pref.clone()];
-        let retrieved: Vec<MemoryEntry> = vec![pref]
+        let queried: Vec<MemoryEntry> = vec![pref]
             .into_iter()
             .filter(|e| !standing.iter().any(|s| s.id == e.id))
             .collect();
-        let block = render_recall_block(standing, retrieved).expect("block");
-        assert_eq!(
-            block.matches("[terse]").count(),
-            1,
-            "one injection only: {block}"
-        );
+        let (plan, block) = render(standing, queried);
+        let block = block.expect("block");
+        assert_eq!(block.matches("[terse]").count(), 1, "{block}");
+        assert_eq!(plan.selected.len(), 1);
     }
 }
 
