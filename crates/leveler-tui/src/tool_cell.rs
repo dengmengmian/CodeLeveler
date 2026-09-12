@@ -31,10 +31,16 @@ fn tool_style(theme: &Theme, status: ToolStatus) -> Style {
 /// Tools whose guard rejection is a neutral skip (closeout, loop-guard,
 /// skip-complete), not a real failure — shown with ⚠ instead of ✗.
 pub(crate) fn is_guard_denied_name(name: &str) -> bool {
-    matches!(
-        name,
-        "update_plan" | "update_goal" | "list_files" | "git_status" | "grep" | "find_files"
-    )
+    // Only the plan/goal bookkeeping tools validate their own arguments and
+    // answer in English written for the model. Everything else fails for a
+    // reason the user needs to read.
+    //
+    // This list used to include grep / find_files / list_files / git_status,
+    // for an observe-dedup guard that no longer exists in the runtime. With the
+    // guard gone the substitution had nothing behind it: a failed search was
+    // handed the sentence "已跳过：重复的检查无需再次执行" in place of its actual
+    // error, which is a state the UI made up.
+    matches!(name, "update_plan" | "update_goal")
 }
 
 /// Localized user-facing note for a guard denial. The runtime's guard text is
@@ -43,7 +49,7 @@ pub(crate) fn guard_denial_note<'a>(name: &str, t: &'a crate::i18n::UiText) -> &
     if name == "update_plan" {
         t.plan_update_rejected
     } else {
-        t.observe_denied
+        t.goal_update_rejected
     }
 }
 
@@ -135,6 +141,11 @@ fn compact_path_for_summary(path: &str) -> String {
     } else {
         parts[parts.len().saturating_sub(2)..].join("/")
     }
+}
+
+/// The compacted file paths a unified diff or `***` patch touches, in order.
+pub(crate) fn patch_touched_files_pub(patch: &str) -> Vec<String> {
+    patch_touched_files(patch)
 }
 
 fn patch_touched_files(patch: &str) -> Vec<String> {
@@ -291,6 +302,9 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
                 path
             }
         }
+        // The question is what the interaction was ABOUT; "询问" alone says
+        // nothing, and the generic field walk below never reaches `question`.
+        "request_user_input" | "ask_user" => s("question"),
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
         "find_files" => s("pattern"),
         "update_plan" => s("explanation"),
@@ -689,7 +703,7 @@ pub(crate) fn tool_lines(
         )
         && let Some(patch) = edit_patch_for(block)
     {
-        push_edit_diff_body(&patch, theme, width, tools_expanded, t, out, true);
+        push_edit_diff_body(&patch, theme, width, out, true);
         return;
     }
 
@@ -1025,25 +1039,30 @@ fn hunk_start(header: &str, side: char) -> Option<u32> {
 
 /// Shared edit body for Tools screen / Conversation: file header, line gutter,
 /// green/red code (no raw `+/-` clutter).
+/// Render an applied patch in full.
+///
+/// Deliberately uncapped (spec §6). Tool OUTPUT — a log, a help dump, a file
+/// read — is a step toward the result and may be summarized behind a
+/// disclosure. A patch that reached the user's tree IS the result, and this
+/// row sequence is the only record of its shape: an abridged diff leaves the
+/// reader unable to answer what the agent actually changed, and no later
+/// Changes view repairs that (it shows the CUMULATIVE tree, not this step).
+/// Long diffs stay affordable because the conversation caches its built lines
+/// per transcript version and the viewport paints only the rows on screen —
+/// the cost is bounded by edits made, not by frames drawn.
 fn push_edit_diff_body(
     patch: &str,
     theme: &Theme,
     width: usize,
-    tools_expanded: bool,
-    t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
     show_file_headers: bool,
 ) {
-    const DIFF_FOLD_ROWS: usize = 16;
     let rows = parse_edit_diff_rows(patch);
     if rows.is_empty() {
         return;
     }
-    let cap = if tools_expanded { 48 } else { DIFF_FOLD_ROWS };
-    let shown = rows.len().min(cap);
-    // The gutter is sized from the largest real line number in the WHOLE
-    // patch, not from the rows that happen to be on screen: folding and
-    // expanding must not shift the code column sideways. A file with 100k
+    // The gutter is sized from the largest real line number in the patch, so
+    // the code column never shifts sideways partway down. A file with 100k
     // lines gets six digits; a short one gets two.
     let widest = rows.iter().filter_map(EditDiffRow::gutter_line).max();
     let digits = widest.map(|n| n.to_string().len()).unwrap_or(0);
@@ -1052,7 +1071,7 @@ fn push_edit_diff_body(
     let mark_w = 2; // "+ " / "- " / "  "
     let inner = width.saturating_sub(4 + gutter_w + mark_w).max(12);
 
-    for (i, row) in rows.iter().take(shown).enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let lead = if i == 0 { "  └ " } else { "    " };
         match row {
             EditDiffRow::FileHeader { path } if show_file_headers => {
@@ -1106,27 +1125,6 @@ fn push_edit_diff_body(
             }
         }
     }
-    if rows.len() > shown {
-        // Count only the SOURCE lines that were cut. File headers and hunk
-        // markers are chrome, and counting them would tell the reader there
-        // are more changed lines hidden than the patch actually has.
-        let hidden_code = rows[shown..]
-            .iter()
-            .filter(|r| matches!(r, EditDiffRow::Code { .. }))
-            .count();
-        let hint = if tools_expanded {
-            format!(
-                "    {}",
-                t.fold_more_lines.replace("{}", &hidden_code.to_string())
-            )
-        } else {
-            format!("    {}", t.fold_full_diff)
-        };
-        out.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme.text.muted),
-        )));
-    }
 }
 
 /// Merge identity for consecutive same-file edits: the patch's touched files.
@@ -1140,10 +1138,6 @@ pub(crate) struct PatchStats {
     pub hunks: usize,
     pub added: usize,
     pub removed: usize,
-}
-
-pub(crate) fn patch_stats(arguments: &str) -> PatchStats {
-    patch_stats_from_text(&patch_text_from_arguments(arguments))
 }
 
 /// Count hunks / +/- lines in raw patch text (also used for synthesized replace).
@@ -1164,13 +1158,11 @@ pub(crate) fn patch_stats_from_text(patch: &str) -> PatchStats {
 
 /// Combined inline diff rows for one or more same-file patches (merged edit
 /// node in the activity stream). File-marker rows are skipped — the unit's
-/// argument line already shows the file. Capped, with a fold hint.
+/// argument line already shows the file. Complete: see [`push_edit_diff_body`].
 pub(crate) fn merged_diff_rows(
     calls: &[&ToolCallBlock],
     theme: &Theme,
     width: usize,
-    expanded: bool,
-    t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
 ) {
     let mut combined = String::new();
@@ -1190,7 +1182,7 @@ pub(crate) fn merged_diff_rows(
         }
     }
     // Head already shows the path; hide per-hunk file headers to avoid noise.
-    push_edit_diff_body(&combined, theme, width, expanded, t, out, false);
+    push_edit_diff_body(&combined, theme, width, out, false);
 }
 
 #[cfg(test)]
@@ -1256,15 +1248,10 @@ mod m1_tests {
 
     fn diff_text(patch: &str, width: usize, expanded: bool) -> String {
         let mut out = Vec::new();
-        push_edit_diff_body(
-            patch,
-            &Theme::no_color(),
-            width,
-            expanded,
-            Locale::Zh.text(),
-            &mut out,
-            true,
-        );
+        // `expanded` is accepted so the callers' matrix still exercises both,
+        // but an applied diff renders the same either way — that is the point.
+        let _ = expanded;
+        push_edit_diff_body(patch, &Theme::no_color(), width, &mut out, true);
         out.iter()
             .map(|line| {
                 line.spans
@@ -1418,6 +1405,7 @@ mod m1_tests {
             preview: Some("ok".into()),
             duration_ms: Some(3),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: applied.map(str::to_string),
         }
@@ -1555,14 +1543,7 @@ mod m1_tests {
             Some("--- a/a.rs\n+++ b/a.rs\n@@ -200,1 +200,1 @@\n-two\n+2\n"),
         );
         let mut out = Vec::new();
-        merged_diff_rows(
-            &[&a, &b],
-            &Theme::no_color(),
-            90,
-            true,
-            Locale::Zh.text(),
-            &mut out,
-        );
+        merged_diff_rows(&[&a, &b], &Theme::no_color(), 90, &mut out);
         let text: String = out
             .iter()
             .map(|l| {
@@ -1580,7 +1561,6 @@ mod m1_tests {
     #[test]
     fn edit_diff_shows_line_numbers_and_clean_add_rows() {
         let theme = Theme::no_color();
-        let t = Locale::Zh.text();
         let patch = r#"*** Begin Patch
 *** Update File: crates/leveler-app/src/lib.rs
 @@ -461,3 +461,6 @@
@@ -1596,8 +1576,6 @@ mod m1_tests {
             &patch_text_from_arguments(&args),
             &theme,
             100,
-            true,
-            t,
             &mut out,
             true,
         );
@@ -1646,6 +1624,7 @@ mod m1_tests {
             preview: Some("ok".into()),
             duration_ms: Some(12),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -1668,6 +1647,84 @@ mod m1_tests {
             text.contains("todo!()") || text.contains("fn a()"),
             "{text}"
         );
+    }
+
+    // ── §6: an applied edit's diff is evidence, so it is never abridged ─────
+    //
+    // Read/search/command output may be summarized: it is a step toward the
+    // result. A patch that landed in the user's tree IS the result, and the
+    // transcript is the only place its shape is recorded. Folding it away
+    // leaves the user unable to answer "what did the agent actually change".
+
+    /// A synthetic applied diff of `adds` added lines against one hunk.
+    fn wide_applied_diff(adds: usize) -> String {
+        let mut patch = String::from("--- a/src/big.rs\n+++ b/src/big.rs\n");
+        patch.push_str(&format!("@@ -10,1 +10,{} @@\n", adds + 1));
+        patch.push_str(" fn anchor() {}\n");
+        for i in 0..adds {
+            patch.push_str(&format!("+    let line_{i} = {i};\n"));
+        }
+        patch
+    }
+
+    /// D1: every added line of a 500-line patch reaches the rows, collapsed.
+    #[test]
+    fn a_long_applied_diff_keeps_every_line_without_being_expanded() {
+        let patch = wide_applied_diff(500);
+        let text = diff_text(&patch, 90, false);
+        for i in [0usize, 1, 17, 250, 498, 499] {
+            assert!(
+                text.contains(&format!("let line_{i} = {i};")),
+                "line {i} was dropped from the diff body"
+            );
+        }
+    }
+
+    /// D2: nothing claims lines are hidden, because none are.
+    #[test]
+    fn a_long_applied_diff_carries_no_truncation_notice() {
+        let patch = wide_applied_diff(500);
+        for expanded in [false, true] {
+            let text = diff_text(&patch, 90, expanded);
+            assert!(
+                !text.contains("完整 Diff") && !text.contains("full diff"),
+                "a complete diff must not offer to show itself: {expanded}"
+            );
+            assert!(
+                !text.contains("还有") && !text.contains("more lines"),
+                "a complete diff must not count hidden lines: {expanded}"
+            );
+        }
+    }
+
+    /// D3: expanding changes nothing about an applied diff — there is no
+    /// hidden half to reveal. (The disclosure still governs tool OUTPUT.)
+    #[test]
+    fn expanding_does_not_change_an_applied_diff() {
+        let patch = wide_applied_diff(120);
+        assert_eq!(diff_text(&patch, 90, false), diff_text(&patch, 90, true));
+    }
+
+    /// D4: the gutter column is sized from the whole patch, so a 4-digit line
+    /// number does not shift the code sideways partway down.
+    #[test]
+    fn a_long_applied_diff_keeps_one_gutter_width() {
+        let mut patch = String::from("--- a/src/big.rs\n+++ b/src/big.rs\n@@ -995,1 +995,21 @@\n");
+        patch.push_str(" fn anchor() {}\n");
+        for i in 0..20 {
+            patch.push_str(&format!("+    let line_{i} = {i};\n"));
+        }
+        let text = diff_text(&patch, 90, false);
+        let code_rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("let line_") || l.contains("fn anchor"))
+            .collect();
+        assert_eq!(code_rows.len(), 21, "{text}");
+        let columns: std::collections::BTreeSet<usize> = code_rows
+            .iter()
+            .map(|l| l.find('\u{2502}').expect("every code row has a gutter bar"))
+            .collect();
+        assert_eq!(columns.len(), 1, "gutter bar moved between rows: {text}");
     }
 }
 
@@ -1822,6 +1879,7 @@ mod tests {
             preview: Some(preview.to_string()),
             duration_ms: None,
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         }
@@ -1872,6 +1930,7 @@ mod tests {
             preview: Some("replaced 1 occurrence".to_string()),
             duration_ms: None,
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -1916,6 +1975,7 @@ mod tests {
             preview: Some("old text not found in src/lib.rs".to_string()),
             duration_ms: None,
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -1955,6 +2015,7 @@ mod tests {
             ),
             duration_ms: None,
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -1982,55 +2043,58 @@ mod tests {
         );
     }
 
+    /// Which failures get the "the model was told off, you do not need the
+    /// wording" treatment: the two bookkeeping tools that validate their own
+    /// arguments, and nothing else.
+    ///
+    /// This replaces a test that fed `list_files` the retired closeout guard's
+    /// English text and asserted a neutral "已跳过" in its place. That guard is
+    /// gone from the runtime — the string it checked now exists nowhere but in
+    /// the test — while the name-keyed substitution it protected went on
+    /// rewriting every real `grep` / `list_files` / `git_status` failure into a
+    /// sentence about a duplicate check that never happened.
     #[test]
-    fn closeout_denied_list_files_reads_as_a_neutral_skip_not_a_red_error() {
-        // After the plan completes, a repeat list_files is turned down with an
-        // English nudge. The user must see a neutral "skipped" (⚠, not ✗) with
-        // a localized note — never the internal English guard text.
-        let block = ToolCallBlock {
-            id: leveler_client_protocol::ToolCallId::new("l1"),
-            name: "list_files".to_string(),
-            arguments: r#"{"path":"backend"}"#.to_string(),
-            status: ToolStatus::Failed,
-            preview: Some(
-                "Plan steps are complete. Do not re-check git status, re-list files, or \
-                 re-audit prior questions — reply with a final summary only."
-                    .to_string(),
-            ),
-            duration_ms: None,
-            parallel: false,
-            started_elapsed_secs: 0,
-            applied_diff: None,
+    fn only_plan_and_goal_failures_get_a_substituted_note() {
+        let render = |name: &str, preview: &str| {
+            let block = ToolCallBlock {
+                id: leveler_client_protocol::ToolCallId::new("g1"),
+                name: name.to_string(),
+                arguments: r#"{"path":"backend"}"#.to_string(),
+                status: ToolStatus::Failed,
+                preview: Some(preview.to_string()),
+                duration_ms: None,
+                parallel: false,
+                batch: None,
+                started_elapsed_secs: 0,
+                applied_diff: None,
+            };
+            let mut out = Vec::new();
+            tool_lines(
+                &block,
+                &Theme::no_color(),
+                80,
+                false,
+                crate::i18n::Locale::Zh.text(),
+                &mut out,
+            );
+            out.iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let mut out = Vec::new();
-        tool_lines(
-            &block,
-            &Theme::no_color(),
-            80,
-            false,
-            crate::i18n::Locale::Zh.text(),
-            &mut out,
-        );
-        let text = out
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+
+        // update_goal: internal English validation, replaced and marked ⚠.
+        let goal = render("update_goal", "a resolution requires an explicit status");
+        assert!(!goal.contains("explicit status"), "{goal}");
+        assert!(goal.contains("目标未更新"), "{goal}");
+        assert!(goal.contains('⚠') && !goal.contains('✗'), "{goal}");
+
+        // list_files: a real failure, reported as itself and marked ✗.
+        let listing = render("list_files", "backend: no such directory");
+        assert!(listing.contains("no such directory"), "{listing}");
         assert!(
-            !text.contains("Plan steps are complete") && !text.contains("re-check"),
-            "internal English guard text must not reach the user: {text}"
-        );
-        assert!(
-            text.contains("已跳过"),
-            "a localized 'skipped' note must show instead: {text}"
-        );
-        assert!(
-            text.contains('⚠'),
-            "a guard denial reads as a warning glyph, not the failure marker: {text}"
-        );
-        assert!(
-            !text.contains('✗'),
-            "a guard denial must not use the failure glyph: {text}"
+            listing.contains('✗'),
+            "a real failure is a failure: {listing}"
         );
     }
 
@@ -2089,6 +2153,7 @@ mod tests {
             preview: Some("tool error: unknown tool `task`".into()),
             duration_ms: None,
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };

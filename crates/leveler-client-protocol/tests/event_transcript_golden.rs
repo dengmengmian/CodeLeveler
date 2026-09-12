@@ -62,6 +62,7 @@ fn snapshot() -> UiSessionSnapshot {
             summary: "删除 build 目录".to_string(),
             command: Some("rm -rf build".to_string()),
             risks: vec!["会删除文件".to_string()],
+            call_id: None,
         })],
         available_models: Vec::new(),
         vision: false,

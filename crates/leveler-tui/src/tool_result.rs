@@ -201,6 +201,7 @@ mod tests {
             preview: Some(preview.into()),
             duration_ms: Some(1200),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         }

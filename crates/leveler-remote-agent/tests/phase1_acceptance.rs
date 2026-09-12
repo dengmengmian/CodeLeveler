@@ -506,6 +506,7 @@ async fn a_phone_pairs_switches_projects_gets_a_timeout_reconnects_and_is_revoke
                 summary: "rm -rf build".to_string(),
                 command: Some("rm -rf build".to_string()),
                 risks: Vec::new(),
+                call_id: None,
             },
         })
         .unwrap();

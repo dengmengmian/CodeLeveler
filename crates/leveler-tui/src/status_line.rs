@@ -389,6 +389,28 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
 
 const WAIT_MARKER: &str = "◌";
 
+/// `当前 2/4` for the live activity line, from the runtime's plan only.
+///
+/// The step shown is the one the plan reports Running — never "the next
+/// pending one", which would claim a step had started because the previous one
+/// finished. No plan, or no running step, means no chip.
+fn live_plan_step_chip(state: &AppState, t: &crate::i18n::UiText) -> Option<String> {
+    let plan = state.plan.as_ref()?;
+    let total = plan.steps.len();
+    if total == 0 {
+        return None;
+    }
+    let current = plan
+        .steps
+        .iter()
+        .find(|s| s.status == leveler_client_protocol::PlanStepStatus::Running)?;
+    Some(
+        t.plan_current_item
+            .replace("{current}", &(current.index + 1).to_string())
+            .replace("{total}", &total.to_string()),
+    )
+}
+
 fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     let t = state.t();
@@ -420,10 +442,26 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     // An activity that owns a clock — a long command's heartbeat — reports its
     // own elapsed. Appending the turn's as well printed two adjacent durations
     // with nothing to tell them apart.
-    let mut parts = vec![
-        format!("{frame} {turn_mode}{label}"),
-        fmt_elapsed(state.activity_elapsed_secs.unwrap_or(state.elapsed_secs)),
-    ];
+    let mut parts = vec![format!("{frame} {turn_mode}{label}")];
+    // Where in the plan, when there IS a plan. A turn with no plan gets no
+    // fraction: "步骤 1/1" invented to look purposeful is chrome, not progress.
+    if let Some(step) = live_plan_step_chip(state, t) {
+        parts.push(step);
+    }
+    parts.push(fmt_elapsed(
+        state.activity_elapsed_secs.unwrap_or(state.elapsed_secs),
+    ));
+    // How much work the turn has actually done. Zero is not reported — nothing
+    // has happened, and a "0 次工具" reads as a measurement of nothing.
+    if state.turn_tool_calls > 0 {
+        parts.push(
+            t.tool_calls_n
+                .replacen("{}", &state.turn_tool_calls.to_string(), 1)
+                .trim_start_matches([' ', '\u{b7}'])
+                .trim()
+                .to_string(),
+        );
+    }
     // Totals are only reported when a round ENDS, so on their own they
     // freeze for the whole of the next round. Show them, then always
     // append the live estimate for the round in flight — that is the
@@ -557,6 +595,85 @@ mod tests {
                 reasoning_effort: None,
             },
         )
+    }
+
+    // ── §8: the live activity line, and only real facts on it ──────────────
+
+    fn busy_line(state: &AppState) -> String {
+        status_lines(state, 140)
+            .first()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn plan_at(current: usize, total: usize) -> leveler_client_protocol::UiPlan {
+        leveler_client_protocol::UiPlan {
+            steps: (0..total)
+                .map(|i| leveler_client_protocol::UiPlanStep {
+                    index: i,
+                    description: format!("step {}", i + 1),
+                    status: match i.cmp(&current) {
+                        std::cmp::Ordering::Less => leveler_client_protocol::PlanStepStatus::Done,
+                        std::cmp::Ordering::Equal => {
+                            leveler_client_protocol::PlanStepStatus::Running
+                        }
+                        std::cmp::Ordering::Greater => {
+                            leveler_client_protocol::PlanStepStatus::Pending
+                        }
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// A1: with a real plan and real tool calls, the live line says where in
+    /// the plan the turn is and how much work it has done.
+    #[test]
+    fn the_live_line_reports_the_plan_step_and_the_tool_count() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.activity = Some("正在检查 WorkerConfig".into());
+        state.plan = Some(plan_at(1, 4));
+        state.turn_tool_calls = 3;
+        state.elapsed_secs = 12;
+        let line = busy_line(&state);
+        assert!(line.contains("正在检查 WorkerConfig"), "{line}");
+        assert!(line.contains("2/4"), "the running step, 1-based: {line}");
+        assert!(line.contains("3 次工具"), "{line}");
+        assert!(line.contains("12s"), "{line}");
+    }
+
+    /// A2: no plan, no step counter. A turn with no plan must not be given
+    /// "步骤 1/1" to look busy.
+    #[test]
+    fn without_a_plan_the_live_line_claims_no_step() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.activity = Some("正在分析".into());
+        state.turn_tool_calls = 2;
+        let line = busy_line(&state);
+        assert!(!line.contains("步骤"), "{line}");
+        assert!(!line.contains('/'), "no invented fraction: {line}");
+        assert!(line.contains("2 次工具"), "{line}");
+    }
+
+    /// A3: nothing has run yet, so nothing is counted. A "0 次工具" would be
+    /// chrome pretending to be a measurement.
+    #[test]
+    fn a_turn_with_no_tool_calls_yet_shows_no_count() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.activity = Some("正在思考".into());
+        assert!(
+            !busy_line(&state).contains("次工具"),
+            "{}",
+            busy_line(&state)
+        );
     }
 
     #[test]
@@ -738,6 +855,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["network".into()],
+                call_id: None,
             }),
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);

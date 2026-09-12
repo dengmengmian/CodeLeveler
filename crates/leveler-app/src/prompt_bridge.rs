@@ -197,6 +197,9 @@ impl Approver for ChannelApprover {
             summary: request.description.clone(),
             command: request.command.clone(),
             risks: risk_bullets(request),
+            // The call this decision is holding, so the UI can stop painting it
+            // as work in progress while it waits on the human.
+            call_id: Some(request.call_id.clone()),
         };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -292,6 +295,7 @@ mod tests {
                     summary: request.description.clone(),
                     command: request.command.clone(),
                     risks: vec![],
+                    call_id: Some(request.call_id.clone()),
                 },
                 reply,
             },

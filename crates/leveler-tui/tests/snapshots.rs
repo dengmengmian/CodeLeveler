@@ -396,6 +396,7 @@ fn renders_approval_overlay_with_deny_visible() {
                 summary: "run git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
+                call_id: None,
             },
         }),
     );
@@ -441,11 +442,11 @@ fn renders_failed_tool_inline_and_tools_screen() {
             message_id: MessageId::new("close-group"),
         }),
     );
-    // A failed shell collapses to its disclosure: ✗ label + first error line.
+    // A lone failed shell is its own evidence row: ✗, the command, the error.
     let conv = render_at(100, 24, &mut state);
     assert!(
-        conv.contains('▸') && conv.contains('✗') && conv.contains("失败"),
-        "collapsed failure must name itself on the disclosure row: {conv}"
+        conv.contains('✗') && conv.contains("cargo test"),
+        "the failure row must name the command that failed: {conv}"
     );
     assert!(
         conv.contains("exit") && conv.contains("101"),
@@ -514,11 +515,11 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             message_id: MessageId::new("close-group"),
         }),
     );
-    // Folded by default: one ▸ disclosure row; raw output stays hidden.
+    // Folded by default: the call's own row, with its OUTPUT still hidden.
     let folded = render_at(100, 24, &mut state);
     assert!(
-        folded.contains('▸') && folded.contains("执行了 1 个命令"),
-        "disclosure row missing: {folded}"
+        folded.contains("执行命令") && folded.contains("cargo"),
+        "the evidence row must name the command: {folded}"
     );
     assert!(!folded.contains("line-one"), "collapsed output leaked");
     assert!(
@@ -536,8 +537,8 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
     );
     let expanded = render_at(100, 24, &mut state);
     assert!(
-        expanded.contains('▾') && expanded.contains("cargo"),
-        "expanded group shows its ▾ header and the command: {expanded}"
+        expanded.contains("cargo"),
+        "expanded group still names the command: {expanded}"
     );
     assert!(
         expanded.contains("line-three"),
@@ -607,8 +608,8 @@ fn command_result_renders_as_important_activity_not_file_list() {
     assert!(!collapsed.contains("工具输出"), "{collapsed}");
     assert!(!collapsed.contains("摘要:"), "{collapsed}");
     assert!(
-        collapsed.contains('▸') && collapsed.contains("执行了 1 个命令"),
-        "finished run folds to its disclosure row: {collapsed}"
+        collapsed.contains("执行命令") && collapsed.contains("cargo test"),
+        "the finished run keeps a row naming what it ran: {collapsed}"
     );
     assert!(
         !collapsed.contains("raw-shell-output"),
@@ -1266,6 +1267,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 summary: "run git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
+                call_id: None,
             },
         }),
     );

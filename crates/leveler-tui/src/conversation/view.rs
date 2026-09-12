@@ -19,6 +19,11 @@ pub struct ConvKey {
     pub(crate) monochrome: bool,
     pub(crate) locale: crate::i18n::Locale,
     pub(crate) tools_expanded: bool,
+    /// The call an open approval is holding. Part of the key because opening or
+    /// answering an approval changes a transcript ROW (§11), and a cache that
+    /// did not notice would keep painting `◌` over a command nobody has
+    /// authorised — or `等待批准` after it was allowed.
+    pub(crate) awaiting_approval: Option<leveler_client_protocol::ToolCallId>,
 }
 
 /// One memoized conversation build: cache key, wrapped lines, and the

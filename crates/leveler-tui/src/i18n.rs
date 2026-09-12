@@ -124,6 +124,9 @@ pub struct UiText {
     /// Terminal tab title vocabulary (short, structured; never model prose).
     pub title_working: &'static str,
     pub title_awaiting_approval: &'static str,
+    /// Trailing marker on the transcript row of a call an open approval is
+    /// holding: announced, not authorised, and so not running (§11).
+    pub approval_pending: &'static str,
     pub title_awaiting_input: &'static str,
     pub title_waiting_background: &'static str,
     /// "等待 3 个后台任务" / "waiting for 3 background tasks"
@@ -256,9 +259,13 @@ pub struct UiText {
     /// Shown instead of the internal validation error when an update_plan is
     /// rejected (e.g. skipping an unfinished step).
     pub plan_update_rejected: &'static str,
-    /// Shown when a read-only/observe call is turned down by a guard (closeout,
-    /// loop-guard) — the model gets English guidance; the user sees this.
-    pub observe_denied: &'static str,
+    /// Shown instead of the internal validation error when an `update_goal` is
+    /// rejected (a resolution with no status, a close while children still run).
+    ///
+    /// Replaces `observe_denied` ("已跳过：重复的检查无需再次执行"), which named
+    /// an observe-dedup guard the runtime no longer has — so the sentence
+    /// described nothing and was being applied to unrelated search failures.
+    pub goal_update_rejected: &'static str,
     pub tool_group_calls: &'static str,
     pub tool_group_running: &'static str,
     pub tool_group_succeeded: &'static str,
@@ -477,6 +484,9 @@ pub struct UiText {
 
     // Turn end / completion report
     pub turn_end_completed: &'static str,
+    /// The loop ended cleanly with no answer committed (§12). Not a failure and
+    /// not a completion — the marker says which half is missing.
+    pub turn_no_final_answer: &'static str,
     pub completion_files_changed: &'static str, // "修改 {} 个文件"
     pub completion_verified: &'static str,      // "验证 {}/{} 通过"
     pub completion_diff_hint: &'static str,
@@ -484,7 +494,6 @@ pub struct UiText {
     // Fold hints
     pub fold_more_lines: &'static str, // "… 还有 {} 行 · Ctrl+O 展开"
     pub fold_more_lines_short: &'static str, // "(+{} 行 · Ctrl+O)"
-    pub fold_full_diff: &'static str,
 
     // Tool detail labels
     pub tool_label_args: &'static str,
@@ -521,7 +530,6 @@ pub struct UiText {
     pub settled_work_many: &'static str,
     pub settled_explore: &'static str,
     /// Live parallel area overflow: "… 还有 {} 个" running members without rows.
-    pub parallel_more_running: &'static str,
     /// Background task lifecycle toasts. The task's opaque runtime id is
     /// never the user-facing name: these carry what it is actually running.
     pub background_task_started: &'static str,
@@ -696,6 +704,7 @@ static ZH: UiText = UiText {
     turn_completed: "✓ 任务已完成",
     title_working: "工作中",
     title_awaiting_approval: "等待审批",
+    approval_pending: "等待批准",
     title_awaiting_input: "等待输入",
     title_waiting_background: "等待后台任务",
     waiting_background_n: "等待 {} 个后台任务",
@@ -797,7 +806,7 @@ static ZH: UiText = UiText {
     unsupported_task_action: "委派（不支持）",
     unsupported_task_hint: "不支持 task，请改用 spawn_agent",
     plan_update_rejected: "计划未更新：需按顺序完成步骤",
-    observe_denied: "已跳过：重复的检查无需再次执行",
+    goal_update_rejected: "目标未更新：需先说明状态",
     tool_group_calls: "工具调用 {} 次",
     tool_group_running: "正在{}",
     tool_group_succeeded: "{} 成功",
@@ -1042,12 +1051,12 @@ static ZH: UiText = UiText {
     final_failed: "失败",
     final_cancelled: "已取消",
     turn_end_completed: "任务已完成",
+    turn_no_final_answer: "执行已结束，但未提交最终回答",
     completion_files_changed: "修改 {} 个文件",
     completion_verified: "验证 {}/{} 通过",
     completion_diff_hint: "/diff 查看改动",
     fold_more_lines: "… 还有 {} 行",
     fold_more_lines_short: "(+{} 行)",
-    fold_full_diff: "… 点击展开完整 Diff",
     tool_label_args: "参数",
     tool_label_patch: "补丁",
     tool_label_replace: "文本替换",
@@ -1072,7 +1081,6 @@ static ZH: UiText = UiText {
     settled_search: "已搜索代码库",
     settled_work_many: "已完成 {} 项操作",
     settled_explore: "已检查代码库",
-    parallel_more_running: "  … 还有 {} 个",
     background_task_started: "后台任务已启动:{}",
     background_task_done: "后台任务已完成:{}",
     background_task_failed: "后台任务失败:{}",
@@ -1161,6 +1169,7 @@ static EN: UiText = UiText {
     turn_completed: "✓ task complete",
     title_working: "working",
     title_awaiting_approval: "awaiting approval",
+    approval_pending: "awaiting approval",
     title_awaiting_input: "awaiting input",
     title_waiting_background: "waiting for background task",
     waiting_background_n: "waiting for {} background tasks",
@@ -1262,7 +1271,7 @@ static EN: UiText = UiText {
     unsupported_task_action: "Delegation (unsupported)",
     unsupported_task_hint: "task is unsupported; use spawn_agent",
     plan_update_rejected: "plan unchanged: complete steps in order",
-    observe_denied: "skipped: repeated check not needed",
+    goal_update_rejected: "goal unchanged: state it explicitly",
     tool_group_calls: "{} tool calls",
     tool_group_running: "running {}",
     tool_group_succeeded: "{} succeeded",
@@ -1507,12 +1516,12 @@ static EN: UiText = UiText {
     final_failed: "Failed",
     final_cancelled: "Cancelled",
     turn_end_completed: "Task completed",
+    turn_no_final_answer: "run ended without a final answer",
     completion_files_changed: "{} files changed",
     completion_verified: "verification {}/{} passed",
     completion_diff_hint: "/diff to view changes",
     fold_more_lines: "… {} more lines",
     fold_more_lines_short: "(+{} lines)",
-    fold_full_diff: "… click for full diff",
     tool_label_args: "Arguments",
     tool_label_patch: "Patch",
     tool_label_replace: "Text replacement",
@@ -1537,7 +1546,6 @@ static EN: UiText = UiText {
     settled_search: "Searched the codebase",
     settled_work_many: "Completed {} operations",
     settled_explore: "Inspected the codebase",
-    parallel_more_running: "  … {} more",
     background_task_started: "Background task started: {}",
     background_task_done: "Background task finished: {}",
     background_task_failed: "Background task failed: {}",

@@ -473,6 +473,7 @@ mod layout_tests {
                 "rm -rf src/main.rs && ls src/ && git status --short && echo done".into(),
             ),
             risks: vec!["可能造成破坏性变更".into()],
+            call_id: None,
         })))
     }
 
@@ -608,6 +609,7 @@ mod layout_tests {
             summary: String::new(),
             command: Some(long),
             risks: vec![],
+            call_id: None,
         })));
         let lines = frame_of(&ov, 110, 40);
         let head = lines
@@ -647,6 +649,7 @@ mod layout_tests {
             summary: String::new(),
             command: Some(long.clone()),
             risks: vec![],
+            call_id: None,
         });
         ap.on_key(ratatui::crossterm::event::KeyEvent::new(
             ratatui::crossterm::event::KeyCode::Char('o'),
@@ -668,6 +671,7 @@ mod layout_tests {
             summary: "记住用户偏好".into(),
             command: None,
             risks: vec![],
+            call_id: None,
         })));
         let screen = frame_of(&ov, 110, 32).join("\n");
         assert!(screen.contains("记住用户偏好"), "frame:\n{screen}");

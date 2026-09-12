@@ -224,7 +224,7 @@ pub fn item_render(
             let locale = locale_from_ui_text(t);
             // Scrollback: finished tools show their final duration, not live (0).
             out.extend(crate::activity_stream::render_activity(
-                group, theme, wrap_width, locale, t, 0,
+                group, theme, wrap_width, locale, t, 0, None,
             ));
         }
         // Scrollback: the agent is finished, so no live elapsed is shown (0).
@@ -570,6 +570,12 @@ fn turn_end_lines(
         TurnEndStatus::ChecksFailed => {
             (format!("⚠ {}", t.turn_checks_failed), theme.status.warning)
         }
+        // Not a failure — the run may have done real work — but not a
+        // completion either. The wording names exactly what is missing.
+        TurnEndStatus::NoFinalAnswer => (
+            format!("⚠ {}", t.turn_no_final_answer),
+            theme.status.warning,
+        ),
         TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.status.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
         TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.text.secondary),
@@ -581,6 +587,7 @@ fn turn_end_lines(
             | TurnEndStatus::Answered
             | TurnEndStatus::Unverified
             | TurnEndStatus::ChecksFailed
+            | TurnEndStatus::NoFinalAnswer
     ) {
         if block.tool_calls > 0 {
             stats.push_str(
@@ -1529,6 +1536,7 @@ mod tests {
                 preview: Some("Goal resolved.".into()),
                 duration_ms: Some(1),
                 parallel: false,
+                batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
             }],

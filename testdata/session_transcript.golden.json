@@ -65,6 +65,7 @@
     "pending_interactions": [
       {
         "request": {
+          "call_id": null,
           "command": "rm -rf build",
           "id": "a_pending",
           "risks": [

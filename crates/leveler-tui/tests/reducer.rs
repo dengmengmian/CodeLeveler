@@ -438,6 +438,7 @@ fn completed_turn_end_may_show_success_verify_chrome() {
             },
         }),
     );
+    answer(&mut s, "m-final", "检查都通过了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let Some(TranscriptItem::TurnEnd(end)) = s
         .transcript
@@ -991,9 +992,188 @@ fn turn_failed_records_error_and_status() {
     ));
 }
 
+/// §11 end to end: a real `ApprovalRequested` naming a running call makes that
+/// call's transcript row say it is waiting, not that it is running.
+#[test]
+fn an_approval_request_stops_its_call_reading_as_running() {
+    let mut s = opened();
+    s.size = (120, 40);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("rm1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"rm","args":["-rf","stale"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    let running = rendered(&mut s, 120, 40);
+    assert!(
+        running.contains('◌'),
+        "the call starts out running: {running}"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: UiApprovalRequest {
+                id: ApprovalId::new("a1"),
+                tool: "run_command".into(),
+                summary: String::new(),
+                command: Some("rm -rf stale".into()),
+                risks: vec!["可能造成破坏性变更".into()],
+                call_id: Some("rm1".into()),
+            },
+        }),
+    );
+    let waiting = rendered(&mut s, 120, 40);
+    assert!(
+        waiting.contains("等待批准"),
+        "the gated row must say what it is waiting for: {waiting}"
+    );
+    assert!(
+        waiting.contains("rm -rf stale"),
+        "and still name the command: {waiting}"
+    );
+
+    // Allowed: the row goes back to running, and the cache must have noticed.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ApprovalResolved {
+            id: ApprovalId::new("a1"),
+        }),
+    );
+    let allowed = rendered(&mut s, 120, 40);
+    assert!(
+        !allowed.contains("等待批准"),
+        "nothing is waiting once it is answered: {allowed}"
+    );
+    assert!(allowed.contains('◌'), "and the call is running: {allowed}");
+}
+
+// ── §12: the completion footer is a claim, and it needs an answer behind it ──
+
+/// Stream and finish one assistant answer, the way a real turn commits one.
+fn answer(s: &mut AppState, id: &str, text: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new(id),
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: MessageId::new(id),
+            delta: text.into(),
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted {
+            message_id: MessageId::new(id),
+        }),
+    );
+}
+
+fn last_turn_end(s: &AppState) -> &leveler_tui::transcript::TurnEndBlock {
+    s.transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::TurnEnd(end) => Some(end),
+            _ => None,
+        })
+        .expect("expected a turn-end marker")
+}
+
+/// C1: the loop ended and nothing was answered. The runtime's own outcome is
+/// still reported, but the marker must not read "✓ 任务已完成" — there is no
+/// answer in the transcript for that claim to be about.
+#[test]
+fn a_turn_that_committed_no_answer_does_not_claim_completion() {
+    for event in [RuntimeEvent::TurnAnswered, RuntimeEvent::TurnCompleted] {
+        let mut s = opened();
+        reduce(&mut s, Action::Runtime(event));
+        assert_eq!(
+            last_turn_end(&s).status,
+            TurnEndStatus::NoFinalAnswer,
+            "a turn with no answer cannot present as done"
+        );
+        let screen = rendered(&mut s, 100, 24);
+        assert!(
+            !screen.contains(leveler_tui::Locale::Zh.text().turn_end_completed),
+            "no green completion wording: {screen}"
+        );
+    }
+}
+
+/// C2: with an answer committed, the runtime's outcome stands untouched.
+#[test]
+fn a_turn_that_committed_an_answer_keeps_its_runtime_outcome() {
+    let mut s = opened();
+    answer(&mut s, "m-final", "P1-8 已完成。");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert_eq!(last_turn_end(&s).status, TurnEndStatus::Completed);
+}
+
+/// C3: prose a tool call acted on is narration, not the answer. A turn whose
+/// only text was "让我先看看" and which then stopped has answered nothing.
+#[test]
+fn interim_narration_does_not_satisfy_the_completion_footer() {
+    let mut s = opened();
+    answer(&mut s, "m-interim", "让我先看看 worker.go。");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "read_file".into(),
+            arguments: r#"{"path":"worker.go"}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "ok".into(),
+            duration_ms: 5,
+            applied_diff: None,
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+    assert_eq!(last_turn_end(&s).status, TurnEndStatus::NoFinalAnswer);
+}
+
+/// C4: an outcome that already says something went wrong keeps saying it. This
+/// rule replaces a false "done", never a true "failed" or "incomplete".
+#[test]
+fn a_failing_outcome_is_not_rewritten_by_the_missing_answer_rule() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        }),
+    );
+    assert_eq!(last_turn_end(&s).status, TurnEndStatus::Incomplete);
+
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "provider closed".into(),
+        }),
+    );
+    assert_eq!(last_turn_end(&s).status, TurnEndStatus::Failed);
+}
+
 #[test]
 fn answer_end_is_distinct_from_verified_task_completion() {
     let mut s = state();
+    answer(&mut s, "m-final", "答完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
 
     assert_eq!(s.status, RuntimeStatus::Idle);
@@ -1063,6 +1243,7 @@ fn approval_req() -> UiApprovalRequest {
         summary: "git push".into(),
         command: Some("git push".into()),
         risks: vec!["将访问网络".into()],
+        call_id: None,
     }
 }
 
@@ -1339,6 +1520,7 @@ fn second_approval_queues_and_advances_after_first_resolved() {
         summary: "rm -rf tmp".into(),
         command: Some("rm -rf tmp".into()),
         risks: vec![],
+        call_id: None,
     };
     reduce(
         &mut s,
@@ -5580,6 +5762,7 @@ fn a_completed_turn_retires_the_live_plan() {
     let mut s = busy_state();
     stale_open_plan(&mut s);
     assert!(s.plan.is_some(), "the plan is live while the turn runs");
+    answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     assert!(s.plan.is_none(), "no live plan after the work is finished");
 }
@@ -5635,6 +5818,7 @@ fn a_completed_turn_marker_does_not_deny_itself_with_a_stale_plan() {
             },
         }),
     );
+    answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = format!("{:?}", s.transcript.items());
     let zh = leveler_tui::Locale::Zh.text();
@@ -5674,6 +5858,7 @@ fn an_incomplete_turn_marker_keeps_real_plan_progress() {
 fn retiring_the_plan_never_fabricates_completed_steps() {
     let mut s = busy_state();
     stale_open_plan(&mut s);
+    answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = format!("{:?}", s.transcript.items());
     assert!(!text.contains("9/9"), "no invented completion: {text}");

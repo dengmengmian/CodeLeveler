@@ -425,6 +425,20 @@ impl AppState {
         }
     }
 
+    /// The tool call an open approval overlay is holding, if any.
+    ///
+    /// Presentation only: the runtime still owns the decision. This exists so a
+    /// call waiting on the human stops wearing the running mark (§11) — a
+    /// `rm -rf` that has been announced but not authorised is not work in
+    /// progress. Derived from the request's own `call_id`; a request that names
+    /// no call (a standing `request_permissions`) gates no row.
+    pub(crate) fn approval_gated_call(&self) -> Option<&leveler_client_protocol::ToolCallId> {
+        match self.overlay.as_ref()? {
+            Overlay::Approval(overlay) => overlay.gated_call.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Localized UI strings for the active locale.
     pub fn t(&self) -> &'static UiText {
         self.locale.text()

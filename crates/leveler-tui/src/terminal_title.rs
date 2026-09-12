@@ -87,7 +87,10 @@ fn sanitize(text: &str) -> String {
 fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
     match end {
         TurnEndStatus::Completed | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
-        TurnEndStatus::Unverified
+        // A run with no answer committed is not a completion, so the title
+        // must not carry the ✓ either.
+        TurnEndStatus::NoFinalAnswer
+        | TurnEndStatus::Unverified
         | TurnEndStatus::ChecksFailed
         | TurnEndStatus::Truncated
         | TurnEndStatus::Incomplete
@@ -322,6 +325,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec![],
+                call_id: None,
             }),
         )));
         let mut p = TerminalTitleProjection::default();

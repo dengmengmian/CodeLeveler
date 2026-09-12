@@ -39,6 +39,9 @@ pub enum ApprovalOutcome {
 #[derive(Debug, Clone)]
 pub struct ApprovalOverlay {
     pub request: UiApprovalRequest,
+    /// The call this decision holds, parsed once from the request. Lets the
+    /// transcript row for that call say "waiting on you" instead of "running".
+    pub(crate) gated_call: Option<leveler_client_protocol::ToolCallId>,
     cursor: usize,
     /// Show the command in full instead of elided to one line.
     expanded: bool,
@@ -47,8 +50,15 @@ pub struct ApprovalOverlay {
 impl ApprovalOverlay {
     /// Open the overlay with the cursor on the safe (Deny) option.
     pub fn new(request: UiApprovalRequest) -> Self {
+        let gated_call = request
+            .call_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(leveler_client_protocol::ToolCallId::new);
         Self {
             request,
+            gated_call,
             cursor: DENY_INDEX,
             expanded: false,
         }
@@ -120,6 +130,7 @@ mod tests {
             summary: "run git push".into(),
             command: Some("git push".into()),
             risks: vec!["将访问网络".into()],
+            call_id: None,
         }
     }
 

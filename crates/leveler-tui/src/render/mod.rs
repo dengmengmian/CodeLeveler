@@ -1364,6 +1364,7 @@ mod tests {
                 preview: Some("tool error: unknown tool `task`; use `spawn_agent`".into()),
                 duration_ms: None,
                 parallel: false,
+                batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
             }],
@@ -1423,6 +1424,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
+                call_id: None,
             }),
         )));
         // A user turn suppresses the splash card so only overlay chrome remains.
@@ -1498,10 +1500,23 @@ mod tests {
                 ),
             );
         }
-        crate::reducer::reduce(
-            &mut s,
-            crate::action::Action::Runtime(leveler_client_protocol::RuntimeEvent::TurnCompleted),
-        );
+        // A completion footer is a claim about an answer, so the turn has to
+        // have committed one (§12) before it may show.
+        for event in [
+            leveler_client_protocol::RuntimeEvent::AssistantMessageStarted {
+                message_id: leveler_client_protocol::MessageId::new("m-final"),
+            },
+            leveler_client_protocol::RuntimeEvent::AssistantTextDelta {
+                message_id: leveler_client_protocol::MessageId::new("m-final"),
+                delta: "两个文件都读过了。".into(),
+            },
+            leveler_client_protocol::RuntimeEvent::AssistantMessageCompleted {
+                message_id: leveler_client_protocol::MessageId::new("m-final"),
+            },
+            leveler_client_protocol::RuntimeEvent::TurnCompleted,
+        ] {
+            crate::reducer::reduce(&mut s, crate::action::Action::Runtime(event));
+        }
 
         let rendered: Vec<String> = crate::conversation::build::build_conversation_lines(&s, 80)
             .iter()
@@ -1844,6 +1859,7 @@ mod tests {
             preview: Some("some output".into()),
             duration_ms: Some(ms),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         }
@@ -1960,29 +1976,34 @@ mod tests {
         );
     }
 
+    /// §6: an applied diff is the change itself, so the disclosure has no say
+    /// over it. This test used to assert the opposite — that a 40-line patch
+    /// showed 16 rows and a "click for the full diff" hint — which left the
+    /// only record of what the agent changed one interaction out of reach.
     #[test]
-    fn long_inline_diff_is_capped_until_expanded() {
+    fn a_long_inline_diff_is_complete_whether_folded_or_expanded() {
         let body: String = (0..40).map(|i| format!("+line {i}\n")).collect();
         let patch = format!("*** Begin Patch\n*** Update File: src/a.rs\n@@\n{body}*** End Patch");
         let args = serde_json::json!({ "patch": patch }).to_string();
         let item = tool_item("apply_patch", &args, 5);
 
-        let folded = tool_render(&item, false);
-        let text = folded.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(!text.contains("line 30"), "folded diff is capped: {text}");
-        // Click-first: the fold names the interaction, not a shortcut.
-        assert!(
-            text.contains("点击展开完整 Diff") && text.contains("…"),
-            "must hint how to see the full diff: {text}"
-        );
-        assert!(
-            !text.contains("Ctrl+O"),
-            "shortcuts are not advertised: {text}"
-        );
-
-        let expanded = tool_render(&item, true);
-        let text = expanded.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("line 30"), "Ctrl+O expands the diff: {text}");
+        for expanded in [false, true] {
+            let text = tool_render(&item, expanded)
+                .iter()
+                .map(line_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for i in [0usize, 15, 30, 39] {
+                assert!(
+                    text.contains(&format!("line {i}")),
+                    "expanded={expanded}: {text}"
+                );
+            }
+            assert!(
+                !text.contains("完整 Diff"),
+                "a complete diff offers nothing to reveal: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1998,6 +2019,7 @@ mod tests {
             ),
             duration_ms: Some(1),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -2019,6 +2041,7 @@ mod tests {
             preview: Some("     1\t# README\n     2\tlots of content".into()),
             duration_ms: Some(1),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -2049,6 +2072,7 @@ mod tests {
             preview: Some("Goal resolved.".into()),
             duration_ms: Some(1),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };
@@ -2085,6 +2109,7 @@ mod tests {
             preview: Some("Goal resolved.".into()),
             duration_ms: Some(1),
             parallel: false,
+            batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
         };

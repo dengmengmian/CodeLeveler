@@ -52,6 +52,7 @@ impl AppState {
             monochrome: self.theme.monochrome,
             locale: self.locale,
             tools_expanded: self.tools_expanded,
+            awaiting_approval: self.approval_gated_call().cloned(),
         };
         if let Some((k, lines, hits)) = self.conv.cache.borrow().as_ref()
             && *k == key
@@ -167,6 +168,7 @@ pub fn build_conversation_lines_with_hits(
                     state.locale,
                     t,
                     state.elapsed_secs,
+                    state.approval_gated_call(),
                 ));
             }
             TranscriptItem::SubAgent(first) => {

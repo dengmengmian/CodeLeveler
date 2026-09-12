@@ -72,8 +72,20 @@ pub struct ToolCallBlock {
     pub preview: Option<String>,
     /// Wall-clock duration measured by the runtime client.
     pub duration_ms: Option<u64>,
-    /// True when this call ran in the concurrent read-only batch.
+    /// True when the runtime dispatched this call into its concurrent
+    /// read-only batch. The runtime's INTENT, which on its own says nothing
+    /// about whether anything actually ran alongside it — a lone eligible read
+    /// carries `parallel: true` too.
     pub parallel: bool,
+    /// Identity of the concurrent burst this call was observed in, or `None`
+    /// when it ran alone.
+    ///
+    /// Assigned by [`TranscriptState::push_tool_started`] from event order
+    /// alone: a call that starts while another is still Running demonstrably
+    /// overlapped it. That is an observation, not an inference from adjacency
+    /// or timestamps — two calls half a second apart in consecutive rounds
+    /// never share a batch, however close their clocks are.
+    pub batch: Option<u32>,
     /// The turn's `elapsed_secs` when this call started, so a running command
     /// can show a live elapsed (`now - started`) instead of a static block.
     pub started_elapsed_secs: u64,
@@ -111,6 +123,14 @@ pub enum TurnEndStatus {
     /// Work finished and the project's own checks then failed over the final
     /// tree. Done, checks failed — both facts on one marker.
     ChecksFailed,
+    /// The loop reached a clean end without committing an answer.
+    ///
+    /// Tool calls finishing is not a task finishing (§12): the turn's claim to
+    /// be done is the answer it wrote, and a run whose model went quiet with no
+    /// prose — or whose only prose a tool call then acted on — has made no such
+    /// claim. Substituted for [`Self::Completed`] / [`Self::Answered`] so the
+    /// green "任务已完成" cannot appear over an empty result.
+    NoFinalAnswer,
     Failed,
     Cancelled,
 }
@@ -257,6 +277,9 @@ pub enum TranscriptItem {
 #[derive(Debug, Default, Clone)]
 pub struct TranscriptState {
     items: Vec<TranscriptItem>,
+    /// Next concurrent-burst id. Monotonic for the session so two bursts are
+    /// never confused after a group closes and reopens.
+    next_batch: u32,
     /// Bumped on every mutation so the conversation renderer can cache its
     /// wrapped lines and only rebuild when the content actually changed. Every
     /// `&mut self` method calls [`Self::bump`]; over-bumping is safe (a wasted
@@ -462,6 +485,44 @@ impl TranscriptState {
         None
     }
 
+    /// Settle this turn's answer classification and report whether it has one.
+    ///
+    /// The `Final` decision is made at exactly one mechanical moment — the turn
+    /// ending on prose nothing acted on — and it has to be made BEFORE anyone
+    /// asks whether an answer exists, or every block is still `Pending` and the
+    /// answer looks absent. Doing both here is what keeps the two in step;
+    /// asking first and deciding later is the ordering bug this replaced.
+    /// Idempotent: [`Self::push_turn_end`] decides again and changes nothing.
+    pub fn settle_final_answer(&mut self) -> bool {
+        self.decide_pending_assistants(AssistantKind::Final);
+        self.has_committed_final_answer()
+    }
+
+    /// Whether this turn committed an answer: a finished assistant message,
+    /// classified [`AssistantKind::Final`], with text in it.
+    ///
+    /// Only the current turn counts — the scan stops at the previous turn-end
+    /// marker or user prompt, so last turn's answer can never vouch for this
+    /// one. Prefer [`Self::settle_final_answer`], which makes the `Final`
+    /// decision first instead of trusting the caller to have made it.
+    pub fn has_committed_final_answer(&self) -> bool {
+        for item in self.items.iter().rev() {
+            match item {
+                TranscriptItem::TurnEnd(_) | TranscriptItem::User(_) => return false,
+                TranscriptItem::Assistant(block) => {
+                    if block.done
+                        && block.kind == AssistantKind::Final
+                        && !block.text.trim().is_empty()
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Decide every still-undecided assistant block, from event order alone.
     ///
     /// Called at the two mechanical moments that carry the fact: a tool call
@@ -573,6 +634,50 @@ impl TranscriptState {
         }
     }
 
+    /// Stamp `call` with the batch it was observed in.
+    ///
+    /// The fact used is event order, not time: this call is starting while the
+    /// open group still holds a Running call, so the two were in flight
+    /// together. Both halves are required — the runtime must have dispatched
+    /// each into its concurrent batch (`parallel`), and they must have
+    /// actually overlapped. Adjacency alone never groups: two rounds of one
+    /// eligible read each produce no batch, because the first had finished
+    /// before the second was announced.
+    fn assign_batch(&mut self, call: &mut ToolCallBlock) {
+        if !call.parallel {
+            return;
+        }
+        let Some(TranscriptItem::ToolGroup(group)) = self.items.last_mut() else {
+            return;
+        };
+        if !group.open {
+            return;
+        }
+        let mut in_flight: Vec<&mut ToolCallBlock> = group
+            .calls
+            .iter_mut()
+            .filter(|c| c.status == ToolStatus::Running && c.parallel)
+            .collect();
+        if in_flight.is_empty() {
+            return;
+        }
+        // Join the burst already underway; mint one only when none of the
+        // calls in flight has been stamped yet.
+        let existing = in_flight.iter().rev().find_map(|c| c.batch);
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = self.next_batch;
+                self.next_batch = self.next_batch.wrapping_add(1);
+                id
+            }
+        };
+        for c in in_flight.iter_mut() {
+            c.batch = Some(id);
+        }
+        call.batch = Some(id);
+    }
+
     /// Record a started tool call as a running block.
     pub fn push_tool_started(
         &mut self,
@@ -583,7 +688,7 @@ impl TranscriptState {
         started_elapsed_secs: u64,
     ) {
         self.bump();
-        let call = ToolCallBlock {
+        let mut call = ToolCallBlock {
             id,
             name,
             arguments,
@@ -593,6 +698,7 @@ impl TranscriptState {
             parallel,
             started_elapsed_secs,
             applied_diff: None,
+            batch: None,
         };
         if let Some(TranscriptItem::ToolGroup(group)) = self.items.last()
             && group.open
@@ -600,6 +706,7 @@ impl TranscriptState {
         {
             self.close_tool_group();
         }
+        self.assign_batch(&mut call);
         // Visible work acting on the prose is the proof that the prose was not
         // the answer. Silent bookkeeping is NOT that proof: a real run ends
         // `answer → update_goal(complete) → turn end`, and counting that as a
@@ -1101,6 +1208,116 @@ mod tests {
         t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
     }
 
+    // ── §5: a parallel batch is observed, never inferred ────────────────────
+
+    /// Announce a call without settling it: the shape the runtime produces
+    /// when it dispatches a concurrent read-only batch (every member is
+    /// announced, then they all run).
+    fn announce(t: &mut TranscriptState, id: &str, name: &str, args: &str, parallel: bool) {
+        t.push_tool_started(ToolCallId::new(id), name.into(), args.into(), parallel, 0);
+    }
+
+    fn finish(t: &mut TranscriptState, id: &str) {
+        t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
+    }
+
+    fn batches(t: &TranscriptState) -> Vec<Option<u32>> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::ToolGroup(g) => Some(g.calls.iter().map(|c| c.batch)),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// B1: three reads announced before any finishes were in flight together,
+    /// so they share one batch.
+    #[test]
+    fn calls_announced_while_another_runs_share_one_batch() {
+        let mut t = TranscriptState::new();
+        announce(&mut t, "a", "grep", r#"{"pattern":"x"}"#, true);
+        announce(&mut t, "b", "grep", r#"{"pattern":"y"}"#, true);
+        announce(&mut t, "c", "read_file", r#"{"path":"z"}"#, true);
+        let b = batches(&t);
+        assert_eq!(b.len(), 3, "{b:?}");
+        assert!(b[0].is_some(), "{b:?}");
+        assert!(b.iter().all(|x| *x == b[0]), "one burst, one batch: {b:?}");
+    }
+
+    /// B2: THE rule the old `parallel` flag could not express. Two rounds of
+    /// one eligible read each are sequential — the first had already finished
+    /// when the second was announced — and must never render as a batch,
+    /// however close together they happened.
+    #[test]
+    fn sequential_eligible_calls_never_form_a_batch() {
+        let mut t = TranscriptState::new();
+        announce(&mut t, "a", "read_file", r#"{"path":"a"}"#, true);
+        finish(&mut t, "a");
+        announce(&mut t, "b", "read_file", r#"{"path":"b"}"#, true);
+        finish(&mut t, "b");
+        assert_eq!(batches(&t), vec![None, None]);
+    }
+
+    /// B3: a later call that overlaps only the surviving member joins its
+    /// burst — it really did run alongside it.
+    #[test]
+    fn a_call_overlapping_a_survivor_joins_its_burst() {
+        let mut t = TranscriptState::new();
+        announce(&mut t, "a", "read_file", r#"{"path":"a"}"#, true);
+        announce(&mut t, "b", "read_file", r#"{"path":"b"}"#, true);
+        finish(&mut t, "a");
+        announce(&mut t, "c", "read_file", r#"{"path":"c"}"#, true);
+        let b = batches(&t);
+        assert_eq!(b[0], b[2], "c overlapped b, which overlapped a: {b:?}");
+    }
+
+    /// B4: two bursts separated by a full settle get different ids, so a group
+    /// holding both never presents six calls as one batch of six.
+    #[test]
+    fn two_separate_bursts_get_distinct_batches() {
+        let mut t = TranscriptState::new();
+        for id in ["a", "b"] {
+            announce(
+                &mut t,
+                id,
+                "read_file",
+                &format!(r#"{{"path":"{id}"}}"#),
+                true,
+            );
+        }
+        for id in ["a", "b"] {
+            finish(&mut t, id);
+        }
+        for id in ["c", "d"] {
+            announce(
+                &mut t,
+                id,
+                "read_file",
+                &format!(r#"{{"path":"{id}"}}"#),
+                true,
+            );
+        }
+        let b = batches(&t);
+        assert_eq!(b.len(), 4, "{b:?}");
+        assert_eq!(b[0], b[1], "{b:?}");
+        assert_eq!(b[2], b[3], "{b:?}");
+        assert_ne!(b[0], b[2], "a second burst is not the first: {b:?}");
+    }
+
+    /// B5: a serial tool the runtime never put in a concurrent batch is not
+    /// batched even if the event stream overlaps it (a guard denial announced
+    /// mid-burst, say).
+    #[test]
+    fn a_call_the_runtime_did_not_dispatch_concurrently_is_never_batched() {
+        let mut t = TranscriptState::new();
+        announce(&mut t, "a", "read_file", r#"{"path":"a"}"#, true);
+        announce(&mut t, "b", "apply_patch", r#"{"patch":"p"}"#, false);
+        let b = batches(&t);
+        assert_eq!(b[1], None, "a serial call joins no burst: {b:?}");
+    }
+
     fn group_shapes(t: &TranscriptState) -> Vec<Vec<String>> {
         t.items()
             .iter()
@@ -1451,6 +1668,7 @@ mod tests {
                 preview: Some("ok".into()),
                 duration_ms: Some(1),
                 parallel: false,
+                batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
             }],

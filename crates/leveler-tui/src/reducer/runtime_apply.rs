@@ -719,6 +719,16 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
+    // §12: a clean outcome still needs an answer behind it. Only the two
+    // outcomes that render as done are rewritten — an Incomplete or Failed turn
+    // already says something went wrong.
+    let answered = state.transcript.settle_final_answer();
+    let status = match status {
+        TurnEndStatus::Completed | TurnEndStatus::Answered if !answered => {
+            TurnEndStatus::NoFinalAnswer
+        }
+        other => other,
+    };
     state.cancel_armed = false;
     state.force_cancel_armed = false;
     // The plan is a LIVE progress surface, and this turn's work is over: a

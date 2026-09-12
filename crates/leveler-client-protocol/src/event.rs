@@ -621,6 +621,7 @@ mod tests {
                     summary: "run ls".to_string(),
                     command: Some("ls".to_string()),
                     risks: vec!["network".to_string()],
+                    call_id: None,
                 },
             },
             "approval_requested",

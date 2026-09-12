@@ -501,6 +501,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec![],
+                call_id: None,
             }),
         )));
         let view = project(&state).expect("approval wait");
