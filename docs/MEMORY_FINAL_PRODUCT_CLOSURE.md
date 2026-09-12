@@ -150,36 +150,72 @@ Memory（`MemoryScope::User` 只是记下的 extension seam）。
 真实模型与真实浏览器支撑，取证自 memory store 文件、`sessions.db` 的
 `model_requests` / `turns` / `context_snapshot`，以及 WebSocket 实际发出的帧。
 
-### 11.1 八项 Dogfood 逐项证据
+### 11.1 取证用的二进制
 
-| # | 断言 | 真实取证 | 结论 |
-| --- | --- | --- | --- |
-| D1 | `记住：…` 直写 active，零模型请求 | active +1、pending +0、`model_requests` +0、`turns` +0、TUI 回显确认、kind=preference | PASS |
-| D2 | 英文 `remember: …` 同语义 | active +1、pending +0、`model_requests` +0、`turns` +0 | PASS |
-| D3 | 软信号只进 pending，拒绝后不再复提 | pending +1、`source=system_inferred`、正文在 TUI 可见；拒绝后 suppress +1，重说同一句 pending 仍为 0 | PASS |
-| D4 | 记忆句式夹带任务时不直写 | 直写 0、pending +0、`model_requests` +6、编码任务真实执行、原始消息未被改写 | PASS |
-| D5 | 召回块有硬预算且不入历史 | 召回块存在且位于 user 消息之前、无 id 无标题、正文截断、持久化 transcript 中 memory 块 0 | PASS |
-| D6 | FullAccess 下 agent 写入仍需人 | 有人时：`remember` 调用 1 次、审批浮层出现、批准前 active +0、批准后 +1；无人值守：active +0、pending +1 | PASS |
-| D7 | 真实浏览器点「忽略」走 RejectMemory | 真实 Chromium + 真实 runtime：`reject_memory` 帧 1、`forget_memory` 帧 0、pending −1、suppress +1、active/archive 不变 | PASS |
-| D8 | Economy 不携带任何 memory 上下文 | 真实模型请求发生的前提下 guidance/catalog/召回块/记忆 id/工具提及全部为 0；同一 profile 下用户 CLI 直写仍成功（rc=0，active 5→6） | PASS |
+Dogfood 跑的是 release 二进制，不是 `cargo run`。`BuildIdentity::matches` 要求
+两侧都 `dirty=false`，所以工作树还有未提交改动时无法构建一个可自证的干净二进制。
+取证二进制由本仓库工作树的一份完整副本在一个临时本地仓库里提交后构建，编译期
+戳入的 `LEVELER_BUILD_COMMIT=02a1eb6ab346`（`dirty=false`）指向那个临时仓库，
+**不是**本仓库的 revision。
 
-D7 的落盘证据是 `memory/suppress/<fingerprint>.json`，内容只有
-`fingerprint` / `rejected_at` / `candidate_id` —— 拒绝是拒绝，不是把候选搬进
-archive，也没有复用 forget 路径。UI 上 `Pending` 由 1 变 0，会话流里出现
-「已拒绝候选 […]，不再重复提示」。
+这一层间接必须能被机械验证，否则所有测量都不可归属。逐文件比对该副本与分支
+HEAD，除 `docs/` 外只有三处差异，全部落在测试代码内：
 
-D8 曾有一次 `USER_DIRECT_WRITE_UNDER_ECONOMY=False`，根因在夯具而非产品：
-`activate` 是幂等的，那一版驱动复用了同一条正文，所以计数本就不该变。改为唯一
-正文后复跑为 True。
+| 文件 | 差异 |
+| --- | --- |
+| `crates/leveler-memory/src/lib.rs` | `mod tests` 内新增两个测试 |
+| `crates/leveler-tui/tests/reducer.rs` | 新增两个测试 |
+| `crates/leveler-app/src/lib.rs` | `#[cfg(test)]` 内一处 rustfmt 换行 |
+
+参与编译的产品代码逐字节一致，所以下表的观测可归属于分支 HEAD 的产品代码。
+
+### 11.2 八项 Dogfood 逐项证据
+
+| # | 真实输入 | 断言 | 真实取证 | 结论 |
+| --- | --- | --- | --- | --- |
+| D1 | `/remember 用户希望终端信息紧凑，不展示冗长的模型推导` | 用户直写命令直接生效，零模型请求 | active +1、pending +0、`model_requests` +0、`turns` +0、`kind=preference`、TUI 显示保存成功 | PASS |
+| D2 | `记住：提交前一定要先运行 pnpm lint` | 严格自然语言命令与 slash 同语义 | active +1、pending +0、`model_requests` +0、`turns` +0、反馈可见 | PASS |
+| D3 | `我通常希望提交前先运行 pnpm lint。` | 软信号只进 pending，拒绝后不再复提 | active +0、pending +1、`source=system_inferred`、正文在 `/memory` 列表可见；拒绝后 active=2 pending=0 archive=0 suppress +1；同一句再说一次 pending 仍为 0 | PASS |
+| D4 | `记住输出要简洁，然后修复 tests/spelling.rs 里的拼写错误` | 夹带任务的句子不被当成记忆命令吞掉 | 直写 0、pending +0、`model_requests` +6、`tests/spelling.rs` 的 `Helo` 被改成 `Hello`、原始消息在 `session_messages` 中完整保留 | PASS |
+| D5 | 新会话提问 `这个界面能不能再克制一点？` | 词法零命中时 standing preference 仍被召回 | `memory search` 命中 0；真实 `ContextSnapshot` 出现 `Lasting preferences`，其中 id、title、body 三者齐全（渲染行 `- [mem-07125ea3…] 输出偏好: 用户希望终端信息紧凑…`）；召回块位于当轮 user message 之前；持久化 transcript 中 memory 块为 0 | PASS |
+| D6 | FullAccess 下要求 agent 用 `remember` 保存一条约定 | agent 写入在任何 profile 下都需要真人 | 有人可达：`remember` 调用 1 次、审批浮层出现、批准前 active +0、批准后 +1；无人值守：active +0、pending +1，候选留在等待确认 | PASS |
+| D7 | 真实 Chromium 在 Inspector → More → Memory 点「忽略」 | 拒绝走 RejectMemory，不复用 forget | `reject_memory` 帧 1、`forget_memory` 帧 0、pending −1、suppress +1、active 与 archive 不变、UI `Pending` 1→0、会话流出现已拒绝且不再复提的提示 | PASS |
+| D8 | Economy profile 下发起真实任务 | Economy 不携带任何 memory 上下文，但用户控制面仍可用 | 真实模型请求确实发生的前提下 guidance / catalog / 召回块 / 记忆 id / 工具提及全部为 0；同一 profile 下 `leveler memory remember` 成功（rc=0，active 5→6） | PASS |
+
+D5 的 id/title/body 不是巧合，而是契约：`render_entry_line` 渲染
+`- [{id}] {title}: {body}`，预算不足时**先截正文、保住 id 与 title**，因为一条
+模型能回查的记忆比一次静默省略更有价值。硬预算与 UTF-8 边界截断由
+`MemoryRecallPlan` 的单元测试证明，不是这一项 Dogfood 的语义。
+
+D7 的落盘证据是 `memory/suppress/<fingerprint>.json`，内容只有 `fingerprint`、
+`rejected_at`、`candidate_id` —— 拒绝是拒绝，不是把候选搬进 archive。
+
+### 11.3 两处曾经的误读，根因都在夯具
+
+两条错误读数都不是产品缺陷，都已经用真实复跑纠正，记在这里是为了让下一个读者
+不必重新怀疑结论。
+
+**D5 曾报 `ID=False TITLE=False`。** 驱动拿"第一条 kind=preference 的 active
+记录"去和快照比对，而那时 D1、D2 已经写入多条 preference，比中的是另一行。改为
+用写入本身返回的 id 与 title 比对后复跑，三者齐全。
+
+**D8 曾报 Economy 下用户 CLI 直写失败。** `MemoryStore::activate` 是幂等的，那
+一版驱动复用了同一条正文，计数本就不应该变。换成唯一正文后复跑 `rc=0`，
+active 5→6。
+
+**D7 的四次失败尝试同样是驱动缺陷。** 最后一个根因值得单独记：
+`get_by_text(...).count()` 不看可见性，折叠的 `<details>` 里的元素也计入，于是
+驱动误判 Memory 面板已展开，随后每次点击都超时在一个隐藏按钮上。改为读
+`details.open` 属性后一次通过。Web 产品侧在这四次里没有缺陷。
 
 ## 12. 终局字段
 
 ```
 DOGFOOD_D1_DIRECT_WRITE=PASS
-DOGFOOD_D2_ENGLISH_PREFIX=PASS
+DOGFOOD_D2_NATURAL_DIRECT=PASS
 DOGFOOD_D3_SOFT_SIGNAL=PASS
-DOGFOOD_D4_TASK_CARRIER=PASS
-DOGFOOD_D5_RECALL_BUDGET=PASS
+DOGFOOD_D4_MIXED_TASK=PASS
+DOGFOOD_D5_CROSS_SESSION_RECALL=PASS
 DOGFOOD_D6_FULLACCESS_CONSENT=PASS
 DOGFOOD_D7_WEB_REJECT=PASS
 DOGFOOD_D8_ECONOMY=PASS
