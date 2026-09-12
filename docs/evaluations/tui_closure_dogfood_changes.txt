@@ -1,0 +1,40 @@
+⑂ master
+ 文件                                          │diff --git a/internal/config/config.go b/internal/config/config.go
+› internal/config/config.go  +4 -3             │index f6f6db1..e9d32ed 100644
+  internal/worker/worker.go  +48 -16           │--- a/internal/config/config.go
+  internal/worker/worker_test.go  +39 -0       │+++ b/internal/config/config.go
+                                               │@@ -9,7 +9,8 @@ type WorkerQueueGroupsConfig struct {
+                                               │
+                                               │ // WorkerConfig is the worker's slice of the service configuration.
+                                               │ type WorkerConfig struct {
+                                               │-       Group       string                  `mapstructure:"group"`
+                                               │-       Concurrency int                     `mapstructure:"concurrency"`
+                                               │-       QueueGroups WorkerQueueGroupsConfig
+                                               │`mapstructure:"queue_groups"`
+                                               │+       Group            string                  `mapstructure:"group"`
+                                               │+       Concurrency       int
+                                               │`mapstructure:"concurrency"`
+                                               │+       LightConcurrency  int
+                                               │`mapstructure:"light_concurrency"`
+                                               │+       QueueGroups       WorkerQueueGroupsConfig
+                                               │`mapstructure:"queue_groups"`
+                                               │ }
+                                               │
+                                               │↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+                                               │
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                                    │
+╰─────────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯

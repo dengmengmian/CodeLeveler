@@ -1,0 +1,39 @@
+
+ CodeLeveler v0.2.0-beta.1 · lab ·  master
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+        58 │   // Run consumes the main group until stop is closed.
+        59 │   func (w *Worker) Run(stop <-chan struct{}) {
+        39 │ -  for {
+        40 │ -   select {
+        41 │ -   case <-stop:
+        42 │ -    return
+        43 │ -   case w.sem <- struct{}{}:
+        44 │ -    task, ok := w.poll(w.cfg.Group)
+        45 │ -    if !ok {
+        46 │ -     <-w.sem
+        47 │ -     continue
+        48 │ -    }
+        49 │ -    w.taskWg.Add(1)
+        50 │ -    go func() {
+        51 │ -     defer w.taskWg.Done()
+        52 │ -     defer func() { <-w.sem }()
+        60 │ +  if w.lightSem != nil {
+        61 │ +   go w.runGroup(stop, w.lightGroup, w.lightSem)
+        62 │ +  }
+        63 │ +  w.runGroup(stop, w.cfg.Group, w.sem)
+        64 │ + }
+        65 │ +
+        66 │ + // runGroup consumes tasks from group under sem until stop is closed.
+        67 │ + func (w *Worker) runGroup(stop <-chan struct{}, group string, sem chan struct{}) {
+        68 │ +  for {
+        69 │ +   select {
+        70 │ +   case <-stop:
+        71 │ +    return
+                                                                                                                   ▼120
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 16k/1M · 缓存 97%

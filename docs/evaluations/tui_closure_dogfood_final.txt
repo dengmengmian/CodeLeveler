@@ -1,0 +1,39 @@
+
+ CodeLeveler v0.2.0-beta.1 · lab ·  master
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+        40 │ +   t.Fatalf("expected light:task from the light group, got %q ok=%v", task, ok)
+        41 │    }
+        42 │   }
+
+    ▸ 执行了 2 个命令
+    ✓ 执行命令  $ go test ./internal/worker/... · 0.9s · 1 行
+    ✓ 执行命令  $ go vet ./... · 0.5s
+
+    ✓ 更新计划 · 3 行
+
+  ● 完成，go test ./internal/worker/... 和 go vet ./... 均通过。
+
+    改动内容：
+
+    • internal/worker/worker.goWorker 新增 lightSem 与 lightGroup 字段（worker.go:11-12），Config 新增
+      LightConcurrency（worker.go:21）。
+    • initLightChannel（worker.go:37-48）：LightGroup 为空或等于主组时 lightSem 保持 nil、维持原有单组行为；否则按
+      LightConcurrency 建独立信号量，未配置时回退到主组并发数。
+    • Run（worker.go:59-64）拆出 runGroup：存在独立 light 组时以 goroutine 并发消费 light 组，主组照旧，两者共用同一
+      stop 与 taskWg，信号量互不干扰。
+
+    • internal/worker/worker_test.go — 补了 5 个测试覆盖空组/等于主组时不建信号量、独立组容量、默认并发回退及 light
+      组队列来源。
+
+    一个设计说明：LightConcurrency <= 0 时回退到主组并发数（而不是禁用 light 消费），这样只配了 LightGroup
+    忘了配并发数也不会悄悄丢任务；如果你更希望这种情况直接不建信号量，说一声我改。
+
+  ── ✓ 任务已完成 · 17 次工具 · 1m 58s · 验证 ✓ ──────────────────────────────────────────────────────────────────────
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  / 命令 · ! Shell · @ 文件 · Shift+Tab 权限 · Ctrl+? 快捷键
+  上下文 16k/1M · 缓存 97%

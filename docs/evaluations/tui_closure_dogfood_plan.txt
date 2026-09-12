@@ -1,0 +1,39 @@
+
+ CodeLeveler v0.2.0-beta.1 · lab ·  master
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+  ▌ internal/worker/worker.go 现在只有一组消费信号量。请给 light 任务加独立限流：先读 internal/config/config.go 和
+  ▌ internal/worker/worker.go，并搜索 WorkerQueueGroupsConfig 与 w.sem 的用法；然后在 config.go 里加 LightConcurrency
+  ▌ 字段；在 worker.go 里加 lightSem 和 lightGroup 字段以及 initLightChannel 方法，LightGroup 为空或等于主组时保持现有
+  ▌ 单组行为；最后用 go test ./internal/worker/... 验证。
+
+    ▸ 检查代码库
+    · 读取文件  internal/config/config.go · 15 行
+    · 读取文件  internal/worker/worker.go · 43 行
+    · 搜索代码  "WorkerQueueGroupsConfig" · 3 行
+    · 搜索代码  "w\.sem" · 3 行
+    · 读取文件  internal/worker/worker_test.go · 18 行
+    · 读取文件  go.mod · 3 行
+
+  ● 已读完三个文件和相关用法。现在结构清楚了：WorkerConfig 缺 LightConcurrency，Worker 只有单一 sem，Run
+    只消费主组。开始修改。
+
+    ✓ 更新计划 · 3 行
+
+
+⠦ 等待模型 · 当前 1/3 · 58s · 7 次工具 · ↑12,130 ↓3,186
+  ▼ 计划 · 0/3 已完成 · 当前 1/3
+    ● 1. config.go 加 LightConcurrency 字段
+    ○ 2. worker.go 加 lightSem/lightGroup 字段与 initLightChannel，接入 New 和 Run
+    ○ 3. 补充单组行为测试并运行 go test ./internal/worker/...
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ›                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────── deepseek-v4-flash (max) · balanced · auto · chat ─╯
+  Esc 打断 · Ctrl+C 取消
+  上下文 15k/1M · 缓存 97%
