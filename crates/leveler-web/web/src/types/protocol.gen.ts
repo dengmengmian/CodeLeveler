@@ -109,6 +109,8 @@ export interface UiAgentObservation {
 
 /** A pending permission request, projected for display. */
 export interface UiApprovalRequest {
+  /** The tool call this request is holding, when the runtime knows it. A UI needs it to tell "announced, waiting for you" apart from "running": the call has an event on screen already, and without an id the only way to find its row would be to guess at the latest running call. `None` for a request that is not about one specific call (a standing `request_permissions`), and for a session recorded before this field. */
+  call_id?: string | null;
   /** The concrete command, when the tool is `run_command`. */
   command?: string | null;
   id: ApprovalId;
