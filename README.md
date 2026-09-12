@@ -243,6 +243,52 @@ the daemon socket transport is not available there yet.
 4. **Hand off** — keep the diff, transcript, verification result, and session
    state available for review or resume.
 
+## Optional capabilities
+
+Some capabilities sit outside the core tool surface. A model is offered one only
+when this machine can actually provide it and the current work profile asks for
+it:
+
+```text
+exposed = enabled (work profile) ∩ available (this machine)
+```
+
+Neither half is enough on its own. `Economy` asks for no optional capability, so
+an Economy turn offers none of them however the machine is configured.
+
+### Browser control
+
+Three tools reach the model. `browser_tab` navigates and manages tabs,
+`browser_act` clicks, fills, types, presses, selects and scrolls, and
+`browser_inspect` reads the console, page errors and network. Each owns one job,
+and no action is reachable through two of them.
+
+A call may name a browser. Otherwise the choice runs in this order:
+
+| Order | Source |
+| --- | --- |
+| 1 | the browser named on the call |
+| 2 | `[browser].default` in configuration |
+| 3 | the operating system's default browser |
+
+A browser that was asked for but cannot be driven is an error naming that
+browser and where it was chosen. A different installed browser is never
+substituted, and Edge and Chrome stay distinct products even though both speak
+CDP. When the browser this host would select cannot be driven, no browser tools
+are offered at all rather than a surprising one.
+
+### Web search
+
+`web_search` needs a Tavily API key in `LEVELER_SEARCH_API_KEY`. Without one the
+tool is never registered, so it is absent from the model's tool list rather than
+present and failing when called. Its parameters are `query` and `count`
+(default 5, maximum 10), and the model receives titles, URLs and snippets.
+
+One request, a ten-second timeout, no retry. It does not fall back to the
+browser and the browser does not fall back to it: two capabilities, configured
+separately. When the active mode or sandbox denies network access, `web_search`
+returns an error instead of bypassing it.
+
 ## Safety and platform support
 
 CodeLeveler can modify files and execute local commands, so its safety boundary

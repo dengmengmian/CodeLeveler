@@ -470,6 +470,69 @@ It must not silently change Tool semantics because:
 “this task looks hard”
 ```
 
+### 8.1 Available, Enabled, and Exposed Are Three Different Facts
+
+An optional capability reaches a model only where two independent answers
+agree:
+
+```text
+AVAILABLE   what this MACHINE can provide
+      ∩
+ENABLED     what this PRODUCT MODE asks for
+      =
+EXPOSED     what the model is offered
+```
+
+AVAILABLE is mechanical: is a search provider configured, is `git` on `PATH`,
+does this model accept an image, can the browser this host would select be
+driven. Nothing in it is a product choice and nothing in it consults how
+capable the model seems.
+
+ENABLED is the user's decision about cost and scope, carried by the work
+profile. `Economy` asks for no optional capability at all, which is why a
+machine with a browser runtime installed and a search key configured still
+offers an Economy turn neither of them.
+
+The intersection is a boundary rather than a suggestion: neither side can
+widen the other. A capability the host owns but the mode did not ask for is
+not advertised, and a capability the mode asked for but the host cannot
+provide is not conjured. This is what keeps “the code for it exists” from
+growing back into “the model can use it”.
+
+### 8.2 Browser Control and Web Search Are Separate Capabilities
+
+They are configured separately, become available for different reasons, and
+neither is the other's fallback. A missing search key does not turn the
+browser into a search tool, and a browser that cannot start does not redirect
+to search.
+
+Browser control puts three tools in front of the model — one for navigation
+and tabs, one for acting as a user would, one for observation — so that each
+expresses one intent rather than one door with an `action=` parameter onto the
+other two.
+
+Which browser gets driven is a precedence, not a search for something that
+works:
+
+```text
+named on the call
+      >
+configured default
+      >
+system default browser
+```
+
+A selected browser that cannot be driven is an error naming that browser and
+the layer that chose it. Substituting a different installed browser would make
+the answer to “which browser did this run in” unknowable, so availability for
+this capability asks whether the SELECTED browser is drivable, not whether any
+browser is installed.
+
+Web search keeps a provider-neutral tool contract. The model's parameters and
+the results it reads are fixed by the tool, not by whichever backend is
+answering, so replacing the backend cannot widen the schema or leak a
+provider's response envelope into the transcript.
+
 ---
 
 ## 9. Host Authority: Who Is Allowed to Change the Real World?
