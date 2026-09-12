@@ -357,6 +357,10 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
                 continues_active_goal: false,
                 prior_epoch_open: true,
             },
+            Some(leveler_model::Message::text(
+                leveler_model::Role::User,
+                "test",
+            )),
             None,
             &mut |_| {},
             cancellation.clone(),

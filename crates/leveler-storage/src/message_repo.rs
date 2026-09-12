@@ -185,6 +185,83 @@ impl<'a> MessageRepository<'a> {
         Ok(())
     }
 
+    /// Fenced, idempotent recovery projection for one turn's initiating user
+    /// message. Identity is `(session_id, turn_id, role=user)`; the content is
+    /// deliberately not compared because equal user text can start distinct
+    /// turns. `BEGIN IMMEDIATE` serializes the check and insert.
+    pub async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &leveler_core::TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError> {
+        let redacted = crate::redact_json_payload_for_session(
+            "session message",
+            payload,
+            Some(session_id.as_str()),
+        )?;
+        let mut tx = begin_immediate(self.db.pool())
+            .await
+            .map_err(crate::OwnershipError::Storage)?;
+        let current: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT owner_runtime_id, owner_epoch FROM tasks WHERE session_id = ?1 AND id = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(token.task_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        let owned = current.as_ref().is_some_and(|(runtime, epoch)| {
+            runtime.as_deref() == Some(token.runtime_id.as_str())
+                && *epoch == token.owner_epoch.get() as i64
+        });
+        if !owned {
+            drop(tx);
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_messages \
+             WHERE session_id = ?1 AND turn_id = ?2 \
+             AND json_extract(payload, '$.role') = 'user')",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        if exists {
+            tx.commit()
+                .await
+                .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+            return Ok(false);
+        }
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        sqlx::query(
+            "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(session_id.as_str())
+        .bind(next)
+        .bind(redacted)
+        .bind(now.to_rfc3339())
+        .bind(turn_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        Ok(true)
+    }
+
     /// Load the payloads of one turn, in order.
     pub async fn load_for_turn(
         &self,

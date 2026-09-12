@@ -6,8 +6,9 @@
 //! The runtime exposes progress as a synchronous `&mut (dyn FnMut(AgentEvent) + Send)`
 //! observer with no channel. This client wraps that callback in a closure that
 //! forwards each event into a `tokio::sync::broadcast`, and drives the turn on a
-//! blocking thread (the turn future is not `Send`) so `send` returns
-//! immediately.
+//! blocking thread (the turn future is not `Send`). Embedded `send` returns
+//! after dispatch; the daemon composition waits for durable turn admission
+//! before its transport writes an ACK.
 //!
 //! Approvals round-trip over the protocol: [`ChannelApprover`] emits an
 //! `ApprovalRequested` event and awaits the matching `ApprovalDecision` command
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use leveler_core::{CheckpointId, SessionId};
@@ -72,6 +73,61 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
         UiApprovalDecision::Deny => leveler_execution::ApprovalDecision::Deny,
     }
 }
+
+/// A command ACK means the engine has committed the turn's write-ahead input
+/// record. The model loop may still be running, but a process death after this
+/// point can reconstruct the transcript from durable state.
+async fn await_turn_acceptance(
+    accepted: oneshot::Receiver<Result<(), String>>,
+) -> Result<(), ClientError> {
+    accepted
+        .await
+        .map_err(|_| {
+            ClientError::Runtime("turn worker stopped before durable admission".to_string())
+        })?
+        .map_err(ClientError::Runtime)
+}
+
+/// Integration-test-only crash barrier. It is inert unless a daemon process
+/// was built with the non-default `test-crash-barrier` feature and receives a
+/// unique marker path directly under its isolated `LEVELER_HOME`. The test
+/// kills the process after the marker is created, so this thread deliberately
+/// never resumes.
+#[cfg(feature = "test-crash-barrier")]
+fn hit_after_turn_started_test_barrier() {
+    let Some(raw_path) = std::env::var_os("LEVELER_TEST_AFTER_TURN_STARTED_BARRIER") else {
+        return;
+    };
+    let Some(raw_home) = std::env::var_os("LEVELER_HOME") else {
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+    let home = PathBuf::from(raw_home);
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".test-crash-barrier-"));
+    if path.parent() != Some(home.as_path()) || !valid_name {
+        tracing::warn!(path = %path.display(), "ignored invalid test crash barrier path");
+        return;
+    }
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"after_turn_started\n"));
+    if let Err(error) = write_result {
+        tracing::warn!(%error, path = %path.display(), "could not announce test crash barrier");
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Production/default builds contain no environment-controlled crash path.
+#[cfg(not(feature = "test-crash-barrier"))]
+fn hit_after_turn_started_test_barrier() {}
 
 /// Pending candidates as UI entries. Kept next to the listing handlers so the
 /// three places that emit `MemoryList` cannot drift on what "pending" means.
@@ -259,6 +315,10 @@ pub struct InProcessRuntimeClient {
     /// Cancelled to retire the process once work has drained. `None` for an
     /// in-process runtime, which has no process of its own to retire.
     process_shutdown: Option<CancellationToken>,
+    /// A daemon must not emit its wire ACK until a fresh turn's write-ahead
+    /// input is durable. Embedded callers keep the historical dispatch-only
+    /// return so current-thread runtimes never wait on their own worker.
+    durable_wire_ack: bool,
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
@@ -315,6 +375,13 @@ impl InProcessRuntimeClient {
         self
     }
 
+    /// Enable the daemon transport's durable ACK boundary. Set only by the
+    /// `serve` composition root; this is not a user-selectable policy.
+    pub fn with_durable_wire_ack(mut self) -> Self {
+        self.durable_wire_ack = true;
+        self
+    }
+
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
     /// interactive TUI sessions.
     pub fn new_with_options(
@@ -355,6 +422,7 @@ impl InProcessRuntimeClient {
             active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
             shutting_down: shutting_down.clone(),
             process_shutdown: None,
+            durable_wire_ack: false,
         }
     }
 
@@ -778,9 +846,10 @@ impl InProcessRuntimeClient {
 
     /// The shared turn-launch preamble: admit the session (one active main
     /// turn), optionally name a placeholder session after its first message,
-    /// capture the pre-turn checkpoint, and append the user's message to the
-    /// client stream. Every path that starts a main turn goes through here so
-    /// the sequence cannot drift between commands.
+    /// capture the pre-turn checkpoint, and emit the optimistic user-message
+    /// notification. Every path that starts a main turn goes through here so
+    /// the sequence cannot drift between commands. This client notification is
+    /// not a persistence witness; daemon ACKs wait on the turn record instead.
     async fn stage_turn(
         &self,
         session_id: &SessionId,
@@ -1058,10 +1127,10 @@ impl InProcessRuntimeClient {
         attachments: Vec<AttachmentRef>,
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
-    ) {
+    ) -> oneshot::Receiver<Result<(), String>> {
         self.notify_memory_candidates(&session_id, &content);
         let parts = self.content_parts(&content, &attachments);
-        self.spawn_content_turn(session_id, parts, cancel, config);
+        self.spawn_content_turn(session_id, parts, cancel, config)
     }
 
     fn spawn_goal_turn(
@@ -1070,11 +1139,11 @@ impl InProcessRuntimeClient {
         content: String,
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
-    ) {
+    ) -> oneshot::Receiver<Result<(), String>> {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
         self.notify_memory_candidates(&session_id, &content);
-        self.spawn_direct_goal_turn(session_id, content, cancel, config);
+        self.spawn_direct_goal_turn(session_id, content, cancel, config)
     }
 
     fn spawn_direct_goal_turn(
@@ -1083,7 +1152,7 @@ impl InProcessRuntimeClient {
         content: String,
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
-    ) {
+    ) -> oneshot::Receiver<Result<(), String>> {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
@@ -1096,13 +1165,27 @@ impl InProcessRuntimeClient {
         // Text the user sends while this turn runs lands here and is injected
         // at the top of the next round.
         let steering = self.steering_for(&session_id);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
 
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
                 let mut bridge = EventBridge::new(events.clone());
-                let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let mut observer = |event: leveler_engine::EngineEvent| {
+                    if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                        && let Some(tx) = observer_acceptance
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    {
+                        let _ = tx.send(Ok(()));
+                        hit_after_turn_started_test_barrier();
+                    }
+                    bridge.forward(event);
+                };
                 let result = app
                     .run_in_session_with_clarifier(
                         &session_id,
@@ -1117,6 +1200,18 @@ impl InProcessRuntimeClient {
                         cancel,
                     )
                     .await;
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let detail = result
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "turn ended before durable admission".to_string());
+                    let _ = tx.send(Err(detail));
+                }
                 let outcome = turn_runtime_event(result);
                 let _ = events.send(outcome);
                 active.finish(&session_id);
@@ -1126,6 +1221,7 @@ impl InProcessRuntimeClient {
                 // (R006 R6-P4).
             });
         });
+        accepted_rx
     }
 
     /// `/recap` (long-goal P3): cut a durable goal checkpoint and surface it
@@ -1419,7 +1515,7 @@ impl InProcessRuntimeClient {
         parts: Vec<ContentPart>,
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
-    ) {
+    ) -> oneshot::Receiver<Result<(), String>> {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
@@ -1429,6 +1525,7 @@ impl InProcessRuntimeClient {
         let repo = self.app.layout.repo_root.clone();
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
+        let (accepted_tx, accepted_rx) = oneshot::channel();
 
         // The runtime's observer is `&mut dyn FnMut`, so the turn future is not
         // `Send` and cannot be `tokio::spawn`ed. Drive it on a blocking thread
@@ -1439,7 +1536,20 @@ impl InProcessRuntimeClient {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
                 let mut bridge = EventBridge::new(events.clone());
-                let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let mut observer = |event: leveler_engine::EngineEvent| {
+                    if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                        && let Some(tx) = observer_acceptance
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    {
+                        let _ = tx.send(Ok(()));
+                        hit_after_turn_started_test_barrier();
+                    }
+                    bridge.forward(event);
+                };
                 let result = app
                     .run_in_session_with_content(
                         &session_id,
@@ -1453,11 +1563,24 @@ impl InProcessRuntimeClient {
                         cancel,
                     )
                     .await;
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let detail = result
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "turn ended before durable admission".to_string());
+                    let _ = tx.send(Err(detail));
+                }
                 let outcome = turn_runtime_event(result);
                 let _ = events.send(outcome);
                 active.finish(&session_id);
             });
         });
+        accepted_rx
     }
     /// Restore a checkpoint: roll back the transcript, task epoch, and (git)
     /// workspace to the checkpoint, surfacing any partial-failure honestly.
@@ -1634,19 +1757,24 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // CollaborationMode is the single source of turn profile:
                 // goal → goal_mode / update_goal path; chat|plan → content turn.
                 // Plan read_only is applied inside engine from session.collaboration.
-                if collaboration_routes_submit_to_goal(&config.collaboration) {
+                let accepted = if collaboration_routes_submit_to_goal(&config.collaboration) {
                     if !attachments.is_empty() {
                         // Goal path is text-first; attachments still need the
                         // multimodal content turn (goal_mode stays false unless
                         // the user used /goal). Prefer content when media present.
-                        self.spawn_turn(session_id, content, attachments, cancel, config);
+                        self.spawn_turn(session_id, content, attachments, cancel, config)
                     } else {
-                        self.spawn_goal_turn(session_id, content, cancel, config);
+                        self.spawn_goal_turn(session_id, content, cancel, config)
                     }
                 } else {
-                    self.spawn_turn(session_id, content, attachments, cancel, config);
+                    self.spawn_turn(session_id, content, attachments, cancel, config)
+                };
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
                 }
-                Ok(())
             }
             ClientCommand::RunGoal {
                 session_id,
@@ -1654,8 +1782,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let config = self.runtime_config(&session_id).await?;
                 let cancel = self.stage_turn(&session_id, &content, true).await?;
-                self.spawn_goal_turn(session_id, content, cancel, config);
-                Ok(())
+                let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
             }
             ClientCommand::AddAttachment { session_id, path } => {
                 let media_root = self.media_root.clone();
@@ -1848,8 +1981,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     content
                 };
                 let cancel = self.stage_turn(&session_id, &goal, false).await?;
-                self.spawn_goal_turn(session_id, goal, cancel, config);
-                Ok(())
+                let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
             }
             ClientCommand::ListMemory {
                 session_id,

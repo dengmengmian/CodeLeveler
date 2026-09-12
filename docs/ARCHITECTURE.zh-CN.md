@@ -679,6 +679,18 @@ CodeLeveler 把“发生了什么”和“事情是否做对了”明确分开�
 
 未来一个智能体可能运行数小时、数天，甚至跨设备继续工作；持久化是这种形态的基础。
 
+### 11.3 回合的持久接收边界
+
+一个新的用户回合或对话回合，只有在同一条 turn 记录已经携带版本化、可重放的 initiating user message 后，才可以持久地进入 `running`。这份预写载荷是崩溃恢复时的权威输入；`session_messages` 是供客户端展示和后续模型请求使用的有序 transcript 投影。
+
+```text
+持久的 running turn
+        ⇒
+持久且可重放的 initiating input
+```
+
+daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 transcript 追加之前退出，重启恢复会在当前 ownership token 下，以 turn id 而不是消息内容作为身份键，恰好一次地补齐 initiating message，然后才结算孤儿 turn。`UserMessageAdded` 是乐观的客户端通知；它不是权威输入、持久化命令或 durability witness。
+
 ---
 
 ## 12. 模型接入与能力协商

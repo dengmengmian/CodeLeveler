@@ -3,7 +3,7 @@
 //! current token, and a runtime never touches another runtime's task.
 
 use leveler_core::{OwnershipToken, RuntimeId, SessionId, TurnId};
-use leveler_storage::{EngineStores, TerminalStore, TurnStore};
+use leveler_storage::{EngineStores, MessageStore, TerminalStore, TurnStore};
 
 use crate::{EngineError, EngineEvent, TurnOutcome};
 
@@ -13,6 +13,7 @@ use crate::{EngineError, EngineEvent, TurnOutcome};
 /// interrupted.
 pub async fn reap_running_turns_owned(
     turns: &dyn TurnStore,
+    messages: &dyn MessageStore,
     terminal: &dyn TerminalStore,
     token: &OwnershipToken,
     session_id: Option<&SessionId>,
@@ -22,6 +23,26 @@ pub async fn reap_running_turns_owned(
     for turn in &running {
         let session_id = SessionId::new(turn.session_id.clone());
         let turn_id = TurnId::new(turn.id.clone());
+        // Fresh user/chat turns carry their initiating input in the same row
+        // that made them `running`. If the process died before TurnSink
+        // appended the transcript projection, rebuild it once by turn
+        // identity before recording the interruption. Legacy/resume turns
+        // have no such payload and retain their historical behavior.
+        if matches!(turn.kind.as_str(), "user" | "chat")
+            && let Some(payload) = turn.payload.as_deref()
+        {
+            let message = crate::turn::TurnInitiationPayload::decode(payload)?;
+            let message_payload = serde_json::to_string(&message)?;
+            messages
+                .ensure_initiating_message_owned(
+                    token,
+                    &session_id,
+                    &turn_id,
+                    &message_payload,
+                    leveler_core::now(),
+                )
+                .await?;
+        }
         let event = EngineEvent::TurnFinished {
             stop: None,
             turn_id: turn_id.clone(),
@@ -103,6 +124,7 @@ pub async fn reap_after_restart(
             .await?;
         let events = reap_running_turns_owned(
             stores.turns.as_ref(),
+            stores.messages.as_ref(),
             stores.terminal.as_ref(),
             &token,
             Some(&session),

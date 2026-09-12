@@ -233,6 +233,10 @@ async fn run_chat_turn(
                 continues_active_goal: false,
                 prior_epoch_open: true,
             },
+            Some(leveler_model::Message::text(
+                leveler_model::Role::User,
+                "test",
+            )),
             None,
             &mut |_| {},
             cancellation.clone(),

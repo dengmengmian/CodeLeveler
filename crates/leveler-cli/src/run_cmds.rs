@@ -935,7 +935,8 @@ pub(crate) async fn cmd_serve(
             sandbox,
             auto_approve,
         )
-        .with_process_shutdown(shutdown.clone()),
+        .with_process_shutdown(shutdown.clone())
+        .with_durable_wire_ack(),
     );
     let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
 
