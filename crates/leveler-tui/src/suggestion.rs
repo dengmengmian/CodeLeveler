@@ -67,6 +67,7 @@ pub fn is_visible(state: &AppState) -> bool {
         && state.runtime_connected
         && state.workbench_focus == WorkbenchFocus::Input
         && state.composer.is_empty()
+        && state.pending_attachments.is_empty()
         && !state.composer.is_browsing_history()
         && state.overlay.is_none()
         && state.turn_nav.is_none()

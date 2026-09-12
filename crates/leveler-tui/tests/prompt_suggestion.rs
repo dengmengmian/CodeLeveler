@@ -137,6 +137,19 @@ fn composer_row(screen: &str) -> String {
         .to_string()
 }
 
+fn image_attachment() -> leveler_client_protocol::AttachmentRef {
+    leveler_client_protocol::AttachmentRef {
+        id: leveler_client_protocol::AttachmentId::new("a1"),
+        kind: leveler_client_protocol::AttachmentKind::Image,
+        name: "clipboard.png".to_string(),
+        mime_type: "image/png".to_string(),
+        size_bytes: 1024,
+        sha256: "0".repeat(64),
+        width: Some(64),
+        height: Some(64),
+    }
+}
+
 /// Complete a turn whose `update_goal` carried `status` and `next_step`.
 fn goal_turn(s: &mut AppState, status: &str, next_step: Option<&str>) {
     let id = ToolCallId::new("goal");
@@ -575,6 +588,57 @@ fn c7_the_external_editor_is_seeded_with_the_empty_buffer() {
         }
         other => panic!("expected one OpenExternalEditor, got {other:?}"),
     }
+    assert_eq!(s.prompt_suggestion, None);
+}
+
+#[test]
+fn c8_staging_a_clipboard_image_dismisses_the_ghost() {
+    let mut s = with_suggestion();
+
+    // An empty bracketed-paste payload is the clipboard-image gesture: it
+    // asks the runtime for the image rather than inserting text.
+    let effects = reduce(&mut s, Action::Paste(String::new()));
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(ClientCommand::AddClipboardImage { .. })
+        )),
+        "expected the clipboard-image request: {effects:?}"
+    );
+
+    // The attachment arriving is the start of a new message.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AttachmentAdded {
+            attachment: image_attachment(),
+        }),
+    );
+    assert_eq!(s.prompt_suggestion, None);
+    assert!(!suggestion::is_visible(&s));
+
+    let row = composer_row(&frame(&mut s, 100, 24));
+    assert!(row.contains("图片 #1"), "the chip is painted: {row:?}");
+    assert!(
+        !row.contains("Tab: ") && !row.contains(NEXT_STEP),
+        "the ghost must not sit behind an attachment chip: {row:?}"
+    );
+}
+
+#[test]
+fn c9_a_staged_attachment_hides_the_ghost_even_if_one_is_held() {
+    let mut s = with_suggestion();
+    // Bypass the event path: whatever put the chip there, a staged attachment
+    // means the user is composing, so the ghost must not show.
+    s.pending_attachments.push(image_attachment());
+
+    assert!(!suggestion::is_visible(&s));
+    assert!(!composer_row(&frame(&mut s, 100, 24)).contains("Tab: "));
+
+    // Peeling the chip back off with Backspace leaves a clean empty composer
+    // and does not resurrect the ghost.
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert!(s.pending_attachments.is_empty());
+    assert!(s.composer.is_empty());
     assert_eq!(s.prompt_suggestion, None);
 }
 

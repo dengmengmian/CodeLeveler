@@ -84,6 +84,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
         }
         RuntimeEvent::AttachmentAdded { attachment } => {
+            // Staging an attachment is the start of a new message, however the
+            // user got here (clipboard image, `/image`, `/attach`). The last
+            // turn's next step no longer describes what they are composing.
+            crate::suggestion::clear(state);
             state.pending_attachments.push(attachment);
         }
         RuntimeEvent::AttachmentProcessingFailed { error } => {
