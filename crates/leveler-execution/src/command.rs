@@ -3922,13 +3922,16 @@ mod tests {
         let handle = tokio::spawn(async move { runner.run(request, run_token).await });
 
         let gc_pid = wait_windows_pidfile(&pidfile).await;
+        // The target has to be observed alive before the kill. The pid file
+        // says the fixture ran; it does not say that process is still there.
+        let witness = require_windows_grandchild_alive(gc_pid);
         token.cancel();
         let result = handle.await.unwrap();
         assert!(
             matches!(result, Err(ProcessError::Cancelled)),
             "expected Cancelled, got {result:?}"
         );
-        assert_windows_grandchild_dead(gc_pid).await;
+        assert_windows_grandchild_dead(witness).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3945,13 +3948,16 @@ mod tests {
             tokio::spawn(async move { runner.run(request, CancellationToken::new()).await });
 
         let gc_pid = wait_windows_pidfile(&pidfile).await;
+        // Observed alive before the timeout fires: a pid file that outlived
+        // its process would make the assertion below vacuous.
+        let witness = require_windows_grandchild_alive(gc_pid);
         let result = handle.await.unwrap().expect("timeout returns Ok timed_out");
         assert!(
             result.timed_out,
             "expected timed_out=true, got exit={:?}",
             result.exit_code
         );
-        assert_windows_grandchild_dead(gc_pid).await;
+        assert_windows_grandchild_dead(witness).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4064,26 +4070,426 @@ mod tests {
         }
     }
 
+    /// What one observation of a pid says.
+    ///
+    /// Deliberately not a bool. "I could not look" is a third answer, and
+    /// folding it into "gone" is exactly what let this canary pass without
+    /// evidence: `Err(_) => false` read an unspawnable `tasklist` as a dead
+    /// process.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum WindowsPidObservation {
+        /// The pid appears as its own field in a readable snapshot.
+        Alive,
+        /// A complete, fully readable snapshot, without that pid.
+        Gone,
+        /// Neither could be established. Never treated as [`Self::Gone`].
+        Unobservable(String),
+    }
+
+    /// A bounded excerpt for a diagnostic: a process snapshot is not something
+    /// to paste whole into a panic message.
+    fn bounded_excerpt(bytes: &[u8]) -> String {
+        const MAX: usize = 300;
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim();
+        if text.chars().count() <= MAX {
+            return text.to_string();
+        }
+        let head: String = text.chars().take(MAX).collect();
+        format!("{head}… (+{} chars)", text.chars().count() - MAX)
+    }
+
+    /// One `tasklist /FO CSV` record, or `None` when the line is not one.
+    ///
+    /// Handwritten rather than `split(',')`, because a field may contain a
+    /// comma — `"1,234 K"` is a real memory value — and rather than a CSV
+    /// crate, because this is the only record shape in the tree. Every field is
+    /// quoted and `""` is an escaped quote; anything else is not this format,
+    /// and guessing at a foreign line is how it becomes data.
+    fn parse_windows_csv_record(line: &str) -> Option<Vec<String>> {
+        let mut fields = Vec::new();
+        let mut chars = line.chars().peekable();
+        loop {
+            if chars.next() != Some('"') {
+                return None;
+            }
+            let mut field = String::new();
+            loop {
+                // `?` covers an unterminated field: the line ends mid-quote.
+                match chars.next()? {
+                    '"' => {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            field.push('"');
+                        } else {
+                            break;
+                        }
+                    }
+                    c => field.push(c),
+                }
+            }
+            fields.push(field);
+            match chars.next() {
+                None => return Some(fields),
+                Some(',') => {}
+                Some(_) => return None,
+            }
+        }
+    }
+
+    /// Read a full `tasklist /FO CSV /NH` snapshot.
+    ///
+    /// The asymmetry is deliberate. One legal row carrying the pid is enough
+    /// to prove `Alive`; proving `Gone` needs the *whole* snapshot readable, so
+    /// a line nobody can parse can never be the thing that turns a missing pid
+    /// into a dead process.
+    fn parse_tasklist_snapshot(stdout: &[u8], pid: u32) -> WindowsPidObservation {
+        let text = String::from_utf8_lossy(stdout);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let mut rows = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+        for line in text.split('\n') {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() {
+                continue;
+            }
+            // The pid is the second field, matched whole. `contains("123")`
+            // also matches 1234, and 12345 in a memory column.
+            let row_pid = parse_windows_csv_record(line)
+                .and_then(|fields| fields.get(1).cloned())
+                .and_then(|field| field.trim().parse::<u32>().ok());
+            match row_pid {
+                Some(row) if row == pid => return WindowsPidObservation::Alive,
+                Some(_) => rows += 1,
+                None => problems.push(bounded_excerpt(line.as_bytes())),
+            }
+        }
+        if rows > 0 && problems.is_empty() {
+            return WindowsPidObservation::Gone;
+        }
+        let why = if problems.is_empty() {
+            "the snapshot held no process rows".to_string()
+        } else {
+            format!(
+                "{} line(s) could not be read, e.g. {:?}",
+                problems.len(),
+                problems[0]
+            )
+        };
+        WindowsPidObservation::Unobservable(why)
+    }
+
+    /// Observe `pid` by running `program`, so the ways the observation itself
+    /// can fail are reachable from a test.
     #[cfg(windows)]
-    async fn assert_windows_grandchild_dead(gc_pid: u32) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(
-            !windows_pid_alive(gc_pid),
-            "grandchild pid {gc_pid} should have been killed by Job Object"
-        );
+    fn observe_windows_pid_with_command(
+        program: &std::path::Path,
+        args: &[&str],
+        pid: u32,
+    ) -> WindowsPidObservation {
+        let out = match std::process::Command::new(program).args(args).output() {
+            Ok(out) => out,
+            Err(error) => {
+                return WindowsPidObservation::Unobservable(format!(
+                    "could not run {}: {error}",
+                    program.display()
+                ));
+            }
+        };
+        if !out.status.success() {
+            return WindowsPidObservation::Unobservable(format!(
+                "{} exited with {}: stdout {:?} stderr {:?}",
+                program.display(),
+                out.status,
+                bounded_excerpt(&out.stdout),
+                bounded_excerpt(&out.stderr),
+            ));
+        }
+        parse_tasklist_snapshot(&out.stdout, pid)
+    }
+
+    /// Observe `pid` from a full, locale-independent snapshot.
+    ///
+    /// A full `tasklist` rather than `/FI "PID eq …"`: a filtered query answers
+    /// "nothing matched" with a localized sentence, and matching that text is
+    /// how a reader ends up depending on the operator's language.
+    #[cfg(windows)]
+    fn observe_windows_pid(pid: u32) -> WindowsPidObservation {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        observe_windows_pid_with_command(
+            &system_root.join(r"System32\tasklist.exe"),
+            &["/FO", "CSV", "/NH"],
+            pid,
+        )
+    }
+
+    /// Proof that a pid was observed alive.
+    ///
+    /// Held across the trigger so the final assertion can only ever be made
+    /// about a target that was there — "the pid file existed" is a different
+    /// fact, and a tree that was already gone would make the last assertion
+    /// true and meaningless.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WindowsAliveWitness {
+        pid: u32,
+    }
+
+    fn establish_windows_alive_witness(
+        pid: u32,
+        observation: WindowsPidObservation,
+    ) -> Result<WindowsAliveWitness, String> {
+        match observation {
+            WindowsPidObservation::Alive => Ok(WindowsAliveWitness { pid }),
+            WindowsPidObservation::Gone => Err(format!(
+                "canary precondition was not established: grandchild pid {pid} was not \
+                 observed alive before the trigger"
+            )),
+            WindowsPidObservation::Unobservable(reason) => Err(format!(
+                "could not observe grandchild pid {pid} before the trigger: {reason} — \
+                 this canary proves nothing"
+            )),
+        }
+    }
+
+    fn verify_windows_pid_gone(
+        witness: WindowsAliveWitness,
+        observation: WindowsPidObservation,
+    ) -> Result<(), String> {
+        match observation {
+            WindowsPidObservation::Gone => Ok(()),
+            WindowsPidObservation::Alive => Err(format!(
+                "grandchild pid {} should have been killed by Job Object",
+                witness.pid
+            )),
+            WindowsPidObservation::Unobservable(reason) => Err(format!(
+                "could not observe grandchild pid {} after termination: {reason} — \
+                 this canary proves nothing",
+                witness.pid
+            )),
+        }
     }
 
     #[cfg(windows)]
-    fn windows_pid_alive(pid: u32) -> bool {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output();
-        match out {
-            Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout);
-                text.contains(&pid.to_string()) && !text.to_uppercase().contains("NO TASKS")
+    fn require_windows_grandchild_alive(pid: u32) -> WindowsAliveWitness {
+        let observation = observe_windows_pid(pid);
+        match establish_windows_alive_witness(pid, observation) {
+            Ok(witness) => witness,
+            Err(why) => panic!("{}", why),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn assert_windows_grandchild_dead(witness: WindowsAliveWitness) {
+        // Unchanged settling window: this task fixes what the canary observes,
+        // not how long it waits.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let observation = observe_windows_pid(witness.pid);
+        if let Err(why) = verify_windows_pid_gone(witness, observation) {
+            panic!("{}", why);
+        }
+    }
+
+    // ── the truth matrix this canary is allowed to answer from ─────────────
+    //
+    // Pure, so every branch runs on every host instead of only where a Windows
+    // runner happens to be. The two that need a real command are gated.
+
+    const IDLE_ROW: &str = "\"System Idle Process\",\"0\",\"Services\",\"0\",\"8 K\"\r\n";
+
+    fn snapshot(rows: &[&str]) -> Vec<u8> {
+        rows.concat().into_bytes()
+    }
+
+    /// §10 A1: a legal row holding the pid is proof of life.
+    #[test]
+    fn windows_tasklist_snapshot_finds_the_pid_it_holds() {
+        let out = snapshot(&[
+            IDLE_ROW,
+            "\"PING.EXE\",\"1234\",\"Console\",\"1\",\"1,234 K\"\r\n",
+        ]);
+        assert_eq!(
+            parse_tasklist_snapshot(&out, 1234),
+            WindowsPidObservation::Alive
+        );
+    }
+
+    /// §10 A2: a complete snapshot without it is proof of absence.
+    #[test]
+    fn windows_tasklist_snapshot_without_the_pid_is_gone() {
+        let out = snapshot(&[
+            IDLE_ROW,
+            "\"PING.EXE\",\"4321\",\"Console\",\"1\",\"9 K\"\r\n",
+        ]);
+        assert_eq!(
+            parse_tasklist_snapshot(&out, 1234),
+            WindowsPidObservation::Gone
+        );
+    }
+
+    /// §10 A3: the pid is a field, not a substring. `123` must not match
+    /// `1234` — the check this replaced was `contains(pid.to_string())`.
+    #[test]
+    fn windows_tasklist_snapshot_does_not_match_a_pid_substring() {
+        let out = snapshot(&["\"PING.EXE\",\"1234\",\"Console\",\"1\",\"8 K\"\r\n"]);
+        assert_eq!(
+            parse_tasklist_snapshot(&out, 123),
+            WindowsPidObservation::Gone
+        );
+    }
+
+    /// §10 A4: the same digits elsewhere in the row are not a pid.
+    #[test]
+    fn windows_tasklist_snapshot_reads_only_the_pid_field() {
+        let out = snapshot(&["\"PING.EXE\",\"9999\",\"Console\",\"1234\",\"1234 K\"\r\n"]);
+        assert_eq!(
+            parse_tasklist_snapshot(&out, 1234),
+            WindowsPidObservation::Gone
+        );
+    }
+
+    /// §10 A5/A6/A7: a comma inside a field, CRLF, LF, and a BOM.
+    #[test]
+    fn windows_tasklist_snapshot_handles_real_csv_shapes() {
+        let comma = "\"PING.EXE\",\"77\",\"Console\",\"1\",\"1,234,567 K\"\r\n";
+        assert_eq!(
+            parse_tasklist_snapshot(comma.as_bytes(), 77),
+            WindowsPidObservation::Alive
+        );
+        let bom = format!("\u{feff}{IDLE_ROW}");
+        assert_eq!(
+            parse_tasklist_snapshot(bom.as_bytes(), 1234),
+            WindowsPidObservation::Gone
+        );
+        let lf_only = "\"PING.EXE\",\"88\",\"Console\",\"1\",\"8 K\"\n";
+        assert_eq!(
+            parse_tasklist_snapshot(lf_only.as_bytes(), 88),
+            WindowsPidObservation::Alive
+        );
+    }
+
+    /// §10 A8/A9: nothing readable is not "no such process".
+    #[test]
+    fn windows_tasklist_snapshot_of_nothing_is_unobservable() {
+        for empty in [&b""[..], b"   \r\n\t\n"] {
+            assert!(
+                matches!(
+                    parse_tasklist_snapshot(empty, 1234),
+                    WindowsPidObservation::Unobservable(_)
+                ),
+                "{:?}",
+                String::from_utf8_lossy(empty)
+            );
+        }
+    }
+
+    /// §10 A10/A11/A12: one unreadable line makes the whole snapshot
+    /// unreadable. Seeing some legal rows is not licence to conclude that a pid
+    /// is absent.
+    #[test]
+    fn windows_tasklist_snapshot_with_an_unreadable_line_is_unobservable() {
+        let mixed = snapshot(&[
+            IDLE_ROW,
+            "\"PING.EXE\",\"4321\"\r\n",
+            "not a tasklist row\r\n",
+        ]);
+        assert!(
+            matches!(
+                parse_tasklist_snapshot(&mixed, 1234),
+                WindowsPidObservation::Unobservable(_)
+            ),
+            "a legal row beside a broken one is not a complete snapshot"
+        );
+        let bad_pid = snapshot(&["\"PING.EXE\",\"not-a-pid\",\"Console\",\"1\",\"8 K\"\r\n"]);
+        assert!(matches!(
+            parse_tasklist_snapshot(&bad_pid, 1234),
+            WindowsPidObservation::Unobservable(_)
+        ));
+        let truncated = snapshot(&["\"PING.EXE\",\"4321\",\"Console\r\n"]);
+        assert!(matches!(
+            parse_tasklist_snapshot(&truncated, 1234),
+            WindowsPidObservation::Unobservable(_)
+        ));
+    }
+
+    /// §10 C: the trigger may only run against a pid observed alive, and the
+    /// two ways to fail say which one happened.
+    #[test]
+    fn windows_alive_witness_requires_an_alive_observation() {
+        let witness = establish_windows_alive_witness(1234, WindowsPidObservation::Alive)
+            .expect("an observed live pid is the precondition");
+        assert_eq!(witness.pid, 1234);
+
+        let gone = establish_windows_alive_witness(1234, WindowsPidObservation::Gone)
+            .expect_err("a pid already gone must not establish the precondition");
+        assert!(gone.contains("precondition was not established"), "{gone}");
+
+        let blind = establish_windows_alive_witness(
+            1234,
+            WindowsPidObservation::Unobservable("tasklist could not run".into()),
+        )
+        .expect_err("an unobservable pid must not establish the precondition");
+        assert!(blind.contains("proves nothing"), "{blind}");
+    }
+
+    /// §10 D: only `Gone` closes the canary, and an observation that failed is
+    /// not evidence of death.
+    #[test]
+    fn windows_gone_is_the_only_success_after_the_trigger() {
+        let witness = WindowsAliveWitness { pid: 1234 };
+        assert!(verify_windows_pid_gone(witness, WindowsPidObservation::Gone).is_ok());
+
+        let alive = verify_windows_pid_gone(witness, WindowsPidObservation::Alive)
+            .expect_err("a surviving pid is the property being violated");
+        assert!(alive.contains("Job Object"), "{alive}");
+
+        let blind = verify_windows_pid_gone(
+            witness,
+            WindowsPidObservation::Unobservable("tasklist could not run".into()),
+        )
+        .expect_err("an unobservable pid is not evidence of death");
+        assert!(blind.contains("proves nothing"), "{blind}");
+    }
+
+    /// §10 B1: an observation that cannot run is `Unobservable`, never `Gone`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_missing_observer_program_is_unobservable() {
+        let observation = observe_windows_pid_with_command(
+            std::path::Path::new(r"C:\Windows\System32\leveler-no-such-observer.exe"),
+            &["/FO", "CSV", "/NH"],
+            1234,
+        );
+        match observation {
+            WindowsPidObservation::Unobservable(reason) => {
+                assert!(reason.contains("could not run"), "{reason}")
             }
-            Err(_) => false,
+            other => panic!(
+                "a missing observer must not answer about the pid: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// §10 B2: a non-zero exit is `Unobservable`, never `Gone`. Real command,
+    /// not a mock.
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_observer_exit_is_unobservable() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let cmd = system_root.join(r"System32\cmd.exe");
+        let observation = observe_windows_pid_with_command(&cmd, &["/D", "/C", "exit 7"], 1234);
+        match observation {
+            WindowsPidObservation::Unobservable(reason) => {
+                assert!(reason.contains("exited with"), "{reason}")
+            }
+            other => panic!(
+                "a failed observer must not answer about the pid: {:?}",
+                other
+            ),
         }
     }
 
