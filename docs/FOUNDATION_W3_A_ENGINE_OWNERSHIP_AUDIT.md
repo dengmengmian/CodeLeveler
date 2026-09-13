@@ -17,12 +17,19 @@ TASK_GOAL_TERMINAL_ATOMICITY=PASS
 SESSION_TASK_CREATION_ATOMICITY=PASS
 CANONICAL_VALIDATION=PASS
 W3_A_GATE=PASS
-FOUNDATION_FROZEN=YES
+FOUNDATION_ARCHITECTURE_CANDIDATE=PASS
+FOUNDATION_FINAL_ACCEPTANCE=DEFERRED_TO_W4
 ```
 
 The first pass found the violations recorded below. The repair pass closed
 them without moving model judgment into the Engine. Independent review and the
 canonical workspace validation both pass on the repaired tree.
+
+Status correction: this record originally ended its status block with
+`FOUNDATION_FROZEN=YES`. That global state preceded the independent W4 final
+acceptance. The W3-A ownership conclusions below are unchanged; the
+Foundation-wide acceptance and freeze decision is recorded only in
+[`FOUNDATION_ACCEPTANCE_AND_FREEZE.md`](FOUNDATION_ACCEPTANCE_AND_FREEZE.md).
 
 ## Authority Contract
 
@@ -372,5 +379,6 @@ git diff --check
 
 All executable tests passed. The suite's explicitly opt-in live/manual corpus,
 visual, and full-repository probe tests remained ignored by their own test
-declarations. W3-A is closed and the Foundation boundary is frozen at this
+declarations. W3-A is closed and the ownership boundary is fixed at this
 repaired tree; delivery still requires commit, push, and remote CI.
+Foundation-wide acceptance belongs to W4.
