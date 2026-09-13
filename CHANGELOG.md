@@ -36,6 +36,25 @@ All notable changes to CodeLeveler are documented here. The format follows
   themselves deleted in this release; compaction folds remain.)
 
 ### Changed
+- **Opening a URL and automating a browser now have separate owners.** TUI
+  `/web` and link clicks go through the host URL opener and report whether the
+  operating system accepted the request; on macOS, LaunchServices can reuse an
+  already-running Safari when Safari is the system default browser. Browser
+  tools use runtime-owned automation sessions. With no explicit or configured
+  product, frontend automation now chooses the first installed CDP browser in
+  the stable Chrome, Edge, Chromium order; Safari remains opt-in because its
+  WebDriver-mandated isolated Automation Window lacks console, page-error, and
+  network inspection and prevents ordinary human interaction while controlled.
+- **Browser refs accept the token exactly as snapshots print it.** A snapshot
+  renders refs such as `[2e3]`; passing that displayed token to `browser_act`
+  previously rejected it before reaching the browser, even though the tool
+  description told the model to use `[ref]` tokens. Bracketed and raw forms now
+  resolve to the same generation-scoped DOM identity.
+- **Chrome's startup page is no longer reported as a popup, and console
+  inspection includes ordinary logs.** The first automation session claims
+  Chrome's existing `about:blank` target instead of creating a second one that
+  the next click would falsely adopt. CDP console capture now preserves
+  `console.log` and other levels as well as warnings and errors.
 - **`web_search` is Tavily, and `LEVELER_SEARCH_API_KEY` now holds a Tavily
   key.** The tool used to carry two backends (Bing Search and Google Custom
   Search) behind a provider switch. It now makes one request to one API.

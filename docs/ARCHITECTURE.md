@@ -511,22 +511,35 @@ and tabs, one for acting as a user would, one for observation — so that each
 expresses one intent rather than one door with an `action=` parameter onto the
 other two.
 
-Which browser gets driven is a precedence, not a search for something that
-works:
+Browser control here means a runtime-owned automation session; it does not
+mean taking over an ordinary browsing window the user already has open.
+Safari WebDriver follows the platform security model and uses an Automation
+Window isolated from normal browsing data, so it cannot read or control the
+user's existing tabs. Opening a URL for the user to view is a separate host
+action: the product asks the host execution authority to hand the URL to the
+operating system's default browser. When that default is Safari, macOS
+LaunchServices may activate an already-running Safari. This one-way action
+creates no automation tab, DOM refs, or session ownership, and is never an
+implicit fallback for browser control.
+
+The browser is chosen before a session starts by a deterministic precedence:
 
 ```text
 named on the call
       >
 configured default
       >
-system default browser
+host automation default (first drivable Chrome → Edge → Chromium)
 ```
 
-A selected browser that cannot be driven is an error naming that browser and
-the layer that chose it. Substituting a different installed browser would make
-the answer to “which browser did this run in” unknowable, so availability for
-this capability asks whether the SELECTED browser is drivable, not whether any
-browser is installed.
+The third layer is capability negotiation before session startup, not a
+fallback after a runtime failure. It considers only CDP products that expose
+console, page-error, and network observation, in a stable order, so Safari is
+never selected implicitly. Safari remains available by explicit call or
+configuration for compatibility testing. An unavailable explicit or configured
+browser is an error naming the product and the layer that chose it. No browser
+is substituted after startup or an operation failure, so every session retains
+one unambiguous browser identity.
 
 Web search keeps a provider-neutral tool contract. The model's parameters and
 the results it reads are fixed by the tool, not by whichever backend is

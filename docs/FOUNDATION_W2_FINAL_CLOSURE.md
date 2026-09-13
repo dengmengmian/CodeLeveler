@@ -81,8 +81,14 @@ back unnoticed.
 Selection is a precedence, not a search for anything that works:
 
 ```text
-named on the call  >  [browser].default  >  system default browser
+named on the call  >  [browser].default  >  host automation default
 ```
+
+The host automation default is the first drivable CDP product in the stable
+Chrome → Edge → Chromium order. Safari remains available only when explicitly
+named or configured because its isolated Automation Window does not expose the
+console, page-error, and network observation channels used for frontend
+debugging.
 
 A selected product that cannot be driven returns `BrowserError::Unavailable`
 naming that product and the layer that chose it. No installed browser is

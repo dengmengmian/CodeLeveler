@@ -263,19 +263,30 @@ Three tools reach the model. `browser_tab` navigates and manages tabs,
 `browser_inspect` reads the console, page errors and network. Each owns one job,
 and no action is reachable through two of them.
 
+These tools control a CodeLeveler-owned automation session. Frontend debugging
+defaults to CDP because it provides console, page-error, and network
+observation. Under Apple's WebDriver security model, Safari uses an isolated
+Automation Window, cannot take over the user's ordinary tabs or read their
+browsing data, and lacks those observation channels, so it is used only when a
+call or configuration explicitly selects it. TUI `/web` and link clicks still
+go to the system default browser; when that default is Safari, macOS activates
+an already-running Safari and follows Safari's own tab/window preference.
+
 A call may name a browser. Otherwise the choice runs in this order:
 
 | Order | Source |
 | --- | --- |
 | 1 | the browser named on the call |
 | 2 | `[browser].default` in configuration |
-| 3 | the operating system's default browser |
+| 3 | the first drivable CDP browser: Chrome → Edge → Chromium |
 
 A browser that was asked for but cannot be driven is an error naming that
-browser and where it was chosen. A different installed browser is never
-substituted, and Edge and Chrome stay distinct products even though both speak
-CDP. When the browser this host would select cannot be driven, no browser tools
-are offered at all rather than a surprising one.
+browser and where it was chosen. No browser is substituted after launch or an
+operation failure, and Edge and Chrome stay distinct products even though both
+speak CDP. An unavailable explicit or configured browser is an error. Only when
+neither is set does the host choose in the stable order above before starting a
+session; if no CDP browser is drivable, the browser tools are unavailable with
+an installation or configuration error.
 
 ### Web search
 
