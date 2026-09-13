@@ -1,0 +1,55 @@
+# CodeLeveler's own Agent Verification Contract.
+#
+# The harness verifies this repository with this repository's own checks, so
+# this file is what an agent's work is judged against inside the verification
+# sandbox — and what `leveler run` reports as `verification=` for this project.
+# It declares the checks that are safe and deterministic under the sandbox's
+# write fence; the full suite stays the operator/CI/release gate.
+#
+# Layer 1 — this contract. Every command here runs confined to the workspace,
+# the per-command scratch and the tool cache: no nested sandbox, no daemon or
+# control-plane socket, no write to the user's home. See
+# docs/VERIFICATION_RUNTIME_AND_RESULT_SEMANTICS_CLOSURE.md.
+#
+# Layer 2 — `cargo test --workspace --all-features --locked --no-fail-fast`
+# (what CI runs). It additionally contains tests that require host capabilities
+# the sandbox deliberately does not grant. macOS seatbelt and Linux bubblewrap
+# cannot nest, so a test that starts a sandbox of its own fails with
+# `sandbox_apply: Operation not permitted`; daemon and user-shell tests need a
+# real socket and process tree. Those are excluded below, per crate.
+#
+# The exclusions are measured, not guessed: each excluded crate owns at least
+# one test that fails under confinement. Adding a crate here to make a run
+# green is not a verification decision — it is deleting evidence.
+verify:
+  format:
+    program: cargo
+    args: ["fmt", "--all", "--", "--check"]
+  build:
+    program: cargo
+    args: ["check", "--workspace", "--all-features", "--locked"]
+  test:
+    program: cargo
+    args:
+      - test
+      - --workspace
+      - --all-features
+      - --locked
+      # Needs nested confinement (its tests start sandboxes of their own).
+      - --exclude
+      - leveler-execution
+      # Needs nested confinement: the verifier under test runs real checks.
+      - --exclude
+      - leveler-verifier
+      # Needs nested confinement: command tools execute confined children.
+      - --exclude
+      - leveler-tools
+      # Need a daemon/control plane, a real process tree, or both.
+      - --exclude
+      - leveler-agent
+      - --exclude
+      - leveler-app
+      - --exclude
+      - leveler-cli
+      - --exclude
+      - leveler-remote-agent
