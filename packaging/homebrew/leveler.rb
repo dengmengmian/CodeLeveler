@@ -3,7 +3,7 @@ class Leveler < Formula
   homepage "https://github.com/dengmengmian/CodeLeveler"
   # Tracks the latest STABLE release. Betas are published as GitHub
   # pre-releases and are installed by name
-  # (`LEVELER_VERSION=v0.2.0-beta.1 … install.sh`), never through this tap:
+  # (`LEVELER_VERSION=v0.2.0-beta.2 … install.sh`), never through this tap:
   # `livecheck`'s :github_latest skips pre-releases by design.
   version "0.1.4"
   license "Apache-2.0"

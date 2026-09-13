@@ -27,18 +27,18 @@ framework are architectural directions — not all shipped yet. See
 [Architecture](docs/ARCHITECTURE.md) for the layer model and the boundaries
 the code does not meet yet.
 
-CodeLeveler is in public beta: **`0.2.0-beta.1`**, published as a pre-release
+CodeLeveler is in public beta: **`0.2.0-beta.2`**, published as a pre-release
 (see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
 
-**The published beta carries macOS and Linux binaries only.** All three
-platforms run the suite in CI and all three are green: the Windows job
-compiles, lints, passes its security canaries and its Edge browser acceptance,
-and runs the workspace tests. `0.2.0-beta.1` was tagged before that work
-landed, so the binaries attached to it predate it; `0.1.4` remains the release
-that ships a Windows build. Windows currently has no CodeLeveler backend for
-per-command network denial: the capability reports `network_deny=false`, and a
-command that requires network isolation is refused rather than run with the
-network open ([`CHANGELOG.md`](CHANGELOG.md)).
+**The release workflow builds macOS, Linux and Windows binaries for every
+tag.** All three platforms run the suite in CI and all three are green: the
+Windows job compiles, lints, passes its security canaries and its Edge browser
+acceptance, and runs the workspace tests. `0.2.0-beta.1` was tagged before the
+Windows work landed, so its archives are macOS and Linux only. Windows
+currently has no CodeLeveler backend for per-command network denial: the
+capability reports `network_deny=false`, and a command that requires network
+isolation is refused rather than run with the network open
+([`CHANGELOG.md`](CHANGELOG.md)).
 
 ## Three focused tools, one workflow
 
@@ -88,7 +88,7 @@ one-line installer, or `leveler upgrade` pick up by default — a beta arrives
 only if you ask for it by name:
 
 ```sh
-LEVELER_VERSION=v0.2.0-beta.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
+LEVELER_VERSION=v0.2.0-beta.2 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
 ```
 
 **Option B — Download a prebuilt binary**

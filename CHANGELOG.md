@@ -6,6 +6,37 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0-beta.2] - 2026-09-14
+
+### Highlights
+
+- **Verification says what it knows, and only that.** A run's completion and
+  the project's checks are separate facts. `verification=passed` means the
+  gating checks ran and passed; a run that proved nothing reports
+  `unavailable`, never a pass, in the durable log, the CLI, the TUI, the web UI
+  and the mobile client alike.
+- **A declared verification contract, instead of an assumption about the
+  repository.** `.leveler/config.yaml` can state the exact format/build/test
+  commands an agent's work is judged against, and this repository now does:
+  the checks that are safe and deterministic inside the verification sandbox.
+  The full workspace suite, the daemon tests and platform acceptance stay the
+  release gate — an agent's "verification passed" means its declared contract
+  passed, and never claims that every test in the repository ran.
+- **The verification sandbox no longer touches your real home.** A confined
+  command that is CodeLeveler itself — or a project's test suite that drives
+  it — writes its locks, state database and control files under the sandbox's
+  own runtime root. The sandbox's writable roots do not include `~/.leveler`,
+  and now they do not need to.
+- **Pre-existing failures are named as such.** A `node --test` suite already
+  red on the baseline is attributed to the baseline instead of being reported
+  as this change's regression, while a failure the baseline did not have still
+  gates, and output from a runner the runtime cannot read still fails closed.
+- **A capability, not a method.** The system prompt states identity, authority,
+  runtime state and product constraints; it no longer tells the model how to
+  work. The agent loop is a reusable kernel with the coding harness beside it,
+  every root directory has one owner, and the runtime no longer judges the
+  model's semantic completion.
+
 ### Added
 - **The model-visible tool surface is composed, not inherited.** A turn gets
   the core primitives, plus the optional capability packs this host can
@@ -26,7 +57,15 @@ All notable changes to CodeLeveler are documented here. The format follows
   framework, no `eval_mode`, no dogfood prompt or budget; it runs
   `leveler eval run` over case YAML and reads the durable record back. Its
   first run failed on the defect above; the accepted run and the new Beta
-  baseline are recorded in `docs/BETA_BASELINE_POST_CLOSURE.md`.
+  baseline are recorded in `docs/BETA_FINAL_GATE_RECONCILIATION.md`.
+- **The repository declares its own agent verification contract.**
+  `.leveler/config.yaml` can state the format/build/test commands that count as
+  verification for a project, and this repository uses it: `cargo fmt --check`,
+  a workspace `cargo check`, and the workspace test suite minus the crates
+  whose tests need host capabilities the sandbox withholds. The declaration is
+  authoritative — a declared section replaces discovery verbatim, and the
+  harness does not narrow it. The full suite remains the release gate.
+  (`docs/VERIFICATION_RUNTIME_AND_RESULT_SEMANTICS_CLOSURE.md`.)
 - **Every model call the runtime makes on its own account is recorded.** The
   runtime's own calls wrote nothing to `model_requests`, so a goal session's
   reported cost was short by all of them. They now write the `advisory` lane,
@@ -216,6 +255,22 @@ All notable changes to CodeLeveler are documented here. The format follows
   here.
 
 ### Fixed
+- **A confined command no longer inherits your runtime root.** The sandbox
+  redirected `TMPDIR`, `CARGO_HOME`, the caches and `npm_config_cache` for
+  confined children, but not CodeLeveler's own home. A project's test suite
+  that drives CodeLeveler — the self-dogfood case — therefore took its lock in
+  the real `~/.leveler/run/locks`, which the sandbox (correctly) refuses to
+  write, so the checks failed with `Operation not permitted` and a passing
+  change ended unverified. A confined child now resolves an isolated root
+  inside the sandbox scratch; every runtime path derives from it, so locks,
+  state and control files are isolated together.
+- **Baseline attribution understands `node --test`.** Only `cargo test` and
+  `go test` had a failure parser, so a Node suite that failed produced no
+  test-level ids, its failure could not be compared against the baseline, and a
+  pre-existing failure was reported as this change's — or, with no evidence
+  either way, always gated. The reporter's own failure markers are now read
+  (spec and TAP forms); an unrecognized runner still yields nothing and still
+  gates.
 - **A verification check's status is one vocabulary, end to end.** The status
   reached the durable log through `format!("{:?}").to_lowercase()`, so
   `CheckStatus::ToolMissing` was written as `toolmissing` — a value the event's
