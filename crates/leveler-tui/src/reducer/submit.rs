@@ -1222,12 +1222,23 @@ mod export_tests {
         assert!(handle_slash(&mut s, "web").is_empty());
 
         // The launch completes: URL is stored and the guard clears.
-        crate::reducer::reduce(
+        let effects = crate::reducer::reduce(
             &mut s,
             crate::action::Action::WebLaunched(Ok("http://127.0.0.1:9/?token=abc".to_string())),
         );
         assert!(!s.web_starting);
         assert_eq!(s.web_url.as_deref(), Some("http://127.0.0.1:9/?token=abc"));
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("Web UI 已启动") && !n.message.contains("浏览器打开")),
+            "server readiness must not claim that the browser opener has completed"
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::OpenWebUrl(
+                "http://127.0.0.1:9/?token=abc".to_string()
+            )],
+            "the first /web must use the same opener path as later invocations"
+        );
 
         // Now /web re-surfaces the running URL AND re-opens the browser —
         // "already running" must not strand the user with a bare URL to copy.
@@ -1257,6 +1268,34 @@ mod export_tests {
         assert!(
             matches!(&s.notification, Some(n) if n.message.contains("启动失败")),
             "should warn on failure"
+        );
+    }
+
+    #[test]
+    fn url_open_completion_reports_the_host_result() {
+        let mut s = state_with_dialogue();
+        let url = "https://example.com/".to_string();
+
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::UrlOpened {
+                url: url.clone(),
+                result: Ok(()),
+            },
+        );
+        assert!(
+            matches!(&s.notification, Some(n) if n.message == format!("系统已接受 URL，并交给默认浏览器：{url}"))
+        );
+
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::UrlOpened {
+                url: url.clone(),
+                result: Err("open failed".to_string()),
+            },
+        );
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("无法在浏览器打开") && n.message.contains("open failed"))
         );
     }
 }

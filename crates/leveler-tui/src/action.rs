@@ -63,6 +63,11 @@ pub enum Action {
     /// The embedded Web UI server finished starting: `Ok(url)` with the
     /// token-carrying URL, or `Err(message)` if it could not start.
     WebLaunched(Result<String, String>),
+    /// The host finished handing a URL to the user's default browser.
+    UrlOpened {
+        url: String,
+        result: Result<(), String>,
+    },
     /// `$EDITOR` exited: `Ok(text)` is whatever was left in the buffer (empty
     /// means the user deleted everything and meant it), `Err(message)` is why
     /// it could not run.
@@ -173,6 +178,17 @@ pub enum RemoteOutcome {
 /// host could not provide any local runtime service.
 pub type WebLauncher = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Injected by the host: opens an HTTP URL in the user's default browser and
+/// reports whether the operating system accepted the request.
+pub type UrlOpener = std::sync::Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;

@@ -538,10 +538,17 @@ fn make_web_launcher(
         let service = service.clone();
         let repo_root = repo_root.clone();
         let shutdown = shutdown.clone();
+        Box::pin(async move { bind_tui_web_ui(service, repo_root, shutdown).await })
+    })
+}
+
+fn make_url_opener() -> leveler_tui::UrlOpener {
+    Arc::new(move |url| {
         Box::pin(async move {
-            let url = bind_tui_web_ui(service, repo_root, shutdown).await?;
-            leveler_tui::open_in_browser(&url);
-            Ok(url)
+            tokio::task::spawn_blocking(move || leveler_execution::open_url(&url))
+                .await
+                .map_err(|error| format!("URL 打开任务异常结束：{error}"))?
+                .map_err(|error| error.to_string())
         })
     })
 }
@@ -724,7 +731,14 @@ pub(crate) async fn cmd_tui(
             web_shutdown.clone(),
         );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
-        leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
+        leveler_tui::run(
+            client,
+            Some(web_launcher),
+            Some(make_url_opener()),
+            Some(remote_launcher),
+            boot,
+        )
+        .await?;
         // Stop the TUI-owned HTTP server; the local daemon keeps running.
         web_shutdown.cancel();
         return Ok(std::process::ExitCode::SUCCESS);
@@ -836,7 +850,14 @@ pub(crate) async fn cmd_tui(
         ),
     );
 
-    leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
+    leveler_tui::run(
+        client,
+        Some(web_launcher),
+        Some(make_url_opener()),
+        Some(remote_launcher),
+        boot,
+    )
+    .await?;
     web_shutdown.cancel();
     // Drop-based reapers never run past `std::process::exit`; shut the
     // runtime down explicitly (background tasks + browser tree, R004 F7).
@@ -1784,7 +1805,7 @@ mod web_launcher_tests {
     }
 
     #[tokio::test]
-    async fn make_web_launcher_and_bind_share_one_composition() {
+    async fn make_web_launcher_returns_the_bound_url() {
         let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
         let shutdown = CancellationToken::new();
         let launcher = make_web_launcher(
@@ -1792,9 +1813,8 @@ mod web_launcher_tests {
             PathBuf::from("/tmp/web-cap-repo"),
             shutdown.clone(),
         );
-        // The launcher is the same composition; do not invoke it here — it
-        // would open a browser. bind_tui_web_ui is what it calls.
-        let _ = launcher;
+        let url = launcher().await.expect("bind Web UI");
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
         shutdown.cancel();
     }
 }

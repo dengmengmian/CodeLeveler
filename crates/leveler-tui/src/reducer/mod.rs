@@ -74,15 +74,29 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                         level: NotificationLevel::Info,
                         message: format!("Web UI 已启动：{url}"),
                     });
-                    state.web_url = Some(url);
+                    state.web_url = Some(url.clone());
+                    vec![Effect::OpenWebUrl(url)]
                 }
                 Err(message) => {
                     state.notification = Some(Notification {
                         level: NotificationLevel::Warning,
                         message: format!("Web UI 启动失败：{message}"),
                     });
+                    Vec::new()
                 }
             }
+        }
+        Action::UrlOpened { url, result } => {
+            state.notification = Some(match result {
+                Ok(()) => Notification {
+                    level: NotificationLevel::Info,
+                    message: format!("系统已接受 URL，并交给默认浏览器：{url}"),
+                },
+                Err(message) => Notification {
+                    level: NotificationLevel::Warning,
+                    message: format!("无法在浏览器打开 {url}：{message}"),
+                },
+            });
             Vec::new()
         }
         Action::EditorFinished(result) => {
@@ -417,7 +431,7 @@ fn handle_selection_tick(state: &mut AppState) -> Vec<Effect> {
 fn open_url(state: &mut AppState, url: &str) -> Vec<Effect> {
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: format!("已在浏览器打开 {url}"),
+        message: format!("正在浏览器打开 {url}…"),
     });
     vec![Effect::OpenWebUrl(url.to_string())]
 }

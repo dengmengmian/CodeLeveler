@@ -27,7 +27,7 @@ use leveler_client_protocol::{
     ProtocolEnvelope, RuntimeEvent, SessionId,
 };
 
-use crate::action::{Action, Effect, EffectCompletion, WebLauncher};
+use crate::action::{Action, Effect, EffectCompletion, UrlOpener, WebLauncher};
 use crate::reducer::reduce;
 use crate::render::render;
 use crate::screen::Screen;
@@ -85,6 +85,7 @@ pub enum TuiError {
 pub async fn run(
     client: Arc<dyn InteractiveRuntimeClient>,
     web_launcher: Option<WebLauncher>,
+    url_opener: Option<UrlOpener>,
     remote_launcher: Option<crate::action::RemoteLauncher>,
     boot: Boot,
 ) -> Result<(), TuiError> {
@@ -299,6 +300,7 @@ pub async fn run(
             &completion_tx,
             &delivery_tx,
             &web_launcher,
+            &url_opener,
             &remote_launcher,
             &mut alt,
             &mut stdout,
@@ -405,6 +407,7 @@ fn dispatch_effects(
     completion_tx: &mpsc::UnboundedSender<Action>,
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
     web_launcher: &Option<WebLauncher>,
+    url_opener: &Option<UrlOpener>,
     remote_launcher: &Option<crate::action::RemoteLauncher>,
     // `$EDITOR` takes the terminal over, so it needs the alternate-screen
     // handle (dropped for the duration) and stdout to restore modes on.
@@ -512,7 +515,24 @@ fn dispatch_effects(
                 };
                 run_remote(remote_launcher.as_ref(), request, completion_tx);
             }
-            Effect::OpenWebUrl(url) => open_in_browser(&url),
+            Effect::OpenWebUrl(url) => {
+                let tx = completion_tx.clone();
+                match url_opener {
+                    Some(opener) => {
+                        let opener = Arc::clone(opener);
+                        tokio::spawn(async move {
+                            let result = opener(url.clone()).await;
+                            let _ = tx.send(Action::UrlOpened { url, result });
+                        });
+                    }
+                    None => {
+                        let _ = tx.send(Action::UrlOpened {
+                            url,
+                            result: Err("当前主机没有可用的 URL 打开器".to_string()),
+                        });
+                    }
+                }
+            }
             Effect::OpenExternalEditor { text } => {
                 // Block the event loop while $EDITOR runs: the user is away from
                 // the TUI, and painting over an active editor would corrupt both.
@@ -544,21 +564,6 @@ fn run_external_editor(
         return Err(format!("终端未能恢复：{e}"));
     }
     result
-}
-
-/// Open `url` in the platform default browser (best-effort, non-blocking).
-/// Shared by the `/web` first launch (CLI launcher closure) and re-invocation
-/// (the [`Effect::OpenWebUrl`] path) so both behave identically.
-pub fn open_in_browser(url: &str) {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else if cfg!(target_os = "windows") {
-        // `start` needs an empty title argument before the URL.
-        ("cmd", vec!["/C", "start", "", url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 fn collect_project_files(repository: &str) -> Vec<String> {
