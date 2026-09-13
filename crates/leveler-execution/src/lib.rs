@@ -6,11 +6,12 @@
 //! [`PermissionProfile`] vocabulary the tool layer tags itself with, a
 //! [`CommandRunner`] with process-tree termination, the permission
 //! [`ApprovalPolicy`]/[`Approver`], and a [`Checkpoint`] for rollback.
-// `deny` (not `forbid`) with exactly one scoped allow: the Linux
-// PR_SET_PDEATHSIG pre-exec hook in `command.rs`/`background.rs` — the only
-// way to guarantee grandchildren die when the parent is force-killed. Any
-// new unsafe block still fails the build unless explicitly allowed and
-// justified like that one.
+// `deny` (not `forbid`) with two audited, scoped allows: the Linux
+// PR_SET_PDEATHSIG pre-exec hook in `command.rs`, which keeps
+// grandchildren from surviving a force-killed parent, and the Windows
+// ShellExecuteW call in `url_open.rs`, which delegates an HTTP URL to the
+// registered system handler. Any new unsafe block still fails the build unless
+// explicitly allowed and justified like those boundaries.
 #![deny(unsafe_code)]
 
 pub mod approval;
@@ -27,6 +28,7 @@ mod shell_ast;
 pub use shell_ast::{literal_command_words, literal_program_names, proven_executed_commands};
 pub mod snapshot;
 pub mod trust;
+mod url_open;
 pub mod windows_acl;
 pub mod windows_confine;
 pub mod windows_sandbox;
@@ -67,6 +69,7 @@ pub use trust::{
     TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
     read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
 };
+pub use url_open::{UrlOpenError, open_url};
 pub use windows_confine::{WriteRootLease, lease_write_roots, recover_stale_write_roots};
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
