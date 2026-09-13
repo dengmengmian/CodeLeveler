@@ -1577,6 +1577,31 @@ mod projection_equivalence {
         }
     }
 
+    /// A row written before the gate and the truth were split carries only the
+    /// gate. `passed: true` cannot say whether anything was proven, so it says
+    /// nothing; `passed: false` can only have come from checks that failed, and
+    /// pretending not to know would hide a real failure.
+    #[test]
+    fn a_legacy_row_reports_what_it_can_and_nothing_more() {
+        let shapes = project(vec![
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: None,
+            },
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: None,
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "verify:passed=Some(false):checks=0",
+                "verify:passed=None:checks=0"
+            ]
+        );
+    }
+
     /// The projection is what every client renders. Facts the runtime already
     /// computed must survive the hop: a contribution dropped here cannot be
     /// recovered downstream, and the UI would have to invent it or omit it.

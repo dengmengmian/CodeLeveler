@@ -6,9 +6,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::{
-    ClientCommand, CommandId, MessageId, ObservationClass, PermissionProfile, PlanStepStatus,
-    RuntimeEvent, SessionId, ToolCallId, UiDiff, UiDiffFile, UiObservabilityLoaded, UiPlan,
-    UiPlanStep, UiRecoveryObservation, UiSessionObservation, UiSessionSnapshot, UiToolAggregate,
+    CheckState, ClientCommand, CommandId, MessageId, ObservationClass, PermissionProfile,
+    PlanStepStatus, RuntimeEvent, SessionId, ToolCallId, UiCheck, UiDiff, UiDiffFile,
+    UiObservabilityLoaded, UiPlan, UiPlanStep, UiRecoveryObservation, UiSessionObservation,
+    UiSessionSnapshot, UiToolAggregate, UiVerification,
 };
 use leveler_tui::action::{Action, Effect};
 use leveler_tui::reducer::reduce;
@@ -638,5 +639,57 @@ fn tui_trace_ignores_legacy_observability_loaded_without_query_id() {
     assert!(
         s.trace.loaded.is_none(),
         "1.5 uncorrelated payload must not populate a 1.6 /trace"
+    );
+}
+
+/// A check that failed without gating must be shown as FAILED, beside a
+/// verdict that passes. Both are true at once — the check's own result, and
+/// the fact that it could not block completion — and a screen that folded the
+/// verdict into the check would report a failed `cargo fmt` as a pass. The
+/// worst version of that lie is the one this test pins: the failed check is
+/// the `?`/`!` family's opposite, and it must not borrow the pass glyph.
+#[test]
+fn a_failed_non_gating_check_is_shown_failed_while_the_verdict_passes() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::VerificationUpdated {
+            verification: UiVerification {
+                checks: vec![
+                    UiCheck {
+                        name: "cargo fmt".into(),
+                        status: CheckState::Failed,
+                        evidence: Some("Diff in src/lib.rs".into()),
+                    },
+                    UiCheck {
+                        name: "cargo test".into(),
+                        status: CheckState::Passed,
+                        evidence: None,
+                    },
+                ],
+                // All GATING checks passed: `cargo fmt` is a non-gating check
+                // by plan, so its failure does not close the completion gate.
+                passed: Some(true),
+            },
+        }),
+    );
+    s.active_screen = Screen::Verification;
+    let text = screen(&mut s);
+
+    assert!(
+        text.contains("✗ cargo fmt"),
+        "the failed check lost its own result:\n{text}"
+    );
+    assert!(
+        text.contains("✓ cargo test"),
+        "the passing check was not shown:\n{text}"
+    );
+    assert!(
+        text.contains("验证通过"),
+        "the overall verdict is missing:\n{text}"
+    );
+    assert!(
+        !text.contains("✗ cargo test"),
+        "a passing gating check was shown as failed:\n{text}"
     );
 }

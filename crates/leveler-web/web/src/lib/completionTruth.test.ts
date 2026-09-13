@@ -71,6 +71,34 @@ describe('completionTruth', () => {
     expect(t?.facts).toContain('验证通过');
   });
 
+  it('a non-gating check failure is neither a pass for it nor a failure for the run', () => {
+    // `cargo fmt` is non-gating by plan: it failed, the completion gate stayed
+    // open, and the verdict really did pass. Two facts, both true at once.
+    // This projection answers only the second; the first travels untouched in
+    // `verification.checks`, which is what the Inspector's own check list
+    // renders (one glyph per `CheckState`, exhaustively mapped there).
+    const verification = {
+      passed: true,
+      checks: [
+        { name: 'cargo fmt', status: 'failed' as const },
+        { name: 'cargo test', status: 'passed' as const },
+      ],
+    };
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 1000 },
+        verification,
+      }),
+    );
+    expect(t?.verify).toBe('passed');
+    expect(t?.trust).toBe('verified');
+    expect(t?.facts).toContain('验证通过');
+    expect(t?.facts).not.toContain('验证未通过');
+    // The failed row is still there, unrewritten, for the surface that shows
+    // per-check results.
+    expect(verification.checks[0]).toEqual({ name: 'cargo fmt', status: 'failed' });
+  });
+
   it('checks that proved nothing are incomplete, never passed', () => {
     // What the runtime sends for a run whose checks could not speak: the
     // completion gate is open (it must be — the run is over) and

@@ -577,4 +577,90 @@ mod tests {
         };
         assert_eq!(r.verdict(), Verdict::Failed);
     }
+
+    // ── Node: the same matrix, from the reporter's real output ──────────
+    //
+    // The report-level cases above hand-build `failed_tests`. These run the
+    // whole path — a failed check's captured output through the parser into
+    // attribution — because that is where the Node gap lived: the parser had
+    // no `node` arm, so the set was always empty and a pre-existing `node
+    // --test` failure could never be proven pre-existing (reconciliation
+    // residual 11, D5 reported `failed`).
+
+    /// A `node --test` run red for one test, as the spec reporter prints it.
+    const NODE_RED: &str = "\
+✖ subtraction is broken (0.397583ms)
+ℹ tests 1
+ℹ pass 0
+ℹ fail 1
+
+✖ failing tests:
+
+✖ subtraction is broken (0.397583ms)
+";
+
+    fn node_test_check(name: &str, status: CheckStatus, output: &str) -> CheckOutcome {
+        CheckOutcome {
+            name: name.to_string(),
+            kind: CheckKind::Test,
+            gating: true,
+            status,
+            evidence: output.to_string(),
+            failure: None,
+            failed_tests: crate::test_results::parse_node_failures(output),
+        }
+    }
+
+    #[test]
+    fn a_node_failure_already_red_on_the_baseline_is_pre_existing() {
+        // Case 3: `npm test` → `node --test`, red for the same test on both
+        // trees, change unrelated. It must stop gating.
+        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
+        let base = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
+        working.attribute_baseline(&base);
+        assert!(
+            working.failed_gates().is_empty(),
+            "a pre-existing node failure still gated: {:?}",
+            working.failed_gates()
+        );
+        // Not Failed (the change is not blamed) and not Verified either: the
+        // suite really is red, so the honest verdict is that no gating check
+        // produced evidence — `unavailable`, with the reason naming why.
+        match working.verdict() {
+            Verdict::Unverified(reason) => {
+                assert!(reason.contains("pre-existing failure"), "reason: {reason}");
+            }
+            other => panic!("expected Unverified(pre-existing), got {other:?}"),
+        }
+        assert!(
+            working.passed(),
+            "a pre-existing failure must not block completion"
+        );
+    }
+
+    #[test]
+    fn a_node_failure_the_baseline_did_not_have_is_a_regression() {
+        // Case 4: the baseline ran the same command and passed it.
+        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
+        let base = report(vec![node_test_check("test", CheckStatus::Passed, "")]);
+        working.attribute_baseline(&base);
+        assert_eq!(working.failed_gates().len(), 1);
+        assert_eq!(working.verdict(), Verdict::Failed);
+    }
+
+    #[test]
+    fn a_node_failure_with_unparsable_output_is_never_suppressed() {
+        // Case 5: a runner we do not recognize. No test-level evidence ⇒ the
+        // failure keeps gating even though the baseline was red too.
+        let opaque = "Tests: 1 failed\n";
+        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, opaque)]);
+        let base = report(vec![node_test_check("test", CheckStatus::Failed, opaque)]);
+        working.attribute_baseline(&base);
+        assert_eq!(
+            working.failed_gates().len(),
+            1,
+            "unattributed must fail closed, not blame the baseline"
+        );
+        assert_eq!(working.verdict(), Verdict::Failed);
+    }
 }

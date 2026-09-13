@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use crate::failure::classify;
 use crate::plan::{CheckKind, ScopePolicy, VerificationCommand, VerificationPlan};
 use crate::report::{CheckOutcome, CheckStatus, VerificationReport};
-use crate::test_results::{parse_go_failures, parse_rust_failures};
+use crate::test_results::{parse_go_failures, parse_node_failures, parse_rust_failures};
 
 const MAX_EVIDENCE: usize = 4000;
 
@@ -339,8 +339,14 @@ fn with_no_fail_fast(command: &VerificationCommand, mut args: Vec<String>) -> Ve
 
 /// Parse a failed check's output into test-level failure ids, dispatching on
 /// the toolchain. Only Test checks carry test granularity; build/fmt/lint and
-/// toolchains without a parser (Node, …) yield an empty set and fall back to
+/// toolchains without a parser yield an empty set and fall back to
 /// exit-code-level baseline attribution.
+///
+/// A Node test run arrives either directly (`node --test`) or through the
+/// package manager's script (`npm run test` → `node --test`), so all four
+/// programs are routed to the node parser. The parser keys on the reporter's
+/// own markers, so an `npm test` that runs some other runner matches nothing
+/// and keeps the exit-code fallback.
 fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<String> {
     if command.kind != CheckKind::Test {
         return BTreeSet::new();
@@ -349,6 +355,7 @@ fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<S
     match program {
         "cargo" => parse_rust_failures(output),
         "go" => parse_go_failures(output),
+        "node" | "npm" | "pnpm" | "yarn" => parse_node_failures(output),
         _ => BTreeSet::new(),
     }
 }
@@ -770,6 +777,77 @@ mod tests {
         );
         assert!(!repo.deny_network);
         assert!(repo.write_scope.confines());
+    }
+
+    /// The whole Node path, over real output: `node --test` on a fixture with
+    /// one failing test must yield a `Failed` check whose `failed_tests` names
+    /// that test. Without the Node arm in `parse_failed_tests` the set stayed
+    /// empty, so a pre-existing `node --test` failure could never be proven
+    /// pre-existing and always gated the run (reconciliation residual 11).
+    #[tokio::test]
+    async fn a_real_node_test_failure_yields_test_level_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.test.js"),
+            "const test = require('node:test');\n\
+             const assert = require('node:assert');\n\
+             test('addition works', () => { assert.strictEqual(1 + 1, 2); });\n\
+             test('subtraction is broken', () => { assert.strictEqual(2 - 1, 5); });\n",
+        )
+        .expect("write node fixture");
+
+        // `Verifier::new` reads the installed process capabilities, which are
+        // empty for a library-only caller — an explicit snapshot is what gives
+        // the check a PATH to find `node` on, exactly as the product does at
+        // startup.
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let v = Verifier::with_environment(dir.path().to_path_buf(), environment);
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "test".into(),
+                program: "node".into(),
+                args: vec!["--test".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 120,
+                scope_policy: ScopePolicy::Auto,
+            }],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        // A host without node cannot judge this: say so rather than assert on
+        // an environment that was never here.
+        if check.status == CheckStatus::ToolMissing {
+            eprintln!("skipping: node is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.status,
+            CheckStatus::Failed,
+            "evidence: {}",
+            check.evidence
+        );
+        assert!(
+            check.failed_tests.contains("subtraction is broken"),
+            "a real node failure was not parsed into test-level evidence: {:?}",
+            check.failed_tests
+        );
+        assert!(
+            !check.failed_tests.contains("addition works"),
+            "a passing test was collected as a failure: {:?}",
+            check.failed_tests
+        );
+        assert_eq!(
+            report.verdict(),
+            crate::report::Verdict::Failed,
+            "a real node failure must gate"
+        );
     }
 
     #[tokio::test]

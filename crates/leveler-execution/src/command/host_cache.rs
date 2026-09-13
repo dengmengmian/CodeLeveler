@@ -113,6 +113,26 @@ impl SandboxPaths {
         self.scratch.path()
     }
 
+    /// The CodeLeveler runtime root a confined child resolves its home from.
+    ///
+    /// A confined program that is CodeLeveler — or a project's test suite that
+    /// drives CodeLeveler's own code, which is what a self-dogfood run does —
+    /// writes runtime state under its home: advisory edit locks, the state
+    /// database, the daemon socket. The sandbox's writable roots are the
+    /// workspace, this scratch and the tool caches, so the user's real home is
+    /// deliberately not writable; a child that insists on it fails with EPERM
+    /// rather than being handed real state. Redirecting `LEVELER_HOME` points
+    /// that child at an isolated root inside the scratch: the same rule this
+    /// module already applies to `TMPDIR`, `CARGO_HOME`, `XDG_CACHE_HOME` and
+    /// the rest — private state lives inside the roots the child may write.
+    ///
+    /// Every CodeLeveler runtime path derives from this one root (see
+    /// `leveler_core::LevelerHome`), so locks, database and control files are
+    /// isolated together and cannot end up split across two homes.
+    pub(crate) fn leveler_home(&self) -> PathBuf {
+        self.scratch.path().join("leveler-home")
+    }
+
     pub(crate) fn tool_cache_path(&self) -> &Path {
         &self.tool_cache
     }
@@ -398,6 +418,9 @@ pub(crate) fn prepare_sandbox_paths(
     }
 
     std::fs::create_dir(scratch.path().join("tmp"))?;
+    // The confined child's CodeLeveler runtime root, created here so
+    // `LEVELER_HOME` always names a directory that already exists.
+    std::fs::create_dir(scratch.path().join("leveler-home"))?;
     let mut cache_write_roots = Vec::new();
     for relative in [
         "cargo/registry",
@@ -909,6 +932,12 @@ pub(crate) fn apply_sandbox_environment(cmd: &mut Command, paths: &SandboxPaths)
     cmd.env("CARGO_HOME", &paths.cargo_home);
     cmd.env("GOMODCACHE", &paths.go_mod_cache);
     cmd.env("npm_config_cache", &paths.npm_cache);
+    // CodeLeveler's own runtime root. `LEVELER_HOME` is the resolver's first
+    // precedence, and every runtime path derives from it, so this isolates
+    // locks, state database and daemon control files in one move. Left unset, a
+    // confined child resolved the real home and its first runtime write was
+    // denied by the very fence the sandbox is supposed to provide.
+    cmd.env("LEVELER_HOME", paths.leveler_home());
 }
 
 #[cfg(test)]
