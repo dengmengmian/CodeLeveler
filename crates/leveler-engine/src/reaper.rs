@@ -75,6 +75,14 @@ pub struct ReapConflict {
     pub owner: Option<RuntimeId>,
 }
 
+/// A session whose orphan turns were durably reaped under this ownership
+/// token. A harness may use the boundary to persist its own recovery facts.
+#[derive(Debug, Clone)]
+pub struct ReapedSession {
+    pub session_id: SessionId,
+    pub token: OwnershipToken,
+}
+
 /// What a restart reap did: the reaped events, plus every foreign-owned task
 /// it explicitly left alone (callers report these; silence would hide a
 /// split-ownership situation).
@@ -82,6 +90,7 @@ pub struct ReapConflict {
 pub struct ReapOutcome {
     pub events: Vec<EngineEvent>,
     pub conflicts: Vec<ReapConflict>,
+    pub reaped_sessions: Vec<ReapedSession>,
 }
 
 /// Daemon-restart recovery: for every session with orphan running turns,
@@ -130,46 +139,13 @@ pub async fn reap_after_restart(
             Some(&session),
         )
         .await?;
-        outcome.events.extend(events);
-        // Long-goal P3: a goal left `running` by the dead process IS the
-        // interrupted one (P2). Cut a structured-only durable checkpoint at
-        // this boundary — no model call, startup must never wait on prose.
-        // Best-effort: a failed checkpoint must not fail the reap, and the
-        // schema-level dedupe makes a repeated restart a no-op (same cursor,
-        // same reason → the same logical checkpoint).
-        match crate::checkpoint::create_goal_checkpoint(
-            stores,
-            &session,
-            leveler_lifecycle::CheckpointReason::Interrupted,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                let log = crate::EventLog::new_owned(
-                    stores.events.as_ref(),
-                    session.clone(),
-                    token.clone(),
-                );
-                let event = crate::checkpoint::checkpoint_created_event(&record);
-                let mut forward = |_: EngineEvent| {};
-                if let Err(error) = log.append(None, event.clone(), &mut forward).await {
-                    tracing::warn!(
-                        %error,
-                        "interrupted checkpoint persisted but its announcement failed"
-                    );
-                } else {
-                    outcome.events.push(event);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                session = %session,
-                "interrupted goal checkpoint failed; the reap stands"
-            ),
+        if !events.is_empty() {
+            outcome.reaped_sessions.push(ReapedSession {
+                session_id: session.clone(),
+                token: token.clone(),
+            });
         }
+        outcome.events.extend(events);
     }
     Ok(outcome)
 }

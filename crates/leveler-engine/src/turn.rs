@@ -17,34 +17,26 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::{Approver, Clarifier};
-use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger, StopReason};
+use leveler_lifecycle::StopReason;
 use leveler_model::{Message, Role};
-use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore};
+use leveler_storage::{EngineStores, MessageStore, ModelRequestStore};
 
 use crate::log::EventLog;
 use crate::ports::{
-    CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord,
-    PortError, TranscriptSink, WorkspaceFacts,
+    EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError, TranscriptSink,
 };
 use crate::recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
 
-/// Whether this turn inherits the session's prior task state.
-#[derive(Debug, Clone, Copy)]
-pub enum SeedRequest {
-    /// A resumed turn: always seed, the task epoch is unchanged.
+/// The mechanical input that starts a turn.
+#[derive(Debug, Clone)]
+pub enum TurnStart {
+    /// A resumed turn has no new initiating message.
     Resume,
-    /// A fresh request. The engine owns one mechanical rule over two facts the
-    /// HARNESS supplies; it does not read `PlanState` or `ProgressLedger`.
-    Fresh {
-        /// A turn the runtime issued after a refused close, which continues the
-        /// SAME goal rather than opening a new one.
-        continues_active_goal: bool,
-        /// The Coding harness's answer to "is the prior domain state still
-        /// open?" — computed from its own `PlanState` / `ProgressLedger`. The
-        /// engine applies the rule; it does not make this judgement.
-        prior_epoch_open: bool,
-    },
+    /// A fresh user turn carries the request accepted into the write-ahead log.
+    Fresh(Message),
+    /// A node or repair turn carries only its mechanical kind payload.
+    Internal,
 }
 
 /// Versioned write-ahead record for the input that initiated a fresh user
@@ -89,20 +81,6 @@ impl TurnInitiationPayload {
     }
 }
 
-/// The durable state a fresh execution resumes from. Every field is read off
-/// the event log: the engine reports what was persisted and does not interpret
-/// any of it.
-pub struct TurnSeeds {
-    pub plan: Option<PlanState>,
-    pub ledger: Option<EvidenceLedger>,
-    pub progress: Option<ProgressLedger>,
-    /// The durable terminal facts of children that finished. Whether a given
-    /// child's settlement was already delivered — and what role it played — is
-    /// the harness's reading of its own `outstanding_children` record; the
-    /// engine carries the fact and nothing else.
-    pub finished_children: Vec<crate::log::FinishedChildFact>,
-}
-
 /// Everything the engine offers the harness for one turn.
 ///
 /// This is the whole seam. The engine hands over durable ports and the state
@@ -114,11 +92,11 @@ pub struct TurnPorts {
     pub emitter: EventEmitter,
     /// Persists the transcript and the model-call rows for this turn.
     pub sink: TurnSink,
-    /// `None` when this turn must not inherit prior task state.
-    pub seeds: Option<TurnSeeds>,
+    /// Durable child terminal facts observed after ghost reconciliation. Their
+    /// domain meaning belongs to the harness.
+    pub finished_children: Vec<crate::log::FinishedChildFact>,
     pub barrier: Arc<dyn EventBarrier>,
     pub fence: Arc<dyn ExecutionFence>,
-    pub checkpoint: Arc<dyn CompactionCheckpoint>,
     /// The turn's approver/clarifier, wrapped so every request and decision
     /// is recorded before it is answered.
     pub approver: Arc<dyn Approver>,
@@ -252,45 +230,6 @@ pub fn storage_model_request(
 
 /// The engine's [`ExecutionFence`]: before a tool dispatch,
 /// re-read the task's current owner and compare it to this run's token.
-/// Long-goal P3: the compaction-boundary checkpoint port handed to the
-/// harness. Flush-then-cursor: every event emitted so far becomes durable
-/// BEFORE the cursor is captured, so the checkpoint can never represent an
-/// event that is not on disk. The `GoalCheckpointCreated` announcement is
-/// emitted after the row exists and lands after the cursor — part of the
-/// recent delta, exactly where a fact newer than the checkpoint belongs.
-pub(crate) struct CompactionCheckpointPort {
-    stores: leveler_storage::EngineStores,
-    session_id: SessionId,
-    workspace: Option<Arc<dyn WorkspaceFacts>>,
-    events: crate::recorders::EventEmitter,
-}
-
-#[async_trait::async_trait]
-impl CompactionCheckpoint for CompactionCheckpointPort {
-    async fn checkpoint_before_compaction(
-        &self,
-        summary: Option<&str>,
-    ) -> Result<Option<String>, PortError> {
-        self.events.flush().await.map_err(PortError::Persistence)?;
-        let record = crate::checkpoint::create_goal_checkpoint(
-            &self.stores,
-            &self.session_id,
-            leveler_lifecycle::CheckpointReason::ContextCompaction,
-            self.workspace.as_deref(),
-            crate::checkpoint::SemanticRecap::briefing(summary),
-        )
-        .await
-        .map_err(|e| PortError::Persistence(e.to_string()))?;
-        let Some(record) = record else {
-            // No goal in scope (plain chat): the fold proceeds as before P3.
-            return Ok(None);
-        };
-        self.events
-            .emit(crate::checkpoint::checkpoint_created_event(&record));
-        Ok(Some(record.payload.context_block()))
-    }
-}
-
 /// Inherently check-then-dispatch (§ the fence guarantees a runtime already
 /// known stale dispatches nothing new; it does not claim exactly-once).
 pub(crate) struct OwnershipFence {
@@ -362,9 +301,7 @@ impl TurnRunner<'_> {
     pub async fn run_turn<T, F, Fut>(
         &self,
         kind: TurnKind,
-        seed: SeedRequest,
-        initiating_message: Option<Message>,
-        workspace: Option<Arc<dyn WorkspaceFacts>>,
+        start: TurnStart,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
         execute: F,
@@ -373,26 +310,25 @@ impl TurnRunner<'_> {
         F: FnOnce(TurnPorts) -> Fut,
         Fut: std::future::Future<Output = Result<TurnFacts<T>, TurnFailure>>,
     {
-        let payload = match (&kind, seed, initiating_message) {
-            (TurnKind::User | TurnKind::Chat, SeedRequest::Fresh { .. }, Some(message)) => {
+        let payload = match (&kind, start) {
+            (TurnKind::User | TurnKind::Chat, TurnStart::Fresh(message)) => {
                 Some(TurnInitiationPayload::encode(message)?)
             }
-            (TurnKind::User | TurnKind::Chat, SeedRequest::Fresh { .. }, None) => {
+            (TurnKind::User | TurnKind::Chat, TurnStart::Resume) => None,
+            (TurnKind::User | TurnKind::Chat, TurnStart::Internal) => {
                 return Err(EngineError::Config(
-                    "a fresh user turn requires a durable initiating message".to_string(),
+                    "a user turn requires a fresh message or resume start".to_string(),
                 ));
             }
-            (TurnKind::User | TurnKind::Chat, SeedRequest::Resume, None) => None,
-            (TurnKind::User | TurnKind::Chat, SeedRequest::Resume, Some(_)) => {
-                return Err(EngineError::Config(
-                    "a resume turn cannot carry a new initiating message".to_string(),
-                ));
+            (TurnKind::Node { node_id }, TurnStart::Internal) => {
+                Some(format!(r#"{{"node_id":"{node_id}"}}"#))
             }
-            (TurnKind::Node { node_id }, _, None) => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
-            (TurnKind::Repair { attempt }, _, None) => Some(format!(r#"{{"attempt":{attempt}}}"#)),
-            (TurnKind::Node { .. } | TurnKind::Repair { .. }, _, Some(_)) => {
+            (TurnKind::Repair { attempt }, TurnStart::Internal) => {
+                Some(format!(r#"{{"attempt":{attempt}}}"#))
+            }
+            (TurnKind::Node { .. } | TurnKind::Repair { .. }, _) => {
                 return Err(EngineError::Config(
-                    "internal turns cannot carry a user initiating message".to_string(),
+                    "internal turns require an internal start".to_string(),
                 ));
             }
         };
@@ -458,8 +394,6 @@ impl TurnRunner<'_> {
             .await?;
         }
 
-        let seeds = self.turn_seeds(seed, &finished_children).await?;
-
         // Margin, not the fix. The fix is the batching pump below: raising this
         // alone only moves the cliff, and a wider fan-out would walk straight
         // back off it. Sized so a burst from several agents has somewhere to sit
@@ -482,19 +416,13 @@ impl TurnRunner<'_> {
                 turn_id: turn_id.clone(),
                 emitter: events.clone(),
                 sink,
-                seeds,
+                finished_children,
                 barrier: Arc::new(crate::recorders::PumpBarrier {
                     events: events.clone(),
                 }),
                 fence: Arc::new(OwnershipFence {
                     ownership: self.stores.ownership.clone(),
                     token: self.token.clone(),
-                }),
-                checkpoint: Arc::new(CompactionCheckpointPort {
-                    stores: self.stores.clone(),
-                    session_id: self.session_id.clone(),
-                    workspace: workspace.clone(),
-                    events: events.clone(),
                 }),
                 approver: Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
@@ -694,93 +622,6 @@ impl TurnRunner<'_> {
             outcome: facts.outcome,
         })
     }
-
-    /// The durable state a fresh execution should resume from.
-    ///
-    /// Resume always seeds. A fresh request seeds when the runtime is
-    /// continuing the active goal, or when the harness reports the prior epoch
-    /// still open. Whether the prior epoch IS open is Coding domain judgement
-    /// and lives in `leveler-agent`: the engine applies that mechanical rule
-    /// and does not read `PlanState` or `ProgressLedger` to form its own.
-    async fn turn_seeds(
-        &self,
-        seed: SeedRequest,
-        finished_children: &[crate::log::FinishedChildFact],
-    ) -> Result<Option<TurnSeeds>, EngineError> {
-        // The engine applies ONE mechanical lifecycle rule over two facts the
-        // harness supplies. Whether the prior Coding epoch is still open is the
-        // harness's judgement (`prior_epoch_open`); the engine never reads
-        // `PlanState`/`ProgressLedger` to decide it.
-        let seeding = match seed {
-            SeedRequest::Resume => true,
-            SeedRequest::Fresh {
-                continues_active_goal,
-                prior_epoch_open,
-            } => should_seed_task_state(continues_active_goal, prior_epoch_open),
-        };
-        if !seeding {
-            return Ok(None);
-        }
-        // Only a seeding turn loads prior state. The direct durable facts —
-        // plan, ledger, progress and the children that finished — are carried
-        // verbatim; reconciling the harness's own `outstanding_children`
-        // encoding against those terminal facts is the harness's job.
-        let progress =
-            last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
-        let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
-        let ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?;
-        Ok(Some(TurnSeeds {
-            plan,
-            ledger,
-            progress,
-            finished_children: finished_children.to_vec(),
-        }))
-    }
-}
-
-/// The engine's mechanical lifecycle rule for a fresh turn.
-///
-/// Pure booleans: `prior_epoch_open` is the HARNESS's judgement over its own
-/// `PlanState`/`ProgressLedger`, and a goal continuation is always open by
-/// construction.
-///
-/// A continuation of the active goal seeds unconditionally. `closing` and a
-/// fully completed plan both describe the previous WINDOW; neither says the
-/// GOAL is done, and the runtime only issues a continuation because it is
-/// not. Whether the carried evidence is still valid is then the workspace
-/// revision's question, never the epoch's.
-pub(crate) fn should_seed_task_state(continues_active_goal: bool, prior_epoch_open: bool) -> bool {
-    continues_active_goal || prior_epoch_open
-}
-
-/// Seed loaders: indexed single-row lookups (never full-log scans), and a
-/// selected row that fails to parse is a hard error — same fail-loud policy as
-/// `EventLog::replay`, never a silently missing seed.
-async fn last_event_of_type(
-    events: &dyn EventStore,
-    session_id: &SessionId,
-    event_type: &str,
-) -> Result<Option<EngineEvent>, EngineError> {
-    match events
-        .load_last_by_type(session_id, event_type, None)
-        .await?
-    {
-        Some(row) => Ok(Some(EngineEvent::from_payload(&row.payload)?)),
-        None => Ok(None),
-    }
-}
-
-/// Last full-list plan from the event log (SoT for resume PlanState).
-pub async fn last_persisted_plan(
-    events: &dyn EventStore,
-    session_id: &SessionId,
-) -> Result<Option<PlanState>, EngineError> {
-    Ok(
-        match last_event_of_type(events, session_id, "plan_updated").await? {
-            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
-            _ => None,
-        },
-    )
 }
 
 impl TurnRunner<'_> {
@@ -850,56 +691,5 @@ impl TurnRunner<'_> {
             self.log.append(Some(attribute_to), event, observer).await?;
         }
         Ok(())
-    }
-}
-
-/// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
-pub async fn last_persisted_ledger(
-    events: &dyn EventStore,
-    session_id: &SessionId,
-) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {
-    Ok(
-        match last_event_of_type(events, session_id, "evidence_ledger_updated").await? {
-            Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
-            _ => None,
-        },
-    )
-}
-
-/// Last ProgressLedger snapshot (closeout / no-progress streak for continue).
-pub async fn last_persisted_progress(
-    events: &dyn EventStore,
-    session_id: &SessionId,
-) -> Result<Option<leveler_lifecycle::ProgressLedger>, EngineError> {
-    Ok(
-        match last_event_of_type(events, session_id, "progress_updated").await? {
-            Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
-            _ => None,
-        },
-    )
-}
-
-#[cfg(test)]
-mod seed_gate_tests {
-    use super::*;
-
-    #[test]
-    fn a_fresh_turn_does_not_seed_a_closed_epoch() {
-        assert!(!should_seed_task_state(false, false));
-    }
-
-    #[test]
-    fn a_fresh_turn_seeds_an_open_epoch() {
-        assert!(should_seed_task_state(false, true));
-    }
-
-    /// A refused close is the opposite of a finished epoch: the goal is
-    /// explicitly still open, and the runtime itself is continuing it. The
-    /// harness's closed-epoch answer (`prior_epoch_open == false`) must not be
-    /// able to drop a continuation.
-    #[test]
-    fn a_goal_continuation_seeds_even_when_the_harness_reports_closed() {
-        assert!(should_seed_task_state(true, false));
-        assert!(should_seed_task_state(true, true));
     }
 }

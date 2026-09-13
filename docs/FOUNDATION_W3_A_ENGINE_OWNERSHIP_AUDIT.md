@@ -4,19 +4,25 @@
 
 ```text
 AUDIT_BASE=38e6a0304f8c38b65fe940853079e9fabadb3840
-AUDIT_MODE=READ_ONLY
+REPAIR_BASE=a15e42e76af36f397a340d41dfb70ed340323dcc
+AUDIT_MODE=REPAIR_AND_REAUDIT
 W3_A_AUDIT=COMPLETE
-INDEPENDENT_REVIEW=AGREES
+W3_A_REPAIR=COMPLETE
+INDEPENDENT_REVIEW=PASS
 MODEL_INTELLIGENCE_BOUNDARY=PASS
-GENERIC_LIFECYCLE_OWNER=FAIL
-DOMAIN_SEMANTICS_ISOLATION=FAIL
-W3_A_GATE=BLOCKED
-FOUNDATION_FROZEN=NO
+GENERIC_LIFECYCLE_OWNER=PASS
+DOMAIN_SEMANTICS_ISOLATION=PASS
+LONG_GOAL_FENCING=PASS
+TASK_GOAL_TERMINAL_ATOMICITY=PASS
+SESSION_TASK_CREATION_ATOMICITY=PASS
+CANONICAL_VALIDATION=PASS
+W3_A_GATE=PASS
+FOUNDATION_FROZEN=YES
 ```
 
-The gate is blocked by existing ownership violations. It is not blocked by a
-test failure, and the audit found no path where the Engine infers that the
-user's request is complete because tests passed or files changed.
+The first pass found the violations recorded below. The repair pass closed
+them without moving model judgment into the Engine. Independent review and the
+canonical workspace validation both pass on the repaired tree.
 
 ## Authority Contract
 
@@ -46,10 +52,9 @@ review base. It traced:
   `leveler-engine`;
 - where outcome, verification, review, and completion decisions are made.
 
-The audit did not modify code, schemas, CI, or tests. No broad refactor is
-authorized by this document. A separate independent review inspected the same
-base and agreed that the gate is blocked, including the session-creation and
-long-goal persistence findings.
+The initial read-only pass did not modify code, schemas, CI, or tests. A
+separate independent review inspected the same base and agreed that the gate
+was blocked, including the session-creation and long-goal persistence findings.
 
 ## Confirmed Ownership Violations
 
@@ -295,21 +300,77 @@ and the one durable store. It must not add an Engine manager, registry, factory,
 generic Workspace framework, second checkpoint store, or parallel lifecycle
 subsystem.
 
-## Gate Decision
+## Repair and Re-Audit
+
+The repair keeps the existing owner model and removes the bypasses found in
+the first pass:
+
+- `TaskEngine::create_task` now commits the configured session and task
+  association in one storage transaction. Normal, daemon, parallel-parent,
+  and fork creation all use it.
+- `TaskEngine::start_task` acquires ownership before atomically writing the
+  caller-supplied execution config and Running projection. A foreign or stale
+  owner changes no config or lifecycle column.
+- Normal, chat, resume, crash acknowledgement, user shell, and parallel parent
+  lifecycle writes pass through `TaskEngine`. Parallel work captures every
+  controlled post-start error and sends it through one terminal epilogue.
+- Coding opens or reuses goals only after ownership. The Harness supplies the
+  goal disposition, and Storage commits its window/settlement with the task
+  terminal and `TaskFinished` event in one transaction. Explicit resume reuses
+  and settles the same goal record.
+- Coding plan/evidence/progress seed interpretation, checkpoint projection,
+  workspace facts, and lost-child contribution stay above the Engine. The
+  executor owns only the generic compaction-hook timing it consumes.
+- `TurnPorts` exposes the ordered `EventEmitter`; it no longer hands a Harness
+  a writable `EventStore` that could bypass fencing and observer delivery.
+- The Harness supplies `AgentState`; generic recovery wording contains no
+  repository assumption; `tempfile` is test-only.
+
+Mechanical tripwires cover dependency direction, the non-Coding Harness,
+atomic session/task creation, stale-token config/start writes, goal terminal
+rollback, exact resume window accounting, App lifecycle entry points, and the
+Fork path.
+
+### Residual risks outside this gate
+
+- Goal checkpoints are derived, rebuildable projections. Their create port is
+  not ownership-fenced; canonical event and lifecycle writes remain fenced.
+  A future cache-contract change should decide whether stale projection writes
+  are rejected or tolerated explicitly.
+- A hard process death between marking a parallel parent Running and opening
+  its first child still relies on restart recovery policy. Controlled errors
+  now always commit a terminal fact; extending reaping to turnless external
+  tasks is a separate recovery-contract change.
+
+No second lifecycle system, manager, registry, or persistent truth source was
+introduced.
+
+## Final Gate Decision
 
 ```text
 ENGINE_INFERS_DOMAIN_COMPLETION=NO
-ENGINE_SELECTS_CODING_WORKFLOW_STATE=YES
-ENGINE_INTERPRETS_CODING_SEEDS=YES
-ENGINE_INTERPRETS_CODING_CHECKPOINTS=YES
-PRODUCT_CREATES_RUNTIME_SESSIONS_DIRECTLY=YES
-LONG_GOAL_WRITES_OWNERSHIP_FENCED=NO
-TASK_TERMINAL_AND_GOAL_SETTLEMENT_ATOMIC=NO
-PRODUCT_OWNS_PARALLEL_PARENT_LIFECYCLE=YES
-ONE_LIFECYCLE_OWNER=NO
-W3_A_GATE=BLOCKED
-NEXT_ACTION=ARCHITECTURE_REPAIR_PLAN_AND_APPROVAL
+ENGINE_SELECTS_CODING_WORKFLOW_STATE=NO
+ENGINE_INTERPRETS_CODING_SEEDS=NO
+ENGINE_INTERPRETS_CODING_CHECKPOINTS=NO
+PRODUCT_CREATES_RUNTIME_SESSIONS_DIRECTLY=NO
+LONG_GOAL_WRITES_OWNERSHIP_FENCED=YES
+TASK_TERMINAL_AND_GOAL_SETTLEMENT_ATOMIC=YES
+PRODUCT_OWNS_PARALLEL_PARENT_LIFECYCLE=NO
+ONE_LIFECYCLE_OWNER=YES
+W3_A_GATE=PASS
+NEXT_ACTION=COMMIT_PUSH_AND_CI
 ```
 
-W3-A is complete as an audit. Foundation cannot be frozen at this base. The
-next task is a scoped architecture repair, not another evidence-only gate.
+Validation completed with:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --locked --no-fail-fast
+git diff --check
+```
+
+All executable tests passed. The suite's explicitly opt-in live/manual corpus,
+visual, and full-repository probe tests remained ignored by their own test
+declarations. W3-A is closed and the Foundation boundary is frozen at this
+repaired tree; delivery still requires commit, push, and remote CI.

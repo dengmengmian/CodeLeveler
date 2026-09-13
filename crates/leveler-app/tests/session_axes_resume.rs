@@ -10,7 +10,7 @@ use leveler_app::Application;
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::SessionRepository;
+use leveler_storage::{SessionRepository, SessionStore, TaskStore};
 use leveler_tools::core_surface;
 
 /// In-process capability handles: the composition under test is about which
@@ -64,6 +64,16 @@ async fn create_session_persists_work_profile_and_collaboration() {
     let record = SessionRepository::new(&db).get(&id).await.unwrap().unwrap();
     assert_eq!(record.work_profile, "delivery");
     assert_eq!(record.collaboration, "goal");
+    assert_eq!(
+        TaskStore::task_for_session(&db, &id).await.unwrap(),
+        Some(leveler_core::TaskId::new(id.as_str())),
+        "session creation must return only after the engine has created its task"
+    );
+    assert_eq!(
+        SessionStore::execution(&db, &id).await.unwrap(),
+        Some(("assisted".into(), false, "direct".into(), None)),
+        "routing creation through the engine must preserve the initial execution config"
+    );
 }
 
 #[tokio::test]

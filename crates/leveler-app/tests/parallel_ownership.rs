@@ -3,38 +3,46 @@
 //! CandidateStarted / CandidateFinished, fenced terminal), proven against a
 //! stale parent token.
 
-use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
-use leveler_engine::{EngineEvent, EventLog, ExecutionKind};
+use leveler_core::{OwnerEpoch, RuntimeId};
+use leveler_engine::{EngineEvent, EventLog, ExecutionKind, NewSession, TaskEngine};
 use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome};
 use leveler_storage::{
-    Database, EventStore, OwnershipStore, SessionRecord, SessionStore, TaskStore, TerminalStore,
+    Database, EngineStores, EventStore, OwnershipStore, SessionRepository, SessionStore, TaskStore,
 };
+
+fn engine(db: &Database, runtime: &str) -> TaskEngine {
+    TaskEngine {
+        stores: EngineStores::from_database(db),
+        runtime_id: RuntimeId::new(runtime),
+    }
+}
+
+async fn create_parallel_parent(engine: &TaskEngine) -> leveler_core::SessionId {
+    engine
+        .create_task(&NewSession {
+            workspace: "/repo".into(),
+            goal: "parallel goal".into(),
+            model: "mock/m".into(),
+            mode: "assisted".into(),
+            sandbox: false,
+            kind: ExecutionKind::Parallel,
+            axes: None,
+        })
+        .await
+        .unwrap()
+}
 
 #[tokio::test]
 async fn parallel_parent_canonical_writes_require_current_owner() {
     let db = Database::connect_in_memory().await.unwrap();
-    let record = SessionRecord::new("/repo", "parallel goal", "mock/m", leveler_core::now());
-    let parent = SessionId::new(record.id.clone());
-    SessionStore::create(&db, &record).await.unwrap();
-    let task = TaskStore::ensure_for_session(&db, &parent, leveler_core::now())
-        .await
-        .unwrap();
-    let rt = RuntimeId::new("rt-parallel");
+    let engine = engine(&db, "rt-parallel");
+    let parent = create_parallel_parent(&engine).await;
 
-    // The parent acquires ownership (as parallel_edit now does)…
-    let token = OwnershipStore::acquire(&db, &task, &rt, OwnerEpoch::UNOWNED)
+    // The parent enters Running through the same engine seam as every task.
+    let token = engine
+        .mark_running(&parent, AgentState::Execute)
         .await
         .unwrap();
-    SessionStore::update_status_owned(
-        &db,
-        &token,
-        &parent,
-        SessionStatus::Running,
-        AgentState::Execute,
-        leveler_core::now(),
-    )
-    .await
-    .unwrap();
     let owned_log = EventLog::new_owned(&db, parent.clone(), token.clone());
     let sink = &mut |_: EngineEvent| {};
     owned_log
@@ -64,7 +72,7 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
         .unwrap();
 
     // …then loses it (a newer epoch exists).
-    OwnershipStore::acquire(&db, &task, &rt, token.owner_epoch)
+    OwnershipStore::acquire(&db, &token.task_id, &engine.runtime_id, token.owner_epoch)
         .await
         .unwrap();
     let events_before = EventStore::load(&db, &parent).await.unwrap().len();
@@ -87,19 +95,22 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
     assert_eq!(forwarded, 0, "no observer forward without persistence");
 
     // Stale terminal: refused atomically — no event, no projection.
-    let result = TerminalStore::finish_task_owned(
-        &db,
-        &token,
-        &parent,
-        "task_finished",
-        "{}",
-        TaskOutcome::Failed,
-        leveler_lifecycle::VerificationStatus::NotRun,
-        SessionStatus::Failed,
-        AgentState::Failed,
-        leveler_core::now(),
-    )
-    .await;
+    let result = engine
+        .finish_task(
+            &token,
+            &parent,
+            leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: Some("stale parent".into()),
+                stop: None,
+                status: SessionStatus::Failed,
+                state: AgentState::Failed,
+                goal: None,
+            },
+            &mut |_| {},
+        )
+        .await;
     assert!(result.is_err(), "stale terminal must be refused");
     assert_eq!(
         EventStore::load(&db, &parent).await.unwrap().len(),
@@ -118,11 +129,11 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
 #[tokio::test]
 async fn parallel_parent_refuses_foreign_owner() {
     let db = Database::connect_in_memory().await.unwrap();
-    let record = SessionRecord::new("/repo", "parallel goal", "mock/m", leveler_core::now());
-    let parent = SessionId::new(record.id.clone());
-    SessionStore::create(&db, &record).await.unwrap();
-    let task = TaskStore::ensure_for_session(&db, &parent, leveler_core::now())
+    let engine = engine(&db, "rt-a");
+    let parent = create_parallel_parent(&engine).await;
+    let task = TaskStore::task_for_session(&db, &parent)
         .await
+        .unwrap()
         .unwrap();
 
     // runtime-B owns the task at epoch 1.
@@ -132,7 +143,8 @@ async fn parallel_parent_refuses_foreign_owner() {
         .unwrap();
 
     // runtime-A's parallel parent acquisition must refuse, not CAS-steal.
-    let error = leveler_app::acquire_parallel_parent_ownership(&db, &task, &RuntimeId::new("rt-a"))
+    let error = engine
+        .mark_running(&parent, AgentState::Execute)
         .await
         .expect_err("a foreign owner must never be auto-stolen");
     assert!(
@@ -160,4 +172,53 @@ async fn parallel_parent_refuses_foreign_owner() {
         "the session must not have entered Running"
     );
     assert!(EventStore::load(&db, &parent).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn parallel_parent_finishes_through_the_engine() {
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine(&db, "rt-parallel");
+    let parent = create_parallel_parent(&engine).await;
+    let token = engine
+        .mark_running(&parent, AgentState::Execute)
+        .await
+        .unwrap();
+
+    engine
+        .finish_task(
+            &token,
+            &parent,
+            leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::Passed,
+                reason: None,
+                stop: None,
+                status: SessionStatus::Completed,
+                state: AgentState::Complete,
+                goal: None,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    let record = SessionRepository::new(&db)
+        .get(&parent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, SessionStatus::Completed);
+    assert_eq!(record.state, AgentState::Complete);
+    assert_eq!(
+        SessionStore::execution(&db, &parent).await.unwrap(),
+        Some((
+            "assisted".into(),
+            false,
+            ExecutionKind::Parallel.as_str().into(),
+            Some(TaskOutcome::Completed),
+        ))
+    );
+    let events = EventStore::load(&db, &parent).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "task_finished");
 }

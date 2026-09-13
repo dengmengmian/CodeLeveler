@@ -229,15 +229,10 @@ async fn run_chat_turn(
     runner
         .run_turn(
             TurnKind::Chat,
-            leveler_engine::SeedRequest::Fresh {
-                continues_active_goal: false,
-                prior_epoch_open: true,
-            },
-            Some(leveler_model::Message::text(
+            leveler_engine::TurnStart::Fresh(leveler_model::Message::text(
                 leveler_model::Role::User,
                 "test",
             )),
-            None,
             &mut |_| {},
             cancellation.clone(),
             |ports| {
@@ -248,6 +243,10 @@ async fn run_chat_turn(
                         prior: Vec::new(),
                         content: vec![ContentPart::Text { text: text.into() }],
                     },
+                    true,
+                    h.session.clone(),
+                    stores.events.clone(),
+                    None,
                     ports,
                     cancellation.clone(),
                 )

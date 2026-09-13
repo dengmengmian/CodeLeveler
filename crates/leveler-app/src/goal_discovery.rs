@@ -107,7 +107,10 @@ mod tests {
         Database, GoalStore, OwnershipStore, SessionRecord, SessionRepository, TaskStore,
     };
 
-    async fn seed(db: &Database) -> (SessionId, TaskId) {
+    async fn seed(
+        db: &Database,
+        owner: &RuntimeId,
+    ) -> (SessionId, TaskId, leveler_core::OwnershipToken) {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         SessionRepository::new(db).create(&record).await.unwrap();
         let session = SessionId::new(record.id);
@@ -115,28 +118,12 @@ mod tests {
             .ensure_for_session(&session, leveler_core::now())
             .await
             .unwrap();
-        (session, task)
+        let token = db.acquire(&task, owner, OwnerEpoch::new(0)).await.unwrap();
+        (session, task, token)
     }
 
     fn rt(id: &str) -> RuntimeId {
         RuntimeId::new(id)
-    }
-
-    #[tokio::test]
-    async fn a_goal_nobody_owns_is_ours_to_report() {
-        let db = Database::connect_in_memory().await.unwrap();
-        let stores = EngineStores::from_database(&db);
-        let (session, task) = seed(&db).await;
-        db.open(&task, "unowned work", leveler_core::now())
-            .await
-            .unwrap();
-
-        let found = list_unfinished_goals(&stores, &rt("rt-1")).await.unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].session_id, session);
-        assert_eq!(found[0].owner, None);
-        assert!(found[0].ours);
-        assert!(found[0].needs_attention());
     }
 
     /// RuntimeId survives a process restart, so a goal abandoned by the
@@ -146,11 +133,8 @@ mod tests {
     async fn a_goal_owned_by_this_runtime_is_ours() {
         let db = Database::connect_in_memory().await.unwrap();
         let stores = EngineStores::from_database(&db);
-        let (_, task) = seed(&db).await;
-        db.acquire(&task, &rt("rt-1"), OwnerEpoch::new(0))
-            .await
-            .unwrap();
-        db.open(&task, "our work", leveler_core::now())
+        let (_, _, token) = seed(&db, &rt("rt-1")).await;
+        db.open(&token, "our work", leveler_core::now())
             .await
             .unwrap();
 
@@ -166,11 +150,8 @@ mod tests {
     async fn a_foreign_owned_goal_is_reported_but_never_claimed() {
         let db = Database::connect_in_memory().await.unwrap();
         let stores = EngineStores::from_database(&db);
-        let (_, task) = seed(&db).await;
-        db.acquire(&task, &rt("rt-other"), OwnerEpoch::new(0))
-            .await
-            .unwrap();
-        db.open(&task, "someone else's work", leveler_core::now())
+        let (_, _, token) = seed(&db, &rt("rt-other")).await;
+        db.open(&token, "someone else's work", leveler_core::now())
             .await
             .unwrap();
 
@@ -188,12 +169,12 @@ mod tests {
     async fn a_settled_goal_is_not_unfinished_work() {
         let db = Database::connect_in_memory().await.unwrap();
         let stores = EngineStores::from_database(&db);
-        let (_, task) = seed(&db).await;
+        let (_, _, token) = seed(&db, &rt("rt-1")).await;
         let goal = db
-            .open(&task, "finished work", leveler_core::now())
+            .open(&token, "finished work", leveler_core::now())
             .await
             .unwrap();
-        db.settle(&goal, leveler_core::now()).await.unwrap();
+        db.settle(&token, &goal, leveler_core::now()).await.unwrap();
 
         assert!(
             list_unfinished_goals(&stores, &rt("rt-1"))
@@ -208,15 +189,17 @@ mod tests {
     async fn a_completed_goal_does_not_hide_or_join_the_unfinished_one() {
         let db = Database::connect_in_memory().await.unwrap();
         let stores = EngineStores::from_database(&db);
-        let (_, task_a) = seed(&db).await;
-        let (_, task_b) = seed(&db).await;
+        let (_, _, token_a) = seed(&db, &rt("rt-1")).await;
+        let (_, _, token_b) = seed(&db, &rt("rt-1")).await;
 
         let done = db
-            .open(&task_a, "goal B", leveler_core::now())
+            .open(&token_a, "goal B", leveler_core::now())
             .await
             .unwrap();
-        db.settle(&done, leveler_core::now()).await.unwrap();
-        db.open(&task_b, "goal A", leveler_core::now())
+        db.settle(&token_a, &done, leveler_core::now())
+            .await
+            .unwrap();
+        db.open(&token_b, "goal A", leveler_core::now())
             .await
             .unwrap();
 
@@ -232,9 +215,9 @@ mod tests {
     async fn listing_unfinished_goals_changes_nothing() {
         let db = Database::connect_in_memory().await.unwrap();
         let stores = EngineStores::from_database(&db);
-        let (_, task) = seed(&db).await;
+        let (_, _, token) = seed(&db, &rt("rt-1")).await;
         let goal = db
-            .open(&task, "untouched", leveler_core::now())
+            .open(&token, "untouched", leveler_core::now())
             .await
             .unwrap();
         let before = db.get(&goal).await.unwrap().unwrap();

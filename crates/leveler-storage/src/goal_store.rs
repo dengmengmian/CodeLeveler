@@ -17,9 +17,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use leveler_core::{GoalId, TaskId, Timestamp};
+use leveler_core::{GoalId, OwnershipToken, TaskId, Timestamp};
 
-use crate::{Database, StorageError};
+use crate::{Database, OwnershipError, StorageError};
 
 /// Does this goal still owe work?
 ///
@@ -77,26 +77,38 @@ pub struct GoalRecord {
     pub windows_run: u32,
 }
 
-/// Identity access to durable goals.
+/// Access to durable goals.
 #[async_trait]
 pub trait GoalStore: Send + Sync {
-    /// Open a goal against a task. Returns its new id.
+    /// Open a goal against the task currently owned by `token`.
+    ///
+    /// The ownership assertion and insert are one atomic write. A stale token
+    /// creates no goal and returns a typed ownership error.
     async fn open(
         &self,
-        task_id: &TaskId,
+        token: &OwnershipToken,
         objective: &str,
         now: Timestamp,
-    ) -> Result<GoalId, StorageError>;
+    ) -> Result<GoalId, OwnershipError>;
 
     /// Note that a work window ran. Idempotency is the caller's business —
     /// this counts calls, because a window that ran twice really is two
     /// windows.
-    async fn note_window(&self, goal_id: &GoalId) -> Result<(), StorageError>;
+    async fn note_window(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+    ) -> Result<(), OwnershipError>;
 
     /// Mark a goal as owing no further work. Settling twice is a no-op rather
     /// than an error: the terminal path can be reached from more than one
     /// place, and the second caller is not wrong.
-    async fn settle(&self, goal_id: &GoalId, now: Timestamp) -> Result<(), StorageError>;
+    async fn settle(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError>;
 
     /// One goal by id, or `None` when it does not exist.
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError>;
@@ -117,45 +129,85 @@ pub trait GoalStore: Send + Sync {
 impl GoalStore for Database {
     async fn open(
         &self,
-        task_id: &TaskId,
+        token: &OwnershipToken,
         objective: &str,
         now: Timestamp,
-    ) -> Result<GoalId, StorageError> {
+    ) -> Result<GoalId, OwnershipError> {
         let id = GoalId::new(leveler_core::new_uuid_string());
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO goals (id, task_id, objective, state, opened_at, windows_run) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+             SELECT ?1, id, ?5, ?6, ?7, 0 FROM tasks \
+             WHERE id = ?2 AND owner_runtime_id = ?3 AND owner_epoch = ?4",
         )
         .bind(id.as_str())
-        .bind(task_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
         .bind(objective)
         .bind(GoalState::Running.as_str())
         .bind(now.to_rfc3339())
         .execute(self.pool())
-        .await?;
-        Ok(id)
+        .await
+        .map_err(StorageError::from)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(id);
+        }
+        Err(crate::ownership_store::sqlite_stale_error(self, token).await)
     }
 
-    async fn note_window(&self, goal_id: &GoalId) -> Result<(), StorageError> {
-        sqlx::query("UPDATE goals SET windows_run = windows_run + 1 WHERE id = ?1")
-            .bind(goal_id.as_str())
-            .execute(self.pool())
-            .await?;
-        Ok(())
+    async fn note_window(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+    ) -> Result<(), OwnershipError> {
+        let updated = sqlx::query(
+            "UPDATE goals SET windows_run = windows_run + 1 \
+             WHERE id = ?1 AND task_id = ?2 AND EXISTS (\
+                 SELECT 1 FROM tasks WHERE id = ?2 \
+                 AND owner_runtime_id = ?3 AND owner_epoch = ?4\
+             )",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        goal_write_miss(self, token, goal_id, false).await
     }
 
-    async fn settle(&self, goal_id: &GoalId, now: Timestamp) -> Result<(), StorageError> {
+    async fn settle(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError> {
         // `state = 'running'` in the predicate makes a second settle a no-op
         // and keeps the first settled_at, which is the one that is true.
-        sqlx::query(
-            "UPDATE goals SET state = ?2, settled_at = ?3 WHERE id = ?1 AND state = 'running'",
+        let updated = sqlx::query(
+            "UPDATE goals SET state = ?2, settled_at = ?3 \
+             WHERE id = ?1 AND task_id = ?4 AND state = 'running' AND EXISTS (\
+                 SELECT 1 FROM tasks WHERE id = ?4 \
+                 AND owner_runtime_id = ?5 AND owner_epoch = ?6\
+             )",
         )
         .bind(goal_id.as_str())
         .bind(GoalState::Settled.as_str())
         .bind(now.to_rfc3339())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
         .execute(self.pool())
-        .await?;
-        Ok(())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        goal_write_miss(self, token, goal_id, true).await
     }
 
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
@@ -194,6 +246,45 @@ impl GoalStore for Database {
     }
 }
 
+async fn goal_write_miss(
+    db: &Database,
+    token: &OwnershipToken,
+    goal_id: &GoalId,
+    settled_is_ok: bool,
+) -> Result<(), OwnershipError> {
+    let owner = crate::OwnershipStore::current(db, &token.task_id).await?;
+    if !owner.as_ref().is_some_and(|owner| {
+        owner.runtime.as_ref() == Some(&token.runtime_id) && owner.epoch == token.owner_epoch
+    }) {
+        return Err(crate::ownership_store::sqlite_stale_error(db, token).await);
+    }
+
+    let goal: Option<(String, String)> =
+        sqlx::query_as("SELECT task_id, state FROM goals WHERE id = ?1")
+            .bind(goal_id.as_str())
+            .fetch_optional(db.pool())
+            .await
+            .map_err(StorageError::from)?;
+    match goal {
+        Some((task_id, state)) if task_id == token.task_id.as_str() => {
+            if settled_is_ok && state == GoalState::Settled.as_str() {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidData(format!(
+                    "goal {goal_id} rejected the requested state transition"
+                ))
+                .into())
+            }
+        }
+        Some(_) => Err(StorageError::InvalidData(format!(
+            "goal {goal_id} does not belong to task {}",
+            token.task_id
+        ))
+        .into()),
+        None => Err(StorageError::InvalidData(format!("goal {goal_id} not found")).into()),
+    }
+}
+
 fn record_from_row(
     row: (String, String, String, String, String, Option<String>, i64),
 ) -> Result<GoalRecord, StorageError> {
@@ -218,9 +309,18 @@ fn parse_ts(s: &str) -> Result<Timestamp, StorageError> {
 
 /// An in-memory [`GoalStore`] for tests and ephemeral runs, honoring the same
 /// contract as the SQLite adapter.
-#[derive(Default)]
 pub struct MemoryGoalStore {
-    rows: Mutex<Vec<GoalRecord>>,
+    pub(crate) rows: Mutex<Vec<GoalRecord>>,
+    ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
+}
+
+impl Default for MemoryGoalStore {
+    fn default() -> Self {
+        Self {
+            rows: Mutex::new(Vec::new()),
+            ownership: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl MemoryGoalStore {
@@ -228,47 +328,101 @@ impl MemoryGoalStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Couple the goal store to the shared ownership authority used by every
+    /// memory fenced store in the same engine.
+    pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
+        let _ = self.ownership.set(state);
+        self
+    }
 }
 
 #[async_trait]
 impl GoalStore for MemoryGoalStore {
     async fn open(
         &self,
-        task_id: &TaskId,
+        token: &OwnershipToken,
         objective: &str,
         now: Timestamp,
-    ) -> Result<GoalId, StorageError> {
+    ) -> Result<GoalId, OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
         let id = GoalId::new(leveler_core::new_uuid_string());
-        self.rows.lock().unwrap().push(GoalRecord {
-            id: id.clone(),
-            task_id: task_id.clone(),
-            objective: objective.to_string(),
-            state: GoalState::Running,
-            opened_at: now,
-            settled_at: None,
-            windows_run: 0,
-        });
+        ownership.with_current(token, || {
+            self.rows.lock().unwrap().push(GoalRecord {
+                id: id.clone(),
+                task_id: token.task_id.clone(),
+                objective: objective.to_string(),
+                state: GoalState::Running,
+                opened_at: now,
+                settled_at: None,
+                windows_run: 0,
+            });
+        })?;
         Ok(id)
     }
 
-    async fn note_window(&self, goal_id: &GoalId) -> Result<(), StorageError> {
-        let mut rows = self.rows.lock().unwrap();
-        if let Some(g) = rows.iter_mut().find(|g| &g.id == goal_id) {
-            g.windows_run += 1;
-        }
-        Ok(())
+    async fn note_window(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+    ) -> Result<(), OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                goal.windows_run += 1;
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
     }
 
-    async fn settle(&self, goal_id: &GoalId, now: Timestamp) -> Result<(), StorageError> {
-        let mut rows = self.rows.lock().unwrap();
-        if let Some(g) = rows
-            .iter_mut()
-            .find(|g| &g.id == goal_id && g.state == GoalState::Running)
-        {
-            g.state = GoalState::Settled;
-            g.settled_at = Some(now);
-        }
-        Ok(())
+    async fn settle(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                if goal.state == GoalState::Running {
+                    goal.state = GoalState::Settled;
+                    goal.settled_at = Some(now);
+                }
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
     }
 
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
@@ -311,16 +465,19 @@ impl GoalStore for MemoryGoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionRecord, SessionRepository, TaskStore};
-    use leveler_core::SessionId;
+    use crate::{
+        MemoryOwnershipState, MemoryOwnershipStore, OwnershipStore, SessionRecord,
+        SessionRepository, TaskStore,
+    };
+    use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
 
     /// One contract, both implementations. Anything asserted here is a promise
     /// the engine may rely on regardless of which store it was handed.
-    async fn assert_goal_store_contract(store: &dyn GoalStore, task: &TaskId) {
+    async fn assert_goal_store_contract(store: &dyn GoalStore, token: &OwnershipToken) {
         assert!(store.unfinished().await.unwrap().is_empty());
 
         let goal = store
-            .open(task, "add rate limiting to login", leveler_core::now())
+            .open(token, "add rate limiting to login", leveler_core::now())
             .await
             .unwrap();
 
@@ -335,11 +492,14 @@ mod tests {
         assert_eq!(owed.len(), 1);
         assert_eq!(owed[0].id, goal);
 
-        store.note_window(&goal).await.unwrap();
-        store.note_window(&goal).await.unwrap();
+        store.note_window(token, &goal).await.unwrap();
+        store.note_window(token, &goal).await.unwrap();
         assert_eq!(store.get(&goal).await.unwrap().unwrap().windows_run, 2);
 
-        store.settle(&goal, leveler_core::now()).await.unwrap();
+        store
+            .settle(token, &goal, leveler_core::now())
+            .await
+            .unwrap();
         let settled = store.get(&goal).await.unwrap().unwrap();
         assert_eq!(settled.state, GoalState::Settled);
         assert!(settled.settled_at.is_some());
@@ -351,7 +511,10 @@ mod tests {
         // Settling twice keeps the first settled_at: the second caller is not
         // wrong, but it is also not the moment the goal actually settled.
         let first = settled.settled_at;
-        store.settle(&goal, leveler_core::now()).await.unwrap();
+        store
+            .settle(token, &goal, leveler_core::now())
+            .await
+            .unwrap();
         assert_eq!(store.get(&goal).await.unwrap().unwrap().settled_at, first);
 
         assert_eq!(store.get(&GoalId::new("missing")).await.unwrap(), None);
@@ -359,19 +522,22 @@ mod tests {
 
     /// The reason this table exists rather than columns on `tasks`: a session
     /// stays open and the user runs another goal, so one task hosts many.
-    async fn assert_one_task_hosts_many_goals(store: &dyn GoalStore, task: &TaskId) {
+    async fn assert_one_task_hosts_many_goals(store: &dyn GoalStore, token: &OwnershipToken) {
         let first = store
-            .open(task, "first", leveler_core::now())
+            .open(token, "first", leveler_core::now())
             .await
             .unwrap();
-        store.settle(&first, leveler_core::now()).await.unwrap();
+        store
+            .settle(token, &first, leveler_core::now())
+            .await
+            .unwrap();
         let second = store
-            .open(task, "second", leveler_core::now())
+            .open(token, "second", leveler_core::now())
             .await
             .unwrap();
 
         assert_ne!(first, second, "a second goal is not the first one again");
-        let all = store.for_task(task).await.unwrap();
+        let all = store.for_task(&token.task_id).await.unwrap();
         assert_eq!(all.len(), 2, "the first goal's history is not overwritten");
         assert_eq!(
             store.unfinished().await.unwrap().len(),
@@ -382,36 +548,58 @@ mod tests {
 
     #[tokio::test]
     async fn memory_store_honors_the_contract() {
-        let store = MemoryGoalStore::new();
-        assert_goal_store_contract(&store, &TaskId::new("t1")).await;
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let token = ownership
+            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_goal_store_contract(&store, &token).await;
     }
 
     #[tokio::test]
     async fn memory_store_hosts_many_goals_per_task() {
-        let store = MemoryGoalStore::new();
-        assert_one_task_hosts_many_goals(&store, &TaskId::new("t1")).await;
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let token = ownership
+            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_one_task_hosts_many_goals(&store, &token).await;
     }
 
-    async fn seeded_task(db: &Database) -> TaskId {
+    async fn seeded_task(db: &Database) -> (TaskId, OwnershipToken) {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         SessionRepository::new(db).create(&record).await.unwrap();
-        db.ensure_for_session(&SessionId::new(record.id), leveler_core::now())
+        let task = db
+            .ensure_for_session(&SessionId::new(record.id), leveler_core::now())
             .await
-            .unwrap()
+            .unwrap();
+        let token = db
+            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        (task, token)
     }
 
     #[tokio::test]
     async fn sqlite_store_honors_the_contract() {
         let db = Database::connect_in_memory().await.unwrap();
-        let task = seeded_task(&db).await;
-        assert_goal_store_contract(&db, &task).await;
+        let (_, token) = seeded_task(&db).await;
+        assert_goal_store_contract(&db, &token).await;
     }
 
     #[tokio::test]
     async fn sqlite_store_hosts_many_goals_per_task() {
         let db = Database::connect_in_memory().await.unwrap();
-        let task = seeded_task(&db).await;
-        assert_one_task_hosts_many_goals(&db, &task).await;
+        let (_, token) = seeded_task(&db).await;
+        assert_one_task_hosts_many_goals(&db, &token).await;
     }
 
     /// A goal outlives the process, so it must be readable from a fresh
@@ -429,8 +617,8 @@ mod tests {
         let path = dir.join("state.db");
         let goal = {
             let db = Database::connect(&path).await.unwrap();
-            let task = seeded_task(&db).await;
-            db.open(&task, "survive a restart", leveler_core::now())
+            let (_, token) = seeded_task(&db).await;
+            db.open(&token, "survive a restart", leveler_core::now())
                 .await
                 .unwrap()
         };
@@ -453,7 +641,13 @@ mod tests {
             .ensure_for_session(&session, leveler_core::now())
             .await
             .unwrap();
-        db.open(&task, "doomed", leveler_core::now()).await.unwrap();
+        let token = db
+            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        db.open(&token, "doomed", leveler_core::now())
+            .await
+            .unwrap();
 
         SessionRepository::new(&db).delete(&session).await.unwrap();
         assert!(
@@ -470,5 +664,52 @@ mod tests {
         assert_eq!(GoalState::parse("settled"), Some(GoalState::Settled));
         assert_eq!(GoalState::parse("interrupted"), None);
         assert_eq!(GoalState::parse(""), None);
+    }
+
+    async fn assert_stale_open_is_rejected(
+        store: &dyn GoalStore,
+        stale: &OwnershipToken,
+        current: &OwnershipToken,
+    ) {
+        let result = store
+            .open(stale, "must not land", leveler_core::now())
+            .await;
+        assert!(matches!(result, Err(OwnershipError::Stale { .. })));
+        assert!(store.for_task(&stale.task_id).await.unwrap().is_empty());
+
+        store
+            .open(current, "current owner", leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(store.for_task(&current.task_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_open_is_fenced_by_owner_epoch() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (task, stale) = seeded_task(&db).await;
+        let current = db
+            .acquire(&task, &RuntimeId::new("rt"), stale.owner_epoch)
+            .await
+            .unwrap();
+        assert_stale_open_is_rejected(&db, &stale, &current).await;
+    }
+
+    #[tokio::test]
+    async fn memory_open_is_fenced_by_owner_epoch() {
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let stale = ownership
+            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let current = ownership
+            .acquire(&task, &RuntimeId::new("rt"), stale.owner_epoch)
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_stale_open_is_rejected(&store, &stale, &current).await;
     }
 }

@@ -18,7 +18,7 @@ use leveler_model::{
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
 use leveler_storage::{
-    Database, EventRepository, MessageRepository, SessionRepository, TurnRepository,
+    Database, EventRepository, GoalStore, MessageRepository, SessionRepository, TurnRepository,
 };
 use leveler_tools::ToolContext;
 use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
@@ -300,6 +300,7 @@ impl leveler_storage::TerminalStore for FailingTerminal {
         _: leveler_lifecycle::VerificationStatus,
         _: leveler_lifecycle::SessionStatus,
         _: leveler_lifecycle::AgentState,
+        _: Option<&leveler_storage::GoalTerminalUpdate>,
         _: leveler_core::Timestamp,
     ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
         Err(leveler_storage::OwnershipError::Storage(
@@ -586,7 +587,6 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
     )
     .await
     .unwrap();
-
     let stores = leveler_storage::EngineStores::from_database(&h.db);
     let reap = leveler_engine::reap_after_restart(&stores, &rt, None)
         .await
@@ -615,7 +615,7 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
 #[tokio::test]
 async fn a_foreign_owned_task_is_reported_not_touched() {
     let h = harness(Vec::new()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let mut spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
     let task = h
         .engine
@@ -643,6 +643,8 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
     )
     .await
     .unwrap();
+    spec.coding.mode = PermissionProfile::FullAccess;
+    spec.coding.sandbox = true;
 
     // Restart reap as rt-test: conflict reported, turn untouched.
     let stores = leveler_storage::EngineStores::from_database(&h.db);
@@ -669,6 +671,20 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
     assert!(
         error.to_string().contains("owned by runtime"),
         "conflict must be named: {error}"
+    );
+    assert!(
+        leveler_storage::GoalStore::unfinished(&h.db)
+            .await
+            .unwrap()
+            .is_empty(),
+        "ownership rejection must happen before the Coding harness opens a goal"
+    );
+    assert_eq!(
+        leveler_storage::SessionStore::execution(&h.db, &session)
+            .await
+            .unwrap(),
+        Some(("assisted".into(), false, "direct".into(), None)),
+        "ownership rejection must happen before execution config changes"
     );
 }
 
@@ -1357,6 +1373,11 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         .expect_err("pre-cancelled");
     let before = MessageRepository::new(&h.db).load(&session).await.unwrap();
     assert!(!before.is_empty(), "the seed must have been persisted");
+    let owed = GoalStore::unfinished(&h.db).await.unwrap();
+    assert_eq!(owed.len(), 1, "the interrupted run leaves one owed goal");
+    let goal_id = owed[0].id.clone();
+    let task_id = owed[0].task_id.clone();
+    assert_eq!(owed[0].windows_run, 1);
 
     // Phase 2: resume on the same database with a fresh scripted runtime.
     let dir2 = tempfile::TempDir::new().unwrap();
@@ -1429,6 +1450,14 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         .unwrap()
         .unwrap();
     assert_eq!(outcome, Some(TaskOutcome::Completed));
+    let goals = GoalStore::for_task(&h.db, &task_id).await.unwrap();
+    assert_eq!(goals.len(), 1, "resume must reuse the existing goal");
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert_eq!(
+        goals[0].windows_run, 2,
+        "the explicit resume consumes exactly one additional work window"
+    );
 }
 
 #[tokio::test]

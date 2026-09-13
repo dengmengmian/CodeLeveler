@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::coding::{TaskReport, TaskSpec, mode_str};
+use leveler_agent::coding::{TaskReport, TaskSpec};
 use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier, StopReason};
 use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 use leveler_execution::{Approver, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
-use leveler_storage::{SessionRecord, SessionRepository};
+use leveler_storage::SessionRepository;
 use leveler_verifier::{CheckStatus, Verdict, VerificationReport};
 
 use crate::{AppError, Application};
@@ -351,6 +351,46 @@ pub(crate) fn mode_from_str(s: &str) -> Option<PermissionProfile> {
     PermissionProfile::parse(s)
 }
 
+pub(crate) async fn checkpoint_reaped_sessions(
+    engine: &leveler_engine::TaskEngine,
+    reaped: &[leveler_engine::ReapedSession],
+) {
+    let stores = &engine.stores;
+    for reaped in reaped {
+        match leveler_agent::coding::create_goal_checkpoint(
+            engine,
+            &reaped.session_id,
+            leveler_lifecycle::CheckpointReason::Interrupted,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                let log = leveler_engine::EventLog::new_owned(
+                    stores.events.as_ref(),
+                    reaped.session_id.clone(),
+                    reaped.token.clone(),
+                );
+                let event = leveler_agent::coding::checkpoint_created_event(&record);
+                if let Err(error) = log.append(None, event, &mut |_| {}).await {
+                    tracing::warn!(
+                        %error,
+                        session = %reaped.session_id,
+                        "interrupted checkpoint persisted but its announcement failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                session = %reaped.session_id,
+                "interrupted goal checkpoint failed; the reap stands"
+            ),
+        }
+    }
+}
+
 impl Application {
     /// Create and persist a new session record, returning its id. The caller can
     /// then run it, and — crucially — knows the id even if the run is cancelled.
@@ -379,13 +419,11 @@ impl Application {
         session: Option<&leveler_core::SessionId>,
     ) -> Result<usize, AppError> {
         let runtime_id = self.runtime_id()?;
-        let outcome = leveler_engine::reap_after_restart(
-            &leveler_storage::EngineStores::from_database(db),
-            &runtime_id,
-            session,
-        )
-        .await
-        .map_err(app_error_from_engine)?;
+        let engine = self.task_engine(db)?;
+        let outcome = leveler_engine::reap_after_restart(&engine.stores, &runtime_id, session)
+            .await
+            .map_err(app_error_from_engine)?;
+        checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
         for conflict in &outcome.conflicts {
             tracing::warn!(
                 session = conflict.session_id.as_str(),
@@ -421,27 +459,21 @@ impl Application {
         model: &ModelRef,
         goal: &str,
     ) -> Result<leveler_core::SessionId, AppError> {
-        let record = SessionRecord::new(
-            self.layout.repo_root.display().to_string(),
-            goal,
-            model.to_string(),
-            leveler_core::now(),
-        )
-        .with_axes(self.collaboration().as_str(), self.work_profile().as_str());
-        let repo = SessionRepository::new(db);
-        repo.create(&record).await?;
-        let id = leveler_core::SessionId::new(record.id);
-        // Never rely on SQLite DEFAULT 'workspace_write' from migration 0003 —
-        // that string is no longer a valid PermissionProfile wire value.
-        repo.set_execution(
-            &id,
-            PermissionProfile::Assisted.as_str(),
-            false,
-            "direct",
-            leveler_core::now(),
-        )
-        .await?;
-        Ok(id)
+        self.task_engine(db)?
+            .create_task(&leveler_engine::NewSession {
+                workspace: self.layout.repo_root.display().to_string(),
+                goal: goal.to_string(),
+                model: model.to_string(),
+                mode: PermissionProfile::Assisted.as_str().to_string(),
+                sandbox: false,
+                kind: ExecutionKind::Direct,
+                axes: Some(leveler_engine::NewSessionAxes {
+                    collaboration: self.collaboration().as_str().to_string(),
+                    work_profile: self.work_profile().as_str().to_string(),
+                }),
+            })
+            .await
+            .map_err(app_error_from_engine)
     }
 
     /// The direct-task spec for this repository: verification is discovered
@@ -619,17 +651,6 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);
-        // Lifecycle (Running/terminal status+state) is stamped by the engine —
-        // the single writer — atomically with outcome and TaskFinished.
-        // Persist the execution config so resume never guesses (plan B4).
-        repo.set_execution(
-            session_id,
-            mode_str(mode),
-            sandbox,
-            ExecutionKind::Direct.as_str(),
-            leveler_core::now(),
-        )
-        .await?;
         // Product axes SoT is the session row (SetProductAxes / create defaults).
         let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
 
@@ -653,104 +674,10 @@ impl Application {
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
-        // Goal identity (long-goal P1/P2). Recorded HERE rather than at the
-        // interactive call site because this is the seam both paths cross:
-        // `leveler run` (headless) and the TUI's RunGoal reach the engine
-        // through it. Wiring only the interactive one left every headless run
-        // — the ones most likely to be killed unattended — with no record
-        // that work was owed.
-        let goal_record = self.open_goal_record(session_id, goal).await;
         let result = engine.run(session_id, &spec, observer, cancellation).await;
-        // The engine already decided what this run means; this reads its
-        // answer rather than inferring one from "the call returned". A goal
-        // whose run stopped at its round budget still owes work, and the whole
-        // reason the goal ledger exists is so that fact survives the process.
-        self.record_goal_windows(goal_record.as_ref(), &result)
-            .await;
-        if goal_owes_no_more_work(&result) {
-            self.settle_goal_record(goal_record).await;
-        }
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
-        }
-    }
-
-    /// Record that a long-lived intent exists, before the work starts.
-    ///
-    /// Best-effort: a goal whose bookkeeping cannot be written must still run.
-    /// `None` means "not recorded", and every caller treats that as nothing to
-    /// settle rather than as a settled goal.
-    async fn open_goal_record(
-        &self,
-        session_id: &leveler_core::SessionId,
-        objective: &str,
-    ) -> Option<leveler_core::GoalId> {
-        let db = self.open_database().await.ok()?;
-        let now = leveler_core::now();
-        let task = leveler_storage::TaskStore::ensure_for_session(&db, session_id, now)
-            .await
-            .ok()?;
-        // An objective this task still owes IS this objective: continuing it is
-        // what resuming means. Opening a second record for the same intent
-        // splits one goal across two — the windows spent on it land half in
-        // each, and the record the earlier invocation left owed stays owed
-        // forever because nothing will ever settle it again.
-        if let Ok(existing) = leveler_storage::GoalStore::for_task(&db, &task).await
-            && let Some(owed) = existing.into_iter().find(|goal| {
-                goal.state == leveler_storage::GoalState::Running && goal.objective == objective
-            })
-        {
-            return Some(owed.id);
-        }
-        match leveler_storage::GoalStore::open(&db, &task, objective, now).await {
-            Ok(id) => Some(id),
-            Err(error) => {
-                tracing::warn!(%error, "could not record goal identity; the goal still runs");
-                None
-            }
-        }
-    }
-
-    /// Record the work windows this invocation spent on the goal.
-    ///
-    /// Best-effort, like every other line of goal bookkeeping: a window that
-    /// cannot be written down must not fail the run that ran it. The store
-    /// counts calls, so a resumed goal accumulates across processes — which is
-    /// the only way a count of windows can outlive the windows.
-    async fn record_goal_windows(
-        &self,
-        goal: Option<&leveler_core::GoalId>,
-        result: &Result<leveler_agent::coding::TaskReport, leveler_engine::EngineError>,
-    ) {
-        let Some(goal) = goal else { return };
-        // A run that never produced a report still opened one window. Saying
-        // "no windows" about a goal that just spent real model calls would be
-        // a worse lie than an approximate count.
-        let windows = result.as_ref().map(|r| r.windows).unwrap_or(1);
-        let Ok(db) = self.open_database().await else {
-            tracing::warn!("could not record goal windows: database unavailable");
-            return;
-        };
-        for _ in 0..windows {
-            if let Err(error) = leveler_storage::GoalStore::note_window(&db, goal).await {
-                tracing::warn!(%error, "could not record a goal work window");
-                break;
-            }
-        }
-    }
-
-    /// Mark a goal as owing no further work.
-    async fn settle_goal_record(&self, goal: Option<leveler_core::GoalId>) {
-        let Some(goal) = goal else { return };
-        let Ok(db) = self.open_database().await else {
-            tracing::warn!("could not settle goal: database unavailable");
-            return;
-        };
-        if let Err(error) =
-            leveler_storage::GoalStore::settle(&db, &goal, leveler_core::now()).await
-        {
-            tracing::warn!(%error, "could not settle goal record");
         }
     }
 
@@ -771,16 +698,6 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);
-        // Lifecycle is stamped by the engine (single writer).
-        repo.set_execution(
-            session_id,
-            mode_str(mode),
-            sandbox,
-            ExecutionKind::Direct.as_str(),
-            leveler_core::now(),
-        )
-        .await?;
-
         let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
         let engine = self
             .engine_for_with_profile(
@@ -818,29 +735,14 @@ impl Application {
         session_id: &leveler_core::SessionId,
     ) -> Result<usize, AppError> {
         let db = self.open_database().await?;
-        // Canonical recovery write ⇒ ownership-fenced. Resolve the task,
-        // refuse a foreign owner explicitly (never auto-steal), reacquire a
-        // fresh epoch for this runtime, then acknowledge under that token.
-        let runtime_id = self.runtime_id()?;
-        let task =
-            leveler_storage::TaskStore::ensure_for_session(&db, session_id, leveler_core::now())
-                .await?;
-        let current = leveler_storage::OwnershipStore::current(&db, &task)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("no task for session {session_id}")))?;
-        if let Some(owner) = &current.runtime
-            && owner != &runtime_id
-        {
-            return Err(AppError::Engine(format!(
-                "task {task} is owned by runtime {owner} at epoch {}; \
-                 this runtime ({runtime_id}) must not acknowledge its crash window",
-                current.epoch
-            )));
-        }
-        let token =
-            leveler_storage::OwnershipStore::acquire(&db, &task, &runtime_id, current.epoch)
-                .await
-                .map_err(|e| AppError::Engine(e.to_string()))?;
+        // Canonical recovery write ⇒ ownership-fenced. The TaskEngine is the
+        // single authority that resolves legacy task rows, refuses a foreign
+        // owner, and advances the fencing epoch.
+        let token = self
+            .task_engine(&db)?
+            .acquire_ownership(session_id)
+            .await
+            .map_err(app_error_from_engine)?;
         leveler_engine::acknowledge_crash_window(&db, &token, session_id)
             .await
             .map_err(app_error_from_engine)
@@ -1319,90 +1221,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out.stop_reason, StopReason::Answered);
-    }
-}
-
-/// Does this run's terminal truth mean the goal owes no further work?
-///
-/// The engine produces a structured verdict for every run and uses it itself —
-/// to decide whether to reap the task, and which kind of checkpoint to cut.
-/// The durable goal record has to read the same verdict. It used to be settled
-/// unconditionally the moment `engine.run` returned, which made "the function
-/// came back" the settlement authority and quietly closed the books on the one
-/// case the record exists for: a goal stopped at a resource boundary with work
-/// still owed.
-///
-/// Deliberately NOT "anything but Verified stays open". A run that genuinely
-/// failed is finished — the goal owes nothing more automatically, and how it
-/// went lives on the session row. Only a run that was *cut short* still owes.
-pub(crate) fn goal_owes_no_more_work(
-    result: &Result<leveler_agent::coding::TaskReport, leveler_engine::EngineError>,
-) -> bool {
-    use leveler_lifecycle::TaskOutcome;
-    match result {
-        Ok(report) => match report.outcome {
-            // Reached an end, however it went.
-            TaskOutcome::Completed | TaskOutcome::Blocked | TaskOutcome::Failed => true,
-            // Stopped at an explicit resource boundary: incomplete and
-            // resumable, which is precisely "still owed".
-            TaskOutcome::BudgetLimited => false,
-            // Cut short. No Ok report carries this today; if one ever does,
-            // "still owed" is the honest reading of it.
-            TaskOutcome::Interrupted => false,
-        },
-        // Cancelled mid-flight. The work was stopped, not finished.
-        Err(leveler_engine::EngineError::Cancelled) => false,
-        // The engine could not reach a verdict at all. A goal with no verdict
-        // is not a settled goal: leaving it owed is what keeps it discoverable
-        // instead of silently dropped.
-        Err(_) => false,
-    }
-}
-
-#[cfg(test)]
-mod goal_settlement_tests {
-    use super::goal_owes_no_more_work;
-    use leveler_agent::coding::TaskReport;
-    use leveler_engine::EngineError;
-    use leveler_lifecycle::TaskOutcome;
-
-    fn report(outcome: TaskOutcome) -> Result<TaskReport, EngineError> {
-        Ok(TaskReport {
-            outcome,
-            verification_status: leveler_lifecycle::VerificationStatus::NotRun,
-            final_text: String::new(),
-            modified_files: Vec::new(),
-            verification: None,
-            stop_reason: leveler_agent::StopReason::Completed,
-            stop_detail: None,
-            rounds: 1,
-            windows: 1,
-            review: None,
-        })
-    }
-
-    #[test]
-    fn a_finished_run_settles_however_it_went() {
-        assert!(goal_owes_no_more_work(&report(TaskOutcome::Completed)));
-        assert!(goal_owes_no_more_work(&report(TaskOutcome::Blocked)));
-        assert!(
-            goal_owes_no_more_work(&report(TaskOutcome::Failed)),
-            "a run that failed is finished; the verdict lives on the session row"
-        );
-    }
-
-    #[test]
-    fn a_run_cut_short_leaves_the_goal_owed() {
-        assert!(!goal_owes_no_more_work(&report(TaskOutcome::BudgetLimited)));
-        assert!(!goal_owes_no_more_work(&report(TaskOutcome::Interrupted)));
-        assert!(!goal_owes_no_more_work(&Err(EngineError::Cancelled)));
-    }
-
-    #[test]
-    fn no_verdict_is_not_a_settlement() {
-        assert!(!goal_owes_no_more_work(&Err(EngineError::Config(
-            "nothing ran".to_string()
-        ))));
     }
 }
 

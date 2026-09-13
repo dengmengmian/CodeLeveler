@@ -7,12 +7,11 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::mode_str;
-use leveler_engine::{EngineEvent, EventLog, ExecutionKind, TaskOutcome};
+use leveler_engine::{EngineEvent, EventLog, ExecutionKind, NewSession, TaskOutcome};
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{SessionRecord, SessionRepository, TaskStore};
 use leveler_vcs::{GitWorkflow, MergeCandidate, slugify, worktree_path};
 
 use crate::{AppError, Application};
@@ -29,34 +28,15 @@ pub struct ParallelEditOutcome {
     pub session: String,
 }
 
-/// Acquire (or same-runtime reacquire) the parallel parent's task ownership —
-/// the SAME policy as `TaskEngine::acquire_ownership`: unowned or owned by
-/// this runtime → CAS to a fresh epoch; owned by a FOREIGN runtime → explicit
-/// error, no acquire, no owner mutation. The OwnershipStore CAS can transfer
-/// across runtimes when given the right expected epoch; that capability is for
-/// explicit future transfer protocols, never an execution path's auto-acquire.
-pub async fn acquire_parallel_parent_ownership(
-    ownership: &dyn leveler_storage::OwnershipStore,
-    task_id: &leveler_core::TaskId,
-    runtime_id: &leveler_core::RuntimeId,
-) -> Result<leveler_core::OwnershipToken, AppError> {
-    let current = ownership
-        .current(task_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("no task row for task {task_id}")))?;
-    if let Some(owner) = &current.runtime
-        && owner != runtime_id
-    {
-        return Err(AppError::Engine(format!(
-            "task {task_id} is owned by runtime {owner} at epoch {}; \
-             this runtime ({runtime_id}) must not run it as a parallel parent",
-            current.epoch
-        )));
+fn honor_parent_cancellation(
+    result: Result<ParallelEditOutcome, AppError>,
+    cancellation: &CancellationToken,
+) -> Result<ParallelEditOutcome, AppError> {
+    if cancellation.is_cancelled() {
+        Err(AppError::Agent(leveler_agent::AgentError::Cancelled))
+    } else {
+        result
     }
-    ownership
-        .acquire(task_id, runtime_id, current.epoch)
-        .await
-        .map_err(|e| AppError::Engine(e.to_string()))
 }
 
 impl Application {
@@ -86,230 +66,240 @@ impl Application {
         // The parent session (plan B9): kind=parallel, its event log records
         // every worktree candidate and the child session that produced it.
         let db = self.open_database().await?;
-        let record = SessionRecord::new(
-            repo_root.display().to_string(),
-            task,
-            model.to_string(),
-            leveler_core::now(),
-        );
-        let repo = SessionRepository::new(&db);
-        repo.create(&record).await?;
-        let parent = leveler_core::SessionId::new(record.id);
-        repo.set_execution(
-            &parent,
-            mode_str(mode),
-            false,
-            ExecutionKind::Parallel.as_str(),
-            leveler_core::now(),
-        )
-        .await?;
-        // The parallel parent never enters the engine's run path, so its
-        // durable task row, ownership acquisition, and fenced Running
-        // transition happen here (the engine does the same in `mark_running`
-        // for direct/chat/resume sessions). Everything canonical below rides
-        // this token; if ownership is lost mid-run, the writes fail typed —
-        // a stale runtime never stamps a covering terminal fact.
-        let task_id = TaskStore::ensure_for_session(&db, &parent, leveler_core::now()).await?;
-        let runtime_id = self.runtime_id()?;
-        let token = acquire_parallel_parent_ownership(&db, &task_id, &runtime_id).await?;
-        leveler_storage::SessionStore::update_status_owned(
-            &db,
-            &token,
-            &parent,
-            SessionStatus::Running,
-            AgentState::Execute,
-            leveler_core::now(),
-        )
-        .await
-        .map_err(|e| AppError::Engine(e.to_string()))?;
-        let log = EventLog::new_owned(&db, parent.clone(), token.clone());
-        let sink = &mut |_: EngineEvent| {};
-        log.append(
-            None,
-            EngineEvent::TaskStarted {
+        let engine = self.task_engine(&db)?;
+        let parent = engine
+            .create_task(&NewSession {
+                workspace: repo_root.display().to_string(),
                 goal: task.to_string(),
                 model: model.to_string(),
                 mode: mode_str(mode).to_string(),
                 sandbox: false,
                 kind: ExecutionKind::Parallel,
-                task_id: Some(token.task_id.clone()),
-            },
-            sink,
-        )
-        .await
-        .map_err(crate::session::app_error_from_engine)?;
-
-        // Create N isolated worktrees off the base commit.
-        let mut worktrees = Vec::new();
-        for i in 0..n {
-            let path = worktree_path(&slug, i);
-            let branch = format!("leveler/parallel-{slug}-{i}");
-            let _ = std::fs::remove_dir_all(&path);
-            // Clean up a stale branch from a prior run.
-            let _ = main_git
-                .remove_worktree(&path, &branch, &cancellation)
-                .await;
-            main_git
-                .add_worktree(&path, &branch, &base, &cancellation)
-                .await?;
-            worktrees.push((path, branch));
-        }
-
-        for (_, branch) in &worktrees {
+                axes: Some(leveler_engine::NewSessionAxes {
+                    collaboration: self.collaboration().as_str().to_string(),
+                    work_profile: self.work_profile().as_str().to_string(),
+                }),
+            })
+            .await
+            .map_err(crate::session::app_error_from_engine)?;
+        let token = engine
+            .mark_running(&parent, AgentState::Execute)
+            .await
+            .map_err(crate::session::app_error_from_engine)?;
+        let log = EventLog::new_owned(&db, parent.clone(), token.clone());
+        let sink = &mut |_: EngineEvent| {};
+        // Once the parent is Running, every exit is converted into one
+        // canonical terminal fact below. The body may fail at any worktree,
+        // candidate-log, or integration step without stranding the parent.
+        let result: Result<ParallelEditOutcome, AppError> = async {
             log.append(
                 None,
-                EngineEvent::CandidateStarted {
-                    branch: branch.clone(),
+                EngineEvent::TaskStarted {
+                    goal: task.to_string(),
+                    model: model.to_string(),
+                    mode: mode_str(mode).to_string(),
+                    sandbox: false,
+                    kind: ExecutionKind::Parallel,
+                    task_id: Some(token.task_id.clone()),
                 },
                 sink,
             )
             .await
             .map_err(crate::session::app_error_from_engine)?;
-        }
 
-        // Run one agent per worktree, concurrently.
-        let futures = worktrees.iter().map(|(path, branch)| {
-            let path = path.clone();
-            let branch = branch.clone();
-            let config_dir = config_dir.clone();
-            let model = model.clone();
-            let task = task.to_string();
-            let cancellation = cancellation.child_token();
-            async move {
-                let layout = Layout::resolve(path.clone(), Some(config_dir));
-                let app = Application::assemble(layout).ok()?;
-                // Direct tool loop only — no orchestrate dual path.
-                let result = async {
-                    let session_id = app.create_session(&model, &task).await.ok()?;
-                    let outcome = app
-                        .run_in_session(
-                            &session_id,
-                            &model,
-                            mode,
-                            &task,
-                            Arc::new(AutoApprove),
-                            false,
-                            &mut |_| {},
-                            cancellation.clone(),
-                        )
+            // Create N isolated worktrees off the base commit.
+            let mut worktrees = Vec::new();
+            for i in 0..n {
+                let path = worktree_path(&slug, i);
+                let branch = format!("leveler/parallel-{slug}-{i}");
+                let _ = std::fs::remove_dir_all(&path);
+                // Clean up a stale branch from a prior run.
+                let _ = main_git
+                    .remove_worktree(&path, &branch, &cancellation)
+                    .await;
+                main_git
+                    .add_worktree(&path, &branch, &base, &cancellation)
+                    .await?;
+                worktrees.push((path, branch));
+            }
+
+            for (_, branch) in &worktrees {
+                log.append(
+                    None,
+                    EngineEvent::CandidateStarted {
+                        branch: branch.clone(),
+                    },
+                    sink,
+                )
+                .await
+                .map_err(crate::session::app_error_from_engine)?;
+            }
+
+            // Run one agent per worktree, concurrently.
+            let futures = worktrees.iter().map(|(path, branch)| {
+                let path = path.clone();
+                let branch = branch.clone();
+                let config_dir = config_dir.clone();
+                let model = model.clone();
+                let task = task.to_string();
+                let cancellation = cancellation.child_token();
+                async move {
+                    let layout = Layout::resolve(path.clone(), Some(config_dir));
+                    let app = Application::assemble(layout).ok()?;
+                    // Direct tool loop only — no orchestrate dual path.
+                    let result = async {
+                        let session_id = app.create_session(&model, &task).await.ok()?;
+                        let outcome = app
+                            .run_in_session(
+                                &session_id,
+                                &model,
+                                mode,
+                                &task,
+                                Arc::new(AutoApprove),
+                                false,
+                                &mut |_| {},
+                                cancellation.clone(),
+                            )
+                            .await
+                            .ok()?;
+                        Some((session_id, outcome))
+                    }
+                    .await;
+
+                    // Commit the candidate's changes (never .leveler/).
+                    let git = GitWorkflow::with_environment(&path, app.environment.clone());
+                    git.commit_changes("parallel candidate", &cancellation)
                         .await
                         .ok()?;
-                    Some((session_id, outcome))
-                }
-                .await;
 
-                // Commit the candidate's changes (never .leveler/).
-                let git = GitWorkflow::with_environment(&path, app.environment.clone());
-                git.commit_changes("parallel candidate", &cancellation)
-                    .await
-                    .ok()?;
-
-                let (child_session, verified) = match result {
-                    Some((session_id, outcome)) => (
-                        session_id.to_string(),
-                        matches!(
-                            outcome.stop_reason,
-                            leveler_agent::StopReason::Completed
-                                | leveler_agent::StopReason::Answered
+                    let (child_session, verified) = match result {
+                        Some((session_id, outcome)) => (
+                            session_id.to_string(),
+                            matches!(
+                                outcome.stop_reason,
+                                leveler_agent::StopReason::Completed
+                                    | leveler_agent::StopReason::Answered
+                            ),
                         ),
-                    ),
-                    None => (String::new(), false),
-                };
-                Some((MergeCandidate { branch, verified }, child_session))
+                        None => (String::new(), false),
+                    };
+                    Some((MergeCandidate { branch, verified }, child_session))
+                }
+            });
+
+            let mut candidates: Vec<MergeCandidate> = Vec::new();
+            for (candidate, child_session) in futures::future::join_all(futures)
+                .await
+                .into_iter()
+                .flatten()
+            {
+                log.append(
+                    None,
+                    EngineEvent::CandidateFinished {
+                        branch: candidate.branch.clone(),
+                        session_id: child_session,
+                        verified: candidate.verified,
+                    },
+                    sink,
+                )
+                .await
+                .map_err(crate::session::app_error_from_engine)?;
+                if candidate.verified {
+                    candidates.push(candidate);
+                }
             }
-        });
+            let verified = candidates.iter().filter(|c| c.verified).count();
 
-        let mut candidates: Vec<MergeCandidate> = Vec::new();
-        for (candidate, child_session) in futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .flatten()
-        {
-            log.append(
-                None,
-                EngineEvent::CandidateFinished {
-                    branch: candidate.branch.clone(),
-                    session_id: child_session,
-                    verified: candidate.verified,
-                },
-                sink,
-            )
-            .await
-            .map_err(crate::session::app_error_from_engine)?;
-            if candidate.verified {
-                candidates.push(candidate);
+            // Integrate into the main working tree.
+            let merge = main_git.integrate(&candidates, &cancellation).await?;
+
+            // Clean up worktrees and their branches.
+            for (path, branch) in &worktrees {
+                main_git.remove_worktree(path, branch, &cancellation).await;
             }
+
+            Ok(ParallelEditOutcome {
+                candidates: candidates.len(),
+                verified,
+                integrated: merge.integrated,
+                conflicted: merge.conflicted,
+                session: parent.to_string(),
+            })
         }
-        let verified = candidates.iter().filter(|c| c.verified).count();
+        .await;
+        // Child candidates intentionally collapse their local failures into
+        // absence, but cancellation is a parent lifecycle fact and must never
+        // be rewritten as a successful zero-candidate run.
+        let result = honor_parent_cancellation(result, &cancellation);
 
-        // Integrate into the main working tree.
-        let merge = main_git.integrate(&candidates, &cancellation).await?;
-
-        // Clean up worktrees and their branches.
-        for (path, branch) in &worktrees {
-            main_git.remove_worktree(path, branch, &cancellation).await;
-        }
-
-        // Terminal outcome: something integrated → Completed, with the
-        // candidates' own checks reported beside it; nothing integrated →
-        // Failed.
-        let outcome = if !merge.integrated.is_empty() {
-            TaskOutcome::Completed
-        } else {
-            TaskOutcome::Failed
-        };
-        let verification = if merge.integrated.is_empty() {
-            leveler_lifecycle::VerificationStatus::NotRun
-        } else if verified > 0 {
-            leveler_lifecycle::VerificationStatus::Passed
-        } else {
-            leveler_lifecycle::VerificationStatus::Failed
-        };
-        let (status, state) = match outcome {
-            TaskOutcome::Completed => (SessionStatus::Completed, AgentState::Complete),
-            _ => (SessionStatus::Failed, AgentState::Failed),
+        let terminal = match &result {
+            Ok(summary) if !summary.integrated.is_empty() => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::Passed,
+                reason: None,
+                stop: None,
+                status: SessionStatus::Completed,
+                state: AgentState::Complete,
+                goal: None,
+            },
+            Ok(summary) => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: Some(format!(
+                    "{} candidate(s), {} verified, 0 integrated",
+                    summary.candidates, summary.verified
+                )),
+                stop: None,
+                status: SessionStatus::Failed,
+                state: AgentState::Failed,
+                goal: None,
+            },
+            Err(AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
+                leveler_engine::TaskTerminal {
+                    outcome: TaskOutcome::Interrupted,
+                    verification: leveler_lifecycle::VerificationStatus::NotRun,
+                    reason: None,
+                    stop: None,
+                    status: SessionStatus::Interrupted,
+                    state: AgentState::Execute,
+                    goal: None,
+                }
+            }
+            Err(error) => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: Some(error.to_string()),
+                stop: None,
+                status: SessionStatus::Failed,
+                state: AgentState::Failed,
+                goal: None,
+            },
         };
         // Terminal event + every lifecycle column in ONE transaction — the
         // same barrier the engine uses. Three separate writes here used to
         // leave a window where a crash produced an outcome without its
         // canonical TaskFinished event (or vice versa).
-        let event = EngineEvent::TaskFinished {
-            stop: None,
-            outcome,
-            verification,
-            reason: (outcome != TaskOutcome::Completed).then(|| {
-                format!(
-                    "{} candidate(s), {} verified, {} integrated",
-                    candidates.len(),
-                    verified,
-                    merge.integrated.len()
-                )
-            }),
-        };
-        let (event_type, payload) = event
-            .to_row()
+        engine
+            .finish_task(&token, &parent, terminal, sink)
+            .await
             .map_err(crate::session::app_error_from_engine)?;
-        leveler_storage::TerminalStore::finish_task_owned(
-            &db,
-            &token,
-            &parent,
-            &event_type,
-            &payload,
-            outcome,
-            verification,
-            status,
-            state,
-            leveler_core::now(),
-        )
-        .await
-        .map_err(|e| AppError::Engine(e.to_string()))?;
 
-        Ok(ParallelEditOutcome {
-            candidates: candidates.len(),
-            verified,
-            integrated: merge.integrated,
-            conflicted: merge.conflicted,
-            session: parent.to_string(),
-        })
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_cancellation_cannot_become_a_successful_empty_result() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = honor_parent_cancellation(Ok(ParallelEditOutcome::default()), &cancellation);
+        assert!(matches!(
+            result,
+            Err(AppError::Agent(leveler_agent::AgentError::Cancelled))
+        ));
     }
 }

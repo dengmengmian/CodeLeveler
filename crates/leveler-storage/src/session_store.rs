@@ -65,6 +65,19 @@ pub trait SessionStore: Send + Sync {
         state: AgentState,
         now: Timestamp,
     ) -> Result<(), crate::OwnershipError>;
+
+    /// Fenced execution start: update the caller-supplied execution config and
+    /// Running projection in one write after ownership has been acquired.
+    async fn start_execution_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        mode: &str,
+        sandbox: bool,
+        kind: &str,
+        state: AgentState,
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError>;
 }
 
 /// The production SQLite adapter: delegates to [`SessionRepository`].
@@ -121,6 +134,40 @@ impl SessionStore for Database {
         )
         .bind(id.as_str())
         .bind(status.as_str())
+        .bind(state.as_str())
+        .bind(now.to_rfc3339())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() != 1 {
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        Ok(())
+    }
+
+    async fn start_execution_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        mode: &str,
+        sandbox: bool,
+        kind: &str,
+        state: AgentState,
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let updated = sqlx::query(
+            "UPDATE sessions SET mode = ?2, sandbox = ?3, kind = ?4, status = ?5, \
+             state = ?6, updated_at = ?7 WHERE id = ?1 AND EXISTS (SELECT 1 FROM tasks \
+             WHERE session_id = ?1 AND id = ?8 AND owner_runtime_id = ?9 AND owner_epoch = ?10)",
+        )
+        .bind(id.as_str())
+        .bind(mode)
+        .bind(sandbox)
+        .bind(kind)
+        .bind(SessionStatus::Running.as_str())
         .bind(state.as_str())
         .bind(now.to_rfc3339())
         .bind(token.task_id.as_str())
@@ -263,6 +310,32 @@ impl SessionStore for MemorySessionStore {
         ownership.with_current(token, || {
             if let Some(session) = self.rows.lock().unwrap().get_mut(id.as_str()) {
                 session.status = status;
+                session.state = state;
+            }
+        })
+    }
+
+    async fn start_execution_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        mode: &str,
+        sandbox: bool,
+        kind: &str,
+        state: AgentState,
+        _now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory session store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership.with_current(token, || {
+            if let Some(session) = self.rows.lock().unwrap().get_mut(id.as_str()) {
+                session.mode = mode.to_string();
+                session.sandbox = sandbox;
+                session.kind = kind.to_string();
+                session.status = SessionStatus::Running;
                 session.state = state;
             }
         })

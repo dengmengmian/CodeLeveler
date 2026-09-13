@@ -2,20 +2,20 @@
 //! idempotent triggers, corrupt-checkpoint fail-closed, and the interruption
 //! trigger — all against real SQLite (in-memory), never mocked stores.
 
-use leveler_core::{RuntimeId, SessionId};
-use leveler_engine::{
-    EngineEvent, create_goal_checkpoint, reap_after_restart, resume_prior_from_checkpoint,
-};
+use leveler_agent::coding::{create_goal_checkpoint, resume_prior_from_checkpoint};
+use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
+use leveler_engine::{EngineEvent, reap_after_restart};
 use leveler_lifecycle::CheckpointReason;
 use leveler_model::{Message, Role};
 use leveler_storage::{
-    Database, EngineStores, GoalStore, MessageRepository, SessionRecord, SessionRepository,
-    TaskStore, TurnRepository,
+    Database, EngineStores, GoalStore, MessageRepository, OwnershipStore, SessionRecord,
+    SessionRepository, TaskStore, TurnRepository,
 };
 
 struct Fixture {
     db: Database,
     stores: EngineStores,
+    engine: leveler_engine::TaskEngine,
     session: SessionId,
     goal: leveler_core::GoalId,
 }
@@ -29,13 +29,26 @@ async fn fixture() -> Fixture {
         .ensure_for_session(&session, leveler_core::now())
         .await
         .unwrap();
-    let goal = GoalStore::open(&db, &task, "port the parser", leveler_core::now())
+    let token = db
+        .acquire(
+            &task,
+            &RuntimeId::new("checkpoint-fixture"),
+            OwnerEpoch::new(0),
+        )
+        .await
+        .unwrap();
+    let goal = GoalStore::open(&db, &token, "port the parser", leveler_core::now())
         .await
         .unwrap();
     let stores = EngineStores::from_database(&db);
+    let engine = leveler_engine::TaskEngine {
+        stores: stores.clone(),
+        runtime_id: RuntimeId::new("checkpoint-fixture"),
+    };
     Fixture {
         db,
         stores,
+        engine,
         session,
         goal,
     }
@@ -60,6 +73,34 @@ fn marker_event(detail: &str) -> EngineEvent {
     EngineEvent::GoalIntercepted {
         kind: "test".into(),
         detail: detail.into(),
+    }
+}
+
+async fn checkpoint_reaped(fx: &Fixture, outcome: &leveler_engine::ReapOutcome) {
+    for reaped in &outcome.reaped_sessions {
+        let Some(record) = create_goal_checkpoint(
+            &fx.engine,
+            &reaped.session_id,
+            CheckpointReason::Interrupted,
+            None,
+            None,
+        )
+        .await
+        .unwrap() else {
+            continue;
+        };
+        let log = leveler_engine::EventLog::new_owned(
+            fx.stores.events.as_ref(),
+            reaped.session_id.clone(),
+            reaped.token.clone(),
+        );
+        log.append(
+            None,
+            leveler_agent::coding::checkpoint_created_event(&record),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -98,7 +139,7 @@ async fn resume_receives_checkpoint_plus_exact_delta() {
     let e2 = append_event(&fx, marker_event("e2")).await;
 
     let record = create_goal_checkpoint(
-        &fx.stores,
+        &fx.engine,
         &fx.session,
         CheckpointReason::Manual,
         None,
@@ -153,7 +194,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
     let fx = fixture().await;
     append_event(&fx, marker_event("e1")).await;
     let first = create_goal_checkpoint(
-        &fx.stores,
+        &fx.engine,
         &fx.session,
         CheckpointReason::Manual,
         None,
@@ -163,7 +204,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
     .unwrap()
     .unwrap();
     let repeat = create_goal_checkpoint(
-        &fx.stores,
+        &fx.engine,
         &fx.session,
         CheckpointReason::Manual,
         None,
@@ -179,7 +220,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
 
     append_event(&fx, marker_event("e2")).await;
     let advanced = create_goal_checkpoint(
-        &fx.stores,
+        &fx.engine,
         &fx.session,
         CheckpointReason::Manual,
         None,
@@ -255,11 +296,10 @@ async fn a_cursor_beyond_the_log_fails_closed() {
     );
 }
 
-/// §29/§64: the restart reaper cuts a structured-only Interrupted checkpoint
-/// for a goal left running by a dead process, and a repeated restart does not
-/// duplicate it.
+/// §29/§64: Engine reports a mechanical reap boundary; Coding decides that it
+/// means an Interrupted goal checkpoint.
 #[tokio::test]
-async fn restart_reap_cuts_one_interrupted_checkpoint() {
+async fn coding_cuts_one_checkpoint_for_a_reaped_session() {
     let fx = fixture().await;
     append_event(&fx, marker_event("work happened")).await;
     // A running turn left behind by the "dead" process.
@@ -268,42 +308,27 @@ async fn restart_reap_cuts_one_interrupted_checkpoint() {
         .await
         .unwrap();
 
-    let runtime = RuntimeId::new("runtime-restarted");
-    reap_after_restart(&fx.stores, &runtime, None)
+    let runtime = RuntimeId::new("checkpoint-fixture");
+    let outcome = reap_after_restart(&fx.stores, &runtime, None)
         .await
         .unwrap();
+    assert_eq!(outcome.reaped_sessions.len(), 1);
+    assert!(
+        fx.stores
+            .goal_checkpoints
+            .for_goal(&fx.goal)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the generic reaper must not create a Coding checkpoint"
+    );
+    checkpoint_reaped(&fx, &outcome).await;
 
     let checkpoints = fx.stores.goal_checkpoints.for_goal(&fx.goal).await.unwrap();
     assert_eq!(checkpoints.len(), 1, "one interrupted checkpoint");
     assert_eq!(checkpoints[0].reason, CheckpointReason::Interrupted);
     // Structured-only: interruption never waits on model prose.
     assert!(checkpoints[0].payload.goal_summary.is_none());
-
-    // The goal is still running (interrupted), so a second restart reaps
-    // again — the same semantic boundary must not duplicate. Note the reap
-    // itself appended a GoalCheckpointCreated event, so the SECOND pass sees
-    // a new cursor only if new work happened; with none, dedupe must hold on
-    // the new boundary too after one extra pass.
-    let before = fx.stores.goal_checkpoints.for_goal(&fx.goal).await.unwrap();
-    TurnRepository::new(&fx.db)
-        .start(&fx.session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
-    reap_after_restart(&fx.stores, &runtime, None)
-        .await
-        .unwrap();
-    reap_after_restart(&fx.stores, &runtime, None)
-        .await
-        .unwrap();
-    let after = fx.stores.goal_checkpoints.for_goal(&fx.goal).await.unwrap();
-    // The announcement event advances the log, so at most one additional
-    // checkpoint may exist for the new boundary — never one per reap call.
-    assert!(
-        after.len() <= before.len() + 1,
-        "repeated reaps must collapse: {} -> {}",
-        before.len(),
-        after.len()
-    );
 }
 
 /// HCH-FIX-1 (§9C): a checkpoint created against a pre-/compact transcript
@@ -317,7 +342,7 @@ async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
     append_messages(&fx, &["m1", "m2", "m3", "m4"]).await;
     append_event(&fx, marker_event("work")).await;
     let old = create_goal_checkpoint(
-        &fx.stores,
+        &fx.engine,
         &fx.session,
         CheckpointReason::Manual,
         None,

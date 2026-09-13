@@ -444,8 +444,19 @@ mod tests {
             .ensure_for_session(&session, leveler_core::now())
             .await
             .unwrap();
-        let goal = db.open(&task, "first", leveler_core::now()).await.unwrap();
-        let other = db.open(&task, "second", leveler_core::now()).await.unwrap();
+        let token = crate::OwnershipStore::acquire(
+            db,
+            &task,
+            &leveler_core::RuntimeId::new("test-runtime"),
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+        let goal = db.open(&token, "first", leveler_core::now()).await.unwrap();
+        let other = db
+            .open(&token, "second", leveler_core::now())
+            .await
+            .unwrap();
         (goal, other, session)
     }
 
