@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::backend::{Act, BrowserBackend};
 use crate::cdp::CdpBackend;
-use crate::discover::{Launcher, availability, select_product, system_default_product};
+use crate::discover::{Launcher, automation_default_product, availability, select_product};
 use crate::webdriver::WebDriverBackend;
 use crate::{
     ActionOutcome, BrowserError, BrowserProduct, BrowserResult, BrowserSessionId, BrowserSnapshot,
@@ -70,10 +70,16 @@ impl Browser {
     /// Which product this host would drive, and whether it can. The answer the
     /// composition root turns into capability availability.
     ///
-    /// It never answers with a product other than the selected one: if the
-    /// user's default browser cannot be driven, that is the answer (§34).
+    /// Explicit and configured products are authoritative. With neither set,
+    /// the host chooses its first available CDP automation product before any
+    /// browser session starts.
     pub fn resolve(&self, explicit: Option<BrowserProduct>) -> BrowserResult<BrowserProduct> {
-        let selected = select_product(explicit, self.configured, system_default_product())?;
+        let automation_default = if explicit.is_none() && self.configured.is_none() {
+            automation_default_product(&self.env)
+        } else {
+            None
+        };
+        let selected = select_product(explicit, self.configured, automation_default)?;
         availability(&self.env, selected.product).map_err(|e| match e {
             BrowserError::Unavailable(why) => BrowserError::Unavailable(format!(
                 "{} is {}, and {why}",
@@ -512,6 +518,7 @@ fn check_ref(r#ref: &str, current: u64) -> BrowserResult<()> {
 }
 
 fn parse_ref(s: &str) -> Option<(u64, u64)> {
+    let s = crate::backend::ref_label(s);
     let (generation, rest) = s.split_once('e')?;
     Some((generation.parse().ok()?, rest.parse().ok()?))
 }
@@ -707,6 +714,7 @@ mod tests {
     #[test]
     fn a_ref_from_a_superseded_snapshot_is_stale_before_any_protocol_call() {
         assert!(check_ref("7e12", 7).is_ok());
+        assert!(check_ref("[7e12]", 7).is_ok());
         let e = check_ref("6e12", 7).unwrap_err();
         assert!(matches!(e, BrowserError::RefStale(_)), "{e:?}");
         assert!(e.to_string().contains("generation 6"), "{e}");

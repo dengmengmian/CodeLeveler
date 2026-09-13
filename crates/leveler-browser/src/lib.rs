@@ -12,10 +12,12 @@
 //!
 //! Three facts define this crate:
 //!
-//! - **The user's default browser is the one that gets driven.** A product is
-//!   chosen by call, then `[browser].default`, then the operating system's
-//!   default. A richer protocol never promotes a product, and an unavailable
-//!   one is an error rather than a different browser ([`discover`]).
+//! - **Browser automation has its own default.** A product is chosen by call,
+//!   then `[browser].default`, then the first installed CDP product in the
+//!   stable Chrome, Edge, Chromium order. Safari WebDriver is opt-in because
+//!   its isolated Automation Window and missing observation channels make it
+//!   a poor default for frontend debugging. An explicit or configured product
+//!   is never substituted after failure ([`discover`]).
 //! - **A product is not a protocol.** Chrome, Edge and Chromium are three
 //!   browsers that happen to share CDP; an Edge default launches Edge.
 //! - **The browser is network-authorised.** Exposing the capability IS the
@@ -36,7 +38,7 @@ mod types;
 mod webdriver;
 
 pub use backend::Act;
-pub use discover::{Launcher, availability, select_product, system_default_product, which};
+pub use discover::{Launcher, automation_default_product, availability, select_product, which};
 pub use error::{BrowserError, BrowserResult};
 pub use session::Browser;
 pub use types::{

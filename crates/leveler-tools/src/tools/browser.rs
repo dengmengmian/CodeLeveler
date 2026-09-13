@@ -133,7 +133,7 @@ struct TabInput {
     #[serde(default)]
     tab: Option<String>,
     /// Which browser to drive: `safari`, `chrome`, `edge` or `chromium`.
-    /// Omit to use the configured or system default browser. Naming a
+    /// Omit to use the configured browser or host CDP automation default. Naming a
     /// different browser than the one already running closes that one and
     /// starts this one, so its tabs and login state do not carry over.
     #[serde(default)]
@@ -147,11 +147,14 @@ impl Tool for BrowserTabTool {
     }
 
     fn description(&self) -> &'static str {
-        "Drive pages and tabs in a real browser: navigate to a URL, read a \
-         semantic snapshot of the current page, capture a screenshot, reload, \
-         and list/open/select/close tabs. The snapshot's [ref] tokens are what \
-         browser_act operates on. Uses your default browser unless `browser` \
-         names one."
+        "Drive pages and tabs in a runtime-owned browser automation session: \
+         navigate to a URL, read a semantic snapshot of the current page, \
+         capture a screenshot, reload, and list/open/select/close tabs. The \
+         snapshot's [ref] tokens are what browser_act operates on. Unless \
+         `browser` or [browser].default names one, uses an installed CDP \
+         browser in Chrome, Edge, Chromium priority order. Safari is opt-in and \
+         uses an isolated Automation Window with no console, page-error, or \
+         network inspection."
     }
 
     fn input_schema(&self) -> serde_json::Value {

@@ -192,12 +192,10 @@ async fn record_event(observations: &Arc<Mutex<HashMap<String, Observation>>>, v
     match method {
         "Runtime.consoleAPICalled" => {
             let level = p.get("type").and_then(Value::as_str).unwrap_or("log");
-            if matches!(level, "error" | "warning" | "assert") {
-                obs.push_console(ConsoleEntry {
-                    level: level.to_string(),
-                    text: console_args_text(&p),
-                });
-            }
+            obs.push_console(ConsoleEntry {
+                level: level.to_string(),
+                text: console_args_text(&p),
+            });
         }
         "Log.entryAdded" => {
             let entry = p.get("entry").cloned().unwrap_or(Value::Null);
@@ -495,8 +493,6 @@ impl CdpBackend {
         Ok(session)
     }
 
-    /// Reconcile the tab map with the browser's live page targets: adopt pages
-    /// this backend has not seen (popups), drop pages the browser has closed.
     /// Reconcile the tab map with the browser's live page targets: adopt page
     /// targets this backend has not seen (popups), drop the ones the browser
     /// has closed. One protocol call, no attaching — `targetInfo` carries what
@@ -580,6 +576,7 @@ impl CdpBackend {
     /// Resolve a ref to a live remote object, or fail as stale. Never widens
     /// the query — a missing attribute is a missing element (§18).
     async fn object_for(&self, session: &str, r#ref: &str) -> BrowserResult<String> {
+        let r#ref = crate::backend::ref_label(r#ref);
         // Two layers, in this order: the ref is escaped for CSS, then the
         // finished selector is emitted as a JSON string literal — which is
         // also a valid JS string literal. Neither layer can be escaped from.
@@ -743,6 +740,23 @@ impl CdpBackend {
 #[async_trait]
 impl BrowserBackend for CdpBackend {
     async fn new_tab(&self) -> BrowserResult<TabId> {
+        // Chrome starts with one page even for an isolated headless profile;
+        // its URL varies by Chrome version (`about:blank`, `chrome://newtab/`,
+        // and similar). Claim the existing runtime-owned page for the first
+        // session instead of creating a second target that would later look
+        // like a popup.
+        if self.tabs.lock().await.is_empty() {
+            let live = self.sync_targets().await?;
+            if let Some((target_id, _, _)) = live.first() {
+                let tabs = self.tabs.lock().await;
+                if let Some((tab, _)) = tabs
+                    .iter()
+                    .find(|(_, attached)| &attached.target_id == target_id)
+                {
+                    return Ok(tab.clone());
+                }
+            }
+        }
         let res = self
             .conn
             .call(

@@ -103,7 +103,7 @@ pub struct LoadedConfig {
     /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
     /// `[browser].default`: the browser the browser capability drives. `None`
-    /// means the operating system's default browser.
+    /// uses the host's CDP automation default.
     pub browser_default: Option<leveler_browser::BrowserProduct>,
 }
 

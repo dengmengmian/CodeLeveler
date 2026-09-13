@@ -81,6 +81,16 @@ impl Act<'_> {
     }
 }
 
+/// Turn a token as printed in a semantic snapshot (`[2e3]`) into its DOM
+/// label (`2e3`). The raw label remains accepted for lower-level callers.
+pub(crate) fn ref_label(token: &str) -> &str {
+    let token = token.trim();
+    token
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(token)
+}
+
 /// One live browser, driven over one protocol.
 #[async_trait]
 pub trait BrowserBackend: Send + Sync {
@@ -160,5 +170,13 @@ mod tests {
             &s[s.len() - 40..]
         );
         assert!(!s.contains("GENERATION"), "no placeholder may survive");
+    }
+
+    #[test]
+    fn displayed_refs_and_raw_labels_have_one_dom_identity() {
+        assert_eq!(ref_label("[2e3]"), "2e3");
+        assert_eq!(ref_label("  [2e3]  "), "2e3");
+        assert_eq!(ref_label("2e3"), "2e3");
+        assert_eq!(ref_label("[2e3"), "[2e3");
     }
 }

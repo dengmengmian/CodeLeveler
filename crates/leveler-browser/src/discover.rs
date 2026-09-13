@@ -3,9 +3,10 @@
 //! Two independent questions, kept apart:
 //!
 //! - **SELECTION** — which PRODUCT does the user want? A pure, deterministic
-//!   precedence: the call, then `[browser].default`, then the operating
-//!   system's default browser. Nothing else participates; capability richness
-//!   never promotes a product (§3).
+//!   precedence: the call, then `[browser].default`, then the host's automation
+//!   default. The automation default is the first installed CDP product in the
+//!   stable Chrome, Edge, Chromium order; Safari is opt-in because WebDriver
+//!   lacks the observation channels frontend debugging requires (§3).
 //! - **AVAILABILITY** — can this machine drive that product right now? An
 //!   executable on disk for the CDP products, and for Safari the additional
 //!   fact that Remote Automation has been switched on.
@@ -14,7 +15,6 @@
 //! and why it was selected. It is never another product (§34).
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use leveler_core::EnvSnapshot;
 
@@ -46,7 +46,7 @@ pub fn which(env: &EnvSnapshot, name: &str) -> Option<PathBuf> {
 pub fn select_product(
     explicit: Option<BrowserProduct>,
     configured: Option<BrowserProduct>,
-    system_default: Option<BrowserProduct>,
+    automation_default: Option<BrowserProduct>,
 ) -> Result<SelectedProduct, BrowserError> {
     if let Some(product) = explicit {
         return Ok(SelectedProduct {
@@ -60,17 +60,40 @@ pub fn select_product(
             source: ProductSource::Configured,
         });
     }
-    if let Some(product) = system_default {
+    if let Some(product) = automation_default {
         return Ok(SelectedProduct {
             product,
-            source: ProductSource::SystemDefault,
+            source: ProductSource::AutomationDefault,
         });
     }
     Err(BrowserError::Unavailable(
-        "no browser selected: the system default browser is not one CodeLeveler \
-         drives (safari, chrome, edge, chromium) and [browser].default is unset"
+        "no browser selected: install Chrome, Edge or Chromium, or set \
+         [browser].default to safari, chrome, edge or chromium"
             .into(),
     ))
+}
+
+/// Choose the host's unconfigured automation product.
+///
+/// This is capability negotiation before a session starts, not a retry after
+/// an operation failed. Explicit and configured products never enter this
+/// search and therefore are never substituted. Safari stays opt-in: its
+/// WebDriver session cannot provide console, page-error, or network inspection
+/// and its glass pane intentionally prevents human interaction while active.
+pub fn automation_default_product(env: &EnvSnapshot) -> Option<BrowserProduct> {
+    automation_default_where(|product| availability(env, product).is_ok())
+}
+
+fn automation_default_where(
+    mut drivable: impl FnMut(BrowserProduct) -> bool,
+) -> Option<BrowserProduct> {
+    [
+        BrowserProduct::Chrome,
+        BrowserProduct::Edge,
+        BrowserProduct::Chromium,
+    ]
+    .into_iter()
+    .find(|product| drivable(*product))
 }
 
 /// What a resolved, available product is launched from.
@@ -200,112 +223,6 @@ fn chromium_path_names(product: BrowserProduct) -> &'static [&'static str] {
     }
 }
 
-/// The operating system's default web browser, when it is one CodeLeveler
-/// drives. Memoised: it changes rarely, and the lookup shells out.
-pub fn system_default_product() -> Option<BrowserProduct> {
-    static CACHE: OnceLock<Option<BrowserProduct>> = OnceLock::new();
-    *CACHE.get_or_init(detect_system_default)
-}
-
-#[cfg(target_os = "macos")]
-fn detect_system_default() -> Option<BrowserProduct> {
-    // LaunchServices records the http handler as a bundle id.
-    let home = std::env::var_os("HOME")?;
-    let plist = PathBuf::from(home)
-        .join("Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist");
-    let out = std::process::Command::new("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-"])
-        .arg(&plist)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let handlers = json.get("LSHandlers")?.as_array()?;
-    let bundle = handlers.iter().find_map(|h| {
-        (h.get("LSHandlerURLScheme")?.as_str()? == "http")
-            .then(|| h.get("LSHandlerRoleAll")?.as_str())
-            .flatten()
-    })?;
-    product_from_bundle_id(bundle)
-}
-
-/// Map a macOS bundle id to a product.
-#[cfg(target_os = "macos")]
-fn product_from_bundle_id(bundle: &str) -> Option<BrowserProduct> {
-    match bundle.to_ascii_lowercase().as_str() {
-        "com.apple.safari" | "com.apple.safaritechnologypreview" => Some(BrowserProduct::Safari),
-        "com.google.chrome" | "com.google.chrome.canary" => Some(BrowserProduct::Chrome),
-        "com.microsoft.edgemac" | "com.microsoft.edgemac.beta" => Some(BrowserProduct::Edge),
-        "org.chromium.chromium" => Some(BrowserProduct::Chromium),
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn detect_system_default() -> Option<BrowserProduct> {
-    let out = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
-            "/v",
-            "ProgId",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    product_from_prog_id(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Map a Windows `ProgId` to a product. Edge ships several ids across
-/// channels/packaging, so this matches the vendor prefix, not one literal.
-#[cfg(windows)]
-fn product_from_prog_id(text: &str) -> Option<BrowserProduct> {
-    let lower = text.to_ascii_lowercase();
-    // Order matters: "chromium" contains "chrome" as a substring.
-    if lower.contains("chromiumhtm") {
-        return Some(BrowserProduct::Chromium);
-    }
-    if lower.contains("msedge") || lower.contains("appxq0fevzme") {
-        return Some(BrowserProduct::Edge);
-    }
-    if lower.contains("chromehtml") {
-        return Some(BrowserProduct::Chrome);
-    }
-    None
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn detect_system_default() -> Option<BrowserProduct> {
-    let out = std::process::Command::new("xdg-settings")
-        .args(["get", "default-web-browser"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    product_from_desktop_entry(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Map an XDG `.desktop` entry name to a product.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn product_from_desktop_entry(text: &str) -> Option<BrowserProduct> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("chromium") {
-        return Some(BrowserProduct::Chromium);
-    }
-    if lower.contains("edge") {
-        return Some(BrowserProduct::Edge);
-    }
-    if lower.contains("chrome") {
-        return Some(BrowserProduct::Chrome);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,9 +235,9 @@ mod tests {
     fn sel(
         explicit: Option<BrowserProduct>,
         configured: Option<BrowserProduct>,
-        system: Option<BrowserProduct>,
+        automation_default: Option<BrowserProduct>,
     ) -> SelectedProduct {
-        select_product(explicit, configured, system).expect("selectable")
+        select_product(explicit, configured, automation_default).expect("selectable")
     }
 
     /// The whole precedence, case by case — the product contract §6 pins.
@@ -331,14 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn the_system_default_wins_when_nothing_is_configured() {
-        // The macOS case that matters: no config, default Safari ⇒ Safari.
-        let s = sel(None, None, Some(SAFARI));
-        assert_eq!(s.product, SAFARI);
-        assert_eq!(s.source, ProductSource::SystemDefault);
-        // And the Windows case: default Edge ⇒ Edge, NOT Chrome.
+    fn the_automation_default_is_used_when_nothing_is_configured() {
+        let s = sel(None, None, Some(CHROME));
+        assert_eq!(s.product, CHROME);
+        assert_eq!(s.source, ProductSource::AutomationDefault);
         assert_eq!(sel(None, None, Some(EDGE)).product, EDGE);
-        assert_eq!(sel(None, None, Some(CHROME)).product, CHROME);
     }
 
     #[test]
@@ -358,18 +272,21 @@ mod tests {
     }
 
     #[test]
-    fn configuration_overrides_the_system_default() {
+    fn configuration_overrides_the_automation_default() {
         let s = sel(None, Some(CHROME), Some(SAFARI));
         assert_eq!(s.product, CHROME);
         assert_eq!(s.source, ProductSource::Configured);
     }
 
-    /// The rule that makes "default browser first" real: a richer protocol is
-    /// not a reason to promote a product. Nothing in `select_product` can even
-    /// see a backend, so Chromium can never outrank a Safari default.
     #[test]
-    fn nothing_promotes_a_product_for_being_more_capable() {
-        assert_eq!(sel(None, None, Some(SAFARI)).product, SAFARI);
+    fn automation_default_has_a_stable_cdp_order_and_excludes_safari() {
+        assert_eq!(automation_default_where(|_| true), Some(CHROME));
+        assert_eq!(automation_default_where(|p| p != CHROME), Some(EDGE));
+        assert_eq!(
+            automation_default_where(|p| p == CHROMIUM || p == SAFARI),
+            Some(CHROMIUM)
+        );
+        assert_eq!(automation_default_where(|p| p == SAFARI), None);
     }
 
     #[test]
@@ -414,59 +331,6 @@ mod tests {
             availability(&env, SAFARI),
             Err(BrowserError::Unavailable(_))
         ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn bundle_ids_map_to_the_product_the_user_actually_runs() {
-        assert_eq!(product_from_bundle_id("com.apple.Safari"), Some(SAFARI));
-        assert_eq!(product_from_bundle_id("com.google.Chrome"), Some(CHROME));
-        assert_eq!(product_from_bundle_id("com.microsoft.edgemac"), Some(EDGE));
-        assert_eq!(
-            product_from_bundle_id("org.chromium.Chromium"),
-            Some(CHROMIUM)
-        );
-        assert_eq!(product_from_bundle_id("org.mozilla.firefox"), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prog_ids_map_to_the_product_the_user_actually_runs() {
-        assert_eq!(
-            product_from_prog_id("ProgId    REG_SZ    ChromeHTML"),
-            Some(CHROME)
-        );
-        assert_eq!(
-            product_from_prog_id("ProgId    REG_SZ    MSEdgeHTM"),
-            Some(EDGE)
-        );
-        assert_eq!(
-            product_from_prog_id("ProgId    REG_SZ    MSEdgeDHTML"),
-            Some(EDGE)
-        );
-        assert_eq!(
-            product_from_prog_id("ProgId    REG_SZ    ChromiumHTM"),
-            Some(CHROMIUM)
-        );
-        assert_eq!(product_from_prog_id("ProgId    REG_SZ    FirefoxURL"), None);
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn desktop_entries_map_to_the_product_the_user_actually_runs() {
-        assert_eq!(
-            product_from_desktop_entry("google-chrome.desktop\n"),
-            Some(CHROME)
-        );
-        assert_eq!(
-            product_from_desktop_entry("microsoft-edge.desktop\n"),
-            Some(EDGE)
-        );
-        assert_eq!(
-            product_from_desktop_entry("chromium_chromium.desktop\n"),
-            Some(CHROMIUM)
-        );
-        assert_eq!(product_from_desktop_entry("firefox.desktop\n"), None);
     }
 
     #[test]

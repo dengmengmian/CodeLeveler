@@ -227,6 +227,7 @@ impl WebDriverBackend {
 
     /// Resolve a ref to a web-element handle, or fail as stale.
     async fn element_for(&self, r#ref: &str) -> BrowserResult<String> {
+        let r#ref = crate::backend::ref_label(r#ref);
         let selector = format!(
             "[data-leveler-ref={}]",
             crate::backend::css_string_literal(r#ref)

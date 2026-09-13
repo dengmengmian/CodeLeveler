@@ -125,10 +125,12 @@ impl Layout {
         self.state_dir.join("permissions.yaml")
     }
 
-    /// Isolated, durable per-project browser profile
-    /// (`<state_dir>/browser/profile/`). Holds cookies/localStorage/login state
-    /// scoped to THIS repository — never the user's real Chrome profile, never
-    /// in the workspace. Distinct per project (keyed by the repo-path hash).
+    /// Isolated, durable per-project CDP-browser profile
+    /// (`<state_dir>/browser/profile/`). Chrome-family sessions keep their
+    /// cookies/localStorage/login state here, scoped to THIS repository — never
+    /// the user's real browser profile, never in the workspace. Safari owns its
+    /// isolated Automation Window and does not use this directory. Distinct per
+    /// project (keyed by the repo-path hash).
     pub fn browser_profile_dir(&self) -> PathBuf {
         self.state_dir.join("browser").join("profile")
     }

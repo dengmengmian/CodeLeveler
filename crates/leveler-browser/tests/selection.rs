@@ -7,7 +7,7 @@
 //! happens to be installed.
 
 use leveler_browser::{
-    Browser, BrowserError, BrowserProduct, availability, system_default_product,
+    Browser, BrowserError, BrowserProduct, automation_default_product, availability,
 };
 
 fn env() -> leveler_core::EnvSnapshot {
@@ -70,36 +70,23 @@ fn a_configured_browser_that_is_absent_is_an_error_not_another_browser() {
     }
 }
 
-/// With nothing configured, the operating system's default browser is the one
-/// that runs. Not the most capable one, not the first one found.
+/// With nothing configured, frontend automation picks the documented first
+/// installed CDP product and never implicitly selects Safari.
 #[test]
-fn nothing_configured_means_the_system_default_browser() {
-    let Some(system) = system_default_product() else {
-        println!("SKIP: this machine's default browser is not one CodeLeveler drives");
+fn nothing_configured_means_the_host_automation_default() {
+    let e = env();
+    let Some(expected) = automation_default_product(&e) else {
+        println!("SKIP: this machine has no supported CDP browser");
         return;
     };
-    match browser(None).resolve(None) {
-        Ok(product) => assert_eq!(
-            product, system,
-            "an unconfigured host must drive the system default browser"
-        ),
-        Err(e) => {
-            // The system default is selected but not drivable. That is still
-            // the right ANSWER — it must name that browser, not another.
-            let text = e.to_string();
-            assert!(
-                text.contains(system.as_str()),
-                "the error must be about the system default ({system}): {text}"
-            );
-            println!("system default {system} is selected but not drivable: {text}");
-        }
-    }
+    assert_ne!(expected, BrowserProduct::Safari);
+    assert_eq!(browser(None).resolve(None).unwrap(), expected);
 }
 
 /// An explicit product beats configuration, in either direction, and a
-/// configured product beats the system default.
+/// configured product beats the host automation default.
 #[test]
-fn explicit_beats_configured_beats_system_default() {
+fn explicit_beats_configured_beats_automation_default() {
     let e = env();
     let drivable: Vec<BrowserProduct> = BrowserProduct::ALL
         .into_iter()

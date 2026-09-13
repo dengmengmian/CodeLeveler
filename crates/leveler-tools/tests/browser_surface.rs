@@ -126,8 +126,8 @@ fn the_browser_can_be_named_on_the_call_that_starts_one() {
         .unwrap()
         .description;
     assert!(
-        description.contains("default browser"),
-        "the default-browser rule belongs in the tool's own description: {description}"
+        description.contains("Chrome, Edge, Chromium"),
+        "the automation-default rule belongs in the tool's own description: {description}"
     );
 }
 

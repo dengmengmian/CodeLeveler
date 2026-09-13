@@ -18,7 +18,7 @@
 //!
 //! [browser]
 //! default = "chrome"           # optional: safari | chrome | edge | chromium.
-//!                              # Unset uses the operating system's default browser.
+//!                              # Unset prefers installed CDP browsers.
 //!
 //! [vcs]
 //! co_author = true             # optional; append the CodeLeveler/model commit trailer
@@ -121,10 +121,10 @@ impl Default for GlobalAgents {
 
 /// `[browser]`. One key: which browser to drive.
 ///
-/// Unset is not "pick one for me" — it means the operating system's default
-/// browser, which is the whole point of the setting: the user is verifying
-/// their frontend in the browser they actually use, and this exists only to
-/// override that.
+/// Unset lets the host choose the first installed browser with the CDP
+/// observation surface, in the stable Chrome, Edge, Chromium order. Safari is
+/// opt-in because its WebDriver session cannot expose console, page-error, or
+/// network inspection.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalBrowser {
@@ -312,9 +312,7 @@ pub struct GlobalBundle {
     pub agents_delegation: bool,
     /// Whether the harness launches an independent reviewer (default Off).
     pub agents_independent_review: leveler_project::IndependentReview,
-    /// `[browser].default`, parsed. An unrecognised value is `None` and the
-    /// system default browser is used — a typo must not silently pick a
-    /// different browser than the one named.
+    /// `[browser].default`, parsed after validation rejects unrecognised values.
     pub browser_default: Option<leveler_browser::BrowserProduct>,
 }
 
@@ -364,8 +362,20 @@ impl GlobalConfig {
         reject_mcp_env_secrets(&value)?;
         let cfg: Self =
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        cfg.validate_browser()?;
         cfg.validate_reasoning()?;
         Ok(cfg)
+    }
+
+    fn validate_browser(&self) -> Result<(), GlobalConfigError> {
+        if let Some(value) = self.browser.default.as_deref()
+            && leveler_browser::BrowserProduct::parse(value).is_none()
+        {
+            return Err(GlobalConfigError::Parse(format!(
+                "[browser].default must be safari, chrome, edge or chromium; got `{value}`"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_reasoning(&self) -> Result<(), GlobalConfigError> {
@@ -1023,6 +1033,14 @@ completion_judge_timeout_seconds = 180
     fn unknown_field_is_rejected() {
         // deny_unknown_fields catches typos rather than silently ignoring them.
         assert!(toml::from_str::<GlobalConfig>("bogus_key = 1").is_err());
+    }
+
+    #[test]
+    fn unknown_browser_is_rejected_instead_of_selecting_another_product() {
+        let err = GlobalConfig::from_toml_str("[browser]\ndefault = \"chorome\"\n")
+            .expect_err("a browser typo must be an error");
+        assert!(err.to_string().contains("[browser].default"), "{err}");
+        assert!(err.to_string().contains("chorome"), "{err}");
     }
 
     #[test]

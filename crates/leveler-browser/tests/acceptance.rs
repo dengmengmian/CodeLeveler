@@ -50,7 +50,7 @@ fn browser(test: &str) -> Option<(Browser, BrowserProduct, PathBuf)> {
     ));
     let _ = std::fs::remove_dir_all(&profile);
     // The product is passed EXPLICITLY on every navigate, so this suite tests
-    // the product it says it tests and never inherits a system default.
+    // the product it says it tests and never inherits another selection source.
     Some((Browser::new(env, profile.clone(), None), product, profile))
 }
 
@@ -119,9 +119,14 @@ async fn b1_click_changes_the_page() {
     );
     let r = ref_for(&before.text, "button \"Run\"").expect("a ref for the button");
 
-    b.act(&s, None, Act::Click { r#ref: &r })
+    let click = b
+        .act(&s, None, Act::Click { r#ref: &r })
         .await
         .expect("click");
+    assert_eq!(
+        click.new_tab, None,
+        "an ordinary click must not adopt Chrome's startup tab as a popup"
+    );
 
     let after = b.snapshot(&s, None).await.expect("snapshot");
     assert!(
@@ -163,7 +168,11 @@ async fn b2_fill_and_submit_a_form() {
         return;
     }
     let snap = b.snapshot(&s, None).await.expect("snapshot");
-    let field = ref_for(&snap.text, "textbox").expect("a ref for the textbox");
+    // Exercise the token exactly as the model sees it in the snapshot.
+    let field = format!(
+        "[{}]",
+        ref_for(&snap.text, "textbox").expect("a ref for the textbox")
+    );
     let role = ref_for(&snap.text, "combobox").expect("a ref for the select");
 
     b.act(
@@ -377,6 +386,7 @@ async fn inspect_reports_what_the_backend_can_actually_see() {
         page(
             r#"<h1>diag</h1>
                <script>
+                 console.log('ordinary console message');
                  console.error('boom from console');
                  fetch('/missing-endpoint').catch(function(){});
                  setTimeout(function(){ throw new Error('uncaught page error') }, 0);
@@ -411,7 +421,9 @@ async fn inspect_reports_what_the_backend_can_actually_see() {
             (_, Ok(report)) => {
                 let found = match (&kind, &report) {
                     (InspectKind::Console, InspectReport::Console(e)) => {
-                        e.iter().any(|c| c.text.contains("boom from console"))
+                        e.iter()
+                            .any(|c| c.text.contains("ordinary console message"))
+                            && e.iter().any(|c| c.text.contains("boom from console"))
                     }
                     (InspectKind::PageErrors, InspectReport::Console(e)) => {
                         e.iter().any(|c| c.text.contains("uncaught page error"))

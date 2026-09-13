@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 /// A browser PRODUCT — what the user actually runs.
 ///
 /// Deliberately separate from the protocol that drives it: "Chromium backend"
-/// is a protocol, not a browser. A user whose default browser is Edge must be
-/// driven through Edge, never through Chrome merely because both speak CDP.
+/// is a protocol, not a browser. An explicitly selected Edge must be driven
+/// through Edge, never through Chrome merely because both speak CDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserProduct {
@@ -58,8 +58,8 @@ pub enum ProductSource {
     Explicit,
     /// `[browser].default` in the global config.
     Configured,
-    /// The operating system's default web browser.
-    SystemDefault,
+    /// The first installed product in the documented CDP automation order.
+    AutomationDefault,
 }
 
 impl ProductSource {
@@ -67,7 +67,7 @@ impl ProductSource {
         match self {
             Self::Explicit => "explicitly requested",
             Self::Configured => "configured as [browser].default",
-            Self::SystemDefault => "the system default browser",
+            Self::AutomationDefault => "the host automation default",
         }
     }
 }
