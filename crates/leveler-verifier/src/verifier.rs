@@ -786,6 +786,14 @@ mod tests {
     /// pre-existing and always gated the run (reconciliation residual 11).
     #[tokio::test]
     async fn a_real_node_test_failure_yields_test_level_evidence() {
+        // This drives the real Verifier, which confines its check: inside a
+        // verification sandbox there is no way to observe confinement, so
+        // stand down with a reason instead of reporting the platform's
+        // nesting limit as a defect.
+        if leveler_test_support::already_confined() {
+            eprintln!("skipping: already inside a verification sandbox (sandboxes do not nest)");
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("a.test.js"),

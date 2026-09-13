@@ -2333,6 +2333,7 @@ dependencies = [
  "leveler-execution",
  "leveler-lifecycle",
  "leveler-project",
+ "leveler-test-support",
  "serde",
  "serde_json",
  "tempfile",

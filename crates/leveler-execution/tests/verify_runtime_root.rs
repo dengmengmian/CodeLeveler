@@ -1,5 +1,16 @@
 //! The verify sandbox gives a confined child its own CodeLeveler runtime root.
 //!
+//! POSIX hosts only. The write probe runs a shell script that resolves
+//! `$LEVELER_HOME` for itself — which is the point, since the child must learn
+//! its root from the environment rather than from the test — and that spelling
+//! is `sh`, not `cmd`. Windows confines with a Low-integrity label list instead
+//! of a per-process filesystem view, and the list is computed by the same
+//! `writable_roots_for_scope` that puts the scratch (and therefore the isolated
+//! root inside it) in the allowed set, so the property this file asserts is
+//! covered there by construction plus the Windows label tests.
+#![cfg(unix)]
+
+//!
 //! A project's verification command may be CodeLeveler itself: a self-dogfood
 //! run verifies this repository with this repository's own suite, which drives
 //! the edit tools in-process and takes an advisory lock under its home. The
@@ -26,6 +37,7 @@ use leveler_core::EnvSnapshot;
 use leveler_execution::{
     CommandRunner, ProcessRequest, VerifyNetworkPolicy, process_request_for_verify_check,
 };
+use leveler_test_support::already_confined;
 use tokio_util::sync::CancellationToken;
 
 /// A script that fails loudly unless it was handed a writable runtime root,
@@ -99,6 +111,13 @@ fn fixture() -> Fixture {
 /// both received an isolated root and could write it.
 #[tokio::test]
 async fn a_confined_child_writes_its_runtime_state_under_its_own_root() {
+    if already_confined() {
+        eprintln!(
+            "skipping: this suite is already running inside a verification sandbox \
+             (sandboxes do not nest)"
+        );
+        return;
+    }
     let fx = fixture();
     let runner = runner_with_home(&fx.home, &fx.workspace);
     let out = runner
@@ -140,6 +159,13 @@ async fn a_confined_child_writes_its_runtime_state_under_its_own_root() {
 /// STATE" half of the contract.
 #[tokio::test]
 async fn a_confined_child_leaves_the_parent_runtime_state_alone() {
+    if already_confined() {
+        eprintln!(
+            "skipping: this suite is already running inside a verification sandbox \
+             (sandboxes do not nest)"
+        );
+        return;
+    }
     let fx = fixture();
     let runner = runner_with_home(&fx.home, &fx.workspace);
     let out = runner
@@ -167,6 +193,13 @@ async fn a_confined_child_leaves_the_parent_runtime_state_alone() {
 /// state: the scratch is per command, and the child's root is keyed on it.
 #[tokio::test]
 async fn two_confined_runs_never_share_a_runtime_root() {
+    if already_confined() {
+        eprintln!(
+            "skipping: this suite is already running inside a verification sandbox \
+             (sandboxes do not nest)"
+        );
+        return;
+    }
     let fx = fixture();
     let runner = runner_with_home(&fx.home, &fx.workspace);
     let mut roots = Vec::new();
@@ -245,6 +278,13 @@ async fn the_repositorys_own_edit_contract_suite_passes_under_verify_confinement
         .and_then(Path::parent)
         .expect("workspace root")
         .to_path_buf();
+    if already_confined() {
+        eprintln!(
+            "skipping: this suite is already running inside a verification sandbox \
+             (sandboxes do not nest)"
+        );
+        return;
+    }
     let Some(binary) = built_test_binary("edit_contract") else {
         // The target is built by `cargo test --workspace`; a run that filtered
         // it out cannot judge this, and quietly passing would claim otherwise.

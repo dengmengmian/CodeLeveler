@@ -20,5 +20,6 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+leveler-test-support = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
