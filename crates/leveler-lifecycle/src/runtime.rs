@@ -103,7 +103,12 @@ pub enum TaskOutcome {
     /// Execution stopped at an explicit resource boundary. The task is
     /// incomplete and resumable; this is not evidence of model failure.
     BudgetLimited,
+    /// The run ended in failure. Unlike [`TaskOutcome::Blocked`], the model did
+    /// not declare the goal unreachable; the task simply did not succeed.
     Failed,
+    /// The run was interrupted, for example by an abnormal process exit or
+    /// user cancellation. Like [`TaskOutcome::Failed`], this is not the model
+    /// declaring the goal unreachable — that is [`TaskOutcome::Blocked`].
     Interrupted,
 }
 
