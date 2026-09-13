@@ -1,14 +1,13 @@
-//! The ONE canonical GoalCheckpoint builder (long-goal P3).
+//! Coding's canonical GoalCheckpoint builder (long-goal P3).
 //!
 //! Every trigger — `/recap`, milestone, interruption, context compaction —
 //! projects through this module, so a Recap in the TUI, the compaction
 //! breadcrumb, and the resume context all present the SAME persisted facts.
 //! Nothing here asks the model what the runtime already knows: structured
 //! facts come from the event log, the evidence ledger, and whatever bounded
-//! workspace metadata the harness supplies through
-//! [`crate::ports::WorkspaceFacts`] — the engine records those, it does not
-//! know how to obtain them. The optional semantic wording is applied by the
-//! caller on top and can fail without costing the structured checkpoint.
+//! workspace metadata the Coding harness captures. The optional semantic
+//! wording is applied by the caller on top and can fail without costing the
+//! structured checkpoint.
 //!
 //! Cursor discipline: [`project_goal_checkpoint`] reads the committed
 //! `MAX(sequence)` of the session's event log. The CALLER owns making that
@@ -21,13 +20,78 @@ use leveler_lifecycle::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
     CheckpointWorkspace, EvidenceLedger, GoalCheckpoint,
 };
-use leveler_storage::{
-    EngineStores, EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore,
-    NewGoalCheckpoint,
-};
+use leveler_storage::{EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore};
 
-use crate::EngineError;
-use crate::event::EngineEvent;
+use leveler_engine::{EngineError, EngineEvent, EventEmitter, PortError};
+
+use crate::executor::CompactionCheckpoint;
+
+/// Bounded facts about the Coding workspace at a checkpoint boundary.
+#[async_trait::async_trait]
+pub trait WorkspaceFacts: Send + Sync {
+    async fn capture(&self) -> CheckpointWorkspace;
+}
+
+pub(crate) struct CodingCompactionCheckpoint {
+    engine: leveler_engine::TaskEngine,
+    session_id: SessionId,
+    workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+    events: EventEmitter,
+}
+
+pub struct CodingCheckpointContext {
+    pub engine: leveler_engine::TaskEngine,
+    pub workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+}
+
+impl CodingCheckpointContext {
+    pub fn new(
+        engine: leveler_engine::TaskEngine,
+        workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+    ) -> Self {
+        Self { engine, workspace }
+    }
+}
+
+impl CodingCompactionCheckpoint {
+    pub(crate) fn new(
+        engine: leveler_engine::TaskEngine,
+        session_id: SessionId,
+        workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+        events: EventEmitter,
+    ) -> Self {
+        Self {
+            engine,
+            session_id,
+            workspace,
+            events,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionCheckpoint for CodingCompactionCheckpoint {
+    async fn checkpoint_before_compaction(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, PortError> {
+        self.events.flush().await.map_err(PortError::Persistence)?;
+        let record = create_goal_checkpoint(
+            &self.engine,
+            &self.session_id,
+            CheckpointReason::ContextCompaction,
+            self.workspace.as_deref(),
+            SemanticRecap::briefing(summary),
+        )
+        .await
+        .map_err(|e| PortError::Persistence(e.to_string()))?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        self.events.emit(checkpoint_created_event(&record));
+        Ok(Some(record.payload.context_block()))
+    }
+}
 
 /// How many settled children / finding refs / changed paths a checkpoint
 /// carries at most. Counts stay authoritative when a list is truncated.
@@ -49,7 +113,7 @@ pub async fn project_goal_checkpoint(
     messages: &dyn MessageStore,
     goal: &GoalRecord,
     session_id: &SessionId,
-    workspace: Option<&dyn crate::ports::WorkspaceFacts>,
+    workspace: Option<&dyn WorkspaceFacts>,
 ) -> Result<ProjectedCheckpoint, EngineError> {
     let event_cursor = events.latest_sequence(session_id).await?.unwrap_or(0);
     let transcript_ordinal = messages.load(session_id).await?.len() as u64;
@@ -132,12 +196,13 @@ impl SemanticRecap {
 /// committed terminal / reaper commit), so the captured cursor is
 /// committed-only by construction.
 pub async fn create_goal_checkpoint(
-    stores: &EngineStores,
+    engine: &leveler_engine::TaskEngine,
     session_id: &SessionId,
     reason: CheckpointReason,
-    workspace: Option<&dyn crate::ports::WorkspaceFacts>,
+    workspace: Option<&dyn WorkspaceFacts>,
     semantic: Option<SemanticRecap>,
 ) -> Result<Option<GoalCheckpointRecord>, EngineError> {
+    let stores = &engine.stores;
     let Some(task) = stores.tasks.task_for_session(session_id).await? else {
         return Ok(None);
     };
@@ -167,18 +232,14 @@ pub async fn create_goal_checkpoint(
         payload.display_summary = semantic.display_summary;
         payload.next_action = semantic.next_action;
     }
-    let record = stores
-        .goal_checkpoints
-        .create(
-            NewGoalCheckpoint {
-                goal_id: goal.id.clone(),
-                session_id: session_id.clone(),
-                reason,
-                event_cursor: projected.event_cursor,
-                payload: payload.bounded(),
-            },
-            leveler_core::now(),
-        )
+    let record = engine
+        .commit_goal_checkpoint(leveler_storage::NewGoalCheckpoint {
+            goal_id: goal.id.clone(),
+            session_id: session_id.clone(),
+            reason,
+            event_cursor: projected.event_cursor,
+            payload: payload.bounded(),
+        })
         .await?;
     Ok(Some(record))
 }
@@ -211,7 +272,7 @@ pub fn checkpoint_created_event(record: &GoalCheckpointRecord) -> EngineEvent {
 /// reach is unknown — no task, no goal, no checkpoint, no watermark — and the
 /// caller reads that as "impose no bound", never as "bound at zero".
 pub async fn checkpoint_transcript_ordinal(
-    stores: &EngineStores,
+    stores: &leveler_storage::EngineStores,
     session_id: &SessionId,
 ) -> Result<Option<u64>, EngineError> {
     let Some(task) = stores.tasks.task_for_session(session_id).await? else {
@@ -232,9 +293,9 @@ pub async fn checkpoint_transcript_ordinal(
 }
 
 pub async fn resume_prior_from_checkpoint(
-    stores: &EngineStores,
+    stores: &leveler_storage::EngineStores,
     session_id: &SessionId,
-    transcript: &crate::RawTranscript,
+    transcript: &leveler_engine::RawTranscript,
 ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
     let Some(task) = stores.tasks.task_for_session(session_id).await? else {
         return Ok(None);

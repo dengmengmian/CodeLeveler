@@ -23,8 +23,8 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies]
 leveler-provider = { workspace = true }
 leveler-test-support = { workspace = true }
+tempfile = "3"

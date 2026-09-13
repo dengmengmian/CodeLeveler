@@ -10,14 +10,16 @@
 use std::sync::Arc;
 
 use crate::{
-    Database, EventStore, MessageStore, ModelRequestStore, SessionStore, TaskStore, TerminalStore,
-    TurnStore,
+    Database, EventStore, MessageStore, ModelRequestStore, SessionStore, TaskCreationStore,
+    TaskStore, TerminalStore, TurnStore,
 };
 
 /// Every persistence port the engine consumes. Cloning is cheap (Arc per
 /// field); one bundle is built at composition time and shared.
 #[derive(Clone)]
 pub struct EngineStores {
+    /// Atomic creation of the configured session and task association.
+    pub task_creation: Arc<dyn TaskCreationStore>,
     /// Canonical append-only event log.
     pub events: Arc<dyn EventStore>,
     /// Durable task identity and task↔session association.
@@ -45,6 +47,7 @@ impl EngineStores {
     /// (shared connection pool; the clones are pool handles, not new pools).
     pub fn from_database(db: &Database) -> Self {
         Self {
+            task_creation: Arc::new(db.clone()),
             events: Arc::new(db.clone()),
             tasks: Arc::new(db.clone()),
             sessions: Arc::new(db.clone()),

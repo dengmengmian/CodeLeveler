@@ -113,9 +113,9 @@ impl Database {
 mod tests {
     use crate::{
         Database, EventRepository, GoalCheckpointStore, GoalStore, MessageRepository,
-        NewGoalCheckpoint, SessionRecord, SessionRepository, TaskStore,
+        NewGoalCheckpoint, OwnershipStore, SessionRecord, SessionRepository, TaskStore,
     };
-    use leveler_core::SessionId;
+    use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
     use leveler_lifecycle::{CheckpointReason, GoalCheckpoint};
 
     async fn seeded(db: &Database) -> (SessionId, leveler_core::GoalId) {
@@ -126,7 +126,11 @@ mod tests {
             .ensure_for_session(&session, leveler_core::now())
             .await
             .unwrap();
-        let goal = GoalStore::open(db, &task, "the goal", leveler_core::now())
+        let token = db
+            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let goal = GoalStore::open(db, &token, "the goal", leveler_core::now())
             .await
             .unwrap();
         MessageRepository::new(db)

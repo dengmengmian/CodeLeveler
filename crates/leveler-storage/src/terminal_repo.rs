@@ -4,11 +4,11 @@ use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
 
 use crate::event_repo::EVENT_SCHEMA_VERSION;
-use crate::{Database, EventRecord, StorageError};
+use crate::{Database, EventRecord, GoalTerminalUpdate, StorageError};
 
-/// Writes that must land together: appending the terminal event and marking
-/// the aggregate finished. Each method runs both in one transaction, so a crash
-/// can never leave a session marked complete without its event, or vice versa.
+/// Writes that must land together: appending the terminal event, marking the
+/// aggregate finished, and applying any supplied goal projection. Each method
+/// uses one transaction, so a crash cannot expose a partial terminal fact.
 pub struct TerminalRepository<'a> {
     db: &'a Database,
 }
@@ -140,6 +140,7 @@ impl TerminalRepository<'_> {
         verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
+        goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
         // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
@@ -183,6 +184,46 @@ impl TerminalRepository<'_> {
             Err(error) => {
                 let _ = tx.rollback().await;
                 return Err(crate::OwnershipError::Storage(error.into()));
+            }
+        }
+        if let Some(goal) = goal {
+            let updated = if goal.settle {
+                sqlx::query(
+                    "UPDATE goals SET windows_run = windows_run + ?3, state = 'settled', \
+                     settled_at = ?4 WHERE id = ?1 AND task_id = ?2 AND state = 'running'",
+                )
+                .bind(goal.goal_id.as_str())
+                .bind(token.task_id.as_str())
+                .bind(i64::from(goal.windows_delta))
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE goals SET windows_run = windows_run + ?3 \
+                     WHERE id = ?1 AND task_id = ?2 AND state = 'running'",
+                )
+                .bind(goal.goal_id.as_str())
+                .bind(token.task_id.as_str())
+                .bind(i64::from(goal.windows_delta))
+                .execute(&mut *tx)
+                .await
+            };
+            match updated {
+                Ok(updated) if updated.rows_affected() == 1 => {}
+                Ok(_) => {
+                    let _ = tx.rollback().await;
+                    return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                        format!(
+                            "running goal {} not found for task {} terminal transition",
+                            goal.goal_id, token.task_id
+                        ),
+                    )));
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(crate::OwnershipError::Storage(error.into()));
+                }
             }
         }
         tx.commit()
@@ -316,7 +357,11 @@ async fn append_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EventRepository, SessionRecord, SessionRepository, TurnRepository};
+    use crate::{
+        EventRepository, GoalState, GoalStore, OwnershipStore, SessionRecord, SessionRepository,
+        SessionStore, TaskStore, TurnRepository,
+    };
+    use leveler_core::{OwnerEpoch, OwnershipToken, RuntimeId};
 
     async fn db_with_turn() -> (Database, SessionId, TurnId) {
         let db = Database::connect_in_memory().await.unwrap();
@@ -328,6 +373,224 @@ mod tests {
             .await
             .unwrap();
         (db, session, TurnId::new(turn.id))
+    }
+
+    async fn db_with_owned_goal() -> (Database, SessionId, OwnershipToken, leveler_core::GoalId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let task = db
+            .ensure_for_session(&session, leveler_core::now())
+            .await
+            .unwrap();
+        let token = db
+            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let goal = db
+            .open(&token, "the goal", leveler_core::now())
+            .await
+            .unwrap();
+        (db, session, token, goal)
+    }
+
+    #[tokio::test]
+    async fn owned_task_terminal_commits_goal_projection_atomically() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 3,
+            settle: true,
+        };
+
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let stored = db.get(&goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 3);
+        assert_eq!(stored.state, GoalState::Settled);
+        assert!(stored.settled_at.is_some());
+        assert_eq!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SessionStore::execution(&db, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .3,
+            Some(TaskOutcome::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_task_terminal_can_record_a_window_without_settling_the_goal() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 2,
+            settle: false,
+        };
+
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"budget_limited"}}"#,
+                TaskOutcome::BudgetLimited,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Incomplete,
+                AgentState::Execute,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let stored = db.get(&goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 2);
+        assert_eq!(stored.state, GoalState::Running);
+        assert_eq!(stored.settled_at, None);
+    }
+
+    #[tokio::test]
+    async fn goal_from_another_task_rolls_back_task_terminal() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        let other_record = SessionRecord::new("/repo", "other", "mock/m", leveler_core::now());
+        SessionRepository::new(&db)
+            .create(&other_record)
+            .await
+            .unwrap();
+        let other_session = SessionId::new(other_record.id);
+        let other_task = db
+            .ensure_for_session(&other_session, leveler_core::now())
+            .await
+            .unwrap();
+        let other_token = db
+            .acquire(
+                &other_task,
+                &RuntimeId::new("other-runtime"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let other_goal = db
+            .open(&other_token, "other goal", leveler_core::now())
+            .await
+            .unwrap();
+        let update = GoalTerminalUpdate {
+            goal_id: other_goal.clone(),
+            windows_delta: 1,
+            settle: true,
+        };
+
+        let result = TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SessionStore::execution(&db, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .3,
+            None
+        );
+        let stored = db.get(&other_goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 0);
+        assert_eq!(stored.state, GoalState::Running);
+    }
+
+    #[tokio::test]
+    async fn goal_projection_failure_rolls_back_task_terminal() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_goal_terminal BEFORE UPDATE OF windows_run ON goals \
+             BEGIN SELECT RAISE(ABORT, 'goal projection failed'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 1,
+            settle: true,
+        };
+
+        let result = TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SessionStore::execution(&db, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .3,
+            None
+        );
+        let stored = db.get(&goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 0);
+        assert_eq!(stored.state, GoalState::Running);
+        assert_eq!(stored.settled_at, None);
     }
 
     #[tokio::test]

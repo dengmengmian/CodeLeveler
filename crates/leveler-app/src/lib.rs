@@ -31,7 +31,7 @@ mod workspace_view;
 
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
-pub use parallel::{ParallelEditOutcome, acquire_parallel_parent_ownership};
+pub use parallel::ParallelEditOutcome;
 pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;
 pub use vcs::ShipOptions;
@@ -385,6 +385,18 @@ impl Application {
         Ok(self.runtime_id.get_or_init(|| id).clone())
     }
 
+    /// Compose the domain-neutral lifecycle engine over this application's
+    /// single durable store.
+    pub(crate) fn task_engine(
+        &self,
+        db: &leveler_storage::Database,
+    ) -> Result<leveler_engine::TaskEngine, AppError> {
+        Ok(leveler_engine::TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(db),
+            runtime_id: self.runtime_id()?,
+        })
+    }
+
     /// Set work profile for subsequent engine builds and session creates.
     pub fn with_work_profile(mut self, profile: WorkProfile) -> Self {
         self.work_profile = profile;
@@ -652,13 +664,11 @@ impl Application {
         let hook_runner =
             leveler_execution::HookRunner::load(&leveler_home, &self.layout.repo_root);
         let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
+        let db = self.open_database().await?;
         Ok(leveler_agent::coding::CodingRuntime {
-            engine: leveler_engine::TaskEngine {
-                // The composition root chooses the adapter: every engine port
-                // backed by this repository's SQLite database (shared pool).
-                stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
-                runtime_id: self.runtime_id()?,
-            },
+            // The composition root chooses the adapter: every engine port is
+            // backed by this repository's one SQLite database.
+            engine: self.task_engine(&db)?,
             factory: leveler_agent::coding::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),

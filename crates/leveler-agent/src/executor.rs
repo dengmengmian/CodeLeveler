@@ -15,8 +15,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent_core::BudgetExhaustion;
 use leveler_context::load_rules;
 use leveler_engine::{
-    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelRequestRecord,
-    PortError, TranscriptSink,
+    ChildToolEvent, EventBarrier, ExecutionFence, ModelRequestRecord, PortError, TranscriptSink,
 };
 use leveler_execution::{
     ApprovalPolicy, Approver, AutoApprove, AutoClarify, AutoReviewer, ClarificationRequest,
@@ -37,6 +36,18 @@ use self::dispatch::text_of;
 use crate::nudges::first_user_text;
 use crate::prompt::{PromptBuilder, TurnContext};
 use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOTAL_AGENTS};
+
+/// Host hook consulted before the executor discards compacted context.
+///
+/// The executor owns when the hook runs. A domain harness owns what durable
+/// checkpoint, if any, the hook creates and which context block it returns.
+#[async_trait]
+pub trait CompactionCheckpoint: Send + Sync {
+    async fn checkpoint_before_compaction(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, PortError>;
+}
 
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.

@@ -737,21 +737,15 @@ impl InProcessRuntimeClient {
                         return;
                     }
                 };
-                // Ownership-fenced canonical writes (the same acquisition the
-                // parallel parent does): a stale runtime must never stamp user
-                // shell facts into a session another runtime now owns — and if
-                // this runtime may not own the session, it must not run a shell
-                // in that workspace at all.
+                // A stale runtime must never stamp user shell facts into a
+                // session another runtime now owns — and if this runtime may
+                // not own the session, it must not run a shell there at all.
                 let fenced = async {
-                    let task_id = leveler_storage::TaskStore::ensure_for_session(
-                        &db,
-                        &session_id,
-                        leveler_core::now(),
-                    )
-                    .await?;
-                    let runtime_id = app.runtime_id()?;
-                    crate::parallel::acquire_parallel_parent_ownership(&db, &task_id, &runtime_id)
+                    let engine = app.task_engine(&db)?;
+                    engine
+                        .acquire_ownership(&session_id)
                         .await
+                        .map_err(crate::session::app_error_from_engine)
                 }
                 .await;
                 let token = match fenced {
@@ -930,14 +924,14 @@ impl InProcessRuntimeClient {
             tracing::warn!("cannot reap: runtime identity unavailable");
             return;
         };
-        let result = leveler_engine::reap_after_restart(
-            &leveler_storage::EngineStores::from_database(&db),
-            &runtime_id,
-            session,
-        )
-        .await;
+        let engine = leveler_engine::TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: runtime_id.clone(),
+        };
+        let result = leveler_engine::reap_after_restart(&engine.stores, &runtime_id, session).await;
         match result {
             Ok(outcome) => {
+                crate::session::checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
                 for conflict in &outcome.conflicts {
                     tracing::warn!(
                         session = conflict.session_id.as_str(),
@@ -1243,6 +1237,7 @@ impl InProcessRuntimeClient {
                 let result: Result<Option<leveler_client_protocol::UiGoalRecap>, String> = async {
                     let db = app.open_database().await.map_err(|e| e.to_string())?;
                     let stores = leveler_storage::EngineStores::from_database(&db);
+                    let engine = app.task_engine(&db).map_err(|e| e.to_string())?;
                     // A session without any goal has nothing to recap —
                     // answer truthfully before spending a model call.
                     let has_goal = match stores.tasks.task_for_session(&session_id).await {
@@ -1258,8 +1253,8 @@ impl InProcessRuntimeClient {
                         return Ok(None);
                     }
                     let semantic = Self::recap_semantic(&app, &session_id, model.clone()).await;
-                    let record = leveler_engine::create_goal_checkpoint(
-                        &stores,
+                    let record = leveler_agent::coding::create_goal_checkpoint(
+                        &engine,
                         &session_id,
                         leveler_lifecycle::CheckpointReason::Manual,
                         Some(&leveler_agent::coding::GitWorkspace::new(
@@ -1301,7 +1296,7 @@ impl InProcessRuntimeClient {
         app: &Application,
         session_id: &SessionId,
         model: ModelRef,
-    ) -> Option<leveler_engine::SemanticRecap> {
+    ) -> Option<leveler_agent::coding::SemanticRecap> {
         const RECAP_SEMANTIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let work = async {
             let db = app.open_database().await.ok()?;
@@ -1350,7 +1345,7 @@ impl InProcessRuntimeClient {
                     .trim()
                     .to_string()
             });
-            Some(leveler_engine::SemanticRecap {
+            Some(leveler_agent::coding::SemanticRecap {
                 goal_summary: Some(text.trim().to_string()),
                 display_summary: Some(display),
                 next_action: next_action.filter(|s| !s.is_empty()),
@@ -2345,20 +2340,30 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         .get(&session_id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("会话不存在"))?;
+                    let (mode, sandbox, kind, _) = sessions
+                        .execution(&session_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("会话执行配置不存在"))?;
                     let title = if record.goal == PLACEHOLDER_GOAL {
                         record.goal.clone()
                     } else {
                         format!("{} (分叉)", record.goal)
                     };
-                    let fork = leveler_storage::SessionRecord::new(
-                        record.repository.clone(),
-                        title,
-                        record.model.clone(),
-                        leveler_core::now(),
-                    )
-                    .with_axes(&record.collaboration, &record.work_profile);
-                    sessions.create(&fork).await?;
-                    let fork_id = SessionId::new(fork.id.clone());
+                    let engine = self.app.task_engine(&db)?;
+                    let fork_id = engine
+                        .create_task(&leveler_engine::NewSession {
+                            workspace: record.repository.clone(),
+                            goal: title,
+                            model: record.model.clone(),
+                            mode,
+                            sandbox,
+                            kind: leveler_engine::ExecutionKind::parse(&kind)?,
+                            axes: Some(leveler_engine::NewSessionAxes {
+                                collaboration: record.collaboration.clone(),
+                                work_profile: record.work_profile.clone(),
+                            }),
+                        })
+                        .await?;
                     let messages = MessageRepository::new(&db);
                     let transcript = messages.load(&session_id).await?;
                     messages

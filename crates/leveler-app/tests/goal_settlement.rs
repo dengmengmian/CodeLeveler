@@ -189,10 +189,9 @@ async fn a_budget_stopped_goal_is_not_settled_and_stays_discoverable() {
     );
     assert_eq!(owed[0].state, GoalState::Running);
     assert_eq!(owed[0].objective, "keep working");
-    assert!(
-        owed[0].windows_run >= 1,
-        "the windows it consumed must be on the record, not lost with the \
-         process that ran them: {:?}",
+    assert_eq!(
+        owed[0].windows_run, 1,
+        "one invocation is one durable work window: {:?}",
         owed[0]
     );
 }
@@ -285,7 +284,7 @@ async fn resuming_a_budget_stopped_goal_continues_the_same_record() {
     assert_eq!(owed.len(), 1, "one goal is owed after the budget stop");
     let goal = owed[0].id.clone();
     let windows_after_first = owed[0].windows_run;
-    assert!(windows_after_first >= 1);
+    assert_eq!(windows_after_first, 1);
 
     run(&f, 8).await.expect("the second window finishes it");
 
@@ -303,10 +302,9 @@ async fn resuming_a_budget_stopped_goal_continues_the_same_record() {
         GoalState::Settled,
         "and the run that finished it settles that same record"
     );
-    assert!(
-        settled.windows_run > windows_after_first,
-        "the windows the second invocation spent are added to the record, not \
-         lost: {windows_after_first} -> {}",
-        settled.windows_run
+    assert_eq!(
+        settled.windows_run,
+        windows_after_first + 1,
+        "the second invocation contributes exactly one additional window"
     );
 }

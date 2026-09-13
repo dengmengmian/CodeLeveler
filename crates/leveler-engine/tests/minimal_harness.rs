@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use leveler_core::{RuntimeId, SessionId};
 use leveler_engine::{
-    EngineEvent, EventLog, ExecutionKind, NewSession, SeedRequest, TaskEngine, TranscriptSink,
-    TurnFacts, TurnFailure, TurnKind, TurnPorts, TurnRunner, reap_after_restart,
+    EngineEvent, EventLog, ExecutionKind, NewSession, TaskEngine, TranscriptSink, TurnFacts,
+    TurnFailure, TurnKind, TurnPorts, TurnRunner, TurnStart, reap_after_restart,
 };
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, AutoClarify};
 use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome, VerificationStatus};
@@ -106,6 +106,7 @@ async fn open_session(db: &Database) -> SessionId {
             mode: "read-only".into(),
             sandbox: false,
             kind: ExecutionKind::Direct,
+            axes: None,
         })
         .await
         .expect("the engine creates a session for any harness")
@@ -117,11 +118,11 @@ async fn run_one(
     db: &Database,
     session: &SessionId,
     input: &str,
-    seed: SeedRequest,
+    resume: bool,
 ) -> (MinimalResult, Vec<EngineEvent>) {
     let engine = engine(db);
     let token = engine
-        .mark_running(session)
+        .mark_running(session, leveler_lifecycle::AgentState::Understand)
         .await
         .expect("ownership is acquirable");
     let log = EventLog::new_owned(db, session.clone(), token.clone());
@@ -137,17 +138,18 @@ async fn run_one(
     let cancellation = CancellationToken::new();
     let mut events = Vec::new();
     let input = input.to_string();
-    let initiating_message = leveler_model::Message::text(leveler_model::Role::User, input.clone());
+    let start = if resume {
+        TurnStart::Resume
+    } else {
+        TurnStart::Fresh(leveler_model::Message::text(
+            leveler_model::Role::User,
+            input.clone(),
+        ))
+    };
     let recorded = runner
         .run_turn(
             TurnKind::User,
-            seed,
-            match seed {
-                SeedRequest::Fresh { .. } => Some(initiating_message),
-                SeedRequest::Resume => None,
-            },
-            // No `WorkspaceFacts`: the engine must not require a repository.
-            None,
+            start,
             &mut |event| events.push(event),
             cancellation.clone(),
             |ports| minimal_turn(input, ports),
@@ -166,16 +168,7 @@ async fn the_engine_runs_a_turn_for_a_harness_that_is_not_the_coding_agent() {
     let db = Database::connect(&path).await.unwrap();
     let session = open_session(&db).await;
 
-    let (outcome, events) = run_one(
-        &db,
-        &session,
-        "alpha",
-        SeedRequest::Fresh {
-            continues_active_goal: false,
-            prior_epoch_open: true,
-        },
-    )
-    .await;
+    let (outcome, events) = run_one(&db, &session, "alpha", false).await;
 
     // H3: the harness's own type comes back untouched.
     assert_eq!(
@@ -225,6 +218,33 @@ async fn the_engine_runs_a_turn_for_a_harness_that_is_not_the_coding_agent() {
     );
 }
 
+/// A foreign Harness may share the durable event stream without inheriting
+/// Coding's payload parser. Even malformed Coding rows are opaque to its turn.
+#[tokio::test]
+async fn a_non_coding_turn_does_not_parse_coding_seed_events() {
+    let db = Database::connect_in_memory().await.unwrap();
+    let session = open_session(&db).await;
+    for event_type in [
+        "plan_updated",
+        "evidence_ledger_updated",
+        "progress_updated",
+    ] {
+        leveler_storage::EventStore::append(
+            &db,
+            &session,
+            None,
+            event_type,
+            "{}",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (outcome, _) = run_one(&db, &session, "opaque", false).await;
+    assert_eq!(outcome.processed, "processed:opaque");
+}
+
 /// H4: a turn the runtime never finished — kill -9, not a clean cancel — is
 /// reaped into `interrupted` after a restart, stays visible, and the next
 /// turn runs on the same session.
@@ -235,20 +255,14 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     let db = Database::connect(&path).await.unwrap();
     let session = open_session(&db).await;
 
-    run_one(
-        &db,
-        &session,
-        "alpha",
-        SeedRequest::Fresh {
-            continues_active_goal: false,
-            prior_epoch_open: true,
-        },
-    )
-    .await;
+    run_one(&db, &session, "alpha", false).await;
 
     // The crash: a turn row opened by a runtime that never came back.
     let crashing = engine(&db);
-    let token = crashing.mark_running(&session).await.unwrap();
+    let token = crashing
+        .mark_running(&session, leveler_lifecycle::AgentState::Understand)
+        .await
+        .unwrap();
     let crash_payload = serde_json::json!({
         "version": 1,
         "initiating_message": Message::text(Role::User, "crash-marker"),
@@ -304,7 +318,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     );
 
     // The next turn resumes the same session.
-    let (outcome, _) = run_one(&db, &session, "beta", SeedRequest::Resume).await;
+    let (outcome, _) = run_one(&db, &session, "beta", true).await;
     assert_eq!(
         outcome,
         MinimalResult {
@@ -321,12 +335,15 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
         .finish_task(
             &token,
             &session,
-            TaskOutcome::Completed,
-            VerificationStatus::NotRun,
-            None,
-            Some(StopReason::Answered),
-            SessionStatus::Completed,
-            AgentState::Complete,
+            leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Completed,
+                verification: VerificationStatus::NotRun,
+                reason: None,
+                stop: Some(StopReason::Answered),
+                status: SessionStatus::Completed,
+                state: AgentState::Complete,
+                goal: None,
+            },
             &mut |_| {},
         )
         .await
@@ -400,16 +417,7 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
         .await
         .unwrap();
 
-    let (_, events) = run_one(
-        &db,
-        &session,
-        "alpha",
-        SeedRequest::Fresh {
-            continues_active_goal: false,
-            prior_epoch_open: true,
-        },
-    )
-    .await;
+    let (_, events) = run_one(&db, &session, "alpha", false).await;
 
     let settled = events
         .iter()
@@ -452,7 +460,7 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
 
     // R1 + R3: reconciled once. A second turn finds no ghost and writes no
     // second terminal.
-    let (_, again) = run_one(&db, &session, "beta", SeedRequest::Resume).await;
+    let (_, again) = run_one(&db, &session, "beta", true).await;
     assert!(
         !again
             .iter()

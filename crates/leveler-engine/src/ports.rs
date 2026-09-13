@@ -12,7 +12,6 @@
 use async_trait::async_trait;
 
 use leveler_execution::RiskLevel;
-use leveler_lifecycle::CheckpointWorkspace;
 use leveler_model::{FinishReason, Message, TokenUsage};
 
 /// Why a lifecycle port refused. Both variants are terminal for the run: the
@@ -110,30 +109,6 @@ pub enum ChildToolEvent {
     },
 }
 
-/// Host port: cut a durable goal checkpoint at the context-compaction
-/// boundary (long-goal P3), so the fold's summary is backed by persisted
-/// truth instead of an ephemeral paragraph.
-///
-/// Contract: the implementation must make every event emitted so far durable
-/// BEFORE capturing its cursor (flush-then-read), persist the checkpoint,
-/// and return its rendered context block — which the loop folds with in
-/// place of the bare summary.
-///
-/// - `Ok(Some(block))`: a durable checkpoint exists; fold with `block`.
-/// - `Ok(None)`: no goal is in scope (plain chat); fold proceeds exactly as
-///   without the port.
-/// - `Err(_)`: the durable boundary could not be established. The loop must
-///   NOT fold this round — old context is kept and the fold retries at the
-///   next boundary (fail closed: continuity is never dropped uncheckpointed).
-#[async_trait]
-pub trait CompactionCheckpoint: Send + Sync {
-    /// `summary` is the semantic compaction summary when one was produced.
-    async fn checkpoint_before_compaction(
-        &self,
-        summary: Option<&str>,
-    ) -> Result<Option<String>, PortError>;
-}
-
 /// A sink that persists the transcript as the loop advances, enabling resume.
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
@@ -211,18 +186,6 @@ pub enum ModelCallKind {
     /// compaction summary, or a closeout nudge's extra round. Never a second
     /// model judging the first — that class of call no longer exists.
     Advisory,
-}
-
-/// Bounded facts about the workspace a checkpoint is cut in.
-///
-/// The engine persists these on a goal checkpoint but must not know how to
-/// obtain them: "which branch, which commit, is it dirty" is a question about
-/// a version-control system, and which one — or whether there is one at all —
-/// is the domain's business. A harness with no workspace supplies nothing and
-/// the checkpoint records the fields as unknown, never as clean.
-#[async_trait]
-pub trait WorkspaceFacts: Send + Sync {
-    async fn capture(&self) -> CheckpointWorkspace;
 }
 
 /// A child this runtime durably STARTED that never produced a terminal fact.

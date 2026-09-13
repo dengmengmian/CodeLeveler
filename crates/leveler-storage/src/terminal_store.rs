@@ -2,11 +2,12 @@
 //!
 //! The transaction boundary IS the contract. `finish_task` commits the
 //! canonical `TaskFinished` event together with every session lifecycle
-//! column (outcome + status + state); `finish_turn` commits the canonical
-//! `TurnFinished` event together with the turn projection. Either everything
-//! lands or nothing does — an implementation must never expose a state where
-//! the event exists without its projection or vice versa, and an unknown
-//! session/turn is a hard error with nothing written.
+//! column (outcome + status + state) and an optional goal projection;
+//! `finish_turn` commits the canonical `TurnFinished` event together with the
+//! turn projection. Either everything lands or nothing does — an
+//! implementation must never expose a state where the event exists without
+//! its projection or vice versa, and an unknown session/turn is a hard error
+//! with nothing written.
 //!
 //! The engine decides the lifecycle facts; this port only commits them. It is
 //! deliberately NOT decomposed into `event_store.append` + `update_status`
@@ -15,10 +16,24 @@
 
 use async_trait::async_trait;
 
-use leveler_core::{SessionId, Timestamp, TurnId};
+use leveler_core::{GoalId, SessionId, Timestamp, TurnId};
 use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
 
 use crate::{Database, EventRecord, StorageError, TerminalRepository};
+
+/// Goal projection supplied by a Harness for the owned task-terminal commit.
+///
+/// Storage applies these already-decided values mechanically. It does not
+/// interpret task outcomes or decide whether the goal still owes work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalTerminalUpdate {
+    /// Goal whose terminal work window is being recorded.
+    pub goal_id: GoalId,
+    /// Number of work windows completed by this invocation.
+    pub windows_delta: u32,
+    /// Whether the Harness decided that this goal owes no further work.
+    pub settle: bool,
+}
 
 /// The engine-facing atomic terminal-commit contract.
 #[async_trait]
@@ -63,7 +78,8 @@ pub trait TerminalStore: Send + Sync {
     ) -> Result<EventRecord, StorageError>;
 
     /// Fenced [`Self::finish_task`]: ownership assertion + terminal event +
-    /// projection in ONE transaction. A stale token rolls back everything.
+    /// session projection + optional Harness-supplied goal projection in ONE
+    /// transaction. A stale token or invalid goal rolls back everything.
     #[allow(clippy::too_many_arguments)]
     async fn finish_task_owned(
         &self,
@@ -75,6 +91,7 @@ pub trait TerminalStore: Send + Sync {
         verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
+        goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError>;
 
@@ -145,6 +162,7 @@ impl TerminalStore for Database {
         verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
+        goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
         TerminalRepository::new(self)
@@ -157,6 +175,7 @@ impl TerminalStore for Database {
                 verification,
                 status,
                 state,
+                goal,
                 now,
             )
             .await
@@ -191,6 +210,8 @@ pub struct MemoryTerminalStore {
     sessions: std::sync::Arc<crate::MemorySessionStore>,
     turns: std::sync::Arc<crate::MemoryTurnStore>,
     events: std::sync::Arc<crate::MemoryEventStore>,
+    /// Goal rows participating in an optional task-terminal commit.
+    goals: std::sync::OnceLock<std::sync::Arc<crate::MemoryGoalStore>>,
     /// Shared ownership authority for the fenced (`*_owned`) commits.
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
     /// When set, the commit fails AT THE EVENT-APPEND STAGE — after
@@ -212,6 +233,7 @@ impl MemoryTerminalStore {
             sessions,
             turns,
             events,
+            goals: std::sync::OnceLock::new(),
             ownership: std::sync::OnceLock::new(),
             fail: std::sync::atomic::AtomicBool::new(false),
         }
@@ -223,6 +245,12 @@ impl MemoryTerminalStore {
         self
     }
 
+    /// Couple to the memory goal rows used by optional terminal goal updates.
+    pub fn with_goals(self, goals: std::sync::Arc<crate::MemoryGoalStore>) -> Self {
+        let _ = self.goals.set(goals);
+        self
+    }
+
     /// Make every subsequent commit fail without writing.
     pub fn fail_commits(&self, fail: bool) {
         self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
@@ -231,8 +259,10 @@ impl MemoryTerminalStore {
     /// The synchronous commit body shared by the fenced and unfenced task
     /// terminals: validate, "commit" (injected failure point), then apply
     /// projection + event. All fallible steps precede all writes.
+    #[allow(clippy::too_many_arguments)]
     fn finish_task_sync(
         &self,
+        task_id: Option<&leveler_core::TaskId>,
         session_id: &SessionId,
         event_type: &str,
         payload: &str,
@@ -240,6 +270,7 @@ impl MemoryTerminalStore {
         verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
+        goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         if !self
@@ -254,6 +285,42 @@ impl MemoryTerminalStore {
                 session_id.as_str()
             )));
         }
+        let mut goal_rows = match goal {
+            Some(update) => {
+                let Some(task_id) = task_id else {
+                    return Err(StorageError::InvalidData(
+                        "terminal goal update requires owned task identity".to_string(),
+                    ));
+                };
+                let Some(goals) = self.goals.get() else {
+                    return Err(StorageError::InvalidData(
+                        "memory terminal store has no goal store configured".to_string(),
+                    ));
+                };
+                let rows = goals.rows.lock().unwrap();
+                let Some(record) = rows.iter().find(|record| {
+                    record.id == update.goal_id
+                        && &record.task_id == task_id
+                        && record.state == crate::GoalState::Running
+                }) else {
+                    return Err(StorageError::InvalidData(format!(
+                        "running goal {} not found for task {} terminal transition",
+                        update.goal_id, task_id
+                    )));
+                };
+                record
+                    .windows_run
+                    .checked_add(update.windows_delta)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {} work-window count overflow",
+                            update.goal_id
+                        ))
+                    })?;
+                Some(rows)
+            }
+            None => None,
+        };
         self.check_injected_failure()?;
         let record = self
             .events
@@ -265,6 +332,17 @@ impl MemoryTerminalStore {
                 session.verification = Some(verification);
                 session.status = status;
                 session.state = state;
+            }
+        }
+        if let (Some(rows), Some(update)) = (goal_rows.as_mut(), goal) {
+            let record = rows
+                .iter_mut()
+                .find(|record| record.id == update.goal_id)
+                .expect("terminal goal was validated while its rows lock was held");
+            record.windows_run += update.windows_delta;
+            if update.settle {
+                record.state = crate::GoalState::Settled;
+                record.settled_at = Some(now);
             }
         }
         Ok(record)
@@ -335,6 +413,7 @@ impl TerminalStore for MemoryTerminalStore {
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         self.finish_task_sync(
+            None,
             session_id,
             event_type,
             payload,
@@ -342,6 +421,7 @@ impl TerminalStore for MemoryTerminalStore {
             verification,
             status,
             state,
+            None,
             now,
         )
     }
@@ -368,6 +448,7 @@ impl TerminalStore for MemoryTerminalStore {
         verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
+        goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
         let Some(ownership) = self.ownership.get() else {
@@ -379,6 +460,7 @@ impl TerminalStore for MemoryTerminalStore {
         ownership
             .with_current(token, || {
                 self.finish_task_sync(
+                    Some(&token.task_id),
                     session_id,
                     event_type,
                     payload,
@@ -386,6 +468,7 @@ impl TerminalStore for MemoryTerminalStore {
                     verification,
                     status,
                     state,
+                    goal,
                     now,
                 )
             })?
@@ -419,9 +502,11 @@ impl TerminalStore for MemoryTerminalStore {
 mod tests {
     use super::*;
     use crate::{
-        EventStore, MemoryEventStore, MemorySessionStore, MemoryTurnStore, SessionRecord,
+        EventStore, GoalState, GoalStore, MemoryEventStore, MemoryGoalStore, MemoryOwnershipState,
+        MemoryOwnershipStore, MemorySessionStore, MemoryTurnStore, OwnershipStore, SessionRecord,
         SessionStore, TurnStore,
     };
+    use leveler_core::{OwnerEpoch, RuntimeId, TaskId};
     use std::sync::Arc;
 
     // Shared contract, verified purely through ports: terminal commits are
@@ -542,6 +627,90 @@ mod tests {
             events.as_ref(),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn memory_owned_terminal_commits_or_rejects_goal_projection_as_one_fact() {
+        let ownership_state = Arc::new(MemoryOwnershipState::new());
+        let session = SessionId::new("session-1");
+        let task = TaskId::new(session.as_str());
+        ownership_state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(ownership_state.clone());
+        let token = ownership
+            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
+        let sessions = Arc::new(MemorySessionStore::new().with_ownership(ownership_state.clone()));
+        let turns = Arc::new(MemoryTurnStore::new().with_ownership(ownership_state.clone()));
+        let events = Arc::new(MemoryEventStore::new().with_ownership(ownership_state.clone()));
+        let goals = Arc::new(MemoryGoalStore::new().with_ownership(ownership_state.clone()));
+        let terminal = MemoryTerminalStore::new(sessions.clone(), turns, events.clone())
+            .with_goals(goals.clone())
+            .with_ownership(ownership_state);
+        let record = SessionRecord {
+            id: session.as_str().to_string(),
+            ..SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now())
+        };
+        sessions.create(&record).await.unwrap();
+        let goal = goals
+            .open(&token, "the goal", leveler_core::now())
+            .await
+            .unwrap();
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 2,
+            settle: true,
+        };
+
+        terminal.fail_commits(true);
+        assert!(
+            terminal
+                .finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    "{}",
+                    TaskOutcome::Completed,
+                    VerificationStatus::NotRun,
+                    SessionStatus::Completed,
+                    AgentState::Complete,
+                    Some(&update),
+                    leveler_core::now(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(events.load(&session).await.unwrap().is_empty());
+        assert_eq!(sessions.execution(&session).await.unwrap().unwrap().3, None);
+        let stored = goals.get(&goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 0);
+        assert_eq!(stored.state, GoalState::Running);
+
+        terminal.fail_commits(false);
+        terminal
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                "{}",
+                TaskOutcome::Completed,
+                VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let stored = goals.get(&goal).await.unwrap().unwrap();
+        assert_eq!(stored.windows_run, 2);
+        assert_eq!(stored.state, GoalState::Settled);
+        assert!(stored.settled_at.is_some());
+        assert_eq!(events.load(&session).await.unwrap().len(), 1);
+        assert_eq!(
+            sessions.execution(&session).await.unwrap().unwrap().3,
+            Some(TaskOutcome::Completed)
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ mod model_request_repo;
 mod ownership_store;
 mod session_repo;
 mod session_store;
+mod task_creation_store;
 mod task_store;
 mod terminal_repo;
 mod terminal_store;
@@ -50,9 +51,10 @@ pub use ownership_store::{
 };
 pub use session_repo::{SessionRecord, SessionRepository};
 pub use session_store::{MemorySessionStore, SessionStore};
+pub use task_creation_store::TaskCreationStore;
 pub use task_store::{MemoryTaskStore, TaskStore};
 pub use terminal_repo::TerminalRepository;
-pub use terminal_store::{MemoryTerminalStore, TerminalStore};
+pub use terminal_store::{GoalTerminalUpdate, MemoryTerminalStore, TerminalStore};
 pub use turn_repo::{TurnRecord, TurnRepository};
 pub use turn_store::{MemoryTurnStore, TurnStore};
 

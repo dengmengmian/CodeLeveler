@@ -11,11 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::SessionId;
 use leveler_engine::{
-    EngineEvent, LostChild, LostChildNote, LostChildVoice, TurnFacts, TurnFailure, TurnPorts,
+    EngineError, EngineEvent, LostChild, LostChildNote, LostChildVoice, TurnFacts, TurnFailure,
+    TurnPorts,
 };
+use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger};
 use leveler_model::{ContentPart, Message};
 use leveler_storage::EventStore;
 
+use crate::coding::checkpoint::{CodingCheckpointContext, CodingCompactionCheckpoint};
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::sub_agent::SettledChildNotice;
 use crate::{AgentError, AgentEvent, AgentOutcome, Executor};
@@ -55,6 +58,10 @@ pub async fn drive_turn(
     factory: &ExecutorFactory,
     profile: TurnProfile,
     input: TurnInput,
+    seed_task_state: bool,
+    session_id: SessionId,
+    events: Arc<dyn EventStore>,
+    checkpoint_context: Option<CodingCheckpointContext>,
     ports: TurnPorts,
     cancellation: CancellationToken,
 ) -> Result<TurnFacts<AgentOutcome>, TurnFailure> {
@@ -62,14 +69,22 @@ pub async fn drive_turn(
         turn_id,
         emitter,
         mut sink,
-        seeds,
+        finished_children,
         barrier,
         fence,
-        checkpoint,
         approver,
         clarifier,
     } = ports;
     let _ = turn_id;
+    let seeds = if seed_task_state {
+        Some(
+            load_coding_seeds(events.as_ref(), &session_id)
+                .await
+                .map_err(seed_failure)?,
+        )
+    } else {
+        None
+    };
     let is_goal_profile = matches!(profile, TurnProfile::Goal { .. });
     // The raw request text, when the caller has one. Resume turns carry no
     // new request, so they stay unclassified.
@@ -96,18 +111,22 @@ pub async fn drive_turn(
         // Side-effect barrier: tool dispatch waits until the announcing
         // canonical events are durable in this turn's event log.
         .with_event_barrier(barrier)
-        // Long-goal P3: a context fold first cuts a durable goal checkpoint;
-        // the fold's summary becomes persisted truth, and a failed checkpoint
-        // keeps the context uncompacted (fail closed in the loop).
-        .with_compaction_checkpoint(checkpoint)
         // Ownership fence: after the barriers, before dispatch, the host
         // re-proves this runtime still owns the task. Inherited by delegated
         // child executors.
         .with_execution_fence(fence);
 
-    // Resume / same unfinished task: seed Plan/Ledger/Progress so Delivery and
-    // closeout stay consistent. The engine decided whether this turn may
-    // inherit them; `None` means it may not.
+    if let Some(context) = checkpoint_context {
+        executor = executor.with_compaction_checkpoint(Arc::new(CodingCompactionCheckpoint::new(
+            context.engine,
+            session_id.clone(),
+            context.workspace,
+            emitter.clone(),
+        )));
+    }
+
+    // Resume / same unfinished task: Coding seeds its Plan/Ledger/Progress so
+    // Delivery and closeout stay consistent.
     if let Some(seeds) = seeds {
         if let Some(plan) = seeds.plan {
             executor = executor.with_seeded_plan(plan);
@@ -122,7 +141,7 @@ pub async fn drive_turn(
             // them.
             let settled = reconcile_outstanding_children(
                 &mut progress.outstanding_children,
-                &seeds.finished_children,
+                &finished_children,
             );
             executor = executor.with_seeded_progress(progress);
             if !settled.is_empty() {
@@ -204,6 +223,85 @@ pub async fn drive_turn(
     }
 }
 
+struct CodingTurnSeeds {
+    plan: Option<PlanState>,
+    ledger: Option<EvidenceLedger>,
+    progress: Option<ProgressLedger>,
+}
+
+async fn load_coding_seeds(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<CodingTurnSeeds, EngineError> {
+    Ok(CodingTurnSeeds {
+        plan: last_persisted_plan(events, session_id).await?,
+        ledger: last_persisted_ledger(events, session_id).await?,
+        progress: last_persisted_progress(events, session_id).await?,
+    })
+}
+
+fn seed_failure(error: EngineError) -> TurnFailure {
+    TurnFailure {
+        cancelled: false,
+        stale_ownership: matches!(
+            error,
+            EngineError::StaleOwnership(_) | EngineError::Ownership(_)
+        ),
+        detail: error.to_string(),
+        model: None,
+    }
+}
+
+async fn last_event_of_type(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    event_type: &str,
+) -> Result<Option<EngineEvent>, EngineError> {
+    match events
+        .load_last_by_type(session_id, event_type, None)
+        .await?
+    {
+        Some(row) => Ok(Some(EngineEvent::from_payload(&row.payload)?)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) async fn last_persisted_plan(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Option<PlanState>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "plan_updated").await? {
+            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
+            _ => None,
+        },
+    )
+}
+
+pub(crate) async fn last_persisted_ledger(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Option<EvidenceLedger>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "evidence_ledger_updated").await? {
+            Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
+}
+
+pub(crate) async fn last_persisted_progress(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Option<ProgressLedger>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "progress_updated").await? {
+            Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
+}
+
 /// Report an executor error to the engine. Cancellation is called out so the
 /// turn is recorded as `interrupted` rather than `failed`: the run was
 /// stopped, it did not break.
@@ -278,21 +376,18 @@ impl LostChildVoice for CodingLostChildVoice {
         // One ledger read for the whole batch. On failure the harness says
         // nothing and the engine still settles every ghost truthfully — a
         // ghost left running is the failure this whole path exists to prevent.
-        let ledger =
-            match leveler_engine::last_persisted_ledger(self.events.as_ref(), &self.session_id)
-                .await
-            {
-                Ok(ledger) => ledger.unwrap_or_default(),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %self.session_id.as_str(),
-                        %error,
-                        "could not read the evidence ledger to speak for a lost child; \
-                         its terminal will carry the lifecycle fact only"
-                    );
-                    return Vec::new();
-                }
-            };
+        let ledger = match last_persisted_ledger(self.events.as_ref(), &self.session_id).await {
+            Ok(ledger) => ledger.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_id.as_str(),
+                    %error,
+                    "could not read the evidence ledger to speak for a lost child; \
+                     its terminal will carry the lifecycle fact only"
+                );
+                return Vec::new();
+            }
+        };
         lost.iter()
             .filter_map(|child| {
                 let projection = leveler_lifecycle::ChildResultProjection::from_findings(

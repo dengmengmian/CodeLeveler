@@ -9,9 +9,7 @@
 //! not judge whether the work satisfies the user, and does not know what kind
 //! of agent produced it.
 
-use tokio_util::sync::CancellationToken;
-
-use leveler_core::{SessionId, TaskId, TurnId};
+use leveler_core::{GoalId, SessionId, TaskId, TurnId};
 use leveler_lifecycle::{AgentState, SessionStatus, StopReason, VerificationStatus};
 use leveler_storage::{EngineStores, EventStore, SessionRecord};
 
@@ -176,20 +174,7 @@ fn messages_slice_eq(a: &[leveler_model::Message], b: &[leveler_model::Message])
 /// Persistence enters exclusively through [`EngineStores`] — narrow
 /// capability ports the composition root wires to its adapter (SQLite
 /// locally). The engine never names a concrete database.
-/// Ask for a handoff briefing only when the raw history is over the fold
-/// threshold. Who writes it — and whether that costs a model call — is the
-/// caller's business; a `None` briefing degrades to the bare-breadcrumb fold
-/// and never blocks the turn.
-async fn summarize_if_over(
-    summarizer: &dyn crate::ContextSummarizer,
-    raw: &[leveler_model::Message],
-) -> Option<String> {
-    if leveler_context::estimate_tokens(raw) <= leveler_context::PRE_REQUEST_COMPACT_THRESHOLD {
-        return None;
-    }
-    summarizer.summarize(raw).await
-}
-
+#[derive(Clone)]
 pub struct TaskEngine {
     pub stores: EngineStores,
     /// This runtime's durable identity (from the composition root). Task
@@ -211,6 +196,42 @@ pub struct NewSession {
     pub mode: String,
     pub sandbox: bool,
     pub kind: ExecutionKind,
+    /// Product-defined axes persisted opaquely with the session. The engine
+    /// does not interpret either value.
+    pub axes: Option<NewSessionAxes>,
+}
+
+pub struct NewSessionAxes {
+    pub collaboration: String,
+    pub work_profile: String,
+}
+
+/// Harness-supplied execution configuration written at a fenced start.
+pub struct TaskExecution {
+    pub mode: String,
+    pub sandbox: bool,
+    pub kind: ExecutionKind,
+}
+
+/// Harness-supplied terminal facts for one task.
+///
+/// The engine persists these values atomically. It does not derive the
+/// outcome, workflow state, verification verdict, or goal disposition.
+pub struct TaskTerminal {
+    /// How the harness says the task ended.
+    pub outcome: TaskOutcome,
+    /// The harness's verification result, orthogonal to task outcome.
+    pub verification: VerificationStatus,
+    /// Optional terminal detail for a non-success outcome.
+    pub reason: Option<String>,
+    /// Optional executor stop reason.
+    pub stop: Option<StopReason>,
+    /// Durable session status selected by the harness.
+    pub status: SessionStatus,
+    /// Durable domain workflow state selected by the harness.
+    pub state: AgentState,
+    /// Optional long-goal projection committed with the terminal fact.
+    pub goal: Option<leveler_storage::GoalTerminalUpdate>,
 }
 
 impl TaskEngine {
@@ -218,21 +239,24 @@ impl TaskEngine {
     /// (outcome + status + state) atomically, then forward the event. The
     /// engine is the one writer of the lifecycle for every session it runs —
     /// no app layer stamps a second copy there — and an observer can never see
-    /// an uncommitted fact. The one session the engine does not run is the
-    /// parallel multi-agent PARENT, whose lifecycle `leveler-app::parallel`
-    /// owns; the two writers own disjoint sessions (§18.11).
+    /// an uncommitted fact. Normal, daemon, and parallel-parent lifecycles all
+    /// pass through this same authority boundary.
     pub async fn finish_task(
         &self,
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
-        outcome: TaskOutcome,
-        verification: VerificationStatus,
-        reason: Option<String>,
-        stop: Option<StopReason>,
-        status: SessionStatus,
-        state: AgentState,
+        terminal: TaskTerminal,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
+        let TaskTerminal {
+            outcome,
+            verification,
+            reason,
+            stop,
+            status,
+            state,
+            goal,
+        } = terminal;
         let event = EngineEvent::TaskFinished {
             outcome,
             verification,
@@ -251,6 +275,7 @@ impl TaskEngine {
                 verification,
                 status,
                 state,
+                goal.as_ref(),
                 leveler_core::now(),
             )
             .await?;
@@ -258,13 +283,34 @@ impl TaskEngine {
         Ok(())
     }
 
-    /// Mark the session running before the first turn. The engine owns this
-    /// transition too — clients observe lifecycle, they never write it.
-    ///
-    /// Also the ONE seam where the durable task identity is guaranteed: every
-    /// execution entry (run/chat/resume) passes here, so a session created by
-    /// any path — including one that predates the tasks table — has its task
-    /// row before the first turn. Returns that task id.
+    /// Open a durable goal under the caller's current task ownership.
+    /// Objective matching is harness semantics; the engine only authorizes
+    /// and forwards the write.
+    pub async fn open_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        objective: &str,
+    ) -> Result<GoalId, EngineError> {
+        Ok(self
+            .stores
+            .goals
+            .open(token, objective, leveler_core::now())
+            .await?)
+    }
+
+    /// Persist a caller-projected checkpoint. The engine owns the mechanical
+    /// write and does not inspect the domain payload.
+    pub async fn commit_goal_checkpoint(
+        &self,
+        checkpoint: leveler_storage::NewGoalCheckpoint,
+    ) -> Result<leveler_storage::GoalCheckpointRecord, EngineError> {
+        Ok(self
+            .stores
+            .goal_checkpoints
+            .create(checkpoint, leveler_core::now())
+            .await?)
+    }
+
     /// Acquire (or same-runtime reacquire) ownership of the session's task.
     /// A task owned by a DIFFERENT runtime is a hard conflict - never
     /// auto-stolen. The epoch always advances, fencing prior incarnations.
@@ -310,6 +356,7 @@ impl TaskEngine {
     pub async fn mark_running(
         &self,
         session_id: &SessionId,
+        state: AgentState,
     ) -> Result<leveler_core::OwnershipToken, EngineError> {
         let token = self.acquire_ownership(session_id).await?;
         self.stores
@@ -318,7 +365,32 @@ impl TaskEngine {
                 &token,
                 session_id,
                 SessionStatus::Running,
-                AgentState::Execute,
+                state,
+                leveler_core::now(),
+            )
+            .await?;
+        Ok(token)
+    }
+
+    /// Acquire ownership, then atomically persist the execution configuration
+    /// and Running projection. A foreign owner rejects the operation before
+    /// any session field changes.
+    pub async fn start_task(
+        &self,
+        session_id: &SessionId,
+        state: AgentState,
+        execution: &TaskExecution,
+    ) -> Result<leveler_core::OwnershipToken, EngineError> {
+        let token = self.acquire_ownership(session_id).await?;
+        self.stores
+            .sessions
+            .start_execution_owned(
+                &token,
+                session_id,
+                &execution.mode,
+                execution.sandbox,
+                execution.kind.as_str(),
+                state,
                 leveler_core::now(),
             )
             .await?;
@@ -337,86 +409,26 @@ impl TaskEngine {
     /// Create and persist the session row, including its execution config,
     /// and the durable task row associated with it.
     pub async fn create_task(&self, session: &NewSession) -> Result<SessionId, EngineError> {
-        let record = SessionRecord::new(
+        let mut record = SessionRecord::new(
             session.workspace.clone(),
             session.goal.clone(),
             session.model.clone(),
             leveler_core::now(),
         );
-        self.stores.sessions.create(&record).await?;
-        let id = SessionId::new(record.id);
+        if let Some(axes) = &session.axes {
+            record = record.with_axes(&axes.collaboration, &axes.work_profile);
+        }
+        let id = SessionId::new(record.id.clone());
         self.stores
-            .sessions
-            .set_execution(
-                &id,
+            .task_creation
+            .create_task(
+                &record,
                 &session.mode,
                 session.sandbox,
                 session.kind.as_str(),
-                leveler_core::now(),
             )
-            .await?;
-        self.stores
-            .tasks
-            .ensure_for_session(&id, leveler_core::now())
             .await?;
         Ok(id)
-    }
-
-    /// Long-goal P3: the checkpoint-backed pre-request fold.
-    ///
-    /// Over the fold threshold, prefer a FRESH durable checkpoint (one whose
-    /// delta still fits the threshold); when the newest checkpoint is stale
-    /// or absent, cut a `ContextCompaction` checkpoint at the current
-    /// committed boundary and continue from its block plus a bounded recent
-    /// tail. `None` = keep the pre-checkpoint path: transcript under the
-    /// threshold, no goal in scope, or checkpoint creation failed — every
-    /// fold leaves the durable transcript untouched, so the fallback
-    /// degrades only to exactly the pre-P3 context, never to lost history.
-    /// The model-visible prior context for a turn: the ONE assembly every
-    /// path shares.
-    ///
-    /// A checkpoint's block wins when one is fresh enough; otherwise the
-    /// transcript is merged with the latest snapshot and folded if it still
-    /// does not fit. No caller assembles its own, and none hands a model the
-    /// raw transcript — an unassembled history is unbounded by construction,
-    /// and on a long session that is the whole history resent every turn.
-    pub async fn assembled_prior(
-        &self,
-        log: &EventLog<'_>,
-        session_id: &SessionId,
-        raw: crate::RawTranscript,
-        objective: Option<&str>,
-        workspace: Option<&dyn crate::ports::WorkspaceFacts>,
-        summarizer: &dyn crate::ContextSummarizer,
-        cancellation: &CancellationToken,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-    ) -> Result<Vec<leveler_model::Message>, EngineError> {
-        if let Some(prior) = self
-            .checkpointed_prior(
-                log,
-                session_id,
-                &raw,
-                workspace,
-                summarizer,
-                cancellation,
-                observer,
-            )
-            .await?
-        {
-            return Ok(prior);
-        }
-        let context = raw
-            .assemble(
-                log,
-                Some(summarizer),
-                objective,
-                leveler_context::PRE_REQUEST_COMPACT_THRESHOLD,
-            )
-            .await?;
-        if context.compacted {
-            log.append(None, context.snapshot_event(), observer).await?;
-        }
-        Ok(context.prior)
     }
 
     /// Load the transcript a request needs, reading only the tail when both
@@ -426,6 +438,7 @@ impl TaskEngine {
     pub async fn load_request_transcript(
         &self,
         session_id: &SessionId,
+        checkpoint_ordinal: Option<u64>,
         strict: Option<&str>,
     ) -> Result<crate::RawTranscript, EngineError> {
         let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
@@ -433,8 +446,6 @@ impl TaskEngine {
             .latest_context_snapshot(None)
             .await?
             .and_then(|view| view.through_ordinal);
-        let checkpoint_ordinal =
-            crate::checkpoint::checkpoint_transcript_ordinal(&self.stores, session_id).await?;
         crate::RawTranscript::load_bounded(
             self.stores.messages.as_ref(),
             session_id,
@@ -444,76 +455,6 @@ impl TaskEngine {
             strict,
         )
         .await
-    }
-
-    pub async fn checkpointed_prior(
-        &self,
-        log: &EventLog<'_>,
-        session_id: &SessionId,
-        raw: &crate::RawTranscript,
-        workspace: Option<&dyn crate::ports::WorkspaceFacts>,
-        summarizer: &dyn crate::ContextSummarizer,
-        cancellation: &CancellationToken,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-    ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
-        let _ = cancellation;
-        let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
-        if leveler_context::estimate_tokens(&raw.messages) <= threshold {
-            return Ok(None);
-        }
-        // Cheap goal probe BEFORE any model call: a session with no goal
-        // keeps the pre-checkpoint path bit-for-bit (including exactly one
-        // summarization call, which mocks and cost accounting rely on).
-        let Some(task) = self.stores.tasks.task_for_session(session_id).await? else {
-            return Ok(None);
-        };
-        if self.stores.goals.for_task(&task).await?.is_empty() {
-            return Ok(None);
-        }
-        if let Some(prior) =
-            crate::checkpoint::resume_prior_from_checkpoint(&self.stores, session_id, raw).await?
-            && leveler_context::estimate_tokens(&prior) <= threshold
-        {
-            return Ok(Some(prior));
-        }
-        let summary = summarize_if_over(summarizer, &raw.messages).await;
-        match crate::checkpoint::create_goal_checkpoint(
-            &self.stores,
-            session_id,
-            leveler_lifecycle::CheckpointReason::ContextCompaction,
-            workspace,
-            crate::checkpoint::SemanticRecap::briefing(summary.as_deref()),
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                let event = crate::checkpoint::checkpoint_created_event(&record);
-                log.append(None, event, observer).await?;
-                // The checkpoint block, plus a bounded raw tail for local
-                // continuity — the same recency window the pre-P3 fold kept.
-                let tail_start = raw
-                    .messages
-                    .len()
-                    .saturating_sub(leveler_context::COMPACT_KEEP_RECENT);
-                let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
-                prior.push(leveler_model::Message {
-                    role: leveler_model::Role::User,
-                    content: vec![leveler_model::ContentPart::Text {
-                        text: record.payload.context_block(),
-                    }],
-                });
-                prior.extend_from_slice(&raw.messages[tail_start..]);
-                Ok(Some(prior))
-            }
-            Ok(None) => Ok(None),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "context-compaction checkpoint failed; using the pre-checkpoint fold"
-                );
-                Ok(None)
-            }
-        }
     }
 
     pub async fn record_recovery_skip(
@@ -563,8 +504,7 @@ pub async fn acknowledge_crash_window(
                 name: call.name.clone(),
                 is_error: true,
                 preview: "user-acknowledged crash recovery: the interrupted call's outcome \
-                          is unknown; the workspace was verified manually and the call was \
-                          not replayed"
+                          is unknown and the call was not replayed"
                     .to_string(),
                 agent_id: call.agent_id.clone(),
                 applied_diff: None,
@@ -861,18 +801,5 @@ mod multi_turn_session_tests {
             leveler_context::estimate_tokens(&out) < tokens || out.len() < raw.len(),
             "compacted transcript should shrink"
         );
-    }
-
-    #[test]
-    fn cumulative_rounds_do_not_reset_on_continue_merge() {
-        // Mirrors continue_active_goal: epoch totals grow, not reset.
-        let mut progress = leveler_lifecycle::ProgressLedger::default();
-        progress.accumulate_drive_rounds(5);
-        progress.accumulate_drive_rounds(3);
-        assert_eq!(progress.cumulative_rounds, 8);
-        // The engine's mechanical seed gate: a fresh turn whose harness reports
-        // a closed prior epoch does not seed. The domain answer ("is the prior
-        // epoch open?") is the harness's and arrives as a bool.
-        assert!(!crate::turn::should_seed_task_state(false, false));
     }
 }

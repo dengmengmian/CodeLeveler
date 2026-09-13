@@ -353,15 +353,10 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
     let recorded = runner
         .run_turn(
             TurnKind::Chat,
-            leveler_engine::SeedRequest::Fresh {
-                continues_active_goal: false,
-                prior_epoch_open: true,
-            },
-            Some(leveler_model::Message::text(
+            leveler_engine::TurnStart::Fresh(leveler_model::Message::text(
                 leveler_model::Role::User,
                 "test",
             )),
-            None,
             &mut |_| {},
             cancellation.clone(),
             |ports| {
@@ -374,6 +369,10 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
                             text: "add a function".into(),
                         }],
                     },
+                    true,
+                    h.session.clone(),
+                    stores.events.clone(),
+                    None,
                     ports,
                     cancellation.clone(),
                 )

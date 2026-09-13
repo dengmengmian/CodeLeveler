@@ -18,7 +18,7 @@ use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
 use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::TurnRepository;
+use leveler_storage::{TaskStore, TurnRepository};
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
@@ -265,6 +265,15 @@ async fn daemon_session_runtime_options_are_isolated_per_session() {
         })
         .await
         .unwrap();
+
+    let db = app.open_database().await.unwrap();
+    for session in [&first.session.id, &second.session.id] {
+        assert_eq!(
+            TaskStore::task_for_session(&db, session).await.unwrap(),
+            Some(leveler_core::TaskId::new(session.as_str())),
+            "daemon creation must return only after the engine has created its task"
+        );
+    }
 
     let first_after_second = client.snapshot(&first.session.id).await.unwrap();
     assert_eq!(
@@ -677,6 +686,13 @@ async fn session_menu_rename_archive_fork_roundtrip() {
         .expect("forked session listed");
     assert_eq!(fork.goal, "登录修复方案 (分叉)");
     let fork_id = SessionId::new(fork.id.clone());
+    assert!(
+        leveler_storage::TaskStore::task_for_session(&db, &fork_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "fork creates its task association atomically with the session"
+    );
     assert_eq!(
         messages.load(&fork_id).await.unwrap().len(),
         2,

@@ -9,9 +9,10 @@ use std::sync::Arc;
 use leveler_core::{OwnerEpoch, OwnershipToken, RuntimeId, SessionId, TaskId, TurnId};
 use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 use leveler_storage::{
-    Database, EventStore, MemoryEventStore, MemoryMessageStore, MemoryOwnershipState,
-    MemoryOwnershipStore, MemorySessionStore, MemoryTerminalStore, MemoryTurnStore, MessageStore,
-    OwnershipError, OwnershipStore, SessionRecord, SessionStore, TerminalStore, TurnStore,
+    Database, EventStore, GoalState, GoalStore, GoalTerminalUpdate, MemoryEventStore,
+    MemoryGoalStore, MemoryMessageStore, MemoryOwnershipState, MemoryOwnershipStore,
+    MemorySessionStore, MemoryTerminalStore, MemoryTurnStore, MessageStore, OwnershipError,
+    OwnershipStore, SessionRecord, SessionStore, TerminalStore, TurnStore,
 };
 
 struct Ports<'a> {
@@ -19,6 +20,7 @@ struct Ports<'a> {
     turns: &'a dyn TurnStore,
     messages: &'a dyn MessageStore,
     sessions: &'a dyn SessionStore,
+    goals: &'a dyn GoalStore,
     terminal: &'a dyn TerminalStore,
 }
 
@@ -215,6 +217,43 @@ async fn assert_fencing_contract(
             .await,
         "status update",
     );
+    assert_stale(
+        ports
+            .sessions
+            .start_execution_owned(
+                stale,
+                session,
+                "full_access",
+                true,
+                "parallel",
+                AgentState::Execute,
+                now(),
+            )
+            .await,
+        "execution start",
+    );
+    assert_eq!(
+        ports.sessions.execution(session).await.unwrap(),
+        Some(("assisted".into(), false, "direct".into(), None)),
+        "a stale execution start must change neither config nor lifecycle"
+    );
+    ports
+        .sessions
+        .start_execution_owned(
+            current,
+            session,
+            "full_access",
+            true,
+            "parallel",
+            AgentState::Execute,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ports.sessions.execution(session).await.unwrap(),
+        Some(("full_access".into(), true, "parallel".into(), None))
+    );
     ports
         .sessions
         .update_status_owned(
@@ -226,6 +265,33 @@ async fn assert_fencing_contract(
         )
         .await
         .unwrap();
+
+    let goal = ports
+        .goals
+        .open(current, "fenced goal", now())
+        .await
+        .unwrap();
+
+    // Every goal mutation is fenced, including the legacy granular write
+    // surface. These calls must remain unusable as a bypass around the
+    // Engine's atomic terminal commit.
+    assert_stale(
+        ports.goals.note_window(stale, &goal).await,
+        "goal window update",
+    );
+    assert_stale(
+        ports.goals.settle(stale, &goal, now()).await,
+        "goal settlement",
+    );
+    let unchanged_goal = ports.goals.get(&goal).await.unwrap().unwrap();
+    assert_eq!(unchanged_goal.windows_run, 0);
+    assert_eq!(unchanged_goal.state, GoalState::Running);
+
+    let goal_update = GoalTerminalUpdate {
+        goal_id: goal.clone(),
+        windows_delta: 1,
+        settle: true,
+    };
 
     // Scenario E: stale terminal commits roll back atomically — no event, no
     // projection mutation.
@@ -257,6 +323,7 @@ async fn assert_fencing_contract(
                 leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
+                Some(&goal_update),
                 now(),
             )
             .await,
@@ -273,6 +340,9 @@ async fn assert_fencing_contract(
     );
     let (_, _, _, outcome) = ports.sessions.execution(session).await.unwrap().unwrap();
     assert_eq!(outcome, None, "no outcome from a stale terminal attempt");
+    let unchanged_goal = ports.goals.get(&goal).await.unwrap().unwrap();
+    assert_eq!(unchanged_goal.windows_run, 0);
+    assert_eq!(unchanged_goal.state, GoalState::Running);
 
     // Scenario I (terminal): the current owner commits normally.
     ports
@@ -299,12 +369,16 @@ async fn assert_fencing_contract(
             leveler_lifecycle::VerificationStatus::NotRun,
             SessionStatus::Completed,
             AgentState::Complete,
+            Some(&goal_update),
             now(),
         )
         .await
         .unwrap();
     let (_, _, _, outcome) = ports.sessions.execution(session).await.unwrap().unwrap();
     assert_eq!(outcome, Some(TaskOutcome::Completed));
+    let finished_goal = ports.goals.get(&goal).await.unwrap().unwrap();
+    assert_eq!(finished_goal.windows_run, 1);
+    assert_eq!(finished_goal.state, GoalState::Settled);
 }
 
 #[tokio::test]
@@ -330,6 +404,7 @@ async fn sqlite_fenced_writes_honor_the_contract() {
             turns: &db,
             messages: &db,
             sessions: &db,
+            goals: &db,
             terminal: &db,
         },
         &session,
@@ -350,8 +425,10 @@ async fn memory_fenced_writes_honor_the_contract() {
     let sessions = Arc::new(MemorySessionStore::new().with_ownership(state.clone()));
     let turns = Arc::new(MemoryTurnStore::new().with_ownership(state.clone()));
     let events = Arc::new(MemoryEventStore::new().with_ownership(state.clone()));
+    let goals = Arc::new(MemoryGoalStore::new().with_ownership(state.clone()));
     let messages = MemoryMessageStore::new().with_ownership(state.clone());
     let terminal = MemoryTerminalStore::new(sessions.clone(), turns.clone(), events.clone())
+        .with_goals(goals.clone())
         .with_ownership(state.clone());
 
     let record = SessionRecord {
@@ -379,6 +456,7 @@ async fn memory_fenced_writes_honor_the_contract() {
             turns: turns.as_ref(),
             messages: &messages,
             sessions: sessions.as_ref(),
+            goals: goals.as_ref(),
             terminal: &terminal,
         },
         &session,

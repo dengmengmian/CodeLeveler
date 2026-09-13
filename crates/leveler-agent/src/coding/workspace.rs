@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use leveler_engine::WorkspaceFacts;
+use crate::coding::checkpoint::WorkspaceFacts;
 use leveler_lifecycle::CheckpointWorkspace;
 
 /// How many changed paths a checkpoint records before it stops listing.

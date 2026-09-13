@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::{SessionId, TurnId};
 use leveler_engine::{
-    DanglingCall, EngineError, EngineEvent, EventLog, ExecutionKind, SeedRequest, TaskEngine,
-    TaskOutcome, TurnKind, TurnRunner,
+    DanglingCall, EngineError, EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome,
+    TurnKind, TurnRunner,
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{
@@ -113,8 +113,8 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
 ///
 /// This is the harness's judgement over its own vocabulary: a finished epoch is
 /// a fully completed plan, or progress that reached Closing/Terminal. The
-/// engine never computes it — it receives the bool in
-/// `SeedRequest::Fresh::prior_epoch_open` and applies one mechanical rule.
+/// engine never computes it. Coding uses the answer when it decides whether
+/// the next fresh turn inherits its prior workflow state.
 ///
 /// Absence of prior state is OPEN, not closed: an empty epoch seeds harmlessly.
 pub(crate) fn prior_epoch_open(
@@ -150,6 +150,16 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
             (SessionStatus::Incomplete, AgentState::Execute)
         }
         S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
+    }
+}
+
+fn goal_owes_no_more_work(result: &Result<TaskReport, EngineError>) -> bool {
+    match result {
+        Ok(report) => matches!(
+            report.outcome,
+            TaskOutcome::Completed | TaskOutcome::Blocked | TaskOutcome::Failed
+        ),
+        Err(_) => false,
     }
 }
 
@@ -268,6 +278,159 @@ pub(crate) fn bound_goal_history(
     messages[messages.len() - max..].to_vec()
 }
 impl CodingRuntime {
+    async fn open_or_reuse_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        objective: &str,
+    ) -> Result<leveler_core::GoalId, EngineError> {
+        if let Some(goal) = self
+            .engine
+            .stores
+            .goals
+            .for_task(&token.task_id)
+            .await?
+            .into_iter()
+            .find(|goal| {
+                goal.state == leveler_storage::GoalState::Running && goal.objective == objective
+            })
+        {
+            return Ok(goal.id);
+        }
+        self.engine.open_goal(token, objective).await
+    }
+
+    async fn load_request_transcript(
+        &self,
+        session_id: &SessionId,
+        strict: Option<&str>,
+    ) -> Result<leveler_engine::RawTranscript, EngineError> {
+        let checkpoint_ordinal = crate::coding::checkpoint::checkpoint_transcript_ordinal(
+            &self.engine.stores,
+            session_id,
+        )
+        .await?;
+        self.engine
+            .load_request_transcript(session_id, checkpoint_ordinal, strict)
+            .await
+    }
+
+    async fn assembled_prior(
+        &self,
+        log: &EventLog<'_>,
+        session_id: &SessionId,
+        raw: leveler_engine::RawTranscript,
+        objective: Option<&str>,
+        workspace: Option<&dyn crate::coding::checkpoint::WorkspaceFacts>,
+        summarizer: &dyn leveler_engine::ContextSummarizer,
+        cancellation: &CancellationToken,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<Vec<leveler_model::Message>, EngineError> {
+        if let Some(prior) = self
+            .checkpointed_prior(
+                log,
+                session_id,
+                &raw,
+                workspace,
+                summarizer,
+                cancellation,
+                observer,
+            )
+            .await?
+        {
+            return Ok(prior);
+        }
+        let context = raw
+            .assemble(
+                log,
+                Some(summarizer),
+                objective,
+                leveler_context::PRE_REQUEST_COMPACT_THRESHOLD,
+            )
+            .await?;
+        if context.compacted {
+            log.append(None, context.snapshot_event(), observer).await?;
+        }
+        Ok(context.prior)
+    }
+
+    async fn checkpointed_prior(
+        &self,
+        log: &EventLog<'_>,
+        session_id: &SessionId,
+        raw: &leveler_engine::RawTranscript,
+        workspace: Option<&dyn crate::coding::checkpoint::WorkspaceFacts>,
+        summarizer: &dyn leveler_engine::ContextSummarizer,
+        _cancellation: &CancellationToken,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
+        let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
+        if leveler_context::estimate_tokens(&raw.messages) <= threshold {
+            return Ok(None);
+        }
+        let Some(task) = self
+            .engine
+            .stores
+            .tasks
+            .task_for_session(session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if self.engine.stores.goals.for_task(&task).await?.is_empty() {
+            return Ok(None);
+        }
+        if let Some(prior) = crate::coding::checkpoint::resume_prior_from_checkpoint(
+            &self.engine.stores,
+            session_id,
+            raw,
+        )
+        .await?
+            && leveler_context::estimate_tokens(&prior) <= threshold
+        {
+            return Ok(Some(prior));
+        }
+        let summary = summarizer.summarize(&raw.messages).await;
+        match crate::coding::checkpoint::create_goal_checkpoint(
+            &self.engine,
+            session_id,
+            leveler_lifecycle::CheckpointReason::ContextCompaction,
+            workspace,
+            crate::coding::checkpoint::SemanticRecap::briefing(summary.as_deref()),
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                log.append(
+                    None,
+                    crate::coding::checkpoint::checkpoint_created_event(&record),
+                    observer,
+                )
+                .await?;
+                let tail_start = raw
+                    .messages
+                    .len()
+                    .saturating_sub(leveler_context::COMPACT_KEEP_RECENT);
+                let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
+                prior.push(leveler_model::Message {
+                    role: leveler_model::Role::User,
+                    content: vec![leveler_model::ContentPart::Text {
+                        text: record.payload.context_block(),
+                    }],
+                });
+                prior.extend_from_slice(&raw.messages[tail_start..]);
+                Ok(Some(prior))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "context-compaction checkpoint failed; using the pre-checkpoint fold"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Load the session's prior Coding domain state and answer whether it is
     /// still open.
     ///
@@ -276,8 +439,8 @@ impl CodingRuntime {
     /// semantics — which is exactly what F9.1 moved out of the engine.
     async fn prior_epoch_open(&self, session_id: &SessionId) -> Result<bool, EngineError> {
         let events = self.engine.stores.events.as_ref();
-        let progress = leveler_engine::last_persisted_progress(events, session_id).await?;
-        let plan = leveler_engine::last_persisted_plan(events, session_id).await?;
+        let progress = crate::coding::turn::last_persisted_progress(events, session_id).await?;
+        let plan = crate::coding::turn::last_persisted_plan(events, session_id).await?;
         Ok(prior_epoch_open(plan.as_ref(), progress.as_ref()))
     }
 
@@ -305,6 +468,10 @@ impl CodingRuntime {
                 mode: mode_str(spec.coding.mode).to_string(),
                 sandbox: spec.coding.sandbox,
                 kind: spec.runtime.kind,
+                axes: Some(leveler_engine::NewSessionAxes {
+                    collaboration: "goal".to_string(),
+                    work_profile: "balanced".to_string(),
+                }),
             })
             .await
     }
@@ -325,6 +492,7 @@ impl CodingRuntime {
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         result: &Result<TaskReport, EngineError>,
+        goal: Option<&leveler_core::GoalId>,
         repo: Option<&std::path::Path>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
@@ -369,6 +537,11 @@ impl CodingRuntime {
                 );
             }
         }
+        let goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
+            goal_id: goal_id.clone(),
+            windows_delta: result.as_ref().map(|report| report.windows).unwrap_or(1),
+            settle: goal_owes_no_more_work(result),
+        });
         let settled = match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
@@ -376,13 +549,16 @@ impl CodingRuntime {
                     .finish_task(
                         token,
                         session_id,
-                        report.outcome,
-                        report.verification_status,
-                        (report.outcome != TaskOutcome::Completed)
-                            .then(|| report.final_text.clone()),
-                        Some(report.stop_reason),
-                        status,
-                        state,
+                        leveler_engine::TaskTerminal {
+                            outcome: report.outcome,
+                            verification: report.verification_status,
+                            reason: (report.outcome != TaskOutcome::Completed)
+                                .then(|| report.final_text.clone()),
+                            stop: Some(report.stop_reason),
+                            status,
+                            state,
+                            goal: goal_update,
+                        },
                         observer,
                     )
                     .await
@@ -392,12 +568,15 @@ impl CodingRuntime {
                     .finish_task(
                         token,
                         session_id,
-                        TaskOutcome::Interrupted,
-                        VerificationStatus::NotRun,
-                        None,
-                        None,
-                        SessionStatus::Interrupted,
-                        AgentState::Execute,
+                        leveler_engine::TaskTerminal {
+                            outcome: TaskOutcome::Interrupted,
+                            verification: VerificationStatus::NotRun,
+                            reason: None,
+                            stop: None,
+                            status: SessionStatus::Interrupted,
+                            state: AgentState::Execute,
+                            goal: goal_update,
+                        },
                         observer,
                     )
                     .await
@@ -407,12 +586,15 @@ impl CodingRuntime {
                     .finish_task(
                         token,
                         session_id,
-                        TaskOutcome::Failed,
-                        VerificationStatus::NotRun,
-                        Some(error.to_string()),
-                        None,
-                        SessionStatus::Failed,
-                        AgentState::Failed,
+                        leveler_engine::TaskTerminal {
+                            outcome: TaskOutcome::Failed,
+                            verification: VerificationStatus::NotRun,
+                            reason: Some(error.to_string()),
+                            stop: None,
+                            status: SessionStatus::Failed,
+                            state: AgentState::Failed,
+                            goal: goal_update,
+                        },
                         observer,
                     )
                     .await
@@ -424,13 +606,13 @@ impl CodingRuntime {
         // includes it). Best-effort: a failed checkpoint never un-settles a
         // committed terminal.
         if settled.is_ok() && goal_continues {
-            match leveler_engine::create_goal_checkpoint(
-                &self.engine.stores,
+            match crate::coding::checkpoint::create_goal_checkpoint(
+                &self.engine,
                 session_id,
                 leveler_lifecycle::CheckpointReason::Milestone,
                 repo.map(GitWorkspace::new)
                     .as_ref()
-                    .map(|w| w as &dyn leveler_engine::WorkspaceFacts),
+                    .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
                 None,
             )
             .await
@@ -441,7 +623,7 @@ impl CodingRuntime {
                         session_id.clone(),
                         token.clone(),
                     );
-                    let event = leveler_engine::checkpoint_created_event(&record);
+                    let event = crate::coding::checkpoint::checkpoint_created_event(&record);
                     if let Err(error) = log.append(None, event, observer).await {
                         tracing::warn!(
                             %error,
@@ -468,7 +650,34 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        let token = self.engine.mark_running(session_id).await?;
+        let token = self
+            .engine
+            .start_task(
+                session_id,
+                AgentState::Execute,
+                &leveler_engine::TaskExecution {
+                    mode: mode_str(spec.coding.mode).to_string(),
+                    sandbox: spec.coding.sandbox,
+                    kind: spec.runtime.kind,
+                },
+            )
+            .await?;
+        let goal = match self.open_or_reuse_goal(&token, &spec.runtime.goal).await {
+            Ok(goal) => goal,
+            Err(error) => {
+                let result = Err(error);
+                self.finish_from_result(
+                    &token,
+                    session_id,
+                    &result,
+                    None,
+                    Some(&spec.coding.repository),
+                    observer,
+                )
+                .await?;
+                return result;
+            }
+        };
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
@@ -538,6 +747,7 @@ impl CodingRuntime {
             &token,
             session_id,
             &result,
+            Some(&goal),
             Some(&spec.coding.repository),
             observer,
         )
@@ -584,11 +794,19 @@ impl CodingRuntime {
         };
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
-        let raw = self
+        let raw = self.load_request_transcript(session_id, None).await?;
+        let token = self
             .engine
-            .load_request_transcript(session_id, None)
+            .start_task(
+                session_id,
+                AgentState::Execute,
+                &leveler_engine::TaskExecution {
+                    mode: mode_str(spec.coding.mode).to_string(),
+                    sandbox: spec.coding.sandbox,
+                    kind: spec.runtime.kind,
+                },
+            )
             .await?;
-        let token = self.engine.mark_running(session_id).await?;
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
@@ -613,7 +831,6 @@ impl CodingRuntime {
             })
             .next();
         let prior = self
-            .engine
             .assembled_prior(
                 &log,
                 session_id,
@@ -643,12 +860,7 @@ impl CodingRuntime {
             let recorded = runner
                 .run_turn(
                     TurnKind::Chat,
-                    SeedRequest::Fresh {
-                        continues_active_goal: false,
-                        prior_epoch_open,
-                    },
-                    Some(initiating_message),
-                    Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
+                    leveler_engine::TurnStart::Fresh(initiating_message),
                     observer,
                     cancellation.clone(),
                     |ports| {
@@ -656,6 +868,13 @@ impl CodingRuntime {
                             &self.factory,
                             chat_profile(spec),
                             TurnInput::Content { prior, content },
+                            prior_epoch_open,
+                            session_id.clone(),
+                            self.engine.stores.events.clone(),
+                            Some(crate::coding::checkpoint::CodingCheckpointContext::new(
+                                self.engine.clone(),
+                                Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                            )),
                             ports,
                             cancellation.clone(),
                         )
@@ -677,6 +896,7 @@ impl CodingRuntime {
             &token,
             session_id,
             &result,
+            None,
             Some(&spec.coding.repository),
             observer,
         )
@@ -702,14 +922,12 @@ impl CodingRuntime {
             .execution(session_id)
             .await?
             .ok_or_else(|| EngineError::Config(format!("no session {session_id}")))?;
-        // A parallel multi-agent PARENT session is written by
-        // `leveler-app::parallel`, not run by the engine: it has no transcript
-        // and is not resumable here. Refuse it by its kind, rather than relying
-        // on its transcript happening to be empty (§18.11).
+        // A parallel multi-agent parent has no direct Coding transcript or
+        // continuation strategy. Refuse it by its kind rather than relying on
+        // its transcript happening to be empty.
         if kind == ExecutionKind::Parallel.as_str() {
             return Err(EngineError::Config(format!(
-                "session {session_id} is a parallel parent session; \
-                 its lifecycle is owned by the launcher and it is not resumable"
+                "session {session_id} is a parallel parent session and is not resumable"
             )));
         }
         if kind != spec.runtime.kind.as_str() {
@@ -725,7 +943,6 @@ impl CodingRuntime {
             )));
         }
         let raw = self
-            .engine
             .load_request_transcript(session_id, Some("transcript"))
             .await?;
         if raw.is_empty() {
@@ -734,7 +951,26 @@ impl CodingRuntime {
                  for interactive chat reopen with: leveler tui --session {session_id}"
             )));
         }
-        let token = self.engine.mark_running(session_id).await?;
+        let token = self
+            .engine
+            .mark_running(session_id, AgentState::Execute)
+            .await?;
+        let goal = match self.open_or_reuse_goal(&token, &spec.runtime.goal).await {
+            Ok(goal) => goal,
+            Err(error) => {
+                let result = Err(error);
+                self.finish_from_result(
+                    &token,
+                    session_id,
+                    &result,
+                    None,
+                    Some(&spec.coding.repository),
+                    observer,
+                )
+                .await?;
+                return result;
+            }
+        };
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
@@ -748,7 +984,6 @@ impl CodingRuntime {
         // Same rules as chat: a checkpoint's block when one is fresh, else the
         // snapshot merged with the post-snapshot rows, folded if still oversized.
         let prior = self
-            .engine
             .assembled_prior(
                 &log,
                 session_id,
@@ -783,6 +1018,7 @@ impl CodingRuntime {
             &token,
             session_id,
             &result,
+            Some(&goal),
             Some(&spec.coding.repository),
             observer,
         )
@@ -935,9 +1171,7 @@ impl CodingRuntime {
         let recorded = runner
             .run_turn(
                 TurnKind::User,
-                SeedRequest::Resume,
-                None,
-                Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
+                leveler_engine::TurnStart::Resume,
                 observer,
                 cancellation.clone(),
                 |ports| {
@@ -945,6 +1179,13 @@ impl CodingRuntime {
                         &self.factory,
                         goal_profile(spec),
                         TurnInput::Resume(prior),
+                        true,
+                        runner.session_id.clone(),
+                        self.engine.stores.events.clone(),
+                        Some(crate::coding::checkpoint::CodingCheckpointContext::new(
+                            self.engine.clone(),
+                            Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                        )),
                         ports,
                         cancellation.clone(),
                     )
@@ -980,12 +1221,10 @@ impl CodingRuntime {
         let recorded = runner
             .run_turn(
                 TurnKind::User,
-                SeedRequest::Fresh {
-                    continues_active_goal: false,
-                    prior_epoch_open,
-                },
-                Some(Message::text(Role::User, spec.runtime.goal.clone())),
-                Some(Arc::new(GitWorkspace::new(&spec.coding.repository)) as Arc<_>),
+                leveler_engine::TurnStart::Fresh(Message::text(
+                    Role::User,
+                    spec.runtime.goal.clone(),
+                )),
                 observer,
                 cancellation.clone(),
                 |ports| {
@@ -996,6 +1235,13 @@ impl CodingRuntime {
                             goal: spec.runtime.goal.clone(),
                             prior,
                         },
+                        prior_epoch_open,
+                        runner.session_id.clone(),
+                        self.engine.stores.events.clone(),
+                        Some(crate::coding::checkpoint::CodingCheckpointContext::new(
+                            self.engine.clone(),
+                            Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                        )),
                         ports,
                         cancellation.clone(),
                     )
@@ -1021,10 +1267,7 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
-        let raw = self
-            .engine
-            .load_request_transcript(session_id, None)
-            .await?;
+        let raw = self.load_request_transcript(session_id, None).await?;
         if raw.is_empty() {
             return Ok(Vec::new());
         }
@@ -1033,14 +1276,13 @@ impl CodingRuntime {
         // continues from a durable checkpoint (fresh or cut here) instead of
         // a blunt last-N tail of replayed history.
         if let Some(prior) = self
-            .engine
             .checkpointed_prior(
                 log,
                 session_id,
                 &raw,
                 repo.map(GitWorkspace::new)
                     .as_ref()
-                    .map(|w| w as &dyn leveler_engine::WorkspaceFacts),
+                    .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
                 &self.context_summarizer(cancellation),
                 cancellation,
                 observer,
@@ -1328,7 +1570,7 @@ impl CodingRuntime {
         if report.checks.is_empty() {
             return Ok(());
         }
-        let Ok(Some(mut ledger)) = leveler_engine::last_persisted_ledger(
+        let Ok(Some(mut ledger)) = crate::coding::turn::last_persisted_ledger(
             runner.stores.events.as_ref(),
             &runner.session_id,
         )
@@ -1477,10 +1719,12 @@ pub(crate) async fn run_review(
     // and commands fold in from its ledger, and its TOKENS AND COST fold in
     // from the very records being written down here — the same authority
     // the bill reconciles against, never a second summary of it.
-    let mut progress =
-        leveler_engine::last_persisted_progress(runner.stores.events.as_ref(), &runner.session_id)
-            .await?
-            .unwrap_or_default();
+    let mut progress = crate::coding::turn::last_persisted_progress(
+        runner.stores.events.as_ref(),
+        &runner.session_id,
+    )
+    .await?
+    .unwrap_or_default();
     for record in &child_records {
         runner
             .stores
@@ -1510,7 +1754,7 @@ pub(crate) async fn run_review(
     // that ran — the data was there, one block too deep.
     let mut adopted_ledger: Option<leveler_lifecycle::EvidenceLedger> = None;
     if !result.findings.is_empty() {
-        let mut ledger = leveler_engine::last_persisted_ledger(
+        let mut ledger = crate::coding::turn::last_persisted_ledger(
             runner.stores.events.as_ref(),
             &runner.session_id,
         )

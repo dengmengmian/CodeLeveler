@@ -29,8 +29,8 @@ pub use child_profile::child_profile_trace;
 pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
-    AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome, ContinuationPolicy,
-    Executor, NoopSink, SteeringSource, StepLimits, SubAgentExecutionPolicies,
+    AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome, CompactionCheckpoint,
+    ContinuationPolicy, Executor, NoopSink, SteeringSource, StepLimits, SubAgentExecutionPolicies,
     SubAgentExecutionPolicy, TurnPolicy, closeout,
 };
 pub use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
@@ -39,8 +39,8 @@ pub use leveler_context::{
     estimate_tokens, summarize_with_model,
 };
 pub use leveler_engine::{
-    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, ModelCallKind,
-    ModelRequestRecord, PortError, TranscriptSink,
+    ChildToolEvent, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError,
+    TranscriptSink,
 };
 pub use leveler_execution::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
 pub use leveler_lifecycle::{

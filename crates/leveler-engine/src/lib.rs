@@ -9,7 +9,6 @@
 //! anything else.
 #![forbid(unsafe_code)]
 
-mod checkpoint;
 mod engine;
 mod event;
 mod log;
@@ -20,29 +19,29 @@ mod session_context;
 mod turn;
 pub mod window;
 
-pub use engine::{NewSession, TaskEngine, acknowledge_crash_window, budget_prior_messages};
+pub use engine::{
+    NewSession, NewSessionAxes, TaskEngine, TaskExecution, TaskTerminal, acknowledge_crash_window,
+    budget_prior_messages,
+};
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
     PublicTurnKind, TurnKind,
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
-pub use checkpoint::{
-    ProjectedCheckpoint, SemanticRecap, checkpoint_created_event, create_goal_checkpoint,
-    project_goal_checkpoint, resume_prior_from_checkpoint,
-};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{DanglingCall, EventLog, FinishedChildFact, SnapshotView};
 pub use ports::{
-    ChildToolEvent, CompactionCheckpoint, EventBarrier, ExecutionFence, LostChild, LostChildNote,
-    LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, TranscriptSink, WorkspaceFacts,
+    ChildToolEvent, EventBarrier, ExecutionFence, LostChild, LostChildNote, LostChildVoice,
+    ModelCallKind, ModelRequestRecord, PortError, TranscriptSink,
 };
-pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
+pub use reaper::{
+    ReapConflict, ReapOutcome, ReapedSession, reap_after_restart, reap_running_turns_owned,
+};
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{
-    SeedRequest, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner, TurnSeeds,
-    TurnSink, last_persisted_ledger, last_persisted_plan, last_persisted_progress,
+    TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner, TurnSink, TurnStart,
     storage_model_request,
 };
 
@@ -99,7 +98,7 @@ pub enum EngineError {
         turn_id: String,
     },
     #[error(
-        "recovery requires manual confirmation: tool `{tool}` (call `{call_id}`) may have already produced a side effect; inspect the workspace before retrying"
+        "recovery requires manual confirmation: tool `{tool}` (call `{call_id}`) may have already produced a side effect; reconcile the unknown result before retrying"
     )]
     RecoveryConfirmationRequired { call_id: String, tool: String },
     /// A fenced write or acquisition found this runtime's token stale. The
