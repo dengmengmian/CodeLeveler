@@ -194,3 +194,24 @@ would settle it, each a user decision:
 Versioning: none of this warrants a release tag; if a beta is cut for the
 runtime and UX fixes, `0.2.0-beta.3` fits the change (no new user-facing
 contract beyond typed child facts and `CancelChild`).
+
+## Addendum — MA4-B (2026-09-14)
+
+The original MA4 FAIL above stands. MA4-B
+(`docs/MULTI_AGENT_WORKLOAD_THRESHOLD_VALIDATION.md`) held the model fixed
+and varied workload size from one function to eight independent packages
+(39 runs, stopped early by user decision). Delegation adoption followed size
+(none on tiny/small work, about two thirds above), parallel time saved
+exceeded coordination overhead from three independent units up, and every
+runtime truth and ownership counter stayed zero — but no size showed a
+stable, repeated benefit: medium work had a latency and cost signal that
+could not be attributed to delegation, large work was high-variance, and at
+the largest size delegated runs were less correct and bounded by the
+100-round turn ceiling.
+
+```text
+MA4B_WORKLOAD_THRESHOLD=FAIL
+MULTI_AGENT_PRODUCT_VALUE=NOT_PROVEN
+MULTI_AGENT_PRODUCT_CLOSURE=BLOCKED
+DEFAULT_MULTI_AGENT_POLICY=delegation stays available and model-chosen; not forced, not advertised as a benefit
+```
