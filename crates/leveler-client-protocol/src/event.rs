@@ -34,15 +34,6 @@ pub enum NotificationLevel {
     Warning,
     Error,
 }
-/// What one child contributed, as counts plus its capability contract.
-///
-/// A flat mirror of the runtime's projection rather than the runtime type
-/// itself: this crate is the stable wire, so an internal refactor of the
-/// ledger must not change what clients parse.
-///
-/// `findings_total` is a count, not a score: it says how much this child
-/// reported, never whether any of it mattered. What the parent did about it
-/// is in the transcript, where the parent said it.
 /// The four-way reading of a settled child's result. "Finished with nothing
 /// to flag" and "stopped with nothing to show" are opposite facts; a client
 /// renders them from this field, never from the summary text.
@@ -69,6 +60,15 @@ pub enum ChildStop {
     Lost,
 }
 
+/// What one child contributed, as counts plus its capability contract.
+///
+/// A flat mirror of the runtime's projection rather than the runtime type
+/// itself: this crate is the stable wire, so an internal refactor of the
+/// ledger must not change what clients parse.
+///
+/// `findings_total` is a count, not a score: it says how much this child
+/// reported, never whether any of it mattered. What the parent did about it
+/// is in the transcript, where the parent said it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChildContribution {
