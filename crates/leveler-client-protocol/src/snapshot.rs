@@ -112,6 +112,7 @@ mod tests {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         };
         // Unset axes stay off the wire (old-client compatibility).
         let value = serde_json::to_value(&snap).unwrap();
@@ -153,6 +154,7 @@ mod tests {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         };
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("reasoning").is_none(), "{value}");
@@ -183,6 +185,21 @@ pub struct UiMessage {
     /// and old runtimes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<u64>,
+    /// What kind of message this is when its role alone would mislead.
+    /// `None` is an ordinary message of its role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<UiMessageKind>,
+}
+
+/// A message whose role does not say who wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiMessageKind {
+    /// Written by the runtime into the model's context as a user-role turn —
+    /// a child's settlement, a lost or resumed delegation — not typed by the
+    /// user. Render it as a runtime notice, never as user input.
+    RuntimeNotice,
 }
 
 /// The runtime's self-description, served to clients for identity
@@ -383,6 +400,10 @@ pub struct UiSessionSnapshot {
     /// (plan) from this value, so clients must not invent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration: Option<String>,
+    /// Every delegated child of this session, oldest first, from the durable
+    /// record. Additive: absent on old runtimes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::UiChildAgent>,
 }
 
 /// Additive reasoning projection. The client must display `effective` and

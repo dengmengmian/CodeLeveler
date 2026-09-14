@@ -137,6 +137,7 @@ impl InteractiveRuntimeClient for FakeRuntime {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         })
     }
 }

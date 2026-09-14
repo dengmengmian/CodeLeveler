@@ -91,6 +91,7 @@ impl InteractiveRuntimeClient for RecordingRuntime {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         })
     }
 }

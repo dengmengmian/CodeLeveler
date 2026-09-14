@@ -104,7 +104,7 @@ pub struct EventBridge {
 }
 
 /// The wire spelling of the runtime's four-way child reading.
-fn project_child_outcome(
+pub(crate) fn project_child_outcome(
     outcome: leveler_lifecycle::ChildStatus,
 ) -> leveler_client_protocol::ChildOutcome {
     use leveler_client_protocol::ChildOutcome as Wire;
@@ -118,7 +118,9 @@ fn project_child_outcome(
 }
 
 /// The wire spelling of how a child's activation ended.
-fn project_child_stop(stop: leveler_lifecycle::ChildStop) -> leveler_client_protocol::ChildStop {
+pub(crate) fn project_child_stop(
+    stop: leveler_lifecycle::ChildStop,
+) -> leveler_client_protocol::ChildStop {
     use leveler_client_protocol::ChildStop as Wire;
     use leveler_lifecycle::ChildStop;
     match stop {
@@ -560,11 +562,12 @@ impl EventBridge {
                 profile_id,
                 profile_role,
                 read_only,
-                spec: _,
+                spec,
             } => {
                 // The capability contract travels with the child so the UI can
                 // state what it was allowed to do rather than implying it.
                 self.child_roles.insert(id.clone(), role.clone());
+                let spec = spec.unwrap_or_default();
                 let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
                     id,
                     nickname,
@@ -578,6 +581,8 @@ impl EventBridge {
                     contribution: None,
                     outcome: None,
                     stop: None,
+                    background: spec.background,
+                    scope: spec.files,
                 });
             }
             EngineEvent::SubAgentProgress {
@@ -630,16 +635,29 @@ impl EventBridge {
                     contribution: projected,
                     outcome: outcome.map(project_child_outcome),
                     stop: stop.map(project_child_stop),
+                    background: false,
+                    scope: Vec::new(),
                 });
             }
             // A child's own transcript is its durable session, not a live
             // client fact: clients see the child through its lifecycle and
             // activity events, never its raw context.
             EngineEvent::SubAgentTranscriptAppended { .. } => {}
-            // Written at a window boundary (the reaper, a turn start), never
-            // while a client is watching the child run. Presentation of an
-            // interrupted or resumed child is MA3's client state model.
-            EngineEvent::SubAgentInterrupted { .. } | EngineEvent::SubAgentResumed { .. } => {}
+            // Written at a window boundary (the reaper, a turn start). A client
+            // already holding the child moves it; one that just connected
+            // reads the same state from the snapshot's children.
+            EngineEvent::SubAgentInterrupted { id } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentStateChanged {
+                    id,
+                    state: leveler_client_protocol::UiChildState::Interrupted,
+                });
+            }
+            EngineEvent::SubAgentResumed { id, .. } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentStateChanged {
+                    id,
+                    state: leveler_client_protocol::UiChildState::Running,
+                });
+            }
             EngineEvent::SubAgentActivity {
                 id,
                 phase,
@@ -1704,6 +1722,62 @@ mod projection_equivalence {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// A child's background flag and scope reach the client at start, and an
+    /// interruption or resume reaches it as a state change — a client must not
+    /// keep drawing a dead activation as running.
+    #[test]
+    fn a_child_start_and_its_lifecycle_moves_reach_the_client() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            role: "worker".into(),
+            task: "write".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                files: vec!["src/a.rs".into()],
+                background: true,
+                ..Default::default()
+            }),
+        });
+        match rx.try_recv().expect("start") {
+            RuntimeEvent::SubAgentUpdated {
+                background, scope, ..
+            } => {
+                assert!(background);
+                assert_eq!(scope, vec!["src/a.rs".to_string()]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        bridge.forward(EngineEvent::SubAgentInterrupted { id: "a1".into() });
+        bridge.forward(EngineEvent::SubAgentResumed {
+            id: "a1".into(),
+            attempt: 1,
+        });
+        let states: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                RuntimeEvent::SubAgentStateChanged { id, state } => (id, state),
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "a1".to_string(),
+                    leveler_client_protocol::UiChildState::Interrupted
+                ),
+                (
+                    "a1".to_string(),
+                    leveler_client_protocol::UiChildState::Running
+                ),
+            ]
+        );
     }
 
     /// `None` means the runtime did not measure this child. It must stay

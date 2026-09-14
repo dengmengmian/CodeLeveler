@@ -210,6 +210,7 @@ mod tests {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         };
         let json =
             serde_json::to_string(&DownstreamMessage::Snapshot { session: snapshot }).unwrap();

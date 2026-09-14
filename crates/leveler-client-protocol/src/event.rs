@@ -69,6 +69,62 @@ pub enum ChildStop {
 /// `findings_total` is a count, not a score: it says how much this child
 /// reported, never whether any of it mattered. What the parent did about it
 /// is in the transcript, where the parent said it.
+/// Where a delegated child's lifecycle stands, as the runtime records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiChildState {
+    /// An activation is live.
+    Running,
+    /// Its activation died with a runtime window; the next turn of the session
+    /// continues it or settles it as lost.
+    Interrupted,
+    /// It has its one terminal.
+    Settled,
+}
+
+/// One delegated child, projected from the durable record — what a client
+/// that reconnects, or opens a session, renders without having seen a single
+/// live event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiChildAgent {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    /// What it was asked to do.
+    pub purpose: String,
+    pub state: UiChildState,
+    /// Whether its parent continued while it ran.
+    #[serde(default)]
+    pub background: bool,
+    /// Exclusive write scope fixed at spawn (empty when late-bound or read-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+    /// How many times it was continued after an interruption.
+    #[serde(default)]
+    pub resumes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ChildOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<ChildStop>,
+    /// The recorded settlement summary, once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Model usage recorded under this child's id.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// `None` when no call carried a price — unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChildContribution {
@@ -296,7 +352,18 @@ pub enum RuntimeEvent {
         /// How the activation ended, once done.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<ChildStop>,
+        /// Whether the parent continues while this child runs.
+        #[serde(default)]
+        background: bool,
+        /// Exclusive write scope fixed at spawn (empty when late-bound or
+        /// read-only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scope: Vec<String>,
     },
+    /// A child's lifecycle moved without a start or a terminal: its activation
+    /// died with a runtime window (`interrupted`) or a new one began under the
+    /// same id (`running`). Clients update the child they already hold.
+    SubAgentStateChanged { id: String, state: UiChildState },
     /// Live execution state and cumulative model usage for one spawned agent.
     SubAgentProgress {
         id: String,
@@ -486,6 +553,7 @@ mod tests {
                 role: UiRole::User,
                 text: "hi".to_string(),
                 ordinal: None,
+                kind: None,
             }],
             pending_interactions: vec![],
             available_models: vec![ModelRef::new("openai", "gpt-4o-mini")],
@@ -502,6 +570,7 @@ mod tests {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         }
     }
 
@@ -713,6 +782,7 @@ mod tests {
                     role: UiRole::User,
                     text: "hello".to_string(),
                     ordinal: None,
+                    kind: None,
                 },
             },
             "user_message_added",

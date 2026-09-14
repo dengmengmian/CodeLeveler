@@ -58,6 +58,7 @@ fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     }
 }
 

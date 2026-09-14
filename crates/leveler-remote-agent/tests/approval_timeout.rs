@@ -87,6 +87,7 @@ impl InteractiveRuntimeClient for WatchedRuntime {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         })
     }
 }

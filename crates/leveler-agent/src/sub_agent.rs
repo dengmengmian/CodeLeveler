@@ -36,6 +36,17 @@ pub fn multi_agent_steer_hint() -> String {
         .to_string()
 }
 
+/// First lines of every notice the runtime writes into a parent's transcript
+/// as a user-role message. The runtime authored these words, so it is the one
+/// place that can tell a client "this is a notice, not the user" — clients
+/// must never infer that from the text themselves.
+pub const RUNTIME_NOTICE_HEADERS: &[&str] = &[
+    "## Background sub-agent settled",
+    "## Sub-agent results re-delivered after restart",
+    "## Sub-agents resumed after restart",
+    "## Delegations lost at restart",
+];
+
 /// The settlement notice injected into the parent's context when a BACKGROUND
 /// child finishes. Runtime-owned and unconditional (a child killed by its
 /// budget is exactly the child that never got to report); `result_for_parent`
@@ -414,6 +425,38 @@ mod tests {
         assert!(should_inject_delegation_hint(true, 0));
         assert!(!should_inject_delegation_hint(true, 1));
         assert!(!should_inject_delegation_hint(false, 0));
+    }
+
+    /// Every notice the runtime writes into a parent transcript opens with a
+    /// header the client classifier knows; a new notice that forgot to
+    /// register would render as something the user typed.
+    #[test]
+    fn every_runtime_notice_opens_with_a_registered_header() {
+        let settled = SettledChildNotice {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            ok: true,
+            summary: "done".into(),
+        };
+        for note in [
+            settlement_notice("Euclid", "c1", AgentRole::Explorer, &[], "result"),
+            settled_children_redelivery_note(&[settled]),
+            lost_children_note(&["c1|Euclid|explorer|".to_string()]),
+            resumed_children_note(&[ResumableChild {
+                id: "c2".into(),
+                nickname: "Newton".into(),
+                role: AgentRole::Explorer,
+                spec: leveler_lifecycle::ChildSpawnSpec::default(),
+                prior: Vec::new(),
+                note: leveler_model::Message::text(leveler_model::Role::User, "note"),
+            }]),
+        ] {
+            assert!(
+                RUNTIME_NOTICE_HEADERS.iter().any(|h| note.starts_with(h)),
+                "{note}"
+            );
+        }
     }
 
     /// Restart notes are prose a model reads. A mangled line continuation

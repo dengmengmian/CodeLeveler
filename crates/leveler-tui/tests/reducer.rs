@@ -108,6 +108,7 @@ fn snapshot() -> UiSessionSnapshot {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     }
 }
 
@@ -265,6 +266,7 @@ fn user_message_added_appends_user_block() {
                 role: UiRole::User,
                 text: "hi".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -811,6 +813,7 @@ fn runtime_user_echo_does_not_duplicate_local_echo() {
                 role: UiRole::User,
                 text: "fix bug".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -1768,6 +1771,7 @@ fn slash_clear_empties_transcript() {
                 role: UiRole::User,
                 text: "hi".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -2054,6 +2058,7 @@ fn compaction_summary_renders_as_summary_not_user_message() {
         role: UiRole::User,
         text: format!("{COMPACTION_SUMMARY_PREFIX}：\n## Briefing\n做了一些事"),
         ordinal: None,
+        kind: None,
     }];
     reduce(
         &mut s,
@@ -2114,6 +2119,8 @@ fn turn_end_finalizes_in_flight_blocks() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
 
@@ -2225,6 +2232,8 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         })
     };
     reduce(&mut s, running("step 1"));
@@ -2255,6 +2264,8 @@ fn sub_agent_finish_before_start_still_renders() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     let blocks = sub_agents(&s);
@@ -2285,6 +2296,8 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     let running = sub_agents(&s);
@@ -2309,6 +2322,8 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     let done = sub_agents(&s);
@@ -2430,6 +2445,7 @@ fn open_session_rebuilds_transcript() {
                 role: UiRole::User,
                 text: "old".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -2440,6 +2456,7 @@ fn open_session_rebuilds_transcript() {
         role: UiRole::User,
         text: "loaded".into(),
         ordinal: None,
+        kind: None,
     }];
     reduce(
         &mut s,
@@ -5703,6 +5720,8 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     let steps = &s.plan.as_ref().unwrap().steps;
@@ -5749,6 +5768,8 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     reduce(&mut s, plan(P::Done, P::Running));
@@ -6019,18 +6040,21 @@ fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
             role: UiRole::User,
             text: "第一问".to_string(),
             ordinal: Some(0),
+            kind: None,
         },
         UiMessage {
             id: MessageId::new("m1"),
             role: UiRole::Assistant,
             text: "第一答".to_string(),
             ordinal: Some(1),
+            kind: None,
         },
         UiMessage {
             id: MessageId::new("m2"),
             role: UiRole::User,
             text: "第二问".to_string(),
             ordinal: Some(2),
+            kind: None,
         },
     ];
     snap.recaps = vec![goal_recap("cp-mid", Some(2))];
@@ -6342,6 +6366,7 @@ fn a_long_turn_shows_bounded_prose_between_tools_and_one_full_answer() {
                 role: UiRole::User,
                 text: "优化一下 PaymentRecords".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -6397,18 +6422,21 @@ fn a_replayed_session_still_shows_each_turns_answer_in_full() {
             role: UiRole::User,
             text: "优化一下".into(),
             ordinal: Some(1),
+            kind: None,
         },
         UiMessage {
             id: MessageId::new("m1"),
             role: UiRole::Assistant,
             text: long,
             ordinal: Some(2),
+            kind: None,
         },
         UiMessage {
             id: MessageId::new("m2"),
             role: UiRole::Assistant,
             text: answer.into(),
             ordinal: Some(3),
+            kind: None,
         },
     ];
     reduce(

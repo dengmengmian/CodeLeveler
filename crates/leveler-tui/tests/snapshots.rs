@@ -56,6 +56,7 @@ fn opened_state() -> AppState {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     };
     reduce(
         &mut s,
@@ -1069,6 +1070,7 @@ fn a_short_conversation_sits_against_the_composer() {
                 role: UiRole::User,
                 text: "改个字".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -1119,6 +1121,7 @@ fn a_silent_tool_group_leaves_no_hole() {
                 role: UiRole::User,
                 text: "看看有多少文件".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -1191,6 +1194,7 @@ fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
                     role: UiRole::User,
                     text: "问题".into(),
                     ordinal: None,
+                    kind: None,
                 },
             }),
         );
@@ -1230,6 +1234,7 @@ fn no_rendered_line_exceeds_the_terminal_width() {
                 // No spaces: a naive wrapper has nowhere to break.
                 text: "验证一个非常长的不带空格的中文串".repeat(6),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -1259,6 +1264,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 role: UiRole::User,
                 text: "推一下代码".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );

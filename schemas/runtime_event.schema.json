@@ -913,6 +913,11 @@
         "type"
       ],
       "properties": {
+        "background": {
+          "description": "Whether the parent continues while this child runs.",
+          "default": false,
+          "type": "boolean"
+        },
         "contribution": {
           "description": "What the parent did with what this child found, once it finished.\n\n`None` means NOT MEASURED — the runtime produced no projection — and must never be rendered as a zero. A child that reported nothing arrives as `Some` with zero counts, which is a different fact and reads differently to the user.",
           "anyOf": [
@@ -974,6 +979,13 @@
         "role": {
           "type": "string"
         },
+        "scope": {
+          "description": "Exclusive write scope fixed at spawn (empty when late-bound or read-only).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "stop": {
           "description": "How the activation ended, once done.",
           "anyOf": [
@@ -989,6 +1001,29 @@
           "type": "string",
           "enum": [
             "sub_agent_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold.",
+      "type": "object",
+      "required": [
+        "id",
+        "state",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/UiChildState"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "sub_agent_state_changed"
           ]
         }
       }
@@ -1527,7 +1562,6 @@
       "type": "string"
     },
     "ChildContribution": {
-      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\n`findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it.",
       "type": "object",
       "required": [
         "findings_total",
@@ -1803,6 +1837,113 @@
         }
       }
     },
+    "UiChildAgent": {
+      "description": "One delegated child, projected from the durable record — what a client that reconnects, or opens a session, renders without having seen a single live event.",
+      "type": "object",
+      "required": [
+        "id",
+        "nickname",
+        "purpose",
+        "role",
+        "state"
+      ],
+      "properties": {
+        "background": {
+          "description": "Whether its parent continued while it ran.",
+          "default": false,
+          "type": "boolean"
+        },
+        "cost_usd_micros": {
+          "description": "`None` when no call carried a price — unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "description": "Model usage recorded under this child's id.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_tokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "description": "What it was asked to do.",
+          "type": "string"
+        },
+        "read_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "resumes": {
+          "description": "How many times it was continued after an interruption.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "role": {
+          "type": "string"
+        },
+        "scope": {
+          "description": "Exclusive write scope fixed at spawn (empty when late-bound or read-only).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "state": {
+          "$ref": "#/definitions/UiChildState"
+        },
+        "stop": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildStop"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "description": "The recorded settlement summary, once settled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "UiChildContribution": {
       "description": "Everything the inspector shows for one child.",
       "type": "object",
@@ -1841,6 +1982,32 @@
           "type": "string"
         }
       }
+    },
+    "UiChildState": {
+      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\n`findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. Where a delegated child's lifecycle stands, as the runtime records it.",
+      "oneOf": [
+        {
+          "description": "An activation is live.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "Its activation died with a runtime window; the next turn of the session continues it or settles it as lost.",
+          "type": "string",
+          "enum": [
+            "interrupted"
+          ]
+        },
+        {
+          "description": "It has its one terminal.",
+          "type": "string",
+          "enum": [
+            "settled"
+          ]
+        }
+      ]
     },
     "UiClarificationRequest": {
       "description": "A mid-task clarification the agent needs answered (spec §35).",
@@ -2275,6 +2442,17 @@
         "id": {
           "$ref": "#/definitions/MessageId"
         },
+        "kind": {
+          "description": "What kind of message this is when its role alone would mislead. `None` is an ordinary message of its role.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMessageKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "ordinal": {
           "description": "Persisted transcript ordinal (append order in the message log), when known. Lets a client interleave durable goal recaps at the position their checkpoint represents. Additive: absent on live-stream messages and old runtimes.",
           "type": [
@@ -2291,6 +2469,18 @@
           "type": "string"
         }
       }
+    },
+    "UiMessageKind": {
+      "description": "A message whose role does not say who wrote it.",
+      "oneOf": [
+        {
+          "description": "Written by the runtime into the model's context as a user-role turn — a child's settlement, a lost or resumed delegation — not typed by the user. Render it as a runtime notice, never as user input.",
+          "type": "string",
+          "enum": [
+            "runtime_notice"
+          ]
+        }
+      ]
     },
     "UiObservabilityLoaded": {
       "description": "Bounded event window + related observation slices. Current and historical sessions use this same payload.",
@@ -2849,6 +3039,13 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/UiCheckpoint"
+          }
+        },
+        "children": {
+          "description": "Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiChildAgent"
           }
         },
         "collaboration": {

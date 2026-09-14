@@ -1268,6 +1268,8 @@ mod tests {
                     contribution: None,
                     outcome: None,
                     stop: None,
+                    background: false,
+                    scope: Vec::new(),
                 }),
             );
         }
@@ -1327,6 +1329,8 @@ mod tests {
                 contribution: None,
                 outcome: None,
                 stop: None,
+                background: false,
+                scope: Vec::new(),
             }),
         );
         let agents = render_text(&mut state, 100, 28);

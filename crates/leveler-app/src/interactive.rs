@@ -894,6 +894,7 @@ impl InProcessRuntimeClient {
                     role: UiRole::User,
                     text: text.to_string(),
                     ordinal: None,
+                    kind: None,
                 },
             });
         Ok(cancel)
@@ -2913,6 +2914,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             record.status
         };
 
+        let children =
+            crate::children::project_children(&db, session_id, self.active.is_running(session_id))
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?;
+
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
             repository: record.repository,
@@ -2937,6 +2943,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             reasoning,
             work_profile: Some(config.work_profile.clone()),
             collaboration: Some(config.collaboration.clone()),
+            children,
         })
     }
 }
@@ -3245,6 +3252,7 @@ async fn compact_conversation(
                 reasoning,
                 work_profile: Some(record.work_profile.clone()),
                 collaboration: Some(record.collaboration.clone()),
+                children: Vec::new(),
             },
         });
     }
@@ -3333,11 +3341,19 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
     if text.trim().is_empty() {
         return None;
     }
+    // Only the runtime's own notices: a user-role message whose first line is
+    // exactly one of the headers the runtime writes.
+    let kind = (role == UiRole::User
+        && text.lines().next().is_some_and(|first| {
+            leveler_agent::RUNTIME_NOTICE_HEADERS.contains(&first.trim_end())
+        }))
+    .then_some(leveler_client_protocol::UiMessageKind::RuntimeNotice);
     Some(UiMessage {
         id: MessageId::new(leveler_core::new_uuid_string()),
         role,
         text,
         ordinal,
+        kind,
     })
 }
 
@@ -3359,6 +3375,42 @@ fn take_child_cancel(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_mut(session_id)
         .and_then(|running| running.remove(child_id))
+}
+
+#[cfg(test)]
+mod runtime_notice_tests {
+    use super::*;
+
+    fn persisted(role: Role, text: &str) -> String {
+        serde_json::to_string(&leveler_model::Message::text(role, text)).unwrap()
+    }
+
+    /// A settlement notice is a user-role message in the transcript, but the
+    /// runtime wrote it. The snapshot says so; a user's own message stays
+    /// ordinary.
+    #[test]
+    fn a_runtime_notice_is_marked_and_a_user_message_is_not() {
+        let notice = ui_message(&persisted(
+            Role::User,
+            "## Background sub-agent settled\nEuclid (c1, role=explorer) has finished.",
+        ))
+        .unwrap();
+        assert_eq!(
+            notice.kind,
+            Some(leveler_client_protocol::UiMessageKind::RuntimeNotice)
+        );
+        let typed = ui_message(&persisted(
+            Role::User,
+            "## Background sub-agent settled? what is that",
+        ))
+        .unwrap();
+        let plain = ui_message(&persisted(Role::User, "please fix the parser")).unwrap();
+        assert_eq!(plain.kind, None);
+        assert_eq!(
+            typed.kind, None,
+            "a notice header is a whole first line, not a prefix a user can type into"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -60,8 +60,8 @@ pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
 pub use event::{
     ChildContribution, ChildOutcome, ChildStop, NotificationLevel,
-    REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES, RuntimeEvent, UiMemoryCandidate,
-    UiMemoryEntry, UiMemoryKind, parse_runtime_event,
+    REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES, RuntimeEvent, UiChildAgent,
+    UiChildState, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind, parse_runtime_event,
 };
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
@@ -79,7 +79,8 @@ pub use progress::{
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, UiActiveToolCall, UiCheckpoint,
-    UiMessage, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary, UiUserShell,
+    UiMessage, UiMessageKind, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary,
+    UiUserShell,
 };
 pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
 pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};

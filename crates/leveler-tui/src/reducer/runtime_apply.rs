@@ -385,6 +385,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::ChildContributionLoaded { detail, .. } => {
             state.team.apply_detail(detail);
         }
+        RuntimeEvent::SubAgentStateChanged { .. } => {}
         RuntimeEvent::SubAgentProgress {
             id,
             active,

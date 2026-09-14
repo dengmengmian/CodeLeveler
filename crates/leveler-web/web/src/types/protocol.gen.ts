@@ -42,7 +42,6 @@ export type CheckState =
   /** The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason. */
   | 'unknown';
 
-/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. */
 export interface ChildContribution {
   findings_total: number;
   profile_id?: string | null;
@@ -144,6 +143,33 @@ export interface UiCheckpoint {
   ordinal: number;
 }
 
+/** One delegated child, projected from the durable record — what a client that reconnects, or opens a session, renders without having seen a single live event. */
+export interface UiChildAgent {
+  /** Whether its parent continued while it ran. */
+  background?: boolean;
+  /** `None` when no call carried a price — unknown, not zero. */
+  cost_usd_micros?: number | null;
+  id: string;
+  /** Model usage recorded under this child's id. */
+  input_tokens?: number;
+  nickname: string;
+  outcome?: ChildOutcome | null;
+  output_tokens?: number;
+  profile_id?: string | null;
+  /** What it was asked to do. */
+  purpose: string;
+  read_only?: boolean;
+  /** How many times it was continued after an interruption. */
+  resumes?: number;
+  role: string;
+  /** Exclusive write scope fixed at spawn (empty when late-bound or read-only). */
+  scope?: string[];
+  state: UiChildState;
+  stop?: ChildStop | null;
+  /** The recorded settlement summary, once settled. */
+  summary?: string | null;
+}
+
 /** Everything the inspector shows for one child. */
 export interface UiChildContribution {
   child_id: string;
@@ -156,6 +182,15 @@ export interface UiChildContribution {
   read_only?: boolean;
   role: string;
 }
+
+/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. Where a delegated child's lifecycle stands, as the runtime records it. */
+export type UiChildState =
+  /** An activation is live. */
+  | 'running'
+  /** Its activation died with a runtime window; the next turn of the session continues it or settles it as lost. */
+  | 'interrupted'
+  /** It has its one terminal. */
+  | 'settled';
 
 /** A mid-task clarification the agent needs answered (spec §35). */
 export interface UiClarificationRequest {
@@ -284,11 +319,18 @@ export type UiMemoryKind =
 /** A rendered message in the transcript. */
 export interface UiMessage {
   id: MessageId;
+  /** What kind of message this is when its role alone would mislead. `None` is an ordinary message of its role. */
+  kind?: UiMessageKind | null;
   /** Persisted transcript ordinal (append order in the message log), when known. Lets a client interleave durable goal recaps at the position their checkpoint represents. Additive: absent on live-stream messages and old runtimes. */
   ordinal?: number | null;
   role: UiRole;
   text: string;
 }
+
+/** A message whose role does not say who wrote it. */
+export type UiMessageKind =
+  /** Written by the runtime into the model's context as a user-role turn — a child's settlement, a lost or resumed delegation — not typed by the user. Render it as a runtime notice, never as user input. */
+  | 'runtime_notice';
 
 /** Bounded event window + related observation slices. Current and historical sessions use this same payload. */
 export interface UiObservabilityLoaded {
@@ -422,6 +464,8 @@ export interface UiSessionSnapshot {
   /** VCS branch, if the repository is a git repo. */
   branch?: string | null;
   checkpoints?: UiCheckpoint[];
+  /** Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes. */
+  children?: UiChildAgent[];
   /** Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it. */
   collaboration?: string | null;
   completion_report?: UiCompletionReport | null;
@@ -695,7 +739,9 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; stop?: ChildStop | null }
+  | { type: 'sub_agent_updated'; background?: boolean; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
+  /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
+  | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   /** Live execution state and cumulative model usage for one spawned agent. */
   | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
   /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */

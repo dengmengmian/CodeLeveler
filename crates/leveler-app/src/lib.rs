@@ -8,6 +8,7 @@
 
 mod active_turns;
 mod checkpoints;
+mod children;
 pub mod contribution_query;
 pub mod doctor;
 /// Engine events -> client events. Public so a recorded session can be replayed

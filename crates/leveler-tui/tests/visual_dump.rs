@@ -72,6 +72,7 @@ fn opened() -> AppState {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     };
     reduce(
         &mut s,
@@ -98,6 +99,8 @@ fn agents_screen_lists_spawned_sub_agents_in_direct_mode() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
     reduce(
@@ -140,6 +143,7 @@ fn visual_inspect() {
                 role: leveler_client_protocol::UiRole::User,
                 text: "分析一下 usage resolver 的设计，给个对比表和代码示例".into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -208,6 +212,8 @@ fn visual_inspect() {
             contribution: None,
             outcome: None,
             stop: None,
+            background: false,
+            scope: Vec::new(),
         }),
     );
 

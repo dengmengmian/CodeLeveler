@@ -29,6 +29,7 @@ async fn records_commands_and_broadcasts_events() {
             role: UiRole::User,
             text: "hi".into(),
             ordinal: None,
+            kind: None,
         },
     });
     let event = rx.recv().await.unwrap();

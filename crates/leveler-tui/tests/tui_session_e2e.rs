@@ -81,6 +81,7 @@ fn opened() -> AppState {
                 reasoning: None,
                 work_profile: None,
                 collaboration: None,
+                children: Vec::new(),
             },
         }),
     );

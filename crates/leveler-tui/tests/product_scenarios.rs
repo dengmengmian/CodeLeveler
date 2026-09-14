@@ -83,6 +83,7 @@ fn opened(goal: &str) -> AppState {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     };
     reduce(
         &mut s,
@@ -96,6 +97,7 @@ fn opened(goal: &str) -> AppState {
                 role: UiRole::User,
                 text: goal.into(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );
@@ -579,12 +581,14 @@ fn s10_resume() {
                 role: UiRole::User,
                 text: "给 navsvc 加一条端到端的退款审计链路".into(),
                 ordinal: Some(1),
+                kind: None,
             },
             UiMessage {
                 id: MessageId::new("a1"),
                 role: UiRole::Assistant,
                 text: "已经落了审计事件结构，还差落库和测试。".into(),
                 ordinal: Some(2),
+                kind: None,
             },
         ],
         pending_interactions: Vec::new(),
@@ -614,6 +618,7 @@ fn s10_resume() {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     };
     reduce(
         &mut s,

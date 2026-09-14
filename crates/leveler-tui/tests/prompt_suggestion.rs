@@ -48,6 +48,7 @@ fn snapshot() -> UiSessionSnapshot {
         reasoning: None,
         work_profile: None,
         collaboration: None,
+        children: Vec::new(),
     }
 }
 
@@ -922,6 +923,7 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
                 role: leveler_client_protocol::UiRole::User,
                 text: NEXT_STEP.to_string(),
                 ordinal: None,
+                kind: None,
             },
         }),
     );

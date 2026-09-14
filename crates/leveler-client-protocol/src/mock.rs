@@ -52,6 +52,7 @@ impl MockRuntimeClient {
             reasoning: None,
             work_profile: None,
             collaboration: None,
+            children: Vec::new(),
         };
         Self {
             events,
