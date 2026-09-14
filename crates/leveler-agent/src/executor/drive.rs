@@ -581,22 +581,36 @@ impl<'a> Drive<'a> {
             executor
                 .ownership
                 .register_owner(&child.id, &format!("{} ({})", child.nickname, child.id));
-            if child.role == AgentRole::Worker
-                && !child.spec.files.is_empty()
-                && let Err(rejection) = executor.ownership.try_claim(&child.id, &child.spec.files)
+            let model_refusal = match child
+                .spec
+                .model
+                .as_deref()
+                .and_then(leveler_model::ModelRef::parse)
             {
-                // Stale authority is never resurrected, and a child that cannot
-                // hold its scope cannot continue. Settle it now, truthfully.
-                executor.ownership.release_all(&child.id);
-                let result = super::handlers::SubAgentRunResult {
-                    result: crate::sub_agent::ChildResult::new(
-                        false,
-                        "",
+                Some(model) => executor.pinned_model_refusal(&model).await,
+                None => None,
+            };
+            let refusal = match model_refusal {
+                Some(refusal) => Some(refusal),
+                None if child.role == AgentRole::Worker && !child.spec.files.is_empty() => executor
+                    .ownership
+                    .try_claim(&child.id, &child.spec.files)
+                    .err()
+                    .map(|rejection| {
                         format!(
                             "its write scope could not be re-claimed: {}",
                             rejection.for_model()
-                        ),
-                    ),
+                        )
+                    }),
+                None => None,
+            };
+            if let Some(refusal) = refusal {
+                // Stale authority is never resurrected, and a child that cannot
+                // hold its scope or run on its model cannot continue. Settle it
+                // now, truthfully.
+                executor.ownership.release_all(&child.id);
+                let result = super::handlers::SubAgentRunResult {
+                    result: crate::sub_agent::ChildResult::new(false, "", refusal),
                     stop: leveler_lifecycle::ChildStop::Failed,
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
@@ -2465,6 +2479,10 @@ impl AgentHarness for Drive<'_> {
                     _ => None,
                 };
                 let model_override = pinned_model.and_then(leveler_model::ModelRef::parse);
+                let model_refusal = match &model_override {
+                    Some(model) => self.executor.pinned_model_refusal(model).await,
+                    None => None,
+                };
                 // A definition's own policy: the tools it may hold and how
                 // long it may run. Empty / 0 means inherit.
                 let (agent_tools, agent_max_rounds) = match &named {
@@ -2505,6 +2523,10 @@ impl AgentHarness for Drive<'_> {
                         "Agent `{}` pins model `{raw}`, which is not a valid `provider/model` \
                              reference. Fix the agent definition.",
                         agent_name.unwrap_or("?")
+                    ))
+                } else if let Some(refusal) = &model_refusal {
+                    Some(format!(
+                        "{refusal}. Fix the agent definition or omit `agent`."
                     ))
                 } else if task.is_empty() {
                     Some("spawn_agent requires a non-empty task.".to_string())
@@ -2668,6 +2690,9 @@ impl AgentHarness for Drive<'_> {
                 barrier.flush().await?;
             }
             let share_n = accepted.len() as u32;
+            // Foreground children's own tokens, so an error in this batch can
+            // stop and wait for them instead of dropping them mid-write.
+            let mut foreground_tokens: Vec<CancellationToken> = Vec::new();
             for (
                 share_of,
                 (
@@ -2780,6 +2805,7 @@ impl AgentHarness for Drive<'_> {
                     continue;
                 }
                 let progress_ch = progress_tx.clone();
+                foreground_tokens.push(token.clone());
                 futs.push(async move {
                     let result = executor
                         .run_one_sub_agent_on(
@@ -2802,10 +2828,22 @@ impl AgentHarness for Drive<'_> {
             }
             drop(progress_tx);
 
+            let mut batch_error: Option<AgentError> = None;
             while !futs.is_empty() {
                 tokio::select! {
                     biased;
-                    Some(progress_ev) = progress_rx.recv() => self.forward_child_event(rt, progress_ev).await?,
+                    Some(progress_ev) = progress_rx.recv(), if batch_error.is_none() => {
+                        if let Err(error) = self.forward_child_event(rt, progress_ev).await {
+                            // The batch is failing. Stop every child still
+                            // running and keep settling them below, so each
+                            // ends, is released after it stopped, and is
+                            // ended for the host before the error returns.
+                            for child_token in &foreground_tokens {
+                                child_token.cancel();
+                            }
+                            batch_error = Some(error);
+                        }
+                    }
                     Some((index, call_id, id, nickname, role, result)) = futs.next() => {
                         self.executor.ownership.release_all(&id);
                         if let Some(host) = &self.executor.steering {
@@ -2836,6 +2874,9 @@ impl AgentHarness for Drive<'_> {
                         });
                     }
                 }
+            }
+            if let Some(error) = batch_error {
+                return Err(error);
             }
             while let Ok(event) = progress_rx.try_recv() {
                 self.forward_child_event(rt, event).await?;

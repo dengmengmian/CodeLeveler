@@ -6458,3 +6458,221 @@ async fn a_host_can_cancel_one_child_without_cancelling_its_parent() {
         "the host is told the child ended"
     );
 }
+
+/// Prices only the parent's model; any pinned model has no pricing, and
+/// `mock/missing` has no profile at all.
+struct PartlyPricedRuntime {
+    agent: &'static str,
+    parent_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ModelRuntime for PartlyPricedRuntime {
+    async fn generate(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        match self
+            .parent_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        {
+            0 => Ok(assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"agent": self.agent, "task": "UNPRICED_CHILD look"}),
+                )],
+                FinishReason::ToolCalls,
+            )),
+            _ => Ok(assistant_text("parent done")),
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        match model.model.as_str() {
+            "m" => Ok(priced_profile(model, 1.0)),
+            "missing" => Err(ModelError::new(
+                leveler_model::ModelErrorKind::InvalidRequest,
+                "model `mock/missing` is not configured",
+            )),
+            _ => {
+                let mut profile = priced_profile(model, 1.0);
+                profile.pricing = None;
+                Ok(profile)
+            }
+        }
+    }
+}
+
+/// Run a parent under a cost cap that delegates to `agent` (defined with
+/// `model`), returning the spawn's tool result and whether a child started.
+async fn spawn_under_cost_cap(tag: &str, agent: &'static str, model: &str) -> (String, bool, bool) {
+    let dir = tmp(tag, 91);
+    std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
+    std::fs::write(
+        dir.join(format!(".leveler/agents/{agent}.md")),
+        format!(
+            "---\nname: {agent}\ndescription: looks\nrole: explorer\nmodel: {model}\n---\nLook.\n"
+        ),
+    )
+    .unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let mut events = Vec::new();
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    Executor::new(
+        Arc::new(PartlyPricedRuntime {
+            agent,
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_pricing(priced_profile(&ModelRef::new("mock", "m"), 1.0).pricing)
+    .with_step_limits(leveler_agent::StepLimits {
+        max_cost_usd_micros: Some(50_000_000),
+        ..Default::default()
+    })
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    let started = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. }));
+    (content, is_error, started)
+}
+
+/// A cost cap cannot be enforced on a model with no price. A child pinned to
+/// one is refused at spawn, saying why — not started and failed before its
+/// first call, and never quietly run without the cap.
+#[tokio::test]
+async fn an_unpriced_pinned_model_is_refused_under_a_cost_cap() {
+    let (content, is_error, started) =
+        spawn_under_cost_cap("unpriced-model", "unpriced-explorer", "mock/free").await;
+    assert!(is_error, "the spawn is refused: {content}");
+    assert!(!started, "no child starts");
+    assert!(
+        content.contains("mock/free") && content.contains("pricing"),
+        "the refusal names the model and the reason: {content}"
+    );
+}
+
+/// A pinned model the runtime cannot resolve is refused at spawn with the
+/// lookup error, rather than failing inside the child.
+#[tokio::test]
+async fn an_unresolvable_pinned_model_is_refused_at_spawn() {
+    let (content, is_error, started) =
+        spawn_under_cost_cap("missing-model", "missing-explorer", "mock/missing").await;
+    assert!(is_error, "the spawn is refused: {content}");
+    assert!(!started, "no child starts");
+    assert!(
+        content.contains("not configured"),
+        "the refusal carries the lookup error: {content}"
+    );
+}
+
+/// A durable sink that cannot record a child's model call.
+struct ChildRecordFailingSink;
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for ChildRecordFailingSink {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), leveler_engine::PortError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), leveler_engine::PortError> {
+        if record.agent_id.is_some() {
+            return Err(leveler_engine::PortError::Persistence(
+                "model_requests unavailable (injected)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A foreground child's cancellation handle is dropped by the host whenever
+/// its batch ends — including a batch that ends on an error. A handle left
+/// behind makes a later `CancelChild` report success for a child that is gone.
+#[tokio::test]
+async fn a_foreground_batch_that_errors_still_ends_its_children_for_the_host() {
+    let dir = tmp("fg-error-ends-child", 92);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let handles = Arc::new(ChildHandles::default());
+    let result = Executor::new(
+        Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call("s1", serde_json::json!({"task": "look"}))],
+                    FinishReason::ToolCalls,
+                ),
+                // The child yields mid-run (a tool round, then a delayed
+                // reply), so its first model-call record reaches the parent
+                // while the child is still running.
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "read_file",
+                        serde_json::json!({"path": "missing.txt"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child report"),
+                assistant_text("parent done"),
+            ],
+            Duration::from_millis(30),
+        )),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_steering(handles.clone())
+    .run(
+        "delegate",
+        &mut |_| {},
+        &mut ChildRecordFailingSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(result.is_err(), "the unrecordable child call ends the run");
+    let started: Vec<String> = handles
+        .started
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        *handles.ended.lock().unwrap(),
+        started,
+        "every started child is ended for the host"
+    );
+}

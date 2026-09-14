@@ -45,6 +45,31 @@ fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
 }
 
 impl Executor {
+    /// Why a child pinned to `model` cannot run, if it cannot: the runtime
+    /// does not resolve the model, or a cost cap is in force and the model
+    /// carries no price to enforce it with. Checked before the child exists,
+    /// so the refusal reaches the model instead of a child that fails before
+    /// its first call — and the cap is never quietly dropped to let it run.
+    pub(crate) async fn pinned_model_refusal(
+        &self,
+        model: &leveler_model::ModelRef,
+    ) -> Option<String> {
+        match self.runtime.profile(model).await {
+            Err(error) => Some(format!(
+                "model `{model}` pinned for this sub-agent is not available: {error}"
+            )),
+            Ok(profile)
+                if profile.pricing.is_none() && self.step_limits.max_cost_usd_micros.is_some() =>
+            {
+                Some(format!(
+                    "model `{model}` pinned for this sub-agent has no pricing, and this task \
+                     runs under a cost limit that cannot be enforced without it"
+                ))
+            }
+            Ok(_) => None,
+        }
+    }
+
     /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
     pub(crate) async fn handle_ask_user(
         &self,
@@ -494,12 +519,25 @@ async fn run_prepared_sub_agent(
             .await;
     }
     if repriced {
-        child.pricing = child
-            .runtime
-            .profile(&child.model)
-            .await
-            .ok()
-            .and_then(|profile| profile.pricing);
+        // Admission already refused a model it could not price under a cap;
+        // this read is the child's own, and a failure here is reported, never
+        // replaced by the parent's rate or by running without the cap.
+        match child.runtime.profile(&child.model).await {
+            Ok(profile) => child.pricing = profile.pricing,
+            Err(error) => {
+                return SubAgentRunResult {
+                    result: ChildResult::new(
+                        false,
+                        "",
+                        format!("its model profile could not be read: {error}"),
+                    ),
+                    stop: leveler_lifecycle::ChildStop::Failed,
+                    progress: ProgressLedger::default(),
+                    modified_files: Vec::new(),
+                    findings: Vec::new(),
+                };
+            }
+        }
     }
     // A definition that declares its own tools / round budget binds every
     // spawn of it — otherwise the field is decoration.

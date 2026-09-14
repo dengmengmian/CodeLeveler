@@ -1100,6 +1100,12 @@ impl ModelRuntime for RoutedRuntime {
     }
 
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        if model.model == "missing" {
+            return Err(ModelError::new(
+                leveler_model::ModelErrorKind::InvalidRequest,
+                "model `mock/missing` is not configured",
+            ));
+        }
         MockRuntime::new(Vec::new()).profile(model).await
     }
 }
@@ -1172,6 +1178,18 @@ async fn seed_ghost_child_with_scope(
     role: &str,
     files: Vec<String>,
 ) -> TurnId {
+    seed_ghost_child_with_model(db, session, id, nickname, role, files, None).await
+}
+
+async fn seed_ghost_child_with_model(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    nickname: &str,
+    role: &str,
+    files: Vec<String>,
+    model: Option<String>,
+) -> TurnId {
     let turn = TurnRepository::new(db)
         .start(session, "user", None, leveler_core::now())
         .await
@@ -1190,6 +1208,7 @@ async fn seed_ghost_child_with_scope(
                 read_only: role != "worker",
                 spec: Some(leveler_lifecycle::ChildSpawnSpec {
                     files,
+                    model,
                     background: true,
                     ..Default::default()
                 }),
@@ -1497,5 +1516,57 @@ async fn a_resumed_worker_writes_inside_its_reclaimed_scope() {
             )
             .count(),
         1
+    );
+}
+
+/// A child whose pinned model the runtime no longer resolves cannot continue:
+/// it settles as failed, saying why, instead of starting and failing blind.
+#[tokio::test]
+async fn a_resumed_child_whose_model_is_gone_settles_as_failed() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let turn = seed_ghost_child_with_model(
+        &db,
+        &session,
+        "agent-m",
+        "wren",
+        "explorer",
+        Vec::new(),
+        Some("mock/missing".to_string()),
+    )
+    .await;
+    EventLog::new(&db, session.clone())
+        .append(
+            Some(&turn),
+            EngineEvent::SubAgentTranscriptAppended {
+                id: "agent-m".into(),
+                messages: vec![Message::text(Role::User, RESUMED_TASK)],
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let terminal = events.iter().find_map(|(_, e)| match e {
+        EngineEvent::SubAgentFinished {
+            id, stop, summary, ..
+        } if id == "agent-m" => Some((*stop, summary.clone())),
+        _ => None,
+    });
+    let (stop, summary) = terminal.expect("the child is settled");
+    assert_eq!(stop, Some(leveler_lifecycle::ChildStop::Failed));
+    assert!(summary.contains("not available"), "{summary}");
+    assert!(
+        runtime.child_requests.lock().unwrap().is_empty(),
+        "the child never asked a model"
     );
 }
