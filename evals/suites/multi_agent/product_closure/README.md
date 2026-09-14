@@ -14,7 +14,14 @@ also parse as ordinary `EvaluationCase` YAML.
 | `ma-parallel-impl` | PARALLELIZABLE_IMPLEMENTATION | four independent stubs |
 | `ma-review-ratelimit` | REVIEW_HEAVY | a fix whose edge cases a visible test does not cover |
 | `ma-long-kvstore` | LONG_GOAL | two packages built from a long contract |
+| `ma-scale-research` | PARALLELIZABLE_RESEARCH_LARGE | scale-up: the inventory task over ten packages, fifty files |
+| `ma-scale-impl` | PARALLELIZABLE_IMPLEMENTATION_LARGE | scale-up: the eight packages of the two small implementation cases in one module |
 | `ma-recovery-parallel` | RECOVERY | killed once mid-run (after a child made progress, or after parent progress if none spawned), then resumed |
+
+The two scale-up cases were added after batch 1 of the seven base cases
+recorded zero natural delegation in every arm (those tasks finished in 5–19
+tool calls). They were declared before any scale-up run and follow the same
+rules. The first seven cases are unchanged.
 
 Rules:
 

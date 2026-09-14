@@ -2395,7 +2395,7 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
-    fn multi_agent_closure_cases_load_one_per_category() {
+    fn multi_agent_closure_cases_all_load() {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/multi_agent_closure");
         let cases = EvaluationCase::load_dir(&root).expect("multi_agent_closure must parse");
@@ -2410,6 +2410,8 @@ expect: { program: cargo, args: [test] }
                 "ma-recovery-parallel",
                 "ma-research-inventory",
                 "ma-review-ratelimit",
+                "ma-scale-impl",
+                "ma-scale-research",
                 "ma-simple-clamp",
             ]
         );
