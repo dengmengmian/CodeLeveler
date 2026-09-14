@@ -1,0 +1,28 @@
+id: ma-multifile-timeout
+name: Add a timeout setting across parse, config and render
+max_rounds: 40
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  README.md: |
+    # evalcase
+
+    ## Settings
+
+    | key | type | default | rule |
+    |---|---|---|---|
+    | name | string | default | non-empty |
+    | retries | integer | 3 | >= 0 |
+  config/config.go: "package config\n\n// Config is the parsed settings block.\ntype Config struct {\n\tName    string\n\tRetries int\n}\n"
+  config/parse.go: "package config\n\nimport (\n\t\"fmt\"\n\t\"strconv\"\n)\n\n// Parse reads settings from key/value pairs, applying defaults.\nfunc Parse(kv map[string]string) (Config, error) {\n\tc := Config{Name: \"default\", Retries: 3}\n\tif v, ok := kv[\"name\"]; ok {\n\t\tif v == \"\" {\n\t\t\treturn Config{}, fmt.Errorf(\"name: empty\")\n\t\t}\n\t\tc.Name = v\n\t}\n\tif v, ok := kv[\"retries\"]; ok {\n\t\tn, err := strconv.Atoi(v)\n\t\tif err != nil || n < 0 {\n\t\t\treturn Config{}, fmt.Errorf(\"retries: invalid %q\", v)\n\t\t}\n\t\tc.Retries = n\n\t}\n\treturn c, nil\n}\n"
+  config/parse_test.go: "package config\n\nimport \"testing\"\n\nfunc TestDefaults(t *testing.T) {\n\tc, err := Parse(nil)\n\tif err != nil || c.Name != \"default\" || c.Retries != 3 {\n\t\tt.Fatalf(\"%+v %v\", c, err)\n\t}\n}\n\nfunc TestBadRetries(t *testing.T) {\n\tif _, err := Parse(map[string]string{\"retries\": \"-1\"}); err == nil {\n\t\tt.Fatal(\"want error\")\n\t}\n}\n"
+  render/render.go: "package render\n\nimport (\n\t\"fmt\"\n\n\t\"evalcase/config\"\n)\n\n// Line renders a config as one status line.\nfunc Line(c config.Config) string {\n\treturn fmt.Sprintf(\"name=%s retries=%d\", c.Name, c.Retries)\n}\n"
+  render/render_test.go: "package render\n\nimport (\n\t\"strings\"\n\t\"testing\"\n\n\t\"evalcase/config\"\n)\n\nfunc TestLineStartsWithName(t *testing.T) {\n\tif !strings.HasPrefix(Line(config.Config{Name: \"x\", Retries: 1}), \"name=x retries=1\") {\n\t\tt.Fatal(Line(config.Config{Name: \"x\", Retries: 1}))\n\t}\n}\n"
+task: 'Add a `timeout` setting. It is given in whole seconds: a positive integer, default 30; zero, a negative number or a non-integer is an error whose message starts with `timeout:`. Store it as `Config.Timeout` of type `time.Duration`. `render.Line` must print it after retries, for example `name=default retries=3 timeout=30s`. Add the setting to the table in README.md. Keep the existing tests passing and do not modify them.'
+expect:
+  program: bash
+  args:
+  - -c
+  - "set -euo pipefail\nmkdir -p \"$(dirname 'config/zz_hidden_test.go')\"\ncat > 'config/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage config\n\nimport (\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestHiddenTimeout(t *testing.T) {\n\tc, err := Parse(nil)\n\tif err != nil || c.Timeout != 30*time.Second {\n\t\tt.Fatalf(\"default %+v %v\", c, err)\n\t}\n\tc, err = Parse(map[string]string{\"timeout\": \"5\"})\n\tif err != nil || c.Timeout != 5*time.Second {\n\t\tt.Fatalf(\"five %+v %v\", c, err)\n\t}\n\tfor _, bad := range []string{\"0\", \"-2\", \"1.5\", \"x\", \"\"} {\n\t\t_, err := Parse(map[string]string{\"timeout\": bad})\n\t\tif err == nil || !strings.HasPrefix(err.Error(), \"timeout:\") {\n\t\t\tt.Fatalf(\"%q: %v\", bad, err)\n\t\t}\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'render/zz_hidden_test.go')\"\ncat > 'render/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage render\n\nimport (\n\t\"testing\"\n\t\"time\"\n\n\t\"evalcase/config\"\n)\n\nfunc TestHiddenLine(t *testing.T) {\n\tgot := Line(config.Config{Name: \"default\", Retries: 3, Timeout: 30 * time.Second})\n\tif got != \"name=default retries=3 timeout=30s\" {\n\t\tt.Fatal(got)\n\t}\n}\nHIDDEN_EOF\ngo test ./... && grep -q '^| timeout |' README.md\n"

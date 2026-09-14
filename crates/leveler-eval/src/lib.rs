@@ -2395,6 +2395,27 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
+    fn multi_agent_closure_cases_load_one_per_category() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/multi_agent_closure");
+        let cases = EvaluationCase::load_dir(&root).expect("multi_agent_closure must parse");
+        let mut ids: Vec<_> = cases.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "ma-long-kvstore",
+                "ma-multifile-timeout",
+                "ma-parallel-impl",
+                "ma-recovery-parallel",
+                "ma-research-inventory",
+                "ma-review-ratelimit",
+                "ma-simple-clamp",
+            ]
+        );
+    }
+
+    #[test]
     fn navigation_cases_still_load_with_benchmark_validity_metadata() {
         // Every navigation case carries a `validity:` block describing what the
         // case discriminates on, so the offline preflight can refuse a case that

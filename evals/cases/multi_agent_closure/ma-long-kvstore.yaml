@@ -1,0 +1,39 @@
+id: ma-long-kvstore
+name: Build a TTL + LRU key-value store and its command script
+max_rounds: 80
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  kv/store.go: "package kv\n\nimport \"time\"\n\n// Store is an in-memory key/value store. See the task for the contract.\ntype Store struct{}\n\n// Stats counts lookups and evictions since New.\ntype Stats struct {\n\tHits, Misses, Evictions int\n}\n\n// New returns an empty store holding at most capacity keys, reading time from now.\nfunc New(capacity int, now func() time.Time) *Store { return &Store{} }\n"
+  kv/store_test.go: "package kv\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestSetGet(t *testing.T) {\n\tnow := time.Unix(0, 0)\n\ts := New(2, func() time.Time { return now })\n\ts.Set(\"a\", \"1\", 0)\n\tif v, ok := s.Get(\"a\"); !ok || v != \"1\" {\n\t\tt.Fatal(v, ok)\n\t}\n}\n"
+  script/script.go: |
+    package script
+
+    // Package script applies text commands to a kv.Store. See the task.
+task: 'Build package kv and package script.
+
+
+  kv.Store (keep `New(capacity int, now func() time.Time) *Store` and the `Stats` type):
+
+  - `Set(key, value string, ttl time.Duration)`: stores the value; ttl 0 means no expiry, otherwise the key expires once `now()` is at or after set time + ttl. Setting an existing key replaces value and ttl.
+
+  - `Get(key string) (string, bool)`: an expired key is removed and reported missing. A hit counts in Stats.Hits, a miss (absent or expired) in Stats.Misses.
+
+  - `Delete(key string) bool`: true if a live key was removed.
+
+  - When a Set of a new key would exceed capacity, first remove expired keys; if still full, evict the least recently used key (Set and a successful Get both count as use) and count it in Stats.Evictions.
+
+  - `Len() int` (live keys), `Keys() []string` (live keys, sorted), `Stats() Stats`.
+
+
+  package script: `Run(s *kv.Store, input string) []string` applies one command per non-empty line and returns one output line per command: `SET k v` or `SET k v <seconds>` → `OK`; `GET k` → the value or `(nil)`; `DEL k` → `1` or `0`; `KEYS` → the sorted keys joined by spaces (empty string if none); `STATS` → `hits=H misses=M evictions=E`; anything else → `ERR unknown command`; a SET with a non-integer or negative seconds field → `ERR bad ttl`.
+
+
+  Add tests for both packages. `go test ./...` must pass.'
+expect:
+  program: bash
+  args:
+  - -c
+  - "set -euo pipefail\nmkdir -p \"$(dirname 'kv/zz_hidden_test.go')\"\ncat > 'kv/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage kv\n\nimport (\n\t\"reflect\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestHiddenKV(t *testing.T) {\n\tnow := time.Unix(1000, 0)\n\ts := New(2, func() time.Time { return now })\n\ts.Set(\"a\", \"1\", 0)\n\ts.Set(\"b\", \"2\", 10*time.Second)\n\tif _, ok := s.Get(\"a\"); !ok {\n\t\tt.Fatal(\"a\")\n\t}\n\ts.Set(\"c\", \"3\", 0)\n\tif _, ok := s.Get(\"b\"); ok {\n\t\tt.Fatal(\"b should be evicted as LRU\")\n\t}\n\tif st := s.Stats(); st.Evictions != 1 || st.Hits != 1 || st.Misses != 1 {\n\t\tt.Fatalf(\"%+v\", st)\n\t}\n\ts.Set(\"d\", \"4\", 5*time.Second)\n\tif !reflect.DeepEqual(s.Keys(), []string{\"c\", \"d\"}) {\n\t\tt.Fatal(s.Keys())\n\t}\n\tnow = now.Add(5 * time.Second)\n\tif _, ok := s.Get(\"d\"); ok {\n\t\tt.Fatal(\"d expired at exactly ttl\")\n\t}\n\tif s.Len() != 1 || s.Delete(\"d\") || !s.Delete(\"c\") {\n\t\tt.Fatal(\"len/delete\")\n\t}\n}\n\nfunc TestHiddenExpiredBeforeEviction(t *testing.T) {\n\tnow := time.Unix(0, 0)\n\ts := New(2, func() time.Time { return now })\n\ts.Set(\"old\", \"x\", time.Second)\n\ts.Set(\"keep\", \"y\", 0)\n\tnow = now.Add(2 * time.Second)\n\ts.Set(\"new\", \"z\", 0)\n\tif s.Stats().Evictions != 0 {\n\t\tt.Fatal(\"expired key must be removed before evicting a live one\")\n\t}\n\tif _, ok := s.Get(\"keep\"); !ok {\n\t\tt.Fatal(\"keep\")\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'script/zz_hidden_test.go')\"\ncat > 'script/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage script\n\nimport (\n\t\"reflect\"\n\t\"testing\"\n\t\"time\"\n\n\t\"evalcase/kv\"\n)\n\nfunc TestHiddenRun(t *testing.T) {\n\tnow := time.Unix(0, 0)\n\ts := kv.New(10, func() time.Time { return now })\n\tgot := Run(s, \"SET a 1\\nSET b 2 5\\n\\nGET a\\nGET zz\\nDEL b\\nDEL b\\nKEYS\\nSTATS\\nPING\\nSET c 3 x\\nSET c 3 -1\")\n\twant := []string{\"OK\", \"OK\", \"1\", \"(nil)\", \"1\", \"0\", \"a\", \"hits=1 misses=1 evictions=0\", \"ERR unknown command\", \"ERR bad ttl\", \"ERR bad ttl\"}\n\tif !reflect.DeepEqual(got, want) {\n\t\tt.Fatalf(\"got %q\", got)\n\t}\n}\nHIDDEN_EOF\ngo test ./...\n"

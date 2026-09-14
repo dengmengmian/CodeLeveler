@@ -63,6 +63,23 @@ class SchemaTests(unittest.TestCase):
         batch = make_batch(batch_id="b1", runs=[run])
         self.assertEqual(validate_batch(batch), [])
 
+    def test_safety_reads_child_lifecycle_counters_instead_of_a_constant(self):
+        lifecycle = {"ownership_violation": 2, "duplicate_settlement": 1, "open_orphan": 3,
+                     "lost_accepted_child": 1}
+        run = make_run(
+            run_id="r1", started_at=None, git_sha=None, binary=None, leveler_home=None,
+            session_db=None, task_id="a01", suite="adoption", max_rounds=None,
+            expected_disposition=None, arm_name="control", arm_factor="baseline",
+            arm_value="product_default", model_ref="m",
+            timeline={"valid": True, "engaged": True, "spawn": False, "disposition": "kept",
+                      "child_lifecycle": lifecycle},
+        )
+        self.assertEqual(run["safety"]["violations"], 2)
+        self.assertEqual(run["safety"]["duplicate_settlement"], 1)
+        self.assertEqual(run["safety"]["open_orphan"], 3)
+        self.assertEqual(run["safety"]["lost_accepted_child"], 1)
+        self.assertEqual(compact_record(run)["safety"]["violations"], 2)
+
     def test_compact_record_has_required_contract_keys(self):
         run = make_run(
             run_id="r1",

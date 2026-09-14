@@ -108,7 +108,11 @@
       "properties": {
         "ownership_granted": { "type": "integer" },
         "ownership_denied": { "type": "integer" },
-        "claim_count": { "type": "integer" }
+        "claim_count": { "type": "integer" },
+        "violations": { "type": "integer" },
+        "duplicate_settlement": { "type": "integer" },
+        "open_orphan": { "type": "integer" },
+        "lost_accepted_child": { "type": "integer" }
       }
     },
     "metrics": {

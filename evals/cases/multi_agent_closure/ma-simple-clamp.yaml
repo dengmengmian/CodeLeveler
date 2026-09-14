@@ -1,0 +1,18 @@
+id: ma-simple-clamp
+name: Clamp an integer into a range
+max_rounds: 20
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  clamp.go: "package evalcase\n\n// Clamp returns v limited to the closed range [lo, hi]. lo <= hi.\nfunc Clamp(v, lo, hi int) int {\n\treturn v\n}\n"
+  clamp_test.go: "package evalcase\n\nimport \"testing\"\n\nfunc TestClamp(t *testing.T) {\n\tcases := []struct{ v, lo, hi, want int }{\n\t\t{5, 0, 10, 5}, {-3, 0, 10, 0}, {12, 0, 10, 10}, {0, 0, 0, 0}, {-7, -9, -8, -8},\n\t}\n\tfor _, c := range cases {\n\t\tif got := Clamp(c.v, c.lo, c.hi); got != c.want {\n\t\t\tt.Fatalf(\"Clamp(%d,%d,%d)=%d want %d\", c.v, c.lo, c.hi, got, c.want)\n\t\t}\n\t}\n}\n"
+task: Implement Clamp in clamp.go so it returns v limited to the closed range [lo, hi]. Do not modify tests.
+expect:
+  program: bash
+  args:
+  - -c
+  - |
+    set -euo pipefail
+    go test ./...

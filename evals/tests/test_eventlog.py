@@ -300,6 +300,14 @@ class CheckAndReviewCountsTests(unittest.TestCase):
         t = self._timeline([("task_started", {"goal": "g", "model": "m"})])
         self.assertIsNone(t["review_stages_ok"])
 
+    def test_the_timeline_carries_child_lifecycle_and_request_usage(self):
+        t = self._timeline([
+            ("task_started", {"goal": "g", "model": "m"}),
+            ("sub_agent_started", {"id": "c", "role": "explorer"}),
+        ])
+        self.assertEqual(t["child_lifecycle"]["open_orphan"], 1)
+        self.assertIn("total", t["request_usage"])
+
 
 if __name__ == "__main__":
     unittest.main()

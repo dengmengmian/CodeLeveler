@@ -12,6 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from child_lifecycle import child_lifecycle, request_usage
 from spawn_metric import MUTATORS, connect_ro, extract_con
 from reviewer import extract_reviewer
 from value import child_result_used, classify_child_contributions, profile_effectiveness
@@ -335,6 +336,8 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
         "child_contributions": classify_child_contributions(spawn),
         "profile_effectiveness": profile_effectiveness(spawn),
         "reviewer": extract_reviewer(spawn),
+        "child_lifecycle": child_lifecycle(con),
+        "request_usage": request_usage(con),
     }
 
 

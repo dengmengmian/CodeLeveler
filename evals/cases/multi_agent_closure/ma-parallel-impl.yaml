@@ -1,0 +1,22 @@
+id: ma-parallel-impl
+name: Implement four independent helper packages
+max_rounds: 60
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  slug/slug.go: "package slug\n\n// Slugify lowercases s, keeps ASCII letters and digits, turns every run of\n// other characters into a single '-', and trims '-' from both ends.\nfunc Slugify(s string) string {\n\treturn s\n}\n"
+  slug/slug_test.go: "package slug\n\nimport \"testing\"\n\nfunc TestSlugify(t *testing.T) {\n\tif got := Slugify(\"Hello, World!\"); got != \"hello-world\" {\n\t\tt.Fatal(got)\n\t}\n}\n"
+  stats/median.go: "package stats\n\n// Median returns the median of xs and true, or 0 and false when xs is empty.\n// It never reorders the caller's slice.\nfunc Median(xs []float64) (float64, bool) {\n\treturn 0, false\n}\n"
+  stats/median_test.go: "package stats\n\nimport \"testing\"\n\nfunc TestMedianOdd(t *testing.T) {\n\tif m, ok := Median([]float64{3, 1, 2}); !ok || m != 2 {\n\t\tt.Fatal(m, ok)\n\t}\n}\n"
+  humandur/format.go: "package humandur\n\nimport \"time\"\n\n// Format renders d as hours, minutes and seconds, omitting zero units:\n// 1h2m3s, 2m, 45s. Sub-second parts are dropped. Zero is \"0s\"; a negative\n// duration is prefixed with '-'.\nfunc Format(d time.Duration) string {\n\treturn \"\"\n}\n"
+  humandur/format_test.go: "package humandur\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestFormat(t *testing.T) {\n\tif got := Format(time.Hour + 2*time.Minute + 3*time.Second); got != \"1h2m3s\" {\n\t\tt.Fatal(got)\n\t}\n}\n"
+  csvq/split.go: "package csvq\n\n// Split splits one CSV line on commas. A field wrapped in double quotes may\n// contain commas, and \"\" inside it is one literal quote. An unterminated\n// quoted field is an error.\nfunc Split(line string) ([]string, error) {\n\treturn nil, nil\n}\n"
+  csvq/split_test.go: "package csvq\n\nimport \"testing\"\n\nfunc TestSplitPlain(t *testing.T) {\n\tgot, err := Split(\"a,b,c\")\n\tif err != nil || len(got) != 3 || got[2] != \"c\" {\n\t\tt.Fatal(got, err)\n\t}\n}\n"
+task: 'Four packages in this module are stubs: slug, stats, humandur and csvq. Implement each one to the contract in its doc comment so that `go test ./...` passes. The packages are independent of each other. Do not modify tests.'
+expect:
+  program: bash
+  args:
+  - -c
+  - "set -euo pipefail\nmkdir -p \"$(dirname 'slug/zz_hidden_test.go')\"\ncat > 'slug/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage slug\n\nimport \"testing\"\n\nfunc TestHiddenSlug(t *testing.T) {\n\tfor in, want := range map[string]string{\"  --Go 1.21 é Rocks--  \": \"go-1-21-rocks\", \"\": \"\", \"___\": \"\", \"a__b\": \"a-b\"} {\n\t\tif got := Slugify(in); got != want {\n\t\t\tt.Fatalf(\"%q: %q want %q\", in, got, want)\n\t\t}\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'stats/zz_hidden_test.go')\"\ncat > 'stats/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage stats\n\nimport \"testing\"\n\nfunc TestHiddenMedian(t *testing.T) {\n\tif _, ok := Median(nil); ok {\n\t\tt.Fatal(\"empty\")\n\t}\n\txs := []float64{4, 1, 3, 2}\n\tif m, ok := Median(xs); !ok || m != 2.5 {\n\t\tt.Fatal(m)\n\t}\n\tif xs[0] != 4 || xs[1] != 1 {\n\t\tt.Fatal(\"reordered input\", xs)\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'humandur/zz_hidden_test.go')\"\ncat > 'humandur/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage humandur\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestHiddenFormat(t *testing.T) {\n\tcases := map[time.Duration]string{0: \"0s\", 2 * time.Minute: \"2m\", 45*time.Second + 900*time.Millisecond: \"45s\", -(time.Hour + time.Second): \"-1h1s\", 500 * time.Millisecond: \"0s\", 26 * time.Hour: \"26h\"}\n\tfor d, want := range cases {\n\t\tif got := Format(d); got != want {\n\t\t\tt.Fatalf(\"%v: %q want %q\", d, got, want)\n\t\t}\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'csvq/zz_hidden_test.go')\"\ncat > 'csvq/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage csvq\n\nimport (\n\t\"reflect\"\n\t\"testing\"\n)\n\nfunc TestHiddenSplit(t *testing.T) {\n\tgot, err := Split(`x,\"a,b\",\"say \"\"hi\"\"\",`)\n\tif err != nil || !reflect.DeepEqual(got, []string{\"x\", \"a,b\", `say \"hi\"`, \"\"}) {\n\t\tt.Fatalf(\"%q %v\", got, err)\n\t}\n\tif _, err := Split(`a,\"open`); err == nil {\n\t\tt.Fatal(\"unterminated\")\n\t}\n\tif got, _ := Split(\"\"); !reflect.DeepEqual(got, []string{\"\"}) {\n\t\tt.Fatalf(\"%q\", got)\n\t}\n}\nHIDDEN_EOF\ngo test ./...\n"

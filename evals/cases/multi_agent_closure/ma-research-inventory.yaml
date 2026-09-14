@@ -1,0 +1,59 @@
+id: ma-research-inventory
+name: Inventory exported API of four packages
+max_rounds: 60
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  README.md: |
+    # shop
+
+    Internal packages live under internal/.
+  internal/auth/token.go: "package auth\n\nimport (\n\t\"fmt\"\n)\n\n// Marker lets sibling packages reference this one.\nconst Marker = 1\n\nvar _ = fmt.Sprint\n\n// IssueToken handles one auth operation.\nfunc IssueToken(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"IssueToken: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// ParseToken handles one auth operation.\nfunc ParseToken(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"ParseToken: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc sign(s string) string {\n\treturn s\n}\n"
+  internal/auth/session.go: "package auth\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Session is a auth record.\ntype Session struct {\n\tID    string\n\tValue int\n}\n\n// Expired reports on the Session.\nfunc (x *Session) Expired() int {\n\treturn x.Value\n}\n\n// Renew reports on the Session.\nfunc (x *Session) Renew() int {\n\treturn x.Value\n}\n\nfunc clock(s string) string {\n\treturn s\n}\n"
+  internal/auth/password.go: "package auth\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// HashPassword handles one auth operation.\nfunc HashPassword(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"HashPassword: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// CheckPassword handles one auth operation.\nfunc CheckPassword(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"CheckPassword: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc pepper(s string) string {\n\treturn s\n}\n"
+  internal/billing/invoice.go: "package billing\n\nimport (\n\t\"fmt\"\n\t\"evalcase/internal/auth\"\n\t\"evalcase/internal/catalog\"\n)\n\n// uses auth for cross-package lookups.\nvar _ = auth.Marker\n\n// uses catalog for cross-package lookups.\nvar _ = catalog.Marker\n\n// Marker lets sibling packages reference this one.\nconst Marker = 1\n\nvar _ = fmt.Sprint\n\n// Invoice is a billing record.\ntype Invoice struct {\n\tID    string\n\tValue int\n}\n\n// Total reports on the Invoice.\nfunc (x *Invoice) Total() int {\n\treturn x.Value\n}\n\n// AddLine reports on the Invoice.\nfunc (x *Invoice) AddLine() int {\n\treturn x.Value\n}\n\nfunc roundCents(s string) string {\n\treturn s\n}\n"
+  internal/billing/charge.go: "package billing\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Charge handles one billing operation.\nfunc Charge(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Charge: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// Refund handles one billing operation.\nfunc Refund(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Refund: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc gateway(s string) string {\n\treturn s\n}\n"
+  internal/billing/tax.go: "package billing\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// TaxFor handles one billing operation.\nfunc TaxFor(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"TaxFor: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc rateTable(s string) string {\n\treturn s\n}\n"
+  internal/catalog/item.go: "package catalog\n\nimport (\n\t\"fmt\"\n)\n\n// Marker lets sibling packages reference this one.\nconst Marker = 1\n\nvar _ = fmt.Sprint\n\n// Item is a catalog record.\ntype Item struct {\n\tID    string\n\tValue int\n}\n\n// Price reports on the Item.\nfunc (x *Item) Price() int {\n\treturn x.Value\n}\n\nfunc normalizeSKU(s string) string {\n\treturn s\n}\n"
+  internal/catalog/search.go: "package catalog\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Search handles one catalog operation.\nfunc Search(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Search: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// ByCategory handles one catalog operation.\nfunc ByCategory(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"ByCategory: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc tokenize(s string) string {\n\treturn s\n}\n"
+  internal/catalog/stock.go: "package catalog\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Reserve handles one catalog operation.\nfunc Reserve(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Reserve: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// Release handles one catalog operation.\nfunc Release(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Release: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// InStock reports on the Item.\nfunc (x *Item) InStock() int {\n\treturn x.Value\n}\n"
+  internal/shipping/quote.go: "package shipping\n\nimport (\n\t\"fmt\"\n\t\"evalcase/internal/catalog\"\n)\n\n// uses catalog for cross-package lookups.\nvar _ = catalog.Marker\n\n// Marker lets sibling packages reference this one.\nconst Marker = 1\n\nvar _ = fmt.Sprint\n\n// Quote handles one shipping operation.\nfunc Quote(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Quote: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\nfunc zoneFor(s string) string {\n\treturn s\n}\n"
+  internal/shipping/label.go: "package shipping\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Label is a shipping record.\ntype Label struct {\n\tID    string\n\tValue int\n}\n\n// Render reports on the Label.\nfunc (x *Label) Render() int {\n\treturn x.Value\n}\n\n// NewLabel handles one shipping operation.\nfunc NewLabel(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"NewLabel: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n"
+  internal/shipping/track.go: "package shipping\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n\n// Track handles one shipping operation.\nfunc Track(id string, n int) (string, error) {\n\tif n < 0 {\n\t\treturn \"\", fmt.Errorf(\"Track: negative\")\n\t}\n\treturn fmt.Sprintf(\"%s-%d\", id, n), nil\n}\n\n// Void reports on the Label.\nfunc (x *Label) Void() int {\n\treturn x.Value\n}\n\nfunc carrierURL(s string) string {\n\treturn s\n}\n"
+task: 'Write INVENTORY.md at the repository root. For each package directory under internal/, add a section headed exactly `## <package name>`. Under it, list every exported top-level function as a bullet `- Name` and every exported method as a bullet `- Type.Name` (no types, constants or variables), then one line `imports: <comma-separated names of the internal packages it imports, or none>`. Do not change any Go file.'
+expect:
+  program: bash
+  args:
+  - -c
+  - |
+    set -euo pipefail
+    git diff --quiet HEAD -- '*.go' && go build ./... && python3 - '{"auth": {"names": ["CheckPassword", "HashPassword", "IssueToken", "ParseToken", "Session.Expired", "Session.Renew"], "imports": []}, "billing": {"names": ["Charge", "Invoice.AddLine", "Invoice.Total", "Refund", "TaxFor"], "imports": ["auth", "catalog"]}, "catalog": {"names": ["ByCategory", "Item.InStock", "Item.Price", "Release", "Reserve", "Search"], "imports": []}, "shipping": {"names": ["Label.Render", "Label.Void", "NewLabel", "Quote", "Track"], "imports": ["catalog"]}}' <<'PY_EOF'
+    import json, re, sys
+    expected = json.loads(sys.argv[1])
+    text = open("INVENTORY.md").read()
+    sections = re.split(r"^## +", text, flags=re.M)[1:]
+    got = {}
+    for sec in sections:
+        head, _, body = sec.partition("\n")
+        names = set(re.findall(r"^\s*[-*]\s+`?([A-Za-z_][\w.]*)`?\s*$", body, flags=re.M))
+        m = re.search(r"^imports:\s*(.*)$", body, flags=re.M)
+        imports = sorted(x.strip().strip("`") for x in (m.group(1) if m else "").split(",") if x.strip() and x.strip().strip("`") != "none")
+        got[head.strip().strip("`")] = {"names": sorted(names), "imports": imports}
+    bad = []
+    for pkg, want in expected.items():
+        have = got.get(pkg)
+        if have is None:
+            bad.append(f"missing section {pkg}")
+            continue
+        if have["names"] != want["names"]:
+            bad.append(f"{pkg} names: got {have['names']} want {want['names']}")
+        if have["imports"] != want["imports"]:
+            bad.append(f"{pkg} imports: got {have['imports']} want {want['imports']}")
+    extra = set(got) - set(expected)
+    if extra:
+        bad.append(f"unexpected sections {sorted(extra)}")
+    print("\n".join(bad) or "inventory ok")
+    sys.exit(1 if bad else 0)
+    PY_EOF

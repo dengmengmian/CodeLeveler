@@ -1,0 +1,14 @@
+{
+  "suite": "multi_agent",
+  "experiment": "MA-PRODUCT-CLOSURE",
+  "purpose": "Category of each case in evals/cases/multi_agent_closure. Never rendered into a prompt. The task text never mentions sub-agents: whether to delegate is the model's decision.",
+  "cases": {
+    "ma-simple-clamp": { "category": "SIMPLE", "delegation_fit": "unsuitable" },
+    "ma-multifile-timeout": { "category": "MULTI_FILE", "delegation_fit": "weak" },
+    "ma-research-inventory": { "category": "PARALLELIZABLE_RESEARCH", "delegation_fit": "suitable" },
+    "ma-parallel-impl": { "category": "PARALLELIZABLE_IMPLEMENTATION", "delegation_fit": "suitable" },
+    "ma-review-ratelimit": { "category": "REVIEW_HEAVY", "delegation_fit": "review" },
+    "ma-long-kvstore": { "category": "LONG_GOAL", "delegation_fit": "weak" },
+    "ma-recovery-parallel": { "category": "RECOVERY", "delegation_fit": "suitable", "kill_and_resume": true }
+  }
+}

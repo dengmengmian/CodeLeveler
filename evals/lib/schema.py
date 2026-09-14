@@ -127,6 +127,7 @@ def make_run(
     mode: str | None = None,
 ) -> dict[str, Any]:
     spawn = timeline.get("spawn_metric") or {}
+    lifecycle = timeline.get("child_lifecycle") or {}
     decision_round, latency = _decision(timeline)
     offered = bool(timeline.get("offered"))
     spawned = bool(timeline.get("spawn"))
@@ -191,7 +192,10 @@ def make_run(
             "ownership_granted": timeline.get("ownership_granted", 0),
             "ownership_denied": timeline.get("ownership_denied", 0),
             "claim_count": timeline.get("claim_count", 0),
-            "violations": 0,
+            "violations": lifecycle.get("ownership_violation", 0),
+            "duplicate_settlement": lifecycle.get("duplicate_settlement", 0),
+            "open_orphan": lifecycle.get("open_orphan", 0),
+            "lost_accepted_child": lifecycle.get("lost_accepted_child", 0),
         },
         "metrics": {
             "valid": bool(timeline.get("valid")),
