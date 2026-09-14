@@ -188,7 +188,7 @@ tasks with children.
 | `cargo test --workspace --all-features --locked --no-fail-fast` | 3853 passed, 0 failed, 20 ignored |
 | web typecheck / vitest / build | pass / 181 passed / pass |
 | `flutter analyze` / `flutter test` | no issues / 54 passed |
-| exact main CI | `8a2b46d` run 34801621375 attempt 1 success (all jobs); review fixes recorded in the MA1 report |
+| exact main CI | `8a2b46d` run 34801621375 attempt 1 success; after review fixes `1ed1c62` run 34803498850 attempt 1 success (Linux, macOS, Windows, web, mobile, deny/audit) |
 
 ### 9.4 Residuals (non-blocking, stated)
 
@@ -236,4 +236,7 @@ CHILD_SETTLEMENT=PASS
 SETTLEMENT_EXACTLY_ONCE=YES
 OWNERSHIP_RELEASE=PASS
 CHILD_USAGE_DURABLE=YES (G7b/G7c bounded residuals)
+INDEPENDENT_REVIEW=3 findings, all fixed
+
+MA1_RUNTIME_CONTRACT=PASS
 ```
