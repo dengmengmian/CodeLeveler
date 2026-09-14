@@ -486,6 +486,28 @@ impl MemoryEventStore {
         Self::default()
     }
 
+    /// Canonical terminal event already committed for an ownership epoch.
+    pub(crate) fn task_terminal_for_epoch(
+        &self,
+        session_id: &SessionId,
+        token: &leveler_core::OwnershipToken,
+    ) -> Option<EventRecord> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.session_id == session_id.as_str()
+                    && event.event_type == "task_finished"
+                    && crate::terminal_store::task_terminal_payload_matches_epoch(
+                        &event.payload,
+                        token,
+                    )
+            })
+            .max_by_key(|event| event.sequence)
+            .cloned()
+    }
+
     /// Couple this store to the shared ownership authority so `append_owned`
     /// can enforce the fence.
     pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {

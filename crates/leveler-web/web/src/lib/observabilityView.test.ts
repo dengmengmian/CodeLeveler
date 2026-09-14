@@ -114,6 +114,9 @@ describe('observability projection', () => {
     expect(
       shouldRefreshObservability({ type: 'observability_loaded', query_id: 'q1', observation: loaded() }),
     ).toBe(false);
+    expect(
+      shouldRefreshObservability({ type: 'turn_completed_with_warnings', reason: 'review unavailable' }),
+    ).toBe(true);
   });
 
   it('projects running / completed / failed agents from protocol status only', () => {

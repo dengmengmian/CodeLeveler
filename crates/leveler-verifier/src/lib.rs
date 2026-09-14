@@ -17,5 +17,8 @@ mod verifier;
 
 pub use failure::{ClassifiedFailure, FailureKind, RecoveryStrategy, classify};
 pub use plan::{CheckKind, VerificationCommand, VerificationPlan};
-pub use report::{CheckOutcome, CheckStatus, Verdict, VerificationReport};
+pub use report::{
+    BaselineProvenance, BaselineSource, CheckExecution, CheckObservation, CheckOutcome,
+    CheckStatus, GateDisposition, GateSkipReason, NotRunReason, Verdict, VerificationReport,
+};
 pub use verifier::Verifier;

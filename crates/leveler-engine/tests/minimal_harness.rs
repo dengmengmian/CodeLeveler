@@ -331,6 +331,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
 
     // And the engine can close the task for this harness too.
     let token = restarted.acquire_ownership(&session).await.unwrap();
+    let mut terminal_observations = 0;
     restarted
         .finish_task(
             &token,
@@ -343,11 +344,34 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
                 status: SessionStatus::Completed,
                 state: AgentState::Complete,
                 goal: None,
+                warnings: Vec::new(),
             },
-            &mut |_| {},
+            &mut |_| terminal_observations += 1,
         )
         .await
         .expect("the engine stamps a terminal fact for any harness");
+    restarted
+        .finish_task(
+            &token,
+            &session,
+            leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Completed,
+                verification: VerificationStatus::NotRun,
+                reason: None,
+                stop: Some(StopReason::Answered),
+                status: SessionStatus::Completed,
+                state: AgentState::Complete,
+                goal: None,
+                warnings: Vec::new(),
+            },
+            &mut |_| terminal_observations += 1,
+        )
+        .await
+        .expect("retrying the same terminal epoch is idempotent");
+    assert_eq!(
+        terminal_observations, 1,
+        "a replayed terminal fact must not be projected twice"
+    );
 }
 
 /// H6: this proof is worthless if it quietly leans on the coding harness.

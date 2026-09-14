@@ -227,6 +227,13 @@ fn render_event_text(event: AgentEvent) {
                 elapsed_ms / 1000
             );
         }
+        AgentEvent::FinalizationStarted => {
+            println!("{} finalizing", console::style("⋯").yellow());
+        }
+        AgentEvent::FinalizationPhaseStarted { phase } => {
+            println!("  {} finalizing: {phase}", console::style("⋯").yellow());
+        }
+        AgentEvent::FinalizationPhaseFinished { .. } => {}
         AgentEvent::Finished(_) => {}
     }
 }
@@ -417,6 +424,15 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         }),
         AgentEvent::CommandProgress { label, elapsed_ms } => serde_json::json!({
             "type": "command_progress", "label": label, "elapsed_ms": elapsed_ms,
+        }),
+        AgentEvent::FinalizationStarted => serde_json::json!({
+            "type": "finalization_started",
+        }),
+        AgentEvent::FinalizationPhaseStarted { phase } => serde_json::json!({
+            "type": "finalization_phase_started", "phase": phase,
+        }),
+        AgentEvent::FinalizationPhaseFinished { phase, elapsed_ms } => serde_json::json!({
+            "type": "finalization_phase_finished", "phase": phase, "elapsed_ms": elapsed_ms,
         }),
     }
 }

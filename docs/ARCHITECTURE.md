@@ -649,6 +649,46 @@ User owns final acceptance.
 
 This prevents a green check, successful Tool call, or changed file from becoming an automatic “done” signal.
 
+### 10.4 Final Prose Is Not a Task Terminal
+
+The model producing its last assistant text proves only that the turn is no longer waiting for model generation. It does not prove that the task is complete.
+
+Closeout crosses one runtime lifecycle boundary:
+
+```text
+Running
+   ↓ final assistant text ends
+Finalizing
+   ↓ dependency settlement, verification, required evidence/review, outcome resolution
+Terminal (TaskFinished)
+```
+
+`Finalizing` is a domain-neutral Runtime state. The Engine records its phases and timing, but does not interpret why a coding check passed, failed, or was exempted. Those semantics belong to the Coding Harness. Durable phase starts, the next phase start, and the `TaskFinished` timestamp are sufficient to calculate each interval mechanically; pure phase-completion timing must not add persistence to the authoritative terminal critical path or alter the result.
+
+`TaskFinished` is the only authoritative task terminal. Clients project completed, failed, blocked, or verification-warning results only from a persisted `TaskFinished`; final prose, turn completion, and background cleanup cannot substitute for it. If the terminal transaction did not commit, a client may surface only a recoverable error, never synthesize `Failed` or any other terminal.
+
+Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint fails the window instead of claiming it is safely resumable. A review configured as required is also completion evidence: it runs for each product-mutating turn, and failure to complete it or reported model findings produce completion warnings separate from project verification. Findings remain advisory model conclusions, not mechanical verification verdicts; an advisory review must not block.
+
+### 10.5 Verification Observation and Gate Disposition Are Separate Facts
+
+Each verification check records at least:
+
+```text
+Observation: Passed | Failed | NotRun(reason)
+Disposition: Required | Skipped(reason)
+```
+
+Observation answers what the machine actually saw. Disposition answers whether that observation blocks this delivery. They must not be collapsed into one status string.
+
+A mechanically confirmed baseline failure is therefore represented as:
+
+```text
+Observation = Failed
+Disposition = Skipped(ConfirmedBaselineFailure { revision, provenance })
+```
+
+It is not `NotRun`. Conversely, a check without execution evidence can only be `NotRun` with a reason; a model's claim that the failure already existed cannot grant a baseline exemption. Confirmation requires comparable mechanical evidence, and checks that cannot yet be compared reliably continue to fail closed.
+
 ---
 
 ## 11. Persistence: Letting Work Continue Beyond One Conversation

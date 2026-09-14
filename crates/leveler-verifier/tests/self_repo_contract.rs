@@ -18,7 +18,7 @@ use std::sync::Arc;
 use leveler_core::EnvSnapshot;
 use leveler_verifier::discover::plan_for_repo;
 use leveler_verifier::plan::{ScopePolicy, VerificationPlan};
-use leveler_verifier::{CheckKind, CheckStatus, Verdict, VerificationReport, Verifier};
+use leveler_verifier::{CheckKind, CheckObservation, Verdict, VerificationReport, Verifier};
 
 fn project(spec: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -76,8 +76,8 @@ async fn a_declared_command_really_executes() {
     let report = run(&dir, &plan).await;
     assert_eq!(report.checks.len(), 1);
     assert_eq!(
-        report.checks[0].status,
-        CheckStatus::Passed,
+        report.checks[0].observation,
+        CheckObservation::Passed,
         "evidence: {}",
         report.checks[0].evidence
     );
@@ -102,7 +102,7 @@ async fn a_declared_failure_propagates() {
     );
     let plan = plan_for_repo(dir.path());
     let report = run(&dir, &plan).await;
-    assert_eq!(report.checks[0].status, CheckStatus::Failed);
+    assert_eq!(report.checks[0].observation, CheckObservation::Failed);
     assert!(
         report.checks[0].evidence.contains("CONTRACT_BROKEN"),
         "the failing command's own output must be kept, got: {}",
@@ -127,7 +127,11 @@ async fn a_declared_non_gating_failure_does_not_block_but_still_reads_failed() {
         .iter()
         .find(|c| c.name == "format")
         .expect("format check");
-    assert_eq!(fmt.status, CheckStatus::Failed, "the check failed; say so");
+    assert_eq!(
+        fmt.observation,
+        CheckObservation::Failed,
+        "the check failed; say so"
+    );
     assert_eq!(report.verdict(), Verdict::Verified);
     assert!(report.passed());
 }

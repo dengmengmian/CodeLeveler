@@ -20,6 +20,7 @@ use leveler_lifecycle::{
     AgentState, PlanState, ProgressLedger, SessionStatus, StopReason, VerificationStatus,
 };
 use leveler_model::{Message, Role};
+#[cfg(test)]
 use leveler_storage::EventStore;
 use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
@@ -27,6 +28,96 @@ use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::coding::turn::{TurnInput, drive_turn};
 use crate::coding::workspace::GitWorkspace;
 use crate::{ContinuationPolicy, StepLimits};
+
+const FINALIZATION_VERIFICATION: &str = "verification";
+const FINALIZATION_REVIEW: &str = "review";
+const FINALIZATION_RESOLVING_OUTCOME: &str = "resolving_outcome";
+const FINALIZATION_CONTINUATION_CHECKPOINT: &str = "continuation_checkpoint";
+const FINALIZATION_PUBLISHING_TERMINAL: &str = "publishing_terminal";
+
+fn engine_verification_observation(
+    observation: &leveler_verifier::CheckObservation,
+) -> leveler_engine::VerificationObservation {
+    match observation {
+        leveler_verifier::CheckObservation::Passed => {
+            leveler_engine::VerificationObservation::Passed
+        }
+        leveler_verifier::CheckObservation::Failed => {
+            leveler_engine::VerificationObservation::Failed
+        }
+        leveler_verifier::CheckObservation::NotRun(reason) => {
+            leveler_engine::VerificationObservation::NotRun {
+                reason: reason.as_str().to_string(),
+            }
+        }
+    }
+}
+
+fn engine_verification_disposition(
+    disposition: &leveler_verifier::GateDisposition,
+) -> leveler_engine::VerificationDisposition {
+    use leveler_verifier::{BaselineSource, GateDisposition, GateSkipReason};
+    match disposition {
+        GateDisposition::Required => leveler_engine::VerificationDisposition::Required,
+        GateDisposition::Skipped(reason) => {
+            let (reason, revision, source, failed_tests) = match reason {
+                GateSkipReason::ConfirmedBaselineFailure {
+                    revision,
+                    provenance,
+                } => (
+                    "confirmed_baseline_failure".to_string(),
+                    Some(revision.clone()),
+                    Some(match provenance.source {
+                        BaselineSource::DetachedWorktreeRerun => {
+                            "detached_worktree_rerun".to_string()
+                        }
+                    }),
+                    provenance.failed_tests.iter().cloned().collect(),
+                ),
+                GateSkipReason::NotApplicable => {
+                    ("not_applicable".to_string(), None, None, Vec::new())
+                }
+                GateSkipReason::Superseded => ("superseded".to_string(), None, None, Vec::new()),
+            };
+            leveler_engine::VerificationDisposition::Skipped {
+                reason,
+                revision,
+                source,
+                failed_tests,
+            }
+        }
+    }
+}
+
+async fn begin_finalization_phase(
+    log: &EventLog<'_>,
+    phase: &str,
+    observer: &mut (dyn FnMut(EngineEvent) + Send),
+) -> Option<std::time::Instant> {
+    if let Err(error) = log
+        .append(
+            None,
+            EngineEvent::FinalizationPhaseStarted {
+                phase: phase.to_string(),
+                at: leveler_core::now(),
+            },
+            observer,
+        )
+        .await
+    {
+        tracing::warn!(%error, %phase, "could not persist finalization phase start");
+        return None;
+    }
+    Some(std::time::Instant::now())
+}
+
+fn finish_finalization_phase(phase: &str, started: std::time::Instant) {
+    tracing::debug!(
+        %phase,
+        elapsed_ms = started.elapsed().as_millis(),
+        "finalization phase finished"
+    );
+}
 
 /// The Coding harness: the composition root for a coding agent, over the
 /// engine that gives it a lifecycle.
@@ -185,12 +276,16 @@ pub struct TaskReport {
     /// The executor's concrete reason for a non-success stop, when available.
     pub stop_detail: Option<String>,
     pub rounds: u32,
+    /// Executor wall time used to preserve the required review's bounded tail.
+    pub execution_duration_ms: u64,
     /// Turns this invocation ran for the goal. One: the engine no longer
     /// opens further windows on the model's behalf, so an invocation is one
     /// turn. Kept as the writer of the durable `goals.windows_run` count.
     pub windows: u32,
     /// Legacy review findings (unused; kept for report shape stability).
     pub review: Option<Vec<String>>,
+    /// Completion-contract warnings orthogonal to project verification.
+    pub completion_warnings: Vec<String>,
 }
 
 impl TaskReport {
@@ -214,8 +309,10 @@ impl TaskReport {
             stop_reason,
             stop_detail: None,
             rounds,
+            execution_duration_ms: 0,
             windows: 1,
             review: None,
+            completion_warnings: Vec::new(),
         }
     }
 
@@ -229,14 +326,96 @@ fn report_from_agent_outcome(
     outcome: crate::AgentOutcome,
     task_outcome: TaskOutcome,
 ) -> TaskReport {
-    TaskReport::new(
+    let execution_duration_ms = outcome.progress.cumulative_duration_ms;
+    let mut report = TaskReport::new(
         task_outcome,
         outcome.final_text,
         outcome.modified_files,
         outcome.stop_reason,
         outcome.rounds,
     )
-    .with_stop_detail(outcome.stop_detail)
+    .with_stop_detail(outcome.stop_detail);
+    report.execution_duration_ms = execution_duration_ms;
+    report
+}
+
+fn task_terminal_reason(report: &TaskReport) -> Option<String> {
+    if report.outcome != TaskOutcome::Completed {
+        return report.stop_detail.clone();
+    }
+    if task_terminal_stop(report) != StopReason::Completed {
+        return report.stop_detail.clone();
+    }
+    match report.verification_status {
+        VerificationStatus::Passed => None,
+        VerificationStatus::Failed => Some(match report.verification.as_ref() {
+            Some(verification) if !verification.scope_ok => format!(
+                "modified files outside allowed scope: {}",
+                verification.scope_violations.join(", ")
+            ),
+            Some(verification) => {
+                let failed = verification
+                    .failed_gates()
+                    .into_iter()
+                    .map(failed_gate_label)
+                    .collect::<Vec<_>>();
+                if failed.is_empty() {
+                    "verification did not pass".to_string()
+                } else {
+                    format!("failed gate(s): {}", failed.join(", "))
+                }
+            }
+            None => "verification did not pass".to_string(),
+        }),
+        VerificationStatus::NotRun | VerificationStatus::Unavailable => {
+            if report.modified_files.is_empty() {
+                return Some("no_code_changes".to_string());
+            }
+            Some(match report.verification.as_ref() {
+                Some(verification) if !verification.has_gating_checks() => {
+                    "no_automatic_verification".to_string()
+                }
+                Some(verification) => match verification.verdict() {
+                    Verdict::Unverified(reason) => reason,
+                    _ => "no_automatic_verification".to_string(),
+                },
+                None => "no_automatic_verification".to_string(),
+            })
+        }
+    }
+}
+
+fn task_terminal_stop(report: &TaskReport) -> StopReason {
+    if report.outcome == TaskOutcome::Completed
+        && report.stop_reason == StopReason::Answered
+        && !report.modified_files.is_empty()
+    {
+        // `Answered` is a truthful executor stop for pure Q&A. Once the Coding
+        // Harness has observed a product mutation, the durable task terminal
+        // must enter the completion+verification path; otherwise replay would
+        // discard failed/unavailable verification and review warnings.
+        StopReason::Completed
+    } else {
+        report.stop_reason
+    }
+}
+
+fn failed_gate_label(check: &leveler_verifier::CheckOutcome) -> String {
+    if check.failed_tests.is_empty() {
+        return check.name.clone();
+    }
+    let shown = check
+        .failed_tests
+        .iter()
+        .take(2)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let remaining = check.failed_tests.len() - shown.len();
+    if remaining == 0 {
+        format!("{} ({})", check.name, shown.join(", "))
+    } else {
+        format!("{} ({}, +{} more)", check.name, shown.join(", "), remaining)
+    }
 }
 
 pub fn mode_str(mode: PermissionProfile) -> &'static str {
@@ -495,6 +674,7 @@ impl CodingRuntime {
         goal: Option<&leveler_core::GoalId>,
         repo: Option<&std::path::Path>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: &CancellationToken,
     ) -> Result<(), EngineError> {
         // A stale runtime has no authority to write a terminal fact - not even
         // Failed. Abort silently here; the current owner decides the task's
@@ -509,13 +689,12 @@ impl CodingRuntime {
         ) {
             return Ok(());
         }
-        // Settle this session's background tasks at the terminal fact — the
-        // ONE choke point every path shares (run/chat/resume/continuation,
-        // completed/failed/budget_limited). R006 R6-P4: the reap used to hang
-        // off one spawn function in the app layer, so a goal continued via
-        // ordinary messages (chat-routed) leaked its dev servers. Interrupted
-        // (user cancel) deliberately keeps them inspectable. Daemon-owned
-        // services (browser/MCP/LSP) have no session scope and are untouched.
+        if matches!(result, Err(EngineError::UnclosedTerminalBoundary(_))) {
+            // A task terminal is a closed evidence boundary. If a child that
+            // can affect completion has no durable terminal, publishing even
+            // a Failed task would put the parent behind an open activation.
+            return Ok(());
+        }
         let interrupted = matches!(result, Err(EngineError::Cancelled));
         // R007 F3: a WORK-WINDOW boundary is not a goal terminal. When the
         // round/step budget runs out the session stays resumable
@@ -523,90 +702,64 @@ impl CodingRuntime {
         // window — R007 hit the ceiling twice and spent each next window
         // rebuilding the dev server this reap had just killed. A genuine goal
         // terminal still reaps, so R6-P4 is unaffected.
-        let goal_continues = matches!(&result, Ok(report)
+        let mut goal_continues = matches!(&result, Ok(report)
             if terminal_status_for(report).1 == AgentState::Execute);
-        if !interrupted
-            && !goal_continues
-            && let Some(scope) = self.factory.tool_context.session_scope.as_deref()
-        {
-            let reaped = self.factory.background_tasks.kill_scope(scope).await;
-            if reaped > 0 {
-                tracing::info!(
-                    session = scope,
-                    "terminal settlement reaped {reaped} session-owned background task(s)"
-                );
-            }
-        }
+        let log = EventLog::new_owned(
+            self.engine.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
+        let resolution_phase =
+            begin_finalization_phase(&log, FINALIZATION_RESOLVING_OUTCOME, observer).await;
         let goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
             goal_id: goal_id.clone(),
             windows_delta: result.as_ref().map(|report| report.windows).unwrap_or(1),
             settle: goal_owes_no_more_work(result),
         });
-        let settled = match result {
+        let mut terminal = match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
-                self.engine
-                    .finish_task(
-                        token,
-                        session_id,
-                        leveler_engine::TaskTerminal {
-                            outcome: report.outcome,
-                            verification: report.verification_status,
-                            reason: (report.outcome != TaskOutcome::Completed)
-                                .then(|| report.final_text.clone()),
-                            stop: Some(report.stop_reason),
-                            status,
-                            state,
-                            goal: goal_update,
-                        },
-                        observer,
-                    )
-                    .await
+                leveler_engine::TaskTerminal {
+                    outcome: report.outcome,
+                    verification: report.verification_status,
+                    reason: task_terminal_reason(report),
+                    stop: Some(task_terminal_stop(report)),
+                    status,
+                    state,
+                    goal: goal_update,
+                    warnings: report.completion_warnings.clone(),
+                }
             }
-            Err(EngineError::Cancelled) => {
-                self.engine
-                    .finish_task(
-                        token,
-                        session_id,
-                        leveler_engine::TaskTerminal {
-                            outcome: TaskOutcome::Interrupted,
-                            verification: VerificationStatus::NotRun,
-                            reason: None,
-                            stop: None,
-                            status: SessionStatus::Interrupted,
-                            state: AgentState::Execute,
-                            goal: goal_update,
-                        },
-                        observer,
-                    )
-                    .await
-            }
-            Err(error) => {
-                self.engine
-                    .finish_task(
-                        token,
-                        session_id,
-                        leveler_engine::TaskTerminal {
-                            outcome: TaskOutcome::Failed,
-                            verification: VerificationStatus::NotRun,
-                            reason: Some(error.to_string()),
-                            stop: None,
-                            status: SessionStatus::Failed,
-                            state: AgentState::Failed,
-                            goal: goal_update,
-                        },
-                        observer,
-                    )
-                    .await
-            }
+            Err(EngineError::Cancelled) => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Interrupted,
+                verification: VerificationStatus::NotRun,
+                reason: None,
+                stop: None,
+                status: SessionStatus::Interrupted,
+                state: AgentState::Execute,
+                goal: goal_update,
+                warnings: Vec::new(),
+            },
+            Err(error) => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Failed,
+                verification: VerificationStatus::NotRun,
+                reason: Some(error.to_string()),
+                stop: None,
+                status: SessionStatus::Failed,
+                state: AgentState::Failed,
+                goal: goal_update,
+                warnings: Vec::new(),
+            },
         };
-        // Long-goal P3 milestone: a work-window boundary where the goal still
-        // continues is the deterministic phase signal — cut a durable
-        // checkpoint AFTER the terminal fact committed (the cursor then
-        // includes it). Best-effort: a failed checkpoint never un-settles a
-        // committed terminal.
-        if settled.is_ok() && goal_continues {
-            match crate::coding::checkpoint::create_goal_checkpoint(
+        // A continuing goal's milestone is part of the authoritative window
+        // boundary. Persist it before TaskFinished releases admission, so its
+        // cursor and workspace facts cannot absorb the next turn.
+        let mut checkpoint_failure = None;
+        if goal_continues && goal.is_some() {
+            let checkpoint_phase =
+                begin_finalization_phase(&log, FINALIZATION_CONTINUATION_CHECKPOINT, observer)
+                    .await;
+            let checkpoint = crate::coding::checkpoint::create_goal_checkpoint(
                 &self.engine,
                 session_id,
                 leveler_lifecycle::CheckpointReason::Milestone,
@@ -615,14 +768,9 @@ impl CodingRuntime {
                     .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
                 None,
             )
-            .await
-            {
+            .await;
+            match checkpoint {
                 Ok(Some(record)) => {
-                    let log = EventLog::new_owned(
-                        self.engine.stores.events.as_ref(),
-                        session_id.clone(),
-                        token.clone(),
-                    );
                     let event = crate::coding::checkpoint::checkpoint_created_event(&record);
                     if let Err(error) = log.append(None, event, observer).await {
                         tracing::warn!(
@@ -631,14 +779,112 @@ impl CodingRuntime {
                         );
                     }
                 }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    "milestone goal checkpoint failed; the terminal fact stands"
-                ),
+                Ok(None) => {
+                    checkpoint_failure = Some(EngineError::Config(
+                        "continuing goal has no checkpointable running goal".to_string(),
+                    ));
+                }
+                Err(error) => checkpoint_failure = Some(error),
+            }
+            if let Some(started) = checkpoint_phase {
+                finish_finalization_phase(FINALIZATION_CONTINUATION_CHECKPOINT, started);
+            }
+            if let Some(error) = checkpoint_failure.as_ref() {
+                // A continuation without its checkpoint is not safely
+                // resumable. Make that the authoritative terminal truth
+                // rather than logging a best-effort failure and claiming the
+                // work window closed correctly.
+                terminal.outcome = TaskOutcome::Failed;
+                terminal.verification = VerificationStatus::NotRun;
+                terminal.reason = Some(format!("continuation checkpoint failed: {error}"));
+                terminal.stop = None;
+                terminal.status = SessionStatus::Failed;
+                terminal.state = AgentState::Failed;
+                if let Some(goal) = terminal.goal.as_mut() {
+                    goal.settle = true;
+                }
+                terminal.warnings.clear();
+                goal_continues = false;
             }
         }
-        settled
+        if let Some(started) = resolution_phase {
+            finish_finalization_phase(FINALIZATION_RESOLVING_OUTCOME, started);
+        }
+        // Detach the cleanup target set before publishing terminal. A new turn
+        // may be admitted as soon as TaskFinished is projected; a later
+        // session-wide lookup could otherwise kill processes owned by that new
+        // turn.
+        let mut cleanup_ticket = if !interrupted && !goal_continues {
+            match self.factory.tool_context.session_scope.as_deref() {
+                Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let publishing_phase =
+            begin_finalization_phase(&log, FINALIZATION_PUBLISHING_TERMINAL, observer).await;
+        // No await may appear between this decision and entering finish_task:
+        // cancellation owns the outcome throughout Finalizing, right up to
+        // the canonical terminal commit's invocation.
+        let cancelled_at_commit = cancellation.is_cancelled();
+        if cancelled_at_commit {
+            terminal.outcome = TaskOutcome::Interrupted;
+            terminal.verification = VerificationStatus::NotRun;
+            terminal.reason = None;
+            terminal.stop = None;
+            terminal.status = SessionStatus::Interrupted;
+            terminal.state = AgentState::Execute;
+            if let Some(goal) = terminal.goal.as_mut() {
+                goal.settle = false;
+            }
+            terminal.warnings.clear();
+            // Interrupted work retains its background processes. The ticket is
+            // only a detached target set and has performed no side effect yet.
+            cleanup_ticket = None;
+        }
+        let settled = self
+            .engine
+            .finish_task(token, session_id, terminal, observer)
+            .await;
+        if let Some(started) = publishing_phase {
+            tracing::debug!(
+                session = %session_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "terminal publish finished"
+            );
+        }
+
+        // Process cleanup is deliberately post-terminal. It cannot change the
+        // TaskReport and the TaskFinished observer has already made the durable
+        // outcome visible. Interrupted and continuing work windows retain their
+        // processes exactly as before.
+        if settled.is_ok()
+            && let Some(ticket) = cleanup_ticket
+            && !ticket.is_empty()
+        {
+            let cleanup_started = std::time::Instant::now();
+            let reaped = ticket.settle().await;
+            if reaped > 0 {
+                tracing::info!(
+                    session = %session_id,
+                    "post-terminal cleanup reaped {reaped} session-owned background task(s)"
+                );
+            }
+            tracing::debug!(
+                session = %session_id,
+                elapsed_ms = cleanup_started.elapsed().as_millis(),
+                "post-terminal cleanup finished"
+            );
+        }
+        settled?;
+        if cancelled_at_commit {
+            return Err(EngineError::Cancelled);
+        }
+        if let Some(error) = checkpoint_failure {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Run the task to a terminal outcome. Every turn, tool call, approval and
@@ -673,6 +919,7 @@ impl CodingRuntime {
                     None,
                     Some(&spec.coding.repository),
                     observer,
+                    &cancellation,
                 )
                 .await?;
                 return result;
@@ -731,6 +978,7 @@ impl CodingRuntime {
         };
 
         // Orchestrate execution path removed; legacy kind falls through to direct.
+        let terminal_cancellation = cancellation.clone();
         let result = match spec.runtime.kind {
             ExecutionKind::Direct => {
                 self.run_direct(&log, &runner, spec, observer, cancellation)
@@ -739,6 +987,11 @@ impl CodingRuntime {
             ExecutionKind::Parallel => Err(EngineError::Config(
                 "the parallel strategy lands in B9".to_string(),
             )),
+        };
+        let result = if terminal_cancellation.is_cancelled() {
+            Err(EngineError::Cancelled)
+        } else {
+            result
         };
 
         // Stamp the terminal outcome (interrupted on cancellation) and emit
@@ -750,6 +1003,7 @@ impl CodingRuntime {
             Some(&goal),
             Some(&spec.coding.repository),
             observer,
+            &terminal_cancellation,
         )
         .await?;
         result
@@ -772,8 +1026,9 @@ impl CodingRuntime {
         // turn: measured on a repo with one pre-existing red test, a 3-round edit
         // became a 45-round run in which the repair turn started rewriting
         // unrelated files trying to make someone else's failure go away.
-        // Interactive chat is the path where a dirty, already-red worktree is the
-        // normal case, so it needs this more than `run` does.
+        // A dirty worktree cannot use HEAD as a truthful before-change
+        // snapshot, so `capture_head` deliberately returns None there and the
+        // turn remains unattributed rather than inventing baseline authority.
         let owned_spec;
         let spec = if spec.coding.base_commit.is_none() {
             match crate::coding::baseline::capture_head(&spec.coding.repository).await {
@@ -856,6 +1111,7 @@ impl CodingRuntime {
             role: Role::User,
             content: content.clone(),
         };
+        let terminal_cancellation = cancellation.clone();
         let result = async {
             let recorded = runner
                 .run_turn(
@@ -892,6 +1148,11 @@ impl CodingRuntime {
             .await
         }
         .await;
+        let result = if terminal_cancellation.is_cancelled() {
+            Err(EngineError::Cancelled)
+        } else {
+            result
+        };
         self.finish_from_result(
             &token,
             session_id,
@@ -899,6 +1160,7 @@ impl CodingRuntime {
             None,
             Some(&spec.coding.repository),
             observer,
+            &terminal_cancellation,
         )
         .await?;
         result
@@ -966,6 +1228,7 @@ impl CodingRuntime {
                     None,
                     Some(&spec.coding.repository),
                     observer,
+                    &cancellation,
                 )
                 .await?;
                 return result;
@@ -1011,9 +1274,15 @@ impl CodingRuntime {
         self.recover_crash_window(&log, observer, &cancellation)
             .await?;
 
+        let terminal_cancellation = cancellation.clone();
         let result = self
             .resume_direct(&log, &runner, spec, prior, observer, cancellation)
             .await;
+        let result = if terminal_cancellation.is_cancelled() {
+            Err(EngineError::Cancelled)
+        } else {
+            result
+        };
         self.finish_from_result(
             &token,
             session_id,
@@ -1021,6 +1290,7 @@ impl CodingRuntime {
             Some(&goal),
             Some(&spec.coding.repository),
             observer,
+            &terminal_cancellation,
         )
         .await?;
         result
@@ -1302,24 +1572,17 @@ impl CodingRuntime {
         Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
     }
 
-    /// Shared tail of fresh and resumed direct runs: map the stop reason,
-    /// then verify + bounded repair.
-    /// Evaluate and (when required) run the independent review at the CLOSURE
-    /// boundary — once per task, for every conclude_direct exit that follows a
-    /// real product mutation. R011-F2: binding this to the Verified label meant
-    /// a failed wide-diff goal — where a reviewer pays most — could never get
-    /// one. R013-F1: a launch failure was swallowed into an unexplained
-    /// downgrade; every branch here persists a `review_stage` event first.
-    ///
-    /// The review result never upgrades or downgrades a non-Verified outcome;
-    /// only the Verified label depends on it (a required review that did not
-    /// complete keeps refusing Verified, exactly as before).
+    /// Settle the configured required review before the terminal boundary.
+    /// Findings remain model-authored advisory information, but whether the
+    /// review completed and whether it reported findings are explicit
+    /// completion warnings rather than hidden post-terminal work.
     async fn closure_review_stage(
         &self,
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
-        outcome: &crate::AgentOutcome,
+        modified_files: &[String],
+        execution_duration_ms: u64,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<ClosureReview, EngineError> {
@@ -1328,7 +1591,7 @@ impl CodingRuntime {
             action: action.to_string(),
             detail,
         };
-        if outcome.modified_files.is_empty() {
+        if modified_files.is_empty() {
             log.append(
                 None,
                 stage(false, "not_required", "no product mutation".to_string()),
@@ -1350,45 +1613,41 @@ impl CodingRuntime {
             }
             IndependentReviewPolicy::Required => format!(
                 "independent_review required, {} modified file(s)",
-                outcome.modified_files.len()
+                modified_files.len()
             ),
         };
-        if session_had_review(runner.stores.events.as_ref(), &runner.session_id)
-            .await
-            .unwrap_or(false)
-        {
-            log.append(None, stage(true, "already_reviewed", reason), observer)
-                .await?;
-            return Ok(ClosureReview::AlreadyReviewed);
-        }
         // Persist the attempt BEFORE it runs, so even a crash mid-launch
         // leaves a breadcrumb instead of silence.
         log.append(None, stage(true, "launching", reason.clone()), observer)
             .await?;
-        let diff = review_diff(&spec.coding.repository, &outcome.modified_files).await;
+        let diff = review_diff(&spec.coding.repository, modified_files).await;
         match run_review(
             runner,
             &self.factory,
             goal_profile(spec),
-            review_brief(&spec.runtime.goal, &outcome.modified_files, diff.as_deref()),
-            outcome.modified_files.clone(),
-            std::time::Duration::from_millis(outcome.progress.cumulative_duration_ms),
+            review_brief(&spec.runtime.goal, modified_files, diff.as_deref()),
+            modified_files.to_vec(),
+            std::time::Duration::from_millis(execution_duration_ms),
             observer,
             cancellation.clone(),
         )
         .await
         {
-            Ok(true) => {
+            Ok(review) if review.completed => {
                 log.append(None, stage(true, "finished_ok", reason), observer)
                     .await?;
-                Ok(ClosureReview::Completed)
+                Ok(ClosureReview::Completed {
+                    findings: review.findings,
+                })
             }
-            Ok(false) => {
+            Ok(review) => {
                 log.append(None, stage(true, "finished_incomplete", reason), observer)
                     .await?;
-                Ok(ClosureReview::Incomplete)
+                Ok(ClosureReview::Incomplete {
+                    findings: review.findings,
+                })
             }
-            Err(error) => {
+            Err(ReviewRunError::Launch(error)) => {
                 tracing::warn!(%error, "required review could not be launched");
                 log.append(
                     None,
@@ -1397,6 +1656,10 @@ impl CodingRuntime {
                 )
                 .await?;
                 Ok(ClosureReview::LaunchFailed)
+            }
+            Err(ReviewRunError::Settlement(error)) => Err(error),
+            Err(ReviewRunError::Unclosed(detail)) => {
+                Err(EngineError::UnclosedTerminalBoundary(detail))
             }
         }
     }
@@ -1419,61 +1682,96 @@ impl CodingRuntime {
         // explicitly configured reviewer is launched. Nothing here repairs
         // on the model's behalf, re-reads the goal, or downgrades a completed
         // run because a heuristic disagreed with the model.
-        if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
-            // A configured review still runs over a failed high-risk change;
-            // the result is recorded for the user, the outcome never changes.
-            let _ = self
-                .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
-                .await?;
-            return Ok(report_from_agent_outcome(outcome, terminal));
-        }
+        let mut task_report =
+            if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
+                report_from_agent_outcome(outcome, terminal)
+            } else if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
+                // No mutation, or no checks configured: nothing to run, and the
+                // report says so instead of pretending a verdict.
+                report_from_agent_outcome(outcome, TaskOutcome::Completed)
+            } else {
+                let report = self
+                    .verify(
+                        log,
+                        spec,
+                        &[],
+                        &outcome.modified_files,
+                        observer,
+                        &cancellation,
+                    )
+                    .await?;
+                let verification_status = verification_status_of(&report);
+                let mut base = report_from_agent_outcome(outcome, TaskOutcome::Completed);
+                let baseline_failures = report.confirmed_baseline_failures();
+                if !baseline_failures.is_empty() {
+                    base.completion_warnings.push(format!(
+                        "mechanically confirmed baseline failure: {}",
+                        baseline_failures
+                            .iter()
+                            .map(|check| check.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                TaskReport {
+                    verification: Some(report),
+                    verification_status,
+                    ..base
+                }
+            };
 
-        // No mutation, or no checks configured: nothing to run, and the
-        // report says so instead of pretending a verdict.
-        if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
-            let _ = self
-                .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
-                .await?;
-            return Ok(report_from_agent_outcome(outcome, TaskOutcome::Completed));
-        }
-
-        let report = self
-            .verify(
+        // A configured required reviewer contributes durable completion
+        // evidence (findings and a child terminal). Settle it before
+        // TaskFinished so that terminal is a closed evidence boundary, not a
+        // point after which the old task keeps writing into a possibly newer
+        // turn. The Finalizing projection names this wait explicitly.
+        let review_phase = begin_finalization_phase(log, FINALIZATION_REVIEW, observer).await;
+        let review = self
+            .closure_review_stage(
                 log,
                 runner,
                 spec,
-                &[],
-                &outcome.modified_files,
+                &task_report.modified_files,
+                task_report.execution_duration_ms,
                 observer,
                 &cancellation,
             )
             .await?;
-        let verification_status = verification_status_of(&report);
-
-        // Explicitly configured closure-boundary review, staged with durable
-        // eligibility/launch/terminal events so an absent reviewer is always
-        // explainable. Its result is recorded, never a verdict on the task.
-        let _ = self
-            .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
-            .await?;
-        let base = report_from_agent_outcome(outcome, TaskOutcome::Completed);
-        Ok(TaskReport {
-            verification: Some(report),
-            verification_status,
-            ..base
-        })
+        if let Some(started) = review_phase {
+            finish_finalization_phase(FINALIZATION_REVIEW, started);
+        }
+        if task_report.outcome == TaskOutcome::Completed {
+            match review {
+                ClosureReview::Completed { findings: 0 } | ClosureReview::NotRequired => {}
+                ClosureReview::Completed { findings } => task_report.completion_warnings.push(
+                    format!("required independent review reported {findings} finding(s)"),
+                ),
+                ClosureReview::Incomplete { findings: 0 } | ClosureReview::LaunchFailed => {
+                    task_report
+                        .completion_warnings
+                        .push("required independent review did not complete".into());
+                }
+                ClosureReview::Incomplete { findings } => task_report.completion_warnings.push(
+                    format!(
+                        "required independent review stopped early after reporting {findings} finding(s)"
+                    ),
+                ),
+            }
+        }
+        Ok(task_report)
     }
 
     async fn verify(
         &self,
         log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         allowed_paths: &[String],
         modified_files: &[String],
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<VerificationReport, EngineError> {
+        let verification_phase =
+            begin_finalization_phase(log, FINALIZATION_VERIFICATION, observer).await;
         log.append(None, EngineEvent::VerificationStarted, observer)
             .await?;
         let verifier = Verifier::with_environment(
@@ -1518,12 +1816,21 @@ impl CodingRuntime {
                     // The durable vocabulary, from the owner of the type.
                     // `format!("{:?}").to_lowercase()` wrote `toolmissing`,
                     // which this event's own contract spells `tool_missing`.
-                    status: check.status.as_str().to_string(),
+                    status: check.legacy_status().as_str().to_string(),
+                    observation: Some(engine_verification_observation(&check.observation)),
+                    disposition: Some(engine_verification_disposition(&check.disposition)),
+                    execution: check.execution.as_ref().map(|execution| {
+                        leveler_engine::VerificationExecution {
+                            program: execution.program.clone(),
+                            args: execution.args.clone(),
+                            exit_code: execution.exit_code,
+                            timed_out: execution.timed_out,
+                        }
+                    }),
                     evidence: matches!(
-                        check.status,
-                        leveler_verifier::CheckStatus::Failed
-                            | leveler_verifier::CheckStatus::ToolMissing
-                            | leveler_verifier::CheckStatus::EnvironmentUnavailable
+                        &check.observation,
+                        leveler_verifier::CheckObservation::Failed
+                            | leveler_verifier::CheckObservation::NotRun(_)
                     )
                     .then(|| check.evidence.clone()),
                 },
@@ -1543,73 +1850,10 @@ impl CodingRuntime {
             observer,
         )
         .await?;
-        self.record_verification_evidence(log, runner, &plan, &report, observer)
-            .await?;
+        if let Some(started) = verification_phase {
+            finish_finalization_phase(FINALIZATION_VERIFICATION, started);
+        }
         Ok(report)
-    }
-
-    /// Record what the runtime's own verification observed, into the ledger.
-    ///
-    /// The engine runs the verification plan in `conclude_direct` over the
-    /// changed tree. Those runs are real commands — the strongest observation
-    /// the runtime makes on its own account — and they reach the EventLog as
-    /// `VerificationCheck` rows; recording them on the `EvidenceLedger` too
-    /// keeps one place that answers "what ran, and how did it exit". Facts
-    /// only: nothing here decides what they prove about the task.
-    ///
-    /// Identity is `engine-verification:<check>`, so re-recording the same
-    /// check does not grow the ledger.
-    async fn record_verification_evidence(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        plan: &VerificationPlan,
-        report: &VerificationReport,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-    ) -> Result<(), EngineError> {
-        if report.checks.is_empty() {
-            return Ok(());
-        }
-        let Ok(Some(mut ledger)) = crate::coding::turn::last_persisted_ledger(
-            runner.stores.events.as_ref(),
-            &runner.session_id,
-        )
-        .await
-        else {
-            // No ledger yet: inventing one here would be a second place that
-            // creates run state.
-            return Ok(());
-        };
-        let mut added = false;
-        for check in &report.checks {
-            // Only a check whose command the plan names can be recorded: the
-            // fingerprint is what makes it comparable to a command the agent
-            // ran, and inventing one for a check with no command would put an
-            // unmatchable string into the evidence vocabulary.
-            let Some(command) = plan.commands.iter().find(|c| c.name == check.name) else {
-                continue;
-            };
-            let id = format!("engine-verification:{}", check.name);
-            if ledger.verifications.iter().any(|v| v.tool_call_id == id) {
-                continue;
-            }
-            let fingerprint = leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
-                &command.program,
-                &command.args,
-            );
-            let exit_code = i32::from(check.status != leveler_verifier::CheckStatus::Passed);
-            ledger.record_verify(id, fingerprint, exit_code);
-            added = true;
-        }
-        if added {
-            log.append(
-                None,
-                EngineEvent::EvidenceLedgerUpdated { ledger },
-                observer,
-            )
-            .await?;
-        }
-        Ok(())
     }
     /// Best-effort model handoff briefing for a pre-request fold: only called
     /// when the raw history exceeds the compact threshold, and any failure
@@ -1658,7 +1902,7 @@ impl CodingRuntime {
 /// is not a turn: no turn row, no plan/ledger seeding, no goal state. The
 /// started/finished pair is persisted because "was this reviewed?" has to be
 /// answerable from durable history rather than from a task card.
-pub(crate) async fn run_review(
+async fn run_review(
     runner: &TurnRunner<'_>,
     factory: &ExecutorFactory,
     profile: TurnProfile,
@@ -1668,10 +1912,11 @@ pub(crate) async fn run_review(
     parent_elapsed: std::time::Duration,
     observer: &mut (dyn FnMut(EngineEvent) + Send),
     cancellation: CancellationToken,
-) -> Result<bool, EngineError> {
+) -> Result<ReviewRunOutcome, ReviewRunError> {
     let executor = factory
         .build(profile, None)
-        .await?
+        .await
+        .map_err(ReviewRunError::Launch)?
         .with_execution_fence(runner.ownership_fence());
     let id = format!("reviewer-{}", leveler_core::RequestId::generate());
     let (profile_id, profile_role, read_only) = crate::child_profile_trace("reviewer");
@@ -1693,139 +1938,173 @@ pub(crate) async fn run_review(
             },
             observer,
         )
-        .await?;
-    // The reviewer's model calls arrive as progress events; the engine's
-    // own sink is the only thing that can make them rows. Collect here,
-    // write below — the child drains its channel after it finishes.
-    let mut child_records: Vec<crate::ModelRequestRecord> = Vec::new();
-    let result = {
-        let mut forward = |event: crate::AgentEvent| {
-            if let crate::AgentEvent::SubAgentModelRequest { record } = &event {
-                child_records.push((**record).clone());
-            }
-            observer(EngineEvent::from(event))
+        .await
+        .map_err(ReviewRunError::Launch)?;
+    let settlement = async {
+        // The reviewer's model calls arrive as progress events; the engine's
+        // own sink is the only thing that can make them rows. Collect here,
+        // write below — the child drains its channel after it finishes.
+        let mut child_records: Vec<crate::ModelRequestRecord> = Vec::new();
+        let result = {
+            let mut forward = |event: crate::AgentEvent| {
+                if let crate::AgentEvent::SubAgentModelRequest { record } = &event {
+                    child_records.push((**record).clone());
+                }
+                observer(EngineEvent::from(event))
+            };
+            executor
+                .run_reviewer_child(
+                    id.clone(),
+                    brief,
+                    files,
+                    parent_elapsed,
+                    &mut forward,
+                    cancellation,
+                )
+                .await
         };
-        executor
-            .run_reviewer_child(
-                id.clone(),
-                brief,
-                files,
-                parent_elapsed,
-                &mut forward,
-                cancellation,
-            )
-            .await
-    };
-    // The review's spend is the session's spend: the reviewer's own rounds
-    // and commands fold in from its ledger, and its TOKENS AND COST fold in
-    // from the very records being written down here — the same authority
-    // the bill reconciles against, never a second summary of it.
-    let mut progress = crate::coding::turn::last_persisted_progress(
-        runner.stores.events.as_ref(),
-        &runner.session_id,
-    )
-    .await?
-    .unwrap_or_default();
-    for record in &child_records {
-        runner
-            .stores
-            .model_requests
-            .insert(&leveler_engine::storage_model_request(
-                record,
-                &runner.session_id,
-            ))
-            .await?;
-        progress.absorb_request_spend(record.usage.total(), 0, record.cost_usd_micros.unwrap_or(0));
-    }
-    progress.absorb_child_work(&result.progress);
-    runner
-        .log
-        .append(
-            None,
-            EngineEvent::ProgressUpdated { ledger: progress },
-            observer,
-        )
-        .await?;
-    // Unified findings: adopt first so the finish summary can name the
-    // parent-side ids the TUI projects as a finding count.
-    let mut summary = result.result.for_parent("reviewer");
-    // Held across the finish event: the projection below is computed from
-    // the same ledger the findings were adopted into. Scoping it to the
-    // adoption branch is what left `contribution: None` on every reviewer
-    // that ran — the data was there, one block too deep.
-    let mut adopted_ledger: Option<leveler_lifecycle::EvidenceLedger> = None;
-    if !result.findings.is_empty() {
-        let mut ledger = crate::coding::turn::last_persisted_ledger(
+        // The review's spend is the session's spend: the reviewer's own rounds
+        // and commands fold in from its ledger, and its TOKENS AND COST fold in
+        // from the very records being written down here — the same authority
+        // the bill reconciles against, never a second summary of it.
+        let mut progress = crate::coding::turn::last_persisted_progress(
             runner.stores.events.as_ref(),
             &runner.session_id,
         )
         .await?
         .unwrap_or_default();
-        let adopted: Vec<String> = result
-            .findings
-            .iter()
-            .map(|finding| ledger.adopt_finding(&id, "reviewer", finding))
-            .collect();
-        if let Some(pos) = summary.find('\n') {
-            summary.insert_str(
-                pos + 1,
-                &format!("Structured findings adopted: {}.\n", adopted.join(", ")),
+        for record in &child_records {
+            runner
+                .stores
+                .model_requests
+                .insert(&leveler_engine::storage_model_request(
+                    record,
+                    &runner.session_id,
+                ))
+                .await?;
+            progress.absorb_request_spend(
+                record.usage.total(),
+                0,
+                record.cost_usd_micros.unwrap_or(0),
             );
-        } else {
-            summary.push_str(&format!(
-                "\nStructured findings adopted: {}.",
-                adopted.join(", ")
-            ));
+        }
+        progress.absorb_child_work(&result.progress);
+        runner
+            .log
+            .append(
+                None,
+                EngineEvent::ProgressUpdated { ledger: progress },
+                observer,
+            )
+            .await?;
+        // Unified findings: adopt first so the finish summary can name the
+        // parent-side ids the TUI projects as a finding count.
+        let mut summary = result.result.for_parent("reviewer");
+        // Held across the finish event: the projection below is computed from
+        // the same ledger the findings were adopted into. Scoping it to the
+        // adoption branch is what left `contribution: None` on every reviewer
+        // that ran — the data was there, one block too deep.
+        let mut adopted_ledger: Option<leveler_lifecycle::EvidenceLedger> = None;
+        if !result.findings.is_empty() {
+            let mut ledger = crate::coding::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await?
+            .unwrap_or_default();
+            let adopted: Vec<String> = result
+                .findings
+                .iter()
+                .map(|finding| ledger.adopt_finding(&id, "reviewer", finding))
+                .collect();
+            if let Some(pos) = summary.find('\n') {
+                summary.insert_str(
+                    pos + 1,
+                    &format!("Structured findings adopted: {}.\n", adopted.join(", ")),
+                );
+            } else {
+                summary.push_str(&format!(
+                    "\nStructured findings adopted: {}.",
+                    adopted.join(", ")
+                ));
+            }
+            runner
+                .log
+                .append(
+                    None,
+                    EngineEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    },
+                    observer,
+                )
+                .await?;
+            adopted_ledger = Some(ledger);
         }
         runner
             .log
             .append(
                 None,
-                EngineEvent::EvidenceLedgerUpdated {
-                    ledger: ledger.clone(),
+                EngineEvent::SubAgentFinished {
+                    id: id.clone(),
+                    nickname: "reviewer".to_string(),
+                    ok: result.ok,
+                    summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
+                    // A reviewer that ran always reports a projection. Zero
+                    // findings is a measured zero — a real fact about this
+                    // review — and only an absent projection means "not
+                    // measured". MA-VALUE-REVIEWER-PILOT could not tell those
+                    // apart and reported five zero-finding reviewers that had
+                    // every one of them reported.
+                    contribution: Some(
+                        leveler_lifecycle::ChildResultProjection::from_findings(
+                            &id,
+                            "reviewer",
+                            adopted_ledger
+                                .as_ref()
+                                .map(|l| l.findings.as_slice())
+                                .unwrap_or(&[]),
+                        )
+                        .with_profile(
+                            profile_id_trace,
+                            profile_role_trace,
+                            read_only_trace,
+                        ),
+                    ),
+                    outcome: Some(result.result.status),
+                    stop: Some(result.stop),
                 },
                 observer,
             )
             .await?;
-        adopted_ledger = Some(ledger);
+        Ok::<ReviewRunOutcome, EngineError>(ReviewRunOutcome {
+            completed: result.ok,
+            findings: result.findings.len(),
+        })
     }
-    runner
-        .log
-        .append(
-            None,
-            EngineEvent::SubAgentFinished {
-                id: id.clone(),
-                nickname: "reviewer".to_string(),
-                ok: result.ok,
-                summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
-                // A reviewer that ran always reports a projection. Zero
-                // findings is a measured zero — a real fact about this
-                // review — and only an absent projection means "not
-                // measured". MA-VALUE-REVIEWER-PILOT could not tell those
-                // apart and reported five zero-finding reviewers that had
-                // every one of them reported.
-                contribution: Some(
-                    leveler_lifecycle::ChildResultProjection::from_findings(
-                        &id,
-                        "reviewer",
-                        adopted_ledger
-                            .as_ref()
-                            .map(|l| l.findings.as_slice())
-                            .unwrap_or(&[]),
-                    )
-                    .with_profile(
-                        profile_id_trace,
-                        profile_role_trace,
-                        read_only_trace,
-                    ),
-                ),
-                outcome: Some(result.result.status),
-                stop: Some(result.stop),
-            },
-            observer,
-        )
-        .await?;
-    Ok(result.ok)
+    .await;
+    match settlement {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => match runner
+            .reconcile_terminal_children(leveler_lifecycle::ChildStop::Failed, observer)
+            .await
+        {
+            Ok(()) => Err(ReviewRunError::Settlement(error)),
+            Err(settlement_error) => Err(ReviewRunError::Unclosed(format!(
+                "required review persistence failed ({error}); child settlement also failed: \
+                 {settlement_error}"
+            ))),
+        },
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReviewRunError {
+    #[error("{0}")]
+    Launch(EngineError),
+    #[error("{0}")]
+    Settlement(EngineError),
+    #[error("{0}")]
+    Unclosed(String),
 }
 /// Whether this session has an independent review on record.
 ///
@@ -1835,6 +2114,7 @@ pub(crate) async fn run_review(
 /// `SubAgentFinished`, so a review counts only when the same agent id appears
 /// in both — a reviewer that started and died without finishing has not
 /// reviewed anything (N1's shape, deliberately not credited).
+#[cfg(test)]
 pub(crate) async fn session_had_review(
     events: &dyn EventStore,
     session_id: &SessionId,
@@ -1873,10 +2153,15 @@ pub(crate) async fn session_had_review(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosureReview {
     NotRequired,
-    AlreadyReviewed,
-    Completed,
-    Incomplete,
+    Completed { findings: usize },
+    Incomplete { findings: usize },
     LaunchFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewRunOutcome {
+    completed: bool,
+    findings: usize,
 }
 
 /// Cap on the unified diff embedded in a reviewer brief. Beyond it the diff is
@@ -2157,22 +2442,42 @@ mod review_brief_tests {
 #[cfg(test)]
 mod verification_status_tests {
     use super::*;
-    use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus};
+    use leveler_verifier::{
+        BaselineProvenance, BaselineSource, CheckExecution, CheckKind, CheckObservation,
+        CheckOutcome, CheckStatus, GateDisposition, GateSkipReason, NotRunReason,
+    };
 
     fn report(status: CheckStatus) -> VerificationReport {
+        let observation = match status {
+            CheckStatus::Passed => CheckObservation::Passed,
+            CheckStatus::Failed => CheckObservation::Failed,
+            CheckStatus::Skipped => CheckObservation::NotRun(NotRunReason::VerificationIncomplete),
+            CheckStatus::ToolMissing => CheckObservation::NotRun(NotRunReason::ToolMissing),
+            CheckStatus::EnvironmentUnavailable => {
+                CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable)
+            }
+        };
         VerificationReport {
             checks: vec![CheckOutcome {
                 name: "test".into(),
                 kind: CheckKind::Test,
                 gating: true,
-                status,
+                observation,
+                disposition: GateDisposition::Required,
+                execution: matches!(status, CheckStatus::Passed | CheckStatus::Failed).then_some(
+                    CheckExecution {
+                        program: "cargo".into(),
+                        args: vec!["test".into()],
+                        exit_code: Some(if status == CheckStatus::Failed { 1 } else { 0 }),
+                        timed_out: false,
+                    },
+                ),
                 evidence: String::new(),
                 failure: None,
                 failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: vec![],
-            baseline_failures: Vec::new(),
         }
     }
 
@@ -2206,7 +2511,14 @@ mod verification_status_tests {
     #[test]
     fn a_baseline_attributed_failure_keeps_the_canonical_status() {
         let mut pre_existing = report(CheckStatus::Failed);
-        pre_existing.baseline_failures = vec!["test".into()];
+        pre_existing.checks[0].disposition =
+            GateDisposition::Skipped(GateSkipReason::ConfirmedBaselineFailure {
+                revision: "base".into(),
+                provenance: BaselineProvenance {
+                    source: BaselineSource::DetachedWorktreeRerun,
+                    failed_tests: std::collections::BTreeSet::new(),
+                },
+            });
         assert!(matches!(pre_existing.verdict(), Verdict::Unverified(_)));
         assert_eq!(
             verification_status_of(&pre_existing),
@@ -2230,7 +2542,6 @@ mod verification_status_tests {
             checks: vec![],
             scope_ok: true,
             scope_violations: vec![],
-            baseline_failures: Vec::new(),
         };
         assert!(
             no_gates.passed(),
@@ -2545,7 +2856,7 @@ mod seed_tests {
         closing.enter_closing();
         assert!(!prior_epoch_open(None, Some(&closing)));
         let mut terminal = ProgressLedger::default();
-        terminal.enter_terminal();
+        terminal.enter_closed();
         assert!(!prior_epoch_open(None, Some(&terminal)));
     }
 
@@ -2557,5 +2868,22 @@ mod seed_tests {
     #[test]
     fn absent_prior_state_is_an_open_epoch() {
         assert!(prior_epoch_open(None, None));
+    }
+
+    #[test]
+    fn coding_mutation_normalizes_answered_into_completion_projection() {
+        let mut report = TaskReport::new(
+            TaskOutcome::Completed,
+            "done".to_string(),
+            vec!["src/lib.rs".to_string()],
+            StopReason::Answered,
+            1,
+        );
+        report.verification_status = VerificationStatus::Unavailable;
+
+        assert_eq!(task_terminal_stop(&report), StopReason::Completed);
+
+        report.modified_files.clear();
+        assert_eq!(task_terminal_stop(&report), StopReason::Answered);
     }
 }

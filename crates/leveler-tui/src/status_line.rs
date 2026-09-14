@@ -16,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use leveler_client_protocol::RuntimeStatus;
+use leveler_client_protocol::{FinalizationStage, RuntimeStatus};
 
 use crate::state::AppState;
 use crate::transcript::TranscriptItem;
@@ -425,14 +425,22 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     }
 
     let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
-    let label = match wait.as_ref() {
-        Some(view) if view.kind == crate::wait_status::WaitKind::Model => {
-            t.waiting_model.to_string()
-        }
-        _ => state
-            .activity
-            .clone()
-            .unwrap_or_else(|| t.waiting_model.to_string()),
+    let label = match state.finalization_stage {
+        Some(FinalizationStage::SettlingDependencies) => t.finalizing_dependencies.to_string(),
+        Some(FinalizationStage::Verification) => t.finalizing_verification.to_string(),
+        Some(FinalizationStage::Evidence) => t.finalizing_evidence.to_string(),
+        Some(FinalizationStage::Review) => t.finalizing_review.to_string(),
+        Some(FinalizationStage::ResolvingOutcome) => t.finalizing_outcome.to_string(),
+        Some(FinalizationStage::PublishingTerminal) => t.finalizing_terminal.to_string(),
+        None => match wait.as_ref() {
+            Some(view) if view.kind == crate::wait_status::WaitKind::Model => {
+                t.waiting_model.to_string()
+            }
+            _ => state
+                .activity
+                .clone()
+                .unwrap_or_else(|| t.waiting_model.to_string()),
+        },
     };
     let turn_mode = if state.goal_mode_active {
         format!("{} · ", t.goal_mode)
@@ -732,6 +740,16 @@ mod tests {
         let status = status_line_content(&state, 120).to_string();
         assert!(status.contains("目标模式"), "status: {status}");
         assert!(status.contains("等待模型"), "status: {status}");
+    }
+
+    #[test]
+    fn finalizing_status_names_the_runtime_stage_not_the_model() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.finalization_stage = Some(FinalizationStage::Verification);
+        let status = status_line_content(&state, 120).to_string();
+        assert!(status.contains("正在验证"), "status: {status}");
+        assert!(!status.contains("等待模型"), "status: {status}");
     }
 
     #[test]

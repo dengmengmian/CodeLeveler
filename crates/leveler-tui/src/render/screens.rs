@@ -101,6 +101,7 @@ pub(super) fn render_verification_screen(frame: &mut Frame, area: Rect, state: &
                     CheckState::Passed => ("✓", theme.status.success),
                     CheckState::Failed => ("✗", theme.status.error),
                     CheckState::Skipped => ("○", theme.text.secondary),
+                    CheckState::NotRun => ("△", theme.status.warning),
                     CheckState::Running => ("●", theme.accent.primary),
                     // A check that could not run is not a check that was
                     // skipped, so it does not borrow the skip's mark.

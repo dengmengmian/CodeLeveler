@@ -233,6 +233,16 @@ impl PromptBuilder {
              the tests\" — prints the same fact twice; when there is nothing to \
              add, call the tool with no prose at all.",
         );
+        // Product-wide delivery contract. This deliberately follows a model
+        // profile's replaceable base instructions, so a custom profile cannot
+        // opt out and turn the final response into a commit/push solicitation.
+        prompt.push_str(
+            "\n\nFINAL DELIVERY: Unless the user explicitly asked for it, do not create a \
+             git commit or push. An uncommitted working tree is a normal delivery state. Never \
+             ask whether the user wants you to commit or push. End after the factual summary of \
+             the result and its verification; do not append an open-ended offer, invitation, or \
+             conversational follow-up such as \"if you want, I can...\".",
+        );
         prompt
     }
 }
@@ -493,6 +503,10 @@ mod tests {
         );
         assert!(prompt.contains("reasoning/thinking text"));
         assert!(prompt.contains("latest user message"));
+        assert!(
+            prompt.contains("An uncommitted working tree is a normal delivery state"),
+            "the shared final-delivery contract must survive a custom base prompt"
+        );
     }
 
     #[test]
@@ -764,9 +778,22 @@ mod tests {
         assert!(prompt.contains("Be concise by default"), "{prompt}");
         assert!(prompt.contains("No process closeout"), "{prompt}");
         assert!(
-            prompt.contains("at most one short follow-up tip"),
+            prompt.contains("do not create a git commit or push"),
             "{prompt}"
         );
+        assert!(
+            prompt.contains("Never ask whether the user wants"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not append an open-ended offer"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("at most one short follow-up tip"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("as the one tip line"), "{prompt}");
     }
 
     /// Removed with the rest of the effort coaching: how much to do for a

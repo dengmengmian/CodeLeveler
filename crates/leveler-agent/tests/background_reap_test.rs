@@ -4,6 +4,7 @@
 //! production. Daemon-scoped tasks and interrupted turns must NOT be reaped.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -303,6 +304,85 @@ async fn direct_run_terminal_reaps_session_owned_background_tasks() {
 
     assert_terminal_within(&h.registry, "bg-1", "direct path").await;
     assert_eq!(h.registry.kill_scope(SESSION_SCOPE).await, 0);
+}
+
+/// The runtime proof for the terminal visibility invariant: the terminal
+/// observer fires while the old process is still live, then post-terminal
+/// settlement kills only the ids detached beforehand. A process admitted by
+/// the observer under the same session scope is a newer epoch and survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_precedes_cleanup_and_the_ticket_spares_new_work() {
+    let h = harness(vec![text("done")]).await;
+    let old = h
+        .registry
+        .spawn_owned(sleep_request(h.dir.path()), None, Some(SESSION_SCOPE))
+        .await
+        .expect("old session process");
+    let s = spec(&h, "answer and close");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let terminal_saw_old = Arc::new(AtomicBool::new(false));
+    let new_id = Arc::new(Mutex::new(None));
+    let observer_registry = h.registry.clone();
+    let observer_path = h.dir.path().to_path_buf();
+    let observer_old = old.clone();
+    let observer_saw_old = terminal_saw_old.clone();
+    let observer_new_id = new_id.clone();
+
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text { text: "hi".into() }],
+            &mut |event| {
+                if matches!(event, leveler_engine::EngineEvent::TaskFinished { .. }) {
+                    observer_saw_old.store(
+                        observer_registry
+                            .try_active_ids_for_scope(SESSION_SCOPE)
+                            .is_some_and(|ids| ids.contains(&observer_old)),
+                        Ordering::SeqCst,
+                    );
+                    let id = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(observer_registry.spawn_owned(
+                            sleep_request(&observer_path),
+                            None,
+                            Some(SESSION_SCOPE),
+                        ))
+                    })
+                    .expect("newly admitted process");
+                    *observer_new_id.lock().unwrap() = Some(id);
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat turn should settle");
+
+    assert!(
+        terminal_saw_old.load(Ordering::SeqCst),
+        "TaskFinished must be projected before cleanup signals the old process"
+    );
+    assert_terminal_within(&h.registry, &old, "detached old process").await;
+    let new_id = new_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("observer spawned work");
+    let new_snapshot = h
+        .registry
+        .get(&new_id)
+        .await
+        .expect("new process registered");
+    assert_eq!(
+        new_snapshot.status,
+        BackgroundTaskStatus::Running,
+        "the immutable cleanup ticket must not kill newly admitted work"
+    );
+    assert_eq!(
+        h.registry.kill_scope(SESSION_SCOPE).await,
+        1,
+        "the new process remains independently owned by the session scope"
+    );
+    assert_terminal_within(&h.registry, &new_id, "new independently reaped process").await;
 }
 
 /// Daemon-scoped tasks (no owner scope — browser runtime, MCP servers) must

@@ -214,6 +214,9 @@ pub struct AppState {
     pub interaction_command_ids: HashMap<String, CommandId>,
 
     pub status: RuntimeStatus,
+    /// Mechanical post-response stage reported by the runtime. `Some` means
+    /// the model is no longer the dependency even though the turn stays busy.
+    pub finalization_stage: Option<leveler_client_protocol::FinalizationStage>,
     /// Number of tools started in the active turn.
     pub turn_tool_calls: usize,
     /// Coarse activity label shown while busy (e.g. "运行 cargo test").
@@ -380,6 +383,7 @@ impl AppState {
             pending_interactions: VecDeque::new(),
             interaction_command_ids: HashMap::new(),
             status: RuntimeStatus::Idle,
+            finalization_stage: None,
             turn_tool_calls: 0,
             activity: None,
             activity_elapsed_secs: None,

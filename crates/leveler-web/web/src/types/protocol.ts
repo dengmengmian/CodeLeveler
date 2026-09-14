@@ -21,6 +21,7 @@ export * from './protocol.gen';
 /** turn 终态事件集合（驱动消息队列出队与终态渲染）。 */
 export const TURN_TERMINAL_TYPES: ReadonlySet<RuntimeEvent['type']> = new Set([
   'turn_completed',
+  'turn_completed_with_warnings',
   'turn_answered',
   'turn_truncated',
   'turn_incomplete',

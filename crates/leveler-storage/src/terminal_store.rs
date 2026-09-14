@@ -21,6 +21,82 @@ use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, Ver
 
 use crate::{Database, EventRecord, StorageError, TerminalRepository};
 
+pub(crate) fn task_terminal_payload_for_epoch(
+    payload: &str,
+    session_id: &SessionId,
+    token: &leveler_core::OwnershipToken,
+    outcome: TaskOutcome,
+    verification: VerificationStatus,
+    status: SessionStatus,
+    state: AgentState,
+    goal: Option<&GoalTerminalUpdate>,
+) -> Result<String, StorageError> {
+    let redacted = crate::redact_json_payload_for_session(
+        "task terminal event",
+        payload,
+        Some(session_id.as_str()),
+    )?;
+    let mut value: serde_json::Value = serde_json::from_str(&redacted).map_err(|error| {
+        StorageError::InvalidData(format!("invalid task terminal event payload: {error}"))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        StorageError::InvalidData("task terminal event payload is not an object".to_string())
+    })?;
+    object.insert(
+        "_terminal_task_id".to_string(),
+        serde_json::Value::String(token.task_id.as_str().to_string()),
+    );
+    object.insert(
+        "_terminal_owner_epoch".to_string(),
+        serde_json::Value::Number(token.owner_epoch.get().into()),
+    );
+    object.insert(
+        "_terminal_projection".to_string(),
+        serde_json::json!({
+            "outcome": outcome.as_str(),
+            "verification": verification.as_str(),
+            "status": status.as_str(),
+            "state": state.as_str(),
+            "goal": goal.map(|update| serde_json::json!({
+                "goal_id": update.goal_id.as_str(),
+                "windows_delta": update.windows_delta,
+                "settle": update.settle,
+            })),
+        }),
+    );
+    Ok(value.to_string())
+}
+
+pub(crate) fn task_terminal_payload_matches_epoch(
+    payload: &str,
+    token: &leveler_core::OwnershipToken,
+) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("_terminal_task_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(token.task_id.as_str())
+                && value
+                    .get("_terminal_owner_epoch")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(token.owner_epoch.get())
+        })
+}
+
+/// Result of an idempotent task-terminal commit.
+///
+/// When `inserted` is false, `event` is the terminal fact already committed
+/// for the current epoch and must not be projected to observers again.
+#[derive(Debug, Clone)]
+pub struct TaskTerminalCommit {
+    /// Canonical durable task-terminal event.
+    pub event: EventRecord,
+    /// Whether this call inserted the event and its projections.
+    pub inserted: bool,
+}
+
 /// Goal projection supplied by a Harness for the owned task-terminal commit.
 ///
 /// Storage applies these already-decided values mechanically. It does not
@@ -93,7 +169,7 @@ pub trait TerminalStore: Send + Sync {
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
-    ) -> Result<EventRecord, crate::OwnershipError>;
+    ) -> Result<TaskTerminalCommit, crate::OwnershipError>;
 
     /// Fenced [`Self::finish_turn`], same single-transaction contract.
     #[allow(clippy::too_many_arguments)]
@@ -164,7 +240,7 @@ impl TerminalStore for Database {
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
-    ) -> Result<EventRecord, crate::OwnershipError> {
+    ) -> Result<TaskTerminalCommit, crate::OwnershipError> {
         TerminalRepository::new(self)
             .finish_task_owned(
                 token,
@@ -262,7 +338,7 @@ impl MemoryTerminalStore {
     #[allow(clippy::too_many_arguments)]
     fn finish_task_sync(
         &self,
-        task_id: Option<&leveler_core::TaskId>,
+        token: Option<&leveler_core::OwnershipToken>,
         session_id: &SessionId,
         event_type: &str,
         payload: &str,
@@ -272,7 +348,7 @@ impl MemoryTerminalStore {
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
-    ) -> Result<EventRecord, StorageError> {
+    ) -> Result<TaskTerminalCommit, StorageError> {
         if !self
             .sessions
             .rows
@@ -285,9 +361,36 @@ impl MemoryTerminalStore {
                 session_id.as_str()
             )));
         }
+        let payload = match token {
+            Some(token) => task_terminal_payload_for_epoch(
+                payload,
+                session_id,
+                token,
+                outcome,
+                verification,
+                status,
+                state,
+                goal,
+            )?,
+            None => payload.to_string(),
+        };
+        if let Some(token) = token
+            && let Some(event) = self.events.task_terminal_for_epoch(session_id, token)
+        {
+            if event.payload != payload {
+                return Err(StorageError::InvalidData(format!(
+                    "conflicting task terminal for ownership epoch {}",
+                    token.owner_epoch.get()
+                )));
+            }
+            return Ok(TaskTerminalCommit {
+                event,
+                inserted: false,
+            });
+        }
         let mut goal_rows = match goal {
             Some(update) => {
-                let Some(task_id) = task_id else {
+                let Some(token) = token else {
                     return Err(StorageError::InvalidData(
                         "terminal goal update requires owned task identity".to_string(),
                     ));
@@ -300,12 +403,12 @@ impl MemoryTerminalStore {
                 let rows = goals.rows.lock().unwrap();
                 let Some(record) = rows.iter().find(|record| {
                     record.id == update.goal_id
-                        && &record.task_id == task_id
+                        && record.task_id == token.task_id
                         && record.state == crate::GoalState::Running
                 }) else {
                     return Err(StorageError::InvalidData(format!(
                         "running goal {} not found for task {} terminal transition",
-                        update.goal_id, task_id
+                        update.goal_id, token.task_id
                     )));
                 };
                 record
@@ -324,7 +427,7 @@ impl MemoryTerminalStore {
         self.check_injected_failure()?;
         let record = self
             .events
-            .append_record_for_terminal_validated(session_id, None, event_type, payload, now)?;
+            .append_record_for_terminal_validated(session_id, None, event_type, &payload, now)?;
         {
             let mut rows = self.sessions.rows.lock().unwrap();
             if let Some(session) = rows.get_mut(session_id.as_str()) {
@@ -345,7 +448,10 @@ impl MemoryTerminalStore {
                 record.settled_at = Some(now);
             }
         }
-        Ok(record)
+        Ok(TaskTerminalCommit {
+            event: record,
+            inserted: true,
+        })
     }
 
     /// The synchronous commit body for turn terminals.
@@ -424,6 +530,7 @@ impl TerminalStore for MemoryTerminalStore {
             None,
             now,
         )
+        .map(|commit| commit.event)
     }
 
     async fn finish_turn(
@@ -450,7 +557,7 @@ impl TerminalStore for MemoryTerminalStore {
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
-    ) -> Result<EventRecord, crate::OwnershipError> {
+    ) -> Result<TaskTerminalCommit, crate::OwnershipError> {
         let Some(ownership) = self.ownership.get() else {
             return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
                 "memory terminal store has no ownership authority configured".to_string(),
@@ -460,7 +567,7 @@ impl TerminalStore for MemoryTerminalStore {
         ownership
             .with_current(token, || {
                 self.finish_task_sync(
-                    Some(&token.task_id),
+                    Some(token),
                     session_id,
                     event_type,
                     payload,
@@ -702,6 +809,62 @@ mod tests {
             )
             .await
             .unwrap();
+        terminal
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                "{}",
+                TaskOutcome::Completed,
+                VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .expect("an identical full terminal commit is idempotent");
+        assert!(
+            terminal
+                .finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    "{}",
+                    TaskOutcome::Completed,
+                    VerificationStatus::NotRun,
+                    SessionStatus::Failed,
+                    AgentState::Failed,
+                    Some(&update),
+                    leveler_core::now(),
+                )
+                .await
+                .is_err(),
+            "the same event body with a different lifecycle projection must conflict"
+        );
+        let different_goal_update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 3,
+            settle: true,
+        };
+        assert!(
+            terminal
+                .finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    "{}",
+                    TaskOutcome::Completed,
+                    VerificationStatus::NotRun,
+                    SessionStatus::Completed,
+                    AgentState::Complete,
+                    Some(&different_goal_update),
+                    leveler_core::now(),
+                )
+                .await
+                .is_err(),
+            "the same event body with a different goal projection must conflict"
+        );
         let stored = goals.get(&goal).await.unwrap().unwrap();
         assert_eq!(stored.windows_run, 2);
         assert_eq!(stored.state, GoalState::Settled);

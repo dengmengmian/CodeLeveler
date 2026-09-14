@@ -531,6 +531,7 @@ mod tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
+                warnings: Vec::new(),
             },
             &mut |_| {},
         )
@@ -545,6 +546,7 @@ mod tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
+                warnings: Vec::new(),
             }],
             "transient delta is skipped; the canonical event replays"
         );
@@ -1345,6 +1347,7 @@ mod tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some("no gating checks".into()),
                 stop: None,
+                warnings: Vec::new(),
             },
         ];
         for e in &events {
@@ -1365,6 +1368,7 @@ mod tests {
             verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             stop: None,
+            warnings: Vec::new(),
         };
         let (event_type, payload) = event.to_row().unwrap();
         store.seed(leveler_storage::EventRecord {
@@ -1399,6 +1403,7 @@ mod tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
+                warnings: Vec::new(),
             },
             &mut |_| {},
         )

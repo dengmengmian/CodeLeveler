@@ -295,6 +295,25 @@
       }
     },
     {
+      "description": "The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event.",
+      "type": "object",
+      "required": [
+        "stage",
+        "type"
+      ],
+      "properties": {
+        "stage": {
+          "$ref": "#/definitions/FinalizationStage"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_finalizing"
+          ]
+        }
+      }
+    },
+    {
       "description": "Coarse progress label from the runtime, shown in the status line.",
       "type": "object",
       "required": [
@@ -771,6 +790,25 @@
           "type": "string",
           "enum": [
             "turn_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The work completed and project verification retains its own result, but a separate required completion contract produced warnings.",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed_with_warnings"
           ]
         }
       }
@@ -1419,7 +1457,7 @@
       }
     },
     {
-      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a 1.6 client must not treat that as ownership.",
+      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a current client must not treat that as ownership.",
       "type": "object",
       "required": [
         "observation",
@@ -1537,6 +1575,13 @@
           ]
         },
         {
+          "description": "No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency.",
+          "type": "string",
+          "enum": [
+            "not_run"
+          ]
+        },
+        {
           "description": "The check's program is not on `PATH`, so it could not run at all.",
           "type": "string",
           "enum": [
@@ -1626,6 +1671,53 @@
     "CommandId": {
       "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
       "type": "string"
+    },
+    "FinalizationStage": {
+      "description": "The mechanical work still running after the assistant has produced its final response but before the runtime publishes the task terminal.\n\nThis is lifecycle chrome, not a second completion authority: the terminal event remains the only fact that ends the turn.",
+      "oneOf": [
+        {
+          "description": "Wait for work already admitted by the turn to settle.",
+          "type": "string",
+          "enum": [
+            "settling_dependencies"
+          ]
+        },
+        {
+          "description": "Run the configured checks over the final tree.",
+          "type": "string",
+          "enum": [
+            "verification"
+          ]
+        },
+        {
+          "description": "Persist verification and other completion evidence.",
+          "type": "string",
+          "enum": [
+            "evidence"
+          ]
+        },
+        {
+          "description": "Run a completion review explicitly required by the task contract.",
+          "type": "string",
+          "enum": [
+            "review"
+          ]
+        },
+        {
+          "description": "Resolve the task outcome from the collected facts.",
+          "type": "string",
+          "enum": [
+            "resolving_outcome"
+          ]
+        },
+        {
+          "description": "Commit and publish the canonical terminal fact.",
+          "type": "string",
+          "enum": [
+            "publishing_terminal"
+          ]
+        }
+      ]
     },
     "MessageId": {
       "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
@@ -3078,6 +3170,17 @@
           "anyOf": [
             {
               "$ref": "#/definitions/UiDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finalization_stage": {
+          "description": "Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FinalizationStage"
             },
             {
               "type": "null"

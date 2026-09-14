@@ -6,6 +6,12 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Final assistant text now enters an explicit, observable `Finalizing` lifecycle instead of leaving clients reporting “waiting for model.” The persisted `TaskFinished` event remains the only terminal authority and is projected immediately in TUI and Web; a failed terminal transaction surfaces a recovery error instead of a fabricated terminal. Configured required review settles before that boundary, while non-authoritative process cleanup runs from an immutable ticket afterward.
+- Verification now stores command observation separately from gate disposition. A grounded baseline failure remains an observed failure with typed revision/provenance and a skipped gate, while checks that did not run carry a typed reason and can no longer be described as pre-existing failures.
+- Coding-agent final responses no longer solicit commits or append open-ended offers. Unless explicitly requested, an uncommitted working tree is the normal delivery state.
+
 ## [0.2.0-beta.2] - 2026-09-14
 
 ### Highlights

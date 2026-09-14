@@ -6,6 +6,29 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The mechanical work still running after the assistant has produced its
+/// final response but before the runtime publishes the task terminal.
+///
+/// This is lifecycle chrome, not a second completion authority: the terminal
+/// event remains the only fact that ends the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizationStage {
+    /// Wait for work already admitted by the turn to settle.
+    SettlingDependencies,
+    /// Run the configured checks over the final tree.
+    Verification,
+    /// Persist verification and other completion evidence.
+    Evidence,
+    /// Run a completion review explicitly required by the task contract.
+    Review,
+    /// Resolve the task outcome from the collected facts.
+    ResolvingOutcome,
+    /// Commit and publish the canonical terminal fact.
+    PublishingTerminal,
+}
+
 /// The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -50,6 +73,10 @@ pub enum CheckState {
     Failed,
     /// Deliberately not run.
     Skipped,
+    /// No pass/fail observation was produced. `UiCheck::evidence` carries the
+    /// reason projected by the runtime, such as cancellation or an unavailable
+    /// dependency.
+    NotRun,
     /// The check's program is not on `PATH`, so it could not run at all.
     ToolMissing,
     /// The check ran but the environment refused it (toolchain/MSRV mismatch).

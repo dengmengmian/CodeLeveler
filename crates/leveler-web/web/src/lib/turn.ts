@@ -4,10 +4,11 @@
 // 软 token（no_code_changes / no_automatic_verification）折叠成平静收场，
 // 其余 unverified/incomplete 一律带 reason 的警示——truth 优先于视觉简洁。
 
-import type { RuntimeEvent } from '../types/protocol';
+import type { FinalizationStage, RuntimeEvent } from '../types/protocol';
 
 export type TurnOutcome =
   | 'completed'
+  | 'completed_with_warnings'
   | 'answered'
   | 'incomplete'
   | 'unverified'
@@ -27,6 +28,8 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
   switch (ev.type) {
     case 'turn_completed':
       return { outcome: 'completed', detail: null };
+    case 'turn_completed_with_warnings':
+      return { outcome: 'completed_with_warnings', detail: ev.reason };
     case 'turn_answered':
       return { outcome: 'answered', detail: null };
     case 'turn_truncated':
@@ -83,6 +86,13 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
   switch (end.outcome) {
     case 'completed':
       return { glyph: '✓', label: '任务已完成', tone: 'success', detail: null };
+    case 'completed_with_warnings':
+      return {
+        glyph: '⚠',
+        label: '已完成，但有警告',
+        tone: 'warn',
+        detail: token,
+      };
     case 'answered':
       return { glyph: '✓', label: '已回答', tone: 'success', detail: null };
     case 'truncated':
@@ -144,4 +154,22 @@ export function turnProgressLabel(
   if (closing) return `收口中 · ${phase}`;
   if (noProgressStreak > 0) return `无进展 ×${noProgressStreak} · ${phase}`;
   return null;
+}
+
+/** turn_finalizing / reconnect snapshot → lifecycle chrome; never terminal truth. */
+export function finalizationStageLabel(stage: FinalizationStage): string {
+  switch (stage) {
+    case 'settling_dependencies':
+      return '正在收尾';
+    case 'verification':
+      return '正在验证';
+    case 'evidence':
+      return '正在结算验证结果';
+    case 'review':
+      return '正在复核';
+    case 'resolving_outcome':
+      return '正在确认任务结果';
+    case 'publishing_terminal':
+      return '正在发布任务结果';
+  }
 }

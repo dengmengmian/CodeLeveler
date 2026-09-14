@@ -10,8 +10,8 @@ use leveler_lifecycle::VerificationStatus;
 use leveler_verifier::CheckStatus;
 
 use leveler_client_protocol::{
-    CheckState, ChildContribution, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
-    UiCheck, UiPlan, UiPlanStep, UiVerification,
+    CheckState, ChildContribution, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus,
+    RuntimeEvent, UiCheck, UiPlan, UiPlanStep, UiVerification,
 };
 
 use crate::AppError;
@@ -27,6 +27,14 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 error: error.to_string(),
             }
         }
+        Err(AppError::UnclosedTerminalBoundary(error)) => RuntimeEvent::Notification {
+            level: NotificationLevel::Error,
+            message: format!("任务终态尚未发布：收尾证据无法持久化，需要恢复后重新结算（{error}）"),
+        },
+        Err(AppError::TerminalCommitFailed(error)) => RuntimeEvent::Notification {
+            level: NotificationLevel::Error,
+            message: format!("任务终态尚未发布：权威终态提交失败，需要恢复后重新结算（{error}）"),
+        },
         Err(error) => RuntimeEvent::TurnFailed {
             error: error.to_string(),
         },
@@ -83,6 +91,156 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
     }
 }
 
+fn task_finished_event(
+    outcome: leveler_lifecycle::TaskOutcome,
+    verification: VerificationStatus,
+    reason: Option<String>,
+    stop: Option<StopReason>,
+    warnings: Vec<String>,
+) -> RuntimeEvent {
+    let detail_with_warnings = || {
+        let mut parts = Vec::new();
+        for part in reason.iter().chain(warnings.iter()) {
+            if !part.trim().is_empty() && !parts.contains(part) {
+                parts.push(part.clone());
+            }
+        }
+        parts.join("; ")
+    };
+    if outcome == leveler_lifecycle::TaskOutcome::Completed
+        && verification == VerificationStatus::Failed
+    {
+        return RuntimeEvent::TurnCompletedChecksFailed {
+            reason: if reason.is_some() || !warnings.is_empty() {
+                detail_with_warnings()
+            } else {
+                "验证未通过".to_string()
+            },
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && !warnings.is_empty() {
+        return RuntimeEvent::TurnCompletedWithWarnings {
+            reason: detail_with_warnings(),
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop == Some(StopReason::Completed) {
+        return match verification {
+            VerificationStatus::Passed if !warnings.is_empty() || reason.is_some() => {
+                RuntimeEvent::TurnCompletedWithWarnings {
+                    reason: detail_with_warnings(),
+                }
+            }
+            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
+            VerificationStatus::Failed => unreachable!("failed verification handled above"),
+            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
+                RuntimeEvent::TurnCompletedUnverified {
+                    reason: reason.unwrap_or_else(|| {
+                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+                    }),
+                }
+            }
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop.is_none() {
+        return match verification {
+            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
+            VerificationStatus::Failed => unreachable!("failed verification handled above"),
+            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
+                RuntimeEvent::TurnCompletedUnverified {
+                    reason: reason.unwrap_or_else(|| {
+                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+                    }),
+                }
+            }
+        };
+    }
+    if let Some(stop) = stop {
+        return turn_end_event(stop, reason);
+    }
+    match outcome {
+        leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnCancelled,
+        leveler_lifecycle::TaskOutcome::Failed => RuntimeEvent::TurnFailed {
+            error: reason.unwrap_or_else(|| "任务执行失败".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::BudgetLimited => RuntimeEvent::TurnIncomplete {
+            reason: reason.unwrap_or_else(|| "执行预算已用尽".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::Blocked => RuntimeEvent::TurnIncomplete {
+            reason: reason.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::Completed => RuntimeEvent::TurnAnswered,
+    }
+}
+
+fn finalization_stage(phase: &str) -> Option<FinalizationStage> {
+    Some(match phase {
+        "settling_dependencies" => FinalizationStage::SettlingDependencies,
+        "settling_turn" => FinalizationStage::SettlingDependencies,
+        "verification" => FinalizationStage::Verification,
+        "evidence" => FinalizationStage::Evidence,
+        "review" => FinalizationStage::Review,
+        "continuation_checkpoint" => FinalizationStage::ResolvingOutcome,
+        "resolving_outcome" => FinalizationStage::ResolvingOutcome,
+        "publishing_terminal" => FinalizationStage::PublishingTerminal,
+        _ => return None,
+    })
+}
+
+fn project_verification_check(
+    legacy: &str,
+    observation: Option<&leveler_engine::VerificationObservation>,
+    disposition: Option<&leveler_engine::VerificationDisposition>,
+    evidence: Option<String>,
+) -> (CheckState, Option<String>) {
+    use leveler_engine::{VerificationDisposition as D, VerificationObservation as O};
+    match (observation, disposition) {
+        (Some(O::Passed), Some(D::Required)) => (CheckState::Passed, evidence),
+        (Some(O::Failed), Some(D::Required)) => (CheckState::Failed, evidence),
+        (
+            Some(O::Failed),
+            Some(D::Skipped {
+                reason,
+                revision,
+                source,
+                failed_tests,
+            }),
+        ) => {
+            let mut grounded = format!("skipped: {reason}");
+            if let Some(revision) = revision {
+                grounded.push_str(&format!("; revision={revision}"));
+            }
+            if let Some(source) = source {
+                grounded.push_str(&format!("; source={source}"));
+            }
+            if !failed_tests.is_empty() {
+                grounded.push_str(&format!("; failed_tests={}", failed_tests.join(",")));
+            }
+            if let Some(evidence) = evidence
+                && !evidence.is_empty()
+            {
+                grounded.push_str(&format!("\n{evidence}"));
+            }
+            (CheckState::Skipped, Some(grounded))
+        }
+        (Some(O::NotRun { reason }), _) => {
+            let state = match reason.as_str() {
+                "tool_missing" => CheckState::ToolMissing,
+                "environment_unavailable" => CheckState::EnvironmentUnavailable,
+                _ => CheckState::NotRun,
+            };
+            (
+                state,
+                evidence.or_else(|| Some(format!("not run: {reason}"))),
+            )
+        }
+        (_, Some(D::Skipped { reason, .. })) => (
+            CheckState::Skipped,
+            evidence.or_else(|| Some(format!("skipped: {reason}"))),
+        ),
+        _ => (map_check_status(legacy), evidence),
+    }
+}
+
 /// Translates the runtime's synchronous `AgentEvent`s into protocol events. Tool
 /// calls carry a stable id, so a `ToolResult` pairs with its `ToolCall` by id
 /// (NOT arrival order — read-only tools run in parallel, so results can arrive
@@ -101,6 +259,14 @@ pub struct EventBridge {
     /// Role per in-flight child, so the terminal event can carry the role the
     /// spawn announced instead of an empty string.
     child_roles: HashMap<String, String>,
+    /// A TaskFinished event is the one terminal authority. Once projected,
+    /// post-terminal timing/cleanup events can never move the client back to a
+    /// busy state, and the interactive wrapper knows not to emit a duplicate.
+    terminal_published: bool,
+    /// Releases host admission ownership at the same boundary that publishes
+    /// the durable terminal. This runs after the client event is enqueued, so
+    /// no newly admitted turn can overtake the preceding terminal projection.
+    on_terminal: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// The wire spelling of the runtime's four-way child reading.
@@ -200,11 +366,42 @@ impl EventBridge {
             verification_checks: Vec::new(),
             recent_assistant_texts: std::collections::VecDeque::new(),
             child_roles: HashMap::new(),
+            terminal_published: false,
+            on_terminal: None,
         }
     }
 
+    pub fn with_terminal_callback(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
+        self.on_terminal = Some(Box::new(callback));
+        self
+    }
+
+    pub fn terminal_published(&self) -> bool {
+        self.terminal_published
+    }
+
     pub fn forward(&mut self, event: EngineEvent) {
+        // TaskFinished is the closed event boundary. No event from the old
+        // epoch may project after it and race a newly admitted turn.
+        if self.terminal_published {
+            return;
+        }
         match event {
+            EngineEvent::FinalizationStarted { .. } => {
+                if !self.terminal_published {
+                    let _ = self.events.send(RuntimeEvent::TurnFinalizing {
+                        stage: FinalizationStage::SettlingDependencies,
+                    });
+                }
+            }
+            EngineEvent::FinalizationPhaseStarted { phase, .. } => {
+                if !self.terminal_published
+                    && let Some(stage) = finalization_stage(&phase)
+                {
+                    let _ = self.events.send(RuntimeEvent::TurnFinalizing { stage });
+                }
+            }
+            EngineEvent::FinalizationPhaseFinished { .. } => {}
             EngineEvent::StreamAttemptStarted => {
                 let message_id = self.open_assistant.take();
                 let _ = self
@@ -514,7 +711,7 @@ impl EventBridge {
                     leveler_lifecycle::TurnPhase::ToolBatch => "tool_batch",
                     leveler_lifecycle::TurnPhase::Closing => "closing",
                     leveler_lifecycle::TurnPhase::AwaitingUser => "awaiting_user",
-                    leveler_lifecycle::TurnPhase::Terminal => "terminal",
+                    leveler_lifecycle::TurnPhase::Closed => "closed",
                 };
                 let _ = self.events.send(RuntimeEvent::TurnProgress {
                     phase: phase.to_string(),
@@ -539,10 +736,19 @@ impl EventBridge {
                 name,
                 status,
                 evidence,
+                observation,
+                disposition,
+                execution: _,
             } => {
+                let (status, evidence) = project_verification_check(
+                    &status,
+                    observation.as_ref(),
+                    disposition.as_ref(),
+                    evidence,
+                );
                 self.verification_checks.push(UiCheck {
                     name,
-                    status: map_check_status(&status),
+                    status,
                     evidence,
                 });
                 self.emit_verification(None);
@@ -690,10 +896,30 @@ impl EventBridge {
             // parallel strategy). Deliberately NOT on the client event stream.
             // This list is exhaustive on purpose — a new EngineEvent variant
             // must make an explicit projection decision here to compile.
+            EngineEvent::TaskFinished {
+                outcome,
+                verification,
+                reason,
+                stop,
+                warnings,
+            } => {
+                if !self.terminal_published {
+                    self.terminal_published = true;
+                    let _ = self.events.send(task_finished_event(
+                        outcome,
+                        verification,
+                        reason,
+                        stop,
+                        warnings,
+                    ));
+                    if let Some(callback) = self.on_terminal.take() {
+                        callback();
+                    }
+                }
+            }
             EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::TurnFinished { .. }
-            | EngineEvent::TaskFinished { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -739,6 +965,7 @@ fn map_check_status(status: &str) -> CheckState {
         Some(CheckStatus::EnvironmentUnavailable) => CheckState::EnvironmentUnavailable,
         // A spelling this vocabulary has never had. Not a pass, and not an
         // invented reason either.
+        None if status == "not_run" => CheckState::NotRun,
         None => CheckState::Unknown,
     }
 }
@@ -847,7 +1074,10 @@ mod bridge_tests {
             },
         );
 
-        let events = drain(&mut rx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
         let plan = events
             .iter()
             .find_map(|e| match e {
@@ -1269,6 +1499,44 @@ mod bridge_tests {
             RuntimeEvent::TurnTruncated { .. }
         ));
     }
+
+    #[test]
+    fn an_unclosed_evidence_boundary_is_a_recovery_fault_not_a_terminal() {
+        let projected = turn_runtime_event(Err(AppError::UnclosedTerminalBoundary(
+            "review terminal write failed".to_string(),
+        )));
+        assert!(matches!(
+            &projected,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                ..
+            }
+        ));
+        assert!(!matches!(
+            &projected,
+            RuntimeEvent::TurnCompleted
+                | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                | RuntimeEvent::TurnCompletedUnverified { .. }
+                | RuntimeEvent::TurnCompletedChecksFailed { .. }
+                | RuntimeEvent::TurnFailed { .. }
+                | RuntimeEvent::TurnCancelled
+        ));
+    }
+
+    #[test]
+    fn a_failed_terminal_commit_is_a_recovery_fault_not_a_terminal() {
+        let projected = turn_runtime_event(Err(AppError::TerminalCommitFailed(
+            "injected terminal failure".to_string(),
+        )));
+        assert!(matches!(
+            projected,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_budget_cutoff_tells_the_user_how_to_carry_on() {
         // Short product copy: next action (continue / /goal), not a long essay.
@@ -1571,6 +1839,9 @@ mod projection_equivalence {
             EngineEvent::VerificationCheck {
                 name: "cargo test".into(),
                 status: "passed".into(),
+                observation: None,
+                disposition: None,
+                execution: None,
                 evidence: None,
             },
             EngineEvent::VerificationFinished {
@@ -1588,6 +1859,226 @@ mod projection_equivalence {
         );
     }
 
+    #[test]
+    fn finalization_stages_precede_the_authoritative_terminal_event() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::AssistantDelta {
+            text: "done".into(),
+        });
+        bridge.forward(EngineEvent::RunFinished {
+            text: "done".into(),
+        });
+        bridge.forward(EngineEvent::FinalizationStarted {
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::FinalizationPhaseStarted {
+            phase: "verification".into(),
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::AssistantMessageStarted { .. },
+                RuntimeEvent::AssistantTextDelta { .. },
+                RuntimeEvent::AssistantMessageCompleted { .. },
+                RuntimeEvent::TurnFinalizing {
+                    stage: FinalizationStage::SettlingDependencies
+                },
+                RuntimeEvent::TurnFinalizing {
+                    stage: FinalizationStage::Verification
+                },
+                RuntimeEvent::TurnCompletedChecksFailed { reason }
+            ] if reason == "failed gate(s): cargo test"
+        ));
+        assert!(bridge.terminal_published());
+    }
+
+    #[test]
+    fn terminal_is_enqueued_before_admission_is_released() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, _rx) = broadcast::channel(4);
+        let mut callback_rx = tx.subscribe();
+        let terminal_was_visible = Arc::new(AtomicBool::new(false));
+        let observed = terminal_was_visible.clone();
+        let mut bridge = EventBridge::new(tx).with_terminal_callback(move || {
+            observed.store(
+                matches!(callback_rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)),
+                Ordering::SeqCst,
+            );
+        });
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+
+        assert!(terminal_was_visible.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn completion_warning_does_not_rewrite_passed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: Some("required independent review did not complete".into()),
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["required independent review did not complete".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
+                if reason == "required independent review did not complete"
+        ));
+    }
+
+    #[test]
+    fn completion_warning_cannot_mask_failed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["required independent review reported 1 finding(s)".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
+                if reason.contains("failed gate(s): cargo test")
+                    && reason.contains("review reported 1 finding")
+        ));
+    }
+
+    #[test]
+    fn answered_stop_cannot_mask_failed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: Vec::new(),
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
+                if reason == "failed gate(s): cargo test"
+        ));
+    }
+
+    #[test]
+    fn legacy_completed_task_without_typed_stop_stays_completed() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            stop: None,
+            warnings: Vec::new(),
+        });
+
+        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
+    }
+
+    #[test]
+    fn grounded_baseline_warning_projects_completed_with_warnings() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Unavailable,
+            reason: Some("required checks were not rerun".into()),
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["mechanically confirmed baseline failure: cargo test".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
+                if reason.contains("required checks were not rerun")
+                    && reason.contains("mechanically confirmed baseline failure")
+        ));
+    }
+
+    #[test]
+    fn terminal_latch_drops_every_post_terminal_event() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
+
+        bridge.forward(EngineEvent::FinalizationPhaseStarted {
+            phase: "cleanup".into(),
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::AssistantMessage {
+            text: "post-terminal review".into(),
+        });
+        bridge.forward(EngineEvent::VerificationStarted);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Failed,
+            verification: VerificationStatus::Failed,
+            reason: Some("duplicate".into()),
+            stop: None,
+            warnings: Vec::new(),
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may make a terminal UI busy or publish a second terminal"
+        );
+
+        bridge.forward(EngineEvent::GoalCheckpointCreated {
+            checkpoint_id: "checkpoint-1".into(),
+            goal_id: "goal-1".into(),
+            reason: "milestone".into(),
+            created_at: "2026-09-14T00:00:00Z".into(),
+            payload: Box::new(leveler_lifecycle::GoalCheckpoint {
+                objective: "continue the goal".into(),
+                ..Default::default()
+            }),
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
     /// §13 C/D: a check that could not run is not a check that was deliberately
     /// skipped. Both spellings a durable row may carry land on the same state,
     /// and none of them lands on `Skipped`.
@@ -1597,6 +2088,7 @@ mod projection_equivalence {
             ("passed", CheckState::Passed),
             ("failed", CheckState::Failed),
             ("skipped", CheckState::Skipped),
+            ("not_run", CheckState::NotRun),
             ("tool_missing", CheckState::ToolMissing),
             ("toolmissing", CheckState::ToolMissing),
             (
@@ -1615,6 +2107,23 @@ mod projection_equivalence {
         // A status this build cannot read is neither a pass nor an invented
         // reason.
         assert_eq!(map_check_status("something-else"), CheckState::Unknown);
+    }
+
+    #[test]
+    fn typed_incomplete_check_projects_as_not_run_with_its_reason() {
+        let (status, evidence) = project_verification_check(
+            "skipped",
+            Some(&leveler_engine::VerificationObservation::NotRun {
+                reason: "verification_incomplete".into(),
+            }),
+            Some(&leveler_engine::VerificationDisposition::Required),
+            None,
+        );
+        assert_eq!(status, CheckState::NotRun);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("not run: verification_incomplete")
+        );
     }
 
     /// The defect this split exists for. A run that owed no check has an open

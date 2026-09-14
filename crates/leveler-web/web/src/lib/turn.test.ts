@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import type { RuntimeEvent } from '../types/protocol';
 import {
   commandProgressLabel,
+  finalizationStageLabel,
   presentTurnEnd,
   turnEndFromEvent,
   turnFooterPrimary,
@@ -16,6 +17,11 @@ describe('turnEndFromEvent', () => {
   it('maps each terminal event to its own outcome — never collapses to completed', () => {
     const cases: Array<[RuntimeEvent, string, string | null]> = [
       [{ type: 'turn_completed' }, 'completed', null],
+      [
+        { type: 'turn_completed_with_warnings', reason: 'review unavailable' },
+        'completed_with_warnings',
+        'review unavailable',
+      ],
       [{ type: 'turn_answered' }, 'answered', null],
       [{ type: 'turn_truncated', error: 'token limit' }, 'truncated', 'token limit'],
       [{ type: 'turn_incomplete', reason: 'round budget' }, 'incomplete', 'round budget'],
@@ -102,6 +108,14 @@ describe('presentTurnEnd', () => {
     expect(presentTurnEnd({ outcome: 'completed', detail: null }).tone).toBe('success');
     expect(presentTurnEnd({ outcome: 'answered', detail: null }).tone).toBe('success');
   });
+
+  it('completed with warnings keeps the warning outcome and reason', () => {
+    const p = presentTurnEnd({ outcome: 'completed_with_warnings', detail: 'review unavailable' });
+    expect(p.glyph).toBe('⚠');
+    expect(p.label).toBe('已完成，但有警告');
+    expect(p.tone).toBe('warn');
+    expect(p.detail).toBe('review unavailable');
+  });
 });
 
 describe('turnFooterPrimary', () => {
@@ -117,6 +131,11 @@ describe('turnFooterPrimary', () => {
 describe('progress → activity labels (TUI parity)', () => {
   it('command progress names the command with a live elapsed', () => {
     expect(commandProgressLabel('cargo test', 92_000)).toBe('运行 cargo test · 01:32');
+  });
+
+  it('finalization stages surface explicit lifecycle chrome', () => {
+    expect(finalizationStageLabel('verification')).toBe('正在验证');
+    expect(finalizationStageLabel('resolving_outcome')).toBe('正在确认任务结果');
   });
 
   it('turn progress surfaces closing and no-progress streaks', () => {

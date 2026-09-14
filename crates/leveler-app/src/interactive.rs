@@ -700,8 +700,8 @@ impl InProcessRuntimeClient {
             return Ok(());
         }
         let config = self.runtime_config(&session_id).await?;
-        let cancel = match self.active.admit(&session_id) {
-            Ok(token) => token,
+        let admission = match self.active.admit(&session_id) {
+            Ok(admission) => admission,
             Err(crate::active_turns::TurnAdmissionError::Busy(_)) => {
                 self.notify_error(
                     &session_id,
@@ -714,6 +714,7 @@ impl InProcessRuntimeClient {
                 return Ok(());
             }
         };
+        let cancel = admission.cancellation();
         let (runner, request, cwd) =
             match self
                 .app
@@ -721,7 +722,7 @@ impl InProcessRuntimeClient {
             {
                 Ok(parts) => parts,
                 Err(error) => {
-                    self.active.finish(&session_id);
+                    self.active.finish(&admission);
                     self.notify_error(&session_id, format!("无法构造执行环境: {error}"));
                     return Ok(());
                 }
@@ -757,7 +758,7 @@ impl InProcessRuntimeClient {
                     Ok(db) => db,
                     Err(error) => {
                         store.finish(&session_id, &id, None, "failed");
-                        active.finish(&session_id);
+                        active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
                             message: format!("无法打开会话数据库: {error}"),
@@ -780,7 +781,7 @@ impl InProcessRuntimeClient {
                     Ok(token) => token,
                     Err(error) => {
                         store.finish(&session_id, &id, None, "failed");
-                        active.finish(&session_id);
+                        active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
                             message: format!("无法获得会话执行所有权: {error}"),
@@ -848,7 +849,7 @@ impl InProcessRuntimeClient {
                 // has exited, its output is drained, and `store.finish` has
                 // already made `CancelUserShell` a no-op. This matches the
                 // failure paths above, which release before they notify.
-                active.finish(&session_id);
+                active.finish(&admission);
                 let _ = log
                     .append(
                         None,
@@ -877,8 +878,8 @@ impl InProcessRuntimeClient {
         session_id: &SessionId,
         text: &str,
         retitle: bool,
-    ) -> Result<tokio_util::sync::CancellationToken, ClientError> {
-        let cancel = self
+    ) -> Result<crate::active_turns::TurnLease, ClientError> {
+        let admission = self
             .active
             .admit(session_id)
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
@@ -897,7 +898,7 @@ impl InProcessRuntimeClient {
                     kind: None,
                 },
             });
-        Ok(cancel)
+        Ok(admission)
     }
 
     /// Steering for one session. Cloned into the executor, which drains it at
@@ -1045,7 +1046,7 @@ impl InProcessRuntimeClient {
         &self,
         session_id: &SessionId,
         op: &str,
-    ) -> Result<CancellationToken, ClientError> {
+    ) -> Result<crate::active_turns::TurnLease, ClientError> {
         self.active.admit(session_id).map_err(|error| match error {
             crate::active_turns::TurnAdmissionError::Busy(_) => {
                 ClientError::Runtime(format!("当前有进行中的回合，请先等待完成或取消后再{op}"))
@@ -1149,32 +1150,32 @@ impl InProcessRuntimeClient {
         session_id: SessionId,
         content: String,
         attachments: Vec<AttachmentRef>,
-        cancel: CancellationToken,
+        admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), String>> {
         self.notify_memory_candidates(&session_id, &content);
         let parts = self.content_parts(&content, &attachments);
-        self.spawn_content_turn(session_id, parts, cancel, config)
+        self.spawn_content_turn(session_id, parts, admission, config)
     }
 
     fn spawn_goal_turn(
         &self,
         session_id: SessionId,
         content: String,
-        cancel: CancellationToken,
+        admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), String>> {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
         self.notify_memory_candidates(&session_id, &content);
-        self.spawn_direct_goal_turn(session_id, content, cancel, config)
+        self.spawn_direct_goal_turn(session_id, content, admission, config)
     }
 
     fn spawn_direct_goal_turn(
         &self,
         session_id: SessionId,
         content: String,
-        cancel: CancellationToken,
+        admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), String>> {
         let app = self.app.clone();
@@ -1184,6 +1185,7 @@ impl InProcessRuntimeClient {
         let mode = config.mode;
         let sandbox = config.sandbox;
         let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
         // Text the user sends while this turn runs lands here and is injected
@@ -1195,23 +1197,28 @@ impl InProcessRuntimeClient {
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
-                let mut bridge = EventBridge::new(events.clone());
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
-                let mut observer = |event: leveler_engine::EngineEvent| {
-                    if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
-                        && let Some(tx) = observer_acceptance
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    {
-                        let _ = tx.send(Ok(()));
-                        hit_after_turn_started_test_barrier();
-                    }
-                    bridge.forward(event);
-                };
-                let result = app
-                    .run_in_session_with_clarifier(
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.run_in_session_with_clarifier(
                         &session_id,
                         &model,
                         mode,
@@ -1223,7 +1230,8 @@ impl InProcessRuntimeClient {
                         &mut observer,
                         cancel,
                     )
-                    .await;
+                    .await
+                };
                 if let Some(tx) = accepted_tx
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1236,9 +1244,13 @@ impl InProcessRuntimeClient {
                         .unwrap_or_else(|| "turn ended before durable admission".to_string());
                     let _ = tx.send(Err(detail));
                 }
-                let outcome = turn_runtime_event(result);
-                let _ = events.send(outcome);
-                active.finish(&session_id);
+                // TaskFinished is the normal path's one terminal authority and
+                // EventBridge projects it immediately. Only failures that never
+                // reached that commit need the wrapper fallback.
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
                 // Session-owned background reap moved to the engine's terminal
                 // settlement (finish_from_result) so chat-routed continuations
                 // are covered too — one reap site, not one per spawn function
@@ -1538,7 +1550,7 @@ impl InProcessRuntimeClient {
         &self,
         session_id: SessionId,
         parts: Vec<ContentPart>,
-        cancel: CancellationToken,
+        admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), String>> {
         let app = self.app.clone();
@@ -1548,6 +1560,7 @@ impl InProcessRuntimeClient {
         let mode = config.mode;
         let sandbox = config.sandbox;
         let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
         // Steers and per-child cancels reach this chat turn through the same
@@ -1563,23 +1576,28 @@ impl InProcessRuntimeClient {
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
-                let mut bridge = EventBridge::new(events.clone());
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
-                let mut observer = |event: leveler_engine::EngineEvent| {
-                    if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
-                        && let Some(tx) = observer_acceptance
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    {
-                        let _ = tx.send(Ok(()));
-                        hit_after_turn_started_test_barrier();
-                    }
-                    bridge.forward(event);
-                };
-                let result = app
-                    .run_in_session_with_content(
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.run_in_session_with_content(
                         &session_id,
                         &model,
                         mode,
@@ -1591,7 +1609,8 @@ impl InProcessRuntimeClient {
                         &mut observer,
                         cancel,
                     )
-                    .await;
+                    .await
+                };
                 if let Some(tx) = accepted_tx
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1604,9 +1623,10 @@ impl InProcessRuntimeClient {
                         .unwrap_or_else(|| "turn ended before durable admission".to_string());
                     let _ = tx.send(Err(detail));
                 }
-                let outcome = turn_runtime_event(result);
-                let _ = events.send(outcome);
-                active.finish(&session_id);
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
             });
         });
         accepted_rx
@@ -1618,7 +1638,7 @@ impl InProcessRuntimeClient {
         session_id: SessionId,
         checkpoint_id: CheckpointId,
     ) -> Result<(), ClientError> {
-        let _token = self.admit_context_op(&session_id, "恢复检查点")?;
+        let admission = self.admit_context_op(&session_id, "恢复检查点")?;
         let ordinal = self.checkpoints.ordinal_of(&session_id, &checkpoint_id);
         if let Some(ordinal) = ordinal {
             // A failed truncate means the conversation did NOT roll
@@ -1681,7 +1701,7 @@ impl InProcessRuntimeClient {
                 "未找到该检查点（可能已被清空、压缩或更早的回滚移除）".to_string(),
             );
         }
-        self.active.finish(&session_id);
+        self.active.finish(&admission);
         Ok(())
     }
     /// Compact the session's context off the request path, owning the
@@ -1689,13 +1709,14 @@ impl InProcessRuntimeClient {
     async fn handle_compact_context(&self, session_id: SessionId) -> Result<(), ClientError> {
         // Own the session while compact runs so Submit/clear/restore
         // cannot race the transcript rewrite.
-        let cancel = self.admit_context_op(&session_id, "压缩上下文")?;
+        let admission = self.admit_context_op(&session_id, "压缩上下文")?;
+        let cancel = admission.cancellation();
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let config = match self.runtime_config(&session_id).await {
             Ok(config) => config,
             Err(error) => {
-                self.active.finish(&session_id);
+                self.active.finish(&admission);
                 // Surface the same way as in-flight compact failures.
                 let _ = events.send(RuntimeEvent::TurnFailed {
                     error: format!("压缩失败：{error}"),
@@ -1727,7 +1748,7 @@ impl InProcessRuntimeClient {
                 if rewrote {
                     checkpoints.drop_session(&session_id);
                 }
-                active.finish(&session_id);
+                active.finish(&admission);
             });
         });
         Ok(())
@@ -1735,7 +1756,7 @@ impl InProcessRuntimeClient {
     /// Clear the conversation: drop stored messages and reset task epoch,
     /// surfacing a DB failure rather than showing a false-empty transcript.
     async fn handle_clear_conversation(&self, session_id: SessionId) -> Result<(), ClientError> {
-        let _token = self.admit_context_op(&session_id, "清空会话")?;
+        let admission = self.admit_context_op(&session_id, "清空会话")?;
         // Drop all stored messages so the next turn starts fresh. A DB
         // failure must be surfaced — silently keeping the history while
         // the UI shows an empty conversation is a lie.
@@ -1757,7 +1778,7 @@ impl InProcessRuntimeClient {
             }
             Err(error) => self.notify_error(&session_id, format!("清空会话失败: {error}")),
         }
-        self.active.finish(&session_id);
+        self.active.finish(&admission);
         Ok(())
     }
 }
@@ -2499,7 +2520,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 {
                     Ok(observation) => {
                         // Echo the caller's token. `None` is a 1.5 query:
-                        // still serve the read model; 1.6 clients will not
+                        // still serve the read model; current clients will not
                         // treat the response as owned.
                         let _ =
                             self.events_for(&session_id)
@@ -2906,7 +2927,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // table is the finer truth and the startup reaper keeps it honest, so
         // ask it: a session whose row says running while every one of its turns
         // has settled is interrupted, and opens idle.
+        let runtime_active = self.active.is_running(session_id);
         let status = if record.status == leveler_lifecycle::SessionStatus::Running
+            && !runtime_active
             && leveler_storage::TurnRepository::new(&db)
                 .list(session_id)
                 .await
@@ -2922,10 +2945,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // decoded fails the snapshot: it is canonical history, and every other
         // reader of it (restart reconciliation, observability) refuses corrupt
         // rows rather than showing a partial truth as the whole one.
-        let children =
-            crate::children::project_children(&db, session_id, self.active.is_running(session_id))
-                .await
-                .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        let children = crate::children::project_children(&db, session_id, runtime_active)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
 
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
@@ -2935,6 +2957,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             mode: protocol_mode(config.mode),
             branch: detect_branch_label(&self.app.layout.repo_root),
             status: status.as_str().to_string(),
+            finalization_stage: runtime_active.then_some(live.finalization_stage).flatten(),
             messages,
             pending_interactions,
             available_models,
@@ -3238,6 +3261,7 @@ async fn compact_conversation(
                 mode: protocol_mode(mode),
                 branch: detect_branch_label(&app.layout.repo_root),
                 status: record.status.as_str().to_string(),
+                finalization_stage: live.finalization_stage,
                 messages,
                 // Compact is admitted like a turn, so no turn is running and
                 // no interaction can be pending; checkpoints are about to be

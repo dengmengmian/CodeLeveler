@@ -231,6 +231,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             name,
             status,
             evidence,
+            ..
         } => AgentEvent::VerificationCheck {
             name,
             // Parsed by the vocabulary's owner. A spelling this build cannot
@@ -334,6 +335,8 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         EngineError::Storage(e) => AppError::Storage(e),
         EngineError::Serde(e) => AppError::Serde(e.to_string()),
         EngineError::Config(m) | EngineError::Corrupt(m) => AppError::Engine(m),
+        EngineError::UnclosedTerminalBoundary(m) => AppError::UnclosedTerminalBoundary(m),
+        EngineError::TerminalCommitFailed(m) => AppError::TerminalCommitFailed(m),
         // Pass the diagnostic through verbatim rather than flattening it back
         // to a bare sentence — the whole point of carrying the event type, the
         // producing agent and the capacity is that they reach the user.
@@ -916,7 +919,9 @@ mod tests {
             stop_detail: None,
             rounds: 1,
             windows: 1,
+            execution_duration_ms: 0,
             review: None,
+            completion_warnings: Vec::new(),
         }
     }
 
@@ -1032,6 +1037,9 @@ mod tests {
             let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
                 name: "test".to_string(),
                 status: durable.to_string(),
+                observation: None,
+                disposition: None,
+                execution: None,
                 evidence: None,
             });
             match projected {
@@ -1051,6 +1059,9 @@ mod tests {
         let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
             name: "test".to_string(),
             status: "something-else".to_string(),
+            observation: None,
+            disposition: None,
+            execution: None,
             evidence: None,
         });
         assert!(projected.is_none(), "{projected:?}");
@@ -1069,21 +1080,24 @@ mod tests {
                 name: "tsc".to_string(),
                 kind: leveler_verifier::CheckKind::Build,
                 gating: true,
-                status: leveler_verifier::CheckStatus::ToolMissing,
+                observation: leveler_verifier::CheckObservation::NotRun(
+                    leveler_verifier::NotRunReason::ToolMissing,
+                ),
+                disposition: leveler_verifier::GateDisposition::Required,
+                execution: None,
                 evidence: String::new(),
                 failure: None,
                 failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
-            baseline_failures: Vec::new(),
         });
 
         let out = report_to_result(task).unwrap();
 
         assert_eq!(
             out.stop_detail.as_deref(),
-            Some("gating checks did not run: tsc (tool missing)")
+            Some("verification incomplete: tsc (tool missing)")
         );
     }
 
@@ -1102,7 +1116,6 @@ mod tests {
             checks: Vec::new(),
             scope_ok: true,
             scope_violations: Vec::new(),
-            baseline_failures: Vec::new(),
         });
 
         let out = report_to_result(task).unwrap();
@@ -1123,7 +1136,10 @@ mod tests {
     /// parsed failing test ids, not just the check name.
     #[test]
     fn checks_failed_marker_names_the_failing_tests() {
-        use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus, VerificationReport};
+        use leveler_verifier::{
+            CheckExecution, CheckKind, CheckObservation, CheckOutcome, GateDisposition,
+            VerificationReport,
+        };
         let mut task = report_with(
             TaskOutcome::Completed,
             leveler_lifecycle::VerificationStatus::Failed,
@@ -1135,7 +1151,14 @@ mod tests {
                 name: "cargo test".into(),
                 kind: CheckKind::Test,
                 gating: true,
-                status: CheckStatus::Failed,
+                observation: CheckObservation::Failed,
+                disposition: GateDisposition::Required,
+                execution: Some(CheckExecution {
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                    exit_code: Some(1),
+                    timed_out: false,
+                }),
                 evidence: String::new(),
                 failure: None,
                 failed_tests: ["permission_grants::always_allow_grants_survive_reassembly"]
@@ -1145,7 +1168,6 @@ mod tests {
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
-            baseline_failures: Vec::new(),
         });
 
         let out = report_to_result(task).unwrap();
@@ -1164,7 +1186,10 @@ mod tests {
     fn checks_failed_marker_caps_the_test_list_and_keeps_the_count() {
         // Many failing tests must not flood the one-line marker: show the
         // first two ids and the size of the remainder.
-        use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus, VerificationReport};
+        use leveler_verifier::{
+            CheckExecution, CheckKind, CheckObservation, CheckOutcome, GateDisposition,
+            VerificationReport,
+        };
         let mut task = report_with(
             TaskOutcome::Completed,
             leveler_lifecycle::VerificationStatus::Failed,
@@ -1176,7 +1201,14 @@ mod tests {
                 name: "cargo test".into(),
                 kind: CheckKind::Test,
                 gating: true,
-                status: CheckStatus::Failed,
+                observation: CheckObservation::Failed,
+                disposition: GateDisposition::Required,
+                execution: Some(CheckExecution {
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                    exit_code: Some(1),
+                    timed_out: false,
+                }),
                 evidence: String::new(),
                 failure: None,
                 failed_tests: ["a::one", "b::two", "c::three", "d::four"]
@@ -1186,7 +1218,6 @@ mod tests {
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
-            baseline_failures: Vec::new(),
         });
 
         let out = report_to_result(task).unwrap();

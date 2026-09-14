@@ -232,6 +232,8 @@ pub struct TaskTerminal {
     pub state: AgentState,
     /// Optional long-goal projection committed with the terminal fact.
     pub goal: Option<leveler_storage::GoalTerminalUpdate>,
+    /// Completion-contract warnings orthogonal to project verification.
+    pub warnings: Vec<String>,
 }
 
 impl TaskEngine {
@@ -256,15 +258,18 @@ impl TaskEngine {
             status,
             state,
             goal,
+            warnings,
         } = terminal;
         let event = EngineEvent::TaskFinished {
             outcome,
             verification,
             reason,
             stop,
+            warnings,
         };
         let (event_type, payload) = event.to_row()?;
-        self.stores
+        let commit = self
+            .stores
             .terminal
             .finish_task_owned(
                 token,
@@ -278,8 +283,11 @@ impl TaskEngine {
                 goal.as_ref(),
                 leveler_core::now(),
             )
-            .await?;
-        observer(event);
+            .await
+            .map_err(|error| EngineError::TerminalCommitFailed(error.to_string()))?;
+        if commit.inserted {
+            observer(event);
+        }
         Ok(())
     }
 

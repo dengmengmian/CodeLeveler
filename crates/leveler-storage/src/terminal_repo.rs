@@ -4,7 +4,7 @@ use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
 
 use crate::event_repo::EVENT_SCHEMA_VERSION;
-use crate::{Database, EventRecord, GoalTerminalUpdate, StorageError};
+use crate::{Database, EventRecord, GoalTerminalUpdate, StorageError, TaskTerminalCommit};
 
 /// Writes that must land together: appending the terminal event, marking the
 /// aggregate finished, and applying any supplied goal projection. Each method
@@ -142,7 +142,7 @@ impl TerminalRepository<'_> {
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
         now: Timestamp,
-    ) -> Result<EventRecord, crate::OwnershipError> {
+    ) -> Result<TaskTerminalCommit, crate::OwnershipError> {
         // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
         // a deferred read-then-write upgrade deadlocks against a concurrent
         // writer with an immediate "database is locked" no busy_timeout can
@@ -158,7 +158,53 @@ impl TerminalRepository<'_> {
             let _ = tx.rollback().await;
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
-        let event = append_event(&mut tx, session_id, None, event_type, payload, &now)
+        let payload = crate::terminal_store::task_terminal_payload_for_epoch(
+            payload,
+            session_id,
+            token,
+            outcome,
+            verification,
+            status,
+            state,
+            goal,
+        )
+        .map_err(crate::OwnershipError::Storage)?;
+        // The idempotency key is the durable task ownership epoch, not event
+        // adjacency. Audit rows may be appended after a terminal without
+        // authorizing a second terminal or charging the goal twice.
+        let prior_terminals = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, \
+             created_at, schema_version FROM events WHERE session_id = ?1 AND type = ?2 \
+             ORDER BY sequence DESC",
+        )
+        .bind(session_id.as_str())
+        .bind(event_type)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(StorageError::from)
+        .map_err(crate::OwnershipError::Storage)?;
+        if let Some(event) = prior_terminals.into_iter().find(|event| {
+            crate::terminal_store::task_terminal_payload_matches_epoch(&event.payload, token)
+        }) {
+            if event.payload != payload {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                    format!(
+                        "conflicting task terminal for ownership epoch {}",
+                        token.owner_epoch.get()
+                    ),
+                )));
+            }
+            tx.commit()
+                .await
+                .map_err(StorageError::from)
+                .map_err(crate::OwnershipError::Storage)?;
+            return Ok(TaskTerminalCommit {
+                event,
+                inserted: false,
+            });
+        }
+        let event = append_event(&mut tx, session_id, None, event_type, &payload, &now)
             .await
             .map_err(crate::OwnershipError::Storage)?;
         let updated = sqlx::query(
@@ -230,7 +276,10 @@ impl TerminalRepository<'_> {
             .await
             .map_err(StorageError::from)
             .map_err(crate::OwnershipError::Storage)?;
-        Ok(event)
+        Ok(TaskTerminalCommit {
+            event,
+            inserted: true,
+        })
     }
 
     /// Fenced [`Self::finish_turn`], same single-transaction contract.
@@ -420,18 +469,108 @@ mod tests {
             .await
             .unwrap();
 
+        EventRepository::new(&db)
+            .append(
+                &session,
+                None,
+                "audit_note",
+                r#"{"type":"audit_note","detail":"after terminal"}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let projection_conflict = TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Failed,
+                AgentState::Failed,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await;
+        assert!(
+            projection_conflict.is_err(),
+            "the same event body with a different lifecycle projection must conflict"
+        );
+
+        let different_goal_update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 4,
+            settle: true,
+        };
+        let goal_conflict = TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                leveler_lifecycle::VerificationStatus::NotRun,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&different_goal_update),
+                leveler_core::now(),
+            )
+            .await;
+        assert!(
+            goal_conflict.is_err(),
+            "the same event body with a different goal projection must conflict"
+        );
+
+        let conflict = TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"failed"}}"#,
+                TaskOutcome::Failed,
+                leveler_lifecycle::VerificationStatus::Failed,
+                SessionStatus::Failed,
+                AgentState::Failed,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "one ownership epoch has one terminal truth"
+        );
+
         let stored = db.get(&goal).await.unwrap().unwrap();
         assert_eq!(stored.windows_run, 3);
         assert_eq!(stored.state, GoalState::Settled);
         assert!(stored.settled_at.is_some());
+        let events = EventRepository::new(&db).load(&session).await.unwrap();
         assert_eq!(
-            EventRepository::new(&db)
-                .load(&session)
-                .await
-                .unwrap()
-                .len(),
+            events
+                .iter()
+                .filter(|event| event.event_type == "task_finished")
+                .count(),
             1
         );
+        assert_eq!(events.len(), 2, "the intervening audit row remains intact");
         assert_eq!(
             SessionStore::execution(&db, &session)
                 .await

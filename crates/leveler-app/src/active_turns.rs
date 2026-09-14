@@ -1,7 +1,7 @@
 //! Per-session ownership of active interactive turns.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use leveler_core::SessionId;
@@ -21,8 +21,27 @@ pub(crate) enum TurnAdmissionError {
     Retiring,
 }
 
+#[derive(Clone)]
+pub(crate) struct TurnLease {
+    session_id: SessionId,
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl TurnLease {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+struct ActiveTurn {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
 pub(crate) struct ActiveTurns {
-    active: Mutex<HashMap<SessionId, CancellationToken>>,
+    active: Mutex<HashMap<SessionId, ActiveTurn>>,
+    next_generation: AtomicU64,
     capacity: usize,
     /// Shared with the runtime's shutdown flag: admission is where retiring
     /// has to bite, because reporting `accepting_work: false` while still
@@ -34,6 +53,7 @@ impl Default for ActiveTurns {
     fn default() -> Self {
         Self {
             active: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
             capacity: 4,
             retiring: Arc::new(AtomicBool::new(false)),
         }
@@ -61,10 +81,7 @@ impl ActiveTurns {
         (active, self.capacity)
     }
 
-    pub(crate) fn admit(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<CancellationToken, TurnAdmissionError> {
+    pub(crate) fn admit(&self, session_id: &SessionId) -> Result<TurnLease, TurnAdmissionError> {
         if self.retiring.load(Ordering::SeqCst) {
             return Err(TurnAdmissionError::Retiring);
         }
@@ -76,8 +93,19 @@ impl ActiveTurns {
             return Err(TurnAdmissionError::Capacity(self.capacity));
         }
         let token = CancellationToken::new();
-        active.insert(session_id.clone(), token.clone());
-        Ok(token)
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        active.insert(
+            session_id.clone(),
+            ActiveTurn {
+                generation,
+                cancellation: token.clone(),
+            },
+        );
+        Ok(TurnLease {
+            session_id: session_id.clone(),
+            generation,
+            cancellation: token,
+        })
     }
 
     /// Whether a main turn is currently running for this session.
@@ -92,21 +120,31 @@ impl ActiveTurns {
     }
 
     pub(crate) fn cancel(&self, session_id: &SessionId) -> bool {
-        if let Some(token) = self.active.lock().unwrap().get(session_id) {
-            token.cancel();
+        if let Some(turn) = self.active.lock().unwrap().get(session_id) {
+            turn.cancellation.cancel();
             true
         } else {
             false
         }
     }
 
-    pub(crate) fn finish(&self, session_id: &SessionId) {
-        self.active.lock().unwrap().remove(session_id);
+    /// Release only the epoch represented by `lease`. Repeating release is
+    /// harmless, and a stale turn can never remove a newer turn admitted for
+    /// the same session after terminal publication.
+    pub(crate) fn finish(&self, lease: &TurnLease) -> bool {
+        let mut active = self.active.lock().unwrap();
+        let owns_slot = active
+            .get(&lease.session_id)
+            .is_some_and(|turn| turn.generation == lease.generation);
+        if owns_slot {
+            active.remove(&lease.session_id);
+        }
+        owns_slot
     }
 
     pub(crate) fn cancel_all(&self) {
-        for (_, token) in self.active.lock().unwrap().drain() {
-            token.cancel();
+        for (_, turn) in self.active.lock().unwrap().drain() {
+            turn.cancellation.cancel();
         }
     }
 }
@@ -126,7 +164,7 @@ mod tests {
         let session = SessionId::new("s1");
 
         let admitted = turns.admit(&session).expect("a live runtime takes work");
-        turns.finish(&session);
+        turns.finish(&admitted);
         drop(admitted);
 
         retiring.store(true, Ordering::SeqCst);
@@ -146,7 +184,7 @@ mod tests {
             Err(TurnAdmissionError::Busy(id)) if id == session
         ));
         assert!(
-            !first.is_cancelled(),
+            !first.cancellation().is_cancelled(),
             "rejected admission must not replace it"
         );
     }
@@ -160,8 +198,8 @@ mod tests {
         let token_b = turns.admit(&b).unwrap();
 
         assert!(turns.cancel(&a));
-        assert!(token_a.is_cancelled());
-        assert!(!token_b.is_cancelled());
+        assert!(token_a.cancellation().is_cancelled());
+        assert!(!token_b.cancellation().is_cancelled());
         assert!(!turns.cancel(&SessionId::new("missing")));
     }
 
@@ -173,13 +211,34 @@ mod tests {
         };
         let a = SessionId::new("a");
         let b = SessionId::new("b");
-        turns.admit(&a).unwrap();
+        let lease_a = turns.admit(&a).unwrap();
         turns.admit(&b).unwrap();
         assert!(matches!(
             turns.admit(&SessionId::new("c")),
             Err(TurnAdmissionError::Capacity(2))
         ));
-        turns.finish(&a);
+        turns.finish(&lease_a);
         assert!(turns.admit(&SessionId::new("c")).is_ok());
+    }
+
+    #[test]
+    fn a_stale_release_cannot_remove_a_newer_turn_for_the_same_session() {
+        let turns = ActiveTurns::default();
+        let session = SessionId::new("same-session");
+        let old = turns.admit(&session).unwrap();
+        assert!(turns.finish(&old));
+
+        let current = turns.admit(&session).unwrap();
+        assert!(
+            !turns.finish(&old),
+            "the old wrapper's late release must be an idempotent no-op"
+        );
+        assert!(turns.is_running(&session));
+        assert!(matches!(
+            turns.admit(&session),
+            Err(TurnAdmissionError::Busy(id)) if id == session
+        ));
+        assert!(turns.cancel(&session));
+        assert!(current.cancellation().is_cancelled());
     }
 }

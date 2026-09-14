@@ -86,7 +86,9 @@ fn sanitize(text: &str) -> String {
 /// more than Completion Truth does.
 fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
     match end {
-        TurnEndStatus::Completed | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
+        TurnEndStatus::Completed
+        | TurnEndStatus::CompletedWithWarnings
+        | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
         // A run with no answer committed is not a completion, so the title
         // must not carry the ✓ either.
         TurnEndStatus::NoFinalAnswer

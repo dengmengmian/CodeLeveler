@@ -96,6 +96,7 @@ mod tests {
             mode: crate::PermissionProfile::Assisted,
             branch: None,
             status: "idle".into(),
+            finalization_stage: None,
             messages: Vec::new(),
             pending_interactions: Vec::new(),
             available_models: Vec::new(),
@@ -138,6 +139,7 @@ mod tests {
             mode: crate::PermissionProfile::Assisted,
             branch: None,
             status: "idle".into(),
+            finalization_stage: None,
             messages: Vec::new(),
             pending_interactions: Vec::new(),
             available_models: Vec::new(),
@@ -344,6 +346,10 @@ pub struct UiSessionSnapshot {
     pub branch: Option<String>,
     /// Persisted status string (e.g. "running", "completed").
     pub status: String,
+    /// Typed in-flight terminalization stage. Present only while the runtime
+    /// still owns an active turn after the final assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_stage: Option<crate::FinalizationStage>,
     pub messages: Vec<UiMessage>,
     /// Live approval/clarification waiters for reconnect/resync.
     #[serde(default)]

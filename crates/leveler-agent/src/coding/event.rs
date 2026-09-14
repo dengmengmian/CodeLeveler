@@ -69,6 +69,20 @@ impl From<AgentEvent> for EngineEvent {
             A::CommandProgress { label, elapsed_ms } => {
                 EngineEvent::CommandProgress { label, elapsed_ms }
             }
+            A::FinalizationStarted => EngineEvent::FinalizationStarted {
+                at: leveler_core::now(),
+            },
+            A::FinalizationPhaseStarted { phase } => EngineEvent::FinalizationPhaseStarted {
+                phase,
+                at: leveler_core::now(),
+            },
+            A::FinalizationPhaseFinished { phase, elapsed_ms } => {
+                EngineEvent::FinalizationPhaseFinished {
+                    phase,
+                    at: leveler_core::now(),
+                    elapsed_ms,
+                }
+            }
             A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
             A::DelegationStage { action, detail } => {
@@ -92,6 +106,9 @@ impl From<AgentEvent> for EngineEvent {
                 // The same durable vocabulary the verifier's own writer uses,
                 // through the same mapper.
                 status: status.as_str().to_string(),
+                observation: None,
+                disposition: None,
+                execution: None,
                 evidence,
             },
             A::VerificationFinished {

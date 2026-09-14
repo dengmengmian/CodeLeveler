@@ -542,6 +542,26 @@ describe('event closure', () => {
     expect(state.current?.lastTurn?.detail).toBe('budget');
   });
 
+  it('completed-with-warnings is terminal, preserves its reason, and clears active state', () => {
+    const { apply, state } = harness();
+    reducer(state, { type: 'turn_active', value: true });
+    apply({ type: 'turn_completed_with_warnings', reason: 'review unavailable' });
+    expect(state.current?.turnActive).toBe(false);
+    expect(state.current?.lastTurn).toMatchObject({
+      outcome: 'completed_with_warnings',
+      detail: 'review unavailable',
+    });
+  });
+
+  it('turn_finalizing replaces generic running chrome without ending the turn', () => {
+    const { apply, state } = harness();
+    reducer(state, { type: 'turn_active', value: true });
+    apply({ type: 'turn_finalizing', stage: 'verification' });
+    expect(state.current?.turnActive).toBe(true);
+    expect(state.current?.activity).toBe('正在验证');
+    expect(state.current?.lastTurn).toBeNull();
+  });
+
   it('command_progress / turn_progress land in the activity slot', () => {
     const { apply, state } = harness();
     apply({ type: 'command_progress', label: 'cargo test', elapsed_ms: 61_000 });

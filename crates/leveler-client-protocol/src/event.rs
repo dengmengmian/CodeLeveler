@@ -11,7 +11,7 @@ use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
-use super::progress::{UiCompletionReport, UiDiff, UiPlan, UiVerification};
+use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan, UiVerification};
 use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
 
 /// Stable `TurnCompletedUnverified.reason` when the turn AUTHORED no source
@@ -195,6 +195,9 @@ pub enum RuntimeEvent {
     ReasoningDelta { delta: String },
     /// The assistant message is complete.
     AssistantMessageCompleted { message_id: MessageId },
+    /// The assistant has produced its final response, while the runtime is
+    /// still settling the task before its one authoritative terminal event.
+    TurnFinalizing { stage: FinalizationStage },
     /// Coarse progress label from the runtime, shown in the status line.
     AgentActivity { label: String },
     /// Heartbeat while a long command tool runs (runtime observability). Lets a
@@ -301,6 +304,9 @@ pub enum RuntimeEvent {
     SessionCompleted { report: UiCompletionReport },
     /// The current turn finished successfully.
     TurnCompleted,
+    /// The work completed and project verification retains its own result,
+    /// but a separate required completion contract produced warnings.
+    TurnCompletedWithWarnings { reason: String },
     /// The assistant naturally finished its answer, without claiming that an
     /// external task was independently verified as complete.
     TurnAnswered,
@@ -458,7 +464,7 @@ pub enum RuntimeEvent {
     /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
     /// projection of durable facts for the current or a historical session.
     /// Echoes the command's `query_id` when the peer sent one. Absent on
-    /// protocol 1.5 peers — a 1.6 client must not treat that as ownership.
+    /// protocol 1.5 peers — a current client must not treat that as ownership.
     ObservabilityLoaded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
@@ -554,6 +560,7 @@ mod tests {
             mode: crate::PermissionProfile::Assisted,
             branch: Some("main".to_string()),
             status: "busy".to_string(),
+            finalization_stage: None,
             messages: vec![UiMessage {
                 id: MessageId::new("m1"),
                 role: UiRole::User,
@@ -823,6 +830,16 @@ mod tests {
                 message_id: MessageId::new("m1"),
             },
             "assistant_message_completed",
+        );
+    }
+
+    #[test]
+    fn turn_finalizing_roundtrips_with_a_typed_stage() {
+        roundtrip(
+            RuntimeEvent::TurnFinalizing {
+                stage: FinalizationStage::ResolvingOutcome,
+            },
+            "turn_finalizing",
         );
     }
 

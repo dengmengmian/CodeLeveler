@@ -92,6 +92,15 @@ describe('product axes', () => {
   });
 });
 
+describe('finalization snapshot', () => {
+  it('restores explicit finalizing chrome instead of generic running state', () => {
+    const state = stateWithSession({ status: 'running', finalization_stage: 'verification' });
+    expect(state.current?.turnActive).toBe(true);
+    expect(state.current?.activity).toBe('正在验证');
+    expect(state.current?.lastTurn).toBeNull();
+  });
+});
+
 function project(path: string, over: Partial<ProjectInfo> = {}): ProjectInfo {
   return { path, name: path.split('/').pop() ?? path, status: 'online', sessions: 0, ...over };
 }

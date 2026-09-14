@@ -207,6 +207,7 @@ export function shouldRefreshObservability(ev: RuntimeEvent): boolean {
     case 'sub_agent_updated':
     case 'sub_agent_state_changed':
     case 'turn_completed':
+    case 'turn_completed_with_warnings':
     case 'turn_answered':
     case 'turn_failed':
     case 'turn_incomplete':

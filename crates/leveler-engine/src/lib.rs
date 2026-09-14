@@ -25,7 +25,8 @@ pub use engine::{
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
-    PublicTurnKind, TurnKind,
+    PublicTurnKind, TurnKind, VerificationDisposition, VerificationExecution,
+    VerificationObservation,
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
@@ -72,6 +73,16 @@ pub enum EngineError {
     /// further canonical facts, not even a terminal one.
     #[error("stale runtime ownership: {0}")]
     StaleOwnership(String),
+    /// A terminal-dependent activation started, but its durable terminal fact
+    /// could not be written. Publishing a task terminal would leave an open
+    /// child behind it, so the caller must return the error without closing
+    /// the task and let recovery reconcile the boundary.
+    #[error("terminal evidence boundary is not closed: {0}")]
+    UnclosedTerminalBoundary(String),
+    /// The canonical task-terminal transaction did not commit. Callers must
+    /// surface a recovery fault, never synthesize a client terminal event.
+    #[error("task terminal was not committed: {0}")]
+    TerminalCommitFailed(String),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]

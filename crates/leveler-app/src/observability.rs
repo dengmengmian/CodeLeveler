@@ -291,6 +291,38 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             "info".into(),
             vec![("Turn".into(), turn_id.as_str().to_string())],
         ),
+        EngineEvent::FinalizationStarted { at } => (
+            ObservationClass::Terminal,
+            "finalization started".into(),
+            at.to_rfc3339(),
+            "running".into(),
+            vec![("At".into(), at.to_rfc3339())],
+        ),
+        EngineEvent::FinalizationPhaseStarted { phase, at } => (
+            ObservationClass::Terminal,
+            format!("finalization {phase}"),
+            at.to_rfc3339(),
+            "running".into(),
+            vec![
+                ("Phase".into(), phase.clone()),
+                ("At".into(), at.to_rfc3339()),
+            ],
+        ),
+        EngineEvent::FinalizationPhaseFinished {
+            phase,
+            at,
+            elapsed_ms,
+        } => (
+            ObservationClass::Terminal,
+            format!("finalization {phase}"),
+            format!("{elapsed_ms} ms"),
+            "ok".into(),
+            vec![
+                ("Phase".into(), phase.clone()),
+                ("At".into(), at.to_rfc3339()),
+                ("Elapsed".into(), format!("{elapsed_ms} ms")),
+            ],
+        ),
         EngineEvent::TurnFinished {
             turn_id,
             outcome,
@@ -328,15 +360,30 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             "running".into(),
             vec![],
         ),
-        EngineEvent::VerificationCheck { name, status, .. } => (
+        EngineEvent::VerificationCheck {
+            name,
+            status,
+            observation,
+            disposition,
+            ..
+        } => (
             ObservationClass::Verify,
             name.clone(),
             status.clone(),
             if status == "failed" { "fail" } else { "info" }.into(),
-            vec![
-                ("Check".into(), name.clone()),
-                ("Status".into(), status.clone()),
-            ],
+            {
+                let mut fields = vec![
+                    ("Check".into(), name.clone()),
+                    ("Status".into(), status.clone()),
+                ];
+                if let Some(observation) = observation {
+                    fields.push(("Observation".into(), format!("{observation:?}")));
+                }
+                if let Some(disposition) = disposition {
+                    fields.push(("Disposition".into(), format!("{disposition:?}")));
+                }
+                fields
+            },
         ),
         EngineEvent::VerificationFinished {
             passed,

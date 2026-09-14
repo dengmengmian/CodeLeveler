@@ -122,6 +122,7 @@ fn snapshot(id: &str, goal: &str, repo: &str, model: &str) -> UiSessionSnapshot 
         mode: leveler_client_protocol::PermissionProfile::Assisted,
         branch: Some("main".into()),
         status: "idle".into(),
+        finalization_stage: None,
         messages: Vec::new(),
         pending_interactions: Vec::new(),
         available_models: Vec::new(),

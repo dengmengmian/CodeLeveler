@@ -380,6 +380,15 @@ pub enum AgentEvent {
     /// executing, so the UI shows "运行 cargo test" with a live elapsed instead
     /// of a bare "等待模型" black box. `label` is the command line being run.
     CommandProgress { label: String, elapsed_ms: u64 },
+    /// The final assistant response is complete, but authoritative task
+    /// settlement has not finished. This is a lifecycle boundary, not a claim
+    /// that the task completed successfully.
+    FinalizationStarted,
+    /// A generic finalization phase began. The stable key is interpreted only
+    /// by product projections; the engine records it opaquely.
+    FinalizationPhaseStarted { phase: String },
+    /// A generic finalization phase settled.
+    FinalizationPhaseFinished { phase: String, elapsed_ms: u64 },
     /// The loop finished with a final answer.
     Finished(String),
 }
@@ -1563,10 +1572,9 @@ impl Executor {
                  update_goal(status=\"complete\", summary=≤12 words). Do not call exploration \
                  tools for a bare greeting.\n\
                  - **Pure Q&A / advice / analysis with no repo edits:** answer fully in the \
-                 prose. Optionally end with at most one soft tip line when a natural next action \
-                 exists (concrete command or one clear follow-up slice) — see base prompt \
-                 \"Soft follow-up tip\". Then update_goal(complete, summary=≤12 words). Prefer \
-                 next_step only when it is a concrete action the user can run/send next.\n\
+                 prose, then update_goal(complete, summary=≤12 words). Use structured next_step \
+                 only when it is a concrete action the user can run/send next; do not append a \
+                 follow-up tip to the final prose.\n\
                  - Never write process closeout: \"任务完成\", \"已全面分析\", \"纯问答类任务\", \
                  \"纯信息查询\", \"直接结束\", \"不需要任何代码变更或测试\", restating the user \
                  question, or listing files you read as a wrap-up. update_goal is silent \
@@ -1589,8 +1597,8 @@ impl Executor {
                  - **Same-session follow-ups:** use prior messages and what you already learned. \
                  Do not pretend the conversation is empty or re-scan the whole repo unless the \
                  user asks something that needs new evidence.\n\
-                 - After a complete answer: final prose (optional one soft tip) + update_goal \
-                 only. Zero \"done / closed / complete\" paragraphs.",
+                 - After a complete answer: factual final prose + update_goal only. Zero \
+                 \"done / closed / complete\" paragraphs or conversational follow-up offers.",
             );
         }
         prompt

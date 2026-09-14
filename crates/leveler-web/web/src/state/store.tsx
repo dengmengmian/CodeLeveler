@@ -6,8 +6,8 @@
 
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
 import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
+import { finalizationStageLabel, type TurnOutcome } from '../lib/turn';
 import { useImmerReducer } from '../lib/useImmerReducer';
-import type { TurnOutcome } from '../lib/turn';
 import type {
   AttachmentRef,
   ChildOutcome,
@@ -384,6 +384,7 @@ function viewFromSnapshot(
   const turnActive =
     s.includes('run') ||
     s.includes('busy') ||
+    snap.finalization_stage != null ||
     tools.length > 0 ||
     pendingApprovals.length > 0 ||
     pendingClarifications.length > 0;
@@ -408,7 +409,12 @@ function viewFromSnapshot(
     completionReport: snap.completion_report ?? null,
     memory: sameSession ? prev.memory : null,
     turnActive,
-    activity: sameSession ? prev.activity : null,
+    activity:
+      snap.finalization_stage != null
+        ? finalizationStageLabel(snap.finalization_stage)
+        : sameSession
+          ? prev.activity
+          : null,
     reasoning: sameSession ? prev.reasoning : '',
     reasoningSuperseded: sameSession ? prev.reasoningSuperseded : false,
     turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,

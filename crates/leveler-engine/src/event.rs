@@ -88,6 +88,45 @@ pub enum NodeStatus {
     Skipped,
 }
 
+/// Domain-neutral wire fact for what a verification command observed. The
+/// harness owns the reason vocabulary; the engine persists it without
+/// interpreting coding semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerificationObservation {
+    Passed,
+    Failed,
+    NotRun { reason: String },
+}
+
+/// Domain-neutral wire fact for whether an observation participates in the
+/// completion gate. Optional provenance remains typed rather than being hidden
+/// in arbitrary metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerificationDisposition {
+    Required,
+    Skipped {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed_tests: Vec<String>,
+    },
+}
+
+/// Mechanical identity and result of the exact command invocation. Optional
+/// on legacy rows and when no process was started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationExecution {
+    pub program: String,
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
 /// What a turn is, matching `turns.kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -138,6 +177,27 @@ pub enum EngineEvent {
         turn_id: TurnId,
         kind: TurnKind,
     },
+    /// The harness has emitted its final assistant response and entered the
+    /// generic runtime finalization boundary. The task is still non-terminal:
+    /// dependent work and authority resolution may follow.
+    FinalizationStarted {
+        at: leveler_core::Timestamp,
+    },
+    /// One named finalization phase began. `phase` is an opaque, stable key
+    /// selected by the harness; the engine records lifecycle timing without
+    /// learning domain-specific verification semantics.
+    FinalizationPhaseStarted {
+        phase: String,
+        at: leveler_core::Timestamp,
+    },
+    /// One finalization phase settled. The paired start/finish records make
+    /// post-run latency attributable without putting telemetry on the terminal
+    /// critical path.
+    FinalizationPhaseFinished {
+        phase: String,
+        at: leveler_core::Timestamp,
+        elapsed_ms: u64,
+    },
     TurnFinished {
         turn_id: TurnId,
         /// Explicit terminal status. Legacy events omitted it and deserialize
@@ -168,6 +228,9 @@ pub enum EngineEvent {
         /// ended in cancellation or an engine error.
         #[serde(default)]
         stop: Option<leveler_lifecycle::StopReason>,
+        /// Completion-contract warnings orthogonal to project verification.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
 
     // ── kernel: model / tools (1:1 from AgentEvent) ──────────────────────
@@ -490,6 +553,16 @@ pub enum EngineEvent {
         /// `environmentunavailable`; readers accept both spellings, and
         /// nothing rewrites a row.
         status: String,
+        /// Structured observation. `None` on legacy one-dimensional rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observation: Option<VerificationObservation>,
+        /// Structured gate disposition, including grounded baseline
+        /// provenance. `None` on legacy one-dimensional rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<VerificationDisposition>,
+        /// Effective invocation after verifier argument resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<VerificationExecution>,
         evidence: Option<String>,
     },
     VerificationFinished {
@@ -650,6 +723,9 @@ impl EngineEvent {
             // surface — safe for a sanitized projection.
             EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnStarted { .. }
+            | EngineEvent::FinalizationStarted { .. }
+            | EngineEvent::FinalizationPhaseStarted { .. }
+            | EngineEvent::FinalizationPhaseFinished { .. }
             | EngineEvent::TurnFinished { .. }
             | EngineEvent::TaskFinished { .. }
             | EngineEvent::TokenUsage { .. }
@@ -728,6 +804,22 @@ impl EngineEvent {
             EngineEvent::TurnStarted { turn_id, kind } => PublicEvent::TurnStarted {
                 turn_id: turn_id.clone(),
                 kind: PublicTurnKind::from(kind),
+            },
+            EngineEvent::FinalizationStarted { at } => PublicEvent::FinalizationStarted { at: *at },
+            EngineEvent::FinalizationPhaseStarted { phase, at } => {
+                PublicEvent::FinalizationPhaseStarted {
+                    phase: phase.clone(),
+                    at: *at,
+                }
+            }
+            EngineEvent::FinalizationPhaseFinished {
+                phase,
+                at,
+                elapsed_ms,
+            } => PublicEvent::FinalizationPhaseFinished {
+                phase: phase.clone(),
+                at: *at,
+                elapsed_ms: *elapsed_ms,
             },
             EngineEvent::TurnFinished {
                 turn_id,
@@ -880,6 +972,18 @@ pub enum PublicEvent {
     TurnStarted {
         turn_id: TurnId,
         kind: PublicTurnKind,
+    },
+    FinalizationStarted {
+        at: leveler_core::Timestamp,
+    },
+    FinalizationPhaseStarted {
+        phase: String,
+        at: leveler_core::Timestamp,
+    },
+    FinalizationPhaseFinished {
+        phase: String,
+        at: leveler_core::Timestamp,
+        elapsed_ms: u64,
     },
     TurnFinished {
         turn_id: TurnId,
@@ -1065,6 +1169,9 @@ mod contract_tests {
             EngineEvent::VerificationCheck {
                 name: "test".into(),
                 status: "failed".into(),
+                observation: Some(VerificationObservation::Failed),
+                disposition: Some(VerificationDisposition::Required),
+                execution: None,
                 evidence: Some("stack trace".into()),
             }
             .data_class(),
@@ -1080,6 +1187,7 @@ mod contract_tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
+                warnings: Vec::new(),
             }
             .data_class(),
             DataClass::Projectable
@@ -1140,6 +1248,7 @@ mod contract_tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some(secret.into()),
                 stop: None,
+                warnings: Vec::new(),
             },
             EngineEvent::ApprovalRequested {
                 id: ApprovalId::new("approval-safe"),
@@ -1215,6 +1324,7 @@ mod contract_tests {
                 verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 stop: None,
+                warnings: Vec::new(),
             }
             .is_transient()
         );

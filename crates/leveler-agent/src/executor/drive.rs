@@ -170,6 +170,9 @@ pub(crate) struct Drive<'a> {
     injected_rule_sources: Vec<String>,
     /// The most recent non-empty assistant text.
     last_text: String,
+    /// Finalization is a one-way lifecycle boundary for this drive. Keeping
+    /// the latch here prevents multiple exit helpers from publishing it twice.
+    finalization_started: bool,
     verification_ran: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
@@ -335,6 +338,7 @@ impl Executor {
             turn_grants: TurnPermissionGrants::default(),
             injected_rule_sources: Vec::new(),
             last_text: String::new(),
+            finalization_started: false,
             verification_ran: false,
             ledger: seeded_ledger,
             // Unified closeout nudge budget shared by every quiet-round
@@ -759,6 +763,37 @@ impl<'a> Drive<'a> {
         Ok(())
     }
 
+    fn enter_finalization(&mut self) {
+        if self.finalization_started {
+            return;
+        }
+        self.finalization_started = true;
+        (self.observer)(AgentEvent::FinalizationStarted);
+    }
+
+    /// Drain completion-dependent children with explicit timing. The phase key
+    /// is intentionally generic and opaque to the engine; the app maps it onto
+    /// its client vocabulary.
+    async fn settle_finalization_dependencies(
+        &mut self,
+        rt: &mut LoopContext,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        self.enter_finalization();
+        let started = std::time::Instant::now();
+        let phase = "settling_dependencies".to_string();
+        (self.observer)(AgentEvent::FinalizationPhaseStarted {
+            phase: phase.clone(),
+        });
+        let result = self.drain_background_children(rt, messages).await;
+        tracing::debug!(
+            %phase,
+            elapsed_ms = started.elapsed().as_millis(),
+            "finalization phase finished"
+        );
+        result
+    }
+
     /// Full drain — await EVERY outstanding background child before the run
     /// returns, so no exit path orphans a running delegation or loses its
     /// result. Children hold cancellation tokens and wall caps, so this
@@ -793,7 +828,7 @@ impl<'a> Drive<'a> {
         detail: &str,
         fallback: &str,
     ) -> Result<AgentOutcome, AgentError> {
-        self.progress.enter_terminal();
+        self.progress.enter_closed();
         (self.observer)(AgentEvent::ProgressUpdated {
             ledger: self.progress.clone(),
         });
@@ -803,8 +838,9 @@ impl<'a> Drive<'a> {
             self.last_text.clone()
         };
         (self.observer)(AgentEvent::Finished(final_text.clone()));
+        self.enter_finalization();
         self.flush_epoch(rt);
-        self.drain_background_children(rt, messages).await?;
+        self.settle_finalization_dependencies(rt, messages).await?;
         Ok(AgentOutcome::drive_result(
             final_text,
             rt.round(),
@@ -1117,8 +1153,9 @@ impl AgentHarness for Drive<'_> {
         if let Some((reason, exhaustion)) = self.budget_exceeded.take() {
             self.sink.append(&[assistant]).await?;
             (self.observer)(AgentEvent::Finished(reason.clone()));
+            self.enter_finalization();
             self.flush_epoch(rt);
-            self.drain_background_children(rt, messages).await?;
+            self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_budget_exhausted(
                 reason,
                 round,
@@ -1212,6 +1249,7 @@ impl AgentHarness for Drive<'_> {
             }
             self.sink.append(&[assistant]).await?;
             (self.observer)(AgentEvent::Finished(self.last_text.clone()));
+            self.enter_finalization();
             // In goal mode reaching this point means the model went quiet
             // through every nudge without ever calling update_goal — that
             // is a stall, not a proven completion. The detail carries the
@@ -1222,7 +1260,7 @@ impl AgentHarness for Drive<'_> {
                     // User said no, model went quiet without resolving the
                     // goal. That is blocked, not a stall — and it is reported
                     // as such, since nothing re-drives a turn on its own.
-                    self.progress.enter_terminal();
+                    self.progress.enter_closed();
                     (self.observer)(AgentEvent::ProgressUpdated {
                         ledger: self.progress.clone(),
                     });
@@ -1238,7 +1276,7 @@ impl AgentHarness for Drive<'_> {
                         .progress
                         .should_hard_stop_no_progress(self.progress_caps)
                     {
-                        self.progress.enter_terminal();
+                        self.progress.enter_closed();
                     }
                     (self.observer)(AgentEvent::ProgressUpdated {
                         ledger: self.progress.clone(),
@@ -1256,7 +1294,7 @@ impl AgentHarness for Drive<'_> {
                     )
                 } else {
                     if self.progress.human_boundary_seen() {
-                        self.progress.enter_terminal();
+                        self.progress.enter_closed();
                         (self.observer)(AgentEvent::ProgressUpdated {
                             ledger: self.progress.clone(),
                         });
@@ -1265,7 +1303,7 @@ impl AgentHarness for Drive<'_> {
                 };
             self.flush_epoch(rt);
 
-            self.drain_background_children(rt, messages).await?;
+            self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_result(
                 self.last_text.clone(),
                 round,
@@ -3080,15 +3118,16 @@ impl AgentHarness for Drive<'_> {
             };
             // Epoch terminal: next Content turn must not inherit Closing state.
             if matches!(reason, StopReason::Completed | StopReason::Blocked) {
-                self.progress.enter_terminal();
+                self.progress.enter_closed();
                 (self.observer)(AgentEvent::ProgressUpdated {
                     ledger: self.progress.clone(),
                 });
             }
             (self.observer)(AgentEvent::Finished(final_text.clone()));
+            self.enter_finalization();
             self.flush_epoch(rt);
 
-            self.drain_background_children(rt, messages).await?;
+            self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_result(
                 final_text,
                 round,
@@ -3103,9 +3142,10 @@ impl AgentHarness for Drive<'_> {
         // A step limit tripped this round: results are committed, stop now.
         if let Some((reason, exhaustion)) = self.budget_exceeded.take() {
             (self.observer)(AgentEvent::Finished(reason.clone()));
+            self.enter_finalization();
             self.flush_epoch(rt);
 
-            self.drain_background_children(rt, messages).await?;
+            self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_budget_exhausted(
                 reason,
                 round,
@@ -3290,8 +3330,10 @@ impl AgentHarness for Drive<'_> {
                 let reason =
                     format!("Stopped: reached the {ceiling}-round ceiling for a single turn.");
                 (self.observer)(AgentEvent::Finished(reason.clone()));
+                self.enter_finalization();
                 self.flush_epoch(rt);
-                self.drain_background_children(rt, &mut messages).await?;
+                self.settle_finalization_dependencies(rt, &mut messages)
+                    .await?;
                 Ok(AgentOutcome::drive_result(
                     reason,
                     rounds,
@@ -3319,8 +3361,10 @@ impl AgentHarness for Drive<'_> {
                     ),
                 };
                 (self.observer)(AgentEvent::Finished(reason.clone()));
+                self.enter_finalization();
                 self.flush_epoch(rt);
-                self.drain_background_children(rt, &mut messages).await?;
+                self.settle_finalization_dependencies(rt, &mut messages)
+                    .await?;
                 Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     rounds,
@@ -3335,7 +3379,6 @@ impl AgentHarness for Drive<'_> {
             // one, or the abort-on-drop backstop hard-kills them (spend and
             // findings lost).
             KernelStop::WindowLimit { limit: round_limit } => {
-                self.drain_background_children(rt, &mut messages).await?;
                 // Budget exhausted: never return an empty answer. Surface the
                 // last thing the model said plus how far it got, so the
                 // caller/UI shows real state.
@@ -3352,6 +3395,10 @@ impl AgentHarness for Drive<'_> {
                     }
                     s
                 };
+                (self.observer)(AgentEvent::Finished(summary.clone()));
+                self.enter_finalization();
+                self.settle_finalization_dependencies(rt, &mut messages)
+                    .await?;
                 self.flush_epoch(rt);
                 Ok(AgentOutcome::drive_result(
                     summary,
@@ -3366,8 +3413,11 @@ impl AgentHarness for Drive<'_> {
             // `on_quiet` owns every quiet exit and returns its own outcome, so
             // the kernel's neutral model-end never decides anything here.
             KernelStop::ModelEnd => {
+                (self.observer)(AgentEvent::Finished(self.last_text.clone()));
+                self.enter_finalization();
                 self.flush_epoch(rt);
-                self.drain_background_children(rt, &mut messages).await?;
+                self.settle_finalization_dependencies(rt, &mut messages)
+                    .await?;
                 Ok(AgentOutcome::drive_result(
                     self.last_text.clone(),
                     rounds,

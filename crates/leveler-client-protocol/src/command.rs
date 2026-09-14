@@ -559,7 +559,7 @@ mod tests {
         let cmd: ClientCommand = serde_json::from_str(
             r#"{"type":"query_observability","session_id":"s1","before":0,"after":80}"#,
         )
-        .expect("1.5 query_observability must decode on 1.6");
+        .expect("1.5 query_observability must decode on a current client");
         match cmd {
             ClientCommand::QueryObservability {
                 session_id,

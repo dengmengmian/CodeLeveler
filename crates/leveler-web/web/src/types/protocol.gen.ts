@@ -35,6 +35,8 @@ export type CheckState =
   | 'running' | 'passed' | 'failed'
   /** Deliberately not run. */
   | 'skipped'
+  /** No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency. */
+  | 'not_run'
   /** The check's program is not on `PATH`, so it could not run at all. */
   | 'tool_missing'
   /** The check ran but the environment refused it (toolchain/MSRV mismatch). */
@@ -62,6 +64,21 @@ export type ClarificationId = string;
 
 /** Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice. */
 export type CommandId = string;
+
+/** The mechanical work still running after the assistant has produced its final response but before the runtime publishes the task terminal. This is lifecycle chrome, not a second completion authority: the terminal event remains the only fact that ends the turn. */
+export type FinalizationStage =
+  /** Wait for work already admitted by the turn to settle. */
+  | 'settling_dependencies'
+  /** Run the configured checks over the final tree. */
+  | 'verification'
+  /** Persist verification and other completion evidence. */
+  | 'evidence'
+  /** Run a completion review explicitly required by the task contract. */
+  | 'review'
+  /** Resolve the task outcome from the collected facts. */
+  | 'resolving_outcome'
+  /** Commit and publish the canonical terminal fact. */
+  | 'publishing_terminal';
 
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;
@@ -472,6 +489,8 @@ export interface UiSessionSnapshot {
   collaboration?: string | null;
   completion_report?: UiCompletionReport | null;
   diff?: UiDiff | null;
+  /** Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message. */
+  finalization_stage?: FinalizationStage | null;
   goal: string;
   id: SessionId;
   /** The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet). */
@@ -688,6 +707,8 @@ export type RuntimeEvent =
   | { type: 'reasoning_delta'; delta: string }
   /** The assistant message is complete. */
   | { type: 'assistant_message_completed'; message_id: MessageId }
+  /** The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event. */
+  | { type: 'turn_finalizing'; stage: FinalizationStage }
   /** Coarse progress label from the runtime, shown in the status line. */
   | { type: 'agent_activity'; label: string }
   /** Heartbeat while a long command tool runs (runtime observability). Lets a client show "运行 cargo test" with a live elapsed instead of a bare "等待模型". Structured so TUI/Web/logs can consume it uniformly. */
@@ -726,6 +747,8 @@ export type RuntimeEvent =
   | { type: 'session_completed'; report: UiCompletionReport }
   /** The current turn finished successfully. */
   | { type: 'turn_completed' }
+  /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. */
+  | { type: 'turn_completed_with_warnings'; reason: string }
   /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
   | { type: 'turn_answered' }
   /** The turn stopped at an output limit even after bounded continuation. */
@@ -772,5 +795,5 @@ export type RuntimeEvent =
   | { type: 'btw_failed'; error: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
   | { type: 'turn_progress'; closing: boolean; no_progress_streak: number; phase: string }
-  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a 1.6 client must not treat that as ownership. */
+  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a current client must not treat that as ownership. */
   | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null };

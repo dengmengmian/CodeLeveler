@@ -256,71 +256,135 @@ async fn factory_reasoning_override_reaches_every_model_request() {
 
 /// A TerminalStore that always refuses to commit — engine-level failure
 /// injection for "the terminal fact is atomic or absent".
-struct FailingTerminal;
+#[derive(Clone, Copy)]
+enum TerminalFailure {
+    Task,
+    Turn,
+}
+
+struct FailingTerminal {
+    inner: Database,
+    failure: TerminalFailure,
+}
 
 #[async_trait]
 impl leveler_storage::TerminalStore for FailingTerminal {
     async fn finish_task(
         &self,
-        _: &leveler_core::SessionId,
-        _: &str,
-        _: &str,
-        _: leveler_engine::TaskOutcome,
-        _: leveler_lifecycle::VerificationStatus,
-        _: leveler_lifecycle::SessionStatus,
-        _: leveler_lifecycle::AgentState,
-        _: leveler_core::Timestamp,
+        session_id: &leveler_core::SessionId,
+        event_type: &str,
+        payload: &str,
+        outcome: leveler_engine::TaskOutcome,
+        verification: leveler_lifecycle::VerificationStatus,
+        status: leveler_lifecycle::SessionStatus,
+        state: leveler_lifecycle::AgentState,
+        now: leveler_core::Timestamp,
     ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
-        Err(leveler_storage::StorageError::InvalidData(
-            "injected terminal failure".into(),
-        ))
+        if matches!(self.failure, TerminalFailure::Task) {
+            return Err(leveler_storage::StorageError::InvalidData(
+                "injected task terminal failure".into(),
+            ));
+        }
+        leveler_storage::TerminalStore::finish_task(
+            &self.inner,
+            session_id,
+            event_type,
+            payload,
+            outcome,
+            verification,
+            status,
+            state,
+            now,
+        )
+        .await
     }
 
     async fn finish_turn(
         &self,
-        _: &leveler_core::SessionId,
-        _: &leveler_core::TurnId,
-        _: &str,
-        _: &str,
-        _: leveler_engine::TurnOutcome,
-        _: leveler_core::Timestamp,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        event_type: &str,
+        payload: &str,
+        outcome: leveler_engine::TurnOutcome,
+        now: leveler_core::Timestamp,
     ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
-        Err(leveler_storage::StorageError::InvalidData(
-            "injected terminal failure".into(),
-        ))
+        if matches!(self.failure, TerminalFailure::Turn) {
+            return Err(leveler_storage::StorageError::InvalidData(
+                "injected turn terminal failure".into(),
+            ));
+        }
+        leveler_storage::TerminalStore::finish_turn(
+            &self.inner,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            outcome,
+            now,
+        )
+        .await
     }
 
     async fn finish_task_owned(
         &self,
-        _: &leveler_core::OwnershipToken,
-        _: &leveler_core::SessionId,
-        _: &str,
-        _: &str,
-        _: leveler_engine::TaskOutcome,
-        _: leveler_lifecycle::VerificationStatus,
-        _: leveler_lifecycle::SessionStatus,
-        _: leveler_lifecycle::AgentState,
-        _: Option<&leveler_storage::GoalTerminalUpdate>,
-        _: leveler_core::Timestamp,
-    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
-        Err(leveler_storage::OwnershipError::Storage(
-            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
-        ))
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        event_type: &str,
+        payload: &str,
+        outcome: leveler_engine::TaskOutcome,
+        verification: leveler_lifecycle::VerificationStatus,
+        status: leveler_lifecycle::SessionStatus,
+        state: leveler_lifecycle::AgentState,
+        goal: Option<&leveler_storage::GoalTerminalUpdate>,
+        now: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::TaskTerminalCommit, leveler_storage::OwnershipError> {
+        if matches!(self.failure, TerminalFailure::Task) {
+            return Err(leveler_storage::OwnershipError::Storage(
+                leveler_storage::StorageError::InvalidData("injected task terminal failure".into()),
+            ));
+        }
+        leveler_storage::TerminalStore::finish_task_owned(
+            &self.inner,
+            token,
+            session_id,
+            event_type,
+            payload,
+            outcome,
+            verification,
+            status,
+            state,
+            goal,
+            now,
+        )
+        .await
     }
 
     async fn finish_turn_owned(
         &self,
-        _: &leveler_core::OwnershipToken,
-        _: &leveler_core::SessionId,
-        _: &leveler_core::TurnId,
-        _: &str,
-        _: &str,
-        _: leveler_engine::TurnOutcome,
-        _: leveler_core::Timestamp,
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        event_type: &str,
+        payload: &str,
+        outcome: leveler_engine::TurnOutcome,
+        now: leveler_core::Timestamp,
     ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
-        Err(leveler_storage::OwnershipError::Storage(
-            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
-        ))
+        if matches!(self.failure, TerminalFailure::Turn) {
+            return Err(leveler_storage::OwnershipError::Storage(
+                leveler_storage::StorageError::InvalidData("injected turn terminal failure".into()),
+            ));
+        }
+        leveler_storage::TerminalStore::finish_turn_owned(
+            &self.inner,
+            token,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            outcome,
+            now,
+        )
+        .await
     }
 }
 
@@ -377,8 +441,8 @@ impl leveler_storage::MessageStore for FailingMessages {
 }
 
 /// Failure injection A/B at the engine level: when the atomic terminal commit
-/// fails, the run errors, and NEITHER the terminal event NOR the outcome
-/// projection is visible — no half-commit.
+/// fails after the turn has settled, the run errors, and NEITHER TaskFinished
+/// NOR the task outcome projection is visible — no half-commit.
 #[tokio::test]
 async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
     let mut h = harness(vec![tool_call(
@@ -387,7 +451,10 @@ async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
         serde_json::json!({"status": "complete", "summary": "done"}),
     )])
     .await;
-    h.engine.engine.stores.terminal = Arc::new(FailingTerminal);
+    h.engine.engine.stores.terminal = Arc::new(FailingTerminal {
+        inner: h.db.clone(),
+        failure: TerminalFailure::Task,
+    });
     let spec = spec(&h, VerificationPlan::default());
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -395,7 +462,13 @@ async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
         .engine
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await;
-    assert!(result.is_err(), "a failed terminal commit must propagate");
+    assert!(
+        matches!(
+            result,
+            Err(leveler_engine::EngineError::TerminalCommitFailed(_))
+        ),
+        "a failed terminal commit must propagate as a nonterminal recovery fault: {result:?}"
+    );
 
     let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
@@ -403,17 +476,56 @@ async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
         .unwrap()
         .unwrap();
     assert_eq!(outcome, None, "no outcome projection without its event");
-    let terminal_events = EventRepository::new(&h.db)
-        .load(&session)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.event_type == "task_finished" || e.event_type == "turn_finished")
-        .count();
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
     assert_eq!(
-        terminal_events, 0,
-        "no terminal event without its projection"
+        rows.iter()
+            .filter(|event| event.event_type == "task_finished")
+            .count(),
+        0,
+        "no task terminal event without its projection"
     );
+    assert_eq!(
+        rows.iter()
+            .filter(|event| event.event_type == "turn_finished")
+            .count(),
+        1,
+        "the already committed turn boundary remains truthful"
+    );
+}
+
+/// A turn that cannot commit its own durable terminal leaves an open recovery
+/// boundary. The task authority must not paper over that hole with Failed.
+#[tokio::test]
+async fn an_uncommitted_turn_terminal_prevents_the_task_terminal() {
+    let mut h = harness(patch_resolve_and_proven_ac()).await;
+    h.engine.engine.stores.terminal = Arc::new(FailingTerminal {
+        inner: h.db.clone(),
+        failure: TerminalFailure::Turn,
+    });
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let result = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(leveler_engine::EngineError::UnclosedTerminalBoundary(_))
+        ),
+        "the open turn must remain a recovery fault: {result:?}"
+    );
+
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
+    assert!(
+        rows.iter().all(|event| event.event_type != "turn_finished"
+            && event.event_type != "task_finished"),
+        "no terminal may be synthesized past the open turn: {rows:?}"
+    );
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "running");
 }
 
 /// Failure injection C: when the transcript append fails, the turn fails
@@ -1288,6 +1400,61 @@ async fn cancellation_is_recorded_as_interrupted() {
     assert_eq!(turns[0].status, "interrupted");
 }
 
+#[tokio::test]
+async fn cancellation_at_the_terminal_publish_boundary_wins_over_completion() {
+    let h = harness(patch_then_resolve()).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    let mut reached_publish = false;
+    let err = h
+        .engine
+        .run(
+            &session,
+            &spec,
+            &mut |event| {
+                if matches!(
+                    event,
+                    EngineEvent::FinalizationPhaseStarted { ref phase, .. }
+                        if phase == "publishing_terminal"
+                ) {
+                    reached_publish = true;
+                    signal.cancel();
+                }
+            },
+            cancellation,
+        )
+        .await
+        .expect_err("a cancellation observed immediately before commit must win");
+    assert!(matches!(err, leveler_engine::EngineError::Cancelled));
+    assert!(reached_publish, "test must reach the final commit boundary");
+
+    let events = EventRepository::new(&h.db)
+        .load(&session)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| EngineEvent::from_payload(&row.payload).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TaskFinished {
+            outcome: TaskOutcome::Interrupted,
+            verification: leveler_lifecycle::VerificationStatus::NotRun,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TaskFinished {
+            outcome: TaskOutcome::Completed,
+            ..
+        }
+    )));
+}
+
 /// Kill -9 / unclean TUI exit can leave a permanent `running` turn. Starting a
 /// new turn must reap that zombie before inserting the next row.
 #[tokio::test]
@@ -1629,6 +1796,142 @@ async fn independent_review_required_launches_on_an_ordinary_change() {
         1,
         "required must launch a reviewer after any product mutation"
     );
+}
+
+struct RejectReviewTerminalEvents {
+    inner: Database,
+}
+
+#[async_trait]
+impl leveler_storage::EventStore for RejectReviewTerminalEvents {
+    async fn append(
+        &self,
+        session_id: &leveler_core::SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
+        if event_type == "sub_agent_finished" {
+            return Err(leveler_storage::StorageError::InvalidData(
+                "review terminal unavailable (injected)".to_string(),
+            ));
+        }
+        leveler_storage::EventStore::append(
+            &self.inner,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            now,
+        )
+        .await
+    }
+
+    async fn load(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<Vec<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+        leveler_storage::EventStore::load(&self.inner, session_id).await
+    }
+
+    async fn load_after(
+        &self,
+        session_id: &leveler_core::SessionId,
+        after: i64,
+    ) -> Result<Vec<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+        leveler_storage::EventStore::load_after(&self.inner, session_id, after).await
+    }
+
+    async fn load_last_by_type(
+        &self,
+        session_id: &leveler_core::SessionId,
+        event_type: &str,
+        turn_id: Option<&leveler_core::TurnId>,
+    ) -> Result<Option<leveler_storage::EventRecord>, leveler_storage::StorageError> {
+        leveler_storage::EventStore::load_last_by_type(&self.inner, session_id, event_type, turn_id)
+            .await
+    }
+
+    async fn append_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+        if event_type == "sub_agent_finished" {
+            return Err(leveler_storage::OwnershipError::Storage(
+                leveler_storage::StorageError::InvalidData(
+                    "review terminal unavailable (injected)".to_string(),
+                ),
+            ));
+        }
+        leveler_storage::EventStore::append_owned(
+            &self.inner,
+            token,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            now,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn an_unsettled_started_review_prevents_the_task_terminal() {
+    let mut responses = patch_then_resolve();
+    responses.push(text("review completed without findings"));
+    responses.push(text("review completed without findings"));
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let spec = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&spec).await.unwrap();
+    h.engine.engine.stores.events = Arc::new(RejectReviewTerminalEvents {
+        inner: h.db.clone(),
+    });
+
+    let error = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("an open review activation must prevent task terminal publication");
+    assert!(
+        matches!(
+            error,
+            leveler_engine::EngineError::UnclosedTerminalBoundary(_)
+        ),
+        "unexpected error: {error}"
+    );
+
+    let events = EventRepository::new(&h.db)
+        .load(&session)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| EngineEvent::from_payload(&row.payload).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        EngineEvent::SubAgentFinished { nickname, .. } if nickname == "reviewer"
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TaskFinished { .. }))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ReviewStage { action, .. } if action == "launch_failed"
+    )));
 }
 
 /// A harness-launched reviewer judges the change; it must not become a second
@@ -2350,19 +2653,19 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
     );
 }
 
-// ── F7-C: the runtime's own verification is evidence ──────────────────────
+// ── F7-C: the runtime's own verification is canonical evidence ────────────
 //
 // The engine runs the verification plan in `conclude_direct`, after the
 // agent's completion claim and before the terminal contract check. Its
-// results reach the EventLog but never the EvidenceLedger, so the one
-// decision that matters is taken without seeing the runtime's own
-// observation of the changed tree. These pin the lifecycle, not a new rule.
+// results live once in VerificationCheck. EvidenceLedger records agent tool
+// observations; duplicating the engine check there would create two truths
+// and add non-authoritative persistence to the terminal critical path.
 
 /// F7-C TEST A. A green gate the ENGINE ran over the changed tree is a real
 /// observation of that tree, and the completion contract has to be able to
 /// see it. Today it is announced as an event and never recorded as evidence.
 #[tokio::test]
-async fn engine_verification_reaches_the_evidence_ledger() {
+async fn engine_verification_is_persisted_once_as_a_typed_check() {
     let h = harness(patch_resolve_and_proven_ac()).await;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
@@ -2371,17 +2674,15 @@ async fn engine_verification_reaches_the_evidence_ledger() {
         .await
         .unwrap();
 
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    assert!(
-        ledger
-            .verifications
-            .iter()
-            .any(|v| v.exit_code == 0 && v.after_mutation_seq > 0),
-        "the gate the engine ran over the edited tree must be in the ledger: {:?}",
-        ledger.verifications
-    );
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
+    let checks: Vec<_> = rows
+        .iter()
+        .filter(|row| row.event_type == "verification_check")
+        .collect();
+    assert_eq!(checks.len(), 1, "one canonical check fact: {checks:?}");
+    let payload: serde_json::Value = serde_json::from_str(&checks[0].payload).unwrap();
+    assert_eq!(payload["payload"]["observation"]["kind"], "passed");
+    assert_eq!(payload["payload"]["execution"]["exit_code"], 0);
 }
 
 /// F7-C TEST B. A failing gate is equally an observation, and its record has
@@ -2418,20 +2719,20 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
         1,
         "a failed check must not open an automatic repair turn"
     );
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    assert!(
-        ledger.verifications.iter().any(|v| v.exit_code != 0),
-        "the failure must be on the record, not merely absent: {:?}",
-        ledger.verifications
-    );
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
+    let check = rows
+        .iter()
+        .find(|row| row.event_type == "verification_check")
+        .expect("the failed check must be durable");
+    let payload: serde_json::Value = serde_json::from_str(&check.payload).unwrap();
+    assert_eq!(payload["payload"]["observation"]["kind"], "failed");
+    assert_ne!(payload["payload"]["execution"]["exit_code"], 0);
 }
 
 /// F7-C TEST I. A completion attempt may be made more than once. The ledger
 /// must not grow a fresh copy of the same observation each time.
 #[tokio::test]
-async fn recording_the_same_verification_twice_does_not_duplicate_it() {
+async fn one_verification_attempt_has_one_canonical_check_fact() {
     let h = harness(patch_resolve_and_proven_ac()).await;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
@@ -2440,24 +2741,14 @@ async fn recording_the_same_verification_twice_does_not_duplicate_it() {
         .await
         .unwrap();
 
-    let ledger = persisted_ledger(&h.db, &session)
-        .await
-        .expect("a ledger was persisted");
-    let engine_records: Vec<_> = ledger
-        .verifications
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
+    let engine_records: Vec<_> = rows
         .iter()
-        .filter(|v| v.tool_call_id.starts_with("engine-verification:"))
+        .filter(|row| row.event_type == "verification_check")
         .collect();
-    let mut ids: Vec<&str> = engine_records
-        .iter()
-        .map(|v| v.tool_call_id.as_str())
-        .collect();
-    ids.sort_unstable();
-    let before = ids.len();
-    ids.dedup();
     assert_eq!(
-        ids.len(),
-        before,
+        engine_records.len(),
+        1,
         "one observation per check per attempt: {engine_records:?}"
     );
 }

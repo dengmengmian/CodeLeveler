@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, BufReader};
@@ -154,6 +155,11 @@ struct TaskInner {
 #[derive(Clone)]
 pub struct BackgroundTaskRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    /// Spawn reservations live outside the async mutex so dropping a
+    /// cancelled spawn future can release its slot synchronously.
+    pending_spawns: Arc<AtomicUsize>,
+    #[cfg(test)]
+    spawn_registration_hook: Arc<std::sync::Mutex<Option<Arc<SpawnRegistrationHook>>>>,
     /// The one spawn path, shared with foreground execution (PR 4).
     runner: CommandRunner,
     /// Dropped when the last registry handle is dropped (session end).
@@ -172,6 +178,100 @@ struct RegistryState {
     next: u64,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct SpawnRegistrationHook {
+    reached: Notify,
+    release: Notify,
+}
+
+/// Cancellation-safe ownership of one reserved background slot and, once the
+/// OS spawn succeeds, its not-yet-registered process.
+///
+/// There is deliberately no async work in `Drop`: a future cancelled while it
+/// waits to re-enter the registry releases the capacity slot and kills the
+/// process tree immediately, so no child can escape the registry boundary.
+struct SpawnReservation {
+    pending_spawns: Arc<AtomicUsize>,
+    process: Option<ManagedProcess>,
+    committed: bool,
+}
+
+impl SpawnReservation {
+    fn new(pending_spawns: Arc<AtomicUsize>) -> Self {
+        Self {
+            pending_spawns,
+            process: None,
+            committed: false,
+        }
+    }
+
+    fn attach(&mut self, process: ManagedProcess) {
+        self.process = Some(process);
+    }
+
+    fn process_mut(&mut self) -> &mut ManagedProcess {
+        self.process
+            .as_mut()
+            .expect("spawned process must remain owned by its reservation")
+    }
+
+    fn take_process(&mut self) -> ManagedProcess {
+        self.process
+            .take()
+            .expect("spawned process must be transferred into the registry")
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+        self.pending_spawns.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(mut process) = self.process.take() {
+            process.identity().kill_tree();
+            process.start_kill();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = process.wait().await;
+                });
+            }
+        }
+        self.pending_spawns.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Immutable set of process identities detached before a terminal is
+/// published and safe to settle afterwards.
+pub struct BackgroundCleanupTicket {
+    registry: BackgroundTaskRegistry,
+    ids: Vec<String>,
+}
+
+impl BackgroundCleanupTicket {
+    /// Signal every process captured by this ticket. Processes admitted later
+    /// under the same scope are not part of the ticket and remain untouched.
+    pub async fn settle(self) -> usize {
+        let mut reaped = 0;
+        for id in self.ids {
+            if self.registry.kill(&id).await.is_ok() {
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    /// Whether the ticket captured no active process.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
 impl BackgroundTaskRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -180,6 +280,9 @@ impl BackgroundTaskRegistry {
     pub fn with_environment(environment: Arc<leveler_core::EnvSnapshot>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryState::default())),
+            pending_spawns: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            spawn_registration_hook: Arc::new(std::sync::Mutex::new(None)),
             kill_on_drop: Arc::new(KillOnDrop::default()),
             runner: CommandRunner::with_environment(environment),
         }
@@ -202,30 +305,47 @@ impl BackgroundTaskRegistry {
         mutation_baseline: Option<MutationBaseline>,
         owner_scope: Option<&str>,
     ) -> Result<String, String> {
-        let mut st = self.inner.lock().await;
-        prune_terminal_tasks(&mut st);
-        let running = st.tasks.values().filter(|t| t.status.is_active()).count();
-        if running >= MAX_CONCURRENT {
-            return Err(format!(
-                "background task limit reached ({MAX_CONCURRENT} concurrent)"
-            ));
-        }
-        st.next += 1;
-        let id = format!("bg-{}", st.next);
+        let (id, mut reservation) = {
+            let mut st = self.inner.lock().await;
+            prune_terminal_tasks(&mut st);
+            let running = st.tasks.values().filter(|t| t.status.is_active()).count();
+            if running + self.pending_spawns.load(Ordering::Acquire) >= MAX_CONCURRENT {
+                return Err(format!(
+                    "background task limit reached ({MAX_CONCURRENT} concurrent)"
+                ));
+            }
+            self.pending_spawns.fetch_add(1, Ordering::AcqRel);
+            st.next += 1;
+            (
+                format!("bg-{}", st.next),
+                SpawnReservation::new(self.pending_spawns.clone()),
+            )
+        };
 
         // `CommandRunner::spawn` is the one confining spawn on every host, so a
         // background command is confined exactly like a foreground one and
         // fails closed in exactly the same place. This registry adds no policy
         // of its own.
-        let mut process = self
+        let process = self
             .runner
             .spawn(&request)
             .await
-            .map_err(|e| format!("spawn background {}: {e}", request.program))?;
-        let identity = process.identity();
-        let stdout = process.take_stdout();
-        let stderr = process.take_stderr();
-        let sandbox_scratch = process.take_sandbox_scratch();
+            .map_err(|error| format!("spawn background {}: {error}", request.program))?;
+        reservation.attach(process);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .spawn_registration_hook
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+        {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+        let identity = reservation.process_mut().identity();
+        let stdout = reservation.process_mut().take_stdout();
+        let stderr = reservation.process_mut().take_stderr();
+        let sandbox_scratch = reservation.process_mut().take_sandbox_scratch();
         let log_pumps_remaining = u8::from(stdout.is_some()) + u8::from(stderr.is_some());
         let done = Arc::new(Notify::new());
         let reg = self.inner.clone();
@@ -233,8 +353,9 @@ impl BackgroundTaskRegistry {
         let kill_on_drop = Arc::downgrade(&self.kill_on_drop);
         let tid = id.clone();
 
+        let mut st = self.inner.lock().await;
         self.kill_on_drop.insert(id.clone(), identity);
-
+        let process = reservation.take_process();
         st.tasks.insert(
             id.clone(),
             TaskInner {
@@ -258,6 +379,7 @@ impl BackgroundTaskRegistry {
                 sandbox_scratch,
             },
         );
+        reservation.commit();
         drop(st);
 
         spawn_log_pump(reg.clone(), tid.clone(), stdout);
@@ -414,14 +536,7 @@ impl BackgroundTaskRegistry {
     /// Kill every non-terminal task owned by `scope` (best-effort; errors on
     /// individual tasks are ignored). Returns how many tasks were signalled.
     pub async fn kill_scope(&self, scope: &str) -> usize {
-        let ids: Vec<String> = {
-            let st = self.inner.lock().await;
-            st.tasks
-                .values()
-                .filter(|t| t.owner_scope.as_deref() == Some(scope) && !t.status.is_terminal())
-                .map(|t| t.id.clone())
-                .collect()
-        };
+        let ids = self.active_ids_for_scope(scope).await;
         let mut n = 0;
         for id in ids {
             if self.kill(&id).await.is_ok() {
@@ -429,6 +544,46 @@ impl BackgroundTaskRegistry {
             }
         }
         n
+    }
+
+    /// Snapshot the active process identities owned by one scope. Terminal
+    /// settlement captures this list before publishing completion, then may
+    /// reap exactly these ids afterwards without touching work admitted by a
+    /// later turn in the same session.
+    pub async fn active_ids_for_scope(&self, scope: &str) -> Vec<String> {
+        {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|t| t.owner_scope.as_deref() == Some(scope) && !t.status.is_terminal())
+                .map(|t| t.id.clone())
+                .collect()
+        }
+    }
+
+    /// Detach an immutable cleanup ticket for one scope. The registry never
+    /// holds its lock across process I/O, so this synchronization is bounded
+    /// to an in-memory snapshot; process signalling happens only when the
+    /// caller settles the ticket later.
+    pub async fn detach_cleanup(&self, scope: &str) -> BackgroundCleanupTicket {
+        BackgroundCleanupTicket {
+            registry: self.clone(),
+            ids: self.active_ids_for_scope(scope).await,
+        }
+    }
+
+    /// Best-effort non-blocking scope inspection for diagnostics and tests.
+    pub fn try_active_ids_for_scope(&self, scope: &str) -> Option<Vec<String>> {
+        let Ok(st) = self.inner.try_lock() else {
+            return None;
+        };
+        Some(
+            st.tasks
+                .values()
+                .filter(|t| t.owner_scope.as_deref() == Some(scope) && !t.status.is_terminal())
+                .map(|t| t.id.clone())
+                .collect(),
+        )
     }
 
     pub async fn kill(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
@@ -659,6 +814,70 @@ mod tests {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_during_registration_releases_capacity_and_kills_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let reg = host_registry();
+        let hook = Arc::new(SpawnRegistrationHook::default());
+        *reg.spawn_registration_hook.lock().expect("hook lock") = Some(hook.clone());
+
+        let spawn = tokio::spawn({
+            let reg = reg.clone();
+            let request = ProcessRequest::new(
+                "sh",
+                vec![
+                    "-c".into(),
+                    format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+                ],
+                dir.path().to_path_buf(),
+            );
+            async move { reg.spawn(request, None).await }
+        });
+
+        hook.reached.notified().await;
+        let pid = wait_for_pid_file(&pid_file, Duration::from_secs(5))
+            .await
+            .expect("spawned child pid");
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("spawn future must be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            reg.pending_spawns.load(Ordering::Acquire),
+            0,
+            "a dropped reservation must release its capacity slot"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_alive(pid),
+            "an aborted, not-yet-registered child must not escape the registry"
+        );
+        assert!(reg.active_ids_for_scope("unused").await.is_empty());
+
+        *reg.spawn_registration_hook.lock().expect("hook lock") = None;
+        let id = reg
+            .spawn(
+                ProcessRequest::new("true", Vec::new(), dir.path().to_path_buf()),
+                None,
+            )
+            .await
+            .expect("released capacity can be reused");
+        let finished = reg
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .expect("replacement task finishes");
+        assert_eq!(finished.exit_code, Some(0));
     }
 
     #[tokio::test]

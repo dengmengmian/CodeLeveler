@@ -241,6 +241,7 @@ impl Application {
                 status: SessionStatus::Completed,
                 state: AgentState::Complete,
                 goal: None,
+                warnings: Vec::new(),
             },
             Ok(summary) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
@@ -253,6 +254,7 @@ impl Application {
                 status: SessionStatus::Failed,
                 state: AgentState::Failed,
                 goal: None,
+                warnings: Vec::new(),
             },
             Err(AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
                 leveler_engine::TaskTerminal {
@@ -263,6 +265,7 @@ impl Application {
                     status: SessionStatus::Interrupted,
                     state: AgentState::Execute,
                     goal: None,
+                    warnings: Vec::new(),
                 }
             }
             Err(error) => leveler_engine::TaskTerminal {
@@ -273,6 +276,7 @@ impl Application {
                 status: SessionStatus::Failed,
                 state: AgentState::Failed,
                 goal: None,
+                warnings: Vec::new(),
             },
         };
         // Terminal event + every lifecycle column in ONE transaction — the

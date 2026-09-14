@@ -123,6 +123,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::AssistantMessageCompleted { message_id } => {
             state.transcript.finish_assistant(&message_id);
         }
+        RuntimeEvent::TurnFinalizing { stage } => {
+            mark_turn_busy(state);
+            state.finalization_stage = Some(stage);
+            // A command heartbeat belongs to the command that just ended. The
+            // typed finalization stage now owns the status line and its clock.
+            clear_activity(state);
+        }
         RuntimeEvent::AgentActivity { label } => {
             mark_turn_busy(state);
             state.activity = Some(label);
@@ -267,6 +274,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TurnCompleted => {
             finish_turn(state, TurnEndStatus::Completed, None);
         }
+        RuntimeEvent::TurnCompletedWithWarnings { reason } => {
+            finish_turn(state, TurnEndStatus::CompletedWithWarnings, Some(reason));
+        }
         RuntimeEvent::TurnAnswered => {
             finish_turn(state, TurnEndStatus::Answered, None);
         }
@@ -290,6 +300,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::TurnFailed { error } => {
             state.status = RuntimeStatus::Error;
+            state.finalization_stage = None;
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
@@ -311,6 +322,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::TurnCancelled => {
             state.status = RuntimeStatus::Idle;
+            state.finalization_stage = None;
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
@@ -648,7 +660,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             observation,
             query_id,
         } => {
-            // Only a correlated 1.6 response for the query this view owns.
+            // Only a correlated current response for the query this view owns.
             // `query_id: None` is a legacy 1.5 payload — decode-safe, not owned.
             match (&state.trace.pending_query_id, &query_id) {
                 (Some(pending), Some(incoming)) if pending == incoming => {}
@@ -732,6 +744,7 @@ fn dismiss_resolved_interaction(
 
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
     state.status = RuntimeStatus::Idle;
+    state.finalization_stage = None;
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
@@ -858,6 +871,7 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
     matches!(
         status,
         TurnEndStatus::Completed
+            | TurnEndStatus::CompletedWithWarnings
             | TurnEndStatus::Answered
             | TurnEndStatus::Unverified
             | TurnEndStatus::ChecksFailed
@@ -878,7 +892,10 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
         });
     }
     // Unverified / incomplete / failed / cancelled: no success verify mark.
-    let allow_success_verify = matches!(status, TurnEndStatus::Completed | TurnEndStatus::Answered);
+    let allow_success_verify = matches!(
+        status,
+        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
+    );
     // Open plan steps travel with the summary only while the turn can still be
     // continued — there "计划 5/9" is real progress information. On a finished
     // turn it would be a stale plan arguing against the outcome the runtime
@@ -956,6 +973,7 @@ fn clear_activity(state: &mut AppState) {
 pub(super) fn start_turn(state: &mut AppState) {
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
+    state.finalization_stage = None;
     state.project_rule_sources.clear();
     // The previous turn's next step is spent — a new turn is under way.
     crate::suggestion::clear(state);
@@ -1027,6 +1045,11 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         "failed" => RuntimeStatus::Error,
         _ => RuntimeStatus::Idle,
     };
+    state.finalization_stage = if state.status == RuntimeStatus::Busy {
+        session.finalization_stage
+    } else {
+        None
+    };
 
     // A reconnect snapshot replaces the live control queue. Only in-process
     // waiters are included, so stale requests from interrupted turns are never
@@ -1085,6 +1108,7 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         state.background_task_labels.clear();
         seal_analysis_segment(state);
         clear_activity(state);
+        state.finalization_stage = None;
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;
         state.pending_attachments.clear();

@@ -538,6 +538,10 @@ fn turn_end_lines(
         TurnEndStatus::Completed | TurnEndStatus::Answered => {
             (format!("✓ {}", t.turn_end_completed), theme.status.success)
         }
+        TurnEndStatus::CompletedWithWarnings => (
+            format!("⚠ {}", t.final_completed_warnings),
+            theme.status.warning,
+        ),
         TurnEndStatus::Truncated => (
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
@@ -584,6 +588,7 @@ fn turn_end_lines(
     if matches!(
         block.status,
         TurnEndStatus::Completed
+            | TurnEndStatus::CompletedWithWarnings
             | TurnEndStatus::Answered
             | TurnEndStatus::Unverified
             | TurnEndStatus::ChecksFailed

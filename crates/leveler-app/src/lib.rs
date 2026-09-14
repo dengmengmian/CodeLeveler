@@ -71,6 +71,15 @@ pub enum AppError {
     VerificationFailed(String),
     #[error("engine error: {0}")]
     Engine(String),
+    /// A truth-affecting child started but could not be durably settled. This
+    /// is intentionally distinct from a terminal engine failure: clients must
+    /// surface a recovery fault without inventing a terminal event.
+    #[error("terminal evidence boundary is not closed: {0}")]
+    UnclosedTerminalBoundary(String),
+    /// The runtime reached the terminal authority, but its atomic commit did
+    /// not land. The UI remains nonterminal until recovery can settle it.
+    #[error("task terminal was not committed: {0}")]
+    TerminalCommitFailed(String),
     #[error("serialization error: {0}")]
     Serde(String),
     #[error("global config error: {0}")]

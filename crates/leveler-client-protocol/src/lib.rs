@@ -73,8 +73,8 @@ pub use observability::{
 };
 pub use origin::ClientOrigin;
 pub use progress::{
-    CheckState, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile, UiPlan,
-    UiPlanStep, UiVerification, UiVerificationStatus,
+    CheckState, FinalizationStage, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile,
+    UiPlan, UiPlanStep, UiVerification, UiVerificationStatus,
 };
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{

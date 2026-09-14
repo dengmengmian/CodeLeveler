@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use crate::failure::classify;
 use crate::plan::{CheckKind, ScopePolicy, VerificationCommand, VerificationPlan};
-use crate::report::{CheckOutcome, CheckStatus, VerificationReport};
+use crate::report::{CheckOutcome, NotRunReason, VerificationReport};
 use crate::test_results::{parse_go_failures, parse_node_failures, parse_rust_failures};
 
 const MAX_EVIDENCE: usize = 4000;
@@ -55,9 +55,22 @@ impl Verifier {
     ) -> VerificationReport {
         let (scope_ok, scope_violations) = check_scope(allowed_paths, modified_files);
 
-        let mut checks = Vec::new();
-        for command in &plan.commands {
+        let mut checks = Vec::with_capacity(plan.commands.len());
+        for (index, command) in plan.commands.iter().enumerate() {
             if cancellation.is_cancelled() {
+                for pending in &plan.commands[index..] {
+                    let outcome = CheckOutcome::not_run(
+                        pending.name.clone(),
+                        pending.kind,
+                        pending.gating,
+                        NotRunReason::VerificationIncomplete,
+                        None,
+                        "verification cancelled before this check ran".to_string(),
+                        None,
+                    );
+                    on_check(&outcome);
+                    checks.push(outcome);
+                }
                 break;
             }
             let outcome = self.run_check(command, modified_files, cancellation).await;
@@ -69,7 +82,6 @@ impl Verifier {
             checks,
             scope_ok,
             scope_violations,
-            baseline_failures: Vec::new(),
         }
     }
 
@@ -125,18 +137,36 @@ impl Verifier {
         cancellation: &CancellationToken,
     ) -> CheckOutcome {
         let Some(resolved) = find_in_path(&command.program, &self.environment) else {
-            return CheckOutcome {
-                name: command.name.clone(),
-                kind: command.kind,
-                gating: command.gating,
-                status: CheckStatus::ToolMissing,
-                evidence: format!("`{}` not found on PATH", command.program),
-                failure: None,
-                failed_tests: BTreeSet::new(),
-            };
+            return CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::ToolMissing,
+                None,
+                format!("`{}` not found on PATH", command.program),
+                None,
+            );
         };
 
+        #[cfg(unix)]
+        if let Some(interpreter) = unavailable_shebang_interpreter(&resolved, &self.environment) {
+            return CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::DependencyUnavailable,
+                None,
+                format!(
+                    "`{}` cannot start because shebang interpreter `{interpreter}` is unavailable",
+                    resolved.display()
+                ),
+                None,
+            );
+        }
+
         let args = effective_args(command, modified_files, &self.workspace_root);
+        let executed_program = command.program.clone();
+        let executed_args = args.clone();
         // Repo / builtin verify: write confinement on, network inherits session
         // (not force-deny — K12 so cargo/go/npm cold caches still work).
         let mut request = process_request_for_verify_check(
@@ -149,35 +179,53 @@ impl Verifier {
 
         match self.runner.run(request, cancellation.child_token()).await {
             Ok(output) => {
+                let execution = crate::report::CheckExecution {
+                    program: executed_program,
+                    args: executed_args,
+                    exit_code: output.exit_code,
+                    timed_out: output.timed_out,
+                };
                 let combined = combine(&output.stdout, &output.stderr);
-                if output.success() {
-                    CheckOutcome {
-                        name: command.name.clone(),
-                        kind: command.kind,
-                        gating: command.gating,
-                        status: CheckStatus::Passed,
-                        evidence: truncate(&combined),
-                        failure: None,
-                        failed_tests: BTreeSet::new(),
-                    }
+                if output.timed_out {
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::VerificationIncomplete,
+                        Some(execution),
+                        format!(
+                            "verification timed out after {}s: {}",
+                            command.timeout_seconds,
+                            truncate(&combined)
+                        ),
+                        None,
+                    )
+                } else if output.success() {
+                    CheckOutcome::passed(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        execution,
+                        truncate(&combined),
+                    )
                 } else if crate::failure::is_environment_mismatch(&combined) {
                     // Toolchain/MSRV refusal: the ENVIRONMENT could not run the
                     // check, the code was never judged (R005 F-P1). Report it
                     // as environment — with provenance naming the binary that
                     // actually ran — instead of gating as a code failure.
-                    CheckOutcome {
-                        name: command.name.clone(),
-                        kind: command.kind,
-                        gating: command.gating,
-                        status: CheckStatus::EnvironmentUnavailable,
-                        evidence: format!(
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::EnvironmentUnavailable,
+                        Some(execution),
+                        format!(
                             "environment mismatch (ran `{}`): {}",
                             resolved.display(),
                             truncate(&combined)
                         ),
-                        failure: Some(classify(command.kind, &combined)),
-                        failed_tests: BTreeSet::new(),
-                    }
+                        Some(classify(command.kind, &combined)),
+                    )
                 } else if let Some(mismatch) = self
                     .unmet_declared_toolchain(&command.program, &resolved, cancellation)
                     .await
@@ -188,42 +236,84 @@ impl Verifier {
                     // themselves; a stale toolchain usually fails in an
                     // ordinary way (R005 in Rust, R009 in Go) and was gating as
                     // a code failure.
-                    CheckOutcome {
-                        name: command.name.clone(),
-                        kind: command.kind,
-                        gating: command.gating,
-                        status: CheckStatus::EnvironmentUnavailable,
-                        evidence: format!("{mismatch}: {}", truncate(&combined)),
-                        failure: Some(classify(command.kind, &combined)),
-                        failed_tests: BTreeSet::new(),
-                    }
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::EnvironmentUnavailable,
+                        Some(execution),
+                        format!("{mismatch}: {}", truncate(&combined)),
+                        Some(classify(command.kind, &combined)),
+                    )
                 } else {
                     let failure = classify(command.kind, &combined);
-                    CheckOutcome {
-                        name: command.name.clone(),
-                        kind: command.kind,
-                        gating: command.gating,
-                        status: CheckStatus::Failed,
-                        evidence: truncate(&combined),
-                        failure: Some(failure),
+                    CheckOutcome::failed(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        Some(execution),
+                        truncate(&combined),
+                        failure,
                         // Full (untruncated) output: the trailing `failures:`
                         // block / `--- FAIL:` lines may lie past the evidence cap.
-                        failed_tests: parse_failed_tests(command, &combined),
-                    }
+                        parse_failed_tests(command, &combined),
+                    )
                 }
             }
             // Could not run the command at all — no test-level signal to parse.
-            Err(e) => CheckOutcome {
-                name: command.name.clone(),
-                kind: command.kind,
-                gating: command.gating,
-                status: CheckStatus::Failed,
-                evidence: format!("failed to run: {e}"),
-                failure: Some(classify(command.kind, &e.to_string())),
-                failed_tests: BTreeSet::new(),
-            },
+            Err(e) if cancellation.is_cancelled() => CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::VerificationIncomplete,
+                None,
+                format!("verification cancelled while check was running: {e}"),
+                None,
+            ),
+            Err(e) => CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::DependencyUnavailable,
+                None,
+                format!("failed to run: {e}"),
+                None,
+            ),
         }
     }
+}
+
+#[cfg(unix)]
+fn unavailable_shebang_interpreter(
+    program: &std::path::Path,
+    environment: &leveler_core::EnvSnapshot,
+) -> Option<String> {
+    let bytes = std::fs::read(program).ok()?;
+    let first_line = bytes.split(|byte| *byte == b'\n').next()?;
+    let shebang = first_line.strip_prefix(b"#!")?;
+    let text = std::str::from_utf8(shebang).ok()?.trim();
+    let mut words = text.split_whitespace();
+    let interpreter = words.next()?;
+    let path = std::path::Path::new(interpreter);
+    if path.is_absolute() && !path.exists() {
+        return Some(interpreter.to_string());
+    }
+
+    // `/usr/bin/env tool` successfully starts `env`, but the declared check
+    // itself never starts when `tool` is absent. Preserve that distinction as
+    // NotRun(DependencyUnavailable), just like a directly missing shebang
+    // interpreter. `-S` is the standard multi-argument shebang form.
+    if path.file_name().and_then(|name| name.to_str()) == Some("env") {
+        let first = words.next()?;
+        let target = if first == "-S" { words.next()? } else { first };
+        if !target.starts_with('-')
+            && !target.contains('=')
+            && find_in_path(target, environment).is_none()
+        {
+            return Some(target.to_string());
+        }
+    }
+    None
 }
 
 /// Confirm that every modified file falls under an allowed path. An empty
@@ -339,14 +429,14 @@ fn with_no_fail_fast(command: &VerificationCommand, mut args: Vec<String>) -> Ve
 
 /// Parse a failed check's output into test-level failure ids, dispatching on
 /// the toolchain. Only Test checks carry test granularity; build/fmt/lint and
-/// toolchains without a parser yield an empty set and fall back to
-/// exit-code-level baseline attribution.
+/// toolchains without a parser yield an empty set and cannot receive baseline
+/// attribution: an exit code alone does not prove that two failures match.
 ///
 /// A Node test run arrives either directly (`node --test`) or through the
 /// package manager's script (`npm run test` → `node --test`), so all four
 /// programs are routed to the node parser. The parser keys on the reporter's
 /// own markers, so an `npm test` that runs some other runner matches nothing
-/// and keeps the exit-code fallback.
+/// and therefore keeps the failure charged to the current change.
 fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<String> {
     if command.kind != CheckKind::Test {
         return BTreeSet::new();
@@ -472,8 +562,8 @@ mod tests {
             .await;
         let check = &report.checks[0];
         assert_eq!(
-            check.status,
-            CheckStatus::Passed,
+            check.observation,
+            crate::report::CheckObservation::Passed,
             "a real repository gate must not fail on the host's compilation cache: {}",
             &check.evidence[..check.evidence.len().min(600)]
         );
@@ -728,6 +818,45 @@ mod tests {
             .await;
         assert!(report.passed());
         assert_eq!(seen, 1);
+        assert_eq!(
+            report.checks[0].execution,
+            Some(crate::report::CheckExecution {
+                program: program.into(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                exit_code: Some(0),
+                timed_out: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_materializes_every_remaining_plan_check_as_not_run() {
+        let verifier = Verifier::new(std::env::temp_dir());
+        let plan = VerificationPlan {
+            commands: vec![
+                cmd("build", "unused-build", &[], true),
+                cmd("test", "unused-test", &[], true),
+            ],
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut seen = 0;
+
+        let report = verifier
+            .verify(&plan, &[], &[], &cancellation, &mut |_| seen += 1)
+            .await;
+
+        assert_eq!(report.checks.len(), plan.commands.len());
+        assert_eq!(seen, plan.commands.len());
+        assert!(report.checks.iter().all(|check| {
+            check.observation
+                == crate::report::CheckObservation::NotRun(NotRunReason::VerificationIncomplete)
+        }));
+        assert!(report.checks.iter().all(|check| check.execution.is_none()));
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
     }
 
     #[tokio::test]
@@ -831,13 +960,13 @@ mod tests {
         let check = &report.checks[0];
         // A host without node cannot judge this: say so rather than assert on
         // an environment that was never here.
-        if check.status == CheckStatus::ToolMissing {
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
             eprintln!("skipping: node is not on PATH");
             return;
         }
         assert_eq!(
-            check.status,
-            CheckStatus::Failed,
+            check.observation,
+            crate::report::CheckObservation::Failed,
             "evidence: {}",
             check.evidence
         );
@@ -874,7 +1003,133 @@ mod tests {
             .await;
         // A missing tool does not fail the gate, but the run is not verified.
         assert!(report.passed());
-        assert_eq!(report.checks[0].status, CheckStatus::ToolMissing);
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_that_cannot_start_is_not_reported_as_a_failed_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("broken-check");
+        std::fs::write(&program, "#!/definitely/missing/interpreter\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("PATH"),
+                dir.path().as_os_str().to_owned(),
+            )],
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![cmd("broken", "broken-check", &[], true)],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::DependencyUnavailable)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_env_shebang_target_is_not_reported_as_a_failed_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("broken-env-check");
+        std::fs::write(
+            &program,
+            "#!/usr/bin/env definitely-not-a-real-interpreter-xyz\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("PATH"),
+                dir.path().as_os_str().to_owned(),
+            )],
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![cmd("broken-env", "broken-env-check", &[], true)],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::DependencyUnavailable)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_check_is_incomplete_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "slow".into(),
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec /bin/sleep 5".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 1,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::VerificationIncomplete),
+            "{}",
+            report.checks[0].evidence
+        );
+        assert!(
+            report.checks[0]
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.timed_out)
+        );
         assert!(matches!(
             report.verdict(),
             crate::report::Verdict::Unverified(_)
@@ -920,11 +1175,12 @@ mod tests {
             .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
             .await;
         assert_eq!(
-            report.checks[0].status,
-            CheckStatus::EnvironmentUnavailable,
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
             "evidence: {}",
             report.checks[0].evidence
         );
+        assert!(report.checks[0].execution.is_some());
         // Environment mismatch must not gate as a code failure…
         assert!(report.passed());
         assert!(report.failed_gates().is_empty());
@@ -1027,7 +1283,7 @@ mod toolchain_provenance_tests {
         )
         .unwrap();
         let check = run_in(dir.path()).await;
-        if check.status == CheckStatus::ToolMissing {
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
             eprintln!("skipping: cargo is not on PATH");
             return;
         }
@@ -1040,8 +1296,8 @@ mod toolchain_provenance_tests {
             return;
         }
         assert_eq!(
-            check.status,
-            CheckStatus::EnvironmentUnavailable,
+            check.observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
             "a repo needing rust 99.0 was never judged on its code: {}",
             check.evidence
         );
@@ -1083,7 +1339,7 @@ mod toolchain_provenance_tests {
             .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
             .await;
         let check = &report.checks[0];
-        if check.status == CheckStatus::ToolMissing {
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
             eprintln!("skipping: go is not on PATH");
             return;
         }
@@ -1095,8 +1351,8 @@ mod toolchain_provenance_tests {
             return;
         }
         assert_eq!(
-            check.status,
-            CheckStatus::EnvironmentUnavailable,
+            check.observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
             "a repo needing go 1.99.0 was never judged on its code: {}",
             check.evidence
         );
@@ -1116,13 +1372,13 @@ mod toolchain_provenance_tests {
         )
         .unwrap();
         let check = run_in(dir.path()).await;
-        if check.status == CheckStatus::ToolMissing {
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
             eprintln!("skipping: cargo is not on PATH");
             return;
         }
         assert_eq!(
-            check.status,
-            CheckStatus::Failed,
+            check.observation,
+            crate::report::CheckObservation::Failed,
             "a satisfied requirement must not excuse a genuine failure: {}",
             check.evidence
         );

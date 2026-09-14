@@ -114,6 +114,7 @@ pub struct ToolGroupBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEndStatus {
     Completed,
+    CompletedWithWarnings,
     Answered,
     Truncated,
     Incomplete,

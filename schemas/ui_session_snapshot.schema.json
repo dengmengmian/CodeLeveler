@@ -78,6 +78,17 @@
         }
       ]
     },
+    "finalization_stage": {
+      "description": "Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FinalizationStage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "goal": {
       "type": "string"
     },
@@ -213,6 +224,13 @@
           ]
         },
         {
+          "description": "No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency.",
+          "type": "string",
+          "enum": [
+            "not_run"
+          ]
+        },
+        {
           "description": "The check's program is not on `PATH`, so it could not run at all.",
           "type": "string",
           "enum": [
@@ -264,6 +282,53 @@
     "ClarificationId": {
       "description": "Identifies a pending clarification (ask-user) request.",
       "type": "string"
+    },
+    "FinalizationStage": {
+      "description": "The mechanical work still running after the assistant has produced its final response but before the runtime publishes the task terminal.\n\nThis is lifecycle chrome, not a second completion authority: the terminal event remains the only fact that ends the turn.",
+      "oneOf": [
+        {
+          "description": "Wait for work already admitted by the turn to settle.",
+          "type": "string",
+          "enum": [
+            "settling_dependencies"
+          ]
+        },
+        {
+          "description": "Run the configured checks over the final tree.",
+          "type": "string",
+          "enum": [
+            "verification"
+          ]
+        },
+        {
+          "description": "Persist verification and other completion evidence.",
+          "type": "string",
+          "enum": [
+            "evidence"
+          ]
+        },
+        {
+          "description": "Run a completion review explicitly required by the task contract.",
+          "type": "string",
+          "enum": [
+            "review"
+          ]
+        },
+        {
+          "description": "Resolve the task outcome from the collected facts.",
+          "type": "string",
+          "enum": [
+            "resolving_outcome"
+          ]
+        },
+        {
+          "description": "Commit and publish the canonical terminal fact.",
+          "type": "string",
+          "enum": [
+            "publishing_terminal"
+          ]
+        }
+      ]
     },
     "MessageId": {
       "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",

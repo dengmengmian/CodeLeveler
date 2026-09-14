@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use leveler_client_protocol::{
-    RuntimeEvent, UiActiveToolCall, UiCompletionReport, UiDiff, UiPlan, UiVerification,
+    FinalizationStage, RuntimeEvent, UiActiveToolCall, UiCompletionReport, UiDiff, UiPlan,
+    UiVerification,
 };
 use leveler_core::SessionId;
 
@@ -22,6 +23,7 @@ pub(crate) struct LiveSessionView {
     pub verification: Option<UiVerification>,
     pub diff: Option<UiDiff>,
     pub completion_report: Option<UiCompletionReport>,
+    pub finalization_stage: Option<FinalizationStage>,
 }
 
 /// Per-session live views, shared via `Arc` with the event forwarder tasks.
@@ -83,15 +85,21 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         }
         RuntimeEvent::UserMessageAdded { .. } => {
             view.completion_report = None;
+            view.finalization_stage = None;
         }
+        RuntimeEvent::TurnFinalizing { stage } => view.finalization_stage = Some(*stage),
         RuntimeEvent::TurnCompleted
+        | RuntimeEvent::TurnCompletedWithWarnings { .. }
         | RuntimeEvent::TurnAnswered
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
         | RuntimeEvent::TurnCompletedUnverified { .. }
         | RuntimeEvent::TurnCompletedChecksFailed { .. }
         | RuntimeEvent::TurnFailed { .. }
-        | RuntimeEvent::TurnCancelled => view.active_tools.clear(),
+        | RuntimeEvent::TurnCancelled => {
+            view.active_tools.clear();
+            view.finalization_stage = None;
+        }
         _ => {}
     }
 }
@@ -129,5 +137,25 @@ mod tests {
             },
         );
         assert!(views.view(&session_id).active_tools.is_empty());
+    }
+
+    #[test]
+    fn live_view_preserves_finalization_for_reconnect_and_clears_at_terminal() {
+        let session_id = SessionId::new("s1");
+        let views = LiveViews::default();
+
+        views.apply(
+            &session_id,
+            &RuntimeEvent::TurnFinalizing {
+                stage: FinalizationStage::Verification,
+            },
+        );
+        assert_eq!(
+            views.view(&session_id).finalization_stage,
+            Some(FinalizationStage::Verification)
+        );
+
+        views.apply(&session_id, &RuntimeEvent::TurnCompleted);
+        assert_eq!(views.view(&session_id).finalization_stage, None);
     }
 }

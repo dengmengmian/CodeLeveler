@@ -12,7 +12,8 @@ pub enum TurnPhase {
     ToolBatch,
     Closing,
     AwaitingUser,
-    Terminal,
+    #[serde(rename = "closed", alias = "terminal")]
+    Closed,
 }
 
 /// Resource caps for the mechanical no-progress watchdog. Two things tick it,
@@ -122,9 +123,9 @@ impl ProgressLedger {
     }
 
     /// True when this ledger must **not** be seeded into a fresh Content turn
-    /// (task already closing/terminal — a new user message is a new epoch).
+    /// (the controller epoch is closing/closed — a new message is a new epoch).
     pub fn is_terminal_for_inheritance(&self) -> bool {
-        self.closing || matches!(self.phase, TurnPhase::Closing | TurnPhase::Terminal)
+        self.closing || matches!(self.phase, TurnPhase::Closing | TurnPhase::Closed)
     }
 
     pub fn enter_closing(&mut self) {
@@ -132,9 +133,9 @@ impl ProgressLedger {
         self.phase = TurnPhase::Closing;
     }
 
-    pub fn enter_terminal(&mut self) {
+    pub fn enter_closed(&mut self) {
         self.closing = true;
-        self.phase = TurnPhase::Terminal;
+        self.phase = TurnPhase::Closed;
     }
 
     /// Fold one finished drive's rounds into the epoch totals.
@@ -238,7 +239,7 @@ impl ProgressLedger {
     /// Fresh epoch after /clear, /compact, or checkpoint restore — no inheritance.
     pub fn new_context_epoch() -> Self {
         let mut led = Self::default();
-        led.enter_terminal();
+        led.enter_closed();
         led
     }
 
@@ -346,9 +347,9 @@ mod tests {
         assert_eq!(led.cumulative_rounds, 5);
         led.accumulate_drive_rounds(3);
         assert_eq!(led.cumulative_rounds, 8);
-        led.enter_terminal();
+        led.enter_closed();
         assert!(led.is_terminal_for_inheritance());
-        assert_eq!(led.phase, TurnPhase::Terminal);
+        assert_eq!(led.phase, TurnPhase::Closed);
     }
 
     #[test]

@@ -4,8 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
-    ApprovalDecision, ApprovalId, ClientCommand, MessageId, PermissionProfile, RuntimeEvent,
-    RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
+    ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId, PermissionProfile,
+    RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
     UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiReasoningState, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
@@ -89,6 +89,7 @@ fn snapshot() -> UiSessionSnapshot {
         mode: PermissionProfile::Assisted,
         branch: Some("main".to_string()),
         status: "idle".to_string(),
+        finalization_stage: None,
         messages: Vec::new(),
         pending_interactions: Vec::new(),
         available_models: vec![
@@ -110,6 +111,28 @@ fn snapshot() -> UiSessionSnapshot {
         collaboration: None,
         children: Vec::new(),
     }
+}
+
+#[test]
+fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
+    let mut state = state();
+    let mut snap = snapshot();
+    snap.status = "running".into();
+    snap.finalization_stage = Some(leveler_client_protocol::FinalizationStage::Verification);
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+
+    assert_eq!(state.status, RuntimeStatus::Busy);
+    assert_eq!(
+        state.finalization_stage,
+        Some(leveler_client_protocol::FinalizationStage::Verification)
+    );
+    let frame = rendered(&mut state, 100, 24);
+    assert!(frame.contains("正在验证"), "{frame}");
+    assert!(!frame.contains("等待模型"), "{frame}");
 }
 
 fn key(code: KeyCode) -> Action {
@@ -1119,6 +1142,37 @@ fn a_turn_that_committed_an_answer_keeps_its_runtime_outcome() {
     answer(&mut s, "m-final", "P1-8 已完成。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     assert_eq!(last_turn_end(&s).status, TurnEndStatus::Completed);
+}
+
+#[test]
+fn finalizing_is_busy_but_never_presented_as_waiting_for_the_model() {
+    let mut s = opened();
+    answer(&mut s, "m-finalizing", "修改和验证结果如下。");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFinalizing {
+            stage: FinalizationStage::Verification,
+        }),
+    );
+
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    assert_eq!(s.finalization_stage, Some(FinalizationStage::Verification));
+    let finalizing = rendered(&mut s, 100, 24);
+    assert!(finalizing.contains("正在验证"), "screen: {finalizing}");
+    assert!(!finalizing.contains("等待模型"), "screen: {finalizing}");
+
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert_eq!(s.status, RuntimeStatus::Idle);
+    assert_eq!(s.finalization_stage, None);
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::TurnEnd(_)))
+            .count(),
+        1,
+        "the terminal event remains the only turn-end authority"
+    );
 }
 
 /// C3: prose a tool call acted on is narration, not the answer. A turn whose

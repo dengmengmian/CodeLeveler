@@ -496,8 +496,15 @@ impl TurnRunner<'_> {
                 }),
             };
             let result = execute(ports).await;
+            let settling_started = result.as_ref().ok().map(|_| {
+                events.emit(EngineEvent::FinalizationPhaseStarted {
+                    phase: "settling_turn".to_string(),
+                    at: leveler_core::now(),
+                });
+                std::time::Instant::now()
+            });
             drop(events);
-            result
+            (result, settling_started)
         };
 
         // Persist-then-forward each pumped event, in emission order. A
@@ -581,7 +588,7 @@ impl TurnRunner<'_> {
             result
         };
 
-        let (exec_result, pump_result) = futures::join!(exec, pump);
+        let ((exec_result, settling_started), pump_result) = futures::join!(exec, pump);
         // A pump failure outranks whatever the harness reported: losing
         // canonical history is the more serious fact, and the harness's
         // outcome was computed against a log that is now incomplete.
@@ -589,6 +596,22 @@ impl TurnRunner<'_> {
             Ok(()) => exec_result.map_err(EngineError::from),
             Err(error) => Err(error),
         };
+        // Every activation announced by this turn must have a durable ending
+        // before the turn itself closes. This is lifecycle settlement, not
+        // advisory cleanup: leaving an open child behind would make the next
+        // turn infer a crash that did not happen.
+        let child_stop = if matches!(run_result, Err(EngineError::Cancelled)) {
+            leveler_lifecycle::ChildStop::Cancelled
+        } else {
+            leveler_lifecycle::ChildStop::Lost
+        };
+        self.reconcile_terminal_children(child_stop, observer)
+            .await
+            .map_err(|error| {
+                EngineError::UnclosedTerminalBoundary(format!(
+                    "could not settle terminal-dependent children: {error}"
+                ))
+            })?;
         // The terminal event and query projection commit atomically. Forwarding
         // happens only after commit, so observers never see an uncommitted fact.
         let (terminal, stop_reason, stop, rounds, modified_files) = match &run_result {
@@ -608,53 +631,6 @@ impl TurnRunner<'_> {
             ),
             Err(error) => (TurnOutcome::Failed, error.to_string(), None, 0, Vec::new()),
         };
-        // Settle any child that never reported, BEFORE the turn's terminal
-        // event, so a replay sees children stop and then the turn end.
-        //
-        // A child's status is derived from the `SubAgentStarted` /
-        // `SubAgentFinished` pair — nothing else records it — so a child whose
-        // finish never lands reads as `running` forever. Session `446c71ad`
-        // still has two explorers in that state: the turn was cancelled
-        // mid-flight and nobody spoke for them. The turn ending IS the child
-        // ending; there is no child that legitimately outlives its turn.
-        //
-        // Best-effort on purpose. This is reconciliation, and the authoritative
-        // record of how the turn ended matters more: if settling a ghost fails
-        // (a stale token, say), that is worth a warning, not a reason to skip
-        // the terminal event below.
-        match self.log.unfinished_children().await {
-            Ok(open) => {
-                let (how, stop) = match terminal {
-                    TurnOutcome::Interrupted => {
-                        ("cancelled", leveler_lifecycle::ChildStop::Cancelled)
-                    }
-                    TurnOutcome::Failed => ("failed", leveler_lifecycle::ChildStop::Failed),
-                    TurnOutcome::Completed => ("ended", leveler_lifecycle::ChildStop::Lost),
-                };
-                if let Err(error) = self
-                    .settle_ghost_children(
-                        open,
-                        &format!("did not report before the turn ended ({how})"),
-                        stop,
-                        &turn_id,
-                        observer,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        session_id = %self.session_id.as_str(),
-                        %error,
-                        "could not settle an unfinished child; it stays running in the log"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(
-                session_id = %self.session_id.as_str(),
-                %error,
-                "could not scan for unfinished children"
-            ),
-        }
-
         let event = EngineEvent::TurnFinished {
             turn_id: turn_id.clone(),
             outcome: terminal,
@@ -663,7 +639,11 @@ impl TurnRunner<'_> {
             rounds,
             modified_files,
         };
-        let (event_type, payload) = event.to_row()?;
+        let (event_type, payload) = event.to_row().map_err(|error| {
+            EngineError::UnclosedTerminalBoundary(format!(
+                "could not serialize the turn terminal: {error}"
+            ))
+        })?;
         self.stores
             .terminal
             .finish_turn_owned(
@@ -675,8 +655,20 @@ impl TurnRunner<'_> {
                 terminal,
                 leveler_core::now(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                EngineError::UnclosedTerminalBoundary(format!(
+                    "could not commit the turn terminal: {error}"
+                ))
+            })?;
         observer(event);
+        if let Some(settling_started) = settling_started {
+            tracing::debug!(
+                phase = "settling_turn",
+                elapsed_ms = settling_started.elapsed().as_millis(),
+                "finalization phase finished"
+            );
+        }
 
         let facts = run_result?;
 
@@ -684,6 +676,34 @@ impl TurnRunner<'_> {
             turn_id,
             outcome: facts.outcome,
         })
+    }
+
+    /// Close child activations that did not report before their owning turn
+    /// ended. This runs before `TurnFinished`; callers outside `run_turn` must
+    /// likewise invoke it only while they still own the turn boundary.
+    pub async fn reconcile_terminal_children(
+        &self,
+        stop: leveler_lifecycle::ChildStop,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        let open = self.log.unfinished_children().await?;
+        for child in open {
+            let event = EngineEvent::SubAgentFinished {
+                id: child.id.clone(),
+                nickname: child.nickname.clone(),
+                ok: false,
+                contribution: None,
+                summary: format!(
+                    "[sub-agent {}] did not report before the task reached its terminal",
+                    child.nickname
+                ),
+                outcome: None,
+                stop: Some(stop),
+            };
+            let origin = child.turn_id.as_deref().map(TurnId::new);
+            self.log.append(origin.as_ref(), event, observer).await?;
+        }
+        Ok(())
     }
 }
 

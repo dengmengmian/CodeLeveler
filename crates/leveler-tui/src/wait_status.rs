@@ -62,6 +62,12 @@ pub(crate) fn project(state: &AppState) -> Option<WaitView> {
     if state.status != RuntimeStatus::Busy {
         return None;
     }
+    // Finalization is an explicit runtime lifecycle fact. Once it begins, the
+    // model is no longer the dependency; never let the presentation fallback
+    // below relabel this interval as "waiting for model".
+    if state.finalization_stage.is_some() {
+        return None;
+    }
 
     let running = running_tools(state);
     if let Some(view) = project_background_wait(state, &running) {
@@ -489,6 +495,16 @@ mod tests {
         let text = render_plain(&view, zh(), 80);
         assert!(text.contains("等待模型"), "{text}");
         assert!(!text.contains("等待任务"), "{text}");
+    }
+
+    #[test]
+    fn finalizing_never_projects_a_model_wait() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.finalization_stage =
+            Some(leveler_client_protocol::FinalizationStage::ResolvingOutcome);
+
+        assert_eq!(project(&state), None);
     }
 
     #[test]

@@ -8,7 +8,12 @@ import { formatClock, modelRefString } from './format';
 import { loadLastSession, saveLastSession } from './lastSession';
 import { getToken } from './token';
 import { shouldRefreshObservability } from './observabilityView';
-import { commandProgressLabel, turnEndFromEvent, turnProgressLabel } from './turn';
+import {
+  commandProgressLabel,
+  finalizationStageLabel,
+  turnEndFromEvent,
+  turnProgressLabel,
+} from './turn';
 import { deliverFrame, WsClient } from './ws';
 import type { Action, AppState } from '../state/store';
 import type {
@@ -272,6 +277,9 @@ export class RuntimeBridge {
         if (label) this.dispatch({ type: 'agent_activity', label });
         break;
       }
+      case 'turn_finalizing':
+        this.dispatch({ type: 'agent_activity', label: finalizationStageLabel(ev.stage) });
+        break;
       case 'sub_agent_updated':
         this.dispatch({
           type: 'sub_agent_updated',

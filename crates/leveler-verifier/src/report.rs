@@ -2,36 +2,113 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::failure::ClassifiedFailure;
 use crate::plan::CheckKind;
 
-/// The status of one verification check.
+/// Why a planned check did not produce a pass/fail observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRunReason {
+    ToolMissing,
+    EnvironmentUnavailable,
+    VerificationIncomplete,
+    DependencyUnavailable,
+}
+
+impl NotRunReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolMissing => "tool_missing",
+            Self::EnvironmentUnavailable => "environment_unavailable",
+            Self::VerificationIncomplete => "verification_incomplete",
+            Self::DependencyUnavailable => "dependency_unavailable",
+        }
+    }
+}
+
+/// What the verifier actually observed when it attempted a check.
+/// This is independent of whether that observation gates completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum CheckObservation {
+    Passed,
+    Failed,
+    NotRun(NotRunReason),
+}
+
+/// How a baseline comparison was mechanically produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineSource {
+    DetachedWorktreeRerun,
+}
+
+/// Evidence that a failed test was already failing before the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineProvenance {
+    pub source: BaselineSource,
+    pub failed_tests: BTreeSet<String>,
+}
+
+/// Why a configured gate was not charged to the current change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum GateSkipReason {
+    ConfirmedBaselineFailure {
+        revision: String,
+        provenance: BaselineProvenance,
+    },
+    NotApplicable,
+    Superseded,
+}
+
+/// Whether this check's observation participates in the completion gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum GateDisposition {
+    Required,
+    Skipped(GateSkipReason),
+}
+
+impl Default for GateDisposition {
+    fn default() -> Self {
+        Self::Required
+    }
+}
+
+/// Legacy one-dimensional wire status.
+///
+/// This type remains only to read and project older event rows. Verdicts use
+/// [`CheckObservation`] and [`GateDisposition`] as their sole authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Passed,
     Failed,
-    /// Deliberately not run (e.g. cancelled or narrowed away).
     Skipped,
-    /// The check's program is not on PATH, so it could not run at all.
     ToolMissing,
-    /// The check ran but the environment refused it (toolchain/MSRV mismatch:
-    /// e.g. cargo declining because the host rustc is older than the tree's
-    /// pin). Like [`Self::ToolMissing`], this is not the code's failure — it
-    /// yields `Unverified`, never `Failed` (R005 F-P1).
     EnvironmentUnavailable,
 }
 
+/// The process result obtained while producing a check observation.
+/// `None` on [`CheckOutcome`] means no process result was obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckExecution {
+    /// The exact executable spelling passed to the process authority.
+    #[serde(default)]
+    pub program: String,
+    /// The effective arguments after verifier-owned scoping or completion
+    /// flags were applied.
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
 impl CheckStatus {
-    /// The durable spelling of this status.
-    ///
-    /// Explicit, and deliberately not `Debug`: a record's vocabulary must not
-    /// move because a variant was renamed or a derive was added, and
-    /// `format!("{:?}").to_lowercase()` wrote `toolmissing` where the event's
-    /// own contract said `tool_missing`.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Passed => "passed",
             Self::Failed => "failed",
@@ -41,13 +118,6 @@ impl CheckStatus {
         }
     }
 
-    /// Read a durable check status, accepting every spelling this vocabulary
-    /// has had.
-    ///
-    /// `toolmissing` and `environmentunavailable` are what the Debug-derived
-    /// writer produced before [`Self::as_str`] existed. They are read and
-    /// never re-written: a row is a fact about what happened, and rewriting
-    /// one to tidy its spelling would be editing the record.
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "passed" => Some(Self::Passed),
@@ -62,237 +132,421 @@ impl CheckStatus {
     }
 }
 
-/// The three-way completion verdict. `Unverified` is not a failure — the task
-/// may still complete — but callers must not report it as verified.
+impl<'de> Deserialize<'de> for CheckStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_wire(&value).ok_or_else(|| D::Error::custom(format!("unknown status: {value}")))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verdict", content = "reason", rename_all = "snake_case")]
 pub enum Verdict {
-    /// Every applicable gating check ran and passed; none failed.
     Verified,
-    /// No gating check produced evidence (none configured, or none could run).
     Unverified(String),
-    /// A gating check failed or the scope was violated.
     Failed,
 }
 
-/// The outcome of running one verification command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The outcome of one planned verification command.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOutcome {
     pub name: String,
     pub kind: CheckKind,
     pub gating: bool,
-    pub status: CheckStatus,
-    /// Captured command output (truncated) — the evidence.
+    pub observation: CheckObservation,
+    pub disposition: GateDisposition,
+    pub execution: Option<CheckExecution>,
     pub evidence: String,
-    /// Present when the check failed.
     pub failure: Option<ClassifiedFailure>,
-    /// Test-level failure identifiers parsed from a failed Test check's output
-    /// (empty for non-Test checks, passing checks, or unparsable output). This
-    /// is what baseline delta attribution diffs against the baseline run so a
-    /// whole-suite command red for the SAME tests on both trees is judged
-    /// pre-existing, while a newly-failing test still gates.
-    #[serde(default)]
     pub failed_tests: BTreeSet<String>,
 }
 
-/// The full verification report for a task (spec §29).
+impl CheckOutcome {
+    pub fn passed(
+        name: String,
+        kind: CheckKind,
+        gating: bool,
+        execution: CheckExecution,
+        evidence: String,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            gating,
+            observation: CheckObservation::Passed,
+            disposition: GateDisposition::Required,
+            execution: Some(execution),
+            evidence,
+            failure: None,
+            failed_tests: BTreeSet::new(),
+        }
+    }
+
+    pub fn failed(
+        name: String,
+        kind: CheckKind,
+        gating: bool,
+        execution: Option<CheckExecution>,
+        evidence: String,
+        failure: ClassifiedFailure,
+        failed_tests: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            gating,
+            observation: CheckObservation::Failed,
+            disposition: GateDisposition::Required,
+            execution,
+            evidence,
+            failure: Some(failure),
+            failed_tests,
+        }
+    }
+
+    pub fn not_run(
+        name: String,
+        kind: CheckKind,
+        gating: bool,
+        reason: NotRunReason,
+        execution: Option<CheckExecution>,
+        evidence: String,
+        failure: Option<ClassifiedFailure>,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            gating,
+            observation: CheckObservation::NotRun(reason),
+            disposition: GateDisposition::Required,
+            execution,
+            evidence,
+            failure,
+            failed_tests: BTreeSet::new(),
+        }
+    }
+
+    /// Read-only compatibility projection. Never use this for verdicts.
+    pub fn legacy_status(&self) -> CheckStatus {
+        match (&self.observation, &self.disposition) {
+            (_, GateDisposition::Skipped(_)) => CheckStatus::Skipped,
+            (CheckObservation::Passed, GateDisposition::Required) => CheckStatus::Passed,
+            (CheckObservation::Failed, GateDisposition::Required) => CheckStatus::Failed,
+            (CheckObservation::NotRun(NotRunReason::ToolMissing), GateDisposition::Required) => {
+                CheckStatus::ToolMissing
+            }
+            (
+                CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
+                GateDisposition::Required,
+            ) => CheckStatus::EnvironmentUnavailable,
+            (CheckObservation::NotRun(_), GateDisposition::Required) => CheckStatus::Skipped,
+        }
+    }
+
+    pub fn confirmed_baseline_failure(&self) -> Option<(&str, &BaselineProvenance)> {
+        match &self.disposition {
+            GateDisposition::Skipped(GateSkipReason::ConfirmedBaselineFailure {
+                revision,
+                provenance,
+            }) => Some((revision, provenance)),
+            _ => None,
+        }
+    }
+}
+
+/// Emit the typed truth plus a derived `status` for old readers.
+impl Serialize for CheckOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            name: &'a str,
+            kind: CheckKind,
+            gating: bool,
+            observation: &'a CheckObservation,
+            disposition: &'a GateDisposition,
+            execution: &'a Option<CheckExecution>,
+            status: CheckStatus,
+            evidence: &'a str,
+            failure: &'a Option<ClassifiedFailure>,
+            failed_tests: &'a BTreeSet<String>,
+        }
+
+        Wire {
+            name: &self.name,
+            kind: self.kind,
+            gating: self.gating,
+            observation: &self.observation,
+            disposition: &self.disposition,
+            execution: &self.execution,
+            status: self.legacy_status(),
+            evidence: &self.evidence,
+            failure: &self.failure,
+            failed_tests: &self.failed_tests,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Old rows contain only `status`. Ambiguous `skipped` is upgraded
+/// conservatively, never fabricated into a baseline exemption.
+impl<'de> Deserialize<'de> for CheckOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            kind: CheckKind,
+            gating: bool,
+            #[serde(default)]
+            observation: Option<CheckObservation>,
+            #[serde(default)]
+            disposition: Option<GateDisposition>,
+            #[serde(default)]
+            execution: Option<CheckExecution>,
+            #[serde(default)]
+            status: Option<CheckStatus>,
+            #[serde(default)]
+            evidence: String,
+            #[serde(default)]
+            failure: Option<ClassifiedFailure>,
+            #[serde(default)]
+            failed_tests: BTreeSet<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let observation = match (wire.observation, wire.status) {
+            (Some(observation), _) => observation,
+            (None, Some(CheckStatus::Passed)) => CheckObservation::Passed,
+            (None, Some(CheckStatus::Failed)) => CheckObservation::Failed,
+            (None, Some(CheckStatus::ToolMissing)) => {
+                CheckObservation::NotRun(NotRunReason::ToolMissing)
+            }
+            (None, Some(CheckStatus::EnvironmentUnavailable)) => {
+                CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable)
+            }
+            (None, Some(CheckStatus::Skipped)) => {
+                CheckObservation::NotRun(NotRunReason::VerificationIncomplete)
+            }
+            (None, None) => return Err(D::Error::missing_field("observation or legacy status")),
+        };
+
+        Ok(Self {
+            name: wire.name,
+            kind: wire.kind,
+            gating: wire.gating,
+            observation,
+            disposition: wire.disposition.unwrap_or_default(),
+            execution: wire.execution,
+            evidence: wire.evidence,
+            failure: wire.failure,
+            failed_tests: wire.failed_tests,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationReport {
     pub checks: Vec<CheckOutcome>,
-    /// Whether all modified files stayed within the allowed scope.
     pub scope_ok: bool,
-    /// Paths modified outside the allowed scope.
     pub scope_violations: Vec<String>,
-    /// Names of gating checks whose failure was attributed to the pre-change
-    /// baseline (see [`Self::attribute_baseline`]) and therefore does NOT gate
-    /// completion. Empty when no baseline was consulted.
-    #[serde(default)]
-    pub baseline_failures: Vec<String>,
 }
 
 impl VerificationReport {
-    /// The completion gate (spec §30): scope holds and no gating check failed.
-    /// Note this does not mean the run is verified — see [`Self::verdict`].
     pub fn passed(&self) -> bool {
         self.verdict() != Verdict::Failed
     }
 
-    /// Reconcile this (working-tree) report against the same plan run on the
-    /// pre-change baseline, recording which gating failures pre-date the change
-    /// so they stop gating completion. `base` is the baseline run's report.
-    ///
-    /// A currently-failing gating check is pre-existing when:
-    /// - **Test check**: it has parsed failing tests AND every one of them was
-    ///   already failing on the baseline. No parsed tests (compile/infra error)
-    ///   → cannot prove sameness → still gates (never suppress on no evidence).
-    /// - **Non-Test check** (build/fmt/lint, no test granularity): the same
-    ///   check also failed on the baseline (exit-code level).
-    ///
-    /// A check the baseline did not fail (passed or absent) is always a genuine
-    /// new failure and keeps gating.
-    pub fn attribute_baseline(&mut self, base: &VerificationReport) {
-        self.baseline_failures = self
-            .checks
-            .iter()
-            .filter(|c| c.gating && c.status == CheckStatus::Failed && pre_dates_change(c, base))
-            .map(|c| c.name.clone())
-            .collect();
+    /// Only parsed Test failures can be mechanically attributed to a baseline.
+    pub fn attribute_baseline(&mut self, base: &VerificationReport, revision: &str) {
+        for working in &mut self.checks {
+            if !working.gating
+                || working.kind != CheckKind::Test
+                || working.observation != CheckObservation::Failed
+                || working.disposition != GateDisposition::Required
+                || working.failed_tests.is_empty()
+            {
+                continue;
+            }
+            let Some(working_execution) = working.execution.as_ref() else {
+                continue;
+            };
+            let Some(base_check) = base.checks.iter().find(|candidate| {
+                candidate.name == working.name
+                    && candidate.kind == CheckKind::Test
+                    && candidate.observation == CheckObservation::Failed
+                    && !candidate.failed_tests.is_empty()
+                    && candidate
+                        .execution
+                        .as_ref()
+                        .is_some_and(|baseline_execution| {
+                            baseline_execution.program == working_execution.program
+                                && baseline_execution.args == working_execution.args
+                        })
+            }) else {
+                continue;
+            };
+            if working
+                .failed_tests
+                .iter()
+                .all(|test| base_check.failed_tests.contains(test))
+            {
+                working.disposition =
+                    GateDisposition::Skipped(GateSkipReason::ConfirmedBaselineFailure {
+                        revision: revision.to_string(),
+                        provenance: BaselineProvenance {
+                            source: BaselineSource::DetachedWorktreeRerun,
+                            failed_tests: base_check.failed_tests.clone(),
+                        },
+                    });
+            }
+        }
     }
 
-    /// Whether a failing check was attributed to the baseline by the most recent
-    /// [`Self::attribute_baseline`] call.
-    fn is_pre_existing(&self, check: &CheckOutcome) -> bool {
-        check.status == CheckStatus::Failed
-            && self.baseline_failures.iter().any(|n| n == &check.name)
-    }
-
-    /// Whether the project configured any gating verification check at all. When
-    /// false there is simply nothing to verify against — a calm "not auto-verified"
-    /// finish, NOT a warning about this task. Callers use it to route the terminal
-    /// state to the soft `no_automatic_verification` copy instead of a warning.
     pub fn has_gating_checks(&self) -> bool {
-        self.checks.iter().any(|c| c.gating)
+        self.checks.iter().any(|check| check.gating)
     }
 
-    /// The three-way verdict: whether completion is actually evidence-backed.
-    ///
-    /// `Verified` requires `scope_ok`, at least one applicable (gating) check,
-    /// and **every** applicable check `Passed`. ToolMissing /
-    /// EnvironmentUnavailable / Skipped / not-run yield `Unverified` (v1 does
-    /// not treat them as non-applicable).
     pub fn verdict(&self) -> Verdict {
         if !self.scope_ok
-            || self
-                .checks
-                .iter()
-                .any(|c| c.gating && c.status == CheckStatus::Failed && !self.is_pre_existing(c))
+            || self.checks.iter().any(|check| {
+                check.gating
+                    && check.disposition == GateDisposition::Required
+                    && check.observation == CheckObservation::Failed
+            })
         {
             return Verdict::Failed;
         }
-
         if !self.has_gating_checks() {
             return Verdict::Unverified(
                 "no gating verification checks were configured".to_string(),
             );
         }
-        let applicable: Vec<&CheckOutcome> = self.checks.iter().filter(|c| c.gating).collect();
-        if applicable.iter().all(|c| c.status == CheckStatus::Passed) {
+        let gating: Vec<&CheckOutcome> = self.checks.iter().filter(|check| check.gating).collect();
+        if gating.iter().all(|check| {
+            check.disposition == GateDisposition::Required
+                && check.observation == CheckObservation::Passed
+        }) {
             return Verdict::Verified;
         }
-
-        let unrun: Vec<String> = applicable
-            .iter()
-            .filter(|c| c.status != CheckStatus::Passed)
-            .map(|c| {
-                if self.is_pre_existing(c) {
-                    return format!("{} (pre-existing failure)", c.name);
-                }
-                match c.status {
-                    CheckStatus::ToolMissing => format!("{} (tool missing)", c.name),
-                    CheckStatus::EnvironmentUnavailable => {
-                        format!("{} (environment mismatch)", c.name)
-                    }
-                    _ => format!("{} (skipped)", c.name),
-                }
+        let incomplete = gating
+            .into_iter()
+            .filter(|check| {
+                check.disposition != GateDisposition::Required
+                    || check.observation != CheckObservation::Passed
             })
-            .collect();
-        Verdict::Unverified(format!("gating checks did not run: {}", unrun.join(", ")))
+            .map(describe_incomplete_gate)
+            .collect::<Vec<_>>();
+        Verdict::Unverified(format!(
+            "verification incomplete: {}",
+            incomplete.join(", ")
+        ))
     }
 
-    /// The gating checks that failed and are NOT attributed to the baseline.
     pub fn failed_gates(&self) -> Vec<&CheckOutcome> {
         self.checks
             .iter()
-            .filter(|c| c.gating && c.status == CheckStatus::Failed && !self.is_pre_existing(c))
+            .filter(|check| {
+                check.gating
+                    && check.disposition == GateDisposition::Required
+                    && check.observation == CheckObservation::Failed
+            })
+            .collect()
+    }
+
+    pub fn confirmed_baseline_failures(&self) -> Vec<&CheckOutcome> {
+        self.checks
+            .iter()
+            .filter(|check| check.confirmed_baseline_failure().is_some())
             .collect()
     }
 }
 
-/// Whether `working`'s failure pre-dates the change, judged against the baseline
-/// run `base`. See [`VerificationReport::attribute_baseline`] for the rules.
-fn pre_dates_change(working: &CheckOutcome, base: &VerificationReport) -> bool {
-    let Some(base_check) = base
-        .checks
-        .iter()
-        .find(|b| b.name == working.name && b.status == CheckStatus::Failed)
-    else {
-        // Baseline passed this check (or never ran it) → genuinely new.
-        return false;
-    };
-    if working.kind == CheckKind::Test {
-        // Require test-level proof: every failing test was already failing on
-        // the baseline. Empty (unparsable / compile error) → cannot prove.
-        !working.failed_tests.is_empty()
-            && working
-                .failed_tests
-                .iter()
-                .all(|t| base_check.failed_tests.contains(t))
-    } else {
-        // No test granularity — the same check failing on the baseline is the
-        // best signal available.
-        true
+fn describe_incomplete_gate(check: &CheckOutcome) -> String {
+    match (&check.observation, &check.disposition) {
+        (
+            CheckObservation::Failed,
+            GateDisposition::Skipped(GateSkipReason::ConfirmedBaselineFailure { revision, .. }),
+        ) => format!(
+            "{} (pre-existing test failure at {})",
+            check.name,
+            short_revision(revision)
+        ),
+        (_, GateDisposition::Skipped(GateSkipReason::NotApplicable)) => {
+            format!("{} (not applicable)", check.name)
+        }
+        (_, GateDisposition::Skipped(GateSkipReason::Superseded)) => {
+            format!("{} (superseded)", check.name)
+        }
+        (CheckObservation::NotRun(reason), GateDisposition::Required) => {
+            format!("{} ({})", check.name, describe_not_run(*reason))
+        }
+        (CheckObservation::Failed, GateDisposition::Required) => {
+            format!("{} (failed)", check.name)
+        }
+        (CheckObservation::Passed, GateDisposition::Skipped(_)) => {
+            format!("{} (gate skipped)", check.name)
+        }
+        (CheckObservation::Passed, GateDisposition::Required) => check.name.clone(),
+        (CheckObservation::NotRun(reason), GateDisposition::Skipped(_)) => {
+            format!("{} ({})", check.name, describe_not_run(*reason))
+        }
     }
+}
+
+fn describe_not_run(reason: NotRunReason) -> &'static str {
+    match reason {
+        NotRunReason::ToolMissing => "tool missing",
+        NotRunReason::EnvironmentUnavailable => "environment mismatch",
+        NotRunReason::VerificationIncomplete => "verification incomplete",
+        NotRunReason::DependencyUnavailable => "dependency unavailable",
+    }
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..revision.len().min(12)).unwrap_or(revision)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn check(name: &str, gating: bool, status: CheckStatus) -> CheckOutcome {
+    fn check(
+        name: &str,
+        kind: CheckKind,
+        gating: bool,
+        observation: CheckObservation,
+    ) -> CheckOutcome {
         CheckOutcome {
             name: name.to_string(),
-            kind: CheckKind::Build,
+            kind,
             gating,
-            status,
+            observation,
+            disposition: GateDisposition::Required,
+            execution: None,
             evidence: String::new(),
             failure: None,
             failed_tests: BTreeSet::new(),
         }
     }
 
-    #[test]
-    fn passes_when_gates_pass_and_scope_ok() {
-        let report = VerificationReport {
-            checks: vec![check("build", true, CheckStatus::Passed)],
-            scope_ok: true,
-            scope_violations: vec![],
-            baseline_failures: vec![],
-        };
-        assert!(report.passed());
-    }
-
-    #[test]
-    fn fails_when_a_gate_fails() {
-        let report = VerificationReport {
-            checks: vec![check("test", true, CheckStatus::Failed)],
-            scope_ok: true,
-            scope_violations: vec![],
-            baseline_failures: vec![],
-        };
-        assert!(!report.passed());
-        assert_eq!(report.failed_gates().len(), 1);
-    }
-
-    #[test]
-    fn non_gating_failure_does_not_block() {
-        let report = VerificationReport {
-            checks: vec![check("fmt", false, CheckStatus::Failed)],
-            scope_ok: true,
-            scope_violations: vec![],
-            baseline_failures: vec![],
-        };
-        assert!(report.passed());
-    }
-
-    #[test]
-    fn scope_violation_blocks_completion() {
-        let report = VerificationReport {
-            checks: vec![check("build", true, CheckStatus::Passed)],
-            scope_ok: false,
-            scope_violations: vec!["../evil.rs".into()],
-            baseline_failures: vec![],
-        };
-        assert!(!report.passed());
+    fn test_failure(name: &str, tests: &[&str]) -> CheckOutcome {
+        let mut outcome = check(name, CheckKind::Test, true, CheckObservation::Failed);
+        outcome.execution = Some(CheckExecution {
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            exit_code: Some(1),
+            timed_out: false,
+        });
+        outcome.failed_tests = tests.iter().map(|test| test.to_string()).collect();
+        outcome
     }
 
     fn report(checks: Vec<CheckOutcome>) -> VerificationReport {
@@ -300,72 +554,180 @@ mod tests {
             checks,
             scope_ok: true,
             scope_violations: vec![],
-            baseline_failures: vec![],
         }
     }
 
     #[test]
-    fn has_gating_checks_reflects_configured_gates_only() {
-        // No checks at all, or only non-gating checks → nothing to verify against.
-        assert!(!report(vec![]).has_gating_checks());
-        assert!(!report(vec![check("fmt", false, CheckStatus::Passed)]).has_gating_checks());
-        // At least one gating check → there is something to verify.
-        assert!(report(vec![check("build", true, CheckStatus::Passed)]).has_gating_checks());
-    }
-
-    #[test]
-    fn no_configured_gates_is_unverified_not_failed() {
-        // "Nothing configured" must be Unverified (a calm not-verified finish),
-        // never Failed — the caller routes it to the soft "not auto-verified" copy.
-        let r = report(vec![check("fmt", false, CheckStatus::Failed)]);
-        assert!(!r.has_gating_checks());
-        assert!(matches!(r.verdict(), Verdict::Unverified(_)));
-    }
-
-    #[test]
-    fn empty_plan_is_unverified() {
-        assert!(matches!(report(vec![]).verdict(), Verdict::Unverified(_)));
-    }
-
-    #[test]
-    fn non_gating_only_is_unverified() {
-        let r = report(vec![check("fmt", false, CheckStatus::Passed)]);
-        assert!(matches!(r.verdict(), Verdict::Unverified(_)));
-    }
-
-    /// The durable vocabulary is explicit, complete, and not Debug.
-    #[test]
-    fn the_durable_vocabulary_is_explicit_and_not_derived_from_debug() {
-        for (status, wire) in [
-            (CheckStatus::Passed, "passed"),
-            (CheckStatus::Failed, "failed"),
-            (CheckStatus::Skipped, "skipped"),
-            (CheckStatus::ToolMissing, "tool_missing"),
-            (
-                CheckStatus::EnvironmentUnavailable,
-                "environment_unavailable",
-            ),
-        ] {
-            assert_eq!(status.as_str(), wire, "{status:?}");
-            assert_eq!(CheckStatus::from_wire(wire), Some(status), "{wire}");
-        }
-        // The two the Debug-derived writer spelled without a separator, named
-        // so the mapper cannot be "simplified" back into a lowercase Debug
-        // without a test going red.
+    fn required_passes_verify_and_required_failures_gate() {
         assert_eq!(
-            format!("{:?}", CheckStatus::ToolMissing).to_lowercase(),
-            "toolmissing"
+            report(vec![check(
+                "build",
+                CheckKind::Build,
+                true,
+                CheckObservation::Passed
+            )])
+            .verdict(),
+            Verdict::Verified
         );
-        assert_ne!(CheckStatus::ToolMissing.as_str(), "toolmissing");
-        assert_ne!(
-            CheckStatus::EnvironmentUnavailable.as_str(),
-            "environmentunavailable"
+        let failed = report(vec![check(
+            "test",
+            CheckKind::Test,
+            true,
+            CheckObservation::Failed,
+        )]);
+        assert_eq!(failed.verdict(), Verdict::Failed);
+        assert_eq!(failed.failed_gates().len(), 1);
+    }
+
+    #[test]
+    fn non_gating_failure_does_not_block_but_does_not_invent_a_gate() {
+        let report = report(vec![check(
+            "fmt",
+            CheckKind::Format,
+            false,
+            CheckObservation::Failed,
+        )]);
+        assert!(report.passed());
+        assert!(!report.has_gating_checks());
+        assert!(matches!(report.verdict(), Verdict::Unverified(_)));
+    }
+
+    #[test]
+    fn scope_violation_blocks_completion() {
+        let mut report = report(vec![check(
+            "build",
+            CheckKind::Build,
+            true,
+            CheckObservation::Passed,
+        )]);
+        report.scope_ok = false;
+        report.scope_violations.push("../evil.rs".into());
+        assert_eq!(report.verdict(), Verdict::Failed);
+    }
+
+    #[test]
+    fn not_run_is_unverified_with_typed_reason() {
+        for reason in [
+            NotRunReason::ToolMissing,
+            NotRunReason::EnvironmentUnavailable,
+            NotRunReason::VerificationIncomplete,
+            NotRunReason::DependencyUnavailable,
+        ] {
+            let report = report(vec![check(
+                "test",
+                CheckKind::Test,
+                true,
+                CheckObservation::NotRun(reason),
+            )]);
+            assert!(report.passed());
+            match report.verdict() {
+                Verdict::Unverified(detail) => assert!(detail.contains(describe_not_run(reason))),
+                other => panic!("expected Unverified, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn grounded_test_baseline_failure_keeps_failed_observation_and_skips_gate() {
+        let revision = "0123456789abcdef";
+        let mut working = report(vec![test_failure("cargo test", &["a::flaky", "a::env"])]);
+        let base = report(vec![test_failure("cargo test", &["a::flaky", "a::env"])]);
+        working.attribute_baseline(&base, revision);
+
+        let check = &working.checks[0];
+        assert_eq!(check.observation, CheckObservation::Failed);
+        let (stored_revision, provenance) = check
+            .confirmed_baseline_failure()
+            .expect("baseline evidence is stored on the check");
+        assert_eq!(stored_revision, revision);
+        assert_eq!(provenance.source, BaselineSource::DetachedWorktreeRerun);
+        assert_eq!(provenance.failed_tests, base.checks[0].failed_tests);
+        assert!(working.failed_gates().is_empty());
+        assert_eq!(working.confirmed_baseline_failures().len(), 1);
+        match working.verdict() {
+            Verdict::Unverified(reason) => {
+                assert!(reason.contains("pre-existing test failure"));
+                assert!(!reason.contains("did not run"));
+            }
+            other => panic!("expected Unverified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_or_unparsed_test_failure_still_gates() {
+        let base = report(vec![test_failure("cargo test", &["a::flaky"])]);
+        let mut new_failure = report(vec![test_failure(
+            "cargo test",
+            &["a::flaky", "a::new_bug"],
+        )]);
+        new_failure.attribute_baseline(&base, "base");
+        assert_eq!(new_failure.verdict(), Verdict::Failed);
+
+        let mut unparsed = report(vec![test_failure("cargo test", &[])]);
+        unparsed.attribute_baseline(&report(vec![test_failure("cargo test", &[])]), "base");
+        assert_eq!(unparsed.verdict(), Verdict::Failed);
+    }
+
+    #[test]
+    fn baseline_attribution_requires_the_same_effective_command() {
+        let mut working = report(vec![test_failure("go test", &["TestSameName"])]);
+        let mut base = report(vec![test_failure("go test", &["TestSameName"])]);
+        working.checks[0].execution.as_mut().unwrap().args = vec!["./pkg/new/...".into()];
+        base.checks[0].execution.as_mut().unwrap().args = vec!["./...".into()];
+
+        working.attribute_baseline(&base, "base");
+
+        assert_eq!(working.verdict(), Verdict::Failed);
+        assert!(working.confirmed_baseline_failures().is_empty());
+    }
+
+    #[test]
+    fn non_test_exit_failure_is_never_baseline_confirmed() {
+        let mut working = report(vec![check(
+            "build",
+            CheckKind::Build,
+            true,
+            CheckObservation::Failed,
+        )]);
+        let base = working.clone();
+        working.attribute_baseline(&base, "base");
+        assert_eq!(working.verdict(), Verdict::Failed);
+        assert!(working.confirmed_baseline_failures().is_empty());
+        assert_eq!(working.checks[0].disposition, GateDisposition::Required);
+    }
+
+    #[test]
+    fn old_check_wire_deserializes_conservatively() {
+        let old = r#"{
+            "name":"test", "kind":"test", "gating":true,
+            "status":"skipped", "evidence":"", "failure":null,
+            "failed_tests":[]
+        }"#;
+        let check: CheckOutcome = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            check.observation,
+            CheckObservation::NotRun(NotRunReason::VerificationIncomplete)
+        );
+        assert_eq!(check.disposition, GateDisposition::Required);
+        assert!(check.execution.is_none());
+        assert!(check.confirmed_baseline_failure().is_none());
+    }
+
+    #[test]
+    fn typed_wire_round_trips_and_carries_legacy_projection() {
+        let check = test_failure("test", &["a"]);
+        let value = serde_json::to_value(&check).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert!(value.get("observation").is_some());
+        assert!(value.get("disposition").is_some());
+        assert_eq!(
+            serde_json::from_value::<CheckOutcome>(value).unwrap(),
+            check
         );
     }
 
-    /// Rows written before the explicit vocabulary still read back.
     #[test]
-    fn every_spelling_this_vocabulary_has_had_reads_back() {
+    fn legacy_status_vocabulary_remains_readable() {
         for (wire, status) in [
             ("passed", CheckStatus::Passed),
             ("failed", CheckStatus::Failed),
@@ -381,286 +743,7 @@ mod tests {
                 CheckStatus::EnvironmentUnavailable,
             ),
         ] {
-            assert_eq!(CheckStatus::from_wire(wire), Some(status), "{wire}");
+            assert_eq!(CheckStatus::from_wire(wire), Some(status));
         }
-        assert_eq!(CheckStatus::from_wire("nonsense"), None);
-        assert_eq!(CheckStatus::from_wire(""), None);
-    }
-
-    #[test]
-    fn all_skipped_gates_is_unverified() {
-        let r = report(vec![
-            check("build", true, CheckStatus::Skipped),
-            check("test", true, CheckStatus::Skipped),
-        ]);
-        assert!(matches!(r.verdict(), Verdict::Unverified(_)));
-    }
-
-    #[test]
-    fn tool_missing_gate_is_unverified_with_reason() {
-        let r = report(vec![check("tsc", true, CheckStatus::ToolMissing)]);
-        match r.verdict() {
-            Verdict::Unverified(reason) => assert!(reason.contains("tsc"), "reason: {reason}"),
-            other => panic!("expected Unverified, got {other:?}"),
-        }
-        // Unverified does not block completion.
-        assert!(r.passed());
-    }
-
-    /// R005 F-P1: a toolchain/MSRV mismatch gate must read as environment —
-    /// open gate (not Failed), honest Unverified reason naming the mismatch.
-    #[test]
-    fn environment_unavailable_gate_is_unverified_with_mismatch_reason() {
-        let r = report(vec![check(
-            "build",
-            true,
-            CheckStatus::EnvironmentUnavailable,
-        )]);
-        assert!(r.passed());
-        match r.verdict() {
-            Verdict::Unverified(reason) => assert!(
-                reason.contains("build (environment mismatch)"),
-                "reason: {reason}"
-            ),
-            other => panic!("expected Unverified, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn all_applicable_gates_passed_is_verified() {
-        let r = report(vec![
-            check("build", true, CheckStatus::Passed),
-            check("test", true, CheckStatus::Passed),
-            check("fmt", false, CheckStatus::Failed), // non-gating ignored
-        ]);
-        assert_eq!(r.verdict(), Verdict::Verified);
-    }
-
-    #[test]
-    fn one_passed_one_tool_missing_is_unverified() {
-        let r = report(vec![
-            check("build", true, CheckStatus::Passed),
-            check("tsc", true, CheckStatus::ToolMissing),
-        ]);
-        match r.verdict() {
-            Verdict::Unverified(reason) => {
-                assert!(reason.contains("tsc"), "reason: {reason}");
-            }
-            other => panic!("expected Unverified, got {other:?}"),
-        }
-        // Unverified does not block completion.
-        assert!(r.passed());
-    }
-
-    #[test]
-    fn one_passed_one_skipped_is_unverified() {
-        let r = report(vec![
-            check("build", true, CheckStatus::Passed),
-            check("test", true, CheckStatus::Skipped),
-        ]);
-        assert!(matches!(r.verdict(), Verdict::Unverified(_)));
-        assert!(r.passed());
-    }
-
-    #[test]
-    fn failed_gate_is_failed_verdict() {
-        let r = report(vec![
-            check("build", true, CheckStatus::Passed),
-            check("test", true, CheckStatus::Failed),
-        ]);
-        assert_eq!(r.verdict(), Verdict::Failed);
-    }
-
-    // ── Test-level baseline delta attribution (A) ────────────────────────
-
-    fn test_check(name: &str, status: CheckStatus, tests: &[&str]) -> CheckOutcome {
-        CheckOutcome {
-            name: name.to_string(),
-            kind: CheckKind::Test,
-            gating: true,
-            status,
-            evidence: String::new(),
-            failure: None,
-            failed_tests: tests.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn same_failing_tests_on_both_trees_are_pre_existing() {
-        // Whole-suite check red for the same tests on base and working → the
-        // change introduced nothing new → does not gate.
-        let mut working = report(vec![test_check(
-            "cargo test",
-            CheckStatus::Failed,
-            &["a::flaky", "a::env"],
-        )]);
-        let base = report(vec![test_check(
-            "cargo test",
-            CheckStatus::Failed,
-            &["a::flaky", "a::env"],
-        )]);
-        working.attribute_baseline(&base);
-        assert!(working.failed_gates().is_empty());
-        assert_ne!(working.verdict(), Verdict::Failed);
-    }
-
-    #[test]
-    fn a_new_failing_test_still_gates_even_if_others_pre_exist() {
-        // base is red for a::flaky; working is red for a::flaky AND a::new_bug.
-        // The whole check exit code is red on both, but the NEW test must gate.
-        let mut working = report(vec![test_check(
-            "cargo test",
-            CheckStatus::Failed,
-            &["a::flaky", "a::new_bug"],
-        )]);
-        let base = report(vec![test_check(
-            "cargo test",
-            CheckStatus::Failed,
-            &["a::flaky"],
-        )]);
-        working.attribute_baseline(&base);
-        let failed: Vec<&str> = working
-            .failed_gates()
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
-        assert_eq!(
-            failed,
-            vec!["cargo test"],
-            "new test failure must not be swallowed"
-        );
-        assert_eq!(working.verdict(), Verdict::Failed);
-    }
-
-    #[test]
-    fn failing_test_check_with_no_parsed_tests_never_suppressed() {
-        // A Test check that failed but yielded no parsed tests (e.g. the test
-        // target failed to COMPILE) cannot be proven pre-existing → still gates,
-        // even though the baseline also failed. Safety over convenience.
-        let mut working = report(vec![test_check("cargo test", CheckStatus::Failed, &[])]);
-        let base = report(vec![test_check("cargo test", CheckStatus::Failed, &[])]);
-        working.attribute_baseline(&base);
-        assert_eq!(working.failed_gates().len(), 1);
-        assert_eq!(working.verdict(), Verdict::Failed);
-    }
-
-    #[test]
-    fn non_test_check_uses_exit_code_baseline() {
-        // build has no test granularity: base build also red → pre-existing.
-        let mut working = report(vec![check("build", true, CheckStatus::Failed)]);
-        let base = report(vec![check("build", true, CheckStatus::Failed)]);
-        working.attribute_baseline(&base);
-        assert!(working.failed_gates().is_empty());
-    }
-
-    #[test]
-    fn failure_absent_from_baseline_is_new_and_gates() {
-        // base passed this check entirely → any working failure is the change's.
-        let mut working = report(vec![test_check(
-            "cargo test",
-            CheckStatus::Failed,
-            &["a::x"],
-        )]);
-        let base = report(vec![test_check("cargo test", CheckStatus::Passed, &[])]);
-        working.attribute_baseline(&base);
-        assert_eq!(working.failed_gates().len(), 1);
-        assert_eq!(working.verdict(), Verdict::Failed);
-    }
-
-    #[test]
-    fn scope_violation_is_failed_verdict() {
-        let r = VerificationReport {
-            checks: vec![check("build", true, CheckStatus::Passed)],
-            scope_ok: false,
-            scope_violations: vec!["../evil.rs".into()],
-            baseline_failures: vec![],
-        };
-        assert_eq!(r.verdict(), Verdict::Failed);
-    }
-
-    // ── Node: the same matrix, from the reporter's real output ──────────
-    //
-    // The report-level cases above hand-build `failed_tests`. These run the
-    // whole path — a failed check's captured output through the parser into
-    // attribution — because that is where the Node gap lived: the parser had
-    // no `node` arm, so the set was always empty and a pre-existing `node
-    // --test` failure could never be proven pre-existing (reconciliation
-    // residual 11, D5 reported `failed`).
-
-    /// A `node --test` run red for one test, as the spec reporter prints it.
-    const NODE_RED: &str = "\
-✖ subtraction is broken (0.397583ms)
-ℹ tests 1
-ℹ pass 0
-ℹ fail 1
-
-✖ failing tests:
-
-✖ subtraction is broken (0.397583ms)
-";
-
-    fn node_test_check(name: &str, status: CheckStatus, output: &str) -> CheckOutcome {
-        CheckOutcome {
-            name: name.to_string(),
-            kind: CheckKind::Test,
-            gating: true,
-            status,
-            evidence: output.to_string(),
-            failure: None,
-            failed_tests: crate::test_results::parse_node_failures(output),
-        }
-    }
-
-    #[test]
-    fn a_node_failure_already_red_on_the_baseline_is_pre_existing() {
-        // Case 3: `npm test` → `node --test`, red for the same test on both
-        // trees, change unrelated. It must stop gating.
-        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
-        let base = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
-        working.attribute_baseline(&base);
-        assert!(
-            working.failed_gates().is_empty(),
-            "a pre-existing node failure still gated: {:?}",
-            working.failed_gates()
-        );
-        // Not Failed (the change is not blamed) and not Verified either: the
-        // suite really is red, so the honest verdict is that no gating check
-        // produced evidence — `unavailable`, with the reason naming why.
-        match working.verdict() {
-            Verdict::Unverified(reason) => {
-                assert!(reason.contains("pre-existing failure"), "reason: {reason}");
-            }
-            other => panic!("expected Unverified(pre-existing), got {other:?}"),
-        }
-        assert!(
-            working.passed(),
-            "a pre-existing failure must not block completion"
-        );
-    }
-
-    #[test]
-    fn a_node_failure_the_baseline_did_not_have_is_a_regression() {
-        // Case 4: the baseline ran the same command and passed it.
-        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, NODE_RED)]);
-        let base = report(vec![node_test_check("test", CheckStatus::Passed, "")]);
-        working.attribute_baseline(&base);
-        assert_eq!(working.failed_gates().len(), 1);
-        assert_eq!(working.verdict(), Verdict::Failed);
-    }
-
-    #[test]
-    fn a_node_failure_with_unparsable_output_is_never_suppressed() {
-        // Case 5: a runner we do not recognize. No test-level evidence ⇒ the
-        // failure keeps gating even though the baseline was red too.
-        let opaque = "Tests: 1 failed\n";
-        let mut working = report(vec![node_test_check("test", CheckStatus::Failed, opaque)]);
-        let base = report(vec![node_test_check("test", CheckStatus::Failed, opaque)]);
-        working.attribute_baseline(&base);
-        assert_eq!(
-            working.failed_gates().len(),
-            1,
-            "unattributed must fail closed, not blame the baseline"
-        );
-        assert_eq!(working.verdict(), Verdict::Failed);
     }
 }

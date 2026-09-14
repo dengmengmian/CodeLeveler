@@ -62,6 +62,7 @@ fn opened() -> AppState {
                 mode: PermissionProfile::Assisted,
                 branch: Some("main".into()),
                 status: "idle".into(),
+                finalization_stage: None,
                 messages: Vec::new(),
                 pending_interactions: Vec::new(),
                 available_models: vec![
@@ -639,7 +640,7 @@ fn tui_trace_ignores_legacy_observability_loaded_without_query_id() {
     );
     assert!(
         s.trace.loaded.is_none(),
-        "1.5 uncorrelated payload must not populate a 1.6 /trace"
+        "1.5 uncorrelated payload must not populate a current /trace"
     );
 }
 

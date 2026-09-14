@@ -107,6 +107,7 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
                 status: SessionStatus::Failed,
                 state: AgentState::Failed,
                 goal: None,
+                warnings: Vec::new(),
             },
             &mut |_| {},
         )
@@ -196,6 +197,7 @@ async fn parallel_parent_finishes_through_the_engine() {
                 status: SessionStatus::Completed,
                 state: AgentState::Complete,
                 goal: None,
+                warnings: Vec::new(),
             },
             &mut |_| {},
         )

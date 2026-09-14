@@ -89,6 +89,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
             verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             stop: None,
+            warnings: Vec::new(),
         },
         &mut |_| {},
     )
@@ -103,6 +104,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
             verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             stop: None,
+            warnings: Vec::new(),
         }],
         "transient delta dropped; canonical completion recovered"
     );

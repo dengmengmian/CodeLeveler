@@ -42,6 +42,7 @@ fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
         mode: PermissionProfile::Assisted,
         branch: None,
         status: "idle".to_string(),
+        finalization_stage: None,
         messages: Vec::new(),
         pending_interactions: Vec::new(),
         available_models: Vec::new(),

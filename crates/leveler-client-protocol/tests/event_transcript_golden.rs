@@ -42,6 +42,7 @@ fn snapshot() -> UiSessionSnapshot {
         mode: PermissionProfile::RequestApproval,
         branch: Some("main".to_string()),
         status: "idle".to_string(),
+        finalization_stage: None,
         messages: vec![
             UiMessage {
                 id: MessageId::new("m_user_1"),
