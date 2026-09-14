@@ -92,10 +92,12 @@ class ChildAgent {
   /// The child's latest tool step while it runs.
   String recentStep = '';
 
+  bool cancelRequested = false;
+
   bool get isOpen => state != 'settled';
 
-  /// Only a running child has anything to stop.
-  bool get canCancel => state == 'running';
+  /// Only a running child has anything to stop, and only once.
+  bool get canCancel => state == 'running' && !cancelRequested;
 
   String get displayName => nickname.isEmpty ? id : nickname;
 
@@ -622,6 +624,15 @@ class SessionState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The user asked to stop this child. Kept until its terminal arrives, so
+  /// a second tap does not send a second command.
+  void noteCancelRequested(String childId) {
+    final child = children[childId];
+    if (child == null || !child.isOpen) return;
+    child.cancelRequested = true;
+    notifyListeners();
+  }
+
   void markResyncRequired() {
     needsResync = true;
     notifyListeners();
@@ -734,7 +745,13 @@ class SessionState extends ChangeNotifier {
   }
 
   void _upsertSubAgent(Map<String, dynamic> event) {
-    final id = event['id'] as String? ?? 'sub-${timeline.length}';
+    final id = event['id'] as String?;
+    if (id == null || id.isEmpty) {
+      // A child with no id cannot be shown truthfully or stopped; the view
+      // is missing something a snapshot will supply.
+      needsResync = true;
+      return;
+    }
     final child = children.putIfAbsent(id, () => ChildAgent(id));
     final done = event['done'] as bool? ?? false;
     if (!done && !child.isOpen) {
@@ -776,8 +793,17 @@ class SessionState extends ChangeNotifier {
       final restored = ChildAgent.fromSnapshot(entry as Map<String, dynamic>);
       final known = children[restored.id];
       if (known != null && !known.isOpen && restored.isOpen) continue;
-      if (known != null) restored.recentStep = known.recentStep;
+      if (known != null) {
+        restored
+          ..recentStep = known.recentStep
+          ..cancelRequested = known.cancelRequested;
+      }
       children[restored.id] = restored;
+    }
+    // The snapshot rebuilt the timeline from messages; the children's rows
+    // come from the merged record.
+    for (final child in children.values) {
+      _renderChildRow(child);
     }
   }
 

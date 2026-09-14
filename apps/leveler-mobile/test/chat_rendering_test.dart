@@ -150,6 +150,27 @@ void main() {
     expect(find.byType(MarkdownBody), findsOneWidget);
   });
 
+  testWidgets('a long host notice wraps instead of overflowing a phone-width row',
+      (tester) async {
+    // Seen on an iPhone simulator: a notice longer than the screen overflowed
+    // its divider row by 92px.
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final session = SessionState('s1')
+      ..applyEvent({
+        'type': 'notification',
+        'level': 'warning',
+        'message': '子 Agent Euclid 已结束或不存在,无需停止 — this notice is deliberately longer than a phone is wide',
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('无需停止'), findsOneWidget);
+  });
+
   testWidgets('a running turn labels the composer as a steer', (tester) async {
     final session = SessionState('s1')
       ..applyEvent({

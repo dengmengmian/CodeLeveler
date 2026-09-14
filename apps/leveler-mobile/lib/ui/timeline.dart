@@ -255,11 +255,17 @@ class _StatusLine extends StatelessWidget {
       child: Row(
         children: [
           Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            child: Text(
-              text,
-              style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.outline),
+          // Flexible: a notice can be longer than the screen is wide, and a
+          // fixed-width child in this row overflowed it.
+          Flexible(
+            flex: 6,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Text(
+                text,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.outline),
+              ),
             ),
           ),
           Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),

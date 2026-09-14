@@ -146,6 +146,33 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(lc["unattributed_child_mutations"], 1)
 
 
+class LegacyLogTests(unittest.TestCase):
+    """v0.2.0-beta.2 logs: no spec, scope appended to the task, no typed terminal."""
+
+    def test_a_legacy_scope_marker_in_the_task_is_the_admitted_scope(self):
+        con = fixture_db([
+            ("sub_agent_started", {"id": "w", "role": "worker", "read_only": False,
+                                   "task": "write notes\n[scope: pkg/a/NOTES.md, pkg/b]"}),
+            *_tool("w", "c1", "write_file", {"path": "pkg/a/NOTES.md", "content": "x"}),
+            *_tool("w", "c2", "write_file", {"path": "pkg/b/y.go", "content": "x"}),
+        ])
+        lc = child_lifecycle(con)
+        self.assertEqual(lc["ownership_violation"], 0)
+        self.assertEqual(lc["child_mutations"], {"w": ["pkg/a/NOTES.md", "pkg/b/y.go"]})
+
+    def test_the_same_call_id_in_parent_and_child_is_not_confused(self):
+        con = fixture_db([
+            _started("w", role="worker", files=["pkg/a"], read_only=False),
+            ("tool_call_started", {"agent_id": "w", "call_id": "functions.write:0", "name": "write_file",
+                                   "arguments": json.dumps({"path": "pkg/a/x.go", "content": "x"})}),
+            ("tool_call_started", {"call_id": "functions.write:0", "name": "write_file",
+                                   "arguments": json.dumps({"path": "b.go", "content": "x"})}),
+            ("tool_call_finished", {"agent_id": "w", "call_id": "functions.write:0", "name": "write_file",
+                                    "is_error": False}),
+        ])
+        self.assertEqual(child_lifecycle(con)["ownership_violation"], 0)
+
+
 class ParentUseTests(unittest.TestCase):
     def test_parent_rereads_of_what_a_child_already_read_are_counted(self):
         con = fixture_db([
@@ -156,8 +183,18 @@ class ParentUseTests(unittest.TestCase):
             ("tool_call_started", {"call_id": "p1", "name": "read_file", "arguments": json.dumps({"path": "a.go"})}),
         ])
         lc = child_lifecycle(con)
-        self.assertEqual(lc["child_read_paths"], 2)
-        self.assertEqual(lc["parent_rereads_after_child"], 1)
+        self.assertEqual(lc["child_reads"], {"e": ["a.go", "b.go"]})
+        self.assertEqual(lc["parent_rereads"], {"e": ["a.go"]})
+
+    def test_rereads_are_distinct_paths_per_child(self):
+        con = fixture_db([
+            _started("e"), *_tool("e", "c1", "read_file", {"path": "a.go"}), _finished("e"),
+            _started("f"), *_tool("f", "c2", "read_file", {"path": "z.go"}), _finished("f"),
+            ("tool_call_started", {"call_id": "p1", "name": "read_file", "arguments": json.dumps({"path": "a.go"})}),
+            ("tool_call_started", {"call_id": "p2", "name": "read_file", "arguments": json.dumps({"path": "./a.go"})}),
+        ])
+        lc = child_lifecycle(con)
+        self.assertEqual(lc["parent_rereads"], {"e": ["a.go"], "f": []})
 
 
 def _requests_db(rows, columns=True):

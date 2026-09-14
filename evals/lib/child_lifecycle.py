@@ -16,6 +16,9 @@ from typing import Any
 from spawn_metric import MUTATORS, event_rows
 
 COMPLETED_OUTCOMES = ("completed_with_findings", "completed_no_findings")
+# v0.2.0-beta.2 recorded no spawn spec; it appended the admitted files to the
+# child's task as a last line instead.
+LEGACY_SCOPE = re.compile(r"\n\[scope: ([^\]]*)\]\s*$")
 PATCH_HEADER = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
 
 
@@ -55,11 +58,16 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
         cid = p.get("id")
         if cid is None or cid in started:
             continue
-        spec = p.get("spec") or {}
+        spec = p.get("spec")
+        if isinstance(spec, dict):
+            files = [f for f in (spec.get("files") or []) if isinstance(f, str)]
+        else:
+            marker = LEGACY_SCOPE.search(str(p.get("task") or ""))
+            files = [f for f in marker.group(1).split(",") if f.strip()] if marker else []
         started[cid] = {
             "role": p.get("role"),
             "read_only": p.get("read_only"),
-            "scope": {_norm(f) for f in (spec.get("files") or []) if isinstance(f, str)},
+            "scope": {_norm(f) for f in files},
         }
 
     terminals: dict[str, list[dict[str, Any]]] = {}
@@ -102,10 +110,12 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
         if child is not None:
             child["scope"].update(_norm(x) for x in paths.split(",") if x.strip())
 
-    calls: dict[str, tuple[str, Any, Any, int]] = {}
+    # Keyed by (agent, call id): a provider that numbers calls per session
+    # can reuse an id across the parent and a child.
+    calls: dict[tuple[Any, str], tuple[str, Any, Any, int]] = {}
     for seq, p in event_rows(con, "tool_call_started"):
         if p.get("call_id"):
-            calls[p["call_id"]] = (p.get("name") or "", p.get("arguments"), p.get("agent_id"), seq)
+            calls[(p.get("agent_id"), p["call_id"])] = (p.get("name") or "", p.get("arguments"), p.get("agent_id"), seq)
 
     mutations: dict[str, list[str]] = {}
     violations: list[dict[str, str]] = []
@@ -115,7 +125,7 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
         name = p.get("name") or ""
         if agent is None or agent not in started or name not in MUTATORS or p.get("is_error"):
             continue
-        call = calls.get(p.get("call_id") or "")
+        call = calls.get((agent, p.get("call_id") or ""))
         paths = mutation_paths(name, call[1]) if call else []
         if not paths:
             unattributed += 1
@@ -126,17 +136,23 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
             if child["read_only"] or not _in_scope(path, child["scope"]):
                 violations.append({"child": agent, "path": path})
 
-    child_reads: set[str] = set()
-    parent_rereads = 0
-    first_finish = min(finished_at.values(), default=None)
-    for name, arguments, agent, seq in sorted(calls.values(), key=lambda c: c[3]):
+    # Distinct paths per child, and which of them the parent read again after
+    # that child settled.
+    child_reads: dict[str, set[str]] = {cid: set() for cid in started}
+    parent_reads_at: list[tuple[int, str]] = []
+    for name, arguments, agent, seq in calls.values():
         if name != "read_file":
             continue
         paths = mutation_paths(name, arguments)
         if agent in started:
-            child_reads.update(paths)
-        elif agent is None and first_finish is not None and seq > first_finish:
-            parent_rereads += sum(1 for path in paths if path in child_reads)
+            child_reads[agent].update(paths)
+        elif agent is None:
+            parent_reads_at.extend((seq, path) for path in paths)
+    parent_rereads = {
+        cid: sorted({path for seq, path in parent_reads_at
+                     if cid in finished_at and seq > finished_at[cid] and path in child_reads[cid]})
+        for cid in started
+    }
 
     return {
         "children": len(started),
@@ -154,8 +170,8 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
         "ownership_violations": violations,
         "unattributed_child_mutations": unattributed,
         "child_mutations": mutations,
-        "child_read_paths": len(child_reads),
-        "parent_rereads_after_child": parent_rereads,
+        "child_reads": {cid: sorted(paths) for cid, paths in child_reads.items()},
+        "parent_rereads": parent_rereads,
     }
 
 

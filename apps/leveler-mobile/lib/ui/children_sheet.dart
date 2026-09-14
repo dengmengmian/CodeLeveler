@@ -87,6 +87,11 @@ class _ChildTile extends StatelessWidget {
                   onPressed: () => onCancel(child.id),
                   child: const Text('停止'),
                 ),
+              )
+            else if (canControl && child.cancelRequested && child.isOpen)
+              ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 44),
+                child: const OutlinedButton(onPressed: null, child: Text('停止中…')),
               ),
           ],
         ),

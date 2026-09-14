@@ -70,6 +70,22 @@ void main() {
     expect(cancelled, ['c1']);
   });
 
+  testWidgets('a pressed stop turns into a disabled 停止中 until the child settles', (tester) async {
+    final session = _sessionWithChildren();
+    final cancelled = <String>[];
+    await tester.pumpWidget(_sheet(session, onCancel: (id) {
+      cancelled.add(id);
+      session.noteCancelRequested(id);
+    }));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(OutlinedButton, '停止'));
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(OutlinedButton, '停止'), findsNothing);
+    expect(find.text('停止中…'), findsOneWidget);
+    expect(cancelled, ['c1']);
+  });
+
   testWidgets('each child shows its recorded facts', (tester) async {
     await tester.pumpWidget(_sheet(_sessionWithChildren()));
     await tester.pumpAndSettle();

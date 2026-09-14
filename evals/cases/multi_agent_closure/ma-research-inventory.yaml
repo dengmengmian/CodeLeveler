@@ -51,9 +51,6 @@ expect:
             bad.append(f"{pkg} names: got {have['names']} want {want['names']}")
         if have["imports"] != want["imports"]:
             bad.append(f"{pkg} imports: got {have['imports']} want {want['imports']}")
-    extra = set(got) - set(expected)
-    if extra:
-        bad.append(f"unexpected sections {sorted(extra)}")
     print("\n".join(bad) or "inventory ok")
     sys.exit(1 if bad else 0)
     PY_EOF

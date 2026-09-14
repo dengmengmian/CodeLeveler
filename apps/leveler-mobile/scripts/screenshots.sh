@@ -82,7 +82,8 @@ sleep 1
 "$LEVELER" remote enroll >/dev/null
 HOST_FINGERPRINT="$("$LEVELER" remote status | sed -n 's/.*公钥指纹：//p')"
 
-printf '{"projects":["%s"],"aliases":{},"ignored":[]}' "$SCRATCH" > "$LEVELER_HOME/web-projects.json"
+mkdir -p "$LEVELER_HOME/state/web"
+printf '{"projects":["%s"],"aliases":{},"ignored":[]}' "$SCRATCH" > "$LEVELER_HOME/state/web/projects.json"
 "$LEVELER" --repo "$SCRATCH" serve > "$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
 "$LEVELER" remote agent > "$WORK/agent.log" 2>&1 &

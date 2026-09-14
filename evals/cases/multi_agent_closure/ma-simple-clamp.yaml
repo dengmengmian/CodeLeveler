@@ -15,4 +15,5 @@ expect:
   - -c
   - |
     set -euo pipefail
+    git diff --quiet HEAD -- '*_test.go'
     go test ./...

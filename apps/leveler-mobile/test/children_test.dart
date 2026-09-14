@@ -195,6 +195,34 @@ void main() {
     });
   });
 
+  group('review follow-ups', () {
+    test('an update without an id marks the view stale instead of inventing a child', () {
+      final state = SessionState('s1')
+        ..applyEvent({'type': 'sub_agent_updated', 'nickname': 'E', 'role': 'explorer', 'done': false, 'ok': false, 'detail': 'x'});
+      expect(state.children, isEmpty);
+      expect(state.timeline, isEmpty);
+      expect(state.needsResync, isTrue);
+    });
+
+    test('a snapshot draws a row for each child it restores', () {
+      final state = SessionState('s1')
+        ..applySnapshot(_snapshot(
+          messages: [{'id': 'm1', 'role': 'user', 'text': 'go'}],
+          children: [_child('w1', 'running')],
+        ));
+      expect(state.timeline.map((item) => item.kind), [TimelineKind.user, TimelineKind.subAgent]);
+    });
+
+    test('a stop request is remembered until the child settles', () {
+      final state = SessionState('s1')..applyEvent(_started('c1'));
+      state.noteCancelRequested('c1');
+      expect(state.children['c1']!.cancelRequested, isTrue);
+      expect(state.children['c1']!.canCancel, isFalse);
+      state.applyEvent(_finished('c1', outcome: 'incomplete_no_result', stop: 'cancelled'));
+      expect(state.children['c1']!.statusLabel, '无结果 · 已取消');
+    });
+  });
+
   test('cancel_child matches the host schema', () {
     expect(Commands.cancelChild(sessionId: 's1', childId: 'c1'), {
       'type': 'cancel_child',

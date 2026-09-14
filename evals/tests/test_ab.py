@@ -12,8 +12,8 @@ def _lifecycle(**over):
         "children": 0, "by_outcome": {}, "by_stop": {}, "child_success": 0, "child_partial": 0,
         "untyped_terminals": 0, "lost_accepted_child": 0, "duplicate_settlement": 0, "open_orphan": 0,
         "interrupted": 0, "resumed": 0, "ownership_violation": 0, "ownership_violations": [],
-        "unattributed_child_mutations": 0, "child_mutations": {}, "child_read_paths": 0,
-        "parent_rereads_after_child": 0,
+        "unattributed_child_mutations": 0, "child_mutations": {}, "child_reads": {},
+        "parent_rereads": {},
     }
     base.update(over)
     return base
@@ -88,7 +88,7 @@ class UsefulDelegationTests(unittest.TestCase):
         j = judge_run(_run(
             children=[{"id": "e", "role": "explorer", "read_only": True}],
             child_terminals={"e": {"outcome": "completed_with_findings", "stop": "completed"}},
-            lifecycle=_lifecycle(children=1, child_success=1, child_read_paths=4, parent_rereads_after_child=1),
+            lifecycle=_lifecycle(children=1, child_reads={"e": ["a", "b", "c", "d"]}, parent_rereads={"e": ["a"]}),
         ))
         self.assertEqual(j["useful_children"], {"e": "evidence_not_redone"})
 
@@ -96,7 +96,7 @@ class UsefulDelegationTests(unittest.TestCase):
         j = judge_run(_run(
             children=[{"id": "e", "role": "explorer", "read_only": True}],
             child_terminals={"e": {"outcome": "completed_with_findings", "stop": "completed"}},
-            lifecycle=_lifecycle(children=1, child_success=1, child_read_paths=2, parent_rereads_after_child=2),
+            lifecycle=_lifecycle(children=1, child_reads={"e": ["a", "b"]}, parent_rereads={"e": ["a", "b"]}),
         ))
         self.assertEqual(j["useful_children"], {})
 
@@ -120,6 +120,51 @@ class UsefulDelegationTests(unittest.TestCase):
         self.assertTrue(j["unnecessary_delegation"])
 
 
+class UnknownIsNotZeroTests(unittest.TestCase):
+    def test_an_untyped_terminal_leaves_usefulness_unknown(self):
+        j = judge_run(_run(
+            children=[{"id": "w", "role": "worker", "read_only": False}],
+            child_terminals={"w": {"outcome": None, "stop": None, "ok": True}},
+        ))
+        self.assertTrue(j["delegated"])
+        self.assertIsNone(j["useful_delegation"])
+        self.assertIsNone(j["unnecessary_delegation"])
+
+    def test_a_run_without_a_record_is_listed_not_counted(self):
+        broken = judge_run({"case": "c", "category": "SIMPLE", "arm": "a", "rep": 0,
+                            "expect_pass": False, "error": "no session database"})
+        self.assertIsNone(broken["delegated"])
+        agg = aggregate([judge_run(_run()), broken])
+        self.assertEqual(agg["n"], 1)
+        self.assertEqual(agg["errored_runs"], 1)
+
+    def test_child_rates_skip_reviewers_and_are_unknown_with_untyped_terminals(self):
+        typed = judge_run(_run(
+            children=[{"id": "w", "role": "worker", "read_only": False},
+                      {"id": "r", "role": "reviewer", "read_only": True}],
+            child_terminals={"w": {"outcome": "incomplete_partial", "stop": "budget"},
+                             "r": {"outcome": "completed_no_findings", "stop": "completed"}},
+        ))
+        agg = aggregate([typed])
+        self.assertEqual(agg["children_total"], 1)
+        self.assertEqual(agg["child_success_rate"], 0.0)
+        self.assertEqual(agg["child_partial_rate"], 1.0)
+        legacy = judge_run(_run(children=[{"id": "w", "role": "worker", "read_only": False}],
+                                child_terminals={"w": {"outcome": None, "stop": None, "ok": True}}))
+        agg = aggregate([legacy])
+        self.assertIsNone(agg["child_success_rate"])
+        self.assertEqual(agg["untyped_terminals"], 1)
+
+    def test_missing_usage_is_unknown_not_zero(self):
+        run = judge_run(_run(usage={"requests": 3, "input_tokens": 10, "output_tokens": 1,
+                                    "cached_input_tokens": None, "cost_usd_micros": None,
+                                    "unpriced_requests": None}))
+        agg = aggregate([run])
+        self.assertIsNone(agg["cached_input_tokens_total"])
+        self.assertIsNone(agg["unpriced_requests"])
+        self.assertEqual(agg["requests_mean"], 3.0)
+
+
 class AggregateTests(unittest.TestCase):
     def test_rates_totals_and_unknown_cost(self):
         runs = [judge_run(_run()), judge_run(_run(expect_pass=False, wall_s=300.0,
@@ -137,8 +182,14 @@ class AggregateTests(unittest.TestCase):
         self.assertIsNone(agg["useful_delegation_rate"])
 
     def test_child_rates_use_children_as_the_denominator(self):
-        run = judge_run(_run(lifecycle=_lifecycle(children=4, child_success=2, child_partial=1, open_orphan=1)))
+        run = judge_run(_run(
+            children=[{"id": k, "role": "explorer", "read_only": True} for k in "abcd"],
+            child_terminals={"a": {"outcome": "completed_with_findings", "stop": "completed"},
+                             "b": {"outcome": "completed_no_findings", "stop": "completed"},
+                             "c": {"outcome": "incomplete_partial", "stop": "budget"}},
+            lifecycle=_lifecycle(children=4, open_orphan=1)))
         agg = aggregate([run])
+        self.assertEqual(agg["children_total"], 4)
         self.assertEqual(agg["child_success_rate"], 0.5)
         self.assertEqual(agg["child_partial_rate"], 0.25)
         self.assertEqual(agg["open_orphan_total"], 1)

@@ -42,7 +42,10 @@ for binary in "$LEVELER" "$RELAY"; do
   [[ -x "$binary" ]] || { echo "缺少 ${binary}，先跑 cargo build -p leveler-cli -p leveler-relay" >&2; exit 1; }
 done
 
-WORK="$(mktemp -d)"
+# Under /tmp, not the per-user temp dir: the daemon's Unix socket lives inside
+# LEVELER_HOME, and a /var/folders/... prefix pushes its path past SUN_LEN, so
+# `serve` dies before any project comes online.
+WORK="$(mktemp -d /tmp/leveler-sim.XXXXXX)"
 export LEVELER_HOME="$WORK/.leveler"
 mkdir -p "$LEVELER_HOME"
 XCCONFIG_BACKUP="$WORK/Generated.xcconfig.orig"
@@ -75,7 +78,7 @@ cleanup() {
     # Per-frame record of what the agent admitted or refused: when a phone's
     # message seems to vanish, this is the only place that says which.
     echo "== 远程审计 =="
-    tail -12 "$LEVELER_HOME"/remote/audit/*.jsonl 2>/dev/null || true
+    tail -12 "$LEVELER_HOME"/state/remote/audit/*.jsonl 2>/dev/null || true
   fi
   for pid in "${SERVE_PID:-}" "${SERVE_B_PID:-}" "${AGENT_PID:-}" "${RELAY_PID:-}" "${PROVIDER_PID:-}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
@@ -167,8 +170,9 @@ echo "本机指纹: $HOST_FINGERPRINT"
 # list, which leaves the session stream — the part that needs an authorized
 # WebSocket — untested; it was broken that way once already.
 echo "== 打开两个项目 =="
+mkdir -p "$LEVELER_HOME/state/web"
 printf '{"projects":["%s","%s"],"aliases":{},"ignored":[]}' "$SCRATCH" "$SCRATCH_B" \
-  > "$LEVELER_HOME/web-projects.json"
+  > "$LEVELER_HOME/state/web/projects.json"
 "$LEVELER" --repo "$SCRATCH" serve > "$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
 "$LEVELER" --repo "$SCRATCH_B" serve > "$WORK/serve-b.log" 2>&1 &

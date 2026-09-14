@@ -125,7 +125,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     builder: (_) => ChildrenSheet(
                       session: session,
                       canControl: !controller.isObserveOnly,
-                      onCancel: controller.cancelChild,
+                      onCancel: (childId) {
+                        session.noteCancelRequested(childId);
+                        controller.cancelChild(childId);
+                      },
                     ),
                   ),
                 ),
