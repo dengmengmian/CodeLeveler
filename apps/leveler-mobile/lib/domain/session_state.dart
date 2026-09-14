@@ -59,6 +59,103 @@ class TimelineItem {
   bool? ok;
 }
 
+/// One delegated child, as the runtime recorded it.
+///
+/// Every field is a fact from the host — the snapshot's `children` or a typed
+/// live event. The status line is built from `state`, `outcome` and `stop`;
+/// nothing here reads a child's prose to decide how it ended.
+class ChildAgent {
+  ChildAgent(this.id);
+
+  final String id;
+  String nickname = '';
+  String role = '';
+  String? profileId;
+  bool readOnly = false;
+  String purpose = '';
+
+  /// `running`, `interrupted` or `settled`. Only `settled` is final.
+  String state = 'running';
+  bool ok = false;
+  String? outcome;
+  String? stop;
+  String? summary;
+  bool? background;
+  List<String> scope = const [];
+  int resumes = 0;
+  int inputTokens = 0;
+  int outputTokens = 0;
+
+  /// Unknown, not zero, when no request carried a price.
+  int? costUsdMicros;
+
+  /// The child's latest tool step while it runs.
+  String recentStep = '';
+
+  bool get isOpen => state != 'settled';
+
+  /// Only a running child has anything to stop.
+  bool get canCancel => state == 'running';
+
+  String get displayName => nickname.isEmpty ? id : nickname;
+
+  String get statusLabel {
+    switch (state) {
+      case 'running':
+        return '运行中';
+      case 'interrupted':
+        return '已中断';
+    }
+    final result = switch (outcome) {
+      'completed_with_findings' => '已完成 · 有发现',
+      'completed_no_findings' => '已完成 · 无发现',
+      'incomplete_partial' => '部分结果',
+      'incomplete_no_result' => '无结果',
+      _ => null,
+    };
+    // Settled before outcomes were typed: the ok bit is all the record has.
+    if (result == null) return ok ? '已完成' : '失败';
+    final ending = switch (stop) {
+      'budget' => '预算耗尽',
+      'cancelled' => '已取消',
+      'lost' => '已丢失',
+      'failed' => '失败',
+      'incomplete' => '未完成',
+      _ => null,
+    };
+    return ending == null ? result : '$result · $ending';
+  }
+
+  void _settle({required bool ok, String? outcome, String? stop, String? summary}) {
+    state = 'settled';
+    this.ok = ok;
+    this.outcome = outcome;
+    this.stop = stop;
+    if (summary != null && summary.isNotEmpty) this.summary = summary;
+  }
+
+  static ChildAgent fromSnapshot(Map<String, dynamic> json) {
+    final child = ChildAgent(json['id'] as String? ?? '')
+      ..nickname = json['nickname'] as String? ?? ''
+      ..role = json['role'] as String? ?? ''
+      ..profileId = json['profile_id'] as String?
+      ..readOnly = json['read_only'] as bool? ?? false
+      ..purpose = json['purpose'] as String? ?? ''
+      ..state = json['state'] as String? ?? 'running'
+      ..ok = json['ok'] as bool? ?? false
+      ..outcome = json['outcome'] as String?
+      ..stop = json['stop'] as String?
+      ..summary = json['summary'] as String?
+      ..background = json['background'] as bool?
+      ..scope = (json['scope'] as List<dynamic>? ?? const []).map((path) => '$path').toList()
+      ..resumes = (json['resumes'] as num?)?.toInt() ?? 0
+      ..inputTokens = (json['input_tokens'] as num?)?.toInt() ?? 0
+      ..outputTokens = (json['output_tokens'] as num?)?.toInt() ?? 0
+      ..costUsdMicros = (json['cost_usd_micros'] as num?)?.toInt();
+    return child;
+  }
+}
+
 /// An approval the host is waiting on.
 class PendingApproval {
   PendingApproval({
@@ -129,6 +226,16 @@ class SessionState extends ChangeNotifier {
   final Map<String, PendingApproval> approvals = {};
   final Map<String, PendingClarification> clarifications = {};
 
+  /// Every child of this session, in the order the phone first learned of it.
+  final Map<String, ChildAgent> children = {};
+
+  List<ChildAgent> get openChildren =>
+      children.values.where((child) => child.isOpen).toList(growable: false);
+
+  /// `spawn_agent` calls on the wire. An accepted one is shown by its child
+  /// row; only a refusal, which has no child, is shown as a tool result.
+  final Set<String> _spawnCalls = {};
+
   String status = 'idle';
   String? activity;
   bool sawPlan = false;
@@ -162,7 +269,11 @@ class SessionState extends ChangeNotifier {
       final message = raw as Map<String, dynamic>;
       return TranscriptEntry(
         id: message['id'] as String? ?? '',
-        role: message['role'] as String? ?? 'assistant',
+        // A notice the runtime wrote into the model's context as a user turn.
+        // Its role says `user`; its kind says nobody typed it.
+        role: message['kind'] == 'runtime_notice'
+            ? 'notice'
+            : message['role'] as String? ?? 'assistant',
         // `text`, which is what the type calls it. Reading `content`
         // produced a transcript of empty bubbles that looked like the
         // host had said nothing.
@@ -175,6 +286,7 @@ class SessionState extends ChangeNotifier {
     timeline
       ..clear()
       ..addAll(messages.map(_itemFromMessage));
+    _restoreChildren(session['children'] as List<dynamic>?);
     artifacts.clear();
     status = session['status'] as String? ?? status;
     goal = session['goal'] as String? ?? goal;
@@ -266,6 +378,10 @@ class SessionState extends ChangeNotifier {
         sawTool = true;
         final name = event['name'] as String? ?? 'tool';
         activity = name;
+        if (name == 'spawn_agent') {
+          _spawnCalls.add('${event['id']}');
+          break;
+        }
         timeline.add(TimelineItem(
           id: '${event['id'] ?? timeline.length}-start',
           kind: TimelineKind.tool,
@@ -274,12 +390,14 @@ class SessionState extends ChangeNotifier {
         ));
       case 'tool_call_completed':
         activity = null;
+        final ok = event['ok'] as bool? ?? true;
+        if (_spawnCalls.remove('${event['id']}') && ok) break;
         timeline.add(TimelineItem(
           id: '${event['id'] ?? timeline.length}-done',
           kind: TimelineKind.toolResult,
-          title: (event['ok'] as bool? ?? true) ? '完成' : '失败',
+          title: ok ? '完成' : '失败',
           detail: event['preview'] as String? ?? '',
-          ok: event['ok'] as bool? ?? true,
+          ok: ok,
         ));
       case 'plan_updated':
         sawPlan = true;
@@ -316,17 +434,35 @@ class SessionState extends ChangeNotifier {
         }
       case 'sub_agent_updated':
         _upsertSubAgent(event);
+      case 'sub_agent_state_changed':
+        final child = children[event['id'] as String? ?? ''];
+        if (child == null) {
+          // A child this view never learned of: the view is incomplete, and
+          // inventing a nameless row would not fix that.
+          needsResync = true;
+        } else if (child.isOpen) {
+          child.state = event['state'] as String? ?? child.state;
+          _renderChildRow(child);
+        }
       case 'sub_agent_progress':
       case 'sub_agent_activity':
         // Heartbeats on the same row. A progress event with no started
         // sub-agent is not a reason to invent one.
         final id = event['id'] as String? ?? '';
+        final child = children[id];
         final row = _timelineById('sub-$id');
-        if (row != null && event['type'] == 'sub_agent_activity') {
+        if (event['type'] == 'sub_agent_progress') {
+          if (child != null) {
+            child.inputTokens = (event['input_tokens'] as num?)?.toInt() ?? child.inputTokens;
+            child.outputTokens = (event['output_tokens'] as num?)?.toInt() ?? child.outputTokens;
+          }
+        } else {
           final tool = event['tool'] as String? ?? '';
           final preview = event['preview'] as String? ?? '';
           if (tool.isNotEmpty) {
-            row.detail = preview.isEmpty ? tool : '$tool · $preview';
+            final step = preview.isEmpty ? tool : '$tool · $preview';
+            child?.recentStep = step;
+            if (row != null && (child == null || child.isOpen)) row.detail = step;
           }
         }
       case 'verification_updated':
@@ -505,11 +641,23 @@ class SessionState extends ChangeNotifier {
     return null;
   }
 
-  static TimelineItem _itemFromMessage(TranscriptEntry entry) => TimelineItem(
-        id: entry.id,
-        kind: entry.role == 'user' ? TimelineKind.user : TimelineKind.assistant,
-        detail: entry.text,
-      );
+  static TimelineItem _itemFromMessage(TranscriptEntry entry) => switch (entry.role) {
+        'user' => TimelineItem(id: entry.id, kind: TimelineKind.user, detail: entry.text),
+        'notice' => TimelineItem(
+            id: entry.id,
+            kind: TimelineKind.notice,
+            title: _noticeTitle(entry.text),
+            detail: entry.text,
+          ),
+        _ => TimelineItem(id: entry.id, kind: TimelineKind.assistant, detail: entry.text),
+      };
+
+  /// The registered header line a runtime notice opens with, without its
+  /// Markdown marker.
+  static String _noticeTitle(String text) {
+    final first = text.split('\n').first.trim();
+    return first.replaceFirst(RegExp(r'^#+\s*'), '');
+  }
 
   static String _toolTitle(String name) => switch (name) {
         'read_file' || 'read' => '读取文件',
@@ -587,28 +735,73 @@ class SessionState extends ChangeNotifier {
 
   void _upsertSubAgent(Map<String, dynamic> event) {
     final id = event['id'] as String? ?? 'sub-${timeline.length}';
-    final nickname = event['nickname'] as String? ?? '';
-    final role = event['role'] as String? ?? '';
+    final child = children.putIfAbsent(id, () => ChildAgent(id));
     final done = event['done'] as bool? ?? false;
-    final ok = event['ok'] as bool? ?? false;
+    if (!done && !child.isOpen) {
+      // A settled child is final; a late or replayed start does not reopen it.
+      _renderChildRow(child);
+      return;
+    }
+    child
+      ..nickname = event['nickname'] as String? ?? child.nickname
+      ..role = event['role'] as String? ?? child.role
+      ..profileId = event['profile_id'] as String? ?? child.profileId
+      ..readOnly = event['read_only'] as bool? ?? child.readOnly;
+    final background = event['background'] as bool?;
+    if (background != null) child.background = background;
+    final scope = event['scope'] as List<dynamic>?;
+    if (scope != null) child.scope = scope.map((path) => '$path').toList();
     final detail = event['detail'] as String? ?? '';
-    final who = nickname.isEmpty ? id : nickname;
-    final title = role.isEmpty ? '子 Agent $who' : '子 Agent $who · $role';
-    final status = done ? (ok ? '已完成' : '失败') : '运行中';
-    final body = detail.isEmpty ? status : '$status\n$detail';
-    final existing = _timelineById('sub-$id');
+    if (done) {
+      child._settle(
+        ok: event['ok'] as bool? ?? false,
+        outcome: event['outcome'] as String?,
+        stop: event['stop'] as String?,
+        summary: detail,
+      );
+    } else {
+      child.state = 'running';
+      if (detail.isNotEmpty) child.purpose = detail;
+    }
+    _renderChildRow(child);
+  }
+
+  /// Merge the host's durable children into what this view already has.
+  ///
+  /// The snapshot is older than any event that arrived after it was taken, so
+  /// it never reopens a child this view saw settle, and a child started after
+  /// it keeps its row.
+  void _restoreChildren(List<dynamic>? raw) {
+    for (final entry in raw ?? const []) {
+      final restored = ChildAgent.fromSnapshot(entry as Map<String, dynamic>);
+      final known = children[restored.id];
+      if (known != null && !known.isOpen && restored.isOpen) continue;
+      if (known != null) restored.recentStep = known.recentStep;
+      children[restored.id] = restored;
+    }
+  }
+
+  void _renderChildRow(ChildAgent child) {
+    final title = child.role.isEmpty
+        ? '子 Agent ${child.displayName}'
+        : '子 Agent ${child.displayName} · ${child.role}';
+    final text = child.isOpen ? child.purpose : (child.summary ?? '');
+    final body = text.isEmpty ? child.statusLabel : '${child.statusLabel}\n$text';
+    final ok = child.isOpen ? null : child.ok;
+    final existing = _timelineById('sub-${child.id}');
     if (existing == null) {
       timeline.add(TimelineItem(
-        id: 'sub-$id',
+        id: 'sub-${child.id}',
         kind: TimelineKind.subAgent,
         title: title,
         detail: body,
-        ok: done ? ok : null,
+        ok: ok,
       ));
     } else {
-      existing.title = title;
-      existing.detail = body;
-      existing.ok = done ? ok : null;
+      existing
+        ..title = title
+        ..detail = body
+        ..ok = ok;
     }
   }
 

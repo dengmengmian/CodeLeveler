@@ -79,6 +79,10 @@ class Commands {
   static Map<String, dynamic> cancelCurrentTurn(String sessionId) =>
       {'type': 'cancel_current_turn', 'session_id': sessionId};
 
+  /// Stop one running child. Its parent turn keeps running.
+  static Map<String, dynamic> cancelChild({required String sessionId, required String childId}) =>
+      {'type': 'cancel_child', 'session_id': sessionId, 'child_id': childId};
+
   static Map<String, dynamic> approvalDecision({
     required String requestId,
     required ApprovalChoice decision,

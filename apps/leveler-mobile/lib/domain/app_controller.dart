@@ -634,6 +634,13 @@ class AppController extends ChangeNotifier {
     await _deliver(Commands.cancelCurrentTurn(current.sessionId));
   }
 
+  /// Stop one running child; its parent turn keeps running.
+  Future<void> cancelChild(String childId) async {
+    final current = session;
+    if (current == null) return;
+    await _deliver(Commands.cancelChild(sessionId: current.sessionId, childId: childId));
+  }
+
   Future<void> answerApproval(String requestId, ApprovalChoice choice) =>
       _deliver(Commands.approvalDecision(requestId: requestId, decision: choice));
 

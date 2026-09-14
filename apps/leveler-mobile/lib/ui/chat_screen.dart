@@ -17,6 +17,7 @@ import '../domain/app_controller.dart';
 import '../domain/artifact.dart';
 import '../domain/session_state.dart';
 import 'artifact_preview.dart';
+import 'children_sheet.dart';
 import 'common.dart';
 import '../protocol/commands.dart';
 import 'task_detail_screen.dart';
@@ -114,6 +115,20 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               ),
+              if (session.children.isNotEmpty)
+                _ChildrenStrip(
+                  session: session,
+                  onOpen: () => showModalBottomSheet<void>(
+                    context: context,
+                    isScrollControlled: true,
+                    showDragHandle: true,
+                    builder: (_) => ChildrenSheet(
+                      session: session,
+                      canControl: !controller.isObserveOnly,
+                      onCancel: controller.cancelChild,
+                    ),
+                  ),
+                ),
               if (session.needsResync)
                 const Material(
                   child: Padding(
@@ -167,6 +182,37 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+/// One line saying how many children this session has and how many are still
+/// open. Tapping it lists them.
+class _ChildrenStrip extends StatelessWidget {
+  const _ChildrenStrip({required this.session, required this.onOpen});
+  final SessionState session;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final open = session.openChildren.length;
+    final total = session.children.length;
+    final label = open == 0 ? '子 Agent · 共 $total' : '子 Agent · $open 未结束 · 共 $total';
+    return Material(
+      child: InkWell(
+        onTap: onOpen,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              const Icon(Icons.hub_outlined, size: 16),
+              const SizedBox(width: 8),
+              Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+              const Icon(Icons.chevron_right, size: 18),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

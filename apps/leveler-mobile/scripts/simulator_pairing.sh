@@ -14,6 +14,12 @@
 # Usage:  ./scripts/simulator_pairing.sh <device-udid>
 #         (build the host binaries first: cargo build -p leveler-cli -p leveler-relay)
 #
+# A journey that needs a real model (children_test: a child's rounds go
+# through the same provider as its parent) runs with a real config instead of
+# the scripted one, and only that journey:
+#
+#     HOST_CONFIG=~/.leveler/config.toml JOURNEYS=children_test ./scripts/simulator_pairing.sh <udid>
+#
 # Works against a real iPhone too, with one difference that matters: a phone is
 # not this machine, so it cannot reach 127.0.0.1. Give it the address the phone
 # can dial and make sure both are on the same Wi-Fi:
@@ -98,10 +104,20 @@ for repo in "$SCRATCH" "$SCRATCH_B"; do
   mkdir -p "$repo"
   git -C "$repo" init -q .
   echo "临时文件，供验收删除" > "$repo/scratch.txt"
+  # Enough files that a child reading one per round is still running when the
+  # phone gets to its stop button.
+  mkdir -p "$repo/notes"
+  for n in $(seq -w 1 16); do
+    printf 'Note %s: the ingest step keeps record order %s.\n' "$n" "$n" > "$repo/notes/note-$n.md"
+  done
   git -C "$repo" add -A
   git -C "$repo" -c user.email=acceptance@local -c user.name=acceptance commit -qm "scratch"
 done
 
+if [[ -n "${HOST_CONFIG:-}" ]]; then
+  echo "== 真实模型配置 =="
+  cp "$HOST_CONFIG" "$LEVELER_HOME/config.toml"
+else
 echo "== 脚本化模型 =="
 python3 "$REPO/apps/leveler-mobile/scripts/scripted_provider.py" "$PROVIDER_PORT" > "$WORK/provider.log" 2>&1 &
 PROVIDER_PID=$!
@@ -121,6 +137,7 @@ max_output_tokens = 4096
 streaming = true
 tool_calling = true
 EOF
+fi
 
 echo "== relay =="
 LEVELER_RELAY_BIND="$RELAY_BIND:$PORT" "$RELAY" > "$WORK/relay.log" 2>&1 &
@@ -247,6 +264,18 @@ run_journey() {
 }
 
 cd "$REPO/apps/leveler-mobile"
+if [[ -n "${JOURNEYS:-}" ]]; then
+  RESULT=0
+  for journey in $JOURNEYS; do
+    set +e
+    run_journey "$journey"
+    RESULT=$?
+    set -e
+    [[ $RESULT -ne 0 ]] && break
+  done
+  exit $RESULT
+fi
+
 RESULT=0
 for journey in pairing_flow_test multi_project_test; do
   set +e
