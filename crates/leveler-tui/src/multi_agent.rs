@@ -19,6 +19,9 @@ pub enum ChildStatus {
     /// Its activation died with a runtime window; the runtime continues it or
     /// settles it as lost. Not running, not finished.
     Interrupted,
+    /// Its turn ended and no terminal reached this view. The UI holds no fact
+    /// about how it ended; a later terminal or snapshot says.
+    Unreported,
     Completed,
     Failed,
 }
@@ -272,19 +275,35 @@ impl TaskTeamView {
                     Some(
                         ChildOutcome::CompletedWithFindings | ChildOutcome::CompletedNoFindings,
                     ) => ChildStatus::Completed,
-                    _ => ChildStatus::Failed,
+                    Some(_) => ChildStatus::Failed,
+                    // Settled before the outcome was typed: only the ok bit.
+                    None if recorded.ok => ChildStatus::Completed,
+                    None => ChildStatus::Failed,
                 },
             };
             let input = u32::try_from(recorded.input_tokens).unwrap_or(u32::MAX);
             let output = u32::try_from(recorded.output_tokens).unwrap_or(u32::MAX);
             if let Some(existing) = self.children.iter_mut().find(|c| c.id == recorded.id) {
-                // A live Running is finer than the record's Running.
-                if !(status == ChildStatus::Waiting && existing.status == ChildStatus::Running) {
+                // A terminal already applied is final: a snapshot taken before
+                // it still says running and must not reopen the child. And a
+                // live Running is finer than the record's Running.
+                let settled_here = matches!(
+                    existing.status,
+                    ChildStatus::Completed | ChildStatus::Failed
+                );
+                let finer_live =
+                    status == ChildStatus::Waiting && existing.status == ChildStatus::Running;
+                if !settled_here && !finer_live {
                     existing.status = status;
+                    existing.stop = recorded.stop;
                 }
-                existing.stop = recorded.stop;
                 existing.input_tokens = existing.input_tokens.max(input);
                 existing.output_tokens = existing.output_tokens.max(output);
+                continue;
+            }
+            // Settled history belongs to the transcript, not the live team:
+            // only children the runtime still has open join it.
+            if recorded.state == UiChildState::Settled {
                 continue;
             }
             self.children.push(ChildAgentView {
@@ -295,15 +314,11 @@ impl TaskTeamView {
                 read_only: recorded.read_only,
                 purpose: recorded.purpose.clone(),
                 status,
-                contribution: if recorded.state == UiChildState::Settled {
-                    Contribution::NotMeasured
-                } else {
-                    Contribution::Pending
-                },
+                contribution: Contribution::Pending,
                 recent_step: None,
                 input_tokens: input,
                 output_tokens: output,
-                stop: recorded.stop,
+                stop: None,
                 started_elapsed_secs: now_elapsed,
                 detail: None,
                 steps: Vec::new(),
@@ -324,16 +339,34 @@ impl TaskTeamView {
         use leveler_client_protocol::UiChildState;
         if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
             match (state, c.status) {
-                (UiChildState::Interrupted, ChildStatus::Waiting | ChildStatus::Running) => {
+                (
+                    UiChildState::Interrupted,
+                    ChildStatus::Waiting | ChildStatus::Running | ChildStatus::Unreported,
+                ) => {
                     c.status = ChildStatus::Interrupted;
                 }
-                (UiChildState::Running, ChildStatus::Interrupted) => {
+                (UiChildState::Running, ChildStatus::Interrupted | ChildStatus::Unreported) => {
                     c.status = ChildStatus::Waiting;
                 }
                 _ => return,
             }
         }
         self.restamp_settlement(now_elapsed);
+    }
+
+    /// A turn ended: a child this view still shows as working got no terminal
+    /// here. Say exactly that — not failed, not interrupted.
+    pub fn mark_unreported_at_turn_end(&mut self, now_elapsed: u64) {
+        let mut changed = false;
+        for c in &mut self.children {
+            if matches!(c.status, ChildStatus::Running | ChildStatus::Waiting) {
+                c.status = ChildStatus::Unreported;
+                changed = true;
+            }
+        }
+        if changed {
+            self.restamp_settlement(now_elapsed);
+        }
     }
 
     /// Live execution state. `active` separates "spending model calls" from
@@ -434,6 +467,76 @@ mod tests {
             collaboration_glyph(&working, false),
             "\u{25c9}",
             "still working"
+        );
+    }
+
+    fn recorded(
+        id: &str,
+        state: leveler_client_protocol::UiChildState,
+        ok: bool,
+    ) -> leveler_client_protocol::UiChildAgent {
+        leveler_client_protocol::UiChildAgent {
+            id: id.into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            profile_id: None,
+            read_only: true,
+            purpose: "look".into(),
+            state,
+            ok,
+            background: true,
+            scope: Vec::new(),
+            resumes: 0,
+            outcome: None,
+            stop: None,
+            summary: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd_micros: None,
+        }
+    }
+
+    /// MA3 review M1: a terminal already applied is final; a snapshot taken
+    /// before it (which still says running) must not reopen the child.
+    #[test]
+    fn a_stale_snapshot_does_not_reopen_a_settled_child() {
+        let mut team = team_with(&[ChildStatus::Completed]);
+        let id = team.children[0].id.clone();
+        team.restore(
+            &[recorded(
+                &id,
+                leveler_client_protocol::UiChildState::Running,
+                false,
+            )],
+            5,
+        );
+        assert_eq!(team.children[0].status, ChildStatus::Completed);
+    }
+
+    /// MA3 review L1 + L4: a settled record restores nothing into the live
+    /// team (history is the transcript's), and an old settled row without an
+    /// outcome is read by its ok bit when it updates a child this view holds.
+    #[test]
+    fn restore_brings_back_open_children_only_and_reads_ok_for_old_rows() {
+        use leveler_client_protocol::UiChildState;
+        let mut team = TaskTeamView::default();
+        team.restore(
+            &[
+                recorded("old", UiChildState::Settled, true),
+                recorded("open", UiChildState::Interrupted, false),
+            ],
+            0,
+        );
+        assert_eq!(team.children.len(), 1, "settled history is not live team");
+        assert_eq!(team.children[0].id, "open");
+
+        let mut live = team_with(&[ChildStatus::Running]);
+        let id = live.children[0].id.clone();
+        live.restore(&[recorded(&id, UiChildState::Settled, true)], 5);
+        assert_eq!(
+            live.children[0].status,
+            ChildStatus::Completed,
+            "ok=true without outcome is completed"
         );
     }
 
@@ -1288,6 +1391,9 @@ pub fn roster_rows(
             ChildStatus::Interrupted => {
                 ("⏸", RosterTone::Failed, t.sub_agent_interrupted.to_string())
             }
+            ChildStatus::Unreported => {
+                ("?", RosterTone::Failed, t.sub_agent_unreported.to_string())
+            }
         };
         rows.push(AgentRosterRow {
             glyph,
@@ -1387,10 +1493,12 @@ pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine>
                 ChildStatus::Completed => "✓",
                 ChildStatus::Failed => "✗",
                 ChildStatus::Interrupted => "⏸",
+                ChildStatus::Unreported => "?",
             };
             let detail = match c.status {
                 ChildStatus::Waiting | ChildStatus::Running => running_line(c, t),
                 ChildStatus::Interrupted => t.sub_agent_interrupted.to_string(),
+                ChildStatus::Unreported => t.sub_agent_unreported.to_string(),
                 ChildStatus::Failed => stop_label(c.stop, t)
                     .unwrap_or(t.sub_agent_incomplete)
                     .to_string(),

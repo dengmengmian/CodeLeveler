@@ -735,6 +735,7 @@ pub(crate) fn sub_agent_status(
     t: &crate::i18n::UiText,
 ) -> &'static str {
     match block.status {
+        _ if block.unreported => t.sub_agent_unreported,
         _ if block.interrupted => t.sub_agent_interrupted,
         ToolStatus::Running if block.progress.active => t.sub_agent_running,
         ToolStatus::Running => t.sub_agent_waiting,
@@ -792,6 +793,7 @@ fn sub_agent_lines(
     now_elapsed_secs: u64,
 ) {
     let (glyph, color) = match block.status {
+        _ if block.unreported => ("?", theme.status.warning),
         _ if block.interrupted => ("⏸", theme.status.warning),
         ToolStatus::Running => ("◌", theme.accent.primary),
         ToolStatus::Ok => ("✓", theme.status.success),
@@ -1095,6 +1097,10 @@ fn sub_agent_tree_child_status(
         ToolStatus::Ok => (
             format!("✓ {}", t.agent_status_completed),
             theme.status.success,
+        ),
+        _ if block.unreported => (
+            format!("? {}", t.sub_agent_unreported),
+            theme.status.warning,
         ),
         _ if block.interrupted => (
             format!("⏸ {}", t.sub_agent_interrupted),
@@ -1718,6 +1724,7 @@ mod tests {
             stop: (status == ToolStatus::Failed)
                 .then_some(leveler_client_protocol::ChildStop::Budget),
             interrupted: false,
+            unreported: false,
         }
     }
 

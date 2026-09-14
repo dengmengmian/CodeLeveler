@@ -2914,6 +2914,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             record.status
         };
 
+        // Unlike the best-effort fields above, a child row that cannot be
+        // decoded fails the snapshot: it is canonical history, and every other
+        // reader of it (restart reconciliation, observability) refuses corrupt
+        // rows rather than showing a partial truth as the whole one.
         let children =
             crate::children::project_children(&db, session_id, self.active.is_running(session_id))
                 .await

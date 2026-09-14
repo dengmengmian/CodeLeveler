@@ -914,9 +914,11 @@
       ],
       "properties": {
         "background": {
-          "description": "Whether the parent continues while this child runs.",
-          "default": false,
-          "type": "boolean"
+          "description": "Whether the parent continues while this child runs. Carried on the start; `None` on a terminal, which says nothing about it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "contribution": {
           "description": "What the parent did with what this child found, once it finished.\n\n`None` means NOT MEASURED — the runtime produced no projection — and must never be rendered as a zero. A child that reported nothing arrives as `Some` with zero counts, which is a different fact and reads differently to the user.",
@@ -1874,6 +1876,11 @@
         },
         "nickname": {
           "type": "string"
+        },
+        "ok": {
+          "description": "Whether it reached the end of its task, once settled. Carried beside `outcome` because rows settled before the outcome was typed have only this bit.",
+          "default": false,
+          "type": "boolean"
         },
         "outcome": {
           "anyOf": [

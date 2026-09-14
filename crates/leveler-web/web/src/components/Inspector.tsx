@@ -428,7 +428,7 @@ function AgentsSection({ live }: { live: readonly SubAgentView[] }) {
     <InspectorBlock title="AGENTS">
       {running.length > 0 && (
         <>
-          <div className="ag-kicker">Running</div>
+          <div className="ag-kicker">Open</div>
           <div className="agent-tree">
             {running.map((a) => (
               <AgentRow key={a.id} agent={a} />

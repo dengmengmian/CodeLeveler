@@ -244,3 +244,10 @@ describe('observability projection', () => {
     expect(view.groups[0]?.steps[2]?.agentLabel).toBe('agent-9');
   });
 });
+
+describe('refresh on child lifecycle moves', () => {
+  it('a child state change refreshes the durable agent list', async () => {
+    const { shouldRefreshObservability } = await import('./observabilityView');
+    expect(shouldRefreshObservability({ type: 'sub_agent_state_changed', id: 'c1', state: 'interrupted' })).toBe(true);
+  });
+});

@@ -205,6 +205,7 @@ export function shouldRefreshObservability(ev: RuntimeEvent): boolean {
     case 'token_usage':
     case 'verification_updated':
     case 'sub_agent_updated':
+    case 'sub_agent_state_changed':
     case 'turn_completed':
     case 'turn_answered':
     case 'turn_failed':

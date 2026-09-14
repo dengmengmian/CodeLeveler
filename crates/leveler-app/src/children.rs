@@ -58,6 +58,7 @@ pub(crate) async fn project_children(
                     read_only,
                     purpose: task,
                     state: UiChildState::Running,
+                    ok: false,
                     background: spec.background,
                     scope: spec.files,
                     resumes: 0,
@@ -71,6 +72,7 @@ pub(crate) async fn project_children(
             }
             EngineEvent::SubAgentFinished {
                 id,
+                ok,
                 summary,
                 outcome,
                 stop,
@@ -80,6 +82,7 @@ pub(crate) async fn project_children(
                     && child.state != UiChildState::Settled
                 {
                     child.state = UiChildState::Settled;
+                    child.ok = ok;
                     child.summary = Some(summary);
                     child.outcome = outcome.map(crate::event_bridge::project_child_outcome);
                     child.stop = stop.map(crate::event_bridge::project_child_stop);

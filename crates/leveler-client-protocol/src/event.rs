@@ -99,6 +99,11 @@ pub struct UiChildAgent {
     /// What it was asked to do.
     pub purpose: String,
     pub state: UiChildState,
+    /// Whether it reached the end of its task, once settled. Carried beside
+    /// `outcome` because rows settled before the outcome was typed have only
+    /// this bit.
+    #[serde(default)]
+    pub ok: bool,
     /// Whether its parent continued while it ran.
     #[serde(default)]
     pub background: bool,
@@ -352,9 +357,10 @@ pub enum RuntimeEvent {
         /// How the activation ended, once done.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<ChildStop>,
-        /// Whether the parent continues while this child runs.
-        #[serde(default)]
-        background: bool,
+        /// Whether the parent continues while this child runs. Carried on the
+        /// start; `None` on a terminal, which says nothing about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<bool>,
         /// Exclusive write scope fixed at spawn (empty when late-bound or
         /// read-only).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

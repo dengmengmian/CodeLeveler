@@ -461,6 +461,11 @@
         "nickname": {
           "type": "string"
         },
+        "ok": {
+          "description": "Whether it reached the end of its task, once settled. Carried beside `outcome` because rows settled before the outcome was typed have only this bit.",
+          "default": false,
+          "type": "boolean"
+        },
         "outcome": {
           "anyOf": [
             {

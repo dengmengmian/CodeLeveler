@@ -153,6 +153,8 @@ export interface UiChildAgent {
   /** Model usage recorded under this child's id. */
   input_tokens?: number;
   nickname: string;
+  /** Whether it reached the end of its task, once settled. Carried beside `outcome` because rows settled before the outcome was typed have only this bit. */
+  ok?: boolean;
   outcome?: ChildOutcome | null;
   output_tokens?: number;
   profile_id?: string | null;
@@ -739,7 +741,7 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; background?: boolean; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
+  | { type: 'sub_agent_updated'; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
   /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
   | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   /** Live execution state and cumulative model usage for one spawned agent. */

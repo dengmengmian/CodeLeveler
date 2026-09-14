@@ -293,6 +293,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
+            state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
             state.force_cancel_armed = false;
             seal_analysis_segment(state);
@@ -313,6 +314,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
+            state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
             state.force_cancel_armed = false;
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
@@ -733,6 +735,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
+    state.team.mark_unreported_at_turn_end(state.elapsed_secs);
     // §12: a clean outcome still needs an answer behind it. Only the two
     // outcomes that render as done are rewritten — an Incomplete or Failed turn
     // already says something went wrong.

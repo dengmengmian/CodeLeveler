@@ -44,6 +44,8 @@ pub enum ActivityStatus {
     Failed,
     /// A child whose activation died with its runtime window.
     Interrupted,
+    /// A child whose turn ended without its terminal reaching this view.
+    Unreported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +87,9 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
         match status {
             ActivityStatus::Running => running.push(row),
             // Interrupted is not finished: the next turn continues or settles it.
-            ActivityStatus::Waiting | ActivityStatus::Interrupted => waiting.push(row),
+            ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
+                waiting.push(row)
+            }
             ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
         }
     }
@@ -109,6 +113,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             ChildStatus::Completed => ActivityStatus::Completed,
             ChildStatus::Failed => ActivityStatus::Failed,
             ChildStatus::Interrupted => ActivityStatus::Interrupted,
+            ChildStatus::Unreported => ActivityStatus::Unreported,
         };
         let row = ActivitySummary {
             id: ActivityId::Child(child.id.clone()),
@@ -122,7 +127,9 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
         match status {
             ActivityStatus::Running => running.push(row),
             // Interrupted is not finished: the next turn continues or settles it.
-            ActivityStatus::Waiting | ActivityStatus::Interrupted => waiting.push(row),
+            ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
+                waiting.push(row)
+            }
             ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
         }
     }
@@ -142,6 +149,7 @@ pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usiz
         ActivityStatus::Completed => "✓",
         ActivityStatus::Failed => "✕",
         ActivityStatus::Interrupted => "⏸",
+        ActivityStatus::Unreported => "?",
     };
     let dur = fmt_elapsed(summary.duration_secs);
     let title = match summary.secondary.as_deref() {

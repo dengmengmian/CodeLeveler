@@ -199,9 +199,12 @@ pub struct SubAgentBlock {
     pub contribution: crate::multi_agent::Contribution,
     /// How the activation ended, once it has (typed by the runtime).
     pub stop: Option<leveler_client_protocol::ChildStop>,
-    /// Its activation ended without a terminal reaching this view — the
-    /// runtime continues it or settles it later. Not a failure.
+    /// The runtime recorded its activation as interrupted; the next turn
+    /// continues it or settles it as lost. Not a failure.
     pub interrupted: bool,
+    /// Its turn ended and no terminal reached this view. The UI holds no fact
+    /// about how it ended.
+    pub unreported: bool,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -631,12 +634,12 @@ impl TranscriptState {
                         }
                     }
                 }
-                // The turn ended and no terminal reached us. Failing the child
-                // would be a fact the UI invented; interrupted is what the
-                // runtime records for an activation that died with its turn.
+                // The turn ended and no terminal reached us. Failed or
+                // interrupted would both be facts the UI invented; say only
+                // that no terminal arrived.
                 TranscriptItem::SubAgent(b) if b.status == ToolStatus::Running => {
                     b.status = ToolStatus::Failed;
-                    b.interrupted = true;
+                    b.unreported = true;
                 }
                 _ => {}
             }
@@ -995,6 +998,10 @@ impl TranscriptState {
             block.detail = task;
             return;
         }
+        // The spawn call's own cell is hidden (Silent), but a child starting
+        // is visible work acting on the prose before it: that prose was not
+        // the answer.
+        self.decide_pending_assistants(AssistantKind::Progress);
         self.close_tool_group();
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
             expanded: false,
@@ -1009,6 +1016,7 @@ impl TranscriptState {
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             interrupted: false,
+            unreported: false,
         }));
     }
 
@@ -1039,6 +1047,7 @@ impl TranscriptState {
             block.contribution = contribution.clone();
             block.stop = stop;
             block.interrupted = false;
+            block.unreported = false;
             return;
         }
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
@@ -1054,6 +1063,7 @@ impl TranscriptState {
             contribution,
             stop,
             interrupted: false,
+            unreported: false,
         }));
     }
 
@@ -1089,6 +1099,7 @@ impl TranscriptState {
             contribution,
             stop: None,
             interrupted: false,
+            unreported: false,
         }));
     }
 
@@ -1098,13 +1109,17 @@ impl TranscriptState {
         use leveler_client_protocol::UiChildState;
         if let Some(block) = self.sub_agent_mut(id) {
             match state {
-                UiChildState::Interrupted if block.status == ToolStatus::Running => {
+                UiChildState::Interrupted
+                    if block.status == ToolStatus::Running || block.unreported =>
+                {
                     block.status = ToolStatus::Failed;
                     block.interrupted = true;
+                    block.unreported = false;
                 }
-                UiChildState::Running if block.interrupted => {
+                UiChildState::Running if block.interrupted || block.unreported => {
                     block.status = ToolStatus::Running;
                     block.interrupted = false;
+                    block.unreported = false;
                 }
                 _ => {}
             }
@@ -1483,6 +1498,28 @@ mod tests {
         assert_eq!(kinds(&t), vec![AssistantKind::Pending], "not yet decided");
         settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
         assert_eq!(kinds(&t), vec![AssistantKind::Progress]);
+    }
+
+    /// MA3 review M4: spawn_agent's own cell is hidden, but a spawned child
+    /// is still visible work acting on the prose before it — that prose was
+    /// not the answer.
+    #[test]
+    fn a_spawned_child_makes_the_preceding_message_progress() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "我把调研交给 explorer");
+        t.push_sub_agent_started(
+            "agent-1".into(),
+            "Euclid".into(),
+            "explorer".into(),
+            "look".into(),
+            0,
+        );
+        say(&mut t, "m2", "它找到了三个函数。");
+        t.push_turn_end(TurnEndStatus::Completed, 1, 3, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Progress, AssistantKind::Final]
+        );
     }
 
     /// The message a turn ended on, with no tool call after it, is the answer.

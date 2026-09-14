@@ -99,7 +99,7 @@ fn agents_screen_lists_spawned_sub_agents_in_direct_mode() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -212,7 +212,7 @@ fn visual_inspect() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );

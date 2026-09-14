@@ -162,6 +162,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         ActivityStatus::Completed => t.title_completed,
         ActivityStatus::Failed => t.title_failed,
         ActivityStatus::Interrupted => t.sub_agent_interrupted,
+        ActivityStatus::Unreported => t.sub_agent_unreported,
     };
     let status_style = match summary.status {
         ActivityStatus::Running | ActivityStatus::Waiting => {
@@ -169,7 +170,9 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         }
         ActivityStatus::Completed => Style::default().fg(theme.status.success),
         ActivityStatus::Failed => Style::default().fg(theme.status.error),
-        ActivityStatus::Interrupted => Style::default().fg(theme.status.warning),
+        ActivityStatus::Interrupted | ActivityStatus::Unreported => {
+            Style::default().fg(theme.status.warning)
+        }
     };
     let heading = match &summary.secondary {
         Some(sec) if summary.kind == crate::activity::ActivityKind::ChildAgent => {
@@ -1163,6 +1166,7 @@ mod tests {
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             interrupted: false,
+            unreported: false,
         });
         let text: String = item_render(
             &item,
@@ -1199,6 +1203,7 @@ mod tests {
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             interrupted: false,
+            unreported: false,
         });
         let text: String = item_render(
             &item,
@@ -1239,6 +1244,7 @@ mod tests {
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             interrupted: false,
+            unreported: false,
         });
         let text = item_render(
             &item,
@@ -1290,7 +1296,7 @@ mod tests {
                     contribution: None,
                     outcome: None,
                     stop: None,
-                    background: true,
+                    background: Some(true),
                     scope: Vec::new(),
                 }),
             );
@@ -1330,7 +1336,7 @@ mod tests {
             contribution: None,
             outcome: None,
             stop,
-            background: true,
+            background: Some(true),
             scope: Vec::new(),
         }
     }
@@ -1362,11 +1368,11 @@ mod tests {
         }
     }
 
-    /// U4/U5: a turn that ends with a child still drawn as running does not
-    /// rewrite it to failed — the UI has no such fact. It is interrupted, which
-    /// is what the runtime records for an activation that died with its turn.
+    /// U4 + MA3 review L3: a turn that ends with a child still drawn as
+    /// running does not rewrite it to failed or interrupted — the UI holds
+    /// neither fact. It says what it knows: no terminal reached this view.
     #[test]
-    fn a_child_left_running_at_turn_end_reads_interrupted_not_failed() {
+    fn a_child_left_running_at_turn_end_reads_unreported_not_failed() {
         use crate::action::Action;
         use crate::reducer::reduce;
         use leveler_client_protocol::RuntimeEvent;
@@ -1383,8 +1389,16 @@ mod tests {
             }),
         );
         let text = render_text(&mut state, 100, 30);
-        assert!(text.contains("已中断"), "{text}");
-        assert!(!text.contains("未完成"), "{text}");
+        assert!(text.contains("未收到结束状态"), "{text}");
+        assert!(
+            !text.contains("未完成") && !text.contains("已中断"),
+            "{text}"
+        );
+        assert_eq!(
+            state.team.children[0].status,
+            crate::multi_agent::ChildStatus::Unreported,
+            "the team says the same as the transcript"
+        );
     }
 
     /// The runtime's own lifecycle move reaches the child: interrupted, then
@@ -1481,7 +1495,7 @@ mod tests {
                     contribution: None,
                     outcome: None,
                     stop: None,
-                    background: false,
+                    background: None,
                     scope: Vec::new(),
                 }),
             );
@@ -1542,7 +1556,7 @@ mod tests {
                 contribution: None,
                 outcome: None,
                 stop: None,
-                background: false,
+                background: None,
                 scope: Vec::new(),
             }),
         );

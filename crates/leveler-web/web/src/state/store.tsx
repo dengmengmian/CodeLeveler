@@ -433,20 +433,29 @@ function viewFromSnapshot(
   };
 }
 
-/** Children the runtime still has open, from the snapshot's durable record,
- * merged over what this view already follows (keeps live step and tokens).
- * Old runtimes send no `children`: keep the live view as it was. */
+/** Merge the snapshot's durable children over what this view already follows.
+ * The snapshot is the base for children it lists, but a terminal already
+ * applied here is final (a snapshot taken before it still says running), and
+ * an open child this view follows that the snapshot has not seen yet (started
+ * after it was taken) is kept. Settled history is the transcript's, so only
+ * open children join the live list. Old runtimes send no `children`: keep
+ * the live view as it was. */
 function restoreAgents(snap: UiSessionSnapshot, live: SubAgentView[]): SubAgentView[] {
   if (!snap.children) return live;
-  const open = snap.children.filter((c) => c.state !== 'settled');
-  return open.map((c) => {
+  const out: SubAgentView[] = [];
+  for (const c of snap.children) {
     const existing = live.find((a) => a.id === c.id);
-    return {
+    if (existing && existing.state === 'settled') {
+      out.push(existing);
+      continue;
+    }
+    if (c.state === 'settled') continue;
+    out.push({
       id: c.id,
       nickname: c.nickname,
       role: c.role,
       status: 'run' as const,
-      state: c.state,
+      state: existing?.state === 'running' && c.state === 'running' ? 'running' : c.state,
       outcome: null,
       stop: null,
       profileId: c.profile_id ?? null,
@@ -458,8 +467,12 @@ function restoreAgents(snap: UiSessionSnapshot, live: SubAgentView[]): SubAgentV
       active: existing?.active ?? false,
       tokens: existing?.tokens ?? { input: c.input_tokens ?? 0, output: c.output_tokens ?? 0, cached: 0 },
       seq: existing?.seq ?? nextSeq(),
-    };
-  });
+    });
+  }
+  for (const a of live) {
+    if (a.state !== 'settled' && !snap.children.some((c) => c.id === a.id)) out.push(a);
+  }
+  return out;
 }
 
 /** Drop every projection that belongs to the session currently on screen. */
@@ -641,9 +654,11 @@ export function reducer(state: AppState, action: Action): void {
         time: action.time,
         seq: nextSeq(),
       });
-      // 新回合开始：清掉上一回合的执行轨（工具/子 agent/后台任务）与终态
+      // 新回合开始：清掉上一回合的执行轨（工具/后台任务）与终态。子 agent 只清
+      // 已结束的：一个仍未结束（例如已中断、将被本回合续跑）的子 agent 不属于
+      // 上一回合，清掉它会让续跑事件找不到对象。
       state.current.tools = [];
-      state.current.agents = [];
+      state.current.agents = state.current.agents.filter((a) => a.state !== 'settled');
       state.current.backgroundTasks = [];
       state.current.turnActive = true;
       state.current.turnStartedAt = Date.now();

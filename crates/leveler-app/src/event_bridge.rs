@@ -581,7 +581,7 @@ impl EventBridge {
                     contribution: None,
                     outcome: None,
                     stop: None,
-                    background: spec.background,
+                    background: Some(spec.background),
                     scope: spec.files,
                 });
             }
@@ -635,7 +635,7 @@ impl EventBridge {
                     contribution: projected,
                     outcome: outcome.map(project_child_outcome),
                     stop: stop.map(project_child_stop),
-                    background: false,
+                    background: None,
                     scope: Vec::new(),
                 });
             }
@@ -1749,7 +1749,7 @@ mod projection_equivalence {
             RuntimeEvent::SubAgentUpdated {
                 background, scope, ..
             } => {
-                assert!(background);
+                assert_eq!(background, Some(true));
                 assert_eq!(scope, vec!["src/a.rs".to_string()]);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1778,6 +1778,27 @@ mod projection_equivalence {
                 ),
             ]
         );
+    }
+
+    /// A terminal says nothing about whether the child ran in the background;
+    /// it must not claim `false`.
+    #[test]
+    fn a_child_terminal_does_not_claim_a_background_flag() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: true,
+            summary: "done".into(),
+            contribution: None,
+            outcome: None,
+            stop: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { background, .. } => assert_eq!(background, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     /// `None` means the runtime did not measure this child. It must stay

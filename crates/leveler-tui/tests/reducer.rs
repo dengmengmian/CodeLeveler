@@ -2119,7 +2119,7 @@ fn turn_end_finalizes_in_flight_blocks() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -2232,7 +2232,7 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         })
     };
@@ -2264,7 +2264,7 @@ fn sub_agent_finish_before_start_still_renders() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -2296,7 +2296,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -2322,7 +2322,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -5720,7 +5720,7 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -5768,7 +5768,7 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
             contribution: None,
             outcome: None,
             stop: None,
-            background: false,
+            background: None,
             scope: Vec::new(),
         }),
     );
@@ -6491,6 +6491,7 @@ fn snapshot_child(
         read_only: true,
         purpose: format!("purpose of {id}"),
         state,
+        ok: false,
         background: true,
         scope: Vec::new(),
         resumes: 0,
@@ -6526,15 +6527,15 @@ fn a_session_snapshot_restores_its_children_with_their_recorded_state() {
         .iter()
         .map(|c| (c.id.as_str(), c.status, c.stop))
         .collect();
+    // Settled history (c1) is the transcript's, not the live team's.
     assert_eq!(
         statuses,
         vec![
-            ("c1", ChildStatus::Failed, Some(ChildStop::Budget)),
             ("c2", ChildStatus::Interrupted, None),
             ("c3", ChildStatus::Waiting, None),
         ]
     );
-    assert_eq!(s.team.children[1].purpose, "purpose of c2");
+    assert_eq!(s.team.children[0].purpose, "purpose of c2");
 }
 
 /// U3: a runtime notice in history is not a user turn.

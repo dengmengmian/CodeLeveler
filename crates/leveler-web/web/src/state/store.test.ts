@@ -593,6 +593,35 @@ describe('sub-agents', () => {
     expect(agents[0]?.detail).toBe('p-c2');
   });
 
+  it('a stale snapshot does not reopen a settled child, and keeps an open one it has not seen', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'sub_agent_updated', id: 'done1', nickname: 'A', role: 'explorer', done: false, ok: false, detail: 't' });
+    reducer(state, { type: 'sub_agent_updated', id: 'done1', nickname: 'A', role: 'explorer', done: true, ok: true, detail: 'r' });
+    reducer(state, { type: 'sub_agent_updated', id: 'new1', nickname: 'B', role: 'explorer', done: false, ok: false, detail: 'n' });
+    reducer(state, {
+      type: 'snapshot',
+      session: snapshot({
+        children: [
+          { id: 'done1', nickname: 'A', role: 'explorer', purpose: 't', state: 'running', ok: false, background: true, read_only: true, resumes: 0, input_tokens: 0, output_tokens: 0 },
+        ],
+      }),
+    });
+    const agents = state.current?.agents ?? [];
+    expect(agents.find((a) => a.id === 'done1')?.state).toBe('settled');
+    expect(agents.find((a) => a.id === 'new1')?.state).toBe('running');
+  });
+
+  it('an interrupted child restored from a snapshot survives the next user turn and resumes', () => {
+    const state = stateWithSession({
+      children: [
+        { id: 'c2', nickname: 'N', role: 'explorer', purpose: 'p', state: 'interrupted', ok: false, background: true, read_only: true, resumes: 0, input_tokens: 0, output_tokens: 0 },
+      ],
+    });
+    reducer(state, { type: 'user_message', id: 'm9', text: 'continue', time: '10:00:00' });
+    reducer(state, { type: 'sub_agent_state_changed', id: 'c2', state: 'running' });
+    expect(state.current?.agents.map((a) => [a.id, a.state])).toEqual([['c2', 'running']]);
+  });
+
   it('a runtime notice in history is a runtime_notice, not a user turn', () => {
     const state = stateWithSession({
       messages: [
@@ -636,8 +665,13 @@ describe('sub-agents', () => {
     expect(state.current?.agents).toHaveLength(1);
     expect(state.observation?.agents).toHaveLength(2);
     reducer(state, { type: 'user_message', id: 'm9', text: 'next', time: '10:00:00' });
-    expect(state.current?.agents).toHaveLength(0);
+    // A child that has not settled is not the previous turn's to clear (MA3
+    // review M3); the durable history stays in the observation either way.
+    expect(state.current?.agents.map((a) => a.id)).toEqual(['agent-3']);
     expect(state.observation?.agents).toHaveLength(2);
+    reducer(state, { type: 'sub_agent_updated', id: 'agent-3', nickname: 'Worker', role: 'worker', done: true, ok: true, detail: 'x' });
+    reducer(state, { type: 'user_message', id: 'm10', text: 'again', time: '10:01:00' });
+    expect(state.current?.agents).toHaveLength(0);
   });
 });
 
