@@ -188,7 +188,7 @@ tasks with children.
 | `cargo test --workspace --all-features --locked --no-fail-fast` | 3853 passed, 0 failed, 20 ignored |
 | web typecheck / vitest / build | pass / 181 passed / pass |
 | `flutter analyze` / `flutter test` | no issues / 54 passed |
-| exact main CI | recorded in the MA1 report after push |
+| exact main CI | `8a2b46d` run 34801621375 attempt 1 success (all jobs); review fixes recorded in the MA1 report |
 
 ### 9.4 Residuals (non-blocking, stated)
 
@@ -204,6 +204,24 @@ tasks with children.
 - Dangling mutating child tool calls still stop `run --resume` behind
   `RecoveryConfirmationRequired`; a chat turn does not run crash-window
   recovery first (pre-existing, same as the parent).
+
+### 9.4a Independent review
+
+`/code-review high` over `ba15ab9..8a2b46d`, run in a separate context at the
+user's request. Three findings, all confirmed against the source and fixed
+test-first:
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | medium | A pinned model without pricing, under a cost cap, made the child fail `InvalidLimits` before its first call (regression from `9c74171`; profile error swallowed) | Admission refuses an unresolvable pinned model, or an unpriced one under a cap, with the reason; a resumed child in that position settles as failed; no error is swallowed; the cap is never dropped (`ac43ef6`, also closes G9b) |
+| 2 | low | A foreground batch that errored while forwarding child events never called `child_ended`, leaving stale cancel handles | The batch cancels, waits for, settles and releases its foreground children, ends them for the host, then returns the error (`ac43ef6`) |
+| 3 | low | `ChildContribution`'s doc comment attached to the new `ChildOutcome` | Enums moved above the doc block; schema and TS regenerated (`7cfadfc`) |
+
+Tests: `an_unpriced_pinned_model_is_refused_under_a_cost_cap`,
+`an_unresolvable_pinned_model_is_refused_at_spawn`,
+`a_resumed_child_whose_model_is_gone_settles_as_failed` (written after the
+code, mutation-checked), `a_foreground_batch_that_errors_still_ends_its_children_for_the_host`.
+Workspace after fixes: 3857 passed, 0 failed, 20 ignored.
 
 ### 9.5 Gates
 
