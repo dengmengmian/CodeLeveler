@@ -525,6 +525,7 @@ class AppController extends ChangeNotifier {
               }
             }
             session?.applyEvent(runtimeEvent);
+            if (session?.takeSnapshotDue() ?? false) unawaited(requestSnapshot());
           case SnapshotMessage(session: final snapshot):
             session?.applySnapshot(snapshot);
           case AckMessage(commandId: final commandId):

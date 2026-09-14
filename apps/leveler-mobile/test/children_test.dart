@@ -223,6 +223,27 @@ void main() {
     });
   });
 
+  group('reconnect mid-answer', () {
+    test('a view that went stale during a turn asks for a snapshot once the turn ends', () {
+      final state = SessionState('s1')
+        ..applySnapshot(_snapshot())
+        // Reopened while an answer was streaming: its start was before the snapshot.
+        ..applyEvent({'type': 'assistant_text_delta', 'message_id': 'm9', 'delta': '半句'});
+      expect(state.needsResync, isTrue);
+      expect(state.takeSnapshotDue(), isFalse, reason: 'a snapshot mid-answer would miss it again');
+
+      state.applyEvent({'type': 'turn_completed'});
+      expect(state.takeSnapshotDue(), isTrue);
+      expect(state.takeSnapshotDue(), isFalse, reason: 'asked once, not on every later event');
+    });
+
+    test('a turn that ends with a consistent view asks for nothing', () {
+      final state = SessionState('s1')..applySnapshot(_snapshot());
+      state.applyEvent({'type': 'turn_completed'});
+      expect(state.takeSnapshotDue(), isFalse);
+    });
+  });
+
   test('cancel_child matches the host schema', () {
     expect(Commands.cancelChild(sessionId: 's1', childId: 'c1'), {
       'type': 'cancel_child',

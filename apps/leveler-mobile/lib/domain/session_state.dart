@@ -559,6 +559,7 @@ class SessionState extends ChangeNotifier {
       case 'turn_cancelled':
         status = 'idle';
         activity = null;
+        if (needsResync) _snapshotDue = true;
         timeline.add(TimelineItem(
           id: 'turn-${timeline.length}',
           kind: TimelineKind.status,
@@ -631,6 +632,17 @@ class SessionState extends ChangeNotifier {
     if (child == null || !child.isOpen) return;
     child.cancelRequested = true;
     notifyListeners();
+  }
+
+  bool _snapshotDue = false;
+
+  /// True once when a turn ended while this view was stale. A snapshot taken
+  /// mid-turn would miss the answer still streaming, so the request waits for
+  /// the turn's end; nothing else asks for one.
+  bool takeSnapshotDue() {
+    final due = _snapshotDue;
+    _snapshotDue = false;
+    return due;
   }
 
   void markResyncRequired() {

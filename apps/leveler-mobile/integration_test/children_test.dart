@@ -93,6 +93,11 @@ void main() {
     // The parent keeps running and ends its own turn.
     await until(tester, () => second.session!.status != 'running',
         limit: const Duration(seconds: 180), what: '父回合结束', controller: second);
-    expect(second.session!.needsResync, isFalse, reason: '${second.session!.unknownEvents}');
+    // Reopened mid-answer, the view may be stale until the turn ends; it must
+    // then fetch a snapshot and settle, not keep showing "resynchronising".
+    await until(tester, () => !second.session!.needsResync,
+        limit: const Duration(seconds: 30), what: '回合结束后视图重新同步', controller: second);
+    expect(second.session!.children[restored.id]!.stop, 'cancelled',
+        reason: '重新同步之后子 Agent 仍应是 cancelled');
   });
 }
