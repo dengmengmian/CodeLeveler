@@ -1,0 +1,26 @@
+id: mat-s1-port-setting
+name: S1 small workload
+max_rounds: 60
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  README.md: |
+    # service
+
+    ## Settings
+
+    | key | type | default | rule |
+    |---|---|---|---|
+    | host | string | localhost | non-empty |
+  settings/settings.go: "package settings\n\nimport \"fmt\"\n\n// Settings is the parsed configuration.\ntype Settings struct {\n\tHost string\n}\n\n// Parse reads settings from key/value pairs, applying defaults.\nfunc Parse(kv map[string]string) (Settings, error) {\n\ts := Settings{Host: \"localhost\"}\n\tif v, ok := kv[\"host\"]; ok {\n\t\tif v == \"\" {\n\t\t\treturn Settings{}, fmt.Errorf(\"host: empty\")\n\t\t}\n\t\ts.Host = v\n\t}\n\treturn s, nil\n}\n"
+  settings/settings_test.go: "package settings\n\nimport \"testing\"\n\nfunc TestDefaults(t *testing.T) {\n\ts, err := Parse(nil)\n\tif err != nil || s.Host != \"localhost\" {\n\t\tt.Fatal(s, err)\n\t}\n}\n"
+  display/display.go: "package display\n\nimport (\n\t\"fmt\"\n\n\t\"evalcase/settings\"\n)\n\n// Address renders where the service listens.\nfunc Address(s settings.Settings) string {\n\treturn fmt.Sprintf(\"http://%s\", s.Host)\n}\n"
+  display/display_test.go: "package display\n\nimport (\n\t\"strings\"\n\t\"testing\"\n\n\t\"evalcase/settings\"\n)\n\nfunc TestAddressStartsWithScheme(t *testing.T) {\n\tif !strings.HasPrefix(Address(settings.Settings{Host: \"h\"}), \"http://h\") {\n\t\tt.Fatal(Address(settings.Settings{Host: \"h\"}))\n\t}\n}\n"
+task: 'Add a `port` setting: an integer in 1..65535, default 8080; anything else (including an empty or non-numeric value) is an error whose message starts with `port:`. Store it as `Settings.Port` (int). `display.Address` must include it as `http://host:port`, except that port 80 is omitted (`http://example.com`). Add the setting to the table in README.md. Keep the existing tests passing and do not modify them.'
+expect:
+  program: bash
+  args:
+  - -c
+  - "set -euo pipefail\ngit diff --quiet HEAD -- '*_test.go'\nmkdir -p \"$(dirname 'settings/zz_hidden_test.go')\"\ncat > 'settings/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage settings\n\nimport (\n\t\"strings\"\n\t\"testing\"\n)\n\nfunc TestHiddenPort(t *testing.T) {\n\ts, err := Parse(nil)\n\tif err != nil || s.Port != 8080 {\n\t\tt.Fatalf(\"%+v %v\", s, err)\n\t}\n\ts, err = Parse(map[string]string{\"port\": \"443\"})\n\tif err != nil || s.Port != 443 {\n\t\tt.Fatalf(\"%+v %v\", s, err)\n\t}\n\tfor _, bad := range []string{\"0\", \"65536\", \"-1\", \"80a\", \"\"} {\n\t\tif _, err := Parse(map[string]string{\"port\": bad}); err == nil || !strings.HasPrefix(err.Error(), \"port:\") {\n\t\t\tt.Fatalf(\"%q: %v\", bad, err)\n\t\t}\n\t}\n}\nHIDDEN_EOF\nmkdir -p \"$(dirname 'display/zz_hidden_test.go')\"\ncat > 'display/zz_hidden_test.go' <<'HIDDEN_EOF'\npackage display\n\nimport (\n\t\"testing\"\n\n\t\"evalcase/settings\"\n)\n\nfunc TestHiddenAddress(t *testing.T) {\n\tif got := Address(settings.Settings{Host: \"localhost\", Port: 8080}); got != \"http://localhost:8080\" {\n\t\tt.Fatal(got)\n\t}\n\tif got := Address(settings.Settings{Host: \"example.com\", Port: 80}); got != \"http://example.com\" {\n\t\tt.Fatal(got)\n\t}\n}\nHIDDEN_EOF\ngo test ./... && grep -Eq '^\\|[[:space:]]*port[[:space:]]*\\|' README.md\n"

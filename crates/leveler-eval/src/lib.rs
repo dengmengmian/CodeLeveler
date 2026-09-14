@@ -2418,6 +2418,25 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
+    fn multi_agent_threshold_ladder_loads() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/cases/multi_agent_threshold");
+        let cases = EvaluationCase::load_dir(&root).expect("multi_agent_threshold must parse");
+        let mut ids: Vec<_> = cases.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "mat-s0-word-count",
+                "mat-s1-port-setting",
+                "mat-s2-three-parsers",
+                "mat-s3-four-engines",
+                "mat-s4-eight-engines",
+            ]
+        );
+    }
+
+    #[test]
     fn navigation_cases_still_load_with_benchmark_validity_metadata() {
         // Every navigation case carries a `validity:` block describing what the
         // case discriminates on, so the offline preflight can refuse a case that

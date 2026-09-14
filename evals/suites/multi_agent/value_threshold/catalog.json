@@ -1,0 +1,70 @@
+{
+  "suite": "multi_agent",
+  "experiment": "MA4-B-WORKLOAD-THRESHOLD",
+  "purpose": "Workload ladder for the multi-agent break-even question. Registered before any run; a case that has runs is never edited (a replacement gets a new id and the old one stays, marked retired).",
+  "cases": {
+    "mat-s0-word-count": {
+      "bucket": "S0",
+      "category": "TINY",
+      "units": [
+        "words.Count"
+      ],
+      "independent_units": 1,
+      "expected_parallelism": "none",
+      "timeout_s": 600
+    },
+    "mat-s1-port-setting": {
+      "bucket": "S1",
+      "category": "SMALL",
+      "units": [
+        "settings.Port parse",
+        "display.Address render"
+      ],
+      "independent_units": 1,
+      "expected_parallelism": "none",
+      "timeout_s": 900
+    },
+    "mat-s2-three-parsers": {
+      "bucket": "S2",
+      "category": "MEDIUM",
+      "units": [
+        "semver package",
+        "ini package",
+        "cron package"
+      ],
+      "independent_units": 3,
+      "expected_parallelism": "medium",
+      "timeout_s": 1800
+    },
+    "mat-s3-four-engines": {
+      "bucket": "S3",
+      "category": "LARGE",
+      "units": [
+        "expr package",
+        "jsonpath package",
+        "textdiff package",
+        "toposort package"
+      ],
+      "independent_units": 4,
+      "expected_parallelism": "high",
+      "timeout_s": 3600
+    },
+    "mat-s4-eight-engines": {
+      "bucket": "S4",
+      "category": "PARALLEL_NATIVE",
+      "units": [
+        "expr package",
+        "jsonpath package",
+        "textdiff package",
+        "toposort package",
+        "ratewindow package",
+        "glob package",
+        "mdtable package",
+        "lruttl package"
+      ],
+      "independent_units": 8,
+      "expected_parallelism": "high",
+      "timeout_s": 5400
+    }
+  }
+}

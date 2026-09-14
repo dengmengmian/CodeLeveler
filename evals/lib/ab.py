@@ -36,6 +36,10 @@ def _useful_child(child: dict[str, Any], terminal: dict[str, Any], run: dict[str
     if child.get("read_only") is False:
         changed = set(run.get("changed_files") or [])
         kept = [p for p in (lc.get("child_mutations") or {}).get(child["id"], []) if p in changed]
+        # A file the parent rewrote after the child settled is work the parent
+        # did again, not work the child saved it.
+        redone = set(((run.get("coordination") or {}).get("parent_rewrites") or {}).get(child["id"]) or [])
+        kept = [p for p in kept if p not in redone]
         return "independent_subtask" if kept and run.get("expect_pass") else None
     read = (lc.get("child_reads") or {}).get(child["id"]) or []
     reread = (lc.get("parent_rereads") or {}).get(child["id"]) or []
@@ -121,6 +125,12 @@ def aggregate(all_runs: list[dict[str, Any]]) -> dict[str, Any]:
         return _rate(sum(1 for t in task_terminals if t and match(t)), children) if typed_rates else None
 
     requests = [u.get("requests") for u in usage]
+    coord = [r.get("coordination") or {} for r in runs]
+
+    def coord_median(key: str) -> float | None:
+        xs = [float(c[key]) for c in coord if c.get(key) is not None]
+        return round(median(xs), 2) if xs else None
+
     return {
         "n": n,
         "errored_runs": len(all_runs) - n,
@@ -155,4 +165,13 @@ def aggregate(all_runs: list[dict[str, Any]]) -> dict[str, Any]:
         "cached_input_tokens_total": _total([u.get("cached_input_tokens") for u in usage]),
         "cost_usd_micros_total": _total([u.get("cost_usd_micros") for u in usage]),
         "unpriced_requests": _total([u.get("unpriced_requests") for u in usage]),
+        "time_to_first_useful_action_s_median": coord_median("time_to_first_useful_action_s"),
+        "time_to_first_spawn_s_median": coord_median("time_to_first_spawn_s"),
+        "parent_planning_s_median": coord_median("parent_planning_s"),
+        "child_critical_path_s_median": coord_median("child_critical_path_s"),
+        "parallel_time_saved_s_median": coord_median("parallel_time_saved_s"),
+        "parent_integration_s_median": coord_median("parent_integration_s"),
+        "coordination_overhead_s_median": coord_median("coordination_overhead_s"),
+        "child_write_after_terminal_total": sum(int(c.get("child_write_after_terminal") or 0) for c in coord),
+        "recovery_duplication_total": sum(int(c.get("recovery_duplication") or 0) for c in coord),
     }

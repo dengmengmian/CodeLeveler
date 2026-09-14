@@ -165,6 +165,39 @@ class UnknownIsNotZeroTests(unittest.TestCase):
         self.assertEqual(agg["requests_mean"], 3.0)
 
 
+class ThresholdMetricsTests(unittest.TestCase):
+    def test_a_worker_whose_file_the_parent_rewrote_is_not_useful(self):
+        j = judge_run(_run(
+            children=[{"id": "w", "role": "worker", "read_only": False}],
+            child_terminals={"w": {"outcome": "completed_with_findings", "stop": "completed"}},
+            lifecycle=_lifecycle(children=1, child_mutations={"w": ["slug/slug.go"]}),
+            changed_files=["slug/slug.go"],
+            coordination={"parent_rewrites": {"w": ["slug/slug.go"]}},
+        ))
+        self.assertEqual(j["useful_children"], {})
+        self.assertTrue(j["unnecessary_delegation"])
+
+    def test_coordination_medians_and_child_counts_are_aggregated(self):
+        runs = [
+            judge_run(_run(wall_s=100.0, coordination={"parent_planning_s": 60.0, "time_to_first_spawn_s": 70.0,
+                                                      "coordination_overhead_s": 80.0, "child_critical_path_s": 40.0,
+                                                      "parallel_time_saved_s": 90.0, "parent_integration_s": 10.0,
+                                                      "child_write_after_terminal": 0, "recovery_duplication": 0,
+                                                      "parent_rewrites": {}})),
+            judge_run(_run(wall_s=50.0, coordination={"parent_planning_s": None, "time_to_first_spawn_s": None,
+                                                     "coordination_overhead_s": None, "child_critical_path_s": None,
+                                                     "parallel_time_saved_s": None, "parent_integration_s": None,
+                                                     "child_write_after_terminal": 1, "recovery_duplication": 0,
+                                                     "parent_rewrites": {}})),
+        ]
+        agg = aggregate(runs)
+        self.assertEqual(agg["parent_planning_s_median"], 60.0)
+        self.assertEqual(agg["coordination_overhead_s_median"], 80.0)
+        self.assertEqual(agg["parallel_time_saved_s_median"], 90.0)
+        self.assertEqual(agg["child_write_after_terminal_total"], 1)
+        self.assertEqual(agg["recovery_duplication_total"], 0)
+
+
 class AggregateTests(unittest.TestCase):
     def test_rates_totals_and_unknown_cost(self):
         runs = [judge_run(_run()), judge_run(_run(expect_pass=False, wall_s=300.0,

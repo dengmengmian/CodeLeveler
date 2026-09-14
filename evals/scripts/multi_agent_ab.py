@@ -41,12 +41,17 @@ sys.path.insert(0, str(EVAL_ROOT / "lib"))
 
 from ab import aggregate, arm_order, judge_run  # noqa: E402
 from child_lifecycle import child_lifecycle, request_usage  # noqa: E402
+from coordination import coordination  # noqa: E402
 from eventlog import extract_timeline  # noqa: E402
 from runner import ARM_MULTI, ARM_SINGLE, default_user_config, prepare_home  # noqa: E402
 from spawn_metric import connect_ro, event_rows  # noqa: E402
 
-CASES = EVAL_ROOT / "cases" / "multi_agent_closure"
-CATALOG = EVAL_ROOT / "suites" / "multi_agent" / "product_closure" / "catalog.json"
+SUITES = {
+    "product_closure": (EVAL_ROOT / "cases" / "multi_agent_closure",
+                        EVAL_ROOT / "suites" / "multi_agent" / "product_closure" / "catalog.json"),
+    "value_threshold": (EVAL_ROOT / "cases" / "multi_agent_threshold",
+                        EVAL_ROOT / "suites" / "multi_agent" / "value_threshold" / "catalog.json"),
+}
 RUN_TIMEOUT_S = 1800
 CHILD_PROGRESS_BEFORE_KILL = 2
 PARENT_PROGRESS_BEFORE_KILL = 6
@@ -173,6 +178,7 @@ def observe(record: dict, home: Path) -> None:
     usage = request_usage(con)
     record["usage"] = usage["total"]
     record["usage_by_lane"] = {"parent": usage["parent"], "child": usage["child"]}
+    record["coordination"] = coordination(con)
     con.close()
 
 
@@ -188,11 +194,12 @@ def run_one(arm: dict, case: dict, meta: dict, rep: int, model: str, root: Path)
     env = dict(os.environ, LEVELER_HOME=str(home))
     env.pop("NODE_OPTIONS", None)
 
-    record = {"case": case["id"], "category": meta["category"], "arm": arm["name"], "rep": rep,
+    record = {"case": case["id"], "category": meta["category"], "bucket": meta.get("bucket"),
+              "arm": arm["name"], "rep": rep,
               "binary_version": arm["version"], "model": model, "started_at": now(), "host": platform.node()}
     common = ["--repo", str(ws), "--model", model, "--auto-approve", "--output", "jsonl"]
     t0 = time.time()
-    deadline = t0 + RUN_TIMEOUT_S
+    deadline = t0 + int(meta.get("timeout_s") or RUN_TIMEOUT_S)
     proc = launch([arm["binary"], "run", case["task"], *common, "--collaboration", "goal",
                    "--max-rounds", str(case.get("max_rounds") or 60)], ws, env, base / "run1")
     exits = []
@@ -243,8 +250,9 @@ def run_one(arm: dict, case: dict, meta: dict, rep: int, model: str, root: Path)
 def cmd_run(args) -> int:
     root = Path(args.out).resolve()
     arms = [parse_arm(a) for a in args.arm]
-    catalog = json.loads(CATALOG.read_text())["cases"]
-    cases = [yaml.safe_load((CASES / f"{cid}.yaml").read_text()) for cid in catalog]
+    cases_dir, catalog_path = SUITES[args.suite]
+    catalog = json.loads(catalog_path.read_text())["cases"]
+    cases = [yaml.safe_load((cases_dir / f"{cid}.yaml").read_text()) for cid in catalog]
     if args.only:
         cases = [c for c in cases if c["id"] in set(args.only)]
     root.mkdir(parents=True, exist_ok=True)
@@ -278,7 +286,8 @@ def cmd_rescore(args) -> int:
     for path in sorted((root / "runs").rglob("*.json")):
         record = json.loads(path.read_text())
         base = root / "work" / record["arm"] / record["case"] / str(record["rep"])
-        case = yaml.safe_load((CASES / f"{record['case']}.yaml").read_text())
+        cases_dir, _ = SUITES[args.suite]
+        case = yaml.safe_load((cases_dir / f"{record['case']}.yaml").read_text())
         if "expect_pass_at_run" not in record:
             record["expect_pass_at_run"] = record.get("expect_pass")
         record.pop("error", None)
@@ -305,6 +314,8 @@ def cmd_report(args) -> int:
     summary = {
         "arms": json.loads((root / "arms.json").read_text()),
         "by_arm": {a: aggregate([r for r in runs if r["arm"] == a]) for a in arms},
+        "by_arm_bucket": {a: {b: aggregate([r for r in runs if r["arm"] == a and r.get("bucket") == b])
+                              for b in sorted({r.get("bucket") for r in runs if r.get("bucket")})} for a in arms},
         "by_arm_category": {a: {c: aggregate([r for r in runs if r["arm"] == a and r["category"] == c])
                                 for c in categories} for a in arms},
         "invalid_attempts": invalid,
@@ -331,6 +342,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--out", required=True)
+    r.add_argument("--suite", choices=sorted(SUITES), default="product_closure")
     r.add_argument("--model", required=True)
     r.add_argument("--arm", action="append", required=True)
     r.add_argument("--runs", type=int, default=1)
@@ -339,6 +351,7 @@ def main() -> int:
     rep.add_argument("--out", required=True)
     rescore = sub.add_parser("rescore")
     rescore.add_argument("--out", required=True)
+    rescore.add_argument("--suite", choices=sorted(SUITES), default="product_closure")
     args = p.parse_args()
     return {"run": cmd_run, "report": cmd_report, "rescore": cmd_rescore}[args.cmd](args)
 
