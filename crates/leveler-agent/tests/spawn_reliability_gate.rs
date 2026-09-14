@@ -899,3 +899,116 @@ async fn the_total_child_cap_survives_a_window_boundary() {
         life.refusals[0]
     );
 }
+
+/// Records which transcript writes happened, in the shared order log.
+struct OrderSink {
+    order: OrderLog,
+}
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for OrderSink {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_engine::PortError> {
+        for message in messages {
+            let text = message.text_content();
+            let result_of_spawn = message.content.iter().any(|part| {
+                matches!(part, ContentPart::ToolResult { result } if result.call_id.as_str() == "s0")
+            });
+            if text.contains("## Background sub-agent settled") {
+                self.order.lock().unwrap().push("notice".to_string());
+            } else if result_of_spawn {
+                self.order.lock().unwrap().push("spawn_result".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The run's order log with the terminal event observed, for `run_in_background`.
+async fn settlement_order(background: bool) -> Vec<String> {
+    let dir = tmp(
+        if background {
+            "settle-durable-bg"
+        } else {
+            "settle-durable-fg"
+        },
+        73,
+    );
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let mut call = spawn_call("s0", "explore slice 0");
+    if let ContentPart::ToolCall { call } = &mut call {
+        call.arguments["run_in_background"] = serde_json::Value::Bool(background);
+    }
+    let script = vec![
+        assistant_with(vec![call], FinishReason::ToolCalls),
+        assistant_text("child 0 report"),
+        assistant_text("parent synthesis"),
+        assistant_text("parent synthesis"),
+    ];
+    let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let observer_order = order.clone();
+    let mut observer = move |event: AgentEvent| {
+        if let AgentEvent::SubAgentFinished { .. } = event {
+            observer_order.lock().unwrap().push("finished".to_string());
+        }
+    };
+    let result = Executor::new(
+        Arc::new(ScriptedRuntime::new(script)),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_event_barrier(Arc::new(RecordingBarrier {
+        order: order.clone(),
+    }))
+    .run(
+        "spawn and synthesise",
+        &mut observer,
+        &mut OrderSink {
+            order: order.clone(),
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+    result.expect("the run itself must succeed");
+    order.lock().unwrap().clone()
+}
+
+fn flush_between(log: &[String], first: &str, then: &str) -> bool {
+    let start = log
+        .iter()
+        .position(|e| e == first)
+        .unwrap_or_else(|| panic!("no `{first}` in {log:?}"));
+    let end = log[start..]
+        .iter()
+        .position(|e| e == then)
+        .map(|i| i + start)
+        .unwrap_or_else(|| panic!("no `{then}` after `{first}` in {log:?}"));
+    log[start..end].iter().any(|e| e == "flush")
+}
+
+/// SETTLEMENT_EXACTLY_ONCE (crash window) — the transcript must never say a
+/// child settled while its terminal event is still in flight. A crash in that
+/// gap leaves the parent holding a result the log calls unfinished, and the
+/// next window would continue a child that had already finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_settlement_is_durable_before_its_notice() {
+    let log = settlement_order(true).await;
+    assert!(
+        flush_between(&log, "finished", "notice"),
+        "no flush between the terminal event and the settlement notice: {log:?}"
+    );
+}
+
+/// The same window on the foreground path: the child's result rides the
+/// spawn call's tool result, which must not reach the transcript first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreground_settlement_is_durable_before_its_result() {
+    let log = settlement_order(false).await;
+    assert!(
+        flush_between(&log, "finished", "spawn_result"),
+        "no flush between the terminal event and the spawn result: {log:?}"
+    );
+}

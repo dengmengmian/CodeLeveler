@@ -529,6 +529,10 @@ impl<'a> Drive<'a> {
             // Terminal release: the child's exclusive claims end with it,
             // whatever its terminal state (idempotent).
             self.executor.ownership.release_all(&id);
+            // The terminal is durable before the transcript says the child
+            // settled: a crash between the two must not leave the parent
+            // holding a result the log still calls unfinished.
+            self.settlements_durable().await?;
             let notice = Message::text(
                 Role::User,
                 settlement_notice(&nickname, &id, role, &scope, &content),
@@ -594,6 +598,7 @@ impl<'a> Drive<'a> {
                     child.role,
                     &result,
                 );
+                self.settlements_durable().await?;
                 let notice = Message::text(
                     Role::User,
                     settlement_notice(
@@ -658,6 +663,15 @@ impl<'a> Drive<'a> {
             );
             self.sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
+        }
+        Ok(())
+    }
+
+    /// Wait until every child terminal emitted so far is durable. Hosts without
+    /// persistence have no barrier and nothing to wait for.
+    async fn settlements_durable(&mut self) -> Result<(), AgentError> {
+        if let Some(barrier) = &self.executor.event_barrier {
+            barrier.flush().await?;
         }
         Ok(())
     }
@@ -2750,6 +2764,9 @@ impl AgentHarness for Drive<'_> {
                 self.forward_child_event(rt, event).await?;
             }
             drop(futs);
+            // Foreground results reach the transcript with this round's tool
+            // message below; their terminals must be durable first.
+            self.settlements_durable().await?;
             // Always flush after sub-agent batch so absorbed spend is durable
             // even when the parent is about to cancel.
             self.flush_epoch(rt);
