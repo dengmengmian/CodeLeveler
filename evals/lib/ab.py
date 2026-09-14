@@ -11,7 +11,15 @@ from __future__ import annotations
 from statistics import mean, median
 from typing import Any
 
+import re
+
 COMPLETED = {"completed", "verified", "completed_unverified"}
+GO_PACKAGE_LINE = re.compile(r"^(ok|FAIL)\s+evalcase/([\w./-]+)", re.M)
+
+
+def unit_results(output: str) -> dict[str, bool]:
+    """Per-package verdicts from `go test` output; empty when none were reported."""
+    return {pkg: status == "ok" for status, pkg in GO_PACKAGE_LINE.findall(output or "")}
 
 
 def arm_order(arms: list[str], slot: int) -> list[str]:
@@ -126,6 +134,9 @@ def aggregate(all_runs: list[dict[str, Any]]) -> dict[str, Any]:
 
     requests = [u.get("requests") for u in usage]
     coord = [r.get("coordination") or {} for r in runs]
+    units = [r.get("unit_results") or {} for r in runs]
+    units_total = sum(len(u) for u in units)
+    units_passed = sum(sum(1 for ok in u.values() if ok) for u in units)
 
     def coord_median(key: str) -> float | None:
         xs = [float(c[key]) for c in coord if c.get(key) is not None]
@@ -165,6 +176,10 @@ def aggregate(all_runs: list[dict[str, Any]]) -> dict[str, Any]:
         "cached_input_tokens_total": _total([u.get("cached_input_tokens") for u in usage]),
         "cost_usd_micros_total": _total([u.get("cost_usd_micros") for u in usage]),
         "unpriced_requests": _total([u.get("unpriced_requests") for u in usage]),
+        "units_passed": units_passed,
+        "units_total": units_total,
+        "unit_pass_rate": _rate(units_passed, units_total),
+        "runs_without_unit_results": sum(1 for u in units if not u),
         "time_to_first_useful_action_s_median": coord_median("time_to_first_useful_action_s"),
         "time_to_first_spawn_s_median": coord_median("time_to_first_spawn_s"),
         "parent_planning_s_median": coord_median("parent_planning_s"),

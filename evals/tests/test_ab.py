@@ -4,7 +4,7 @@ import unittest
 
 from _path import LIB  # noqa: F401
 
-from ab import aggregate, arm_order, judge_run
+from ab import aggregate, arm_order, judge_run, unit_results
 
 
 def _lifecycle(**over):
@@ -196,6 +196,34 @@ class ThresholdMetricsTests(unittest.TestCase):
         self.assertEqual(agg["parallel_time_saved_s_median"], 90.0)
         self.assertEqual(agg["child_write_after_terminal_total"], 1)
         self.assertEqual(agg["recovery_duplication_total"], 0)
+
+
+class UnitQualityTests(unittest.TestCase):
+    OUTPUT = (
+        "ok  \tevalcase/expr\t1.537s\n"
+        "--- FAIL: TestHiddenSyntaxErrors (0.00s)\nFAIL\n"
+        "FAIL\tevalcase/jsonpath\t0.949s\n"
+        "ok  \tevalcase/textdiff\t(cached)\n"
+        "FAIL\tevalcase/toposort [build failed]\n"
+        "?   \tevalcase\t[no test files]\n"
+    )
+
+    def test_each_package_verdict_is_read_from_go_test_output(self):
+        self.assertEqual(unit_results(self.OUTPUT),
+                         {"expr": True, "jsonpath": False, "textdiff": True, "toposort": False})
+
+    def test_output_without_package_lines_is_unknown(self):
+        self.assertEqual(unit_results("git diff reported a modified test file"), {})
+
+    def test_unit_pass_rate_is_aggregated_over_units(self):
+        a = judge_run(_run(unit_results={"a": True, "b": False}))
+        b = judge_run(_run(unit_results={"a": True, "b": True}))
+        c = judge_run(_run(unit_results={}))
+        agg = aggregate([a, b, c])
+        self.assertEqual(agg["units_passed"], 3)
+        self.assertEqual(agg["units_total"], 4)
+        self.assertEqual(agg["unit_pass_rate"], 0.75)
+        self.assertEqual(agg["runs_without_unit_results"], 1)
 
 
 class AggregateTests(unittest.TestCase):

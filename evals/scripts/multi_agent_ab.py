@@ -39,7 +39,7 @@ import yaml
 EVAL_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVAL_ROOT / "lib"))
 
-from ab import aggregate, arm_order, judge_run  # noqa: E402
+from ab import aggregate, arm_order, judge_run, unit_results  # noqa: E402
 from child_lifecycle import child_lifecycle, request_usage  # noqa: E402
 from coordination import coordination  # noqa: E402
 from eventlog import extract_timeline  # noqa: E402
@@ -240,6 +240,7 @@ def run_one(arm: dict, case: dict, meta: dict, rep: int, model: str, root: Path)
     record["changed_files"] = changed_files(ws)
     record["visible_checks_pass"], _ = check(["go", "test", "./..."], ws)
     record["expect_pass"], output = check([case["expect"]["program"], *case["expect"]["args"]], ws)
+    record["unit_results"] = unit_results(output)
     (base / "expect.out").write_text(output)
 
     observe(record, home)
@@ -292,6 +293,7 @@ def cmd_rescore(args) -> int:
             record["expect_pass_at_run"] = record.get("expect_pass")
         record.pop("error", None)
         record["expect_pass"], output = check([case["expect"]["program"], *case["expect"]["args"]], base / "ws")
+        record["unit_results"] = unit_results(output)
         (base / "expect.rescored.out").write_text(output)
         observe(record, base / "home")
         record["rescored_at"] = now()
