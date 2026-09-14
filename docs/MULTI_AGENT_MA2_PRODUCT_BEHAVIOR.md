@@ -1,6 +1,6 @@
 # Multi-Agent MA2 — Product Behavior Closure
 
-Status: **PASS**. Scope from `docs/MULTI_AGENT_MA0_REALITY_AND_GAP_AUDIT.md`
+Status: **PASS** (gate recorded after CI, §6). Scope from `docs/MULTI_AGENT_MA0_REALITY_AND_GAP_AUDIT.md`
 §9 (REAL_MA2_SCOPE). Base: MA1 PASS at `1ed1c62`.
 
 ## 1. What MA2 did not change, on purpose
@@ -16,9 +16,9 @@ Status: **PASS**. Scope from `docs/MULTI_AGENT_MA0_REALITY_AND_GAP_AUDIT.md`
 
 | Item | Change | Commit | Test |
 |---|---|---|---|
-| G9a silent role mapping | An unknown role word or `reviewer` (from the model or a named agent) is refused with the reason; omitted/empty still means Default | `55884f9` | `an_unknown_or_harness_only_role_word_is_refused` |
+| G9a silent role mapping | An unknown role word or `reviewer` is refused with the reason — alone or beside `profile`; a non-string `role`/`profile` is refused; a bad role in a named agent's definition names the agent; omitted/empty still means Default | `55884f9`, `412ee90` (review) | `an_unknown_or_harness_only_role_word_is_refused`, `an_unknown_role_beside_a_profile_is_refused`, `a_non_string_role_is_refused_not_read_as_omitted`, `a_bad_role_in_an_agent_definition_names_the_definition` |
 | G9b pinned model admission | Unresolvable pinned model, or unpriced under a cost cap, refused at spawn; resumed child settles failed | `ac43ef6` (MA1 review) | `an_unpriced_pinned_model_is_refused_under_a_cost_cap`, `an_unresolvable_pinned_model_is_refused_at_spawn` |
-| Task tools on a child id (MA1 dogfood) | `wait_task` / `get_task` / `kill_task` naming a running child answer what the id is and that its settlement arrives automatically | `55884f9` | `waiting_on_a_child_with_the_task_tools_says_what_the_id_is` |
+| Task tools on a child id (MA1 dogfood) | `wait_task` / `get_task` / `kill_task` naming a child get an informational answer (`is_error=false`): what the id is, whether it is running or finished-awaiting-settlement, and for `kill_task` that a child cannot be cancelled from the model side | `55884f9`, `412ee90` | `task_tools_naming_a_running_child_say_what_the_id_is`, `task_tools_naming_a_finished_unsettled_child_do_not_call_it_running` (child held on a signal, no sleep race for the running case) |
 
 ## 3. Real-model behavior batch
 
@@ -28,13 +28,18 @@ run each. S2–S8 name `spawn_agent` in the task: they check what the runtime
 and the parent do once a child exists, not whether the model elects to
 delegate. Counts read from each session's event log and `model_requests`.
 
+Columns: **Dup** = children with more than one terminal; **Open** = started
+children with no terminal; **Refused** = `spawn_agent` calls that returned an
+error (admission refusals only — task-tool answers are not counted); **Wall**
+= first to last event of the session.
+
 | Scenario | Spawns | Child terminals (outcome / stop) | Dup | Open | Refused | Wall | Result |
 |---|---|---|---|---|---|---|---|
 | S1 simple question, no instruction | 0 | — | 0 | 0 | 0 | 4 s | answered directly; no delegation |
 | S2 background explorer | 1 | with_findings / completed | 0 | 0 | 0 | 29 s | `SINKS.md` written from the settled report |
 | S3 foreground dependency | 1 | with_findings / completed | 0 | 0 | 0 | 29 s | parent used the result: comment added in `internal/ingest/decoder.go`; checks passed |
 | S4 parallel explorers (one message) | 2 | with_findings / completed ×2 | 0 | 0 | 0 | 25 s | `PACKAGES.md` with both summaries |
-| S5 parallel disjoint workers | 2 | with_findings / completed ×2 | 0 | 0 | 0 | 23 s | both `NOTES.md` files, nothing else changed; the parent called `wait_task` on both child ids and got the new sub-agent answer (not `unknown task`) |
+| S5 parallel disjoint workers | 2 | with_findings / completed ×2 | 0 | 0 | 0 | 23 s | both `NOTES.md` files, nothing else changed; the parent called `wait_task` on both child ids and got the sub-agent answer (binary `55884f9`, before the review wording change) |
 | S6 child stopped by its round cap | 1 | incomplete_partial / budget | 0 | 0 | 0 | 19 s | parent reported the child did not finish and named what was not covered; did not treat it as investigated |
 | S7 harness-launched reviewer | 1 (reviewer) | with_findings / completed | 0 | 0 | 0 | 22 s | change landed, reviewer bounded (2 requests), checks passed |
 | S8 overlapping workers, one message | 1 | with_findings / completed | 0 | 0 | 1 | 21 s | second spawn refused: "overlaps a worker already admitted in this batch"; only A wrote |
@@ -59,6 +64,23 @@ Covered elsewhere, not re-run here:
   real model, not its rate. Rates are MA4.
 - Parent confusion between background tasks and children is answered, not
   prevented: the model may still spend a round on it (seen in S5).
+
+## 4a. Independent review
+
+A fresh-context review of `1ed1c62..4292d00` found no high-severity issue and
+no authority bypass (the interception runs no tool; role changes only
+narrow). One medium (this document claimed PASS before CI and carried no
+workspace-test evidence) and six low findings (role word beside `profile`
+skipped; non-string role read as omitted; misleading refusal for a bad role
+in an agent definition; "still running" for a finished-unsettled child and
+no cancel wording for `kill_task`; `is_error=true` counted as progress; a
+sleep-raced test). All fixed test-first in the commit after `4292d00`. It
+could not verify the real-model batch, whose sessions live outside the
+repository.
+
+Quality after the fixes: `cargo fmt` pass, `cargo clippy -D warnings` pass,
+`cargo test --workspace --all-features --locked`: 3863 passed, 0 failed,
+20 ignored.
 
 ## 5. Gates
 
