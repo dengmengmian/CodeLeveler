@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import sqlite3
@@ -130,6 +131,14 @@ def wait(proc: subprocess.Popen, deadline: float) -> int | str:
         kill_group(proc)
         proc.wait()
         return "timeout"
+
+
+HIDDEN_TEST = re.compile(r"cat > '([^'/]+)/zz_hidden_test\.go'")
+
+
+def registered_units(case: dict) -> list[str]:
+    """The packages the oracle writes hidden tests into: the case's work units."""
+    return sorted(set(HIDDEN_TEST.findall(" ".join(case["expect"]["args"]))))
 
 
 def changed_files(ws: Path) -> list[str]:
@@ -242,7 +251,7 @@ def run_one(arm: dict, case: dict, meta: dict, rep: int, model: str, root: Path)
     record["changed_files"] = changed_files(ws)
     record["visible_checks_pass"], _ = check(["go", "test", "./..."], ws)
     record["expect_pass"], output = check([case["expect"]["program"], *case["expect"]["args"]], ws)
-    record["unit_results"] = unit_results(output)
+    record["unit_results"] = unit_results(output, registered_units(case))
     (base / "expect.out").write_text(output)
 
     observe(record, home)
@@ -305,7 +314,7 @@ def cmd_rescore(args) -> int:
             record["expect_pass_at_run"] = record.get("expect_pass")
         record.pop("error", None)
         record["expect_pass"], output = check([case["expect"]["program"], *case["expect"]["args"]], base / "ws")
-        record["unit_results"] = unit_results(output)
+        record["unit_results"] = unit_results(output, registered_units(case))
         (base / "expect.rescored.out").write_text(output)
         observe(record, base / "home")
         record["rescored_at"] = now()

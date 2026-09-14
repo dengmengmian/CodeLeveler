@@ -17,9 +17,16 @@ COMPLETED = {"completed", "verified", "completed_unverified"}
 GO_PACKAGE_LINE = re.compile(r"^(ok|FAIL)\s+evalcase/([\w./-]+)", re.M)
 
 
-def unit_results(output: str) -> dict[str, bool]:
-    """Per-package verdicts from `go test` output; empty when none were reported."""
-    return {pkg: status == "ok" for status, pkg in GO_PACKAGE_LINE.findall(output or "")}
+def unit_results(output: str, registered: list[str] | None = None) -> dict[str, bool]:
+    """Per-package verdicts from `go test` output; empty when none were reported.
+
+    With `registered`, only those packages are scored: a scratch package the
+    agent left behind is not a work unit (it can still fail the oracle).
+    """
+    found = {pkg: status == "ok" for status, pkg in GO_PACKAGE_LINE.findall(output or "")}
+    if registered is None:
+        return found
+    return {pkg: ok for pkg, ok in found.items() if pkg in set(registered)}
 
 
 def arm_order(arms: list[str], slot: int) -> list[str]:

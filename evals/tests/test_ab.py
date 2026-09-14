@@ -222,6 +222,11 @@ class UnitQualityTests(unittest.TestCase):
         self.assertEqual(unit_results(self.OUTPUT),
                          {"expr": True, "jsonpath": False, "textdiff": True, "toposort": False})
 
+    def test_only_registered_units_are_scored(self):
+        output = self.OUTPUT + "FAIL\tevalcase/zzcheck\t2.120s\n"
+        self.assertEqual(unit_results(output, registered=["expr", "jsonpath", "textdiff", "toposort"]),
+                         {"expr": True, "jsonpath": False, "textdiff": True, "toposort": False})
+
     def test_output_without_package_lines_is_unknown(self):
         self.assertEqual(unit_results("git diff reported a modified test file"), {})
 
