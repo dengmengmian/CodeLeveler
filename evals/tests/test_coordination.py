@@ -6,20 +6,23 @@ import unittest
 
 from _path import LIB  # noqa: F401
 
-from coordination import coordination
+from coordination import coordination, reasoning_effort_by_lane
 
 
 def _db(events, requests=()):
-    """events: (seconds, type, payload); requests: (end_seconds, latency_s, agent_id)."""
+    """events: (seconds, type, payload); requests: (end_seconds, latency_s, agent_id[, input, output])."""
     con = sqlite3.connect(":memory:")
     con.execute("create table events (sequence integer, type text, payload text, created_at text)")
-    con.execute("create table model_requests (created_at text, latency_ms integer, agent_id text)")
+    con.execute("create table model_requests (created_at text, latency_ms integer, agent_id text, "
+                "input_tokens integer default 0, output_tokens integer default 0, provider_request_id text)")
     for i, (t, etype, payload) in enumerate(events, start=1):
         con.execute("insert into events values (?,?,?,?)",
                     (i, etype, json.dumps({"type": etype, "payload": payload}), f"2026-09-14T00:{int(t)//60:02d}:{t%60:06.3f}+00:00"))
-    for end, latency, agent in requests:
-        con.execute("insert into model_requests values (?,?,?)",
-                    (f"2026-09-14T00:{int(end)//60:02d}:{end%60:06.3f}+00:00", int(latency * 1000), agent))
+    for end, latency, agent, *tokens in requests:
+        tin, tout = tokens or (0, 0)
+        con.execute("insert into model_requests values (?,?,?,?,?,null)",
+                    (f"2026-09-14T00:{int(end)//60:02d}:{end%60:06.3f}+00:00", int(latency * 1000), agent,
+                     tin, tout))
     return con
 
 
@@ -46,6 +49,8 @@ class NoDelegationTests(unittest.TestCase):
         self.assertIsNone(c["time_to_first_spawn_s"])
         self.assertIsNone(c["coordination_overhead_s"])
         self.assertEqual(c["children"], [])
+        self.assertIsNone(c["time_to_first_read_s"])
+        self.assertIsNone(c["parent_pre_spawn"])
 
 
 class DelegatedRunTests(unittest.TestCase):
@@ -54,7 +59,7 @@ class DelegatedRunTests(unittest.TestCase):
             [
                 (0, "turn_started", {}),
                 *_tool(2, None, "read_file", "a.go"),
-                (70, "sub_agent_started", {"id": "c1", "role": "worker"}),
+                (70, "sub_agent_started", {"id": "c1", "role": "worker", "task": "implement p/one"}),
                 (70, "sub_agent_started", {"id": "c2", "role": "worker"}),
                 *_tool(75, None, "write_file", "own.go"),
                 *_tool(80, "c1", "write_file", "p/one.go"),
@@ -65,7 +70,8 @@ class DelegatedRunTests(unittest.TestCase):
                 (120, "task_finished", {"outcome": "completed"}),
             ],
             # Both children begin work the moment they start (no queue).
-            requests=[(3, 1, None), (69, 65, None), (79, 9, "c1"), (94, 24, "c2"), (110, 4, None)],
+            requests=[(3, 1, None, 100, 10), (69, 65, None, 300, 40), (79, 9, "c1"), (94, 24, "c2"),
+                      (110, 4, None, 500, 5)],
         )
         self.c = coordination(self.con)
 
@@ -74,6 +80,16 @@ class DelegatedRunTests(unittest.TestCase):
         # The parent's request that ended before the spawn took 65 s.
         self.assertEqual(self.c["parent_planning_s"], 65.0)
         self.assertEqual(self.c["time_to_first_useful_action_s"], 70.0)
+
+    def test_first_read_and_parent_work_before_the_first_spawn(self):
+        self.assertEqual(self.c["time_to_first_read_s"], 2.0)
+        self.assertEqual(self.c["parent_pre_spawn"], {
+            "requests": 2, "input_tokens": 400, "output_tokens": 50, "model_wait_s": 66.0})
+        self.assertEqual(self.c["parent_requests"], 3)
+
+    def test_each_child_brief_length_is_reported(self):
+        briefs = {c["id"]: c["brief_chars"] for c in self.c["children"]}
+        self.assertEqual(briefs, {"c1": len("implement p/one"), "c2": None})
 
     def test_child_runtime_critical_path_and_parallel_saving(self):
         runtimes = {c["id"]: c["runtime_s"] for c in self.c["children"]}
@@ -143,6 +159,27 @@ class SafetyTests(unittest.TestCase):
         c = coordination(con)
         self.assertIsNone(c["time_to_first_spawn_s"])
         self.assertEqual(c["children"], [])
+
+
+class ReasoningEffortByLaneTests(unittest.TestCase):
+    def test_trace_lines_are_joined_to_their_lane_by_request_id(self):
+        con = _db([(0, "turn_started", {})])
+        con.executemany("insert into model_requests (created_at, latency_ms, agent_id, provider_request_id) "
+                        "values ('2026-09-14T00:00:01+00:00', 1, ?, ?)",
+                        [(None, "req_p1"), (None, "req_p2"), ("c1", "req_c1")])
+        err = (
+            "\x1b[2m2026-09-14T00:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m leveler_agent_core::model_round: "
+            "model round started request_id=req_p1 messages=3 reasoning_effort=Some(High)\n"
+            "2026-09-14T00:00:01Z  INFO leveler_agent_core::model_round: model round started "
+            "request_id=req_p2 messages=5 reasoning_effort=Some(High)\n"
+            "2026-09-14T00:00:02Z  INFO leveler_agent_core::model_round: model round started "
+            "request_id=req_c1 messages=2 reasoning_effort=Some(Max)\n"
+            "2026-09-14T00:00:03Z  INFO leveler_agent_core::model_round: model round started "
+            "request_id=req_lost messages=2 reasoning_effort=None\n"
+            "2026-09-14T00:00:04Z  INFO leveler_agent_core::model_round: model round finished request_id=req_p1\n"
+        )
+        self.assertEqual(reasoning_effort_by_lane(err, con), {
+            "parent": {"High": 2}, "child": {"Max": 1}, "unmatched": {"None": 1}})
 
 
 if __name__ == "__main__":

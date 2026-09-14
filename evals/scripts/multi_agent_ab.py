@@ -44,7 +44,7 @@ sys.path.insert(0, str(EVAL_ROOT / "lib"))
 
 from ab import aggregate, judge_run, plan_slots, unit_results  # noqa: E402
 from child_lifecycle import child_lifecycle, request_usage  # noqa: E402
-from coordination import coordination  # noqa: E402
+from coordination import coordination, reasoning_effort_by_lane  # noqa: E402
 from eventlog import extract_timeline  # noqa: E402
 from runner import ARM_MULTI, ARM_SINGLE, default_user_config, prepare_home  # noqa: E402
 from spawn_metric import connect_ro, event_rows  # noqa: E402
@@ -56,6 +56,10 @@ SUITES = {
                         EVAL_ROOT / "suites" / "multi_agent" / "value_threshold" / "catalog.json"),
 }
 RUN_TIMEOUT_S = 1800
+PARENT_EFFORT_ENV = "LEVELER_EVAL_PARENT_REASONING_EFFORT"
+# The CLI's default filter is `leveler=warn`; keep that and add the one line
+# that names each request's reasoning effort.
+EFFORT_TRACE = "leveler=warn,leveler_agent_core::model_round=info"
 CHILD_PROGRESS_BEFORE_KILL = 2
 PARENT_PROGRESS_BEFORE_KILL = 6
 
@@ -67,10 +71,23 @@ def now() -> str:
 def parse_arm(spec: str) -> dict:
     name, _, rest = spec.partition("=")
     binary, _, mode = rest.partition(":")
-    if not name or not binary or mode not in ("", "single"):
-        raise SystemExit(f"bad --arm {spec!r}: want name=/path/to/leveler[:single]")
+    parent_effort = mode.removeprefix("parent=") if mode.startswith("parent=") else None
+    if not name or not binary or (mode not in ("", "single") and not parent_effort):
+        raise SystemExit(f"bad --arm {spec!r}: want name=/path/to/leveler[:single|:parent=<effort>]")
     version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
-    return {"name": name, "binary": binary, "single": mode == "single", "version": version}
+    return {"name": name, "binary": binary, "single": mode == "single", "parent_effort": parent_effort,
+            "version": version}
+
+
+def arm_env(arm: dict, home: Path) -> dict:
+    """The run's environment. Every arm traces the effort each request was
+    sent with; only a `parent=` arm lowers the top-level seat's effort."""
+    env = dict(os.environ, LEVELER_HOME=str(home), RUST_LOG=EFFORT_TRACE)
+    env.pop("NODE_OPTIONS", None)
+    env.pop(PARENT_EFFORT_ENV, None)
+    if arm.get("parent_effort"):
+        env[PARENT_EFFORT_ENV] = arm["parent_effort"]
+    return env
 
 
 def materialize(case: dict, ws: Path) -> None:
@@ -190,6 +207,9 @@ def observe(record: dict, home: Path) -> None:
     record["usage"] = usage["total"]
     record["usage_by_lane"] = {"parent": usage["parent"], "child": usage["child"]}
     record["coordination"] = coordination(con)
+    trace = "".join(p.read_text(errors="replace") for p in sorted(home.parent.glob("run*.err")))
+    record["effort_by_lane"] = reasoning_effort_by_lane(trace, con)
+    record["round_limit_hit"] = record["task_outcome"] == "budget_limited"
     con.close()
 
 
@@ -202,11 +222,10 @@ def run_one(arm: dict, case: dict, meta: dict, rep: int, model: str, root: Path)
     materialize(case, ws)
     user_cfg = default_user_config()
     prepare_home(home, ARM_SINGLE if arm["single"] else ARM_MULTI, user_cfg if user_cfg.is_file() else None)
-    env = dict(os.environ, LEVELER_HOME=str(home))
-    env.pop("NODE_OPTIONS", None)
+    env = arm_env(arm, home)
 
     record = {"case": case["id"], "category": meta["category"], "bucket": meta.get("bucket"),
-              "arm": arm["name"], "rep": rep,
+              "arm": arm["name"], "rep": rep, "parent_effort": arm.get("parent_effort"),
               "binary_version": arm["version"], "model": model, "started_at": now(), "host": platform.node()}
     common = ["--repo", str(ws), "--model", model, "--auto-approve", "--output", "jsonl"]
     t0 = time.time()
