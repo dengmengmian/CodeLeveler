@@ -572,6 +572,8 @@ mod tests {
             ok,
             summary: "done".into(),
             contribution: None,
+            outcome: None,
+            stop: None,
         }
     }
 
@@ -967,6 +969,8 @@ mod tests {
                 ok: true,
                 summary: "done".into(),
                 contribution: None,
+                outcome: None,
+                stop: None,
             },
             &mut sink,
         )
@@ -1012,6 +1016,8 @@ mod tests {
                 ok: false,
                 summary: "failed, but it reported".into(),
                 contribution: None,
+                outcome: None,
+                stop: None,
             },
             &mut sink,
         )

@@ -390,6 +390,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             ok,
             summary,
             contribution,
+            ..
         } => (
             ObservationClass::Agent,
             format!("{nickname} done"),
@@ -1004,6 +1005,8 @@ mod tests {
                     findings_total: 3,
                     ..Default::default()
                 }),
+                outcome: None,
+                stop: None,
             },
         )
         .await;
@@ -1255,6 +1258,8 @@ mod tests {
             ok,
             summary: summary.into(),
             contribution: None,
+            outcome: None,
+            stop: None,
         }
     }
 

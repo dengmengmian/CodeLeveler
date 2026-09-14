@@ -42,7 +42,6 @@ export type CheckState =
   /** The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason. */
   | 'unknown';
 
-/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. */
 export interface ChildContribution {
   findings_total: number;
   profile_id?: string | null;
@@ -51,6 +50,12 @@ export interface ChildContribution {
   read_only?: boolean;
   role: string;
 }
+
+/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. `findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. The four-way reading of a settled child's result. "Finished with nothing to flag" and "stopped with nothing to show" are opposite facts; a client renders them from this field, never from the summary text. */
+export type ChildOutcome = 'completed_with_findings' | 'completed_no_findings' | 'incomplete_partial' | 'incomplete_no_result';
+
+/** How a settled child's activation ended. */
+export type ChildStop = 'completed' | 'incomplete' | 'budget' | 'cancelled' | 'failed' | 'lost';
 
 /** Identifies a pending clarification (ask-user) request. */
 export type ClarificationId = string;
@@ -687,7 +692,7 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string }
+  | { type: 'sub_agent_updated'; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; stop?: ChildStop | null }
   /** Live execution state and cumulative model usage for one spawned agent. */
   | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
   /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */

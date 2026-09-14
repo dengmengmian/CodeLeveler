@@ -340,6 +340,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             profile_role: _,
             read_only,
             contribution,
+            ..
         } => {
             let started = state.elapsed_secs;
             state.team.apply_update(crate::multi_agent::ChildUpdate {

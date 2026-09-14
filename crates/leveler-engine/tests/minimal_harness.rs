@@ -427,8 +427,12 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
                 ok,
                 contribution,
                 summary,
+                outcome,
+                stop,
                 ..
-            } if id == "ghost-1" => Some((*ok, contribution.clone(), summary.clone())),
+            } if id == "ghost-1" => {
+                Some((*ok, contribution.clone(), summary.clone(), *outcome, *stop))
+            }
             _ => None,
         })
         .expect("the engine settles a ghost with no harness help at all");
@@ -436,6 +440,15 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
     assert!(
         settled.1.is_none(),
         "no voice, no contribution: the engine must not invent one"
+    );
+    assert!(
+        settled.3.is_none(),
+        "no voice, no four-way reading: the engine must not invent one"
+    );
+    assert_eq!(
+        settled.4,
+        Some(leveler_lifecycle::ChildStop::Lost),
+        "how the activation ended IS the engine's to say"
     );
     assert!(
         settled.2.contains("Helper") && settled.2.contains("lost"),
@@ -467,4 +480,64 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
             .any(|e| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "ghost-1")),
         "the first terminal fact wins; the engine must not settle it twice"
     );
+}
+
+/// A turn that ends while a child it announced never reported: the engine's
+/// turn-end reconciliation says HOW that activation ended, from the turn's own
+/// terminal — a cancelled turn cancelled its child.
+#[tokio::test]
+async fn a_child_left_open_by_a_cancelled_turn_is_settled_as_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::connect(&dir.path().join("minimal.sqlite"))
+        .await
+        .unwrap();
+    let session = open_session(&db).await;
+    let engine = engine(&db);
+    let token = engine
+        .mark_running(&session, AgentState::Understand)
+        .await
+        .unwrap();
+    let log = EventLog::new_owned(&db, session.clone(), token.clone());
+    let runner = TurnRunner {
+        stores: &engine.stores,
+        token,
+        session_id: session.clone(),
+        log: &log,
+        approver: Arc::new(NoHuman),
+        clarifier: Arc::new(AutoClarify),
+        lost_child_voice: None,
+    };
+    let mut events = Vec::new();
+    let result = runner
+        .run_turn(
+            TurnKind::User,
+            TurnStart::Fresh(Message::text(Role::User, "go")),
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+            |ports: TurnPorts| async move {
+                ports.emitter.emit(EngineEvent::SubAgentStarted {
+                    id: "open-1".into(),
+                    nickname: "Helper".into(),
+                    role: "whatever".into(),
+                    task: "something".into(),
+                    profile_id: None,
+                    profile_role: None,
+                    read_only: true,
+                });
+                Err::<TurnFacts<MinimalResult>, _>(TurnFailure {
+                    cancelled: true,
+                    detail: "stopped".into(),
+                    stale_ownership: false,
+                    model: None,
+                })
+            },
+        )
+        .await;
+    assert!(result.is_err(), "a cancelled turn reports its cancellation");
+
+    let stop = events.iter().find_map(|e| match e {
+        EngineEvent::SubAgentFinished { id, stop, .. } if id == "open-1" => Some(*stop),
+        _ => None,
+    });
+    assert_eq!(stop, Some(Some(leveler_lifecycle::ChildStop::Cancelled)));
 }

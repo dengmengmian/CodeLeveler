@@ -31,6 +31,19 @@ fn stop_reason_wording(reason: StopReason) -> String {
     .to_string()
 }
 
+/// The mechanical class of a child run that returned on its own.
+fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
+    use leveler_lifecycle::ChildStop;
+    match reason {
+        StopReason::Completed
+        | StopReason::Answered
+        | StopReason::CompletedUnverified
+        | StopReason::CompletedChecksFailed => ChildStop::Completed,
+        StopReason::BudgetExhausted | StopReason::TurnLimitReached => ChildStop::Budget,
+        StopReason::Blocked | StopReason::Stalled | StopReason::Incomplete => ChildStop::Incomplete,
+    }
+}
+
 impl Executor {
     /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
     pub(crate) async fn handle_ask_user(
@@ -268,6 +281,7 @@ impl Executor {
         }
         DelegatedChildResult {
             ok: result.result.status.completed(),
+            stop: result.stop,
             result: result.result,
             progress: result.progress,
             modified_files: result.modified_files,
@@ -376,6 +390,7 @@ async fn run_prepared_sub_agent(
         Err(_) => {
             return SubAgentRunResult {
                 result: ChildResult::new(false, "", "no concurrency slot was available to run it"),
+                stop: leveler_lifecycle::ChildStop::Failed,
                 progress: ProgressLedger::default(),
                 modified_files: Vec::new(),
                 findings: Vec::new(),
@@ -551,6 +566,7 @@ async fn run_prepared_sub_agent(
             };
             SubAgentRunResult {
                 result: ChildResult::new(completed, &findings, stop_reason),
+                stop: child_stop(outcome.stop_reason),
                 progress: outcome.progress,
                 modified_files: outcome.modified_files,
                 findings: reported_findings,
@@ -567,6 +583,7 @@ async fn run_prepared_sub_agent(
                     &said_before_stopping(),
                     "stopped before it could finish",
                 ),
+                stop: leveler_lifecycle::ChildStop::Cancelled,
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
@@ -577,6 +594,7 @@ async fn run_prepared_sub_agent(
             let paths = ledger.cumulative_modified_paths.clone();
             SubAgentRunResult {
                 result: ChildResult::new(false, &said_before_stopping(), e.to_string()),
+                stop: leveler_lifecycle::ChildStop::Failed,
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
@@ -591,6 +609,8 @@ async fn run_prepared_sub_agent(
 pub struct DelegatedChildResult {
     /// Whether the child reached a clean terminal state.
     pub ok: bool,
+    /// How the activation ended, mechanically.
+    pub stop: leveler_lifecycle::ChildStop,
     /// What the child established, and how its run ended.
     pub result: ChildResult,
     /// The child's own spend (rounds, tokens, cost, commands, paths), for the
@@ -608,6 +628,8 @@ pub struct DelegatedChildResult {
 #[derive(Debug, Clone)]
 pub(crate) struct SubAgentRunResult {
     pub result: ChildResult,
+    /// How the activation ended, mechanically.
+    pub stop: leveler_lifecycle::ChildStop,
     pub progress: ProgressLedger,
     pub modified_files: Vec<String>,
     /// Typed findings captured from the child's ledger snapshots.

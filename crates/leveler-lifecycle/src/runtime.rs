@@ -228,6 +228,38 @@ impl TurnOutcome {
     }
 }
 
+/// How one delegated child's activation ended, mechanically. Carried on the
+/// child's terminal event so no reader has to recover it from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildStop {
+    /// Ran to its own clean end.
+    Completed,
+    /// Ended on its own without finishing (blocked, stalled, refused).
+    Incomplete,
+    /// A wall, round, token or cost bound stopped it.
+    Budget,
+    /// Its parent, its task or a user cancelled it.
+    Cancelled,
+    /// Its run broke (provider, persistence, panic).
+    Failed,
+    /// Its activation died with a runtime window and it was not continued.
+    Lost,
+}
+
+impl ChildStop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChildStop::Completed => "completed",
+            ChildStop::Incomplete => "incomplete",
+            ChildStop::Budget => "budget",
+            ChildStop::Cancelled => "cancelled",
+            ChildStop::Failed => "failed",
+            ChildStop::Lost => "lost",
+        }
+    }
+}
+
 /// Why the loop stopped. Serialized (snake_case) into terminal engine events
 /// so blocked/budget/complete stay machine-discriminable after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

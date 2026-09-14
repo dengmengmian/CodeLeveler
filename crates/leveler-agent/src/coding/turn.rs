@@ -389,26 +389,32 @@ impl LostChildVoice for CodingLostChildVoice {
             }
         };
         lost.iter()
-            .filter_map(|child| {
+            .map(|child| {
                 let projection = leveler_lifecycle::ChildResultProjection::from_findings(
                     &child.id,
                     &child.role,
                     &ledger.findings,
                 );
                 let preserved = projection.findings_total;
-                // Nothing to add for a child that reported nothing: the
-                // engine's own sentence is already the whole truth.
-                (preserved > 0).then(|| {
-                    (
-                        child.id.clone(),
-                        LostChildNote {
-                            detail: Some(format!(
-                                "{preserved} finding(s) on its ledger record remain adopted"
-                            )),
-                            contribution: Some(projection),
-                        },
-                    )
-                })
+                // Nothing to add to the sentence for a child that reported
+                // nothing — the engine's own words are the whole truth — but
+                // the reading is still this crate's to give.
+                let note = if preserved > 0 {
+                    LostChildNote {
+                        detail: Some(format!(
+                            "{preserved} finding(s) on its ledger record remain adopted"
+                        )),
+                        contribution: Some(projection),
+                        outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+                    }
+                } else {
+                    LostChildNote {
+                        detail: None,
+                        contribution: None,
+                        outcome: Some(leveler_lifecycle::ChildStatus::IncompleteNoResult),
+                    }
+                };
+                (child.id.clone(), note)
             })
             .collect()
     }

@@ -3098,6 +3098,8 @@ fn fold_child_settlement(
         ok: result.result.status.completed(),
         summary: preview(&content),
         contribution: Some(contribution),
+        outcome: Some(result.result.status),
+        stop: Some(result.stop),
     });
     (content, result.result.status.completed())
 }
@@ -3122,6 +3124,7 @@ fn join_settlement(
                 "",
                 format!("its background task ended abnormally: {join_error}"),
             ),
+            stop: leveler_lifecycle::ChildStop::Failed,
             progress: leveler_lifecycle::ProgressLedger::default(),
             modified_files: Vec::new(),
             findings: Vec::new(),

@@ -345,6 +345,14 @@ Under D1 = B, add G10 (the 08-27 design, Explorer first).
 
 ---
 
+## 9a. Decisions recorded (2026-09-14, user)
+
+| Decision | Choice | Effect on scope |
+|---|---|---|
+| D1 | **B — durable child session + resume** | REAL_MA1_SCOPE = items 1–7 **plus G10**. G1 changes shape: at restart an open child becomes a typed, durable *interrupted* (resumable) state tied to its parent task, not a synthetic lost terminal; a lost terminal remains only for children that cannot be resumed or whose parent is closed/cancelled |
+| D2 | **Push deferred**; MA5 = Mobile only | REAL_MA5_SCOPE item 2 removed. Final gate records `PUSH=DEFERRED_BY_USER_DECISION`, not PASS |
+| D3 | **In-repo public task set, `deepseek-v4-flash`** | REAL_MA4_SCOPE item 3 builds the seven categories under `evals/`; arms interleaved baseline `v0.2.0-beta.2` vs treatment |
+
 ## 10. Gate
 
 ```text

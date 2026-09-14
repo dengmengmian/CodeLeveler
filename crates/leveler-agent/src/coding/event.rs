@@ -149,12 +149,16 @@ impl From<AgentEvent> for EngineEvent {
                 ok,
                 summary,
                 contribution,
+                outcome,
+                stop,
             } => EngineEvent::SubAgentFinished {
                 id,
                 nickname,
                 ok,
                 summary,
                 contribution,
+                outcome,
+                stop,
             },
             A::SubAgentActivity {
                 id,

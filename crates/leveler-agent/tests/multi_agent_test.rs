@@ -37,6 +37,23 @@ fn first_started_id(events: &[AgentEvent]) -> String {
         .expect("SubAgentStarted")
 }
 
+/// The typed terminal of the first settled child: its four-way outcome and
+/// how its activation stopped. Read off the event, never out of the prose.
+fn first_terminal(
+    events: &[AgentEvent],
+) -> (
+    Option<leveler_agent::ChildStatus>,
+    Option<leveler_agent::ChildStop>,
+) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentFinished { outcome, stop, .. } => Some((*outcome, *stop)),
+            _ => None,
+        })
+        .expect("SubAgentFinished")
+}
+
 /// Replays scripted responses in order; each `stream` sleeps either the next
 /// staged delay or the default delay, so concurrent sub-agents can overlap.
 struct SleepyRuntime {
@@ -2785,6 +2802,7 @@ async fn child_completed_with_findings_is_reported_as_such() {
         ],
         Duration::from_millis(0),
     );
+    let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -2796,7 +2814,12 @@ async fn child_completed_with_findings_is_reported_as_such() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
     .await;
 
     let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
@@ -2809,6 +2832,14 @@ async fn child_completed_with_findings_is_reported_as_such() {
         "the findings themselves must survive: {content}"
     );
     assert!(!is_error, "a completed child is not an error");
+    assert_eq!(
+        first_terminal(&events),
+        (
+            Some(leveler_agent::ChildStatus::CompletedWithFindings),
+            Some(leveler_agent::ChildStop::Completed)
+        ),
+        "the terminal event carries the reading, not just the prose"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2837,6 +2868,7 @@ async fn child_completed_without_findings_is_distinguishable_from_failure() {
         ],
         Duration::from_millis(0),
     );
+    let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -2848,7 +2880,12 @@ async fn child_completed_without_findings_is_distinguishable_from_failure() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
     .await;
 
     let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
@@ -2861,6 +2898,13 @@ async fn child_completed_without_findings_is_distinguishable_from_failure() {
         "a completed child must never be labelled incomplete: {content}"
     );
     assert!(!is_error, "reporting nothing is not an error");
+    assert_eq!(
+        first_terminal(&events),
+        (
+            Some(leveler_agent::ChildStatus::CompletedNoFindings),
+            Some(leveler_agent::ChildStop::Completed)
+        )
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2905,6 +2949,7 @@ async fn budget_limited_child_preserves_its_partial_findings() {
         tokio::time::sleep(Duration::from_millis(220)).await;
         cancel.cancel();
     });
+    let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -2916,7 +2961,7 @@ async fn budget_limited_child_preserves_its_partial_findings() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .run("delegate", &mut |_| {}, &mut sink, token)
+    .run("delegate", &mut |e| events.push(e), &mut sink, token)
     .await;
 
     let (content, _) = spawn_result(&transcript.lock().unwrap(), "s1");
@@ -2927,6 +2972,14 @@ async fn budget_limited_child_preserves_its_partial_findings() {
     assert!(
         content.contains("Headers.vue sets the header in two places"),
         "work the child had already done must not be discarded: {content}"
+    );
+    assert_eq!(
+        first_terminal(&events),
+        (
+            Some(leveler_agent::ChildStatus::IncompletePartial),
+            Some(leveler_agent::ChildStop::Cancelled)
+        ),
+        "an external cancel is a cancellation, not a budget stop"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2949,6 +3002,7 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
         )],
         Duration::from_millis(0),
     );
+    let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -2960,7 +3014,12 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
     .await;
 
     let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
@@ -2975,6 +3034,13 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
     assert!(
         is_error,
         "a child that never ran is an error for the parent"
+    );
+    assert_eq!(
+        first_terminal(&events),
+        (
+            Some(leveler_agent::ChildStatus::IncompleteNoResult),
+            Some(leveler_agent::ChildStop::Failed)
+        )
     );
     std::fs::remove_dir_all(&dir).ok();
 }

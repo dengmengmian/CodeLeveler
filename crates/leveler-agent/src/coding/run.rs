@@ -1818,6 +1818,8 @@ pub(crate) async fn run_review(
                         read_only_trace,
                     ),
                 ),
+                outcome: Some(result.result.status),
+                stop: Some(result.stop),
             },
             observer,
         )
@@ -2427,6 +2429,8 @@ mod session_review_tests {
             ok: true,
             summary: "done".into(),
             contribution: None,
+            outcome: None,
+            stop: None,
         }
     }
 

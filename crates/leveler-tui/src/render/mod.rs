@@ -1266,6 +1266,8 @@ mod tests {
                     profile_role: None,
                     read_only: false,
                     contribution: None,
+                    outcome: None,
+                    stop: None,
                 }),
             );
         }
@@ -1323,6 +1325,8 @@ mod tests {
                 profile_role: None,
                 read_only: false,
                 contribution: None,
+                outcome: None,
+                stop: None,
             }),
         );
         let agents = render_text(&mut state, 100, 28);

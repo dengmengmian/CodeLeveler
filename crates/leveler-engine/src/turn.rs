@@ -388,6 +388,7 @@ impl TurnRunner<'_> {
             self.settle_ghost_children(
                 open_ghosts,
                 "was lost when its previous runtime window ended before it reported",
+                leveler_lifecycle::ChildStop::Lost,
                 &turn_id,
                 observer,
             )
@@ -564,15 +565,18 @@ impl TurnRunner<'_> {
         // the terminal event below.
         match self.log.unfinished_children().await {
             Ok(open) => {
-                let how = match terminal {
-                    TurnOutcome::Interrupted => "cancelled",
-                    TurnOutcome::Failed => "failed",
-                    _ => "ended",
+                let (how, stop) = match terminal {
+                    TurnOutcome::Interrupted => {
+                        ("cancelled", leveler_lifecycle::ChildStop::Cancelled)
+                    }
+                    TurnOutcome::Failed => ("failed", leveler_lifecycle::ChildStop::Failed),
+                    TurnOutcome::Completed => ("ended", leveler_lifecycle::ChildStop::Lost),
                 };
                 if let Err(error) = self
                     .settle_ghost_children(
                         open,
                         &format!("did not report before the turn ended ({how})"),
+                        stop,
                         &turn_id,
                         observer,
                     )
@@ -651,6 +655,7 @@ impl TurnRunner<'_> {
         &self,
         open: Vec<crate::log::UnfinishedChild>,
         desc: &str,
+        stop: leveler_lifecycle::ChildStop,
         current_turn: &TurnId,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
@@ -685,6 +690,8 @@ impl TurnRunner<'_> {
                 ok: false,
                 contribution: note.and_then(|note| note.contribution.clone()),
                 summary,
+                outcome: note.and_then(|note| note.outcome),
+                stop: Some(stop),
             };
             let origin = child.turn_id.clone().map(TurnId::new);
             let attribute_to = origin.as_ref().unwrap_or(current_turn);

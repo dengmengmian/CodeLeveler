@@ -2286,6 +2286,18 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
         Some("reviewer"),
         "the trace must name the capability contract that produced it"
     );
+    let typed = seen.iter().rev().find_map(|e| match e {
+        EngineEvent::SubAgentFinished { outcome, stop, .. } => Some((*outcome, *stop)),
+        _ => None,
+    });
+    assert_eq!(
+        typed,
+        Some((
+            Some(leveler_lifecycle::ChildStatus::CompletedWithFindings),
+            Some(leveler_lifecycle::ChildStop::Completed)
+        )),
+        "the reviewer terminal is typed like every other child's"
+    );
 }
 
 /// A reviewer that reports no structured finding contributed a measured zero.

@@ -210,6 +210,8 @@ pub struct LostChildNote {
     /// compute this: it would have to read the harness's role vocabulary and
     /// its evidence record.
     pub contribution: Option<leveler_lifecycle::ChildResultProjection>,
+    /// The harness's four-way reading of what the lost child left behind.
+    pub outcome: Option<leveler_lifecycle::ChildStatus>,
 }
 
 /// Speaks for the children a runtime lost.

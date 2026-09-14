@@ -337,6 +337,10 @@ pub enum AgentEvent {
         summary: String,
         /// Absent on events written before contribution tracing existed.
         contribution: Option<leveler_lifecycle::ChildResultProjection>,
+        /// The four-way reading of the child's result.
+        outcome: Option<leveler_lifecycle::ChildStatus>,
+        /// How the child's activation ended.
+        stop: Option<leveler_lifecycle::ChildStop>,
     },
     /// Live step for one spawned sub-agent (tool start/finish). Transient UI
     /// signal — not full child transcript. Attributed by `id` so concurrent

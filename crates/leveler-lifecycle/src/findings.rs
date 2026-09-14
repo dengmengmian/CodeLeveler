@@ -84,6 +84,45 @@ pub struct FindingRecord {
     pub symbol: Option<String>,
 }
 
+/// How a child's run ended, in the four readings a parent must tell apart.
+///
+/// R007b N1: a child died on its wall budget and returned only a stop string.
+/// The parent read that as "investigated, nothing to report" and closed the task
+/// without ever opening the file the child had been reading. "Finished and found
+/// nothing" and "stopped before finding anything" are opposite instructions, and
+/// a bare text field cannot carry the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildStatus {
+    /// Ran to a clean end and reported something.
+    CompletedWithFindings,
+    /// Ran to a clean end with nothing to flag. This IS a result.
+    CompletedNoFindings,
+    /// Stopped early, but what it had established survives in `findings`.
+    IncompletePartial,
+    /// Stopped early with nothing to show. NOT the same as "no findings".
+    IncompleteNoResult,
+}
+
+impl ChildStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChildStatus::CompletedWithFindings => "COMPLETED_WITH_FINDINGS",
+            ChildStatus::CompletedNoFindings => "COMPLETED_NO_FINDINGS",
+            ChildStatus::IncompletePartial => "INCOMPLETE_PARTIAL",
+            ChildStatus::IncompleteNoResult => "INCOMPLETE_NO_RESULT",
+        }
+    }
+
+    /// Whether the child reached the end of its task.
+    pub fn completed(self) -> bool {
+        matches!(
+            self,
+            ChildStatus::CompletedWithFindings | ChildStatus::CompletedNoFindings
+        )
+    }
+}
+
 /// A compact, durable view of what one child produced — enough to trace its
 /// contribution without copying its findings into an event.
 ///

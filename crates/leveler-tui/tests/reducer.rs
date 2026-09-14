@@ -2112,6 +2112,8 @@ fn turn_end_finalizes_in_flight_blocks() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
 
@@ -2221,6 +2223,8 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         })
     };
     reduce(&mut s, running("step 1"));
@@ -2249,6 +2253,8 @@ fn sub_agent_finish_before_start_still_renders() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     let blocks = sub_agents(&s);
@@ -2277,6 +2283,8 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     let running = sub_agents(&s);
@@ -2299,6 +2307,8 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     let done = sub_agents(&s);
@@ -5691,6 +5701,8 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     let steps = &s.plan.as_ref().unwrap().steps;
@@ -5735,6 +5747,8 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     reduce(&mut s, plan(P::Done, P::Running));

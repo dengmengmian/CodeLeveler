@@ -103,6 +103,34 @@ pub struct EventBridge {
     child_roles: HashMap<String, String>,
 }
 
+/// The wire spelling of the runtime's four-way child reading.
+fn project_child_outcome(
+    outcome: leveler_lifecycle::ChildStatus,
+) -> leveler_client_protocol::ChildOutcome {
+    use leveler_client_protocol::ChildOutcome as Wire;
+    use leveler_lifecycle::ChildStatus;
+    match outcome {
+        ChildStatus::CompletedWithFindings => Wire::CompletedWithFindings,
+        ChildStatus::CompletedNoFindings => Wire::CompletedNoFindings,
+        ChildStatus::IncompletePartial => Wire::IncompletePartial,
+        ChildStatus::IncompleteNoResult => Wire::IncompleteNoResult,
+    }
+}
+
+/// The wire spelling of how a child's activation ended.
+fn project_child_stop(stop: leveler_lifecycle::ChildStop) -> leveler_client_protocol::ChildStop {
+    use leveler_client_protocol::ChildStop as Wire;
+    use leveler_lifecycle::ChildStop;
+    match stop {
+        ChildStop::Completed => Wire::Completed,
+        ChildStop::Incomplete => Wire::Incomplete,
+        ChildStop::Budget => Wire::Budget,
+        ChildStop::Cancelled => Wire::Cancelled,
+        ChildStop::Failed => Wire::Failed,
+        ChildStop::Lost => Wire::Lost,
+    }
+}
+
 /// Map the runtime's projection onto the wire type.
 ///
 /// Deliberately total: every field crosses. Dropping one here is invisible at
@@ -547,6 +575,8 @@ impl EventBridge {
                     profile_role,
                     read_only,
                     contribution: None,
+                    outcome: None,
+                    stop: None,
                 });
             }
             EngineEvent::SubAgentProgress {
@@ -570,6 +600,8 @@ impl EventBridge {
                 ok,
                 summary,
                 contribution,
+                outcome,
+                stop,
             } => {
                 let projected = contribution.as_ref().map(project_contribution);
                 // Prefer the role recorded at spawn; a projection carries it
@@ -595,6 +627,8 @@ impl EventBridge {
                     profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
                     read_only: projected.as_ref().is_some_and(|c| c.read_only),
                     contribution: projected,
+                    outcome: outcome.map(project_child_outcome),
+                    stop: stop.map(project_child_stop),
                 });
             }
             EngineEvent::SubAgentActivity {
@@ -1618,6 +1652,8 @@ mod projection_equivalence {
                 leveler_lifecycle::ChildResultProjection::from_findings("a1", "explorer", &[])
                     .with_profile("explorer", "explorer", true),
             ),
+            outcome: None,
+            stop: None,
         });
         let ev = rx.try_recv().expect("one event");
         match ev {
@@ -1628,6 +1664,34 @@ mod projection_equivalence {
                 let c = contribution.expect("the projection must reach the client");
                 assert_eq!(c.role, "explorer");
                 assert_eq!(c.profile_id.as_deref(), Some("explorer"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The typed terminal crosses the bridge as typed fields. A client that
+    /// has to recover "partial" or "lost" from the summary text is deriving
+    /// runtime truth, which is exactly what it must not do.
+    #[test]
+    fn a_child_typed_terminal_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+            stop: Some(leveler_lifecycle::ChildStop::Budget),
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { outcome, stop, .. } => {
+                assert_eq!(
+                    outcome,
+                    Some(leveler_client_protocol::ChildOutcome::IncompletePartial)
+                );
+                assert_eq!(stop, Some(leveler_client_protocol::ChildStop::Budget));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1645,6 +1709,8 @@ mod projection_equivalence {
             ok: false,
             summary: "did not report".into(),
             contribution: None,
+            outcome: None,
+            stop: None,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated { contribution, .. } => {
@@ -1714,6 +1780,8 @@ mod projection_equivalence {
                 ok: true,
                 summary: "done".into(),
                 contribution: None,
+                outcome: None,
+                stop: None,
             },
         ]);
         assert_eq!(

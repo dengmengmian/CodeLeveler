@@ -62,7 +62,7 @@ pub use checkpoint::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
 };
-pub use findings::{ChildResultProjection, FindingKind, FindingRecord};
+pub use findings::{ChildResultProjection, ChildStatus, FindingKind, FindingRecord};
 pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
@@ -71,6 +71,7 @@ pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
 pub use runtime::{
-    SessionStatus, StopReason, TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus,
+    ChildStop, SessionStatus, StopReason, TaskOutcome, TurnOutcome, UnknownVariant,
+    VerificationStatus,
 };
 pub use workflow::AgentState;

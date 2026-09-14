@@ -232,7 +232,11 @@ fn render_event_text(event: AgentEvent) {
 }
 
 fn render_event_jsonl(event: AgentEvent) {
-    let value = match event {
+    emit_jsonl(event_jsonl(event));
+}
+
+fn event_jsonl(event: AgentEvent) -> serde_json::Value {
+    match event {
         AgentEvent::StreamAttemptStarted => {
             serde_json::json!({ "type": "stream_attempt_started" })
         }
@@ -362,6 +366,8 @@ fn render_event_jsonl(event: AgentEvent) {
             ok,
             summary,
             contribution,
+            outcome,
+            stop,
         } => serde_json::json!({
             "type": "sub_agent_finished",
             "id": id, "nickname": nickname, "ok": ok, "summary": summary,
@@ -369,6 +375,10 @@ fn render_event_jsonl(event: AgentEvent) {
             // instead of parsing prose. Null for children that never reported
             // and for logs written before contribution tracing.
             "contribution": contribution,
+            // The typed terminal: null only for rows written before it was
+            // recorded.
+            "outcome": outcome,
+            "stop": stop,
         }),
         AgentEvent::SubAgentActivity {
             id,
@@ -407,10 +417,31 @@ fn render_event_jsonl(event: AgentEvent) {
         AgentEvent::CommandProgress { label, elapsed_ms } => serde_json::json!({
             "type": "command_progress", "label": label, "elapsed_ms": elapsed_ms,
         }),
-    };
-    emit_jsonl(value);
+    }
 }
 
 pub(crate) fn emit_jsonl(value: serde_json::Value) {
     println!("{value}");
+}
+
+#[cfg(test)]
+mod jsonl_tests {
+    use super::*;
+
+    /// Eval collectors read a child's terminal from this line. The typed
+    /// reading must be on it; recovering it from `summary` is prose parsing.
+    #[test]
+    fn a_child_terminal_line_carries_its_typed_reading() {
+        let line = event_jsonl(AgentEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: Some(leveler_lifecycle::ChildStatus::IncompleteNoResult),
+            stop: Some(leveler_lifecycle::ChildStop::Lost),
+        });
+        assert_eq!(line["outcome"], "incomplete_no_result");
+        assert_eq!(line["stop"], "lost");
+    }
 }

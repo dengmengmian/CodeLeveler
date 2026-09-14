@@ -666,6 +666,8 @@ mod tests {
                     role: "explorer".into(),
                     ..Default::default()
                 }),
+                outcome: None,
+                stop: None,
             },
         )
         .await;
@@ -678,6 +680,8 @@ mod tests {
                 ok: false,
                 summary: "budget exhausted".into(),
                 contribution: None,
+                outcome: None,
+                stop: None,
             },
         )
         .await;

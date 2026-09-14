@@ -96,6 +96,8 @@ fn agents_screen_lists_spawned_sub_agents_in_direct_mode() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
     reduce(
@@ -204,6 +206,8 @@ fn visual_inspect() {
             profile_role: None,
             read_only: false,
             contribution: None,
+            outcome: None,
+            stop: None,
         }),
     );
 

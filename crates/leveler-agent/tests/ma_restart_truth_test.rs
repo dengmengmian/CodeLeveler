@@ -365,10 +365,22 @@ async fn a_ghost_worker_from_a_dead_window_settles_as_an_incomplete_terminal() {
         Some(origin_turn.as_str()),
         "the synthetic terminal must be attributed to the turn the child started in"
     );
-    let (_, EngineEvent::SubAgentFinished { ok, .. }) = ghost_finish else {
+    let (
+        _,
+        EngineEvent::SubAgentFinished {
+            ok, outcome, stop, ..
+        },
+    ) = ghost_finish
+    else {
         unreachable!()
     };
     assert!(!ok, "a child that never reported cannot be recorded as ok");
+    assert_eq!(*stop, Some(leveler_lifecycle::ChildStop::Lost));
+    assert_eq!(
+        *outcome,
+        Some(leveler_lifecycle::ChildStatus::IncompleteNoResult),
+        "the harness knows it adopted nothing from this child"
+    );
 
     let refused_over_a_finding = events.iter().any(|(_, e)| {
         matches!(
@@ -460,6 +472,8 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
             ok: true,
             contribution: None,
             summary: "explored the parser: three modules, no defects".into(),
+            outcome: None,
+            stop: None,
         },
     )
     .await;
@@ -616,6 +630,8 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
         EngineEvent::SubAgentFinished {
             contribution,
             summary,
+            outcome,
+            stop,
             ..
         },
     ) = events
@@ -635,6 +651,12 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
     assert!(
         summary.contains("remain adopted"),
         "the terminal must say the earlier findings still stand: {summary}"
+    );
+    assert_eq!(*stop, Some(leveler_lifecycle::ChildStop::Lost));
+    assert_eq!(
+        *outcome,
+        Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+        "adopted findings make a lost child partial, not empty"
     );
 
     let ledger = last_ledger(&events).unwrap();

@@ -43,6 +43,32 @@ pub enum NotificationLevel {
 /// `findings_total` is a count, not a score: it says how much this child
 /// reported, never whether any of it mattered. What the parent did about it
 /// is in the transcript, where the parent said it.
+/// The four-way reading of a settled child's result. "Finished with nothing
+/// to flag" and "stopped with nothing to show" are opposite facts; a client
+/// renders them from this field, never from the summary text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ChildOutcome {
+    CompletedWithFindings,
+    CompletedNoFindings,
+    IncompletePartial,
+    IncompleteNoResult,
+}
+
+/// How a settled child's activation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ChildStop {
+    Completed,
+    Incomplete,
+    Budget,
+    Cancelled,
+    Failed,
+    Lost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChildContribution {
@@ -263,6 +289,13 @@ pub enum RuntimeEvent {
         /// fact and reads differently to the user.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contribution: Option<ChildContribution>,
+        /// The four-way reading, once done. `None` while running and for
+        /// children settled before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<ChildOutcome>,
+        /// How the activation ended, once done.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<ChildStop>,
     },
     /// Live execution state and cumulative model usage for one spawned agent.
     SubAgentProgress {

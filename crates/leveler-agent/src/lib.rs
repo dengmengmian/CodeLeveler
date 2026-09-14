@@ -44,8 +44,8 @@ pub use leveler_engine::{
 };
 pub use leveler_execution::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
 pub use leveler_lifecycle::{
-    CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState,
-    PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase, WorkProfile,
+    ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource, PlanOrigin,
+    PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase, WorkProfile,
 };
 pub use sub_agent::{ChildResult, ChildStatus, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

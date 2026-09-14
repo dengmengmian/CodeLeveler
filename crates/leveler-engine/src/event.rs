@@ -388,6 +388,14 @@ pub enum EngineEvent {
         /// tracing existed still replay.
         #[serde(default)]
         contribution: Option<leveler_lifecycle::ChildResultProjection>,
+        /// The harness's four-way reading of the child's result. `None` on
+        /// rows written before it was typed, or when no harness spoke for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<leveler_lifecycle::ChildStatus>,
+        /// How the child's activation ended. `None` on rows written before it
+        /// was typed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<leveler_lifecycle::ChildStop>,
     },
     /// TRANSIENT: live tool/step for one sub-agent (attributed by `id`).
     SubAgentActivity {
