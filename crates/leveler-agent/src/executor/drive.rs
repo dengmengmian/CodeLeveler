@@ -2477,6 +2477,7 @@ impl AgentHarness for Drive<'_> {
                 Vec<String>,
                 u32,
                 bool, // run in background (runtime-resolved default: true)
+                CancellationToken,
             )> = Vec::new();
             // Exclusive scopes of workers already admitted in THIS batch.
             // "Exclusive" is only true if admission enforces it: two
@@ -2729,6 +2730,13 @@ impl AgentHarness for Drive<'_> {
                     ledger: self.progress.clone(),
                 });
                 let (profile_id, profile_role, read_only) = profile.trace_fields();
+                // The host holds the child's cancel handle before anyone can
+                // see the child: a client that reacts to the start event with
+                // "stop this child" must find it.
+                let token = cancellation.child_token();
+                if let Some(host) = &self.executor.steering {
+                    host.child_started(&id, token.clone());
+                }
                 (self.observer)(AgentEvent::SubAgentStarted {
                     id: id.clone(),
                     nickname: nickname.clone(),
@@ -2757,6 +2765,7 @@ impl AgentHarness for Drive<'_> {
                     agent_tools,
                     agent_max_rounds,
                     background,
+                    token,
                 ));
             }
             // A child may only begin once its `SubAgentStarted` is durable
@@ -2768,8 +2777,14 @@ impl AgentHarness for Drive<'_> {
             // persistence leave the barrier unset and proceed as before.
             if !accepted.is_empty()
                 && let Some(barrier) = &self.executor.event_barrier
+                && let Err(error) = barrier.flush().await
             {
-                barrier.flush().await?;
+                if let Some(host) = &self.executor.steering {
+                    for accepted_child in &accepted {
+                        host.child_ended(&accepted_child.5);
+                    }
+                }
+                return Err(error.into());
             }
             let share_n = accepted.len() as u32;
             // Foreground children's own tokens, so an error in this batch can
@@ -2789,15 +2804,11 @@ impl AgentHarness for Drive<'_> {
                     agent_tools,
                     agent_max_rounds,
                     background,
+                    token,
                 ),
             ) in accepted.into_iter().enumerate()
             {
                 let sem = self.run_agents_semaphore.clone();
-                let token = cancellation.child_token();
-                // The host may stop this child alone (a user's "cancel child").
-                if let Some(host) = &self.executor.steering {
-                    host.child_started(&id, token.clone());
-                }
                 // Residual parent budgets split across concurrent spawns.
                 let residual = residual_step_limits(
                     self.executor.step_limits,

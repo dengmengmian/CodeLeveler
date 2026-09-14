@@ -133,9 +133,17 @@ async fn next_child_event(
     }
 }
 
-async fn cancel_running_child(background: bool) {
+/// Foreground only. A background child's terminal is settled at its parent's
+/// next round boundary, and this mock serves responses in arrival order, so
+/// whether the parent or the child gets the silent response is a race: a
+/// background variant tests the mock, not the product (it failed that way on
+/// one CI host). The background path is pinned by
+/// `a_host_can_cancel_one_child_without_cancelling_its_parent` in
+/// leveler-agent and was accepted end to end from a phone (MA5 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_stops_a_running_foreground_child() {
     let (_tmp, _server, client, session) = client_with(vec![
-        spawn_call(background),
+        spawn_call(false),
         // The child's first model call: silent long enough that only a
         // cancel can end it inside the test's deadline.
         MockResponse::SilentThenJson {
@@ -156,11 +164,11 @@ async fn cancel_running_child(background: bool) {
         .await
         .unwrap();
 
+    // Cancellable from the moment it is seen: the host holds the child's
+    // handle before its start is observed.
     let (child_id, _) = next_child_event(&mut rx, false)
         .await
         .expect("a child starts");
-    // Let the child reach its model call.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     client
         .send(ClientCommand::CancelChild {
             session_id: session.clone(),
@@ -180,16 +188,6 @@ async fn cancel_running_child(background: bool) {
             session_id: session,
         })
         .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_client_stops_a_running_foreground_child() {
-    cancel_running_child(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_client_stops_a_running_background_child() {
-    cancel_running_child(true).await;
 }
 
 fn tool_call(name: &str, arguments: serde_json::Value) -> MockResponse {

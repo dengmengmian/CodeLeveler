@@ -6459,6 +6459,61 @@ async fn a_host_can_cancel_one_child_without_cancelling_its_parent() {
     );
 }
 
+/// A client sees a child through its `SubAgentStarted`. Its cancel handle
+/// must already be with the host by then, or a "stop" sent the moment the
+/// child appears is answered with "no such child".
+#[tokio::test]
+async fn a_child_is_cancellable_by_the_time_its_start_is_observed() {
+    let dir = tmp("cancellable-at-start", 90);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let handles = Arc::new(ChildHandles::default());
+    let seen = handles.clone();
+    let registered_at_start = Arc::new(Mutex::new(Vec::new()));
+    let record = registered_at_start.clone();
+    let watcher = handles.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Some((_, token)) = watcher.started.lock().unwrap().first() {
+                token.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let outcome = Executor::new(
+        Arc::new(SlowChildRuntime {
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_steering(handles.clone())
+    .run(
+        "delegate",
+        &mut |e| {
+            if let AgentEvent::SubAgentStarted { id, .. } = &e {
+                let known = seen
+                    .started
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(started, _)| started == id);
+                record.lock().unwrap().push(known);
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(outcome.is_ok());
+    assert_eq!(*registered_at_start.lock().unwrap(), vec![true]);
+}
+
 /// Prices only the parent's model; any pinned model has no pricing, and
 /// `mock/missing` has no profile at all.
 struct PartlyPricedRuntime {
