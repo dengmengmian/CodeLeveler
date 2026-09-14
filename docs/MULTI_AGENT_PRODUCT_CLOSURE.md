@@ -179,9 +179,11 @@ The failing gate is a measurement of value, not a defect list, and the
 program's rules forbid closing it by forcing or encouraging delegation. What
 would settle it, each a user decision:
 
-1. **Model**: repeat MA4 on a model where MA-VALUE-A saw benefit
-   (`deepseek-v4-pro`, or a lower `reasoning_effort` on flash — the parent's
-   planning time dominated the one delegated run).
+1. **Model / effort**: repeat MA4 on a stronger model such as
+   `deepseek-v4-pro`, or on flash at a lower `reasoning_effort` (the parent's
+   planning time dominated the one delegated run). The earlier MA-VALUE-A
+   study reported a success gain at 2.5× wall; which model it used is not
+   re-verified here.
 2. **Task size**: tasks where each independent unit takes minutes rather
    than seconds, so four concurrent children can win back the parent's
    planning cost; the harness already supports adding cases.
