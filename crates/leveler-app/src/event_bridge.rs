@@ -636,6 +636,10 @@ impl EventBridge {
             // client fact: clients see the child through its lifecycle and
             // activity events, never its raw context.
             EngineEvent::SubAgentTranscriptAppended { .. } => {}
+            // Written at a window boundary (the reaper, a turn start), never
+            // while a client is watching the child run. Presentation of an
+            // interrupted or resumed child is MA3's client state model.
+            EngineEvent::SubAgentInterrupted { .. } | EngineEvent::SubAgentResumed { .. } => {}
             EngineEvent::SubAgentActivity {
                 id,
                 phase,

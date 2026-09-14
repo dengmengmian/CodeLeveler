@@ -70,6 +70,8 @@ pub async fn drive_turn(
         emitter,
         mut sink,
         finished_children,
+        resumed_children,
+        lost_children,
         barrier,
         fence,
         approver,
@@ -143,11 +145,40 @@ pub async fn drive_turn(
                 &mut progress.outstanding_children,
                 &finished_children,
             );
+            // A resumed child is relaunched (and re-listed) by the drive; a
+            // lost one must be named even when its outstanding entry never
+            // became durable before the window died.
+            progress.outstanding_children.retain(|entry| {
+                let id = entry.split('|').next().unwrap_or("");
+                !resumed_children.iter().any(|child| child.id == id)
+            });
+            for child in &lost_children {
+                if !progress
+                    .outstanding_children
+                    .iter()
+                    .any(|entry| entry.split('|').next() == Some(child.id.as_str()))
+                {
+                    progress
+                        .outstanding_children
+                        .push(format!("{}|{}|{}|", child.id, child.nickname, child.role));
+                }
+            }
             executor = executor.with_seeded_progress(progress);
             if !settled.is_empty() {
                 executor = executor.with_restart_settled_children(settled);
             }
         }
+    }
+
+    let resumable = crate::coding::child_session::load_resumable_children(
+        events.as_ref(),
+        &session_id,
+        &resumed_children,
+    )
+    .await
+    .map_err(seed_failure)?;
+    if !resumable.is_empty() {
+        executor = executor.with_resumed_children(resumable);
     }
 
     let registry = factory.registry.clone();
@@ -417,6 +448,29 @@ impl LostChildVoice for CodingLostChildVoice {
                 (child.id.clone(), note)
             })
             .collect()
+    }
+
+    async fn continues(&self, interrupted: &[LostChild]) -> Vec<String> {
+        // Infallible like `speak_for`: a harness that cannot read its own
+        // record continues nothing, and the engine settles the child as lost —
+        // a truthful terminal, never a child left running.
+        match crate::coding::child_session::continuable_children(
+            self.events.as_ref(),
+            &self.session_id,
+            interrupted,
+        )
+        .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_id.as_str(),
+                    %error,
+                    "could not read the child sessions to continue them; they settle as lost"
+                );
+                Vec::new()
+            }
+        }
     }
 }
 

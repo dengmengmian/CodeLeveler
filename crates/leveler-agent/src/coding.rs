@@ -10,6 +10,7 @@
 
 pub mod baseline;
 pub mod checkpoint;
+mod child_session;
 mod event;
 pub mod factory;
 pub mod policy;

@@ -140,6 +140,15 @@ pub async fn reap_after_restart(
         )
         .await?;
         if !events.is_empty() {
+            // A reaped turn's children died with it. Mark them now, under the
+            // same fresh token, so nothing reads them as running while the
+            // session waits to be resumed.
+            let log =
+                crate::EventLog::new_owned(stores.events.as_ref(), session.clone(), token.clone());
+            let mut marked = Vec::new();
+            log.interrupt_open_children(&mut |event| marked.push(event))
+                .await?;
+            outcome.events.extend(marked);
             outcome.reaped_sessions.push(ReapedSession {
                 session_id: session.clone(),
                 token: token.clone(),

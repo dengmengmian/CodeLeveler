@@ -106,6 +106,49 @@ pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) 
     out
 }
 
+/// An interrupted child rebuilt from its durable session, ready for a new
+/// activation under the same identity.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumableChild {
+    pub id: String,
+    pub nickname: String,
+    pub role: AgentRole,
+    pub spec: leveler_lifecycle::ChildSpawnSpec,
+    /// The child's own transcript, as persisted.
+    pub prior: Vec<leveler_model::Message>,
+    /// The host-authored recovery note, appended (and persisted) before the
+    /// child is asked anything.
+    pub note: leveler_model::Message,
+}
+
+/// What the parent reads when its interrupted children continue.
+pub(crate) fn resumed_children_note(children: &[ResumableChild]) -> String {
+    let mut out = String::from(
+        "## Sub-agents resumed after restart
+         The previous session window ended while these sub-agents were still          working. Each continues its own task in the background under the same          id, from its saved progress; its settlement will arrive as usual. Do not          re-delegate their work:
+",
+    );
+    for child in children {
+        if child.spec.files.is_empty() {
+            out.push_str(&format!(
+                "- {} ({}, role={})\n",
+                child.nickname,
+                child.id,
+                child.role.label()
+            ));
+        } else {
+            out.push_str(&format!(
+                "- {} ({}, role={}, scope: {})\n",
+                child.nickname,
+                child.id,
+                child.role.label(),
+                child.spec.files.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 /// Truthful note for a resumed run whose previous window still had background
 /// children running: in-process children do not survive a restart.
 pub(crate) fn lost_children_note(outstanding: &[String]) -> String {

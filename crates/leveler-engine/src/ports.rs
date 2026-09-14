@@ -209,6 +209,18 @@ pub struct LostChild {
     pub role: String,
 }
 
+/// An interrupted child the engine recorded as resumed for this turn: the
+/// harness launches its new activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumedChild {
+    pub id: String,
+    pub nickname: String,
+    /// The role label recorded on `SubAgentStarted`, carried verbatim.
+    pub role: String,
+    /// Which resume this is (1 = the first activation after the original).
+    pub attempt: u32,
+}
+
 /// What a harness has to say about one lost child.
 #[derive(Debug, Clone, Default)]
 pub struct LostChildNote {
@@ -243,4 +255,13 @@ pub trait LostChildVoice: Send + Sync {
     /// A note per child the harness can speak for, keyed by child id. Children
     /// left unnamed get the engine's mechanical terminal.
     async fn speak_for(&self, lost: &[LostChild]) -> Vec<(String, LostChildNote)>;
+
+    /// Which of these interrupted children the harness continues in a new
+    /// activation, by id. Whether a child CAN be continued is the harness's
+    /// knowledge (its spec, its role, its evidence); the engine records the
+    /// resume and settles every child not named as lost. A harness with no
+    /// child semantics continues none.
+    async fn continues(&self, _interrupted: &[LostChild]) -> Vec<String> {
+        Vec::new()
+    }
 }

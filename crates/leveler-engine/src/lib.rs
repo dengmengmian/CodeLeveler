@@ -33,7 +33,7 @@ pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{DanglingCall, EventLog, FinishedChildFact, SnapshotView};
 pub use ports::{
     ChildToolEvent, EventBarrier, ExecutionFence, LostChild, LostChildNote, LostChildVoice,
-    ModelCallKind, ModelRequestRecord, PortError, TranscriptSink,
+    ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,
 };
 pub use reaper::{
     ReapConflict, ReapOutcome, ReapedSession, reap_after_restart, reap_running_turns_owned,
@@ -41,8 +41,8 @@ pub use reaper::{
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{
-    TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner, TurnSink, TurnStart,
-    storage_model_request,
+    MAX_CHILD_RESUMES, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner,
+    TurnSink, TurnStart, storage_model_request,
 };
 
 /// Engine-level errors. Persistence and replay failures are hard errors —

@@ -137,7 +137,15 @@ pub async fn query_observability(
     // Session-wide: sub-agent start/finish only. Same class of bug Tools had
     // when `collect_agents` read the event window.
     let agent_rows = db
-        .load_by_types(session_id, &["sub_agent_started", "sub_agent_finished"])
+        .load_by_types(
+            session_id,
+            &[
+                "sub_agent_started",
+                "sub_agent_finished",
+                "sub_agent_interrupted",
+                "sub_agent_resumed",
+            ],
+        )
         .await
         .map_err(AppError::from)?;
     let agents = collect_agents(&decode_records(&agent_rows)?);
@@ -664,6 +672,21 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                 row.nickname = nickname.clone();
                 row.status = if *ok { "ok" } else { "fail" }.into();
                 row.summary = truncate(summary, 64);
+            }
+            // Only a child still open changes state here: a terminal stands.
+            EngineEvent::SubAgentInterrupted { id } => {
+                if let Some(row) = by_id.get_mut(id)
+                    && row.status == "running"
+                {
+                    row.status = "interrupted".into();
+                }
+            }
+            EngineEvent::SubAgentResumed { id, .. } => {
+                if let Some(row) = by_id.get_mut(id)
+                    && row.status == "interrupted"
+                {
+                    row.status = "running".into();
+                }
             }
             _ => {}
         }
@@ -1271,6 +1294,44 @@ mod tests {
             .iter()
             .find(|a| a.id == id)
             .unwrap_or_else(|| panic!("missing agent {id} in {agents:?}"))
+    }
+
+    /// A child whose activation died is not running. The list reads the
+    /// durable lifecycle, so an interrupted child says so, and a resumed one
+    /// is running again.
+    #[tokio::test]
+    async fn an_interrupted_child_is_not_listed_as_running() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "interrupted agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        for id in ["agent-1", "agent-2"] {
+            persist(
+                &db,
+                &sid,
+                agent_start(id, "Explorer", "explorer", "Inspect"),
+            )
+            .await;
+            persist(
+                &db,
+                &sid,
+                EngineEvent::SubAgentInterrupted { id: id.into() },
+            )
+            .await;
+        }
+        persist(
+            &db,
+            &sid,
+            EngineEvent::SubAgentResumed {
+                id: "agent-2".into(),
+                attempt: 1,
+            },
+        )
+        .await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert_eq!(by_agent(&loaded.agents, "agent-1").status, "interrupted");
+        assert_eq!(by_agent(&loaded.agents, "agent-2").status, "running");
     }
 
     #[tokio::test]

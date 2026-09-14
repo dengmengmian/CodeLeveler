@@ -28,6 +28,11 @@ use crate::ports::{
 use crate::recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
 
+/// How many times one child may be continued after its activation died. A
+/// child whose activations keep dying with their window is settled as lost
+/// rather than resumed forever.
+pub const MAX_CHILD_RESUMES: u32 = 3;
+
 /// The mechanical input that starts a turn.
 #[derive(Debug, Clone)]
 pub enum TurnStart {
@@ -95,6 +100,11 @@ pub struct TurnPorts {
     /// Durable child terminal facts observed after ghost reconciliation. Their
     /// domain meaning belongs to the harness.
     pub finished_children: Vec<crate::log::FinishedChildFact>,
+    /// Interrupted children this turn continues, already recorded as resumed.
+    /// The harness launches their new activations.
+    pub resumed_children: Vec<crate::ResumedChild>,
+    /// Interrupted children this turn settled as lost before the harness ran.
+    pub lost_children: Vec<crate::LostChild>,
     pub barrier: Arc<dyn EventBarrier>,
     pub fence: Arc<dyn ExecutionFence>,
     /// The turn's approver/clarifier, wrapped so every request and decision
@@ -383,16 +393,63 @@ impl TurnRunner<'_> {
         // past an unreconciled ghost Worker is exactly the false-Verified path
         // this exists to close. The finished facts feed the settlement
         // re-delivery during seeding below.
-        let (open_ghosts, finished_children) = self.log.child_reconciliation_view().await?;
-        if !open_ghosts.is_empty() {
-            self.settle_ghost_children(
-                open_ghosts,
-                "was lost when its previous runtime window ended before it reported",
-                leveler_lifecycle::ChildStop::Lost,
-                &turn_id,
-                observer,
-            )
-            .await?;
+        //
+        // At a turn start no activation of this session can be live, so every
+        // open child is a dead activation: it is marked interrupted, then the
+        // harness says which it continues. Those are recorded as resumed and
+        // handed over; the rest settle as lost here, before anything runs.
+        let (open, finished_children) = self.log.interrupt_open_children(observer).await?;
+        let continued = match &self.lost_child_voice {
+            Some(voice) if !open.is_empty() => voice.continues(&lost_view(&open)).await,
+            _ => Vec::new(),
+        };
+        let (wanted, lost): (Vec<_>, Vec<_>) = open
+            .into_iter()
+            .partition(|child| continued.contains(&child.id));
+        let (resumable, exhausted): (Vec<_>, Vec<_>) = wanted
+            .into_iter()
+            .partition(|child| child.resumes < MAX_CHILD_RESUMES);
+        let lost_children = lost_view(&lost)
+            .into_iter()
+            .chain(lost_view(&exhausted))
+            .collect();
+        self.settle_ghost_children(
+            lost,
+            "was lost when its previous runtime window ended before it reported",
+            leveler_lifecycle::ChildStop::Lost,
+            &turn_id,
+            observer,
+        )
+        .await?;
+        self.settle_ghost_children(
+            exhausted,
+            &format!(
+                "was interrupted again after {MAX_CHILD_RESUMES} resumes and is not continued"
+            ),
+            leveler_lifecycle::ChildStop::Lost,
+            &turn_id,
+            observer,
+        )
+        .await?;
+        let mut resumed_children = Vec::with_capacity(resumable.len());
+        for child in resumable {
+            let attempt = child.resumes + 1;
+            self.log
+                .append(
+                    Some(&turn_id),
+                    EngineEvent::SubAgentResumed {
+                        id: child.id.clone(),
+                        attempt,
+                    },
+                    observer,
+                )
+                .await?;
+            resumed_children.push(crate::ResumedChild {
+                id: child.id,
+                nickname: child.nickname,
+                role: child.role,
+                attempt,
+            });
         }
 
         // Margin, not the fix. The fix is the batching pump below: raising this
@@ -418,6 +475,8 @@ impl TurnRunner<'_> {
                 emitter: events.clone(),
                 sink,
                 finished_children,
+                resumed_children,
+                lost_children,
                 barrier: Arc::new(crate::recorders::PumpBarrier {
                     events: events.clone(),
                 }),
@@ -626,6 +685,18 @@ impl TurnRunner<'_> {
             outcome: facts.outcome,
         })
     }
+}
+
+/// The harness-facing view of children read off the log.
+fn lost_view(children: &[crate::log::UnfinishedChild]) -> Vec<crate::LostChild> {
+    children
+        .iter()
+        .map(|child| crate::LostChild {
+            id: child.id.clone(),
+            nickname: child.nickname.clone(),
+            role: child.role.clone(),
+        })
+        .collect()
 }
 
 impl TurnRunner<'_> {

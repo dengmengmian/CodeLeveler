@@ -373,6 +373,18 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spec: Option<leveler_lifecycle::ChildSpawnSpec>,
     },
+    /// A child's activation died with its runtime window. The child itself —
+    /// its identity, spec and transcript — remains, and a later turn of the
+    /// same session either continues it or settles it as lost.
+    SubAgentInterrupted {
+        id: String,
+    },
+    /// A new activation of an interrupted child, under the same identity.
+    /// `attempt` counts the activations after the first (1 = first resume).
+    SubAgentResumed {
+        id: String,
+        attempt: u32,
+    },
     /// Messages a delegated child appended to its own transcript, in order.
     /// With the start's spec this is the child session: what a later window
     /// restores to continue the same child.
@@ -674,6 +686,8 @@ impl EngineEvent {
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
             | EngineEvent::SubAgentTranscriptAppended { .. }
+            | EngineEvent::SubAgentInterrupted { .. }
+            | EngineEvent::SubAgentResumed { .. }
             | EngineEvent::SubAgentProgress { .. }
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
@@ -824,6 +838,8 @@ impl EngineEvent {
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
             | EngineEvent::SubAgentTranscriptAppended { .. }
+            | EngineEvent::SubAgentInterrupted { .. }
+            | EngineEvent::SubAgentResumed { .. }
             | EngineEvent::SubAgentProgress { .. }
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }

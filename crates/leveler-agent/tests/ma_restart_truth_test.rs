@@ -1051,3 +1051,451 @@ async fn a_spawned_child_records_its_spec_and_its_own_transcript() {
         "the child's final answer is durable: {transcript:?}"
     );
 }
+
+/// A model that answers the parent and a child from separate scripts, routed
+/// by whether the request carries the child's task. A resumed child runs in
+/// the background beside its parent, so one shared FIFO would hand each of
+/// them the other's replies in whatever order the scheduler picked.
+struct RoutedRuntime {
+    child_marker: String,
+    child: Mutex<VecDeque<ModelResponse>>,
+    parent: Mutex<VecDeque<ModelResponse>>,
+    child_requests: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl ModelRuntime for RoutedRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let is_child = request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(&self.child_marker));
+        let queue = if is_child {
+            self.child_requests
+                .lock()
+                .unwrap()
+                .push(request.messages.clone());
+            &self.child
+        } else {
+            &self.parent
+        };
+        Ok(queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| text("stopping")))
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        MockRuntime::new(Vec::new()).profile(model).await
+    }
+}
+
+const RESUMED_TASK: &str = "survey src/lib.rs for the resume gate";
+
+/// Seed the wreckage of a window that died while a durable child was mid-task:
+/// a running turn, the child's start WITH a spec, and one persisted round of
+/// its own transcript.
+async fn seed_interrupted_child_session(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+) -> TurnId {
+    seed_interrupted_child_session_scoped(db, session, id, role, Vec::new()).await
+}
+
+async fn seed_interrupted_child_session_scoped(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+    files: Vec<String>,
+) -> TurnId {
+    let turn_id = seed_ghost_child_with_scope(db, session, id, "wren", role, files).await;
+    let log = EventLog::new(db, session.clone());
+    let round = vec![
+        Message::text(Role::System, "you are a sub-agent"),
+        Message::text(Role::User, RESUMED_TASK),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new("r-before-crash"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            }],
+        },
+        Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: ToolCallId::new("r-before-crash"),
+                    content: "pub fn old() {}".into(),
+                    is_error: false,
+                },
+            }],
+        },
+    ];
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentTranscriptAppended {
+            id: id.to_string(),
+            messages: round,
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    turn_id
+}
+
+async fn seed_ghost_child_with_scope(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    nickname: &str,
+    role: &str,
+    files: Vec<String>,
+) -> TurnId {
+    let turn = TurnRepository::new(db)
+        .start(session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    let turn_id = TurnId::new(turn.id);
+    EventLog::new(db, session.clone())
+        .append(
+            Some(&turn_id),
+            EngineEvent::SubAgentStarted {
+                id: id.to_string(),
+                nickname: nickname.to_string(),
+                role: role.to_string(),
+                task: RESUMED_TASK.to_string(),
+                profile_id: None,
+                profile_role: None,
+                read_only: role != "worker",
+                spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                    files,
+                    background: true,
+                    ..Default::default()
+                }),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    turn_id
+}
+
+fn routed_engine(
+    db: &Database,
+    dir: &Path,
+    child: Vec<ModelResponse>,
+) -> (CodingRuntime, Arc<RoutedRuntime>) {
+    let runtime = Arc::new(RoutedRuntime {
+        child_marker: RESUMED_TASK.to_string(),
+        child: Mutex::new(VecDeque::from(child)),
+        parent: Mutex::new(VecDeque::new()),
+        child_requests: Mutex::new(Vec::new()),
+    });
+    let mut engine = engine_on(db, dir, Vec::new());
+    engine.factory.runtime = runtime.clone();
+    (engine, runtime)
+}
+
+/// RUNNING_CHILD_RESTART_SAFE — the child a dead window left mid-task is
+/// continued, not replaced: same id, no second start, its own earlier round in
+/// context, told it was interrupted, and settled exactly once.
+#[tokio::test]
+async fn an_interrupted_child_is_resumed_with_the_same_identity_and_settles_once() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![text("src/lib.rs defines old(); resumed and done")],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+
+    let mut seen = Vec::new();
+    engine
+        .run(
+            &session,
+            &spec,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let count =
+        |pred: &dyn Fn(&EngineEvent) -> bool| events.iter().filter(|(_, e)| pred(e)).count();
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentStarted { id, .. } if id == "agent-r")),
+        1,
+        "a resumed child is the same child: it never starts twice"
+    );
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentInterrupted { id } if id == "agent-r")),
+        1,
+        "the dead activation is recorded as interrupted, once"
+    );
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentResumed { id, attempt: 1 } if id == "agent-r")),
+        1,
+        "the new activation is recorded as a resume"
+    );
+    let terminals: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EngineEvent::SubAgentFinished {
+                id,
+                ok,
+                stop,
+                summary,
+                ..
+            } if id == "agent-r" => Some((*ok, *stop, summary.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "settled exactly once: {terminals:?}");
+    assert!(
+        terminals[0].0,
+        "the resumed child finished its task: {terminals:?}"
+    );
+    assert_eq!(
+        terminals[0].1,
+        Some(leveler_lifecycle::ChildStop::Completed)
+    );
+
+    let first = runtime
+        .child_requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the resumed child asked the model");
+    assert!(
+        first.iter().any(|m| m.content.iter().any(|p| matches!(
+            p,
+            ContentPart::ToolCall { call } if call.id.as_str() == "r-before-crash"
+        ))),
+        "the child's own earlier round is restored into its context"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|m| m.text_content().contains("Resumed after an interruption")),
+        "the child is told it was interrupted"
+    );
+
+    let parent_told = transcript(
+        &leveler_storage::MessageRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap(),
+    )
+    .iter()
+    .any(|m| {
+        m.text_content()
+            .contains("Sub-agents resumed after restart")
+            && m.text_content().contains("wren")
+    });
+    assert!(parent_told, "the parent is told which child continues");
+}
+
+/// A child whose activation has already been continued the maximum number of
+/// times is not continued again: it settles as lost, truthfully.
+#[tokio::test]
+async fn a_child_interrupted_too_many_times_settles_as_lost() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let turn = seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+    let log = EventLog::new(&db, session.clone());
+    for attempt in 1..=leveler_engine::MAX_CHILD_RESUMES {
+        log.append(
+            Some(&turn),
+            EngineEvent::SubAgentInterrupted {
+                id: "agent-r".into(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn),
+            EngineEvent::SubAgentResumed {
+                id: "agent-r".into(),
+                attempt,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    }
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert!(
+        !events.iter().any(|(_, e)| matches!(
+            e,
+            EngineEvent::SubAgentResumed { attempt, .. } if *attempt > leveler_engine::MAX_CHILD_RESUMES
+        )),
+        "no activation beyond the bound"
+    );
+    let stop = events.iter().find_map(|(_, e)| match e {
+        EngineEvent::SubAgentFinished { id, stop, .. } if id == "agent-r" => Some(*stop),
+        _ => None,
+    });
+    assert_eq!(stop, Some(Some(leveler_lifecycle::ChildStop::Lost)));
+}
+
+/// The reviewer is harness-launched and bounded; it is rerun fresh, never
+/// continued from a dead activation.
+#[tokio::test]
+async fn an_interrupted_reviewer_is_not_resumed() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "reviewer").await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::SubAgentResumed { .. }))
+    );
+    assert!(events.iter().any(|(_, e)| matches!(
+        e,
+        EngineEvent::SubAgentFinished { id, stop: Some(leveler_lifecycle::ChildStop::Lost), .. } if id == "agent-r"
+    )));
+}
+
+/// NO_OPEN_ORPHAN_AFTER_RESTART — the daemon-restart reaper does not leave a
+/// child reading as running until someone happens to resume its session.
+#[tokio::test]
+async fn the_restart_reaper_marks_an_open_child_interrupted() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(&db, dir.path(), Vec::new());
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+
+    leveler_engine::reap_after_restart(
+        &engine.engine.stores,
+        &engine.engine.runtime_id,
+        Some(&session),
+    )
+    .await
+    .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentInterrupted { id } if id == "agent-r")
+            )
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { .. })),
+        "interrupted is not settled: the session may still continue it"
+    );
+}
+
+/// A resumed Worker holds its scope again — it can write inside it — and the
+/// recovery note it was given is part of its durable session, so a second
+/// interruption restores that too.
+#[tokio::test]
+async fn a_resumed_worker_writes_inside_its_reclaimed_scope() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "w1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn resumed() {}\n*** End Patch"
+                }),
+            ),
+            text("added resumed() in src/lib.rs"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session_scoped(
+        &db,
+        &session,
+        "agent-w",
+        "worker",
+        vec!["src/lib.rs".to_string()],
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        lib.contains("pub fn resumed()"),
+        "the resumed worker's write inside its re-claimed scope must land: {lib}"
+    );
+    let events = event_rows(&db, &session).await;
+    let transcript = child_transcript(&events, "agent-w");
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.text_content().contains("re-claimed for this activation")),
+        "the recovery note is persisted into the child's own session"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-w")
+            )
+            .count(),
+        1
+    );
+}

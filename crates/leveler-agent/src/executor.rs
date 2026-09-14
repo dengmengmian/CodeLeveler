@@ -909,6 +909,10 @@ pub struct Executor {
     /// top of a depth-0 run; the pruned outstanding record is the
     /// once-per-restart mark.
     restart_settled_children: Vec<crate::sub_agent::SettledChildNotice>,
+    /// Interrupted children the engine recorded as resumed for this turn,
+    /// rebuilt from their durable sessions. Launched once, at the top of the
+    /// first round of a depth-0 run.
+    resumed_children: Vec<crate::sub_agent::ResumableChild>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1023,6 +1027,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
+            resumed_children: Vec::new(),
             seeded_objective: None,
             memory_catalog: String::new(),
             memory_expose: false,
@@ -1088,6 +1093,15 @@ impl Executor {
         children: Vec<crate::sub_agent::SettledChildNotice>,
     ) -> Self {
         self.restart_settled_children = children;
+        self
+    }
+
+    /// Hand the run the interrupted children it continues (MA1 G10).
+    pub(crate) fn with_resumed_children(
+        mut self,
+        children: Vec<crate::sub_agent::ResumableChild>,
+    ) -> Self {
+        self.resumed_children = children;
         self
     }
 
@@ -1357,6 +1371,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
+            resumed_children: Vec::new(),
             seeded_objective: None,
             memory_catalog: String::new(),
             memory_expose: self.memory_expose,

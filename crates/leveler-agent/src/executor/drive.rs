@@ -155,6 +155,8 @@ pub(crate) struct Drive<'a> {
     context_diverged: bool,
     session_approved: HashSet<String>,
     background_children: BackgroundChildren,
+    /// Whether this run's resumed children (if any) were launched yet.
+    resumed_children_launched: bool,
     run_agents_semaphore: Arc<tokio::sync::Semaphore>,
     bg_progress_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     bg_progress_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
@@ -321,6 +323,7 @@ impl Executor {
                 children: Vec::new(),
                 ownership: Some(self.ownership.clone()),
             },
+            resumed_children_launched: false,
             run_agents_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 self.policy.max_concurrent_agents.max(1),
             )),
@@ -541,6 +544,124 @@ impl<'a> Drive<'a> {
         Ok(())
     }
 
+    /// Launch a new background activation for every child the engine recorded
+    /// as resumed: same id, same spec, its restored transcript. From here it is
+    /// an ordinary background child — permit, budget share, fence, settlement.
+    async fn launch_resumed_children(
+        &mut self,
+        rt: &mut LoopContext,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let executor = self.executor;
+        if executor.depth != 0 || executor.resumed_children.is_empty() {
+            return Ok(());
+        }
+        let share_n = executor.resumed_children.len() as u32;
+        let mut launched = Vec::new();
+        for (share_of, child) in executor.resumed_children.iter().enumerate() {
+            executor
+                .ownership
+                .register_owner(&child.id, &format!("{} ({})", child.nickname, child.id));
+            if child.role == AgentRole::Worker
+                && !child.spec.files.is_empty()
+                && let Err(rejection) = executor.ownership.try_claim(&child.id, &child.spec.files)
+            {
+                // Stale authority is never resurrected, and a child that cannot
+                // hold its scope cannot continue. Settle it now, truthfully.
+                executor.ownership.release_all(&child.id);
+                let result = super::handlers::SubAgentRunResult {
+                    result: crate::sub_agent::ChildResult::new(
+                        false,
+                        "",
+                        format!(
+                            "its write scope could not be re-claimed: {}",
+                            rejection.for_model()
+                        ),
+                    ),
+                    stop: leveler_lifecycle::ChildStop::Failed,
+                    progress: ProgressLedger::default(),
+                    modified_files: Vec::new(),
+                    findings: Vec::new(),
+                };
+                let (content, _) = fold_child_settlement(
+                    &mut self.progress,
+                    &mut self.commands_run,
+                    &mut self.modified_files,
+                    &mut self.ledger,
+                    &mut *self.observer,
+                    &child.id,
+                    &child.nickname,
+                    child.role,
+                    &result,
+                );
+                let notice = Message::text(
+                    Role::User,
+                    settlement_notice(
+                        &child.nickname,
+                        &child.id,
+                        child.role,
+                        &child.spec.files,
+                        &content,
+                    ),
+                );
+                self.sink.append(std::slice::from_ref(&notice)).await?;
+                messages.push(notice);
+                continue;
+            }
+            let residual = residual_step_limits(
+                executor.step_limits,
+                self.commands_run,
+                rt.model_tokens_spent(),
+                rt.cost_spent_micros(),
+                projected_epoch_file_count(&self.progress, &self.modified_files),
+                self.epoch_duration_at_start,
+                rt.run_started(),
+                share_of as u32,
+                share_n,
+            );
+            let parent_wall = super::handlers::ParentWallBudget {
+                cap: executor.step_limits.max_duration,
+                epoch_duration_at_start: self.epoch_duration_at_start,
+                run_started: rt.run_started(),
+            };
+            let handle = tokio::spawn(executor.sub_agent_resume_future(
+                child,
+                self.run_agents_semaphore.clone(),
+                self.bg_progress_tx.clone(),
+                residual,
+                rt.cancellation().child_token(),
+                parent_wall,
+            ));
+            self.progress.outstanding_children.push(format!(
+                "{}|{}|{}|{}",
+                child.id,
+                child.nickname,
+                child.role.label(),
+                child.spec.files.join(",")
+            ));
+            self.background_children.children.push(BackgroundChild {
+                id: child.id.clone(),
+                nickname: child.nickname.clone(),
+                role: child.role,
+                scope: child.spec.files.clone(),
+                handle,
+            });
+            launched.push(child.clone());
+        }
+        (self.observer)(AgentEvent::ProgressUpdated {
+            ledger: self.progress.clone(),
+        });
+        if !launched.is_empty() {
+            let note = Message::text(
+                Role::User,
+                crate::sub_agent::resumed_children_note(&launched),
+            );
+            self.sink.append(std::slice::from_ref(&note)).await?;
+            messages.push(note);
+        }
+        Ok(())
+    }
+
     /// Full drain — await EVERY outstanding background child before the run
     /// returns, so no exit path orphans a running delegation or loses its
     /// result. Children hold cancellation tokens and wall caps, so this
@@ -630,6 +751,13 @@ impl AgentHarness for Drive<'_> {
                 self.sink.append(std::slice::from_ref(&message)).await?;
                 messages.push(message);
             }
+        }
+        // Interrupted children this turn continues start before the parent's
+        // first model call, so the parent is told about them up front and
+        // never re-delegates work that is already resuming.
+        if !self.resumed_children_launched {
+            self.resumed_children_launched = true;
+            self.launch_resumed_children(rt, messages).await?;
         }
         // Background settlements land before the model is asked anything —
         // whichever path reached this round top (tool batch, quiet wait,

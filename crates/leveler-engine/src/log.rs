@@ -264,7 +264,12 @@ impl<'a> EventLog<'a> {
             .store
             .load_by_types(
                 &self.session_id,
-                &["sub_agent_started", "sub_agent_finished"],
+                &[
+                    "sub_agent_started",
+                    "sub_agent_finished",
+                    "sub_agent_interrupted",
+                    "sub_agent_resumed",
+                ],
             )
             .await?;
         let mut open: Vec<UnfinishedChild> = Vec::new();
@@ -279,6 +284,9 @@ impl<'a> EventLog<'a> {
                         id,
                         nickname,
                         role,
+                        resumes: 0,
+                        interrupted: false,
+                        active_turn: row.turn_id.clone(),
                     });
                 }
                 EngineEvent::SubAgentFinished {
@@ -298,8 +306,45 @@ impl<'a> EventLog<'a> {
                         });
                     }
                 }
+                EngineEvent::SubAgentInterrupted { id } => {
+                    if let Some(child) = open.iter_mut().find(|child| child.id == id) {
+                        child.interrupted = true;
+                    }
+                }
+                EngineEvent::SubAgentResumed { id, attempt } => {
+                    if let Some(child) = open.iter_mut().find(|child| child.id == id) {
+                        child.resumes = child.resumes.max(attempt);
+                        child.interrupted = false;
+                        child.active_turn = row.turn_id.clone();
+                    }
+                }
                 _ => {}
             }
+        }
+        Ok((open, finished))
+    }
+
+    /// Record every open child whose latest activation is not yet marked as
+    /// interrupted. Called only where no activation of this session can be
+    /// live — a restart reap, a turn start — so an open child there is by
+    /// construction a dead activation, and the log must stop reading it as
+    /// running. Returns the children as they stand afterwards.
+    pub async fn interrupt_open_children(
+        &self,
+        forward: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(Vec<UnfinishedChild>, Vec<FinishedChildFact>), EngineError> {
+        let (mut open, finished) = self.child_reconciliation_view().await?;
+        for child in open.iter_mut().filter(|child| !child.interrupted) {
+            let turn = child.active_turn.clone().map(TurnId::new);
+            self.append(
+                turn.as_ref(),
+                EngineEvent::SubAgentInterrupted {
+                    id: child.id.clone(),
+                },
+                forward,
+            )
+            .await?;
+            child.interrupted = true;
         }
         Ok((open, finished))
     }
@@ -419,6 +464,13 @@ pub struct UnfinishedChild {
     /// Role label as recorded on `SubAgentStarted`, carried verbatim. What a
     /// given role means for the task is the harness's reading, not the log's.
     pub role: String,
+    /// How many times this child has already been continued.
+    pub resumes: u32,
+    /// Whether its latest activation is already recorded as interrupted.
+    pub interrupted: bool,
+    /// The turn its latest activation ran in — the start's turn, or the turn
+    /// that last resumed it. An interruption belongs to that turn.
+    pub active_turn: Option<String>,
 }
 
 /// The durable terminal fact of a child that DID finish — what restart

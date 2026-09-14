@@ -359,7 +359,7 @@ impl Executor {
             role,
             agent_tools,
             agent_max_rounds,
-            task,
+            ChildStart::Task(task),
             permit,
             progress,
             residual_limits,
@@ -367,6 +367,58 @@ impl Executor {
             parent_wall,
         )
     }
+
+    /// The owned future of a NEW activation of an interrupted child: the same
+    /// id, rebuilt from its spec, continuing its restored transcript after the
+    /// recovery note. Everything else — permit, budgets, cancellation, spend
+    /// capture, settlement — is the spawn path's, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sub_agent_resume_future(
+        &self,
+        child: &crate::sub_agent::ResumableChild,
+        permit: Arc<tokio::sync::Semaphore>,
+        progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        residual_limits: StepLimits,
+        cancellation: CancellationToken,
+        parent_wall: ParentWallBudget,
+    ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
+        let model_override = child
+            .spec
+            .model
+            .as_deref()
+            .and_then(leveler_model::ModelRef::parse);
+        let prepared_child = self
+            .child_for_role_on(child.role, child.spec.files.clone(), model_override)
+            .with_agent_id(child.id.clone());
+        run_prepared_sub_agent(
+            prepared_child,
+            self.hook_runner.clone(),
+            child.id.clone(),
+            child.role,
+            child.spec.tools.clone(),
+            child.spec.max_rounds,
+            ChildStart::Resume {
+                prior: child.prior.clone(),
+                note: child.note.clone(),
+            },
+            permit,
+            progress,
+            residual_limits,
+            cancellation,
+            parent_wall,
+        )
+    }
+}
+
+/// How an activation begins: a fresh task, or a restored child session.
+enum ChildStart {
+    Task(String),
+    Resume {
+        prior: Vec<leveler_model::Message>,
+        /// Persisted to the child's transcript before it runs, so a second
+        /// interruption restores it too.
+        note: leveler_model::Message,
+    },
 }
 
 /// The owned body of one sub-agent run (see [`Executor::sub_agent_run_future`]).
@@ -378,7 +430,7 @@ async fn run_prepared_sub_agent(
     role: AgentRole,
     agent_tools: Vec<String>,
     agent_max_rounds: u32,
-    task: String,
+    start: ChildStart,
     permit: Arc<tokio::sync::Semaphore>,
     progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     mut residual_limits: StepLimits,
@@ -512,8 +564,22 @@ async fn run_prepared_sub_agent(
     // Box the recursive future (agent → spawn_agent → agent) so its size is
     // finite.
     let hook_token = cancellation.clone();
-    let run = child.run(&task, &mut capture, &mut sink, cancellation);
-    let outcome = Box::pin(run).await;
+    let outcome = match start {
+        ChildStart::Task(task) => {
+            Box::pin(child.run(&task, &mut capture, &mut sink, cancellation)).await
+        }
+        ChildStart::Resume { mut prior, note } => {
+            match leveler_engine::TranscriptSink::append(&mut sink, std::slice::from_ref(&note))
+                .await
+            {
+                Ok(()) => {
+                    prior.push(note);
+                    Box::pin(child.resume(prior, &mut capture, &mut sink, cancellation)).await
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    };
     if hook_runner.has_lifecycle() {
         let ok = outcome.is_ok();
         hook_runner
