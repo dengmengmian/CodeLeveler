@@ -7,7 +7,12 @@ import { choiceOrdinal, splitChoiceOption } from '../lib/choiceLabel';
 import { CTRL_ICON } from '../lib/icons';
 import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
 import { formatElapsed } from '../lib/format';
-import { currentPlanProgress, inspectorMode, inspectorVisibleSections } from '../lib/inspectorModel';
+import {
+  childStateLabel,
+  currentPlanProgress,
+  inspectorMode,
+  inspectorVisibleSections,
+} from '../lib/inspectorModel';
 import {
   projectObservability,
   type AgentDelegationStatus,
@@ -223,20 +228,45 @@ function VerificationSection({ current }: { current: SessionView }) {
 }
 
 function AgentRow({ agent }: { agent: SubAgentView }) {
-  const glyph = agent.status === 'run' ? '●' : agent.status === 'done' ? '✓' : '✗';
+  const bridge = useBridge();
+  const glyph =
+    agent.state === 'interrupted' ? '⏸' : agent.state === 'running' ? '●' : agent.status === 'done' ? '✓' : '✗';
+  const tone = agent.state === 'interrupted' ? 'interrupted' : agent.status;
+  const bounds = [
+    agent.readOnly ? 'read-only' : null,
+    agent.background ? 'background' : null,
+    agent.scope.length > 0 ? `scope: ${agent.scope.join(', ')}` : null,
+  ].filter(Boolean);
   return (
-    <div className={`agent-row ${agent.status}`}>
+    <div className={`agent-row ${tone}`}>
       <span className="ag-glyph">{glyph}</span>
       <span className="ag-main">
         <span className="ag-name">
           {agent.nickname}
           <span className="ag-role">{agent.role}</span>
+          <span className="ag-state">{childStateLabel({ ...agent, ok: agent.status === 'done' })}</span>
         </span>
         <span className="ag-detail">{agent.detail}</span>
-        {agent.status === 'run' && agent.recentStep && (
+        {bounds.length > 0 && <span className="ag-bounds">{bounds.join(' · ')}</span>}
+        {agent.state === 'running' && agent.recentStep && (
           <span className="ag-step">{agent.recentStep}</span>
         )}
+        {(agent.tokens.input > 0 || agent.tokens.output > 0) && (
+          <span className="ag-bounds">
+            ↑ {agent.tokens.input} · ↓ {agent.tokens.output}
+          </span>
+        )}
       </span>
+      {agent.state === 'running' && (
+        <button
+          type="button"
+          className="abtn danger ag-cancel"
+          title="只停止这个子 Agent，主任务继续"
+          onClick={() => bridge.cancelChild(agent.id)}
+        >
+          取消
+        </button>
+      )}
     </div>
   );
 }
@@ -356,6 +386,7 @@ function artifactLine(a: ArtifactFacts): string {
 
 function delegationStatus(status: AgentDelegationStatus): string {
   if (status === 'running') return '● Running';
+  if (status === 'interrupted') return '⏸ Interrupted';
   if (status === 'completed') return '✓ Finished';
   return '✗ Failed';
 }
@@ -388,7 +419,9 @@ function DelegationStar({ agents }: { agents: readonly AgentDelegationView[] }) 
 
 function AgentsSection({ live }: { live: readonly SubAgentView[] }) {
   const { observation } = useAppState();
-  const running = live.filter((a) => a.status === 'run');
+  // Open children: running, or interrupted and waiting for the runtime to
+  // continue or settle them. Settled ones live in Delegated.
+  const running = live.filter((a) => a.state !== 'settled');
   const delegated = observation ? projectObservability(observation).agents : [];
   if (running.length === 0 && delegated.length === 0) return null;
   return (

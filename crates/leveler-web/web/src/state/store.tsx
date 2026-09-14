@@ -10,6 +10,8 @@ import { useImmerReducer } from '../lib/useImmerReducer';
 import type { TurnOutcome } from '../lib/turn';
 import type {
   AttachmentRef,
+  ChildOutcome,
+  ChildStop,
   ModelRef,
   PermissionProfile,
   ProjectInfo,
@@ -18,14 +20,15 @@ import type {
   ToolCallId,
   UiApprovalRequest,
   UiCheckpoint,
+  UiChildState,
   UiClarificationRequest,
   UiCompletionReport,
   UiDiff,
   UiMemoryCandidate,
   UiMemoryEntry,
+  UiObservabilityLoaded,
   UiPlan,
   UiRole,
-  UiObservabilityLoaded,
   UiSessionSnapshot,
   UiSessionSummary,
   UiVerification,
@@ -50,8 +53,9 @@ export interface ChatMessage {
   seq: number;
   /** 旁问（/btw）侧答：存被问的问题，非空即渲染为独立侧答卡片 */
   btw?: string;
-  /** Product presentation; compaction is stamped by the runtime prefix. */
-  kind?: 'compaction_summary';
+  /** Product presentation; compaction is stamped by the runtime prefix, a
+   * runtime notice by the runtime's own message kind. */
+  kind?: 'compaction_summary' | 'runtime_notice';
 }
 
 export interface ToolCallView {
@@ -93,6 +97,14 @@ export interface SubAgentView {
   nickname: string;
   role: string;
   status: 'run' | 'done' | 'fail';
+  /** Runtime lifecycle, as recorded — never derived by the UI. */
+  state: UiChildState;
+  outcome: ChildOutcome | null;
+  stop: ChildStop | null;
+  profileId: string | null;
+  readOnly: boolean;
+  background: boolean;
+  scope: string[];
   /** 运行中 = 任务描述；完成后 = 结果摘要（协议语义） */
   detail: string;
   /** 最近一步工具活动（sub_agent_activity），如 `cargo test ✓` */
@@ -280,7 +292,22 @@ export type Action =
   | { type: 'btw_done' }
   | { type: 'tool_started'; id: ToolCallId; name: string; arguments: string; parallel: boolean }
   | { type: 'tool_completed'; id: ToolCallId; ok: boolean; preview: string; durationMs: number }
-  | { type: 'sub_agent_updated'; id: string; nickname: string; role: string; done: boolean; ok: boolean; detail: string }
+  | {
+      type: 'sub_agent_updated';
+      id: string;
+      nickname: string;
+      role: string;
+      done: boolean;
+      ok: boolean;
+      detail: string;
+      outcome?: ChildOutcome | null;
+      stop?: ChildStop | null;
+      profileId?: string | null;
+      readOnly?: boolean;
+      background?: boolean;
+      scope?: string[];
+    }
+  | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   | { type: 'sub_agent_progress'; id: string; active: boolean; input: number; output: number; cached: number }
   | { type: 'sub_agent_activity'; id: string; step: string }
   | { type: 'background_started'; taskId: string; program: string; args: string[] }
@@ -337,7 +364,11 @@ function viewFromSnapshot(
     time: null,
     seq: nextSeq(),
     kind:
-      m.role === 'user' && isCompactionSummaryText(m.text) ? 'compaction_summary' : undefined,
+      m.kind === 'runtime_notice'
+        ? 'runtime_notice'
+        : m.role === 'user' && isCompactionSummaryText(m.text)
+          ? 'compaction_summary'
+          : undefined,
   }));
   const tools: ToolCallView[] = (snap.active_tools ?? []).map((t) => ({
     id: t.id,
@@ -366,7 +397,7 @@ function viewFromSnapshot(
     messages,
     tools,
     traces: sameSession ? (prev.traces ?? []) : [],
-    agents: sameSession ? prev.agents : [],
+    agents: restoreAgents(snap, sameSession ? prev.agents : []),
     backgroundTasks: sameSession ? prev.backgroundTasks : [],
     pendingApprovals,
     pendingClarifications,
@@ -400,6 +431,35 @@ function viewFromSnapshot(
     contextTokens: sameSession ? prev.contextTokens : 0,
     contextWindow: contextWindow ?? (sameSession ? prev.contextWindow : null),
   };
+}
+
+/** Children the runtime still has open, from the snapshot's durable record,
+ * merged over what this view already follows (keeps live step and tokens).
+ * Old runtimes send no `children`: keep the live view as it was. */
+function restoreAgents(snap: UiSessionSnapshot, live: SubAgentView[]): SubAgentView[] {
+  if (!snap.children) return live;
+  const open = snap.children.filter((c) => c.state !== 'settled');
+  return open.map((c) => {
+    const existing = live.find((a) => a.id === c.id);
+    return {
+      id: c.id,
+      nickname: c.nickname,
+      role: c.role,
+      status: 'run' as const,
+      state: c.state,
+      outcome: null,
+      stop: null,
+      profileId: c.profile_id ?? null,
+      readOnly: c.read_only ?? false,
+      background: c.background ?? false,
+      scope: c.scope ?? [],
+      detail: existing?.detail ?? c.purpose,
+      recentStep: existing?.recentStep ?? null,
+      active: existing?.active ?? false,
+      tokens: existing?.tokens ?? { input: c.input_tokens ?? 0, output: c.output_tokens ?? 0, cached: 0 },
+      seq: existing?.seq ?? nextSeq(),
+    };
+  });
 }
 
 /** Drop every projection that belongs to the session currently on screen. */
@@ -703,7 +763,9 @@ export function reducer(state: AppState, action: Action): void {
     }
     case 'sub_agent_updated': {
       if (!state.current) return;
-      markBusy(state.current);
+      // A start means work is happening. A terminal can arrive after its turn
+      // ended; it settles the child and must not reopen that turn.
+      if (!action.done) markBusy(state.current);
       const existing = state.current.agents.find((a) => a.id === action.id);
       if (existing) {
         existing.nickname = action.nickname;
@@ -711,6 +773,9 @@ export function reducer(state: AppState, action: Action): void {
         existing.detail = action.detail;
         if (action.done) {
           existing.status = action.ok ? 'done' : 'fail';
+          existing.state = 'settled';
+          existing.outcome = action.outcome ?? null;
+          existing.stop = action.stop ?? null;
           existing.active = false;
         }
         return;
@@ -720,12 +785,28 @@ export function reducer(state: AppState, action: Action): void {
         nickname: action.nickname,
         role: action.role,
         status: action.done ? (action.ok ? 'done' : 'fail') : 'run',
+        state: action.done ? 'settled' : 'running',
+        outcome: action.outcome ?? null,
+        stop: action.stop ?? null,
+        profileId: action.profileId ?? null,
+        readOnly: action.readOnly ?? false,
+        background: action.background ?? false,
+        scope: action.scope ?? [],
         detail: action.detail,
         recentStep: null,
         active: !action.done,
         tokens: { input: 0, output: 0, cached: 0 },
         seq: nextSeq(),
       });
+      return;
+    }
+    case 'sub_agent_state_changed': {
+      const agent = state.current?.agents.find((a) => a.id === action.id);
+      // A terminal is final; only an open child moves.
+      if (agent && agent.state !== 'settled') {
+        agent.state = action.state;
+        if (action.state !== 'running') agent.active = false;
+      }
       return;
     }
     case 'sub_agent_progress': {

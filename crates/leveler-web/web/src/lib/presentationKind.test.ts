@@ -21,6 +21,15 @@ describe('compaction presentation', () => {
   });
 });
 
+describe('runtime notices', () => {
+  it('a runtime notice is not a user turn, and its kind is the runtime\'s', () => {
+    const notice = { role: 'user', text: '## Background sub-agent settled', kind: 'runtime_notice' as const };
+    expect(isTurnUser(notice)).toBe(false);
+    expect(presentationKindOf(notice)).toBe('runtime_notice');
+    expect(presentationKindOf({ role: 'user', text: '## Background sub-agent settled' })).toBe('normal');
+  });
+});
+
 describe('presentationKindOf', () => {
   it('uses the live btw field, not text.startsWith', () => {
     expect(presentationKindOf({ role: 'assistant', text: 'hello', btw: '这是什么' })).toBe('btw');

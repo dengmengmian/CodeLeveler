@@ -14,6 +14,7 @@ import {
 import { useAppState, type ChatMessage, type LastTurn, type TurnTrace } from '../state/store';
 import { AgentRunBlock } from './AgentRunBlock';
 import { CompactionSummary } from './CompactionSummary';
+import { RuntimeNotice } from './RuntimeNotice';
 import { ApprovalCard } from './ApprovalCard';
 import { ClarificationCard } from './ClarificationCard';
 import { CopyButton } from './CopyButton';
@@ -41,6 +42,7 @@ function AssistantTurn({ m }: { m: ChatMessage }) {
 
 function renderTurn(m: ChatMessage) {
   if (m.kind === 'compaction_summary') return <CompactionSummary key={m.id} text={m.text} />;
+  if (m.kind === 'runtime_notice') return <RuntimeNotice key={m.id} text={m.text} />;
   if (m.btw !== undefined) return <BtwTurn key={m.id} m={m} />;
   if (m.role === 'user') return <UserTurn key={m.id} m={m} />;
   return <AssistantTurn key={m.id} m={m} />;

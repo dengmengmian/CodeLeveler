@@ -150,6 +150,13 @@ describe('observability projection', () => {
     ]);
   });
 
+  it('an interrupted child is interrupted, not running', () => {
+    const [view] = projectAgentDelegation([
+      { id: 'c1', nickname: 'Euclid', role: 'explorer', status: 'interrupted', summary: 'look' },
+    ]);
+    expect(view?.status).toBe('interrupted');
+  });
+
   it('does not invent a finished agent task that the protocol already overwrote', () => {
     const [view] = projectAgentDelegation([
       { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'auth flow mapped' },

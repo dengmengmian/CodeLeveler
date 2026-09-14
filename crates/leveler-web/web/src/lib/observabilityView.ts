@@ -31,7 +31,7 @@ export interface ExecStep {
   agentLabel: string | null;
 }
 
-export type AgentDelegationStatus = 'running' | 'completed' | 'failed';
+export type AgentDelegationStatus = 'running' | 'interrupted' | 'completed' | 'failed';
 
 /** In-session delegated worker. Not a child Session. */
 export interface AgentDelegationView {
@@ -145,6 +145,9 @@ export function projectAgentDelegation(agents: readonly UiAgentObservation[]): A
     }
     if (a.status === 'fail') {
       return { id: a.id, nickname: a.nickname, role: a.role, status: 'failed', task: null, summary: text };
+    }
+    if (a.status === 'interrupted') {
+      return { id: a.id, nickname: a.nickname, role: a.role, status: 'interrupted', task: text, summary: null };
     }
     return { id: a.id, nickname: a.nickname, role: a.role, status: 'running', task: text, summary: null };
   });

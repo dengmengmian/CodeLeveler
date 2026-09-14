@@ -535,6 +535,12 @@ button { font-family: inherit; }
 }
 .compaction-toggle:hover { color: var(--text-primary); }
 .compaction-body { padding: 0 12px 12px 36px; }
+.runtime-notice { margin: 4px 0; font-size: 12px; color: var(--text-secondary); }
+.runtime-notice-toggle {
+  background: none; border: 0; padding: 4px 12px; color: inherit; cursor: pointer; font: inherit;
+}
+.runtime-notice-toggle:hover { color: var(--text-primary); }
+.runtime-notice-body { padding: 0 12px 8px 28px; }
 
 /* 用户消息：问题标题，不是聊天气泡 */
 .message-user {
@@ -1004,6 +1010,10 @@ button { font-family: inherit; }
 .agent-row.run .ag-glyph { color: var(--accent); }
 .agent-row.done .ag-glyph { color: var(--success); }
 .agent-row.fail .ag-glyph { color: var(--danger); }
+.agent-row.interrupted .ag-glyph { color: var(--warning); }
+.agent-row .ag-state { margin-left: 6px; font-size: 11px; color: var(--text-secondary); }
+.agent-row .ag-bounds { font-size: 11px; color: var(--text-secondary); }
+.agent-row .ag-cancel { flex: none; align-self: center; }
 .agent-row .ag-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .agent-row .ag-name,
 .ag-star-row .ag-name { color: var(--text-primary); }

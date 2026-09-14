@@ -577,6 +577,32 @@ describe('sub-agents', () => {
     expect(state.current?.agents[0]?.recentStep).toBe('cargo test ✓');
   });
 
+  it('a snapshot restores children the runtime still has open, from its record', () => {
+    const child = (id: string, state: 'running' | 'interrupted' | 'settled') => ({
+      id, nickname: `n-${id}`, role: 'explorer', purpose: `p-${id}`, state,
+      background: true, read_only: true, resumes: 0, input_tokens: 5, output_tokens: 1,
+    });
+    const state = stateWithSession({
+      children: [child('c1', 'settled'), child('c2', 'interrupted'), child('c3', 'running')],
+    });
+    const agents = state.current?.agents ?? [];
+    expect(agents.map((a) => [a.id, a.state])).toEqual([
+      ['c2', 'interrupted'],
+      ['c3', 'running'],
+    ]);
+    expect(agents[0]?.detail).toBe('p-c2');
+  });
+
+  it('a runtime notice in history is a runtime_notice, not a user turn', () => {
+    const state = stateWithSession({
+      messages: [
+        { id: 'm1', role: 'user', text: '## Background sub-agent settled\nEuclid finished.', kind: 'runtime_notice' },
+        { id: 'm2', role: 'user', text: 'please continue' },
+      ],
+    });
+    expect(state.current?.messages.map((m) => m.kind)).toEqual(['runtime_notice', undefined]);
+  });
+
   it('a new user turn clears the previous turn agents (like tools)', () => {
     const state = stateWithSession();
     reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'W', role: 'worker', done: true, ok: true, detail: 'x' });

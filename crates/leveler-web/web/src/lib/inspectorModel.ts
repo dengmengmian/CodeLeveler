@@ -2,10 +2,39 @@
 // 用户语言：等待操作 / 运行中 / 终态 / 空闲。不暴露 RuntimeEvent。
 
 import type { SessionView } from '../state/store';
-import type { UiPlan } from '../types/protocol';
+import type { ChildOutcome, ChildStop, UiChildState, UiPlan } from '../types/protocol';
 import { presentTurnEnd, type TurnEnd, type TurnTone } from './turn';
 
 export type InspectorMode = 'waiting' | 'running' | 'terminal' | 'idle';
+
+const OUTCOME_LABEL: Record<ChildOutcome, string> = {
+  completed_with_findings: '完成',
+  completed_no_findings: '完成 · 无发现',
+  incomplete_partial: '部分结果',
+  incomplete_no_result: '无结果',
+};
+
+const STOP_LABEL: Partial<Record<ChildStop, string>> = {
+  budget: '预算耗尽',
+  cancelled: '已取消',
+  failed: '失败',
+  lost: '已丢失',
+};
+
+/** One child's state in user words, from the runtime's typed facts only.
+ * "No result" and "no findings" are opposite facts and never share a label. */
+export function childStateLabel(a: {
+  state: UiChildState;
+  ok: boolean;
+  outcome: ChildOutcome | null;
+  stop: ChildStop | null;
+}): string {
+  if (a.state === 'running') return '运行中';
+  if (a.state === 'interrupted') return '已中断';
+  const outcome = a.outcome ? OUTCOME_LABEL[a.outcome] : a.ok ? '完成' : '未完成';
+  const stop = a.stop ? STOP_LABEL[a.stop] : undefined;
+  return stop ? `${outcome} · ${stop}` : outcome;
+}
 
 export function inspectorMode(s: SessionView | null): InspectorMode {
   if (!s) return 'idle';

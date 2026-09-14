@@ -281,7 +281,16 @@ export class RuntimeBridge {
           done: ev.done,
           ok: ev.ok,
           detail: ev.detail,
+          outcome: ev.outcome ?? null,
+          stop: ev.stop ?? null,
+          profileId: ev.profile_id ?? null,
+          readOnly: ev.read_only ?? false,
+          background: ev.background ?? false,
+          scope: ev.scope ?? [],
         });
+        break;
+      case 'sub_agent_state_changed':
+        this.dispatch({ type: 'sub_agent_state_changed', id: ev.id, state: ev.state });
         break;
       case 'sub_agent_progress':
         this.dispatch({
@@ -660,6 +669,13 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return;
     this.deliver({ type: 'cancel_current_turn', session_id: current.id });
+  }
+
+  /** Stop one running child; its parent turn keeps running. */
+  cancelChild(childId: string): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'cancel_child', session_id: current.id, child_id: childId });
   }
 
   setPermission(mode: PermissionProfile): void {

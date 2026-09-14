@@ -7,7 +7,10 @@
 /** Stamped by the runtime on the message that replaces compacted history. */
 export const COMPACTION_SUMMARY_PREFIX = '对话摘要（已压缩历史）';
 
-export type PresentationKind = 'normal' | 'btw' | 'compaction_summary';
+// - Runtime notice: the runtime's own message kind (`runtime_notice`) on a
+//   user-role message it wrote into the model's context (a child settled, a
+//   delegation was lost or resumed). Never inferred from the text here.
+export type PresentationKind = 'normal' | 'btw' | 'compaction_summary' | 'runtime_notice';
 
 export function isCompactionSummaryText(text: string): boolean {
   return text.startsWith(COMPACTION_SUMMARY_PREFIX);
@@ -24,7 +27,12 @@ export function isTurnUser(m: {
   btw?: string;
   kind?: PresentationKind;
 }): boolean {
-  return m.role === 'user' && m.btw === undefined && m.kind !== 'compaction_summary';
+  return (
+    m.role === 'user' &&
+    m.btw === undefined &&
+    m.kind !== 'compaction_summary' &&
+    m.kind !== 'runtime_notice'
+  );
 }
 
 export function presentationKindOf(m: {
@@ -35,6 +43,7 @@ export function presentationKindOf(m: {
 }): PresentationKind {
   if (m.btw !== undefined) return 'btw';
   if (m.kind === 'compaction_summary') return 'compaction_summary';
+  if (m.kind === 'runtime_notice') return 'runtime_notice';
   if (m.role === 'user' && isCompactionSummaryText(m.text)) return 'compaction_summary';
   return 'normal';
 }

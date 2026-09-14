@@ -342,6 +342,12 @@ describe('interaction commands', () => {
     expect(sent).toEqual([{ type: 'btw', session_id: 's1', question: '这是什么' }]);
   });
 
+  it('cancelChild delivers cancel_child for that child only', () => {
+    const { bridge, sent } = harness();
+    bridge.cancelChild('ag-1');
+    expect(sent).toEqual([{ type: 'cancel_child', session_id: 's1', child_id: 'ag-1' }]);
+  });
+
   it('openChanges requests a fresh diff then stages Changes', () => {
     const { bridge, sent, state } = harness();
     bridge.openChanges();
@@ -494,6 +500,39 @@ describe('event closure', () => {
     apply({ type: 'sub_agent_activity', id: 'ag', phase: 'tool_finished', tool: 'cargo test', preview: '', is_error: false });
     expect(state.current?.agents[0]?.tokens.input).toBe(10);
     expect(state.current?.agents[0]?.recentStep).toBe('cargo test ✓');
+  });
+
+  it('a child terminal and its lifecycle moves reach state typed', () => {
+    const { apply, state } = harness();
+    apply({
+      type: 'sub_agent_updated', id: 'ag', nickname: 'W', role: 'worker', done: false, ok: false,
+      detail: 'task', profile_id: 'worker', read_only: false, background: true, scope: ['src/a.rs'],
+    });
+    const started = state.current?.agents[0];
+    expect(started?.background).toBe(true);
+    expect(started?.scope).toEqual(['src/a.rs']);
+    expect(started?.profileId).toBe('worker');
+    apply({ type: 'sub_agent_state_changed', id: 'ag', state: 'interrupted' });
+    expect(state.current?.agents[0]?.state).toBe('interrupted');
+    apply({ type: 'sub_agent_state_changed', id: 'ag', state: 'running' });
+    expect(state.current?.agents[0]?.state).toBe('running');
+    apply({
+      type: 'sub_agent_updated', id: 'ag', nickname: 'W', role: 'worker', done: true, ok: false,
+      detail: 'partial', outcome: 'incomplete_partial', stop: 'budget',
+    });
+    const settled = state.current?.agents[0];
+    expect(settled?.state).toBe('settled');
+    expect(settled?.outcome).toBe('incomplete_partial');
+    expect(settled?.stop).toBe('budget');
+  });
+
+  it('a late child terminal does not reopen a finished turn', () => {
+    const { apply, state } = harness();
+    apply({ type: 'sub_agent_updated', id: 'ag', nickname: 'W', role: 'worker', done: false, ok: false, detail: 't' });
+    apply({ type: 'turn_completed' });
+    expect(state.current?.turnActive).toBe(false);
+    apply({ type: 'sub_agent_updated', id: 'ag', nickname: 'W', role: 'worker', done: true, ok: true, detail: 'x' });
+    expect(state.current?.turnActive).toBe(false);
   });
 
   it('turn_incomplete does NOT surface as completed', () => {

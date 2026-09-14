@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionView } from '../state/store';
 import {
+  childStateLabel,
   inspectorMode,
   inspectorTerminalTone,
   inspectorVisibleSections,
@@ -212,5 +213,17 @@ describe('inspectorVisibleSections', () => {
     );
     expect(sections).toContain('verification');
     expect(sections.filter((s) => s === 'verification')).toHaveLength(1);
+  });
+});
+
+describe('child state label', () => {
+  const base = { state: 'settled' as const, ok: false, outcome: null, stop: null };
+  it('reads the typed terminal, never the prose', () => {
+    expect(childStateLabel({ ...base, state: 'running' })).toBe('运行中');
+    expect(childStateLabel({ ...base, state: 'interrupted' })).toBe('已中断');
+    expect(childStateLabel({ ...base, ok: true, outcome: 'completed_no_findings' })).toBe('完成 · 无发现');
+    expect(childStateLabel({ ...base, outcome: 'incomplete_partial', stop: 'budget' })).toBe('部分结果 · 预算耗尽');
+    expect(childStateLabel({ ...base, outcome: 'incomplete_no_result', stop: 'cancelled' })).toBe('无结果 · 已取消');
+    expect(childStateLabel({ ...base, stop: 'lost' })).toBe('未完成 · 已丢失');
   });
 });
