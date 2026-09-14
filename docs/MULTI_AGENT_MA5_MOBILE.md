@@ -26,7 +26,7 @@ one control over it, `cancel_child`. Nothing is derived from prose.
 | Commit | Change |
 |---|---|
 | `99e27ec` | `SessionState.children`, typed labels, snapshot merge, de-dup, runtime notices, children strip + sheet with bounds/usage/stop, `Commands.cancelChild`, `children_test` journey |
-| `06714ea` | **Runtime bug found by this acceptance**: the interactive chat turn (`run_in_session_with_content`, the turn TUI, Web and phone submit) had no steering source, so `CancelChild` never found a handle and a mid-turn steer was never injected. Both are pinned red→green by `crates/leveler-app/tests/mid_turn_controls.rs` (foreground and background child cancelled through `InProcessRuntimeClient`; steer reaches the conversation). |
+| `06714ea` | **Runtime bug found by this acceptance**: the interactive chat turn (`run_in_session_with_content`, the turn TUI, Web and phone submit) had no steering source, so `CancelChild` never found a handle and a mid-turn steer was never injected. Both are pinned red→green by `crates/leveler-app/tests/mid_turn_controls.rs` (a child cancelled through `InProcessRuntimeClient`; a steer reaches the conversation). |
 | `c6a3b66` | Review follow-ups: no invented child for an id-less update; snapshot redraws child rows; disabled `停止中…` after a press; a long notice wraps (a 92 px overflow seen on the simulator); simulator script fixes (work dir under `/tmp` for the socket path, projects registry at `state/web/projects.json`) |
 | `48f8533` | A view left stale by a mid-answer reconnect asks for a snapshot when the turn ends (the resync banner stayed up forever before) |
 | `3544129` | **Runtime race found by CI**: a child's cancel handle reached the host only after its start was flushed, so a stop sent the moment a child appeared could be told the child did not exist; the handle is now registered before the start is emitted (`a_child_is_cancellable_by_the_time_its_start_is_observed`). The app-level background cancel test, which raced the mock server's response order, was removed with the reason recorded. |
@@ -60,7 +60,7 @@ confirming, then:
 | parent continues | host `task_finished completed / answered` 06:29:07 |
 | view consistent afterwards | resync completes; child still `cancelled`; no layout overflow in the run log |
 
-The two runs before the fixes are part of the record: the first failed on the
+The three runs before the fixes are part of the record: the first failed on the
 script's stale registry path and socket length; the second reached the stop
 and showed the child running on for 60 s to `completed` (the `06714ea` bug);
 the third failed its final consistency check (the `48f8533` bug). The passing
