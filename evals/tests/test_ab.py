@@ -235,6 +235,10 @@ class UnitQualityTests(unittest.TestCase):
         self.assertEqual(agg["unit_pass_rate"], 0.75)
         self.assertEqual(agg["runs_without_unit_results"], 1)
 
+    def test_suspect_truncated_writes_are_totalled(self):
+        run = judge_run(_run(lifecycle=_lifecycle(suspect_truncated_writes=[{"child": "w", "path_prefix": "x/"}])))
+        self.assertEqual(aggregate([run])["suspect_truncated_writes_total"], 1)
+
 
 class AggregateTests(unittest.TestCase):
     def test_rates_totals_and_unknown_cost(self):

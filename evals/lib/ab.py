@@ -180,6 +180,7 @@ def aggregate(all_runs: list[dict[str, Any]]) -> dict[str, Any]:
         "duplicate_settlement_total": sum(x.get("duplicate_settlement", 0) for x in lc),
         "ownership_violation_total": sum(x.get("ownership_violation", 0) for x in lc),
         "unattributed_child_mutations": sum(x.get("unattributed_child_mutations", 0) for x in lc),
+        "suspect_truncated_writes_total": sum(len(x.get("suspect_truncated_writes") or []) for x in lc),
         "interrupted_total": sum(x.get("interrupted", 0) for x in lc),
         "resumed_total": sum(x.get("resumed", 0) for x in lc),
         "rounds_mean": _mean([float(r["rounds"]) for r in runs if r.get("rounds") is not None]),

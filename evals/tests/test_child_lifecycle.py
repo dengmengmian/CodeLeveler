@@ -146,6 +146,31 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(lc["unattributed_child_mutations"], 1)
 
 
+class TruncatedArgumentTests(unittest.TestCase):
+    """The durable log caps each string argument, e.g. {"path":"semver/s…"}."""
+
+    def test_a_truncated_path_under_a_granted_prefix_is_unattributed_not_a_violation(self):
+        con = fixture_db([
+            _started("w", role="worker", read_only=False),
+            ("delegation_stage", {"action": "ownership_granted", "detail": "w: semver/semver.go"}),
+            *_tool("w", "c1", "write_file", {"path": "semver/s\u2026", "content": "// Packa\u2026"}),
+        ])
+        lc = child_lifecycle(con)
+        self.assertEqual(lc["ownership_violation"], 0)
+        self.assertEqual(lc["unattributed_child_mutations"], 1)
+        self.assertEqual(lc["suspect_truncated_writes"], [])
+
+    def test_a_truncated_path_matching_no_scope_is_flagged_for_review(self):
+        con = fixture_db([
+            _started("w", role="worker", read_only=False),
+            ("delegation_stage", {"action": "ownership_granted", "detail": "w: semver/semver.go"}),
+            *_tool("w", "c1", "write_file", {"path": "cron/c\u2026", "content": "x"}),
+        ])
+        lc = child_lifecycle(con)
+        self.assertEqual(lc["ownership_violation"], 0)
+        self.assertEqual(lc["suspect_truncated_writes"], [{"child": "w", "path_prefix": "cron/c"}])
+
+
 class LegacyLogTests(unittest.TestCase):
     """v0.2.0-beta.2 logs: no spec, scope appended to the task, no typed terminal."""
 

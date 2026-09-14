@@ -16,6 +16,9 @@ from typing import Any
 from spawn_metric import MUTATORS, event_rows
 
 COMPLETED_OUTCOMES = ("completed_with_findings", "completed_no_findings")
+# The durable log stores tool arguments as a compact preview that cuts each
+# long string and ends it with this mark.
+TRUNCATED = "\u2026"
 # v0.2.0-beta.2 recorded no spawn spec; it appended the admitted files to the
 # child's task as a last line instead.
 LEGACY_SCOPE = re.compile(r"\n\[scope: ([^\]]*)\]\s*$")
@@ -119,6 +122,7 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
 
     mutations: dict[str, list[str]] = {}
     violations: list[dict[str, str]] = []
+    suspects: list[dict[str, str]] = []
     unattributed = 0
     for _seq, p in event_rows(con, "tool_call_finished"):
         agent = p.get("agent_id")
@@ -132,8 +136,21 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
             continue
         child = started[agent]
         for path in paths:
+            if child["read_only"]:
+                violations.append({"child": agent, "path": path})
+                continue
+            if path.endswith(TRUNCATED):
+                # The log capped this argument: the real path is unknown. It is
+                # not a violation on this evidence; it is flagged when no scope
+                # the child held could even begin with what survived.
+                unattributed += 1
+                prefix = path[: -len(TRUNCATED)]
+                if not any(scope.startswith(prefix) or prefix.startswith(scope + "/")
+                           for scope in child["scope"]):
+                    suspects.append({"child": agent, "path_prefix": prefix})
+                continue
             mutations.setdefault(agent, []).append(path)
-            if child["read_only"] or not _in_scope(path, child["scope"]):
+            if not _in_scope(path, child["scope"]):
                 violations.append({"child": agent, "path": path})
 
     # Distinct paths per child, and which of them the parent read again after
@@ -169,6 +186,7 @@ def child_lifecycle(con: sqlite3.Connection) -> dict[str, Any]:
         "ownership_violation": len(violations),
         "ownership_violations": violations,
         "unattributed_child_mutations": unattributed,
+        "suspect_truncated_writes": suspects,
         "child_mutations": mutations,
         "child_reads": {cid: sorted(paths) for cid, paths in child_reads.items()},
         "parent_rereads": parent_rereads,
