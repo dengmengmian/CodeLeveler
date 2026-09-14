@@ -700,6 +700,10 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
+        // Mid-turn user text and per-child cancel handles. The chat turn is
+        // the one TUI, Web and phone submit, so without it neither a steer
+        // nor a "stop this child" can reach the running turn.
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -717,7 +721,8 @@ impl Application {
                 read_only,
                 Some(session_id.as_str()),
             )
-            .await?;
+            .await?
+            .with_steering(steering);
         let goal = goal_from_content(&content);
         // See the note in `run_in_session_with_policy`: the notice belongs to
         // the layer with a client to notify.

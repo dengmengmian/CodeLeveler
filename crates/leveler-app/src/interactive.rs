@@ -1550,6 +1550,9 @@ impl InProcessRuntimeClient {
         let repo = self.app.layout.repo_root.clone();
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
+        // Steers and per-child cancels reach this chat turn through the same
+        // source the goal turn uses.
+        let steering = self.steering_for(&session_id);
         let (accepted_tx, accepted_rx) = oneshot::channel();
 
         // The runtime's observer is `&mut dyn FnMut`, so the turn future is not
@@ -1584,6 +1587,7 @@ impl InProcessRuntimeClient {
                         approver,
                         clarifier,
                         sandbox,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
                         &mut observer,
                         cancel,
                     )
