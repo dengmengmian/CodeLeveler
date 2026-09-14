@@ -87,9 +87,12 @@ pub struct SettledChildNotice {
 /// that is already done.
 pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) -> String {
     let mut out = String::from(
-        "## Sub-agent results re-delivered after restart
-         The previous session window ended after these sub-agents settled,          possibly before their results were acted on. Their recorded outcomes          follow (re-delivered; one may repeat a notice you already saw).          Integrate them — do NOT re-delegate or redo work that is already          done:
-",
+        "## Sub-agent results re-delivered after restart\n\
+         The previous session window ended after these sub-agents settled, \
+         possibly before their results were acted on. Their recorded outcomes \
+         follow (re-delivered; one may repeat a notice you already saw). \
+         Integrate them — do NOT re-delegate or redo work that is already \
+         done:\n",
     );
     for child in children {
         let status = if child.ok {
@@ -98,8 +101,7 @@ pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) 
             "stopped incomplete"
         };
         out.push_str(&format!(
-            "- {} ({}, role={}) — {status}: {}
-",
+            "- {} ({}, role={}) — {status}: {}\n",
             child.nickname, child.id, child.role, child.summary
         ));
     }
@@ -124,9 +126,11 @@ pub(crate) struct ResumableChild {
 /// What the parent reads when its interrupted children continue.
 pub(crate) fn resumed_children_note(children: &[ResumableChild]) -> String {
     let mut out = String::from(
-        "## Sub-agents resumed after restart
-         The previous session window ended while these sub-agents were still          working. Each continues its own task in the background under the same          id, from its saved progress; its settlement will arrive as usual. Do not          re-delegate their work:
-",
+        "## Sub-agents resumed after restart\n\
+         The previous session window ended while these sub-agents were still \
+         working. Each continues its own task in the background under the same \
+         id, from its saved progress; its settlement will arrive as usual. Do not \
+         re-delegate their work:\n",
     );
     for child in children {
         if child.spec.files.is_empty() {
@@ -410,6 +414,38 @@ mod tests {
         assert!(should_inject_delegation_hint(true, 0));
         assert!(!should_inject_delegation_hint(true, 1));
         assert!(!should_inject_delegation_hint(false, 0));
+    }
+
+    /// Restart notes are prose a model reads. A mangled line continuation
+    /// once left ten-space gaps and stray line breaks mid-sentence in them.
+    #[test]
+    fn restart_notes_read_as_clean_prose() {
+        let settled = settled_children_redelivery_note(&[SettledChildNotice {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            ok: true,
+            summary: "done".into(),
+        }]);
+        let resumed = resumed_children_note(&[ResumableChild {
+            id: "c2".into(),
+            nickname: "Newton".into(),
+            role: AgentRole::Worker,
+            spec: leveler_lifecycle::ChildSpawnSpec {
+                files: vec!["src/a.rs".into()],
+                ..Default::default()
+            },
+            prior: Vec::new(),
+            note: leveler_model::Message::text(leveler_model::Role::User, "note"),
+        }]);
+        for note in [settled, resumed] {
+            assert!(!note.contains("  "), "a gap inside the prose: {note:?}");
+            let header_end = note.find('\n').expect("a header line");
+            assert!(
+                !note[header_end + 1..].starts_with(' '),
+                "the body starts indented: {note:?}"
+            );
+        }
     }
 
     #[test]
