@@ -6319,3 +6319,142 @@ async fn a_child_on_a_pinned_model_is_billed_at_that_models_price() {
         "1M input tokens at the pinned model's $1/Mtok, not the parent's $10: {child_costs:?}"
     );
 }
+
+/// A host that records every child's cancellation handle as it starts, the
+/// way the app does for `CancelChild`.
+#[derive(Default)]
+struct ChildHandles {
+    started: Mutex<Vec<(String, CancellationToken)>>,
+    ended: Mutex<Vec<String>>,
+}
+
+impl leveler_agent::SteeringSource for ChildHandles {
+    fn take_pending(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn child_started(&self, id: &str, cancel: CancellationToken) {
+        self.started.lock().unwrap().push((id.to_string(), cancel));
+    }
+
+    fn child_ended(&self, id: &str) {
+        self.ended.lock().unwrap().push(id.to_string());
+    }
+}
+
+/// A slow background child whose parent keeps working, routed by task text.
+struct SlowChildRuntime {
+    parent_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ModelRuntime for SlowChildRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains("CANCELLABLE_CHILD"))
+        {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(ModelError::new(leveler_model::ModelErrorKind::Cancelled, "cancelled"));
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            return Ok(assistant_text("child would have finished"));
+        }
+        let call = self
+            .parent_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            return Ok(assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": "CANCELLABLE_CHILD survey"}),
+                )],
+                FinishReason::ToolCalls,
+            ));
+        }
+        // The parent waits a little each round so the test can cancel the
+        // child while the parent is still running.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(assistant_text("parent done"))
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        SleepyRuntime::new(Vec::new(), Duration::ZERO)
+            .profile(model)
+            .await
+    }
+}
+
+/// CHILD_CANCELLATION (user cancels one child) — the host can cancel ONE
+/// child without cancelling its parent: the child settles as cancelled, the
+/// parent's run carries on to its own end, and the host is told the child
+/// ended so it drops the handle.
+#[tokio::test]
+async fn a_host_can_cancel_one_child_without_cancelling_its_parent() {
+    let dir = tmp("cancel-one-child", 90);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let handles = Arc::new(ChildHandles::default());
+    let watcher = handles.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Some((_, token)) = watcher.started.lock().unwrap().first() {
+                token.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        Arc::new(SlowChildRuntime {
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_steering(handles.clone())
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        outcome.is_ok(),
+        "the parent is not cancelled with its child"
+    );
+    let stop = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentFinished { stop, .. } => Some(*stop),
+        _ => None,
+    });
+    assert_eq!(stop, Some(Some(leveler_agent::ChildStop::Cancelled)));
+    let started = handles.started.lock().unwrap().len();
+    assert_eq!(started, 1);
+    assert_eq!(
+        handles.ended.lock().unwrap().len(),
+        1,
+        "the host is told the child ended"
+    );
+}

@@ -801,6 +801,14 @@ pub trait SteeringSource: Send + Sync {
     /// Take everything queued since the last call. Returning empty is the
     /// normal case and must be cheap.
     fn take_pending(&self) -> Vec<String>;
+
+    /// A delegated child started (or resumed) in this turn; `cancel` stops
+    /// that child alone. A host that lets its user cancel one child keeps the
+    /// handle until [`Self::child_ended`].
+    fn child_started(&self, _id: &str, _cancel: CancellationToken) {}
+
+    /// The child settled; its cancellation handle is no longer meaningful.
+    fn child_ended(&self, _id: &str) {}
 }
 
 /// How one turn runs.

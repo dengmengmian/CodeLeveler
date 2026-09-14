@@ -322,12 +322,19 @@ pub struct InProcessRuntimeClient {
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    /// The cancellation handle of every child running in a session's turn,
+    /// by child id, so a user can stop one child without stopping the turn.
+    child_cancels: ChildCancels,
 }
 
-/// Drains one session's steering queue for the agent loop.
+type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
+
+/// Drains one session's steering queue for the agent loop, and holds the
+/// session's running children's cancellation handles.
 struct SessionSteering {
     session_id: SessionId,
     queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    children: ChildCancels,
 }
 
 impl leveler_agent::SteeringSource for SessionSteering {
@@ -338,6 +345,26 @@ impl leveler_agent::SteeringSource for SessionSteering {
             .get_mut(&self.session_id)
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    fn child_started(&self, id: &str, cancel: CancellationToken) {
+        self.children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.session_id.clone())
+            .or_default()
+            .insert(id.to_string(), cancel);
+    }
+
+    fn child_ended(&self, id: &str) {
+        if let Some(running) = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.session_id)
+        {
+            running.remove(id);
+        }
     }
 }
 
@@ -416,6 +443,7 @@ impl InProcessRuntimeClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),
+            child_cancels: Arc::new(Mutex::new(HashMap::new())),
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
@@ -896,6 +924,7 @@ impl InProcessRuntimeClient {
         Arc::new(SessionSteering {
             session_id: session_id.clone(),
             queues: self.steering.clone(),
+            children: self.child_cancels.clone(),
         })
     }
 
@@ -2411,6 +2440,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::CancelChild {
+                session_id,
+                child_id,
+            } => {
+                match take_child_cancel(&self.child_cancels, &session_id, &child_id) {
+                    // The child observes its token, stops, and settles as
+                    // cancelled through the ordinary settlement path.
+                    Some(token) => token.cancel(),
+                    None => self.notify_error(
+                        &session_id,
+                        format!("子 Agent {child_id} 已结束或不存在,无需停止"),
+                    ),
+                }
+                Ok(())
+            }
             ClientCommand::RunUserShell {
                 session_id,
                 command,
@@ -3302,6 +3346,56 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
 /// truncates the whole transcript.
 fn checkpoint_ordinal(loaded: Result<usize, String>) -> Option<usize> {
     loaded.ok()
+}
+
+/// Take the cancellation handle of one running child, if it is still running.
+fn take_child_cancel(
+    children: &ChildCancels,
+    session_id: &SessionId,
+    child_id: &str,
+) -> Option<CancellationToken> {
+    children
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(session_id)
+        .and_then(|running| running.remove(child_id))
+}
+
+#[cfg(test)]
+mod child_cancel_tests {
+    use super::*;
+    use leveler_agent::SteeringSource;
+
+    /// A started child can be cancelled alone, exactly once; an ended child is
+    /// not running, and asking to cancel it finds nothing to stop.
+    #[test]
+    fn a_running_child_can_be_cancelled_and_an_ended_one_cannot() {
+        let children: ChildCancels = Arc::new(Mutex::new(HashMap::new()));
+        let session = SessionId::new("s1");
+        let steering = SessionSteering {
+            session_id: session.clone(),
+            queues: Arc::new(Mutex::new(HashMap::new())),
+            children: children.clone(),
+        };
+        let running = CancellationToken::new();
+        steering.child_started("c1", running.clone());
+        steering.child_started("c2", CancellationToken::new());
+        steering.child_ended("c2");
+
+        take_child_cancel(&children, &session, "c1")
+            .expect("a running child has a handle")
+            .cancel();
+        assert!(running.is_cancelled());
+        assert!(
+            take_child_cancel(&children, &session, "c1").is_none(),
+            "a handle is used once"
+        );
+        assert!(
+            take_child_cancel(&children, &session, "c2").is_none(),
+            "an ended child is not running"
+        );
+        assert!(take_child_cancel(&children, &SessionId::new("other"), "c1").is_none());
+    }
 }
 
 #[cfg(test)]

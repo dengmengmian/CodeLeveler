@@ -81,6 +81,12 @@ pub enum ClientCommand {
     CancelCurrentTurn { session_id: SessionId },
     /// Escalate a cancel the user has already requested once.
     ForceCancelCurrentTurn { session_id: SessionId },
+    /// Cancel ONE running delegated child of the session's turn. The child
+    /// settles as cancelled; its parent turn keeps running.
+    CancelChild {
+        session_id: SessionId,
+        child_id: String,
+    },
     /// Resolve a pending permission request .
     ApprovalDecision {
         request_id: ApprovalId,
@@ -291,6 +297,7 @@ impl ClientCommand {
             | ClientCommand::AddClipboardImage { session_id }
             | ClientCommand::CancelCurrentTurn { session_id }
             | ClientCommand::ForceCancelCurrentTurn { session_id }
+            | ClientCommand::CancelChild { session_id, .. }
             | ClientCommand::SelectModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
@@ -459,6 +466,17 @@ mod tests {
                 session_id: SessionId::new("s1"),
             },
             "cancel_current_turn",
+        );
+    }
+
+    #[test]
+    fn cancel_child_roundtrips() {
+        roundtrip(
+            ClientCommand::CancelChild {
+                session_id: SessionId::new("s1"),
+                child_id: "c1".to_string(),
+            },
+            "cancel_child",
         );
     }
 

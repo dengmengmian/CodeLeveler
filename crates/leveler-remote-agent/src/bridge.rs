@@ -635,6 +635,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::Recap { .. } => "recap",
         ClientCommand::RunUserShell { .. } => "run_user_shell",
         ClientCommand::CancelUserShell { .. } => "cancel_user_shell",
+        ClientCommand::CancelChild { .. } => "cancel_child",
         ClientCommand::QueryObservability { .. } => "query_observability",
         ClientCommand::QueryChildContribution { .. } => "query_child_contribution",
         ClientCommand::ListUnfinishedGoals { .. } => "list_unfinished_goals",

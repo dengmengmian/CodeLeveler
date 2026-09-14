@@ -541,6 +541,8 @@ export type ClientCommand =
   | { type: 'cancel_current_turn'; session_id: SessionId }
   /** Escalate a cancel the user has already requested once. */
   | { type: 'force_cancel_current_turn'; session_id: SessionId }
+  /** Cancel ONE running delegated child of the session's turn. The child settles as cancelled; its parent turn keeps running. */
+  | { type: 'cancel_child'; child_id: string; session_id: SessionId }
   /** Resolve a pending permission request . */
   | { type: 'approval_decision'; decision: ApprovalDecision; request_id: ApprovalId }
   /** Answer a pending clarification (spec §35). An empty answer means "skip". */

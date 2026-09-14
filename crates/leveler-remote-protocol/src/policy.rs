@@ -162,6 +162,8 @@ impl RemotePolicy {
             | ClientCommand::RunGoal { .. }
             | ClientCommand::CancelCurrentTurn { .. }
             | ClientCommand::ForceCancelCurrentTurn { .. }
+            // Stopping one child is a narrower act than stopping the turn.
+            | ClientCommand::CancelChild { .. }
             | ClientCommand::AnswerClarification { .. }
             | ClientCommand::SelectModel { .. }
             | ClientCommand::SetProductAxes { .. }

@@ -541,6 +541,9 @@ impl<'a> Drive<'a> {
             // Terminal release: the child's exclusive claims end with it,
             // whatever its terminal state (idempotent).
             self.executor.ownership.release_all(&id);
+            if let Some(host) = &self.executor.steering {
+                host.child_ended(&id);
+            }
             // The terminal is durable before the transcript says the child
             // settled: a crash between the two must not leave the parent
             // holding a result the log still calls unfinished.
@@ -642,6 +645,9 @@ impl<'a> Drive<'a> {
                 run_started: rt.run_started(),
             };
             let token = rt.cancellation().child_token();
+            if let Some(host) = &executor.steering {
+                host.child_started(&child.id, token.clone());
+            }
             let handle = tokio::spawn(executor.sub_agent_resume_future(
                 child,
                 self.run_agents_semaphore.clone(),
@@ -708,6 +714,9 @@ impl<'a> Drive<'a> {
             );
             clear_outstanding_child(&mut self.progress, &child.id);
             self.executor.ownership.release_all(&child.id);
+            if let Some(host) = &self.executor.steering {
+                host.child_ended(&child.id);
+            }
         }
         while let Ok(event) = self.bg_progress_rx.try_recv() {
             match event {
@@ -2678,6 +2687,10 @@ impl AgentHarness for Drive<'_> {
             {
                 let sem = self.run_agents_semaphore.clone();
                 let token = cancellation.child_token();
+                // The host may stop this child alone (a user's "cancel child").
+                if let Some(host) = &self.executor.steering {
+                    host.child_started(&id, token.clone());
+                }
                 // Residual parent budgets split across concurrent spawns.
                 let residual = residual_step_limits(
                     self.executor.step_limits,
@@ -2795,6 +2808,9 @@ impl AgentHarness for Drive<'_> {
                     Some(progress_ev) = progress_rx.recv() => self.forward_child_event(rt, progress_ev).await?,
                     Some((index, call_id, id, nickname, role, result)) = futs.next() => {
                         self.executor.ownership.release_all(&id);
+                        if let Some(host) = &self.executor.steering {
+                            host.child_ended(&id);
+                        }
                         let (content, ok) = fold_child_settlement(
                             &mut self.progress,
                             &mut self.commands_run,

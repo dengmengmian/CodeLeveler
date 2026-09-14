@@ -87,6 +87,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            "cancel_child",
+            ClientCommand::CancelChild {
+                session_id: session(),
+                child_id: "c1".to_string(),
+            },
+            true,
+        ),
+        (
             "approval_decision",
             ClientCommand::ApprovalDecision {
                 request_id: ApprovalId::new("a1"),
