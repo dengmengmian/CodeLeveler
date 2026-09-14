@@ -66,6 +66,9 @@ pub struct ExecutionOverrides {
     pub max_parallel_tools: Option<usize>,
     pub max_files_per_step: Option<usize>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning effort for the top-level seat only; delegated seats keep
+    /// `reasoning_effort` / the model default. MA4-C parent-budget ablation.
+    pub main_reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_output_bytes: Option<usize>,
     /// Measurement knob: persist the model context after every round
     /// (`ContextSnapshot`), not only when it diverges from the transcript.
@@ -149,7 +152,10 @@ pub fn resolve_execution_policy(
         // is refused for a missing plan.
         // Safety rail: only the eval seam may lower it.
         reasoning_effort: leveler_model::resolve_reasoning_effort(
-            o.reasoning_effort,
+            match role {
+                ExecutionRole::Main => o.main_reasoning_effort.or(o.reasoning_effort),
+                _ => o.reasoning_effort,
+            },
             &profile.reasoning,
         )
         .effective,
@@ -334,5 +340,37 @@ mod tests {
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
         assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn main_reasoning_effort_lowers_only_the_top_level_seat() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.default_effort = Some(ReasoningEffort::Max);
+        p.reasoning.supported_efforts = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ];
+        let parent_only = ExecutionOverrides {
+            main_reasoning_effort: Some(ReasoningEffort::High),
+            ..ExecutionOverrides::default()
+        };
+        let main =
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&parent_only));
+        assert_eq!(main.reasoning_effort, Some(ReasoningEffort::High));
+        for role in [
+            ExecutionRole::Default,
+            ExecutionRole::Explorer,
+            ExecutionRole::Worker,
+            ExecutionRole::Reviewer,
+        ] {
+            let child = resolve_execution_policy(&p, role, &goal_turn(), Some(&parent_only));
+            assert_eq!(
+                child.reasoning_effort,
+                Some(ReasoningEffort::Max),
+                "{role:?} keeps the model default"
+            );
+        }
     }
 }

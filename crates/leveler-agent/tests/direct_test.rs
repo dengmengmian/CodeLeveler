@@ -254,6 +254,48 @@ async fn factory_reasoning_override_reaches_every_model_request() {
     );
 }
 
+#[tokio::test]
+async fn main_reasoning_override_reaches_parent_requests_but_not_child_requests() {
+    let mut h = harness(vec![
+        tool_call(
+            "s1",
+            "spawn_agent",
+            serde_json::json!({"task": "read src/lib.rs and report", "run_in_background": false}),
+        ),
+        text("child report: one function"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+    ])
+    .await;
+    h.engine.factory.overrides = Some(leveler_agent::coding::ExecutionOverrides {
+        main_reasoning_effort: Some(leveler_model::ReasoningEffort::High),
+        ..leveler_agent::coding::ExecutionOverrides::default()
+    });
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+    h.engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // Children never advertise spawn_agent; that is how the lanes separate.
+    let requests = h.requests.lock().unwrap();
+    let (parent, child): (Vec<_>, Vec<_>) = requests
+        .iter()
+        .partition(|request| request.tools.iter().any(|t| t.name == "spawn_agent"));
+    assert!(!parent.is_empty() && !child.is_empty(), "both lanes ran");
+    assert!(
+        parent
+            .iter()
+            .all(|r| r.reasoning_effort == Some(leveler_model::ReasoningEffort::High))
+    );
+    // The mock profile declares no effort: a child keeps that default.
+    assert!(child.iter().all(|r| r.reasoning_effort.is_none()));
+}
+
 /// A TerminalStore that always refuses to commit — engine-level failure
 /// injection for "the terminal fact is atomic or absent".
 #[derive(Clone, Copy)]

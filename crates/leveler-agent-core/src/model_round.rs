@@ -185,6 +185,7 @@ async fn stream_round(
     tracing::info!(
         request_id = %request_id,
         messages = message_count,
+        reasoning_effort = ?request.reasoning_effort,
         "model round started"
     );
 

@@ -37,10 +37,13 @@ pub(crate) async fn cmd_run(
     collaboration: leveler_lifecycle::CollaborationMode,
     max_rounds: Option<u32>,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let app = Application::assemble(layout)?
+    let mut app = Application::assemble(layout)?
         .with_work_profile(work_profile)
         .with_collaboration(collaboration)
         .with_task_round_budget(max_rounds);
+    if let Some(overrides) = parent_reasoning_override(std::env::var(PARENT_REASONING_ENV).ok())? {
+        app = app.with_execution_overrides(overrides);
+    }
     let model_ref = resolve_model(&app, model)?;
     let execution_mode = map_mode(mode);
 
@@ -2239,5 +2242,57 @@ mod replacement_verification_tests {
     #[test]
     fn a_dirty_replacement_is_rejected() {
         assert!(verify_replacement(Some(&build("same", true)), &build("same", false)).is_err());
+    }
+}
+
+/// MA4-C ablation seam, EVAL ONLY: `LEVELER_EVAL_PARENT_REASONING_EFFORT`
+/// lowers the reasoning effort of the top-level `leveler run` seat while
+/// delegated children keep the model default. Unset leaves the run untouched;
+/// an unknown level is refused rather than silently ignored.
+const PARENT_REASONING_ENV: &str = "LEVELER_EVAL_PARENT_REASONING_EFFORT";
+
+fn parent_reasoning_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let effort = leveler_model::ReasoningEffort::parse(&raw).ok_or_else(|| {
+        anyhow::anyhow!("{PARENT_REASONING_ENV}: unknown reasoning effort {raw:?}")
+    })?;
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        main_reasoning_effort: Some(effort),
+        ..Default::default()
+    }))
+}
+
+#[cfg(test)]
+mod parent_reasoning_tests {
+    use super::parent_reasoning_override;
+    use leveler_model::ReasoningEffort;
+
+    #[test]
+    fn unset_leaves_the_run_without_overrides() {
+        assert!(parent_reasoning_override(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_level_sets_only_the_top_level_seat() {
+        let o = parent_reasoning_override(Some("high".into()))
+            .unwrap()
+            .expect("override");
+        assert_eq!(o.main_reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            o,
+            leveler_agent::coding::ExecutionOverrides {
+                main_reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused() {
+        assert!(parent_reasoning_override(Some("hihg".into())).is_err());
     }
 }
