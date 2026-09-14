@@ -118,4 +118,9 @@ pub enum EngineError {
     },
     #[error("corrupt or unreplayable history: {0}")]
     Corrupt(String),
+    /// A delegated child already has a durable terminal and something tried
+    /// to write a second one. A child settles once; the write is refused so
+    /// the record never holds two contradictory endings.
+    #[error("child {child_id} is already settled; a second terminal was refused")]
+    DuplicateChildSettlement { child_id: String },
 }

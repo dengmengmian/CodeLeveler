@@ -79,6 +79,8 @@ impl<'a> EventLog<'a> {
         forward: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         if !event.is_transient() {
+            self.refuse_second_settlement(std::slice::from_ref(&event))
+                .await?;
             let (event_type, payload) = event.to_row()?;
             match &self.owner {
                 Some(token) => {
@@ -134,6 +136,7 @@ impl<'a> EventLog<'a> {
         if events.is_empty() {
             return Ok(());
         }
+        self.refuse_second_settlement(&events).await?;
         let rows = events
             .iter()
             .filter(|event| !event.is_transient())
@@ -158,6 +161,38 @@ impl<'a> EventLog<'a> {
         }
         for event in events {
             forward(event);
+        }
+        Ok(())
+    }
+
+    /// Refuse a child terminal whose child already has one — durably, or
+    /// earlier in the same burst. Checked where the write happens: a session
+    /// has one fenced writer, so check-then-append cannot race another one.
+    async fn refuse_second_settlement(&self, events: &[EngineEvent]) -> Result<(), EngineError> {
+        let mut settling: Vec<&str> = Vec::new();
+        for event in events {
+            if let EngineEvent::SubAgentFinished { id, .. } = event {
+                if settling.contains(&id.as_str()) {
+                    return Err(EngineError::DuplicateChildSettlement {
+                        child_id: id.clone(),
+                    });
+                }
+                settling.push(id);
+            }
+        }
+        if settling.is_empty() {
+            return Ok(());
+        }
+        for row in self
+            .store
+            .load_by_types(&self.session_id, &["sub_agent_finished"])
+            .await?
+        {
+            if let EngineEvent::SubAgentFinished { id, .. } = decode_row(&row)?
+                && settling.contains(&id.as_str())
+            {
+                return Err(EngineError::DuplicateChildSettlement { child_id: id });
+            }
         }
         Ok(())
     }
@@ -1024,6 +1059,46 @@ mod tests {
         .await
         .unwrap();
         assert!(log.unfinished_children().await.unwrap().is_empty());
+    }
+
+    /// A child settles once. A second terminal for the same child is refused
+    /// where it would be written — reading "first one wins" afterwards would
+    /// leave two contradictory facts in the durable record.
+    #[tokio::test]
+    async fn a_second_terminal_for_one_child_is_refused_at_write() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+        let mut sink = |_e: EngineEvent| {};
+        log.append(None, child_finished("a1", "Euclid", true), &mut sink)
+            .await
+            .unwrap();
+
+        let single = log
+            .append(None, child_finished("a1", "Euclid", false), &mut sink)
+            .await;
+        assert!(single.is_err(), "a second terminal must not be written");
+
+        let batch = log
+            .append_batch(
+                None,
+                vec![
+                    child_finished("b1", "Newton", true),
+                    child_finished("b1", "Newton", false),
+                ],
+                &mut sink,
+            )
+            .await;
+        assert!(batch.is_err(), "two terminals in one burst are still two");
+
+        let rows = db
+            .load_by_types(&session, &["sub_agent_finished"])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the first terminal is durable: {rows:?}"
+        );
     }
 
     /// The pump drains in batches now. A batch must be indistinguishable from

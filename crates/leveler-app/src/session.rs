@@ -335,7 +335,8 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         // Pass the diagnostic through verbatim rather than flattening it back
         // to a bare sentence — the whole point of carrying the event type, the
         // producing agent and the capacity is that they reach the user.
-        error @ EngineError::EventBufferOverloaded { .. } => AppError::Engine(error.to_string()),
+        error @ (EngineError::EventBufferOverloaded { .. }
+        | EngineError::DuplicateChildSettlement { .. }) => AppError::Engine(error.to_string()),
         EngineError::RecoveryConfirmationRequired { call_id, tool } => AppError::Engine(format!(
             "crash recovery halted: an interrupted `{tool}` (call {call_id}) may already have \
              run; inspect the workspace, then resume with --confirm-recovery to acknowledge \
