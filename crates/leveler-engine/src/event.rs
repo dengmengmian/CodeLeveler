@@ -368,6 +368,17 @@ pub enum EngineEvent {
         /// taxonomy; `false` is then the floor, never a claim.
         #[serde(default)]
         read_only: bool,
+        /// What re-creates this child's activation. `None` on rows written
+        /// before children were resumable — such a child cannot be continued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec: Option<leveler_lifecycle::ChildSpawnSpec>,
+    },
+    /// Messages a delegated child appended to its own transcript, in order.
+    /// With the start's spec this is the child session: what a later window
+    /// restores to continue the same child.
+    SubAgentTranscriptAppended {
+        id: String,
+        messages: Vec<leveler_model::Message>,
     },
     /// TRANSIENT: live execution state and cumulative usage for one sub-agent.
     SubAgentProgress {
@@ -662,6 +673,7 @@ impl EngineEvent {
             | EngineEvent::WorkspaceSnapshotCreated { .. }
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
+            | EngineEvent::SubAgentTranscriptAppended { .. }
             | EngineEvent::SubAgentProgress { .. }
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
@@ -811,6 +823,7 @@ impl EngineEvent {
             | EngineEvent::WorkspaceSnapshotCreated { .. }
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
+            | EngineEvent::SubAgentTranscriptAppended { .. }
             | EngineEvent::SubAgentProgress { .. }
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }

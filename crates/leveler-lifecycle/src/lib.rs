@@ -71,7 +71,7 @@ pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
 pub use runtime::{
-    ChildStop, SessionStatus, StopReason, TaskOutcome, TurnOutcome, UnknownVariant,
+    ChildSpawnSpec, ChildStop, SessionStatus, StopReason, TaskOutcome, TurnOutcome, UnknownVariant,
     VerificationStatus,
 };
 pub use workflow::AgentState;

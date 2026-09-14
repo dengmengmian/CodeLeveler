@@ -508,7 +508,7 @@ async fn run_prepared_sub_agent(
         }
         _ => {}
     };
-    let mut sink = SubAgentProgressSink::new(id, progress);
+    let mut sink = SubAgentProgressSink::new(id, progress, child.event_barrier.clone());
     // Box the recursive future (agent → spawn_agent → agent) so its size is
     // finite.
     let hook_token = cancellation.clone();

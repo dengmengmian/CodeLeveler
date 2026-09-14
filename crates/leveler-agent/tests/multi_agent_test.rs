@@ -2464,6 +2464,7 @@ mod child_side_effects_are_recoverable {
                 ChildToolEvent::Started { .. } => "started",
                 ChildToolEvent::Finished { .. } => "finished",
                 ChildToolEvent::Ownership { .. } => "ownership",
+                ChildToolEvent::Transcript { .. } => "transcript",
             });
             self.events.lock().unwrap().push(event);
         }

@@ -107,6 +107,15 @@ pub enum ChildToolEvent {
         action: String,
         detail: String,
     },
+    /// Messages the child appended to its own transcript.
+    ///
+    /// On this queue so a child's transcript lands in order with the tool
+    /// facts it produced: a round is appended only after its tools ran, and
+    /// those tools' `Started` events are already ahead of it here.
+    Transcript {
+        agent_id: String,
+        messages: Vec<leveler_model::Message>,
+    },
 }
 
 /// A sink that persists the transcript as the loop advances, enabling resume.

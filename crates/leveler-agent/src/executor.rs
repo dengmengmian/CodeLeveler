@@ -309,6 +309,8 @@ pub enum AgentEvent {
         profile_role: Option<String>,
         /// Whether this child holds a physically read-only toolset.
         read_only: bool,
+        /// What re-creates this child's activation, when it can be continued.
+        spec: Option<leveler_lifecycle::ChildSpawnSpec>,
     },
     /// One model call made by a sub-agent, carrying the child's id so the
     /// parent can persist it. Boxed because this variant is much larger than
@@ -687,16 +689,24 @@ impl TranscriptSink for NoopSink {
 struct SubAgentProgressSink {
     id: String,
     events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    /// The parent's durable queue. A child's transcript is its session: it
+    /// is recorded here, attributed, so a later window can continue it.
+    barrier: Option<Arc<dyn EventBarrier>>,
     input_tokens: u64,
     output_tokens: u64,
     cached_input_tokens: u64,
 }
 
 impl SubAgentProgressSink {
-    fn new(id: String, events: tokio::sync::mpsc::UnboundedSender<AgentEvent>) -> Self {
+    fn new(
+        id: String,
+        events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        barrier: Option<Arc<dyn EventBarrier>>,
+    ) -> Self {
         Self {
             id,
             events,
+            barrier,
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
@@ -710,7 +720,15 @@ impl SubAgentProgressSink {
 
 #[async_trait]
 impl TranscriptSink for SubAgentProgressSink {
-    async fn append(&mut self, _messages: &[Message]) -> Result<(), PortError> {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), PortError> {
+        if let Some(barrier) = &self.barrier
+            && !messages.is_empty()
+        {
+            barrier.record_child_tool_event(ChildToolEvent::Transcript {
+                agent_id: self.id.clone(),
+                messages: messages.to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -2463,7 +2481,7 @@ mod child_accounting_tests {
     #[tokio::test]
     async fn a_child_sink_emits_the_record_stamped_with_its_agent_id() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut sink = SubAgentProgressSink::new("reviewer-6d8ab312".to_string(), tx);
+        let mut sink = SubAgentProgressSink::new("reviewer-6d8ab312".to_string(), tx, None);
 
         sink.record_model_request(&a_record()).await.unwrap();
 
@@ -2488,7 +2506,7 @@ mod child_accounting_tests {
     #[tokio::test]
     async fn every_child_call_produces_its_own_record() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut sink = SubAgentProgressSink::new("reviewer-a".to_string(), tx);
+        let mut sink = SubAgentProgressSink::new("reviewer-a".to_string(), tx, None);
 
         sink.record_model_request(&a_record()).await.unwrap();
         sink.record_model_request(&a_record()).await.unwrap();

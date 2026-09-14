@@ -1689,6 +1689,7 @@ pub(crate) async fn run_review(
                 profile_id: Some(profile_id),
                 profile_role: Some(profile_role),
                 read_only,
+                spec: None,
             },
             observer,
         )
@@ -2419,6 +2420,7 @@ mod session_review_tests {
             profile_id: None,
             profile_role: None,
             read_only: true,
+            spec: None,
         }
     }
 

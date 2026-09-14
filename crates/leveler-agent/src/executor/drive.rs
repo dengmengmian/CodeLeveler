@@ -2422,6 +2422,13 @@ impl AgentHarness for Drive<'_> {
                     profile_id: Some(profile_id),
                     profile_role: Some(profile_role),
                     read_only,
+                    spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                        files: files.clone(),
+                        model: model_override.as_ref().map(|m| m.to_string()),
+                        tools: agent_tools.clone(),
+                        max_rounds: agent_max_rounds,
+                        background,
+                    }),
                 });
                 accepted.push((
                     index,

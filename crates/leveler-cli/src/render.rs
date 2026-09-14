@@ -339,6 +339,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             profile_id,
             profile_role,
             read_only,
+            spec: _,
         } => serde_json::json!({
             "type": "sub_agent_started",
             "id": id, "nickname": nickname, "role": role, "task": task,

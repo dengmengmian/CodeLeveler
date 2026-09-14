@@ -260,6 +260,7 @@ async fn seed_ghost_child(
             profile_id: None,
             profile_role: None,
             read_only: false,
+            spec: None,
         },
         &mut |_| {},
     )
@@ -459,6 +460,7 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            spec: None,
         },
     )
     .await;
@@ -962,5 +964,90 @@ async fn reviewer_lifecycle_events_share_truthful_null_attribution() {
     assert_eq!(
         reviewer_finished.0, None,
         "start and terminal must agree on the (null) attribution"
+    );
+}
+
+// ── MA1: durable child session ───────────────────────────────────────────────
+
+/// All messages a child appended to its own transcript, in durable order.
+fn child_transcript(events: &[(Option<String>, EngineEvent)], child: &str) -> Vec<Message> {
+    events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EngineEvent::SubAgentTranscriptAppended { id, messages } if id == child => {
+                Some(messages.clone())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// A child is a session, not only an activation: its start records what
+/// re-creates it and its own transcript is durable as it advances. Without
+/// both, a later window can only re-delegate — never continue the same child.
+#[tokio::test]
+async fn a_spawned_child_records_its_spec_and_its_own_transcript() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![
+            tool_call(
+                "s1",
+                "spawn_agent",
+                serde_json::json!({
+                    "task": "survey src/lib.rs",
+                    "role": "explorer",
+                    "run_in_background": false
+                }),
+            ),
+            // Child round 1: one read, so a tool round must be persisted.
+            tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+            text("src/lib.rs defines old()"),
+            text("synthesis done; stopping"),
+        ]),
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let (child_id, recorded) = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            EngineEvent::SubAgentStarted { id, spec, .. } => Some((id.clone(), spec.clone())),
+            _ => None,
+        })
+        .expect("the explorer must have started");
+    assert_eq!(
+        recorded,
+        Some(leveler_lifecycle::ChildSpawnSpec {
+            background: false,
+            ..Default::default()
+        }),
+        "the start must record what re-creates the activation"
+    );
+
+    let transcript = child_transcript(&events, &child_id);
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.role == Role::User && m.text_content().contains("survey src/lib.rs")),
+        "the child's own task opens its durable transcript: {transcript:?}"
+    );
+    assert!(
+        transcript.iter().any(|m| m.role == Role::Tool),
+        "a tool round is part of the child session: {transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.text_content().contains("defines old()")),
+        "the child's final answer is durable: {transcript:?}"
     );
 }

@@ -597,6 +597,7 @@ mod tests {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            spec: None,
         }
     }
 
@@ -990,6 +991,7 @@ mod tests {
                     profile_id: None,
                     profile_role: None,
                     read_only: false,
+                    spec: None,
                 },
                 &mut sink,
             )
@@ -1038,6 +1040,7 @@ mod tests {
                 profile_id: None,
                 profile_role: None,
                 read_only: false,
+                spec: None,
             },
             &mut sink,
         )

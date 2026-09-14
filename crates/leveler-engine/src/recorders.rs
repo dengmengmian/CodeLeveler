@@ -181,6 +181,12 @@ impl EventBarrier for PumpBarrier {
                 action,
                 detail: format!("{agent_id}: {detail}"),
             },
+            ChildToolEvent::Transcript { agent_id, messages } => {
+                EngineEvent::SubAgentTranscriptAppended {
+                    id: agent_id,
+                    messages,
+                }
+            }
         });
     }
 }

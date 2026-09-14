@@ -477,6 +477,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
         ),
         // Prompt-like or high-volume rows stay out of the default trace.
         EngineEvent::ContextSnapshot { .. }
+        | EngineEvent::SubAgentTranscriptAppended { .. }
         | EngineEvent::AssistantMessage { .. }
         | EngineEvent::AssistantDelta { .. }
         | EngineEvent::ReasoningDelta { .. }
@@ -988,6 +989,7 @@ mod tests {
                 profile_id: Some("reviewer".into()),
                 profile_role: Some("reviewer".into()),
                 read_only: true,
+                spec: None,
             },
         )
         .await;
@@ -1248,6 +1250,7 @@ mod tests {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            spec: None,
         }
     }
 

@@ -411,6 +411,7 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
                 profile_id: None,
                 profile_role: None,
                 read_only: false,
+                spec: None,
             },
             &mut |_| {},
         )
@@ -523,6 +524,7 @@ async fn a_child_left_open_by_a_cancelled_turn_is_settled_as_cancelled() {
                     profile_id: None,
                     profile_role: None,
                     read_only: true,
+                    spec: None,
                 });
                 Err::<TurnFacts<MinimalResult>, _>(TurnFailure {
                     cancelled: true,

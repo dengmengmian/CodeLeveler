@@ -109,6 +109,7 @@ impl From<AgentEvent> for EngineEvent {
                 profile_id,
                 profile_role,
                 read_only,
+                spec,
             } => EngineEvent::SubAgentStarted {
                 id,
                 nickname,
@@ -117,6 +118,7 @@ impl From<AgentEvent> for EngineEvent {
                 profile_id,
                 profile_role,
                 read_only,
+                spec,
             },
             // Durable-only: the drive loop intercepts this and writes the
             // row. Nothing downstream renders it, and the child's running

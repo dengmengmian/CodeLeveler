@@ -260,6 +260,29 @@ impl ChildStop {
     }
 }
 
+/// What re-creates a delegated child's activation: everything its spawn fixed
+/// that is not in its own transcript. Recorded on the child's durable start so
+/// a later window can continue the same child instead of guessing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildSpawnSpec {
+    /// The exclusive write scope fixed at spawn (empty for late-bound or
+    /// read-only children).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// A pinned `provider/model`, when the child does not run on its parent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A tool subset the child was restricted to (empty = its role's set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// A round cap the child was given (0 = its role's default).
+    #[serde(default)]
+    pub max_rounds: u32,
+    /// Whether the parent continued while the child ran.
+    #[serde(default)]
+    pub background: bool,
+}
+
 /// Why the loop stopped. Serialized (snake_case) into terminal engine events
 /// so blocked/budget/complete stay machine-discriminable after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

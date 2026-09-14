@@ -560,6 +560,7 @@ impl EventBridge {
                 profile_id,
                 profile_role,
                 read_only,
+                spec: _,
             } => {
                 // The capability contract travels with the child so the UI can
                 // state what it was allowed to do rather than implying it.
@@ -631,6 +632,10 @@ impl EventBridge {
                     stop: stop.map(project_child_stop),
                 });
             }
+            // A child's own transcript is its durable session, not a live
+            // client fact: clients see the child through its lifecycle and
+            // activity events, never its raw context.
+            EngineEvent::SubAgentTranscriptAppended { .. } => {}
             EngineEvent::SubAgentActivity {
                 id,
                 phase,
@@ -1734,6 +1739,7 @@ mod projection_equivalence {
             profile_id: Some("reviewer".into()),
             profile_role: Some("reviewer".into()),
             read_only: true,
+            spec: None,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated {
@@ -1759,6 +1765,7 @@ mod projection_equivalence {
                 profile_id: None,
                 profile_role: None,
                 read_only: false,
+                spec: None,
             },
             EngineEvent::SubAgentProgress {
                 id: "a1".into(),
