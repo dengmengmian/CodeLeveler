@@ -4,7 +4,7 @@ import unittest
 
 from _path import LIB  # noqa: F401
 
-from ab import aggregate, arm_order, judge_run, unit_results
+from ab import aggregate, arm_order, judge_run, plan_slots, unit_results
 
 
 def _lifecycle(**over):
@@ -38,6 +38,16 @@ class ArmOrderTests(unittest.TestCase):
         leads = [arm_order(arms, slot)[0] for slot in range(6)]
         self.assertEqual(sorted(leads), ["a", "a", "b", "b", "c", "c"])
         self.assertEqual(sorted(arm_order(arms, 4)), arms)
+
+
+class SlotPlanTests(unittest.TestCase):
+    def test_every_arm_of_a_slot_runs_in_the_same_slot(self):
+        slots = plan_slots(["c1", "c2"], ["a", "b", "c"], runs=2)
+        self.assertEqual(len(slots), 4)
+        self.assertEqual(slots[0], [("c1", 0, "a"), ("c1", 0, "b"), ("c1", 0, "c")])
+        self.assertEqual(slots[1][0], ("c2", 0, "b"))
+        self.assertEqual({arm for slot in slots for _c, _r, arm in slot}, {"a", "b", "c"})
+        self.assertEqual(sorted(len(slot) for slot in slots), [3, 3, 3, 3])
 
 
 class TruthTests(unittest.TestCase):

@@ -30,7 +30,9 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,7 +41,7 @@ import yaml
 EVAL_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVAL_ROOT / "lib"))
 
-from ab import aggregate, arm_order, judge_run, unit_results  # noqa: E402
+from ab import aggregate, judge_run, plan_slots, unit_results  # noqa: E402
 from child_lifecycle import child_lifecycle, request_usage  # noqa: E402
 from coordination import coordination  # noqa: E402
 from eventlog import extract_timeline  # noqa: E402
@@ -258,21 +260,31 @@ def cmd_run(args) -> int:
         cases = [c for c in cases if c["id"] in set(args.only)]
     root.mkdir(parents=True, exist_ok=True)
     (root / "arms.json").write_text(json.dumps(arms, indent=2))
-    slot = 0
-    for rep in range(args.runs):
-        for case in cases:
-            for name in arm_order([a["name"] for a in arms], slot):
-                arm = next(a for a in arms if a["name"] == name)
-                out = root / "runs" / arm["name"] / case["id"] / f"{rep}.json"
-                if out.exists():
-                    continue
-                record = run_one(arm, case, catalog[case["id"]], rep, args.model, root)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(json.dumps(record, indent=2))
-                print(f"{now()} {arm['name']:9} {case['id']:24} rep={rep} expect={record.get('expect_pass')} "
-                      f"wall={record['wall_s']}s children={len(record.get('children') or [])} "
-                      f"exits={record['exits']}", flush=True)
-            slot += 1
+    by_name = {a["name"]: a for a in arms}
+    by_case = {c["id"]: c for c in cases}
+    print_lock = threading.Lock()
+
+    def job(case_id: str, rep: int, arm_name: str) -> None:
+        arm, case = by_name[arm_name], by_case[case_id]
+        out = root / "runs" / arm["name"] / case["id"] / f"{rep}.json"
+        if out.exists():
+            return
+        record = run_one(arm, case, catalog[case["id"]], rep, args.model, root)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(record, indent=2))
+        with print_lock:
+            print(f"{now()} {arm['name']:9} {case['id']:24} rep={rep} expect={record.get('expect_pass')} "
+                  f"wall={record['wall_s']}s children={len(record.get('children') or [])} "
+                  f"exits={record['exits']}", flush=True)
+
+    for slot in plan_slots([c["id"] for c in cases], [a["name"] for a in arms], args.runs):
+        if args.parallel <= 1:
+            for case_id, rep, arm_name in slot:
+                job(case_id, rep, arm_name)
+            continue
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            for future in [pool.submit(job, *j) for j in slot]:
+                future.result()
     return 0
 
 
@@ -348,6 +360,8 @@ def main() -> int:
     r.add_argument("--model", required=True)
     r.add_argument("--arm", action="append", required=True)
     r.add_argument("--runs", type=int, default=1)
+    r.add_argument("--parallel", type=int, default=1,
+                   help="runs executed at once; with one worker per arm, every arm of a slot runs together")
     r.add_argument("--only", nargs="*")
     rep = sub.add_parser("report")
     rep.add_argument("--out", required=True)

@@ -28,6 +28,21 @@ def arm_order(arms: list[str], slot: int) -> list[str]:
     return arms[k:] + arms[:k]
 
 
+def plan_slots(cases: list[str], arms: list[str], runs: int) -> list[list[tuple[str, int, str]]]:
+    """(case, rep, arm) jobs grouped into time slots.
+
+    Every arm of a slot runs at the same time, so the arms of one comparison
+    share provider conditions; the order inside a slot rotates like
+    `arm_order` so no arm is always submitted first.
+    """
+    slots, slot = [], 0
+    for rep in range(runs):
+        for case in cases:
+            slots.append([(case, rep, arm) for arm in arm_order(arms, slot)])
+            slot += 1
+    return slots
+
+
 UNKNOWN = "unknown"
 
 
