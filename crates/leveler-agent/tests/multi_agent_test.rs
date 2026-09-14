@@ -6071,3 +6071,102 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A model that fails the parent's second request outright while its
+/// background child is still thinking. Routed by the child's task text so the
+/// two never trade replies.
+struct FailingParentRuntime {
+    child_marker: &'static str,
+    parent_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ModelRuntime for FailingParentRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(self.child_marker))
+        {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return Ok(assistant_text("child finished looking"));
+        }
+        match self
+            .parent_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        {
+            0 => Ok(assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": self.child_marker}),
+                )],
+                FinishReason::ToolCalls,
+            )),
+            _ => Err(ModelError::new(
+                leveler_model::ModelErrorKind::InvalidRequest,
+                "rejected (injected)",
+            )),
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        SleepyRuntime::new(Vec::new(), Duration::ZERO)
+            .profile(model)
+            .await
+    }
+}
+
+/// CANCELLED_CHILD_CAN_NEVER_CONTINUE_WRITING — a run that ends on an error
+/// must stop its background children and wait for them, not abort them and
+/// release their scopes at once. An abort cannot stop a write already inside a
+/// blocking section, so releasing on abort lets that write land after the
+/// scope is gone. Waiting also gives every such child its own terminal.
+#[tokio::test]
+async fn a_run_ending_in_error_stops_and_settles_its_background_children() {
+    let dir = tmp("error-exit-drains", 88);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let mut events = Vec::new();
+    let result = Executor::new(
+        Arc::new(FailingParentRuntime {
+            child_marker: "look around slowly",
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate then fail",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(result.is_err(), "the parent's model error ends the run");
+    let stop = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentFinished { stop, .. } => Some(*stop),
+        _ => None,
+    });
+    assert_eq!(
+        stop,
+        Some(Some(leveler_agent::ChildStop::Cancelled)),
+        "the child was stopped and waited for before the run returned"
+    );
+}

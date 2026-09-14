@@ -65,6 +65,9 @@ struct BackgroundChild {
     /// Worker exclusive scope (empty for read-only roles). Held for overlap
     /// admission and the parent write fence until settlement.
     scope: Vec<String>,
+    /// This child's own cancellation, so an exit path can stop it and wait
+    /// rather than abort it.
+    token: CancellationToken,
     handle: tokio::task::JoinHandle<super::handlers::SubAgentRunResult>,
 }
 
@@ -368,7 +371,15 @@ impl Executor {
             .with_pricing(self.pricing)
             .with_max_output_tokens(Some(self.max_output_tokens))
             .with_reasoning_effort(self.policy.reasoning_effort);
-        agent.run(messages, &mut harness, cancellation).await
+        let result = agent.run(messages, &mut harness, cancellation).await;
+        if result.is_err() {
+            // Every normal exit drains its children; an error exit must too.
+            // Aborting instead cannot stop a write already inside a blocking
+            // section, and releasing a scope on abort lets that write land
+            // after the scope is gone.
+            harness.stop_background_children().await;
+        }
+        result
     }
 }
 
@@ -512,6 +523,7 @@ impl<'a> Drive<'a> {
                 role,
                 scope,
                 handle,
+                ..
             } = child;
             let result = join_settlement(handle.await);
             let (content, _ok) = fold_child_settlement(
@@ -629,12 +641,13 @@ impl<'a> Drive<'a> {
                 epoch_duration_at_start: self.epoch_duration_at_start,
                 run_started: rt.run_started(),
             };
+            let token = rt.cancellation().child_token();
             let handle = tokio::spawn(executor.sub_agent_resume_future(
                 child,
                 self.run_agents_semaphore.clone(),
                 self.bg_progress_tx.clone(),
                 residual,
-                rt.cancellation().child_token(),
+                token.clone(),
                 parent_wall,
             ));
             self.progress.outstanding_children.push(format!(
@@ -649,6 +662,7 @@ impl<'a> Drive<'a> {
                 nickname: child.nickname.clone(),
                 role: child.role,
                 scope: child.spec.files.clone(),
+                token,
                 handle,
             });
             launched.push(child.clone());
@@ -665,6 +679,52 @@ impl<'a> Drive<'a> {
             messages.push(note);
         }
         Ok(())
+    }
+
+    /// The error-exit drain: cancel every background child, wait for each to
+    /// stop, and settle it like any other exit. Its scope is released only
+    /// after it has stopped. Best effort on the durable side — the run is
+    /// already failing, and that original error is what the caller gets.
+    async fn stop_background_children(&mut self) {
+        if self.background_children.children.is_empty() {
+            return;
+        }
+        for child in &self.background_children.children {
+            child.token.cancel();
+        }
+        let children = std::mem::take(&mut self.background_children.children);
+        for child in children {
+            let result = join_settlement(child.handle.await);
+            fold_child_settlement(
+                &mut self.progress,
+                &mut self.commands_run,
+                &mut self.modified_files,
+                &mut self.ledger,
+                &mut *self.observer,
+                &child.id,
+                &child.nickname,
+                child.role,
+                &result,
+            );
+            clear_outstanding_child(&mut self.progress, &child.id);
+            self.executor.ownership.release_all(&child.id);
+        }
+        while let Ok(event) = self.bg_progress_rx.try_recv() {
+            match event {
+                AgentEvent::SubAgentModelRequest { record } => {
+                    if let Err(error) = self.persist_request(*record).await {
+                        tracing::warn!(%error, "could not record a stopped child's model call");
+                    }
+                }
+                other => (self.observer)(other),
+            }
+        }
+        (self.observer)(AgentEvent::ProgressUpdated {
+            ledger: self.progress.clone(),
+        });
+        if let Err(error) = self.settlements_durable().await {
+            tracing::warn!(%error, "stopped children's terminals may not be durable");
+        }
     }
 
     /// Wait until every child terminal emitted so far is durable. Hosts without
@@ -2652,7 +2712,7 @@ impl AgentHarness for Drive<'_> {
                         sem,
                         self.bg_progress_tx.clone(),
                         residual,
-                        token,
+                        token.clone(),
                         parent_wall,
                     );
                     let handle = tokio::spawn(fut);
@@ -2694,6 +2754,7 @@ impl AgentHarness for Drive<'_> {
                         nickname,
                         role,
                         scope: files,
+                        token,
                         handle,
                     });
                     results[index] = Some(ContentPart::ToolResult {
