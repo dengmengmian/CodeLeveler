@@ -466,6 +466,7 @@ mod tests {
                 started_elapsed_secs: 8,
                 detail: None,
                 steps: Vec::new(),
+                stop: None,
             });
 
         let view = project(&state).expect("child wait");

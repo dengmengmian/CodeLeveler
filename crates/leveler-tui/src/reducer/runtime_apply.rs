@@ -340,6 +340,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             profile_role: _,
             read_only,
             contribution,
+            stop,
             ..
         } => {
             let started = state.elapsed_secs;
@@ -354,6 +355,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 read_only,
                 contribution: contribution.clone(),
                 started_elapsed_secs: started,
+                stop,
             });
             if done {
                 // The projection is the source of truth now, not a count
@@ -365,9 +367,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .find(|c| c.id == id)
                     .map(|c| c.contribution.clone())
                     .unwrap_or(crate::multi_agent::Contribution::NotMeasured);
-                state
-                    .transcript
-                    .complete_sub_agent_with_contribution(&id, &nickname, ok, detail, projected);
+                state.transcript.complete_sub_agent_with_contribution(
+                    &id, &nickname, ok, detail, projected, stop,
+                );
             } else {
                 state
                     .transcript
@@ -385,7 +387,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::ChildContributionLoaded { detail, .. } => {
             state.team.apply_detail(detail);
         }
-        RuntimeEvent::SubAgentStateChanged { .. } => {}
+        RuntimeEvent::SubAgentStateChanged {
+            id,
+            state: child_state,
+        } => {
+            state.team.apply_state(&id, child_state, state.elapsed_secs);
+            state.transcript.set_sub_agent_state(&id, child_state);
+        }
         RuntimeEvent::SubAgentProgress {
             id,
             active,
@@ -1077,7 +1085,10 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;
         state.pending_attachments.clear();
+        // Another session's children are not this session's.
+        state.team = crate::multi_agent::TaskTeamView::default();
     }
+    state.team.restore(&session.children, state.elapsed_secs);
 
     // Rebuild the transcript from the session's persisted messages. Opening a
     // different session (or a lagged resync) replaces the current view.
@@ -1113,6 +1124,13 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
                     .transcript
                     .append_assistant(&message.id, &message.text);
                 state.transcript.finish_assistant(&message.id);
+            }
+            // Written by the runtime into the model's context (a child's
+            // settlement, a lost or resumed delegation), not typed by the user.
+            UiRole::User
+                if message.kind == Some(leveler_client_protocol::UiMessageKind::RuntimeNotice) =>
+            {
+                state.transcript.push_note(message.text.clone());
             }
             UiRole::User => state.transcript.push_user(message.text.clone()),
             UiRole::Assistant => {

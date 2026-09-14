@@ -161,6 +161,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         ActivityStatus::Waiting => t.sub_agent_waiting,
         ActivityStatus::Completed => t.title_completed,
         ActivityStatus::Failed => t.title_failed,
+        ActivityStatus::Interrupted => t.sub_agent_interrupted,
     };
     let status_style = match summary.status {
         ActivityStatus::Running | ActivityStatus::Waiting => {
@@ -168,6 +169,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         }
         ActivityStatus::Completed => Style::default().fg(theme.status.success),
         ActivityStatus::Failed => Style::default().fg(theme.status.error),
+        ActivityStatus::Interrupted => Style::default().fg(theme.status.warning),
     };
     let heading = match &summary.secondary {
         Some(sec) if summary.kind == crate::activity::ActivityKind::ChildAgent => {
@@ -1149,6 +1151,8 @@ mod tests {
             recent_step: None,
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
+            stop: None,
+            interrupted: false,
         });
         let text: String = item_render(
             &item,
@@ -1183,6 +1187,8 @@ mod tests {
             recent_step: None,
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
+            stop: None,
+            interrupted: false,
         });
         let text: String = item_render(
             &item,
@@ -1221,6 +1227,8 @@ mod tests {
             recent_step: None,
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
+            stop: None,
+            interrupted: false,
         });
         let text = item_render(
             &item,
@@ -1240,6 +1248,201 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("Euclid"), "{text}");
+    }
+
+    fn spawn_call_then(state: &mut crate::state::AppState, ok: bool, preview: &str) {
+        use crate::action::Action;
+        use crate::reducer::reduce;
+        use leveler_client_protocol::{RuntimeEvent, ToolCallId};
+        reduce(
+            state,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new("s1"),
+                name: "spawn_agent".into(),
+                arguments: serde_json::json!({"task": "SPAWNED survey", "role": "explorer"})
+                    .to_string(),
+                parallel: false,
+            }),
+        );
+        if ok {
+            reduce(
+                state,
+                Action::Runtime(RuntimeEvent::SubAgentUpdated {
+                    id: "agent-1".into(),
+                    nickname: "Euclid".into(),
+                    role: "explorer".into(),
+                    done: false,
+                    ok: false,
+                    detail: "SPAWNED survey".into(),
+                    profile_id: None,
+                    profile_role: None,
+                    read_only: true,
+                    contribution: None,
+                    outcome: None,
+                    stop: None,
+                    background: true,
+                    scope: Vec::new(),
+                }),
+            );
+        }
+        reduce(
+            state,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                id: ToolCallId::new("s1"),
+                ok,
+                preview: preview.into(),
+                duration_ms: 3,
+                applied_diff: None,
+            }),
+        );
+    }
+
+    fn child_event(
+        id: &str,
+        done: bool,
+        ok: bool,
+        stop: Option<leveler_client_protocol::ChildStop>,
+    ) -> leveler_client_protocol::RuntimeEvent {
+        leveler_client_protocol::RuntimeEvent::SubAgentUpdated {
+            id: id.into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done,
+            ok,
+            detail: if done {
+                "result".into()
+            } else {
+                "survey".into()
+            },
+            profile_id: None,
+            profile_role: None,
+            read_only: true,
+            contribution: None,
+            outcome: None,
+            stop,
+            background: true,
+            scope: Vec::new(),
+        }
+    }
+
+    /// U4: how a child ended is read off its typed terminal, not guessed from
+    /// its summary text and not collapsed into one "incomplete".
+    #[test]
+    fn a_child_terminal_reads_its_typed_stop() {
+        use crate::action::Action;
+        use crate::reducer::reduce;
+        use leveler_client_protocol::ChildStop;
+        for (stop, expected) in [
+            (ChildStop::Cancelled, "已取消"),
+            (ChildStop::Lost, "已丢失"),
+            (ChildStop::Budget, "预算耗尽"),
+        ] {
+            let mut state = test_state();
+            state.status = leveler_client_protocol::RuntimeStatus::Busy;
+            reduce(
+                &mut state,
+                Action::Runtime(child_event("agent-1", false, false, None)),
+            );
+            reduce(
+                &mut state,
+                Action::Runtime(child_event("agent-1", true, false, Some(stop))),
+            );
+            let text = render_text(&mut state, 100, 30);
+            assert!(text.contains(expected), "{stop:?}: {text}");
+        }
+    }
+
+    /// U4/U5: a turn that ends with a child still drawn as running does not
+    /// rewrite it to failed — the UI has no such fact. It is interrupted, which
+    /// is what the runtime records for an activation that died with its turn.
+    #[test]
+    fn a_child_left_running_at_turn_end_reads_interrupted_not_failed() {
+        use crate::action::Action;
+        use crate::reducer::reduce;
+        use leveler_client_protocol::RuntimeEvent;
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        reduce(
+            &mut state,
+            Action::Runtime(child_event("agent-1", false, false, None)),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::TurnFailed {
+                error: "boom".into(),
+            }),
+        );
+        let text = render_text(&mut state, 100, 30);
+        assert!(text.contains("已中断"), "{text}");
+        assert!(!text.contains("未完成"), "{text}");
+    }
+
+    /// The runtime's own lifecycle move reaches the child: interrupted, then
+    /// running again under the same id.
+    #[test]
+    fn a_child_state_change_moves_the_child() {
+        use crate::action::Action;
+        use crate::reducer::reduce;
+        use leveler_client_protocol::{RuntimeEvent, UiChildState};
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        reduce(
+            &mut state,
+            Action::Runtime(child_event("agent-1", false, false, None)),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::SubAgentStateChanged {
+                id: "agent-1".into(),
+                state: UiChildState::Interrupted,
+            }),
+        );
+        assert!(render_text(&mut state, 100, 30).contains("已中断"));
+        assert_eq!(
+            state.team.children[0].status,
+            crate::multi_agent::ChildStatus::Interrupted
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::SubAgentStateChanged {
+                id: "agent-1".into(),
+                state: UiChildState::Running,
+            }),
+        );
+        assert!(!render_text(&mut state, 100, 30).contains("已中断"));
+        assert_eq!(
+            state.team.children[0].status,
+            crate::multi_agent::ChildStatus::Waiting
+        );
+    }
+
+    /// U1: an accepted spawn is ONE entry — the child block. The spawn call's
+    /// own tool cell said the same thing a second time.
+    #[test]
+    fn an_accepted_spawn_is_one_entry_not_a_tool_cell_and_a_child() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        spawn_call_then(
+            &mut state,
+            true,
+            "[sub-agent Euclid (agent-1, role=explorer)] started in the background.",
+        );
+        let text = render_text(&mut state, 100, 30);
+        assert!(text.contains("探索 Agent 1"), "{text}");
+        assert!(
+            !text.contains("子 Agent ·"),
+            "the spawn call rendered as its own cell: {text}"
+        );
+    }
+
+    /// A refused spawn has no child block, so its failure stays visible.
+    #[test]
+    fn a_refused_spawn_still_shows_its_failure() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        spawn_call_then(&mut state, false, "Unknown role `explorr`.");
+        let text = render_text(&mut state, 100, 30);
+        assert!(text.contains("子 Agent"), "{text}");
     }
 
     #[test]

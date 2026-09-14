@@ -16,6 +16,9 @@ pub enum ChildStatus {
     Waiting,
     /// Actively spending model calls.
     Running,
+    /// Its activation died with a runtime window; the runtime continues it or
+    /// settles it as lost. Not running, not finished.
+    Interrupted,
     Completed,
     Failed,
 }
@@ -62,6 +65,9 @@ pub struct ChildAgentView {
     pub recent_step: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// How the activation ended, once it has. `None` while running and for
+    /// terminals recorded before it was typed.
+    pub stop: Option<leveler_client_protocol::ChildStop>,
     pub started_elapsed_secs: u64,
     /// Findings loaded on demand by the Contribution Inspector.
     ///
@@ -112,6 +118,8 @@ pub struct ChildUpdate {
     pub read_only: bool,
     /// `None` means the runtime produced no projection — not measured.
     pub contribution: Option<ChildContribution>,
+    /// How the activation ended, when it did. Read, never inferred.
+    pub stop: Option<leveler_client_protocol::ChildStop>,
     pub started_elapsed_secs: u64,
 }
 
@@ -172,7 +180,10 @@ impl TaskTeamView {
         }
         match self.settled_at_elapsed {
             None => true,
-            Some(at) => now_elapsed.saturating_sub(at) < COLLABORATION_TERMINAL_SECS,
+            // A clock that went BACKWARDS (the turn clock resets when the
+            // session goes idle) means the turn that stamped this has ended:
+            // the linger is over, not restarted.
+            Some(at) => now_elapsed >= at && now_elapsed - at < COLLABORATION_TERMINAL_SECS,
         }
     }
 
@@ -192,6 +203,7 @@ impl TaskTeamView {
             profile_id,
             read_only,
             contribution,
+            stop,
             started_elapsed_secs,
         } = update;
         let contribution = if !done {
@@ -211,6 +223,7 @@ impl TaskTeamView {
             }
             existing.status = status;
             existing.contribution = contribution;
+            existing.stop = stop;
             if !role.is_empty() {
                 existing.role = role;
             }
@@ -233,11 +246,94 @@ impl TaskTeamView {
             recent_step: None,
             input_tokens: 0,
             output_tokens: 0,
+            stop,
             started_elapsed_secs,
             detail: None,
             steps: Vec::new(),
         });
         self.restamp_settlement(started_elapsed_secs);
+    }
+
+    /// Take the children the runtime recorded (a snapshot on open or
+    /// reconnect). Each is upserted by id: a child this view already follows
+    /// keeps its live-only detail (steps, loaded findings) and takes the
+    /// recorded state; one it never saw is added as recorded.
+    pub fn restore(
+        &mut self,
+        children: &[leveler_client_protocol::UiChildAgent],
+        now_elapsed: u64,
+    ) {
+        use leveler_client_protocol::{ChildOutcome, UiChildState};
+        for recorded in children {
+            let status = match recorded.state {
+                UiChildState::Running => ChildStatus::Waiting,
+                UiChildState::Interrupted => ChildStatus::Interrupted,
+                UiChildState::Settled => match recorded.outcome {
+                    Some(
+                        ChildOutcome::CompletedWithFindings | ChildOutcome::CompletedNoFindings,
+                    ) => ChildStatus::Completed,
+                    _ => ChildStatus::Failed,
+                },
+            };
+            let input = u32::try_from(recorded.input_tokens).unwrap_or(u32::MAX);
+            let output = u32::try_from(recorded.output_tokens).unwrap_or(u32::MAX);
+            if let Some(existing) = self.children.iter_mut().find(|c| c.id == recorded.id) {
+                // A live Running is finer than the record's Running.
+                if !(status == ChildStatus::Waiting && existing.status == ChildStatus::Running) {
+                    existing.status = status;
+                }
+                existing.stop = recorded.stop;
+                existing.input_tokens = existing.input_tokens.max(input);
+                existing.output_tokens = existing.output_tokens.max(output);
+                continue;
+            }
+            self.children.push(ChildAgentView {
+                id: recorded.id.clone(),
+                nickname: recorded.nickname.clone(),
+                role: recorded.role.clone(),
+                profile_id: recorded.profile_id.clone(),
+                read_only: recorded.read_only,
+                purpose: recorded.purpose.clone(),
+                status,
+                contribution: if recorded.state == UiChildState::Settled {
+                    Contribution::NotMeasured
+                } else {
+                    Contribution::Pending
+                },
+                recent_step: None,
+                input_tokens: input,
+                output_tokens: output,
+                stop: recorded.stop,
+                started_elapsed_secs: now_elapsed,
+                detail: None,
+                steps: Vec::new(),
+            });
+        }
+        self.restamp_settlement(now_elapsed);
+    }
+
+    /// The runtime moved a child without a start or terminal: its activation
+    /// died (interrupted) or a new one began (running). A settled child stays
+    /// settled — a terminal is final.
+    pub fn apply_state(
+        &mut self,
+        id: &str,
+        state: leveler_client_protocol::UiChildState,
+        now_elapsed: u64,
+    ) {
+        use leveler_client_protocol::UiChildState;
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
+            match (state, c.status) {
+                (UiChildState::Interrupted, ChildStatus::Waiting | ChildStatus::Running) => {
+                    c.status = ChildStatus::Interrupted;
+                }
+                (UiChildState::Running, ChildStatus::Interrupted) => {
+                    c.status = ChildStatus::Waiting;
+                }
+                _ => return,
+            }
+        }
+        self.restamp_settlement(now_elapsed);
     }
 
     /// Live execution state. `active` separates "spending model calls" from
@@ -274,6 +370,21 @@ impl TaskTeamView {
                 }
             }
         }
+    }
+}
+
+/// The words for a non-completed stop the runtime typed. `None` for a stop
+/// that has no more specific word than "incomplete".
+pub fn stop_label(
+    stop: Option<leveler_client_protocol::ChildStop>,
+    t: &crate::i18n::UiText,
+) -> Option<&'static str> {
+    use leveler_client_protocol::ChildStop;
+    match stop? {
+        ChildStop::Cancelled => Some(t.sub_agent_cancelled),
+        ChildStop::Lost => Some(t.sub_agent_lost),
+        ChildStop::Budget => Some(t.sub_agent_budget),
+        ChildStop::Completed | ChildStop::Incomplete | ChildStop::Failed => None,
     }
 }
 
@@ -326,6 +437,24 @@ mod tests {
         );
     }
 
+    /// U2: the turn clock resets to 0 when the session goes idle. A settled
+    /// team stamped at 10s must not read "0 - 10 saturates to 0, still under
+    /// the linger" and stay on screen for the whole idle period.
+    #[test]
+    fn a_settled_team_leaves_the_surface_when_the_turn_clock_resets() {
+        let mut team = team_with(&[ChildStatus::Completed]);
+        team.settled_at_elapsed = Some(10);
+        assert!(team.surface_visible(12), "inside the linger");
+        assert!(
+            !team.surface_visible(10 + COLLABORATION_TERMINAL_SECS),
+            "aged out"
+        );
+        assert!(
+            !team.surface_visible(0),
+            "the clock reset: the linger is over"
+        );
+    }
+
     fn team_with(statuses: &[ChildStatus]) -> TaskTeamView {
         let mut team = TaskTeamView::default();
         for (i, st) in statuses.iter().enumerate() {
@@ -348,6 +477,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: Vec::new(),
+                stop: None,
             });
         }
         team
@@ -433,6 +563,7 @@ mod tests {
             read_only: true,
             contribution: None,
             started_elapsed_secs: 0,
+            stop: None,
         });
     }
 
@@ -448,6 +579,7 @@ mod tests {
             read_only: false,
             contribution: c,
             started_elapsed_secs: 0,
+            stop: None,
         });
     }
 
@@ -561,6 +693,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
+            stop: None,
         });
         assert!(!team2.children[0].is_read_only());
     }
@@ -580,6 +713,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
+            stop: None,
         });
         assert_eq!(team.children[0].role, "explorer");
     }
@@ -1147,8 +1281,13 @@ pub fn roster_rows(
             ChildStatus::Failed => (
                 "!",
                 RosterTone::Failed,
-                t.sub_agent_ended_incomplete.to_string(),
+                stop_label(child.stop, t)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| t.sub_agent_ended_incomplete.to_string()),
             ),
+            ChildStatus::Interrupted => {
+                ("⏸", RosterTone::Failed, t.sub_agent_interrupted.to_string())
+            }
         };
         rows.push(AgentRosterRow {
             glyph,
@@ -1247,10 +1386,14 @@ pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine>
                 ChildStatus::Running => "⟳",
                 ChildStatus::Completed => "✓",
                 ChildStatus::Failed => "✗",
+                ChildStatus::Interrupted => "⏸",
             };
             let detail = match c.status {
                 ChildStatus::Waiting | ChildStatus::Running => running_line(c, t),
-                ChildStatus::Failed => t.sub_agent_incomplete.to_string(),
+                ChildStatus::Interrupted => t.sub_agent_interrupted.to_string(),
+                ChildStatus::Failed => stop_label(c.stop, t)
+                    .unwrap_or(t.sub_agent_incomplete)
+                    .to_string(),
                 ChildStatus::Completed => {
                     contribution_line(c, t).unwrap_or_else(|| t.sub_agent_completed.to_string())
                 }

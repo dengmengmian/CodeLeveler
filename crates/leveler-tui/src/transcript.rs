@@ -197,6 +197,11 @@ pub struct SubAgentBlock {
     /// `NotMeasured` when the runtime produced no projection — which is not
     /// the same fact as a measured zero and must not render as one.
     pub contribution: crate::multi_agent::Contribution,
+    /// How the activation ended, once it has (typed by the runtime).
+    pub stop: Option<leveler_client_protocol::ChildStop>,
+    /// Its activation ended without a terminal reaching this view — the
+    /// runtime continues it or settles it later. Not a failure.
+    pub interrupted: bool,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -626,8 +631,12 @@ impl TranscriptState {
                         }
                     }
                 }
+                // The turn ended and no terminal reached us. Failing the child
+                // would be a fact the UI invented; interrupted is what the
+                // runtime records for an activation that died with its turn.
                 TranscriptItem::SubAgent(b) if b.status == ToolStatus::Running => {
                     b.status = ToolStatus::Failed;
+                    b.interrupted = true;
                 }
                 _ => {}
             }
@@ -998,6 +1007,8 @@ impl TranscriptState {
             recent_step: None,
             started_elapsed_secs,
             contribution: crate::multi_agent::Contribution::Pending,
+            stop: None,
+            interrupted: false,
         }));
     }
 
@@ -1015,6 +1026,7 @@ impl TranscriptState {
         ok: bool,
         summary: String,
         contribution: crate::multi_agent::Contribution,
+        stop: Option<leveler_client_protocol::ChildStop>,
     ) {
         let status = if ok {
             ToolStatus::Ok
@@ -1025,6 +1037,8 @@ impl TranscriptState {
             block.status = status;
             block.detail = summary;
             block.contribution = contribution.clone();
+            block.stop = stop;
+            block.interrupted = false;
             return;
         }
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
@@ -1038,6 +1052,8 @@ impl TranscriptState {
             recent_step: None,
             started_elapsed_secs: 0,
             contribution,
+            stop,
+            interrupted: false,
         }));
     }
 
@@ -1071,7 +1087,28 @@ impl TranscriptState {
             recent_step: None,
             started_elapsed_secs: 0,
             contribution,
+            stop: None,
+            interrupted: false,
         }));
+    }
+
+    /// The runtime moved a child without a terminal: interrupted (its
+    /// activation died) or running again. A settled block stays settled.
+    pub fn set_sub_agent_state(&mut self, id: &str, state: leveler_client_protocol::UiChildState) {
+        use leveler_client_protocol::UiChildState;
+        if let Some(block) = self.sub_agent_mut(id) {
+            match state {
+                UiChildState::Interrupted if block.status == ToolStatus::Running => {
+                    block.status = ToolStatus::Failed;
+                    block.interrupted = true;
+                }
+                UiChildState::Running if block.interrupted => {
+                    block.status = ToolStatus::Running;
+                    block.interrupted = false;
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn update_sub_agent_progress(

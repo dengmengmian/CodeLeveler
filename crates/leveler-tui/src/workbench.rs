@@ -1287,6 +1287,7 @@ mod tests {
                 read_only: true,
                 contribution: None,
                 started_elapsed_secs: 0,
+                stop: None,
             });
         }
         team
@@ -1774,6 +1775,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: Vec::new(),
+                stop: None,
             });
         }
         team
@@ -1865,6 +1867,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
+            stop: None,
         });
         team.apply_progress("c1", true, 120_000, 48_000);
         state.team = team;
@@ -1910,6 +1913,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 4,
+            stop: None,
         });
         team.apply_update(crate::multi_agent::ChildUpdate {
             id: "bad1".into(),
@@ -1922,6 +1926,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 5,
+            stop: None,
         });
         // A third child still active keeps the surface in full roster shape
         // (frozen transience: all-settled collapses to the terminal line).
@@ -1936,6 +1941,7 @@ mod tests {
             read_only: false,
             contribution: None,
             started_elapsed_secs: 6,
+            stop: None,
         });
         state.team = team;
         let rows = panel_rows(&state, 5).join("\n");
@@ -1958,6 +1964,9 @@ mod tests {
     fn roster_all_settled_collapses_to_truthful_terminal_line() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        // The children settle at 3s on the turn clock, and the frame is drawn
+        // then — a settlement stamped after "now" is not a state a turn reaches.
+        state.elapsed_secs = 3;
         let mut team = crate::multi_agent::TaskTeamView::default();
         for (id, ok) in [("ok1", true), ("bad1", false)] {
             team.apply_update(crate::multi_agent::ChildUpdate {
@@ -1971,6 +1980,7 @@ mod tests {
                 read_only: false,
                 contribution: None,
                 started_elapsed_secs: 3,
+                stop: None,
             });
         }
         state.team = team;

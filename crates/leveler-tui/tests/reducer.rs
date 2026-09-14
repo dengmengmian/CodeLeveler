@@ -6477,3 +6477,91 @@ fn raw_reasoning_still_never_reaches_the_conversation() {
     );
     assert_eq!(assistant_indexes(&s).len(), 1, "one assistant block only");
 }
+
+fn snapshot_child(
+    id: &str,
+    state: leveler_client_protocol::UiChildState,
+    stop: Option<leveler_client_protocol::ChildStop>,
+) -> leveler_client_protocol::UiChildAgent {
+    leveler_client_protocol::UiChildAgent {
+        id: id.into(),
+        nickname: format!("nick-{id}"),
+        role: "explorer".into(),
+        profile_id: None,
+        read_only: true,
+        purpose: format!("purpose of {id}"),
+        state,
+        background: true,
+        scope: Vec::new(),
+        resumes: 0,
+        outcome: None,
+        stop,
+        summary: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd_micros: None,
+    }
+}
+
+/// U5: a reopened or reconnected session shows its children from the
+/// snapshot — the runtime's record — not from live events it never saw.
+#[test]
+fn a_session_snapshot_restores_its_children_with_their_recorded_state() {
+    use leveler_client_protocol::{ChildStop, UiChildState};
+    use leveler_tui::multi_agent::ChildStatus;
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.children = vec![
+        snapshot_child("c1", UiChildState::Settled, Some(ChildStop::Budget)),
+        snapshot_child("c2", UiChildState::Interrupted, None),
+        snapshot_child("c3", UiChildState::Running, None),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let statuses: Vec<_> = s
+        .team
+        .children
+        .iter()
+        .map(|c| (c.id.as_str(), c.status, c.stop))
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![
+            ("c1", ChildStatus::Failed, Some(ChildStop::Budget)),
+            ("c2", ChildStatus::Interrupted, None),
+            ("c3", ChildStatus::Waiting, None),
+        ]
+    );
+    assert_eq!(s.team.children[1].purpose, "purpose of c2");
+}
+
+/// U3: a runtime notice in history is not a user turn.
+#[test]
+fn a_runtime_notice_in_history_is_not_rendered_as_user_input() {
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.messages = vec![leveler_client_protocol::UiMessage {
+        id: leveler_client_protocol::MessageId::new("m1"),
+        role: leveler_client_protocol::UiRole::User,
+        text: "## Background sub-agent settled\nEuclid finished.".into(),
+        ordinal: Some(0),
+        kind: Some(leveler_client_protocol::UiMessageKind::RuntimeNotice),
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let items = s.transcript.items();
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, leveler_tui::transcript::TranscriptItem::User(_))),
+        "{items:?}"
+    );
+    assert!(items.iter().any(|item| matches!(
+        item,
+        leveler_tui::transcript::TranscriptItem::Note(text) if text.contains("Euclid finished")
+    )));
+}

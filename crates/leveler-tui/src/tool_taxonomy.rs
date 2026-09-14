@@ -373,13 +373,16 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         read_only_default: true,
         visibility: ActivityVisibility::Important,
     },
+    // An accepted spawn is represented by its child block; its own call cell
+    // said the same thing twice. Silent still shows a refused spawn, which has
+    // no child block.
     ToolTaxonomyEntry {
         name: "spawn_agent",
         kind: ToolKind::Other,
         presentation_en: "Subagent",
         presentation_zh: "子 Agent",
         read_only_default: false,
-        visibility: ActivityVisibility::Important,
+        visibility: ActivityVisibility::Silent,
     },
     ToolTaxonomyEntry {
         name: "task",

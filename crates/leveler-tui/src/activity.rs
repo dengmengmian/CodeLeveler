@@ -42,6 +42,8 @@ pub enum ActivityStatus {
     Waiting,
     Completed,
     Failed,
+    /// A child whose activation died with its runtime window.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,8 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
         };
         match status {
             ActivityStatus::Running => running.push(row),
-            ActivityStatus::Waiting => waiting.push(row),
+            // Interrupted is not finished: the next turn continues or settles it.
+            ActivityStatus::Waiting | ActivityStatus::Interrupted => waiting.push(row),
             ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
         }
     }
@@ -105,6 +108,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             ChildStatus::Waiting => ActivityStatus::Waiting,
             ChildStatus::Completed => ActivityStatus::Completed,
             ChildStatus::Failed => ActivityStatus::Failed,
+            ChildStatus::Interrupted => ActivityStatus::Interrupted,
         };
         let row = ActivitySummary {
             id: ActivityId::Child(child.id.clone()),
@@ -117,7 +121,8 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
         };
         match status {
             ActivityStatus::Running => running.push(row),
-            ActivityStatus::Waiting => waiting.push(row),
+            // Interrupted is not finished: the next turn continues or settles it.
+            ActivityStatus::Waiting | ActivityStatus::Interrupted => waiting.push(row),
             ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
         }
     }
@@ -136,6 +141,7 @@ pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usiz
         ActivityStatus::Waiting => "◌",
         ActivityStatus::Completed => "✓",
         ActivityStatus::Failed => "✕",
+        ActivityStatus::Interrupted => "⏸",
     };
     let dur = fmt_elapsed(summary.duration_secs);
     let title = match summary.secondary.as_deref() {
@@ -415,6 +421,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: Vec::new(),
+                stop: None,
             });
         let rows = summaries(&state);
         assert_eq!(rows[0].kind, ActivityKind::ChildAgent);
@@ -447,6 +454,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: Vec::new(),
+                stop: None,
             });
         let rows = summaries(&state);
         assert_eq!(rows[0].status, ActivityStatus::Completed);
@@ -677,6 +685,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: vec!["read_file".into()],
+                stop: None,
             });
         let wait = crate::wait_status::project(&state).expect("child wait");
         assert_eq!(wait.kind, crate::wait_status::WaitKind::ChildAgent);
@@ -723,6 +732,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 detail: None,
                 steps: vec!["read_file".into()],
+                stop: None,
             });
         let row = &summaries(&state)[0];
         let line = compact_row(row, false, 80);

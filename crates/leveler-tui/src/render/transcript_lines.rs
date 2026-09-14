@@ -735,10 +735,13 @@ pub(crate) fn sub_agent_status(
     t: &crate::i18n::UiText,
 ) -> &'static str {
     match block.status {
+        _ if block.interrupted => t.sub_agent_interrupted,
         ToolStatus::Running if block.progress.active => t.sub_agent_running,
         ToolStatus::Running => t.sub_agent_waiting,
         ToolStatus::Ok => t.sub_agent_completed,
-        ToolStatus::Failed => t.sub_agent_incomplete,
+        ToolStatus::Failed => {
+            crate::multi_agent::stop_label(block.stop, t).unwrap_or(t.sub_agent_incomplete)
+        }
     }
 }
 
@@ -789,6 +792,7 @@ fn sub_agent_lines(
     now_elapsed_secs: u64,
 ) {
     let (glyph, color) = match block.status {
+        _ if block.interrupted => ("⏸", theme.status.warning),
         ToolStatus::Running => ("◌", theme.accent.primary),
         ToolStatus::Ok => ("✓", theme.status.success),
         ToolStatus::Failed => ("✗", theme.status.error),
@@ -1057,10 +1061,10 @@ fn sub_agent_tree_group_lines(
     }
 }
 
-/// Whether a failed sub-agent hit its round limit (the "timeout" outcome).
+/// Whether a failed sub-agent was stopped by a budget (the "timeout" outcome),
+/// as the runtime typed it — never read out of its summary text.
 fn sub_agent_hit_round_limit(block: &crate::transcript::SubAgentBlock) -> bool {
-    block.detail.starts_with("Reached the ")
-        && block.detail.contains("-round limit before finishing.")
+    block.stop == Some(leveler_client_protocol::ChildStop::Budget)
 }
 
 /// Compact usage stats for one fully-succeeded tree child (`↑ 87.8k · ↓ 45.8k`).
@@ -1092,10 +1096,20 @@ fn sub_agent_tree_child_status(
             format!("✓ {}", t.agent_status_completed),
             theme.status.success,
         ),
+        _ if block.interrupted => (
+            format!("⏸ {}", t.sub_agent_interrupted),
+            theme.status.warning,
+        ),
         ToolStatus::Failed if sub_agent_hit_round_limit(block) => {
             (format!("✗ {}", t.agent_status_timeout), theme.status.error)
         }
-        ToolStatus::Failed => (format!("✗ {}", t.sub_agent_incomplete), theme.status.error),
+        ToolStatus::Failed => (
+            format!(
+                "✗ {}",
+                crate::multi_agent::stop_label(block.stop, t).unwrap_or(t.sub_agent_incomplete)
+            ),
+            theme.status.error,
+        ),
     }
 }
 
@@ -1699,6 +1713,11 @@ mod tests {
             started_elapsed_secs: 0,
             expanded: false,
             contribution: crate::multi_agent::Contribution::Pending,
+            // A failed fixture child was stopped by its round budget — typed,
+            // as the runtime sends it; the summary text above is only prose.
+            stop: (status == ToolStatus::Failed)
+                .then_some(leveler_client_protocol::ChildStop::Budget),
+            interrupted: false,
         }
     }
 
