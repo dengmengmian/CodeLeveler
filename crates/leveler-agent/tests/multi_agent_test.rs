@@ -6170,3 +6170,152 @@ async fn a_run_ending_in_error_stops_and_settles_its_background_children() {
         "the child was stopped and waited for before the run returned"
     );
 }
+
+/// Bills every request 1M input tokens; prices each model from its own id.
+struct PricedRuntime {
+    child_marker: &'static str,
+    parent_calls: std::sync::atomic::AtomicUsize,
+}
+
+fn priced_profile(model: &ModelRef, usd_per_mtok: f64) -> ModelProfile {
+    serde_json::from_value(serde_json::json!({
+        "id": model.model, "provider": model.provider, "model_id": model.model,
+        "protocol": "openai_chat",
+        "capabilities": {
+            "streaming": true, "tool_calling": true, "parallel_tool_calls": true,
+            "structured_output": false, "reasoning": false, "vision": false
+        },
+        "limits": {
+            "context_window": 128000, "reliable_context": 64000,
+            "max_output_tokens": 4096, "max_tool_schema_bytes": 65536,
+            "max_parallel_tool_calls": 4
+        },
+        "pricing": {"input_usd_per_mtok": usd_per_mtok, "output_usd_per_mtok": 0.0}
+    }))
+    .unwrap()
+}
+
+#[async_trait]
+impl ModelRuntime for PricedRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let mut response = if request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(self.child_marker))
+        {
+            assistant_text("cheap child report")
+        } else {
+            match self
+                .parent_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 => assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"agent": "cheap-explorer", "task": self.child_marker}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                _ => assistant_text("parent done"),
+            }
+        };
+        response.usage = usage;
+        Ok(response)
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(priced_profile(
+            model,
+            if model.model == "cheap" { 1.0 } else { 10.0 },
+        ))
+    }
+}
+
+/// Keeps every model-request record the run hands its durable sink.
+#[derive(Default)]
+struct RequestSink {
+    records: Vec<leveler_agent::ModelRequestRecord>,
+}
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for RequestSink {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), leveler_engine::PortError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), leveler_engine::PortError> {
+        self.records.push(record.clone());
+        Ok(())
+    }
+}
+
+/// CHILD_USAGE_DURABLE — a child pinned to another model is billed at THAT
+/// model's price. It used to inherit the parent's pricing, so a cheap
+/// investigation persona was recorded at the expensive parent's rate.
+#[tokio::test]
+async fn a_child_on_a_pinned_model_is_billed_at_that_models_price() {
+    let dir = tmp("pinned-model-pricing", 89);
+    std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
+    std::fs::write(
+        dir.join(".leveler/agents/cheap-explorer.md"),
+        "---\nname: cheap-explorer\ndescription: looks around cheaply\nrole: explorer\nmodel: mock/cheap\n---\nLook around.\n",
+    )
+    .unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(PricedRuntime {
+        child_marker: "PRICED_CHILD_TASK",
+        parent_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let parent_pricing = priced_profile(&ModelRef::new("mock", "m"), 10.0).pricing;
+    let mut sink = RequestSink::default();
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_pricing(parent_pricing)
+    .run(
+        "delegate cheaply",
+        &mut |_| {},
+        &mut sink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let child_costs: Vec<Option<u64>> = sink
+        .records
+        .iter()
+        .filter(|record| record.agent_id.is_some())
+        .map(|record| record.cost_usd_micros)
+        .collect();
+    assert!(!child_costs.is_empty(), "the child made a model call");
+    assert!(
+        child_costs.iter().all(|cost| *cost == Some(1_000_000)),
+        "1M input tokens at the pinned model's $1/Mtok, not the parent's $10: {child_costs:?}"
+    );
+}

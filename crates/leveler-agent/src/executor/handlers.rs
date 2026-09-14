@@ -348,12 +348,14 @@ impl Executor {
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
+        let repriced = model_override.is_some();
         let prepared_child = self
             .child_for_role_on(role, files, model_override)
             .with_agent_id(id.clone());
         let hook_runner = self.hook_runner.clone();
         run_prepared_sub_agent(
             prepared_child,
+            repriced,
             hook_runner,
             id,
             role,
@@ -387,11 +389,13 @@ impl Executor {
             .model
             .as_deref()
             .and_then(leveler_model::ModelRef::parse);
+        let repriced = model_override.is_some();
         let prepared_child = self
             .child_for_role_on(child.role, child.spec.files.clone(), model_override)
             .with_agent_id(child.id.clone());
         run_prepared_sub_agent(
             prepared_child,
+            repriced,
             self.hook_runner.clone(),
             child.id.clone(),
             child.role,
@@ -425,6 +429,10 @@ enum ChildStart {
 #[allow(clippy::too_many_arguments)]
 async fn run_prepared_sub_agent(
     mut child: Executor,
+    // The child runs on a model other than its parent's, so it is priced from
+    // that model's own profile. Pricing that cannot be read records no cost:
+    // the parent's rate would be a wrong number, not an estimate.
+    repriced: bool,
     hook_runner: leveler_execution::HookRunner,
     id: String,
     role: AgentRole,
@@ -484,6 +492,14 @@ async fn run_prepared_sub_agent(
                 &cancellation,
             )
             .await;
+    }
+    if repriced {
+        child.pricing = child
+            .runtime
+            .profile(&child.model)
+            .await
+            .ok()
+            .and_then(|profile| profile.pricing);
     }
     // A definition that declares its own tools / round budget binds every
     // spawn of it — otherwise the field is decoration.
