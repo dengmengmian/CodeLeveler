@@ -1564,10 +1564,11 @@ impl AgentHarness for Drive<'_> {
                 continue;
             }
 
-            // The task tools manage background shell tasks. A running child's
-            // id is not one of those, and "unknown task" would read as if the
-            // child did not exist. Say what the id is and how its result
-            // arrives; nothing is waited on or killed through the wrong door.
+            // The task tools manage background shell tasks. A child's id is
+            // not one of those, and "unknown task" would read as if the child
+            // did not exist. Answer what the id is and how its result arrives;
+            // nothing is waited on or killed through the wrong door. An
+            // answer, not a refusal: the call is closed with is_error=false.
             if matches!(call.name.as_str(), "wait_task" | "get_task" | "kill_task")
                 && let Some(child) = call
                     .arguments
@@ -1581,10 +1582,21 @@ impl AgentHarness for Drive<'_> {
                             .find(|child| child.id == task_id)
                     })
             {
+                let state = if child.handle.is_finished() {
+                    "It has finished; its result is delivered to you automatically before \
+                     your next step."
+                } else {
+                    "It is still running; its result is delivered to you automatically when \
+                     it settles."
+                };
+                let tail = if call.name == "kill_task" {
+                    " A sub-agent cannot be cancelled from here: you have no tool that stops \
+                     one, and kill_task stops only background shell tasks."
+                } else {
+                    " There is nothing to wait on or poll."
+                };
                 let answer = format!(
-                    "`{}` is sub-agent {} ({}), not a background task. It is still running; \
-                     its result is delivered to you automatically when it settles, so there \
-                     is nothing to wait on or poll.",
+                    "`{}` is sub-agent {} ({}), not a background task. {state}{tail}",
                     child.id,
                     child.nickname,
                     child.role.label()
@@ -1595,7 +1607,20 @@ impl AgentHarness for Drive<'_> {
                     arguments: compact_json(&call.arguments),
                     parallel: false,
                 });
-                self.settle_refused_call(&call, answer, &mut results, index);
+                (self.observer)(AgentEvent::ToolResult {
+                    id: call.id.as_str().to_string(),
+                    name: call.name.clone(),
+                    is_error: false,
+                    preview: preview(&answer),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id.clone(),
+                        content: answer,
+                        is_error: false,
+                    },
+                });
                 continue;
             }
 
@@ -2534,7 +2559,24 @@ impl AgentHarness for Drive<'_> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let admitted_profile = ChildProfile::admit_spawn(profile_arg, role_hint, &files);
+                // A capability field that is present but not a string is not
+                // "omitted": read that way it would buy the default child, a
+                // writer.
+                let malformed_capability = ["role", "profile"].into_iter().find(|field| {
+                    call.arguments
+                        .get(*field)
+                        .is_some_and(|v| !v.is_string() && !v.is_null())
+                });
+                let admitted_profile = ChildProfile::admit_spawn(profile_arg, role_hint, &files)
+                    .map_err(|error| match (&named, named_role) {
+                        // The role came from the agent's own definition, not
+                        // from the call: the definition is what needs fixing.
+                        (Some((name, Some(_))), Some(declared)) => format!(
+                            "Agent `{name}` declares role `{declared}` in its agent definition, \
+                             which is not accepted: {error} Fix the agent definition."
+                        ),
+                        _ => error,
+                    });
 
                 // Reject (no agent started) for depth, empty task, or cap.
                 let reject = if let Some((requested, None)) = &named {
@@ -2550,6 +2592,11 @@ impl AgentHarness for Drive<'_> {
                     Some(format!(
                         "Unknown agent `{requested}`. Available: {known}. Omit `agent` to \
                              spawn with an inline task instead."
+                    ))
+                } else if let Some(field) = malformed_capability {
+                    Some(format!(
+                        "spawn_agent `{field}` must be a string (or omitted); it was {}.",
+                        call.arguments[field]
                     ))
                 } else if self.executor.depth >= MAX_SUB_AGENT_DEPTH {
                     Some("Sub-agents may not spawn their own sub-agents.".to_string())

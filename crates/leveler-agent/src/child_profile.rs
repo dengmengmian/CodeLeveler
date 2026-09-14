@@ -409,8 +409,7 @@ impl ChildProfile {
                 );
             }
             if let Some(role_raw) = role.map(str::trim).filter(|s| !s.is_empty())
-                && let Some(explicit) = AgentRole::from_label(role_raw)
-                && explicit != resolved.role
+                && AgentRole::parse(Some(role_raw))? != resolved.role
             {
                 return Err(format!(
                     "profile='{raw}' is role '{}' but role='{role_raw}' was also set. \
@@ -596,6 +595,15 @@ mod tests {
             ChildProfile::admit_spawn(None, None, &[]).unwrap().role,
             AgentRole::Default
         );
+    }
+
+    /// With `profile` set, a role word still has to be a role word: an
+    /// unknown one is refused, not skipped.
+    #[test]
+    fn an_unknown_role_beside_a_profile_is_refused() {
+        let err = ChildProfile::admit_spawn(Some("worker"), Some("explorr"), &["a.rs".into()])
+            .unwrap_err();
+        assert!(err.contains("explorr"), "{err}");
     }
 
     /// `reviewer` is not a model-facing role word, but it IS a valid label

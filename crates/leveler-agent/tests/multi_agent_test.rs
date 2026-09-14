@@ -6677,9 +6677,14 @@ async fn a_foreground_batch_that_errors_still_ends_its_children_for_the_host() {
     );
 }
 
-/// A parent that spawns a background child, then — confusing a child with a
-/// background shell task — calls `wait_task` with the child's id.
-struct WaitOnChildRuntime {
+/// A parent that spawns a background child and then addresses it through the
+/// task tools. The child is held on a signal the parent's runtime releases,
+/// so whether it is still running at that moment is decided, not raced.
+struct TaskToolsOnChildRuntime {
+    /// Release the child before issuing the task-tool calls (and give it time
+    /// to finish), so it has ended but not yet been settled.
+    finish_first: bool,
+    release: Arc<tokio::sync::Notify>,
     parent_calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -6698,7 +6703,7 @@ fn child_id_from_ack(messages: &[Message]) -> Option<String> {
 }
 
 #[async_trait]
-impl ModelRuntime for WaitOnChildRuntime {
+impl ModelRuntime for TaskToolsOnChildRuntime {
     async fn generate(
         &self,
         request: ModelRequest,
@@ -6707,9 +6712,9 @@ impl ModelRuntime for WaitOnChildRuntime {
         if request
             .messages
             .iter()
-            .any(|m| m.text_content().contains("WAITED_ON_CHILD"))
+            .any(|m| m.text_content().contains("HELD_CHILD"))
         {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.release.notified().await;
             return Ok(assistant_text("child done"));
         }
         let call = self
@@ -6719,23 +6724,31 @@ impl ModelRuntime for WaitOnChildRuntime {
             0 => assistant_with(
                 vec![spawn_call_default(
                     "s1",
-                    serde_json::json!({"task": "WAITED_ON_CHILD look"}),
+                    serde_json::json!({"task": "HELD_CHILD look"}),
                 )],
                 FinishReason::ToolCalls,
             ),
             1 => {
+                if self.finish_first {
+                    self.release.notify_one();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
                 let id =
                     child_id_from_ack(&request.messages).expect("the spawn ack names the child");
+                let args = serde_json::json!({"task_id": id, "timeout_seconds": 5});
                 assistant_with(
-                    vec![tool_call_part(
-                        "w1",
-                        "wait_task",
-                        serde_json::json!({"task_id": id, "timeout_seconds": 5}),
-                    )],
+                    vec![
+                        tool_call_part("w1", "wait_task", args.clone()),
+                        tool_call_part("w2", "get_task", args.clone()),
+                        tool_call_part("w3", "kill_task", args),
+                    ],
                     FinishReason::ToolCalls,
                 )
             }
-            _ => assistant_text("parent done"),
+            _ => {
+                self.release.notify_one();
+                assistant_text("parent done")
+            }
         })
     }
 
@@ -6755,21 +6768,23 @@ impl ModelRuntime for WaitOnChildRuntime {
     }
 }
 
-/// Observed in the MA1 Worker dogfood: the parent called `wait_task` with a
-/// child's id and got "unknown task". The id is known — it names a child, not
-/// a background task — so the answer says what it is and how its result
-/// arrives, instead of an error that reads like the child does not exist.
-#[tokio::test]
-async fn waiting_on_a_child_with_the_task_tools_says_what_the_id_is() {
-    let dir = tmp("wait-on-child", 93);
+/// The three task-tool answers for a child, and the observer events.
+async fn task_tools_on_child(
+    tag: &str,
+    finish_first: bool,
+) -> (Vec<(String, bool)>, Vec<AgentEvent>) {
+    let dir = tmp(tag, 93);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
     };
+    let mut events = Vec::new();
     Executor::new(
-        Arc::new(WaitOnChildRuntime {
+        Arc::new(TaskToolsOnChildRuntime {
+            finish_first,
+            release: Arc::new(tokio::sync::Notify::new()),
             parent_calls: std::sync::atomic::AtomicUsize::new(0),
         }),
         Arc::new(default_registry()),
@@ -6777,18 +6792,155 @@ async fn waiting_on_a_child_with_the_task_tools_says_what_the_id_is() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
     .await
     .unwrap();
     std::fs::remove_dir_all(&dir).ok();
+    let answers = ["w1", "w2", "w3"]
+        .iter()
+        .map(|id| spawn_result(&transcript.lock().unwrap(), id))
+        .collect();
+    (answers, events)
+}
 
-    let (content, _) = spawn_result(&transcript.lock().unwrap(), "w1");
+/// Observed in the MA1 Worker dogfood: the parent called `wait_task` with a
+/// child's id and got "unknown task". The id is known — it names a child —
+/// so each task tool answers what it is. An answer, not a refusal; the
+/// announced call is closed on both channels.
+#[tokio::test]
+async fn task_tools_naming_a_running_child_say_what_the_id_is() {
+    let (answers, events) = task_tools_on_child("task-tools-running", false).await;
+    for (content, is_error) in &answers {
+        assert!(!is_error, "an informational answer: {content}");
+        assert!(!content.contains("unknown task"), "{content}");
+        assert!(
+            content.contains("sub-agent") && content.contains("still running"),
+            "{content}"
+        );
+    }
     assert!(
-        !content.contains("unknown task"),
-        "the id is a known child, not an unknown task: {content}"
+        answers[2].0.contains("cannot") && answers[2].0.contains("cancel"),
+        "kill_task says the model has no way to stop a child: {}",
+        answers[2].0
     );
+    for id in ["w1", "w2", "w3"] {
+        let started = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { id: call, .. } if call == id));
+        let finished = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolResult { id: call, .. } if call == id));
+        assert!(started && finished, "{id} is announced and closed");
+    }
+}
+
+/// A child that has already ended but has not been settled yet is not
+/// "still running": the answer says its result is on its way.
+#[tokio::test]
+async fn task_tools_naming_a_finished_unsettled_child_do_not_call_it_running() {
+    let (answers, _) = task_tools_on_child("task-tools-finished", true).await;
+    for (content, _) in &answers {
+        assert!(!content.contains("still running"), "{content}");
+        assert!(content.contains("finished"), "{content}");
+    }
+}
+
+/// The spawn result of a one-spawn round with these arguments, and whether a
+/// child started. The workspace optionally carries named agent definitions.
+async fn single_spawn(
+    tag: &str,
+    args: serde_json::Value,
+    agents: &[(&str, &str)],
+) -> (String, bool, bool) {
+    let dir = tmp(tag, 94);
+    if !agents.is_empty() {
+        std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
+        for (name, body) in agents {
+            std::fs::write(dir.join(format!(".leveler/agents/{name}.md")), body).unwrap();
+        }
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(vec![spawn_call("s1", args)], FinishReason::ToolCalls),
+                assistant_text("child report"),
+                assistant_text("parent done"),
+            ],
+            Duration::ZERO,
+        )),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    let started = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. }));
+    (content, is_error, started)
+}
+
+/// A `role` or `profile` that is present but not a string is refused. Read as
+/// "omitted" it would buy the default child — a writer.
+#[tokio::test]
+async fn a_non_string_role_is_refused_not_read_as_omitted() {
+    for (tag, args) in [
+        (
+            "role-array",
+            serde_json::json!({"task": "look", "role": ["explorer"]}),
+        ),
+        (
+            "role-number",
+            serde_json::json!({"task": "look", "role": 1}),
+        ),
+        (
+            "profile-object",
+            serde_json::json!({"task": "look", "profile": {"id": "explorer"}}),
+        ),
+    ] {
+        let (content, is_error, started) = single_spawn(tag, args, &[]).await;
+        assert!(is_error && !started, "{tag}: {content}");
+        assert!(content.contains("string"), "{tag}: {content}");
+    }
+}
+
+/// A bad role in a named agent's definition is the definition's fault; the
+/// refusal says so and names the agent, instead of telling the model to omit
+/// a role it never passed.
+#[tokio::test]
+async fn a_bad_role_in_an_agent_definition_names_the_definition() {
+    let (content, is_error, started) = single_spawn(
+        "bad-definition-role",
+        serde_json::json!({"task": "look", "agent": "shouty"}),
+        &[(
+            "shouty",
+            "---\nname: shouty\ndescription: d\nrole: Explorer\n---\nLook.\n",
+        )],
+    )
+    .await;
+    assert!(is_error && !started, "{content}");
     assert!(
-        content.contains("sub-agent") && content.contains("settle"),
-        "the answer names what the id is and how its result arrives: {content}"
+        content.contains("shouty") && content.contains("agent definition"),
+        "{content}"
     );
 }
