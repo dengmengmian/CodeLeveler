@@ -6565,3 +6565,82 @@ fn a_runtime_notice_in_history_is_not_rendered_as_user_input() {
         leveler_tui::transcript::TranscriptItem::Note(text) if text.contains("Euclid finished")
     )));
 }
+
+fn child_detail_state(status: leveler_tui::multi_agent::ChildStatus) -> AppState {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    s.team
+        .children
+        .push(leveler_tui::multi_agent::ChildAgentView {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            profile_id: None,
+            read_only: true,
+            purpose: "look".into(),
+            status,
+            contribution: leveler_tui::multi_agent::Contribution::Pending,
+            recent_step: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop: None,
+            started_elapsed_secs: 0,
+            detail: None,
+            steps: Vec::new(),
+        });
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Child("c1".into()));
+    s.active_screen = Screen::Activity;
+    s
+}
+
+/// In a running child's detail, `x` stops exactly that child; Esc only
+/// leaves. Back and stop are different actions, as in Shell Details.
+#[test]
+fn x_in_a_running_child_detail_cancels_that_child_only() {
+    let mut s = child_detail_state(leveler_tui::multi_agent::ChildStatus::Running);
+    let effects = reduce(&mut s, raw_char('x'));
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(leveler_client_protocol::ClientCommand::CancelChild { child_id, .. })
+                if child_id == "c1"
+        )),
+        "{effects:?}"
+    );
+    let mut settled = child_detail_state(leveler_tui::multi_agent::ChildStatus::Completed);
+    // Wide glyphs occupy two cells; compare without the padding spaces.
+    let running_frame = render_screen_text(&mut s).replace(' ', "");
+    assert!(running_frame.contains("x:停止此子Agent"), "{running_frame}");
+    assert!(
+        !render_screen_text(&mut settled)
+            .replace(' ', "")
+            .contains("x:停止此子Agent")
+    );
+    assert!(
+        reduce(&mut settled, raw_char('x')).is_empty(),
+        "a settled child has nothing to stop"
+    );
+}
+
+fn render_screen_text(s: &mut AppState) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|f| leveler_tui::render::render(f, s))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

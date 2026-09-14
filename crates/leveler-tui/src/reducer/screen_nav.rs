@@ -163,6 +163,27 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::Esc => {
                 crate::activity::close(state);
             }
+            // `x` stops exactly the open child; its parent turn keeps running.
+            // Esc backs out without stopping anything.
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                if let Some(crate::activity::ActivityId::Child(id)) = &state.activity_open
+                    && state.team.children.iter().any(|child| {
+                        child.id == *id
+                            && matches!(
+                                child.status,
+                                crate::multi_agent::ChildStatus::Running
+                                    | crate::multi_agent::ChildStatus::Waiting
+                            )
+                    })
+                {
+                    return vec![Effect::Send(
+                        leveler_client_protocol::ClientCommand::CancelChild {
+                            session_id: state.session_id.clone(),
+                            child_id: id.clone(),
+                        },
+                    )];
+                }
+            }
             _ => {
                 scroll_screen_key(state, &key, true);
             }

@@ -282,7 +282,17 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(t.activity_esc.to_string(), dim)));
+    let running_child = matches!(&id, ActivityId::Child(_))
+        && matches!(
+            summary.status,
+            ActivityStatus::Running | ActivityStatus::Waiting
+        );
+    let footer = if running_child {
+        format!("{} · {}", t.activity_esc, t.activity_cancel_child)
+    } else {
+        t.activity_esc.to_string()
+    };
+    lines.push(Line::from(Span::styled(footer, dim)));
 
     let height = area.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
