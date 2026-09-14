@@ -6676,3 +6676,119 @@ async fn a_foreground_batch_that_errors_still_ends_its_children_for_the_host() {
         "every started child is ended for the host"
     );
 }
+
+/// A parent that spawns a background child, then — confusing a child with a
+/// background shell task — calls `wait_task` with the child's id.
+struct WaitOnChildRuntime {
+    parent_calls: std::sync::atomic::AtomicUsize,
+}
+
+fn child_id_from_ack(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find_map(|m| {
+        m.content.iter().find_map(|part| match part {
+            ContentPart::ToolResult { result } if result.call_id.as_str() == "s1" => {
+                let text = &result.content;
+                let start = text.find('(')? + 1;
+                let end = text[start..].find(',')? + start;
+                Some(text[start..end].to_string())
+            }
+            _ => None,
+        })
+    })
+}
+
+#[async_trait]
+impl ModelRuntime for WaitOnChildRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains("WAITED_ON_CHILD"))
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return Ok(assistant_text("child done"));
+        }
+        let call = self
+            .parent_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match call {
+            0 => assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": "WAITED_ON_CHILD look"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            1 => {
+                let id =
+                    child_id_from_ack(&request.messages).expect("the spawn ack names the child");
+                assistant_with(
+                    vec![tool_call_part(
+                        "w1",
+                        "wait_task",
+                        serde_json::json!({"task_id": id, "timeout_seconds": 5}),
+                    )],
+                    FinishReason::ToolCalls,
+                )
+            }
+            _ => assistant_text("parent done"),
+        })
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        SleepyRuntime::new(Vec::new(), Duration::ZERO)
+            .profile(model)
+            .await
+    }
+}
+
+/// Observed in the MA1 Worker dogfood: the parent called `wait_task` with a
+/// child's id and got "unknown task". The id is known — it names a child, not
+/// a background task — so the answer says what it is and how its result
+/// arrives, instead of an error that reads like the child does not exist.
+#[tokio::test]
+async fn waiting_on_a_child_with_the_task_tools_says_what_the_id_is() {
+    let dir = tmp("wait-on-child", 93);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    Executor::new(
+        Arc::new(WaitOnChildRuntime {
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await
+    .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let (content, _) = spawn_result(&transcript.lock().unwrap(), "w1");
+    assert!(
+        !content.contains("unknown task"),
+        "the id is a known child, not an unknown task: {content}"
+    );
+    assert!(
+        content.contains("sub-agent") && content.contains("settle"),
+        "the answer names what the id is and how its result arrives: {content}"
+    );
+}

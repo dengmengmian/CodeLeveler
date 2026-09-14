@@ -29,13 +29,23 @@ pub(crate) enum AgentRole {
 }
 
 impl AgentRole {
-    /// Model-facing parse. `"reviewer"` is *not* accepted: that role is
-    /// harness-only. Unknown / omitted → Default (the historical behaviour).
-    pub(crate) fn parse(s: Option<&str>) -> Self {
-        match s.map(str::trim) {
-            Some("explorer") => AgentRole::Explorer,
-            Some("worker") => AgentRole::Worker,
-            _ => AgentRole::Default,
+    /// Model-facing parse. Omitted or empty → Default. `"reviewer"` is
+    /// harness-only and an unknown word is not a role: both are refused with
+    /// the reason, never read as Default — Default holds write tools, so a
+    /// mistyped `explorer` would otherwise gain authority.
+    pub(crate) fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("default") => Ok(AgentRole::Default),
+            Some("explorer") => Ok(AgentRole::Explorer),
+            Some("worker") => Ok(AgentRole::Worker),
+            Some("reviewer") => Err(
+                "role='reviewer' is harness-launched independent verification; spawn_agent \
+                 cannot request it. Use role='explorer' to investigate, or omit role."
+                    .into(),
+            ),
+            Some(other) => Err(format!(
+                "Unknown role `{other}`. Roles: explorer, worker, default (or omit role)."
+            )),
         }
     }
 
@@ -410,7 +420,7 @@ impl ChildProfile {
             }
             return Self::admit(resolved.role, files);
         }
-        Self::admit(AgentRole::parse(role), files)
+        Self::admit(AgentRole::parse(role)?, files)
     }
 }
 
@@ -560,13 +570,41 @@ mod tests {
         );
     }
 
+    /// A role word the model got wrong is refused, not read as `default`.
+    /// `default` holds write tools, so a typo for `explorer` used to buy the
+    /// child MORE authority than asked for — the opposite of an honest denial.
+    #[test]
+    fn an_unknown_or_harness_only_role_word_is_refused() {
+        let unknown = ChildProfile::admit_spawn(None, Some("explorr"), &[]).unwrap_err();
+        assert!(unknown.contains("explorr"), "{unknown}");
+        let reviewer = ChildProfile::admit_spawn(None, Some("reviewer"), &[]).unwrap_err();
+        assert!(reviewer.contains("harness"), "{reviewer}");
+        assert_eq!(
+            ChildProfile::admit_spawn(None, Some("default"), &[])
+                .unwrap()
+                .role,
+            AgentRole::Default
+        );
+        assert_eq!(
+            ChildProfile::admit_spawn(None, Some("  "), &[])
+                .unwrap()
+                .role,
+            AgentRole::Default,
+            "an empty role is an omitted role"
+        );
+        assert_eq!(
+            ChildProfile::admit_spawn(None, None, &[]).unwrap().role,
+            AgentRole::Default
+        );
+    }
+
     /// `reviewer` is not a model-facing role word, but it IS a valid label
     /// when the harness resolves one by name.
     #[test]
     fn role_parsing_keeps_reviewer_harness_only() {
-        assert_eq!(AgentRole::parse(Some("reviewer")), AgentRole::Default);
-        assert_eq!(AgentRole::parse(Some("explorer")), AgentRole::Explorer);
-        assert_eq!(AgentRole::parse(None), AgentRole::Default);
+        assert!(AgentRole::parse(Some("reviewer")).is_err());
+        assert_eq!(AgentRole::parse(Some("explorer")), Ok(AgentRole::Explorer));
+        assert_eq!(AgentRole::parse(None), Ok(AgentRole::Default));
         assert_eq!(AgentRole::from_label("reviewer"), Some(AgentRole::Reviewer));
         assert_eq!(AgentRole::from_label("nonsense"), None);
     }

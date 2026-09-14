@@ -1564,6 +1564,41 @@ impl AgentHarness for Drive<'_> {
                 continue;
             }
 
+            // The task tools manage background shell tasks. A running child's
+            // id is not one of those, and "unknown task" would read as if the
+            // child did not exist. Say what the id is and how its result
+            // arrives; nothing is waited on or killed through the wrong door.
+            if matches!(call.name.as_str(), "wait_task" | "get_task" | "kill_task")
+                && let Some(child) = call
+                    .arguments
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .and_then(|task_id| {
+                        self.background_children
+                            .children
+                            .iter()
+                            .find(|child| child.id == task_id)
+                    })
+            {
+                let answer = format!(
+                    "`{}` is sub-agent {} ({}), not a background task. It is still running; \
+                     its result is delivered to you automatically when it settles, so there \
+                     is nothing to wait on or poll.",
+                    child.id,
+                    child.nickname,
+                    child.role.label()
+                );
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: call.name.clone(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                });
+                self.settle_refused_call(&call, answer, &mut results, index);
+                continue;
+            }
+
             // spawn_agent defers to the concurrent batch after this pass, so
             // several spawns in one round run in parallel.
             if call.name == SPAWN_AGENT_TOOL {
