@@ -100,3 +100,10 @@ OWNERSHIP_VIOLATION=0
 
 MA2_PRODUCT_BEHAVIOR=PASS
 ```
+
+## 6. CI
+
+| Commit | Run | Attempt | Result |
+|---|---|---|---|
+| `4292d00` (batch + doc) | `34804369759` | 1 | success |
+| `8cc63b6` (review fixes `412ee90` + doc) | `34805121346` | 1 | success: Linux, macOS, Windows, web, mobile, deny/audit |
