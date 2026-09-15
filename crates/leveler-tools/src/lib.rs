@@ -16,8 +16,8 @@ pub(crate) mod workspace;
 
 pub use capabilities::Capabilities;
 pub use registry::{
-    CapabilityPacks, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface, default_registry,
-    is_observe_class_tool, model_surface,
+    CapabilityPacks, MODEL_SURFACE_TOOLS, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface,
+    default_registry, is_observe_class_tool, model_surface,
 };
 pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
 

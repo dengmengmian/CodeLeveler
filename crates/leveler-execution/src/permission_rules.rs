@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::approval::{is_memory_write_tool, is_shell_wrapper_program};
+use crate::approval::{is_shell_wrapper_program, needs_human_consent};
 
 /// Effect of a matching rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,7 +320,7 @@ pub fn always_rules_for(
     command: Option<&str>,
     paths: &[String],
 ) -> Vec<PermissionRule> {
-    if is_memory_write_tool(tool) {
+    if needs_human_consent(tool) {
         return Vec::new();
     }
     let allow = |match_: RuleMatch| PermissionRule {
@@ -668,7 +668,7 @@ rules:
 
     #[test]
     fn always_rules_memory_writes_never_get_standing_permission() {
-        for tool in ["remember", "forget"] {
+        for tool in ["remember", "forget", "save_agent", "delete_agent"] {
             assert!(
                 always_rules_for(tool, None, &["notes.md".to_string()]).is_empty(),
                 "K36: {tool} must not derive durable rules"

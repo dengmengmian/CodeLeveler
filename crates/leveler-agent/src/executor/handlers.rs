@@ -317,10 +317,12 @@ impl Executor {
             .run_one_sub_agent_on(
                 id,
                 AgentRole::Reviewer,
-                files,
+                leveler_lifecycle::ChildSpawnSpec {
+                    files,
+                    max_rounds: reviewer_rounds,
+                    ..Default::default()
+                },
                 None,
-                Vec::new(),
-                reviewer_rounds,
                 brief,
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 progress_tx,
@@ -355,10 +357,8 @@ impl Executor {
         &self,
         id: String,
         role: AgentRole,
-        files: Vec<String>,
-        model_override: Option<leveler_model::ModelRef>,
-        agent_tools: Vec<String>,
-        agent_max_rounds: u32,
+        spec: leveler_lifecycle::ChildSpawnSpec,
+        brief: Option<String>,
         task: String,
         permit: Arc<tokio::sync::Semaphore>,
         progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
@@ -369,10 +369,8 @@ impl Executor {
         self.sub_agent_run_future(
             id,
             role,
-            files,
-            model_override,
-            agent_tools,
-            agent_max_rounds,
+            spec,
+            brief,
             task,
             permit,
             progress,
@@ -393,10 +391,8 @@ impl Executor {
         &self,
         id: String,
         role: AgentRole,
-        files: Vec<String>,
-        model_override: Option<leveler_model::ModelRef>,
-        agent_tools: Vec<String>,
-        agent_max_rounds: u32,
+        spec: leveler_lifecycle::ChildSpawnSpec,
+        brief: Option<String>,
         task: String,
         permit: Arc<tokio::sync::Semaphore>,
         progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
@@ -404,19 +400,16 @@ impl Executor {
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
-        let repriced = model_override.is_some();
         let prepared_child = self
-            .child_for_role_on(role, files, model_override)
+            .child_for_spec(role, &spec, brief)
             .with_agent_id(id.clone());
         let hook_runner = self.hook_runner.clone();
         run_prepared_sub_agent(
             prepared_child,
-            repriced,
             hook_runner,
             id,
             role,
-            agent_tools,
-            agent_max_rounds,
+            spec,
             ChildStart::Task(task),
             permit,
             progress,
@@ -440,23 +433,17 @@ impl Executor {
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
-        let model_override = child
-            .spec
-            .model
-            .as_deref()
-            .and_then(leveler_model::ModelRef::parse);
-        let repriced = model_override.is_some();
+        // The brief is already in the restored transcript's system message;
+        // the definition's files are never read again.
         let prepared_child = self
-            .child_for_role_on(child.role, child.spec.files.clone(), model_override)
+            .child_for_spec(child.role, &child.spec, None)
             .with_agent_id(child.id.clone());
         run_prepared_sub_agent(
             prepared_child,
-            repriced,
             self.hook_runner.clone(),
             child.id.clone(),
             child.role,
-            child.spec.tools.clone(),
-            child.spec.max_rounds,
+            child.spec.clone(),
             ChildStart::Resume {
                 prior: child.prior.clone(),
                 note: child.note.clone(),
@@ -485,15 +472,10 @@ enum ChildStart {
 #[allow(clippy::too_many_arguments)]
 async fn run_prepared_sub_agent(
     mut child: Executor,
-    // The child runs on a model other than its parent's, so it is priced from
-    // that model's own profile. Pricing that cannot be read records no cost:
-    // the parent's rate would be a wrong number, not an estimate.
-    repriced: bool,
     hook_runner: leveler_execution::HookRunner,
     id: String,
     role: AgentRole,
-    agent_tools: Vec<String>,
-    agent_max_rounds: u32,
+    spec: leveler_lifecycle::ChildSpawnSpec,
     start: ChildStart,
     permit: Arc<tokio::sync::Semaphore>,
     progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
@@ -550,7 +532,10 @@ async fn run_prepared_sub_agent(
             )
             .await;
     }
-    if repriced {
+    // The child runs on a model other than its parent's, so it is priced from
+    // that model's own profile. Pricing that cannot be read records no cost:
+    // the parent's rate would be a wrong number, not an estimate.
+    if spec.model.is_some() {
         // Admission already refused a model it could not price under a cap;
         // this read is the child's own, and a failure here is reported, never
         // replaced by the parent's rate or by running without the cap.
@@ -574,7 +559,14 @@ async fn run_prepared_sub_agent(
     }
     // A definition that declares its own tools / round budget binds every
     // spawn of it — otherwise the field is decoration.
-    child.apply_agent_policy(&agent_tools, agent_max_rounds);
+    child.apply_agent_policy(&spec.tools, spec.max_rounds);
+    // A declarative agent's own wall-clock bound only ever shortens the
+    // child's; it never extends past what the parent can give.
+    if let Some(secs) = spec.agent.as_ref().and_then(|a| a.max_duration_secs) {
+        let own = std::time::Duration::from_secs(secs);
+        residual_limits.max_duration =
+            Some(residual_limits.max_duration.map_or(own, |d| d.min(own)));
+    }
     // Task-level residual budgets: child cannot spend more than its share
     // of the parent remainder (Some(0) hard-blocks that dimension).
     child.step_limits = residual_limits;

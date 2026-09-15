@@ -1,0 +1,4 @@
+version: 1
+name: code-reviewer
+description: 审查改动的正确性、安全与项目规范符合度，只报有把握的问题
+capability: read_only

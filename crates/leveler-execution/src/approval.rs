@@ -80,7 +80,7 @@ impl Approver for AutoApprove {
     }
 
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if is_memory_write_tool(&request.tool) {
+        if needs_human_consent(&request.tool) {
             return ApprovalDecision::Deny;
         }
         ApprovalDecision::ApproveOnce
@@ -115,7 +115,7 @@ impl Approver for EvalApprove {
     }
 
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if is_memory_write_tool(&request.tool) {
+        if needs_human_consent(&request.tool) {
             return ApprovalDecision::Deny;
         }
         // Escalation, by the request's own classification — not by what it says
@@ -178,6 +178,19 @@ pub fn is_self_consent_command(program: &str, args: &[String]) -> bool {
 
 pub fn is_memory_write_tool(tool: &str) -> bool {
     matches!(tool, "remember" | "forget")
+}
+
+/// Tools that write an agent definition (`save_agent`, `delete_agent`). Like a
+/// memory write, a definition changes what future sessions do, so only a
+/// person may approve one — never an auto-approver, a standing rule, or the
+/// full-access shortcut.
+pub fn is_agent_definition_write_tool(tool: &str) -> bool {
+    matches!(tool, "save_agent" | "delete_agent")
+}
+
+/// Tools only a person may approve.
+pub fn needs_human_consent(tool: &str) -> bool {
+    is_memory_write_tool(tool) || is_agent_definition_write_tool(tool)
 }
 
 /// Always denies.
@@ -658,7 +671,7 @@ impl ApprovalPolicy {
         // memory is read back silently, turn after turn, long after the run
         // that wrote it is forgotten — so the user confirms it, whatever they
         // opted into for execution.
-        if is_memory_write_tool(tool) {
+        if needs_human_consent(tool) {
             return Requirement::NeedApproval;
         }
 
@@ -752,7 +765,7 @@ mod tests {
     /// the next write would then skip the human entirely.
     #[test]
     fn approve_always_derives_no_rule_for_a_memory_write() {
-        for tool in ["remember", "forget"] {
+        for tool in ["remember", "forget", "save_agent", "delete_agent"] {
             assert!(
                 crate::permission_rules::always_rules_for(tool, None, &[]).is_empty(),
                 "{tool} must not become a standing allow"
@@ -953,7 +966,7 @@ mod tests {
             PermissionProfile::Assisted,
             PermissionProfile::RequestApproval,
         ] {
-            for tool in ["remember", "forget"] {
+            for tool in ["remember", "forget", "save_agent", "delete_agent"] {
                 assert_eq!(
                     policy.evaluate(profile, tool, RiskLevel::WorkspaceWrite, None),
                     Requirement::NeedApproval,
