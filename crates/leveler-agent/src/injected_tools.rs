@@ -463,11 +463,10 @@ pub(crate) fn advertise_escalation(tools: &mut [ToolDefinition]) {
     }
 }
 
-/// How long an approved elevation lasts. The approval prompt must say which:
-/// `request_permissions` holds for the rest of the turn, a command's
-/// `escalate` for that one call. Telling the user "本轮" while granting less
-/// would be harmless; telling them "本轮" is what we must not do when it is
-/// actually broader than the words, and either way the prompt should not lie.
+/// How long an approved elevation lasts. `request_permissions` holds for the
+/// rest of the turn, and its prompt says so. A command's `escalate` lasts as
+/// long as the option the user picks — this call ("仅允许本次") or the turn
+/// ("本轮对话内允许") — so its description claims neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantScope {
     Turn,
@@ -478,14 +477,14 @@ impl GrantScope {
     fn fs_note(self) -> &'static str {
         match self {
             Self::Turn => "文件系统(本轮写不受工作区沙箱限制,近似 full-access)",
-            Self::SingleCall => "文件系统(仅此一次调用写不受工作区沙箱限制)",
+            Self::SingleCall => "文件系统(写不受工作区沙箱限制)",
         }
     }
 
     fn prefix(self) -> &'static str {
         match self {
             Self::Turn => "模型请求",
-            Self::SingleCall => "模型请求(仅此一次)",
+            Self::SingleCall => "命令请求",
         }
     }
 }
@@ -1061,12 +1060,12 @@ mod tests {
         let turn = permission_request_description("git pull", "", grants, GrantScope::Turn);
         assert!(turn.contains("本轮"), "{turn}");
 
+        // A command's escalation lasts as long as the option the user picks
+        // ("仅允许本次" / "本轮对话内允许"); the description claims neither.
         let once = permission_request_description("git pull", "", grants, GrantScope::SingleCall);
-        assert!(
-            !once.contains("本轮"),
-            "a one-call grant must not be sold as a turn-long one: {once}"
-        );
-        assert!(once.contains("仅此一次"), "{once}");
+        assert!(!once.contains("本轮"), "{once}");
+        assert!(!once.contains("仅此一次"), "{once}");
+        assert!(once.contains("写不受工作区沙箱限制"), "{once}");
     }
 
     #[test]
