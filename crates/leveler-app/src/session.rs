@@ -354,6 +354,8 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         error @ (EngineError::Ownership(_) | EngineError::OwnershipConflict { .. }) => {
             AppError::Engine(error.to_string())
         }
+        EngineError::OwnedByLiveBoot { .. } => AppError::SessionRunningElsewhere,
+        EngineError::OwnershipUnknown { .. } => AppError::SessionOwnershipUnknown,
     }
 }
 
@@ -416,31 +418,35 @@ impl Application {
         self.insert_session(&db, model, goal).await
     }
 
-    /// Clear the zombie `running` turns this runtime left behind, optionally
+    /// Clear the zombie `running` turns dead boots left behind, optionally
     /// scoped to one session. Returns how many were reaped.
     ///
-    /// A process that is starting up does this once: a turn whose owning
-    /// process was killed is not running any more, and a row that still says it
-    /// is becomes a live spinner over dead work the next time anyone opens the
-    /// session. Foreign-owned tasks are reported and never touched — the
-    /// ownership check inside the reaper is what makes it safe to call from a
-    /// repository where a daemon may be alive.
+    /// A process that is starting up — or creating or reopening a session —
+    /// does this: a turn whose boot was killed is not running any more, and a
+    /// row that still says it is becomes a live spinner over dead work the
+    /// next time anyone opens the session. Only a boot proven dead gives this
+    /// authority, which is what makes it safe from any host on a repository
+    /// other processes share: a live boot's turn — this process's own
+    /// included — and a turn whose boot cannot be probed are left alone.
     pub async fn reap_zombie_turns(
         &self,
         db: &leveler_storage::Database,
         session: Option<&leveler_core::SessionId>,
     ) -> Result<usize, AppError> {
-        let runtime_id = self.runtime_id()?;
         let engine = self.task_engine(db)?;
-        let outcome = leveler_engine::reap_after_restart(&engine.stores, &runtime_id, session)
-            .await
-            .map_err(app_error_from_engine)?;
+        let outcome = leveler_engine::reap_after_restart(
+            &engine,
+            session,
+            leveler_engine::ReapScope::EndedBoots,
+        )
+        .await
+        .map_err(app_error_from_engine)?;
         checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
         for conflict in &outcome.conflicts {
             tracing::warn!(
                 session = conflict.session_id.as_str(),
-                owner = ?conflict.owner,
-                "not reaping a task owned by another runtime"
+                refusal = ?conflict.refusal,
+                "not reaping running turns without proof their boot has ended"
             );
         }
         if !outcome.events.is_empty() {

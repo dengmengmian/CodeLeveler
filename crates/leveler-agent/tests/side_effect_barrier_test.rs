@@ -212,6 +212,7 @@ async fn run_chat_turn(
         &h.db,
         &task,
         &leveler_core::RuntimeId::new("rt-test"),
+        &leveler_core::BootId::new("test-boot"),
         owner.epoch,
     )
     .await

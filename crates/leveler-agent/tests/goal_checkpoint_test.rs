@@ -4,7 +4,7 @@
 
 use leveler_agent::coding::{create_goal_checkpoint, resume_prior_from_checkpoint};
 use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
-use leveler_engine::{EngineEvent, reap_after_restart};
+use leveler_engine::{EngineEvent, ReapScope, reap_after_restart};
 use leveler_lifecycle::CheckpointReason;
 use leveler_model::{Message, Role};
 use leveler_storage::{
@@ -33,6 +33,7 @@ async fn fixture() -> Fixture {
         .acquire(
             &task,
             &RuntimeId::new("checkpoint-fixture"),
+            &leveler_core::BootId::new("test-boot"),
             OwnerEpoch::new(0),
         )
         .await
@@ -44,6 +45,10 @@ async fn fixture() -> Fixture {
     let engine = leveler_engine::TaskEngine {
         stores: stores.clone(),
         runtime_id: RuntimeId::new("checkpoint-fixture"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
     };
     Fixture {
         db,
@@ -302,14 +307,24 @@ async fn a_cursor_beyond_the_log_fails_closed() {
 async fn coding_cuts_one_checkpoint_for_a_reaped_session() {
     let fx = fixture().await;
     append_event(&fx, marker_event("work happened")).await;
-    // A running turn left behind by the "dead" process.
-    TurnRepository::new(&fx.db)
-        .start(&fx.session, "user", None, leveler_core::now())
+    // A running turn left behind by the "dead" process: a boot of the same
+    // runtime that has since ended.
+    let dead = leveler_engine::TaskEngine {
+        stores: fx.stores.clone(),
+        runtime_id: RuntimeId::new("checkpoint-fixture"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
+    };
+    let token = dead.acquire_ownership(&fx.session).await.unwrap();
+    fx.stores
+        .turns
+        .start_owned(&token, &fx.session, "user", None, leveler_core::now())
         .await
         .unwrap();
 
-    let runtime = RuntimeId::new("checkpoint-fixture");
-    let outcome = reap_after_restart(&fx.stores, &runtime, None)
+    let outcome = reap_after_restart(&fx.engine, None, ReapScope::EndedBoots)
         .await
         .unwrap();
     assert_eq!(outcome.reaped_sessions.len(), 1);

@@ -180,6 +180,18 @@ pub struct TaskEngine {
     /// This runtime's durable identity (from the composition root). Task
     /// ownership is acquired for it at every execution entry.
     pub runtime_id: leveler_core::RuntimeId,
+    /// The live boot this engine executes as. Several boots can share one
+    /// runtime identity; ownership and recovery decide by boot, never by
+    /// runtime identity alone.
+    pub boot: EngineBoot,
+}
+
+/// A boot as the engine sees it: its id, and the host's answer to whether
+/// some other boot is still alive.
+#[derive(Clone)]
+pub struct EngineBoot {
+    pub id: leveler_core::BootId,
+    pub liveness: std::sync::Arc<dyn leveler_core::BootLivenessProbe>,
 }
 
 /// The persisted description of a session to create.
@@ -319,9 +331,12 @@ impl TaskEngine {
             .await?)
     }
 
-    /// Acquire (or same-runtime reacquire) ownership of the session's task.
+    /// Acquire (or same-boot reacquire) ownership of the session's task.
     /// A task owned by a DIFFERENT runtime is a hard conflict - never
-    /// auto-stolen. The epoch always advances, fencing prior incarnations.
+    /// auto-stolen. Within this runtime, a task another boot owns passes only
+    /// once that boot is proven dead: a live one keeps it, and one whose
+    /// liveness cannot be established keeps it too. The epoch always
+    /// advances, fencing prior incarnations.
     pub async fn acquire_ownership(
         &self,
         session_id: &SessionId,
@@ -352,10 +367,37 @@ impl TaskEngine {
                 this_runtime: self.runtime_id.clone(),
             });
         }
+        // A turn left running before boots were recorded has no boot whose
+        // death could be proven; whoever runs it may still be running it.
+        if self
+            .stores
+            .turns
+            .list_running(Some(session_id))
+            .await?
+            .iter()
+            .any(|turn| turn.owner_boot_id.is_none())
+        {
+            return Err(EngineError::OwnershipUnknown { task_id });
+        }
+        if let Some(owner) = &current.boot
+            && owner != &self.boot.id
+        {
+            match self.boot.liveness.liveness(owner) {
+                // An ended boot never comes back, so this cannot turn stale
+                // before the compare-and-swap below.
+                leveler_core::BootLiveness::Dead => {}
+                leveler_core::BootLiveness::Alive => {
+                    return Err(EngineError::OwnedByLiveBoot { task_id });
+                }
+                leveler_core::BootLiveness::Unknown => {
+                    return Err(EngineError::OwnershipUnknown { task_id });
+                }
+            }
+        }
         Ok(self
             .stores
             .ownership
-            .acquire(&task_id, &self.runtime_id, current.epoch)
+            .acquire(&task_id, &self.runtime_id, &self.boot.id, current.epoch)
             .await?)
     }
 

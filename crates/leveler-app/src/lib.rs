@@ -94,6 +94,16 @@ pub enum AppError {
     },
     #[error("runtime identity error: {0}")]
     RuntimeIdentity(#[from] runtime_identity::RuntimeIdentityError),
+    /// Another live CodeLeveler process is executing this session. Nothing
+    /// was taken from it.
+    #[error(
+        "这个会话正在另一个 CodeLeveler 进程中运行。请等待当前任务结束，或回到正在运行该任务的窗口。"
+    )]
+    SessionRunningElsewhere,
+    /// Whether another process is still executing this session cannot be
+    /// established, so nothing was taken over.
+    #[error("无法确认这个会话是否仍在另一个 CodeLeveler 进程中运行，未做任何更改。")]
+    SessionOwnershipUnknown,
 }
 
 /// The loaded configuration bundle (kept around for `config show` / `doctor`).
@@ -182,6 +192,15 @@ pub struct Application {
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
+    /// This process's boot: started before the first ownership-sensitive
+    /// write, held until the application is dropped. Command receipts, task
+    /// ownership and running turns all carry its one id.
+    boot: std::sync::Mutex<Option<runtime_boot::RuntimeBootLease>>,
+    /// Commands this boot is handling — see
+    /// [`interactive::InProcessRuntimeClient`]. Kept beside the boot because
+    /// "a receipt of this boot that is not in flight" is a fact about the
+    /// boot, not about one client of it.
+    in_flight_commands: interactive::InFlightCommands,
     /// The live permission profile of each session, keyed by session scope.
     ///
     /// The persisted `sessions.mode` column is the durable record; this is the
@@ -381,6 +400,8 @@ impl Application {
             background_tasks,
             browser,
             runtime_id: OnceLock::new(),
+            boot: std::sync::Mutex::new(None),
+            in_flight_commands: Default::default(),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -396,15 +417,54 @@ impl Application {
         Ok(self.runtime_id.get_or_init(|| id).clone())
     }
 
+    /// This process's boot id, starting the boot on first use. Concurrent
+    /// first callers get the same boot: there is one per application.
+    pub fn boot_id(&self) -> Result<leveler_core::BootId, AppError> {
+        let mut boot = self
+            .boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lease) = boot.as_ref() {
+            return Ok(lease.id().clone());
+        }
+        let lease =
+            runtime_boot::RuntimeBootLease::acquire(&self.layout.state_dir).map_err(|source| {
+                AppError::Io {
+                    path: self.layout.state_dir.join("boots").display().to_string(),
+                    source,
+                }
+            })?;
+        Ok(boot.insert(lease).id().clone())
+    }
+
+    /// The boot, if it has started. Reading it never starts one.
+    pub(crate) fn started_boot_id(&self) -> Option<leveler_core::BootId> {
+        self.boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|lease| lease.id().clone())
+    }
+
+    pub(crate) fn in_flight_commands(&self) -> interactive::InFlightCommands {
+        self.in_flight_commands.clone()
+    }
+
     /// Compose the domain-neutral lifecycle engine over this application's
-    /// single durable store.
-    pub(crate) fn task_engine(
+    /// single durable store, executing as this process's boot.
+    pub fn task_engine(
         &self,
         db: &leveler_storage::Database,
     ) -> Result<leveler_engine::TaskEngine, AppError> {
         Ok(leveler_engine::TaskEngine {
             stores: leveler_storage::EngineStores::from_database(db),
             runtime_id: self.runtime_id()?,
+            boot: leveler_engine::EngineBoot {
+                id: self.boot_id()?,
+                liveness: Arc::new(runtime_boot::StateDirBootLiveness::new(
+                    &self.layout.state_dir,
+                )),
+            },
         })
     }
 

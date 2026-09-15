@@ -448,6 +448,7 @@ mod tests {
             db,
             &task,
             &leveler_core::RuntimeId::new("test-runtime"),
+            &leveler_core::BootId::new("test-boot"),
             leveler_core::OwnerEpoch::UNOWNED,
         )
         .await

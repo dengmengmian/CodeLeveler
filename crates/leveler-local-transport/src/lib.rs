@@ -309,6 +309,9 @@ struct WireError {
     /// [`ClientError::Unresolvable`]. Absent from older daemons.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unresolvable: bool,
+    /// [`ClientError::OwnershipConflict`]. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ownership_conflict: bool,
 }
 
 #[cfg(unix)]
@@ -320,24 +323,35 @@ impl From<ClientError> for WireError {
                 session_id: Some(session_id),
                 outcome_unknown: false,
                 unresolvable: false,
+                ownership_conflict: false,
             },
             ClientError::Runtime(message) => Self {
                 message,
                 session_id: None,
                 outcome_unknown: false,
                 unresolvable: false,
+                ownership_conflict: false,
             },
             ClientError::OutcomeUnknown(message) => Self {
                 message,
                 session_id: None,
                 outcome_unknown: true,
                 unresolvable: false,
+                ownership_conflict: false,
             },
             ClientError::Unresolvable(message) => Self {
                 message,
                 session_id: None,
                 outcome_unknown: false,
                 unresolvable: true,
+                ownership_conflict: false,
+            },
+            ClientError::OwnershipConflict(message) => Self {
+                message,
+                session_id: None,
+                outcome_unknown: false,
+                unresolvable: false,
+                ownership_conflict: true,
             },
         }
     }
@@ -350,6 +364,7 @@ impl WireError {
             Some(session_id) => ClientError::SessionNotFound(session_id),
             None if self.outcome_unknown => ClientError::OutcomeUnknown(self.message),
             None if self.unresolvable => ClientError::Unresolvable(self.message),
+            None if self.ownership_conflict => ClientError::OwnershipConflict(self.message),
             None => ClientError::Runtime(self.message),
         }
     }
@@ -1341,6 +1356,7 @@ mod unix {
                     session_id: None,
                     outcome_unknown: false,
                     unresolvable: false,
+                    ownership_conflict: false,
                 }),
             )
             .await?;
@@ -2194,6 +2210,13 @@ mod tests {
         assert!(matches!(
             back.into_client_error(),
             ClientError::Unresolvable(message) if message == "boot ended"
+        ));
+
+        let wire = WireError::from(ClientError::OwnershipConflict("elsewhere".to_string()));
+        let back: WireError = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        assert!(matches!(
+            back.into_client_error(),
+            ClientError::OwnershipConflict(message) if message == "elsewhere"
         ));
 
         let legacy: WireError =

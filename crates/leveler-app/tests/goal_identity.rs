@@ -35,7 +35,12 @@ async fn seed_task(db: &Database) -> (SessionId, TaskId, leveler_core::Ownership
         .await
         .unwrap();
     let token = db
-        .acquire(&task, &RuntimeId::new("goal-identity"), OwnerEpoch::new(0))
+        .acquire(
+            &task,
+            &RuntimeId::new("goal-identity"),
+            &leveler_core::BootId::new("test-boot"),
+            OwnerEpoch::new(0),
+        )
         .await
         .unwrap();
     (session, task, token)

@@ -685,6 +685,8 @@ impl CodingRuntime {
             Err(EngineError::Ownership(
                 leveler_storage::OwnershipError::Stale { .. }
             )) | Err(EngineError::OwnershipConflict { .. })
+                | Err(EngineError::OwnedByLiveBoot { .. })
+                | Err(EngineError::OwnershipUnknown { .. })
                 | Err(EngineError::StaleOwnership(_))
         ) {
             return Ok(());

@@ -14,6 +14,10 @@ fn engine(db: &Database, runtime: &str) -> TaskEngine {
     TaskEngine {
         stores: EngineStores::from_database(db),
         runtime_id: RuntimeId::new(runtime),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
     }
 }
 
@@ -72,9 +76,15 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
         .unwrap();
 
     // …then loses it (a newer epoch exists).
-    OwnershipStore::acquire(&db, &token.task_id, &engine.runtime_id, token.owner_epoch)
-        .await
-        .unwrap();
+    OwnershipStore::acquire(
+        &db,
+        &token.task_id,
+        &engine.runtime_id,
+        &leveler_core::BootId::new("test-boot"),
+        token.owner_epoch,
+    )
+    .await
+    .unwrap();
     let events_before = EventStore::load(&db, &parent).await.unwrap().len();
 
     // Stale CandidateFinished append: refused, nothing stored, observer
@@ -139,9 +149,15 @@ async fn parallel_parent_refuses_foreign_owner() {
 
     // runtime-B owns the task at epoch 1.
     let b = RuntimeId::new("rt-b");
-    OwnershipStore::acquire(&db, &task, &b, OwnerEpoch::UNOWNED)
-        .await
-        .unwrap();
+    OwnershipStore::acquire(
+        &db,
+        &task,
+        &b,
+        &leveler_core::BootId::new("test-boot"),
+        OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
 
     // runtime-A's parallel parent acquisition must refuse, not CAS-steal.
     let error = engine

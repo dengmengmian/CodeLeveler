@@ -29,7 +29,7 @@ pub use ids::{
     GoalCheckpointId, GoalId, RequestId, RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId,
     TurnId, UserShellId, new_uuid_string,
 };
-pub use ownership::{OwnerEpoch, OwnershipToken};
+pub use ownership::{BootLiveness, BootLivenessProbe, OwnerEpoch, OwnershipToken};
 pub use secret::{
     DetectedSecret, SECRET_PLACEHOLDER, clear_session_secrets, register_session_secrets,
     sanitize_model_visible, scrub_registered_secrets,

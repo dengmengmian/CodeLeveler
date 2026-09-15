@@ -9,7 +9,27 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{RuntimeId, TaskId};
+use crate::ids::{BootId, RuntimeId, TaskId};
+
+/// What can be known about whether a boot is still alive. Only `Dead` is
+/// evidence: it is what lets one boot settle work another boot left behind.
+/// `Unknown` — the probe itself failed — must never be read as `Dead`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootLiveness {
+    /// Something still holds the boot: it may yet write.
+    Alive,
+    /// The boot has ended and, since boot ids are never reused, stays ended.
+    Dead,
+    /// The probe could not tell.
+    Unknown,
+}
+
+/// The host's answer to "is this boot still alive?". The engine asks it; how
+/// a host proves it (an OS lock, say) is not the engine's business.
+pub trait BootLivenessProbe: Send + Sync {
+    /// Probe `boot`. Implementations answer `Unknown` rather than guess.
+    fn liveness(&self, boot: &BootId) -> BootLiveness;
+}
 
 /// A monotonic fencing token generation. Epoch 0 means "never owned"; the
 /// first acquisition yields epoch 1. Epochs only move forward — there is no
@@ -66,6 +86,9 @@ pub struct OwnershipToken {
     pub task_id: TaskId,
     /// The owning runtime's durable identity.
     pub runtime_id: RuntimeId,
+    /// The boot that acquired this generation — the live incarnation whose
+    /// death is what lets another boot take the task over.
+    pub boot_id: BootId,
     /// The ownership generation this token was minted at.
     pub owner_epoch: OwnerEpoch,
 }
@@ -106,6 +129,7 @@ mod tests {
         let token = OwnershipToken {
             task_id: TaskId::new("t1"),
             runtime_id: RuntimeId::new("rt-a"),
+            boot_id: BootId::new("boot-a"),
             owner_epoch: OwnerEpoch::new(7),
         };
         let json = serde_json::to_string(&token).unwrap();

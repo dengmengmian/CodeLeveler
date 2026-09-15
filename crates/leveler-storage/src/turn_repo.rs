@@ -31,6 +31,9 @@ pub struct TurnRecord {
     /// End time, or `None` while the turn is still `running` — a turn left
     /// with `None` after a crash is how resume spots an interrupted run.
     pub finished_at: Option<String>,
+    /// The boot that ran this turn, kept after it ends. `None` only on turns
+    /// from before boots were recorded, or ones started outside ownership.
+    pub owner_boot_id: Option<String>,
 }
 
 /// Read/write access to the `turns` table.
@@ -74,7 +77,7 @@ impl<'a> TurnRepository<'a> {
         .execute(self.db.pool())
         .await?;
         let row = sqlx::query_as::<_, TurnRecord>(
-            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at \
+            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
              FROM turns WHERE id = ?1",
         )
         .bind(&id)
@@ -138,7 +141,7 @@ impl<'a> TurnRepository<'a> {
     /// All turns of a session, in ordinal order.
     pub async fn list(&self, session_id: &SessionId) -> Result<Vec<TurnRecord>, StorageError> {
         let rows = sqlx::query_as::<_, TurnRecord>(
-            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at \
+            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
              FROM turns WHERE session_id = ?1 ORDER BY ordinal",
         )
         .bind(session_id.as_str())
@@ -155,7 +158,7 @@ impl<'a> TurnRepository<'a> {
     ) -> Result<Vec<TurnRecord>, StorageError> {
         let rows = match session_id {
             Some(session_id) => sqlx::query_as::<_, TurnRecord>(
-                "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at \
+                "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
                  FROM turns WHERE session_id = ?1 AND status = 'running' AND finished_at IS NULL \
                  ORDER BY ordinal",
             )
@@ -163,7 +166,7 @@ impl<'a> TurnRepository<'a> {
             .fetch_all(self.db.pool())
             .await?,
             None => sqlx::query_as::<_, TurnRecord>(
-                "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at \
+                "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
                  FROM turns WHERE status = 'running' AND finished_at IS NULL \
                  ORDER BY session_id, ordinal",
             )

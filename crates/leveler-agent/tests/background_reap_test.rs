@@ -184,6 +184,10 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(&db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime,

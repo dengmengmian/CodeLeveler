@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use leveler_core::{RuntimeId, SessionId};
 use leveler_engine::{
-    EngineEvent, EventLog, ExecutionKind, NewSession, TaskEngine, TranscriptSink, TurnFacts,
-    TurnFailure, TurnKind, TurnPorts, TurnRunner, TurnStart, reap_after_restart,
+    EngineEvent, EventLog, ExecutionKind, NewSession, ReapScope, TaskEngine, TranscriptSink,
+    TurnFacts, TurnFailure, TurnKind, TurnPorts, TurnRunner, TurnStart, reap_after_restart,
 };
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, AutoClarify};
 use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome, VerificationStatus};
@@ -92,6 +92,12 @@ fn engine(db: &Database) -> TaskEngine {
     TaskEngine {
         stores: EngineStores::from_database(db),
         runtime_id: RuntimeId::new("rt-minimal-harness"),
+        // Every call is a fresh boot, and the probe reports every other boot
+        // ended: a second engine here is a restart, never a live sibling.
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
     }
 }
 
@@ -286,7 +292,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     // The restart.
     let db = Database::connect(&path).await.unwrap();
     let restarted = engine(&db);
-    let reaped = reap_after_restart(&restarted.stores, &restarted.runtime_id, Some(&session))
+    let reaped = reap_after_restart(&restarted, Some(&session), ReapScope::EndedBoots)
         .await
         .expect("recovery reads its own history");
     assert!(
@@ -417,9 +423,14 @@ async fn the_engine_settles_a_ghost_child_for_a_harness_with_no_child_semantics(
         .unwrap();
     let session = open_session(&db).await;
 
-    // A dead window: a turn that opened a child and never reported it.
-    let lost_in = TurnRepository::new(&db)
-        .start(&session, "user", None, leveler_core::now())
+    // A dead window: a turn that opened a child and never reported it. Its
+    // boot is gone, so the next boot may take the session over.
+    let dead = engine(&db);
+    let dead_token = dead.acquire_ownership(&session).await.unwrap();
+    let lost_in = dead
+        .stores
+        .turns
+        .start_owned(&dead_token, &session, "user", None, leveler_core::now())
         .await
         .unwrap();
     let lost_in = leveler_core::TurnId::new(lost_in.id);

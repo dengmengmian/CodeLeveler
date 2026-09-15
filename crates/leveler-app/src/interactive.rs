@@ -86,14 +86,28 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
 /// record. The model loop may still be running, but a process death after this
 /// point can reconstruct the transcript from durable state.
 async fn await_turn_acceptance(
-    accepted: oneshot::Receiver<Result<(), String>>,
+    accepted: oneshot::Receiver<Result<(), ClientError>>,
 ) -> Result<(), ClientError> {
-    accepted
-        .await
-        .map_err(|_| {
-            ClientError::Runtime("turn worker stopped before durable admission".to_string())
-        })?
-        .map_err(ClientError::Runtime)
+    accepted.await.map_err(|_| {
+        ClientError::Runtime("turn worker stopped before durable admission".to_string())
+    })?
+}
+
+/// A refusal because another process owns the session, in the user's words.
+fn ownership_conflict(error: &crate::AppError) -> ClientError {
+    ClientError::OwnershipConflict(error.to_string())
+}
+
+/// Why a fresh turn was never durably admitted, as its caller hears it.
+fn turn_rejection<T>(result: &Result<T, crate::AppError>) -> ClientError {
+    match result {
+        Err(
+            error @ (crate::AppError::SessionRunningElsewhere
+            | crate::AppError::SessionOwnershipUnknown),
+        ) => ownership_conflict(error),
+        Err(error) => ClientError::Runtime(error.to_string()),
+        Ok(_) => ClientError::Runtime("turn ended before durable admission".to_string()),
+    }
 }
 
 /// Integration-test-only crash barrier. It is inert unless a daemon process
@@ -348,10 +362,6 @@ pub struct InProcessRuntimeClient {
     /// input is durable. Embedded callers keep the historical dispatch-only
     /// return so current-thread runtimes never wait on their own worker.
     durable_wire_ack: bool,
-    /// This runtime's boot, started before its first command admission and
-    /// held for its whole life: receipts it admits carry the id, and another
-    /// runtime can tell from the lease whether this boot is still alive.
-    boot: tokio::sync::OnceCell<crate::runtime_boot::RuntimeBootLease>,
     /// Commands this boot is handling. A command enters before its receipt is
     /// written and leaves only once the receipt is settled — or once the path
     /// handling it has ended without settling it — so a `dispatching` receipt
@@ -367,7 +377,7 @@ pub struct InProcessRuntimeClient {
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
 /// Command id → number of deliveries of it this boot is handling.
-type InFlightCommands = Arc<Mutex<HashMap<String, usize>>>;
+pub(crate) type InFlightCommands = Arc<Mutex<HashMap<String, usize>>>;
 
 /// One delivery's membership in [`InProcessRuntimeClient::in_flight`].
 struct InFlightDelivery {
@@ -514,6 +524,7 @@ impl InProcessRuntimeClient {
     ) -> Self {
         let (events, _) = broadcast::channel(2048);
         let media_root = app.layout.state_dir.join("media");
+        let in_flight = app.in_flight_commands();
         // One flag, shared: the runtime reports it and admission enforces it.
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
@@ -545,8 +556,7 @@ impl InProcessRuntimeClient {
             shutting_down: shutting_down.clone(),
             process_shutdown: None,
             durable_wire_ack: false,
-            boot: tokio::sync::OnceCell::new(),
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight,
         }
     }
 
@@ -579,7 +589,7 @@ impl InProcessRuntimeClient {
             leveler_storage::DispatchingBoot::NotDispatching => false,
             leveler_storage::DispatchingBoot::Unknown => return Err(unknown()),
             leveler_storage::DispatchingBoot::Boot(boot)
-                if self.boot.get().is_some_and(|own| own.id() == &boot) =>
+                if self.app.started_boot_id().as_ref() == Some(&boot) =>
             {
                 !self
                     .in_flight
@@ -587,10 +597,10 @@ impl InProcessRuntimeClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains_key(command_id.as_str())
             }
-            leveler_storage::DispatchingBoot::Boot(boot) => matches!(
-                crate::runtime_boot::boot_liveness(&self.app.layout.state_dir, &boot),
-                Ok(crate::runtime_boot::BootLiveness::Ended)
-            ),
+            leveler_storage::DispatchingBoot::Boot(boot) => {
+                crate::runtime_boot::boot_liveness(&self.app.layout.state_dir, &boot)
+                    == leveler_core::BootLiveness::Dead
+            }
         };
         if abandoned
             && receipts
@@ -1109,28 +1119,35 @@ impl InProcessRuntimeClient {
     /// Best-effort reaper for zombie `running` turns left by kill / unclean exit.
     ///
     /// `Some(session)` reaps that session only (cancel / force-cancel).
-    /// `None` reaps every still-running turn (process quit).
-    async fn reap_running_turns(&self, session: Option<&SessionId>) {
-        let Ok(db) = self.app.open_database().await else {
-            return;
+    /// `None` reaps every still-running turn in `scope` (process quit settles
+    /// only this boot's own). Returns the running turns it had to leave alone:
+    /// ones another live boot runs, or whose boot cannot be probed — this
+    /// process has no way to reach them.
+    async fn reap_running_turns(
+        &self,
+        session: Option<&SessionId>,
+        scope: leveler_engine::ReapScope,
+    ) -> Vec<leveler_engine::ReapConflict> {
+        let engine = match self
+            .app
+            .open_database()
+            .await
+            .and_then(|db| self.app.task_engine(&db))
+        {
+            Ok(engine) => engine,
+            Err(error) => {
+                tracing::warn!("cannot reap running turns: {error}");
+                return Vec::new();
+            }
         };
-        let Ok(runtime_id) = self.app.runtime_id() else {
-            tracing::warn!("cannot reap: runtime identity unavailable");
-            return;
-        };
-        let engine = leveler_engine::TaskEngine {
-            stores: leveler_storage::EngineStores::from_database(&db),
-            runtime_id: runtime_id.clone(),
-        };
-        let result = leveler_engine::reap_after_restart(&engine.stores, &runtime_id, session).await;
-        match result {
+        match leveler_engine::reap_after_restart(&engine, session, scope).await {
             Ok(outcome) => {
                 crate::session::checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
                 for conflict in &outcome.conflicts {
                     tracing::warn!(
                         session = conflict.session_id.as_str(),
-                        owner = ?conflict.owner,
-                        "not reaping a task owned by another runtime"
+                        refusal = ?conflict.refusal,
+                        "not reaping running turns without proof their boot has ended"
                     );
                 }
                 if !outcome.events.is_empty() {
@@ -1140,11 +1157,40 @@ impl InProcessRuntimeClient {
                         "reaped zombie running turns"
                     );
                 }
+                outcome.conflicts
             }
             Err(error) => {
                 tracing::warn!("failed to reap running turns: {error}");
+                Vec::new()
             }
         }
+    }
+
+    /// Cancel a session with nothing of this boot running in it: settle what
+    /// this boot or a dead boot left behind. A turn another live boot runs is
+    /// out of this process's reach — the answer says so rather than claiming
+    /// a cancel that did not happen.
+    async fn cancel_orphaned(&self, session_id: &SessionId) -> Result<(), ClientError> {
+        let conflicts = self
+            .reap_running_turns(
+                Some(session_id),
+                leveler_engine::ReapScope::OwnAndEndedBoots,
+            )
+            .await;
+        if conflicts
+            .iter()
+            .any(|conflict| conflict.refusal == leveler_engine::ReapRefusal::LiveBoot)
+        {
+            return Err(ownership_conflict(
+                &crate::AppError::SessionRunningElsewhere,
+            ));
+        }
+        if !conflicts.is_empty() {
+            return Err(ownership_conflict(
+                &crate::AppError::SessionOwnershipUnknown,
+            ));
+        }
+        Ok(())
     }
 
     /// Build the first user message's content parts from text and image
@@ -1315,7 +1361,7 @@ impl InProcessRuntimeClient {
         attachments: Vec<AttachmentRef>,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
-    ) -> oneshot::Receiver<Result<(), String>> {
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
         self.notify_memory_candidates(&session_id, &content);
         let parts = self.content_parts(&content, &attachments);
         self.spawn_content_turn(session_id, parts, admission, config)
@@ -1327,7 +1373,7 @@ impl InProcessRuntimeClient {
         content: String,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
-    ) -> oneshot::Receiver<Result<(), String>> {
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
         self.notify_memory_candidates(&session_id, &content);
@@ -1340,7 +1386,7 @@ impl InProcessRuntimeClient {
         content: String,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
-    ) -> oneshot::Receiver<Result<(), String>> {
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
@@ -1400,12 +1446,7 @@ impl InProcessRuntimeClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                 {
-                    let detail = result
-                        .as_ref()
-                        .err()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "turn ended before durable admission".to_string());
-                    let _ = tx.send(Err(detail));
+                    let _ = tx.send(Err(turn_rejection(&result)));
                 }
                 // TaskFinished is the normal path's one terminal authority and
                 // EventBridge projects it immediately. Only failures that never
@@ -1715,7 +1756,7 @@ impl InProcessRuntimeClient {
         parts: Vec<ContentPart>,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
-    ) -> oneshot::Receiver<Result<(), String>> {
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
@@ -1779,12 +1820,7 @@ impl InProcessRuntimeClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                 {
-                    let detail = result
-                        .as_ref()
-                        .err()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "turn ended before durable admission".to_string());
-                    let _ = tx.send(Err(detail));
+                    let _ = tx.send(Err(turn_rejection(&result)));
                 }
                 if !bridge.terminal_published() {
                     let _ = events.send(turn_runtime_event(result));
@@ -2624,13 +2660,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // No owned live turn: recover a possible orphan left by an
                     // earlier process. Never race the active executor's own
                     // terminal transition with the reaper.
-                    self.reap_running_turns(Some(&session_id)).await;
+                    self.cancel_orphaned(&session_id).await?;
                 }
                 Ok(())
             }
             ClientCommand::ForceCancelCurrentTurn { session_id } => {
                 if !self.cancel_active(&session_id) {
-                    self.reap_running_turns(Some(&session_id)).await;
+                    self.cancel_orphaned(&session_id).await?;
                 }
                 Ok(())
             }
@@ -2813,7 +2849,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 self.active.cancel_all();
                 // Process is exiting: reaper is the safety net for turns that
                 // never got finish() because the OS killed the process mid-flight.
-                self.reap_running_turns(None).await;
+                // Only this boot's own: a sibling process sharing the
+                // repository keeps running its turns.
+                self.reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
+                    .await;
                 // Runtime-owned OS resources must not outlive the runtime:
                 // background tasks (dev servers) and the browser tree are
                 // reaped explicitly — Drop never runs on exit paths that call
@@ -2939,11 +2978,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // failed is retryable; one that never resolved (crash mid-dispatch) is
         // surfaced as uncertain, not silently swallowed as done.
         let boot = self
-            .boot
-            .get_or_try_init(|| async {
-                crate::runtime_boot::RuntimeBootLease::acquire(&self.app.layout.state_dir)
-            })
-            .await
+            .app
+            .boot_id()
             .map_err(|e| ClientError::Runtime(format!("cannot start a runtime boot: {e}")))?;
         let (in_flight, admission) = InFlightDelivery::admit(
             &self.in_flight,
@@ -2953,7 +2989,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 &envelope.session_id,
                 &command_fingerprint,
                 &envelope.issued_at,
-                boot.id(),
+                &boot,
                 leveler_core::now(),
             ),
         )

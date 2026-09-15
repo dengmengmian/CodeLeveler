@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use leveler_core::{OwnerEpoch, OwnershipToken, RuntimeId, TaskId};
+use leveler_core::{BootId, OwnerEpoch, OwnershipToken, RuntimeId, TaskId};
 
 use crate::{Database, StorageError};
 
@@ -21,6 +21,9 @@ use crate::{Database, StorageError};
 pub struct TaskOwner {
     /// The owning runtime; `None` while unowned (epoch history retained).
     pub runtime: Option<RuntimeId>,
+    /// The boot that acquired the current epoch; `None` while unowned, and on
+    /// ownership recorded before boots were.
+    pub boot: Option<BootId>,
     /// Current fencing epoch (0 = never owned).
     pub epoch: OwnerEpoch,
 }
@@ -71,14 +74,17 @@ pub trait OwnershipStore: Send + Sync {
     async fn current(&self, task_id: &TaskId) -> Result<Option<TaskOwner>, StorageError>;
 
     /// Compare-and-acquire: if the task's current epoch equals
-    /// `expected_epoch`, atomically set `runtime` as owner at
-    /// `expected_epoch + 1` and return the new token. Any mismatch is
+    /// `expected_epoch`, atomically set `runtime` and `boot` as owner at
+    /// `expected_epoch + 1` and return the new token. Whether `boot` may take
+    /// the task from its current owner is the caller's decision; this is only
+    /// the atomic write. Any mismatch is
     /// [`OwnershipError::Stale`] with the actual state. Exactly one of two
     /// concurrent callers with the same expectation wins.
     async fn acquire(
         &self,
         task_id: &TaskId,
         runtime: &RuntimeId,
+        boot: &BootId,
         expected_epoch: OwnerEpoch,
     ) -> Result<OwnershipToken, OwnershipError>;
 }
@@ -89,13 +95,15 @@ pub trait OwnershipStore: Send + Sync {
 #[async_trait]
 impl OwnershipStore for Database {
     async fn current(&self, task_id: &TaskId) -> Result<Option<TaskOwner>, StorageError> {
-        let row: Option<(Option<String>, i64)> =
-            sqlx::query_as("SELECT owner_runtime_id, owner_epoch FROM tasks WHERE id = ?1")
-                .bind(task_id.as_str())
-                .fetch_optional(self.pool())
-                .await?;
-        Ok(row.map(|(runtime, epoch)| TaskOwner {
+        let row: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT owner_runtime_id, owner_boot_id, owner_epoch FROM tasks WHERE id = ?1",
+        )
+        .bind(task_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(runtime, boot, epoch)| TaskOwner {
             runtime: runtime.map(RuntimeId::new),
+            boot: boot.map(BootId::new),
             epoch: OwnerEpoch::new(epoch.max(0) as u64),
         }))
     }
@@ -104,6 +112,7 @@ impl OwnershipStore for Database {
         &self,
         task_id: &TaskId,
         runtime: &RuntimeId,
+        boot: &BootId,
         expected_epoch: OwnerEpoch,
     ) -> Result<OwnershipToken, OwnershipError> {
         let next = expected_epoch
@@ -112,13 +121,14 @@ impl OwnershipStore for Database {
                 task_id: task_id.clone(),
             })?;
         let updated = sqlx::query(
-            "UPDATE tasks SET owner_runtime_id = ?2, owner_epoch = ?3 \
+            "UPDATE tasks SET owner_runtime_id = ?2, owner_boot_id = ?5, owner_epoch = ?3 \
              WHERE id = ?1 AND owner_epoch = ?4",
         )
         .bind(task_id.as_str())
         .bind(runtime.as_str())
         .bind(next.get() as i64)
         .bind(expected_epoch.get() as i64)
+        .bind(boot.as_str())
         .execute(self.pool())
         .await
         .map_err(StorageError::from)?;
@@ -126,6 +136,7 @@ impl OwnershipStore for Database {
             return Ok(OwnershipToken {
                 task_id: task_id.clone(),
                 runtime_id: runtime.clone(),
+                boot_id: boot.clone(),
                 owner_epoch: next,
             });
         }
@@ -143,6 +154,8 @@ impl OwnershipStore for Database {
     }
 }
 
+type MemoryOwner = (Option<String>, Option<String>, u64);
+
 /// The shared in-memory ownership authority. One instance is shared by the
 /// memory ownership store AND every memory fenced store, and its mutex is
 /// held across fenced check+write sections — the memory equivalent of the
@@ -150,9 +163,10 @@ impl OwnershipStore for Database {
 /// concurrency.
 #[derive(Default)]
 pub struct MemoryOwnershipState {
-    /// task_id → (owner runtime, epoch). Absent = task unknown here; fenced
-    /// stores treat "no ownership row registered" as unowned epoch 0.
-    owners: Mutex<HashMap<String, (Option<String>, u64)>>,
+    /// task_id → (owner runtime, owner boot, epoch). Absent = task unknown
+    /// here; fenced stores treat "no ownership row registered" as unowned
+    /// epoch 0.
+    owners: Mutex<HashMap<String, MemoryOwner>>,
 }
 
 impl MemoryOwnershipState {
@@ -168,18 +182,15 @@ impl MemoryOwnershipState {
             .lock()
             .unwrap()
             .entry(task_id.as_str().to_string())
-            .or_insert((None, 0));
+            .or_insert((None, None, 0));
     }
 
     /// Whether `token` is the task's current ownership. Used by memory fenced
     /// stores WHILE HOLDING their own row locks inside `with_current`.
-    fn is_current_locked(
-        owners: &HashMap<String, (Option<String>, u64)>,
-        token: &OwnershipToken,
-    ) -> bool {
+    fn is_current_locked(owners: &HashMap<String, MemoryOwner>, token: &OwnershipToken) -> bool {
         owners
             .get(token.task_id.as_str())
-            .is_some_and(|(runtime, epoch)| {
+            .is_some_and(|(runtime, _, epoch)| {
                 runtime.as_deref() == Some(token.runtime_id.as_str())
                     && *epoch == token.owner_epoch.get()
             })
@@ -197,10 +208,10 @@ impl MemoryOwnershipState {
     ) -> Result<T, OwnershipError> {
         let owners = self.owners.lock().unwrap();
         if !Self::is_current_locked(&owners, token) {
-            let (runtime, epoch) = owners
+            let (runtime, _, epoch) = owners
                 .get(token.task_id.as_str())
                 .cloned()
-                .unwrap_or((None, 0));
+                .unwrap_or((None, None, 0));
             return Err(OwnershipError::Stale {
                 task_id: token.task_id.clone(),
                 expected_epoch: token.owner_epoch,
@@ -250,8 +261,9 @@ impl OwnershipStore for MemoryOwnershipStore {
             .lock()
             .unwrap()
             .get(task_id.as_str())
-            .map(|(runtime, epoch)| TaskOwner {
+            .map(|(runtime, boot, epoch)| TaskOwner {
                 runtime: runtime.clone().map(RuntimeId::new),
+                boot: boot.clone().map(BootId::new),
                 epoch: OwnerEpoch::new(*epoch),
             }))
     }
@@ -260,6 +272,7 @@ impl OwnershipStore for MemoryOwnershipStore {
         &self,
         task_id: &TaskId,
         runtime: &RuntimeId,
+        boot: &BootId,
         expected_epoch: OwnerEpoch,
     ) -> Result<OwnershipToken, OwnershipError> {
         let next = expected_epoch
@@ -273,18 +286,23 @@ impl OwnershipStore for MemoryOwnershipStore {
                 task_id: task_id.clone(),
             });
         };
-        if entry.1 != expected_epoch.get() {
+        if entry.2 != expected_epoch.get() {
             return Err(OwnershipError::Stale {
                 task_id: task_id.clone(),
                 expected_epoch,
                 actual_runtime: entry.0.clone().map(RuntimeId::new),
-                actual_epoch: OwnerEpoch::new(entry.1),
+                actual_epoch: OwnerEpoch::new(entry.2),
             });
         }
-        *entry = (Some(runtime.as_str().to_string()), next.get());
+        *entry = (
+            Some(runtime.as_str().to_string()),
+            Some(boot.as_str().to_string()),
+            next.get(),
+        );
         Ok(OwnershipToken {
             task_id: task_id.clone(),
             runtime_id: runtime.clone(),
+            boot_id: boot.clone(),
             owner_epoch: next,
         })
     }
@@ -301,51 +319,84 @@ mod tests {
     async fn assert_ownership_contract(store: &dyn OwnershipStore, task: &TaskId) {
         let a = leveler_core::RuntimeId::new("rt-a");
         let b = leveler_core::RuntimeId::new("rt-b");
+        let boot_1 = BootId::new("boot-1");
+        let boot_2 = BootId::new("boot-2");
 
         // Unknown task: typed error.
         assert!(matches!(
             store
-                .acquire(&TaskId::new("ghost"), &a, OwnerEpoch::UNOWNED)
+                .acquire(&TaskId::new("ghost"), &a, &boot_1, OwnerEpoch::UNOWNED)
                 .await,
             Err(OwnershipError::UnknownTask { .. })
         ));
 
-        // Scenario A: initial acquire → epoch 1.
+        // Scenario A: initial acquire → epoch 1, owned by the acquiring boot.
         let current = store.current(task).await.unwrap().unwrap();
         assert_eq!(
             current,
             TaskOwner {
                 runtime: None,
+                boot: None,
                 epoch: OwnerEpoch::UNOWNED
             }
         );
-        let t1 = store.acquire(task, &a, OwnerEpoch::UNOWNED).await.unwrap();
+        let t1 = store
+            .acquire(task, &a, &boot_1, OwnerEpoch::UNOWNED)
+            .await
+            .unwrap();
         assert_eq!(t1.owner_epoch.get(), 1);
+        assert_eq!(t1.boot_id, boot_1);
+        assert_eq!(
+            store.current(task).await.unwrap().unwrap(),
+            TaskOwner {
+                runtime: Some(a.clone()),
+                boot: Some(boot_1.clone()),
+                epoch: t1.owner_epoch
+            }
+        );
 
         // Scenario B: same runtime reacquire → epoch 2; old expectation stale.
-        let t2 = store.acquire(task, &a, t1.owner_epoch).await.unwrap();
+        let t2 = store
+            .acquire(task, &a, &boot_1, t1.owner_epoch)
+            .await
+            .unwrap();
         assert_eq!(t2.owner_epoch.get(), 2);
-        let stale = store.acquire(task, &a, t1.owner_epoch).await;
+        let stale = store.acquire(task, &a, &boot_2, t1.owner_epoch).await;
         assert!(
             matches!(stale, Err(OwnershipError::Stale { actual_epoch, .. }) if actual_epoch.get() == 2)
+        );
+        assert_eq!(
+            store.current(task).await.unwrap().unwrap().boot,
+            Some(boot_1.clone()),
+            "a refused acquire leaves the owning boot in place"
         );
 
         // Scenario C: CAS to another runtime → epoch 3; blind steal (wrong
         // expected epoch) refused.
         assert!(matches!(
-            store.acquire(task, &b, OwnerEpoch::new(1)).await,
+            store.acquire(task, &b, &boot_2, OwnerEpoch::new(1)).await,
             Err(OwnershipError::Stale { .. }),
         ));
-        let t3 = store.acquire(task, &b, t2.owner_epoch).await.unwrap();
+        let t3 = store
+            .acquire(task, &b, &boot_2, t2.owner_epoch)
+            .await
+            .unwrap();
         assert_eq!(t3.owner_epoch.get(), 3);
         assert_eq!(
-            store.current(task).await.unwrap().unwrap().runtime.as_ref(),
-            Some(&b)
+            store.current(task).await.unwrap().unwrap(),
+            TaskOwner {
+                runtime: Some(b.clone()),
+                boot: Some(boot_2.clone()),
+                epoch: t3.owner_epoch
+            },
+            "runtime, boot and epoch change together"
         );
 
         // Epoch exhaustion fails loudly, never wraps.
         assert!(matches!(
-            store.acquire(task, &a, OwnerEpoch::new(u64::MAX)).await,
+            store
+                .acquire(task, &a, &boot_1, OwnerEpoch::new(u64::MAX))
+                .await,
             Err(OwnershipError::EpochExhausted { .. })
         ));
     }
@@ -388,7 +439,8 @@ mod tests {
             let task = task.clone();
             join.spawn(async move {
                 let rt = leveler_core::RuntimeId::new(format!("rt-{i}"));
-                OwnershipStore::acquire(db.as_ref(), &task, &rt, OwnerEpoch::UNOWNED).await
+                let boot = BootId::new(format!("boot-{i}"));
+                OwnershipStore::acquire(db.as_ref(), &task, &rt, &boot, OwnerEpoch::UNOWNED).await
             });
         }
         let mut winners = 0;

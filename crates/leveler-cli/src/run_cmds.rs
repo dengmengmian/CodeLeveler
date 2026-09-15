@@ -978,19 +978,20 @@ pub(crate) async fn cmd_serve(
     // token-less clients); an ephemeral TCP port alone proves nothing.
     let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
 
-    // Resolve the durable identity before the reap: recovery is an
-    // authoritative write and must be performed as a named runtime.
     let runtime_id = app.runtime_id()?;
+    // Recovery is an authoritative write, performed as this runtime's boot.
+    // The socket lock proves no other daemon is live — not that no TUI or
+    // `leveler run` is — so only turns of boots proven dead are reaped.
     let db = app.open_database().await?;
     let reap = leveler_engine::reap_after_restart(
-        &leveler_storage::EngineStores::from_database(&db),
-        &runtime_id,
+        &app.task_engine(&db)?,
         None,
+        leveler_engine::ReapScope::EndedBoots,
     )
     .await?;
     for conflict in &reap.conflicts {
-        tracing::warn!(session = conflict.session_id.as_str(), owner = ?conflict.owner,
-            "not reaping a task owned by another runtime");
+        tracing::warn!(session = conflict.session_id.as_str(), refusal = ?conflict.refusal,
+            "not reaping running turns without proof their boot has ended");
     }
     if !reap.events.is_empty() {
         tracing::warn!(
@@ -1136,11 +1137,10 @@ pub(crate) async fn cmd_web(
             ));
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
             let db = app.open_database().await?;
-            let runtime_id = app.runtime_id()?;
             let reap = leveler_engine::reap_after_restart(
-                &leveler_storage::EngineStores::from_database(&db),
-                &runtime_id,
+                &app.task_engine(&db)?,
                 None,
+                leveler_engine::ReapScope::EndedBoots,
             )
             .await?;
             if !reap.events.is_empty() {

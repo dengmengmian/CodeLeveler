@@ -437,6 +437,151 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
     stop_daemon(&mut daemon);
 }
 
+/// Running turns and task owners, read straight from the shared database.
+async fn running_turns(db: &leveler_storage::Database) -> Vec<leveler_storage::TurnRecord> {
+    leveler_storage::TurnStore::list_running(db, None)
+        .await
+        .unwrap()
+}
+
+async fn task_owner(
+    db: &leveler_storage::Database,
+    session: &leveler_core::SessionId,
+) -> leveler_storage::TaskOwner {
+    let task = leveler_storage::TaskStore::task_for_session(db, session)
+        .await
+        .unwrap()
+        .expect("a session that ran has a task");
+    leveler_storage::OwnershipStore::current(db, &task)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Real processes, one repository, one RuntimeId. A daemon runs a turn; a
+/// `leveler run` process starts beside it and must not interrupt or fence it.
+/// Then the daemon is SIGKILLed: the next daemon reaps the dead daemon's turn
+/// — and leaves the still-live `leveler run` turn alone.
+#[tokio::test]
+async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready1.json");
+    let mut daemon = spawn_serve(&env, &ready1);
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let daemon_session = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "daemon work".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: daemon_session.clone(),
+            content: "daemon keeps working".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    drop(client);
+
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let daemon_turn = running_turns(&db)
+        .await
+        .pop()
+        .expect("the daemon's turn runs");
+    let daemon_owner = task_owner(&db, &daemon_session).await;
+    assert!(daemon_turn.owner_boot_id.is_some());
+    assert_eq!(
+        daemon_owner.boot.as_ref().map(|b| b.as_str()),
+        daemon_turn.owner_boot_id.as_deref()
+    );
+
+    // A second host on the same repository: `leveler run` creates a session
+    // (with its startup recovery) and starts its own turn.
+    let mut sibling = Command::new(env!("CARGO_BIN_EXE_leveler"))
+        .arg("--repo")
+        .arg(&env.repo)
+        .arg("run")
+        .arg("sibling work")
+        .env("LEVELER_HOME", &env.home)
+        .env("LEVELER_CONFIG_DIR", &env.config_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn leveler run");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let sibling_turn = loop {
+        if let Some(turn) = running_turns(&db)
+            .await
+            .into_iter()
+            .find(|turn| turn.session_id != daemon_session.as_str())
+        {
+            break turn;
+        }
+        assert!(
+            sibling.try_wait().unwrap().is_none(),
+            "leveler run exited before starting its turn"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "leveler run never started a turn"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let sibling_session = leveler_core::SessionId::new(sibling_turn.session_id.clone());
+    let sibling_owner = task_owner(&db, &sibling_session).await;
+    assert_ne!(sibling_turn.owner_boot_id, daemon_turn.owner_boot_id);
+
+    // LIVE_OWNER_FALSE_REAP = 0: the daemon's turn survived the sibling's start.
+    let still = running_turns(&db).await;
+    assert!(
+        still.iter().any(|turn| turn.id == daemon_turn.id),
+        "a starting sibling interrupted the live daemon's turn: {still:?}"
+    );
+    assert_eq!(task_owner(&db, &daemon_session).await, daemon_owner);
+
+    // The crash.
+    daemon.kill().expect("SIGKILL daemon");
+    let _ = daemon.wait();
+
+    let ready2 = env.home.join("ready2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+
+    // DEAD_OWNER_MISSED_REAP = 0, and still no false reap of the live sibling.
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&daemon_session)
+        .await
+        .unwrap();
+    let reaped = turns.iter().find(|turn| turn.id == daemon_turn.id).unwrap();
+    assert_eq!(
+        reaped.status, "interrupted",
+        "the killed daemon's turn is reaped"
+    );
+    assert_eq!(reaped.owner_boot_id, daemon_turn.owner_boot_id);
+    let running = running_turns(&db).await;
+    assert!(
+        running.iter().any(|turn| turn.id == sibling_turn.id),
+        "the restarted daemon interrupted the live `leveler run` turn: {running:?}"
+    );
+    assert_eq!(task_owner(&db, &sibling_session).await, sibling_owner);
+
+    let _ = sibling.kill();
+    let _ = sibling.wait();
+    stop_daemon(&mut daemon);
+}
+
 /// Deterministic C2/C5/C8 boundary: ACK has been returned and the running turn
 /// carries its canonical input, while the transcript append is held behind an
 /// exact test barrier. SIGKILL there must reconstruct one user message; a

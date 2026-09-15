@@ -20,8 +20,8 @@ mod turn;
 pub mod window;
 
 pub use engine::{
-    NewSession, NewSessionAxes, TaskEngine, TaskExecution, TaskTerminal, acknowledge_crash_window,
-    budget_prior_messages,
+    EngineBoot, NewSession, NewSessionAxes, TaskEngine, TaskExecution, TaskTerminal,
+    acknowledge_crash_window, budget_prior_messages,
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
@@ -37,7 +37,8 @@ pub use ports::{
     ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,
 };
 pub use reaper::{
-    ReapConflict, ReapOutcome, ReapedSession, reap_after_restart, reap_running_turns_owned,
+    ReapConflict, ReapOutcome, ReapRefusal, ReapScope, ReapedSession, reap_after_restart,
+    reap_running_turns_owned,
 };
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
@@ -127,6 +128,15 @@ pub enum EngineError {
         epoch: leveler_core::OwnerEpoch,
         this_runtime: leveler_core::RuntimeId,
     },
+    /// Another live boot of this runtime owns the task. Never taken over:
+    /// that boot decides the task's future.
+    #[error("task {task_id} is being executed by another live boot of this runtime")]
+    OwnedByLiveBoot { task_id: leveler_core::TaskId },
+    /// Whether the task's executor is still alive cannot be established — its
+    /// boot could not be probed, or a running turn predates boot records.
+    /// Nothing is taken over on a guess.
+    #[error("task {task_id} may still be executing elsewhere: its owner's liveness is unknown")]
+    OwnershipUnknown { task_id: leveler_core::TaskId },
     #[error("corrupt or unreplayable history: {0}")]
     Corrupt(String),
     /// A delegated child already has a durable terminal and something tried

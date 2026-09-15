@@ -32,6 +32,12 @@ pub enum ClientError {
     /// completed, not undelivered — and it is never dispatched again.
     #[error("outcome unresolvable: {0}")]
     Unresolvable(String),
+    /// Refused because another live runtime process executes the session (or
+    /// whether one still does cannot be established). Nothing was taken from
+    /// it; the message says so in the user's words. Reading the session is
+    /// unaffected.
+    #[error("{0}")]
+    OwnershipConflict(String),
 }
 
 /// The seam between UI clients and the CodeLeveler runtime.

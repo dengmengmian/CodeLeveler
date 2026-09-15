@@ -10,6 +10,10 @@
 //!
 //! The lock is per boot, not per state directory: any number of live boots may
 //! share one database.
+//!
+//! [`boot_liveness`] is the one place that reads this proof. Command delivery
+//! asks it directly; task ownership and turn recovery ask it through
+//! [`StateDirBootLiveness`], the probe the engine is given.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -17,16 +21,9 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
-use leveler_core::BootId;
+use leveler_core::{BootId, BootLiveness, BootLivenessProbe};
 
 const BOOTS_DIR: &str = "boots";
-
-/// Whether a boot still has a live holder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootLiveness {
-    Live,
-    Ended,
-}
 
 /// A live boot: its id and the locked file that proves it. Dropping it (or the
 /// process dying) ends the boot.
@@ -73,20 +70,48 @@ impl Drop for RuntimeBootLease {
 
 /// Whether `boot` still has a live holder. Taking its lock succeeds only when
 /// no process holds it; the probe's own lock is released at once, which is
-/// harmless because an ended boot never comes back.
-pub fn boot_liveness(state_dir: &Path, boot: &BootId) -> io::Result<BootLiveness> {
-    let path = lock_path(state_dir, boot)?;
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BootLiveness::Ended),
-        Err(error) => return Err(error),
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(BootLiveness::Ended),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Ok(BootLiveness::Live)
+/// harmless because an ended boot never comes back. A probe that fails for
+/// any other reason proves nothing: `Unknown`, never `Dead`.
+pub fn boot_liveness(state_dir: &Path, boot: &BootId) -> BootLiveness {
+    let probe = || -> io::Result<BootLiveness> {
+        let path = lock_path(state_dir, boot)?;
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(BootLiveness::Dead);
+            }
+            Err(error) => return Err(error),
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(BootLiveness::Dead),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                Ok(BootLiveness::Alive)
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
+    };
+    probe().unwrap_or_else(|error| {
+        tracing::warn!(boot = boot.as_str(), %error, "boot liveness cannot be established");
+        BootLiveness::Unknown
+    })
+}
+
+/// [`boot_liveness`] over one state directory, as the engine's probe.
+pub struct StateDirBootLiveness {
+    state_dir: PathBuf,
+}
+
+impl StateDirBootLiveness {
+    pub fn new(state_dir: &Path) -> Self {
+        Self {
+            state_dir: state_dir.to_path_buf(),
+        }
+    }
+}
+
+impl BootLivenessProbe for StateDirBootLiveness {
+    fn liveness(&self, boot: &BootId) -> BootLiveness {
+        boot_liveness(&self.state_dir, boot)
     }
 }
 
@@ -109,18 +134,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_held_lease_is_live_and_a_released_one_has_ended() {
+    fn a_held_lease_is_alive_and_a_released_one_is_dead() {
         let dir = tempfile::tempdir().unwrap();
         let lease = RuntimeBootLease::acquire(dir.path()).unwrap();
         let id = lease.id().clone();
-        assert_eq!(boot_liveness(dir.path(), &id).unwrap(), BootLiveness::Live);
+        assert_eq!(boot_liveness(dir.path(), &id), BootLiveness::Alive);
         drop(lease);
-        assert_eq!(boot_liveness(dir.path(), &id).unwrap(), BootLiveness::Ended);
+        assert_eq!(boot_liveness(dir.path(), &id), BootLiveness::Dead);
     }
 
     /// A crashed boot leaves its file behind with nobody holding the lock.
     #[test]
-    fn an_unheld_lock_file_is_an_ended_boot() {
+    fn an_unheld_lock_file_is_a_dead_boot() {
         let dir = tempfile::tempdir().unwrap();
         let lease = RuntimeBootLease::acquire(dir.path()).unwrap();
         let id = lease.id().clone();
@@ -130,15 +155,15 @@ mod tests {
         // the OS releasing it by replacing the file with an unlocked one.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"").unwrap();
-        assert_eq!(boot_liveness(dir.path(), &id).unwrap(), BootLiveness::Ended);
+        assert_eq!(boot_liveness(dir.path(), &id), BootLiveness::Dead);
     }
 
     #[test]
-    fn a_boot_that_left_no_file_has_ended() {
+    fn a_boot_that_left_no_file_is_dead() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            boot_liveness(dir.path(), &BootId::generate()).unwrap(),
-            BootLiveness::Ended
+            boot_liveness(dir.path(), &BootId::generate()),
+            BootLiveness::Dead
         );
     }
 
@@ -148,19 +173,34 @@ mod tests {
         let a = RuntimeBootLease::acquire(dir.path()).unwrap();
         let b = RuntimeBootLease::acquire(dir.path()).unwrap();
         assert_ne!(a.id(), b.id());
-        assert_eq!(
-            boot_liveness(dir.path(), a.id()).unwrap(),
-            BootLiveness::Live
-        );
-        assert_eq!(
-            boot_liveness(dir.path(), b.id()).unwrap(),
-            BootLiveness::Live
-        );
+        assert_eq!(boot_liveness(dir.path(), a.id()), BootLiveness::Alive);
+        assert_eq!(boot_liveness(dir.path(), b.id()), BootLiveness::Alive);
     }
 
     #[test]
     fn a_stored_id_cannot_name_a_path_outside_the_boots_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(boot_liveness(dir.path(), &BootId::new("../runtime-id")).is_err());
+        assert_eq!(
+            boot_liveness(dir.path(), &BootId::new("../runtime-id")),
+            BootLiveness::Unknown
+        );
+    }
+
+    /// A lock file the probe may not open says nothing about its holder.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_the_probe_cannot_open_is_unknown_not_dead() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lease = RuntimeBootLease::acquire(dir.path()).unwrap();
+        let id = lease.id().clone();
+        let path = lease.path.clone();
+        drop(lease);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let liveness = boot_liveness(dir.path(), &id);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(liveness, BootLiveness::Unknown);
     }
 }

@@ -1,0 +1,272 @@
+//! Boot authority: several boots share one runtime identity, and neither
+//! taking a task over nor interrupting a running turn may rest on that
+//! identity. Only a boot proven dead gives up what it held.
+
+use std::sync::Arc;
+
+use leveler_core::{BootId, BootLiveness, OwnerEpoch, RuntimeId, SessionId, TaskId};
+use leveler_engine::{
+    EngineBoot, EngineError, ReapRefusal, ReapScope, TaskEngine, reap_after_restart,
+};
+use leveler_storage::{
+    Database, EngineStores, SessionRecord, SessionRepository, TaskOwner, TurnRecord, TurnRepository,
+};
+use leveler_test_support::TestBoots;
+
+const RUNTIME: &str = "rt-shared";
+
+struct World {
+    db: Database,
+    boots: Arc<TestBoots>,
+}
+
+impl World {
+    async fn new() -> Self {
+        Self {
+            db: Database::connect_in_memory().await.unwrap(),
+            boots: Arc::new(TestBoots::new()),
+        }
+    }
+
+    /// An engine for `boot`. Every boot shares one runtime identity.
+    fn boot(&self, boot: &str) -> TaskEngine {
+        TaskEngine {
+            stores: EngineStores::from_database(&self.db),
+            runtime_id: RuntimeId::new(RUNTIME),
+            boot: EngineBoot {
+                id: BootId::new(boot),
+                liveness: self.boots.clone(),
+            },
+        }
+    }
+
+    fn set(&self, boot: &str, liveness: BootLiveness) {
+        self.boots.set(&BootId::new(boot), liveness);
+    }
+
+    async fn session(&self) -> SessionId {
+        let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&self.db)
+            .create(&record)
+            .await
+            .unwrap();
+        SessionId::new(record.id)
+    }
+
+    /// `boot` takes the session and starts a running turn in it.
+    async fn running_turn(&self, boot: &str, session: &SessionId) -> leveler_core::OwnershipToken {
+        let engine = self.boot(boot);
+        let token = engine.acquire_ownership(session).await.unwrap();
+        engine
+            .stores
+            .turns
+            .start_owned(&token, session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        token
+    }
+
+    async fn turns(&self, session: &SessionId) -> Vec<TurnRecord> {
+        TurnRepository::new(&self.db).list(session).await.unwrap()
+    }
+
+    async fn statuses(&self, session: &SessionId) -> Vec<String> {
+        self.turns(session)
+            .await
+            .into_iter()
+            .map(|turn| turn.status)
+            .collect()
+    }
+
+    async fn owner(&self, session: &SessionId) -> TaskOwner {
+        let stores = EngineStores::from_database(&self.db);
+        let task: TaskId = stores
+            .tasks
+            .task_for_session(session)
+            .await
+            .unwrap()
+            .unwrap();
+        stores.ownership.current(&task).await.unwrap().unwrap()
+    }
+}
+
+/// T2/T14: the same runtime identity is no authority. A live boot keeps its
+/// task, its generation stays current, and its fenced writes still land.
+#[tokio::test]
+async fn a_live_boot_keeps_its_task_against_a_sibling_of_the_same_runtime() {
+    let world = World::new().await;
+    let session = world.session().await;
+    let token = world.running_turn("b1", &session).await;
+    world.set("b1", BootLiveness::Alive);
+    let before = world.owner(&session).await;
+
+    let refused = world.boot("b2").acquire_ownership(&session).await;
+    assert!(
+        matches!(refused, Err(EngineError::OwnedByLiveBoot { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(world.owner(&session).await, before);
+    assert_eq!(before.boot, Some(BootId::new("b1")));
+
+    world
+        .boot("b1")
+        .stores
+        .turns
+        .start_owned(&token, &session, "user", None, leveler_core::now())
+        .await
+        .expect("the live owner's generation is still current");
+}
+
+/// T9/T15: a probe that cannot tell is not a death certificate.
+#[tokio::test]
+async fn an_owner_of_unknown_liveness_is_neither_taken_over_nor_reaped() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.running_turn("b1", &session).await;
+    world.set("b1", BootLiveness::Unknown);
+    let before = world.owner(&session).await;
+
+    let refused = world.boot("b2").acquire_ownership(&session).await;
+    assert!(
+        matches!(refused, Err(EngineError::OwnershipUnknown { .. })),
+        "{refused:?}"
+    );
+    let reap = reap_after_restart(&world.boot("b2"), None, ReapScope::EndedBoots)
+        .await
+        .unwrap();
+    assert!(reap.events.is_empty());
+    assert_eq!(reap.conflicts.len(), 1);
+    assert_eq!(reap.conflicts[0].refusal, ReapRefusal::UnknownOwner);
+    assert_eq!(world.statuses(&session).await, ["running"]);
+    assert_eq!(world.owner(&session).await, before);
+}
+
+/// T3/T4: a dead boot's task passes to the next boot, and the next boot's
+/// recovery interrupts the dead boot's turn under a fresh generation.
+#[tokio::test]
+async fn a_dead_boots_turn_is_interrupted_and_its_task_taken_over() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.running_turn("b1", &session).await;
+    world.set("b1", BootLiveness::Dead);
+    let before = world.owner(&session).await;
+
+    let reap = reap_after_restart(&world.boot("b2"), None, ReapScope::EndedBoots)
+        .await
+        .unwrap();
+    assert!(reap.conflicts.is_empty(), "{:?}", reap.conflicts);
+    let turns = world.turns(&session).await;
+    assert_eq!(turns[0].status, "interrupted");
+    assert_eq!(
+        turns[0].owner_boot_id.as_deref(),
+        Some("b1"),
+        "an interrupted turn keeps the boot that ran it"
+    );
+    let after = world.owner(&session).await;
+    assert_eq!(after.boot, Some(BootId::new("b2")));
+    assert_eq!(after.epoch, before.epoch.next().unwrap());
+}
+
+/// T8: a turn left running before boots were recorded has no provable owner.
+#[tokio::test]
+async fn a_running_turn_without_a_boot_is_never_reaped_or_taken_over() {
+    let world = World::new().await;
+    let session = world.session().await;
+    TurnRepository::new(&world.db)
+        .start(&session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+
+    for scope in [
+        ReapScope::EndedBoots,
+        ReapScope::OwnBoot,
+        ReapScope::OwnAndEndedBoots,
+    ] {
+        reap_after_restart(&world.boot("b2"), None, scope)
+            .await
+            .unwrap();
+    }
+    let refused = world.boot("b2").acquire_ownership(&session).await;
+    assert!(
+        matches!(refused, Err(EngineError::OwnershipUnknown { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(world.statuses(&session).await, ["running"]);
+    assert_eq!(world.owner(&session).await.epoch, OwnerEpoch::UNOWNED);
+}
+
+/// T16/T17: recovery settles exactly the dead boot's turn. Live siblings'
+/// turns stay running and their generations do not move.
+#[tokio::test]
+async fn recovery_touches_only_the_dead_boots_session() {
+    let world = World::new().await;
+    let (s1, s2, s3) = (
+        world.session().await,
+        world.session().await,
+        world.session().await,
+    );
+    world.running_turn("b1", &s1).await;
+    world.running_turn("b2", &s2).await;
+    world.running_turn("b3", &s3).await;
+    world.set("b1", BootLiveness::Alive);
+    world.set("b2", BootLiveness::Alive);
+    world.set("b3", BootLiveness::Dead);
+    let (o1, o2, o3) = (
+        world.owner(&s1).await,
+        world.owner(&s2).await,
+        world.owner(&s3).await,
+    );
+
+    reap_after_restart(&world.boot("b4"), None, ReapScope::EndedBoots)
+        .await
+        .unwrap();
+
+    assert_eq!(world.statuses(&s1).await, ["running"]);
+    assert_eq!(world.statuses(&s2).await, ["running"]);
+    assert_eq!(world.statuses(&s3).await, ["interrupted"]);
+    assert_eq!(world.owner(&s1).await, o1);
+    assert_eq!(world.owner(&s2).await, o2);
+    assert_eq!(world.owner(&s3).await.epoch, o3.epoch.next().unwrap());
+}
+
+/// T18: a boot's recovery leaves its own live turns alone, and its shutdown
+/// settles only them — never a live sibling's.
+#[tokio::test]
+async fn shutdown_settles_only_the_boots_own_turns() {
+    let world = World::new().await;
+    let (theirs, mine) = (world.session().await, world.session().await);
+    world.running_turn("b1", &theirs).await;
+    world.running_turn("b2", &mine).await;
+    world.set("b1", BootLiveness::Alive);
+    let their_owner = world.owner(&theirs).await;
+
+    reap_after_restart(&world.boot("b2"), None, ReapScope::EndedBoots)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.statuses(&mine).await,
+        ["running"],
+        "recovery must not interrupt this boot's own live turn"
+    );
+
+    let shutdown = reap_after_restart(&world.boot("b2"), None, ReapScope::OwnBoot)
+        .await
+        .unwrap();
+    assert!(shutdown.conflicts.is_empty(), "{:?}", shutdown.conflicts);
+    assert_eq!(world.statuses(&mine).await, ["interrupted"]);
+    assert_eq!(world.statuses(&theirs).await, ["running"]);
+    assert_eq!(world.owner(&theirs).await, their_owner);
+}
+
+/// T10: one boot reacquiring its own task keeps the ordinary generation
+/// advance.
+#[tokio::test]
+async fn a_boot_reacquires_its_own_task() {
+    let world = World::new().await;
+    let session = world.session().await;
+    let engine = world.boot("b1");
+    let first = engine.acquire_ownership(&session).await.unwrap();
+    let second = engine.acquire_ownership(&session).await.unwrap();
+    assert_eq!(second.owner_epoch, first.owner_epoch.next().unwrap());
+    assert_eq!(second.boot_id, BootId::new("b1"));
+}

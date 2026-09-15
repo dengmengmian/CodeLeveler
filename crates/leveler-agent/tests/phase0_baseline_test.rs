@@ -335,6 +335,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
         &h.db,
         &task,
         &leveler_core::RuntimeId::new("rt-test"),
+        &leveler_core::BootId::new("test-boot"),
         owner.epoch,
     )
     .await
@@ -440,6 +441,10 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         engine: TaskEngine {
             stores,
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: h.factory,
         approver: Arc::new(AutoApprove),
@@ -524,6 +529,10 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         engine: TaskEngine {
             stores,
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: h.factory,
         approver: Arc::new(AutoApprove),

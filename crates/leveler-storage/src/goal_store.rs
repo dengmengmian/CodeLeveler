@@ -553,7 +553,12 @@ mod tests {
         state.register_task(&task);
         let ownership = MemoryOwnershipStore::new(state.clone());
         let token = ownership
-            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let store = MemoryGoalStore::new().with_ownership(state);
@@ -567,7 +572,12 @@ mod tests {
         state.register_task(&task);
         let ownership = MemoryOwnershipStore::new(state.clone());
         let token = ownership
-            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let store = MemoryGoalStore::new().with_ownership(state);
@@ -582,7 +592,12 @@ mod tests {
             .await
             .unwrap();
         let token = db
-            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         (task, token)
@@ -642,7 +657,12 @@ mod tests {
             .await
             .unwrap();
         let token = db
-            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         db.open(&token, "doomed", leveler_core::now())
@@ -689,7 +709,12 @@ mod tests {
         let db = Database::connect_in_memory().await.unwrap();
         let (task, stale) = seeded_task(&db).await;
         let current = db
-            .acquire(&task, &RuntimeId::new("rt"), stale.owner_epoch)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                stale.owner_epoch,
+            )
             .await
             .unwrap();
         assert_stale_open_is_rejected(&db, &stale, &current).await;
@@ -702,11 +727,21 @@ mod tests {
         state.register_task(&task);
         let ownership = MemoryOwnershipStore::new(state.clone());
         let stale = ownership
-            .acquire(&task, &RuntimeId::new("rt"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let current = ownership
-            .acquire(&task, &RuntimeId::new("rt"), stale.owner_epoch)
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                stale.owner_epoch,
+            )
             .await
             .unwrap();
         let store = MemoryGoalStore::new().with_ownership(state);

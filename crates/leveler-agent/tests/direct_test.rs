@@ -196,6 +196,10 @@ async fn harness_with(
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(&db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime,
@@ -224,6 +228,30 @@ async fn harness_with(
         dir,
         requests,
     }
+}
+
+/// A running turn left by a process that died: opened under the ownership of a
+/// boot of this runtime that has since ended.
+async fn crashed_turn(
+    db: &Database,
+    session: &leveler_core::SessionId,
+    kind: &str,
+) -> leveler_storage::TurnRecord {
+    let stores = leveler_storage::EngineStores::from_database(db);
+    let dead = TaskEngine {
+        stores: stores.clone(),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
+    };
+    let token = dead.acquire_ownership(session).await.unwrap();
+    stores
+        .turns
+        .start_owned(&token, session, kind, None, leveler_core::now())
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -639,6 +667,7 @@ impl ModelRuntime for HijackingRuntime {
                 &self.db,
                 &task,
                 &leveler_core::RuntimeId::new("rt-hijacker"),
+                &leveler_core::BootId::new("test-boot"),
                 current.epoch,
             )
             .await
@@ -726,6 +755,7 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
         &h.db,
         &task,
         &rt,
+        &leveler_core::BootId::new("test-boot"),
         leveler_core::OwnerEpoch::UNOWNED,
     )
     .await
@@ -741,10 +771,13 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
     )
     .await
     .unwrap();
-    let stores = leveler_storage::EngineStores::from_database(&h.db);
-    let reap = leveler_engine::reap_after_restart(&stores, &rt, None)
-        .await
-        .unwrap();
+    let reap = leveler_engine::reap_after_restart(
+        &h.engine.engine,
+        None,
+        leveler_engine::ReapScope::EndedBoots,
+    )
+    .await
+    .unwrap();
     assert_eq!(reap.events.len(), 1, "the orphan turn is reaped");
     assert!(reap.conflicts.is_empty());
     // The old token is now stale (epoch advanced by the reacquire).
@@ -783,6 +816,7 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
         &h.db,
         &task,
         &other,
+        &leveler_core::BootId::new("test-boot"),
         leveler_core::OwnerEpoch::UNOWNED,
     )
     .await
@@ -801,11 +835,13 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
     spec.coding.sandbox = true;
 
     // Restart reap as rt-test: conflict reported, turn untouched.
-    let stores = leveler_storage::EngineStores::from_database(&h.db);
-    let reap =
-        leveler_engine::reap_after_restart(&stores, &leveler_core::RuntimeId::new("rt-test"), None)
-            .await
-            .unwrap();
+    let reap = leveler_engine::reap_after_restart(
+        &h.engine.engine,
+        None,
+        leveler_engine::ReapScope::EndedBoots,
+    )
+    .await
+    .unwrap();
     assert!(reap.events.is_empty());
     assert_eq!(reap.conflicts.len(), 1);
     assert_eq!(
@@ -1549,10 +1585,7 @@ async fn starting_a_turn_reaps_orphan_running_siblings() {
     let session = h.engine.create_task(&spec).await.unwrap();
 
     // Simulate a zombie left by process kill: status running, no finished_at.
-    let zombie = TurnRepository::new(&h.db)
-        .start(&session, "chat", None, leveler_core::now())
-        .await
-        .unwrap();
+    let zombie = crashed_turn(&h.db, &session, "chat").await;
     assert_eq!(zombie.status, "running");
     assert!(zombie.finished_at.is_none());
 
@@ -1640,6 +1673,10 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(&h.db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
@@ -2250,6 +2287,10 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(&db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime,

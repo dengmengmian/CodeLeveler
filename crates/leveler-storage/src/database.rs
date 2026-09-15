@@ -275,6 +275,62 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Rows written before boots were recorded keep a NULL boot: no boot can
+    /// be proven dead for them, and the migration must not invent one.
+    #[tokio::test]
+    async fn migration_0025_leaves_existing_rows_without_a_boot() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap();
+            conn.ensure_migrations_table().await.unwrap();
+            for migration in MIGRATOR.migrations.iter().filter(|m| m.version < 25) {
+                conn.apply(migration).await.unwrap();
+            }
+            for statement in [
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at) VALUES ('s','/r','g','running','m','understand','t','t')",
+                "INSERT INTO tasks (id, session_id, created_at, owner_runtime_id, owner_epoch) \
+                 VALUES ('s','s','t','rt',3)",
+                "INSERT INTO turns (id, session_id, ordinal, kind, status, created_at) \
+                 VALUES ('done','s',1,'user','completed','t')",
+                "INSERT INTO turns (id, session_id, ordinal, kind, status, created_at) \
+                 VALUES ('live','s',2,'user','running','t')",
+            ] {
+                sqlx::query(statement).execute(&mut conn).await.unwrap();
+            }
+        }
+
+        let db = Database::connect(&path).await.unwrap();
+        let task: (Option<String>, Option<String>, i64) = sqlx::query_as(
+            "SELECT owner_runtime_id, owner_boot_id, owner_epoch FROM tasks WHERE id = 's'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(task, (Some("rt".to_string()), None, 3));
+        let turns: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT id, status, owner_boot_id FROM turns ORDER BY ordinal")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            turns,
+            vec![
+                ("done".to_string(), "completed".to_string(), None),
+                ("live".to_string(), "running".to_string(), None),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn peek_repository_reads_latest_row_without_migrating() {
         let dir = std::env::temp_dir().join(format!(

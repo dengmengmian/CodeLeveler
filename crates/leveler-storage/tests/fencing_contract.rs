@@ -392,12 +392,24 @@ async fn sqlite_fenced_writes_honor_the_contract() {
         .unwrap();
     let rt = RuntimeId::new("rt-a");
     // Epoch 1 then reacquire to epoch 2: the epoch-1 token is stale.
-    let stale = OwnershipStore::acquire(&db, &task, &rt, OwnerEpoch::UNOWNED)
-        .await
-        .unwrap();
-    let current = OwnershipStore::acquire(&db, &task, &rt, stale.owner_epoch)
-        .await
-        .unwrap();
+    let stale = OwnershipStore::acquire(
+        &db,
+        &task,
+        &rt,
+        &leveler_core::BootId::new("test-boot"),
+        OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    let current = OwnershipStore::acquire(
+        &db,
+        &task,
+        &rt,
+        &leveler_core::BootId::new("test-boot"),
+        stale.owner_epoch,
+    )
+    .await
+    .unwrap();
     assert_fencing_contract(
         Ports {
             events: &db,
@@ -442,11 +454,21 @@ async fn memory_fenced_writes_honor_the_contract() {
     let ownership = MemoryOwnershipStore::new(state);
     let rt = RuntimeId::new("rt-a");
     let stale = ownership
-        .acquire(&task, &rt, OwnerEpoch::UNOWNED)
+        .acquire(
+            &task,
+            &rt,
+            &leveler_core::BootId::new("test-boot"),
+            OwnerEpoch::UNOWNED,
+        )
         .await
         .unwrap();
     let current = ownership
-        .acquire(&task, &rt, stale.owner_epoch)
+        .acquire(
+            &task,
+            &rt,
+            &leveler_core::BootId::new("test-boot"),
+            stale.owner_epoch,
+        )
         .await
         .unwrap();
 

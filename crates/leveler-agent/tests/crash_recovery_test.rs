@@ -26,7 +26,7 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
-use leveler_storage::{Database, EventRepository, MessageRepository, TurnRepository};
+use leveler_storage::{Database, EventRepository, MessageRepository};
 use leveler_tools::ToolContext;
 use leveler_verifier::VerificationPlan;
 
@@ -159,6 +159,10 @@ async fn harness(
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(&db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
@@ -225,10 +229,7 @@ async fn seed_dangling_call(
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(db)
-        .start(session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(db, session.clone());
     log.append(
@@ -257,10 +258,7 @@ async fn seed_pending_approval_call(
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(db)
-        .start(session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(db, session.clone());
     log.append(
@@ -306,6 +304,30 @@ async fn recorded_events(db: &Database, session: &SessionId) -> Vec<EngineEvent>
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+/// A running turn left by a process that died: opened under the ownership of a
+/// boot of this runtime that has since ended.
+async fn crashed_turn(
+    db: &Database,
+    session: &SessionId,
+    kind: &str,
+) -> leveler_storage::TurnRecord {
+    let stores = leveler_storage::EngineStores::from_database(db);
+    let dead = TaskEngine {
+        stores: stores.clone(),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
+    };
+    let token = dead.acquire_ownership(session).await.unwrap();
+    stores
+        .turns
+        .start_owned(&token, session, kind, None, leveler_core::now())
+        .await
+        .unwrap()
+}
 
 /// A read-only tool that crashed mid-execution is idempotent, so resume just
 /// re-runs it and records the fresh result — no approval prompt.
@@ -569,10 +591,7 @@ async fn legacy_call_without_persisted_risk_blocks_conservatively() {
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     seed_transcript(&db, &session).await;
-    let turn = TurnRepository::new(&db)
-        .start(&session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(&db, &session, "user").await;
     EventLog::new(&db, session.clone())
         .append(
             Some(&TurnId::new(turn.id)),
@@ -836,10 +855,7 @@ async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
     let session = engine.create_task(&spec).await.unwrap();
     seed_transcript(&db, &session).await;
 
-    let turn = TurnRepository::new(&db)
-        .start(&session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(&db, &session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(&db, session.clone());
 
@@ -901,19 +917,32 @@ async fn stale_runtime_cannot_acknowledge_crash_window() {
         .await
         .unwrap()
         .unwrap();
+    // The crashed turn's boot already took the task once.
+    let seeded = leveler_storage::OwnershipStore::current(&db, &task)
+        .await
+        .unwrap()
+        .unwrap()
+        .epoch;
     let rt = leveler_core::RuntimeId::new("rt-test");
     let stale = leveler_storage::OwnershipStore::acquire(
         &db,
         &task,
         &rt,
-        leveler_core::OwnerEpoch::UNOWNED,
+        &leveler_core::BootId::new("test-boot"),
+        seeded,
     )
     .await
     .unwrap();
     // Reacquire: the first token is now stale.
-    leveler_storage::OwnershipStore::acquire(&db, &task, &rt, stale.owner_epoch)
-        .await
-        .unwrap();
+    leveler_storage::OwnershipStore::acquire(
+        &db,
+        &task,
+        &rt,
+        &leveler_core::BootId::new("test-boot"),
+        stale.owner_epoch,
+    )
+    .await
+    .unwrap();
 
     let result = leveler_engine::acknowledge_crash_window(&db, &stale, &session).await;
     assert!(result.is_err(), "a stale token must not acknowledge");
@@ -941,11 +970,18 @@ async fn foreign_runtime_cannot_acknowledge_crash_window() {
         .await
         .unwrap()
         .unwrap();
+    // The crashed turn's boot already took the task once.
+    let seeded = leveler_storage::OwnershipStore::current(&db, &task)
+        .await
+        .unwrap()
+        .unwrap()
+        .epoch;
     leveler_storage::OwnershipStore::acquire(
         &db,
         &task,
         &leveler_core::RuntimeId::new("rt-other"),
-        leveler_core::OwnerEpoch::UNOWNED,
+        &leveler_core::BootId::new("test-boot"),
+        seeded,
     )
     .await
     .unwrap();

@@ -118,7 +118,15 @@ mod tests {
             .ensure_for_session(&session, leveler_core::now())
             .await
             .unwrap();
-        let token = db.acquire(&task, owner, OwnerEpoch::new(0)).await.unwrap();
+        let token = db
+            .acquire(
+                &task,
+                owner,
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::new(0),
+            )
+            .await
+            .unwrap();
         (session, task, token)
     }
 

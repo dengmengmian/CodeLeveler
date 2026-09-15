@@ -127,7 +127,12 @@ mod tests {
             .await
             .unwrap();
         let token = db
-            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("test-runtime"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let goal = GoalStore::open(db, &token, "the goal", leveler_core::now())

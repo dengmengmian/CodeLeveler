@@ -371,6 +371,25 @@ async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() 
     ));
 }
 
+/// T12/T20: command delivery and task ownership are one boot. A receipt the
+/// application's boot admitted — the boot its turns are owned by — is judged
+/// as this boot's own: not in flight here means abandoned, with no probe that
+/// would find the application's own lease held and answer "still alive".
+#[tokio::test]
+async fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let envelope = submission("cmd-own-boot", &session_id, "admitted by this boot");
+    leave_dispatching(&app, &envelope, &app.boot_id().unwrap()).await;
+
+    let error = client.deliver(envelope).await.unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::Unresolvable(_)),
+        "delivery must recognise the application's boot as its own: {error:?}"
+    );
+    assert_eq!(turns(&app, &session_id).await, 0, "never rerun");
+}
+
 /// This boot admitted the command, and the path that was handling it has
 /// ended without settling the receipt (its dispatch returned an error, which
 /// cannot prove nothing happened). A later delivery of the same id — the

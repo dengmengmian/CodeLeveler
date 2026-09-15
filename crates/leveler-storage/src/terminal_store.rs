@@ -744,7 +744,12 @@ mod tests {
         ownership_state.register_task(&task);
         let ownership = MemoryOwnershipStore::new(ownership_state.clone());
         let token = ownership
-            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("test-runtime"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let sessions = Arc::new(MemorySessionStore::new().with_ownership(ownership_state.clone()));

@@ -342,6 +342,7 @@ fn error_frame(error: &ClientError, command_id: Option<String>) -> DownstreamMes
         ClientError::Runtime(_) => "runtime_error",
         ClientError::OutcomeUnknown(_) => "outcome_unknown",
         ClientError::Unresolvable(_) => "outcome_unresolvable",
+        ClientError::OwnershipConflict(_) => "ownership_conflict",
     };
     DownstreamMessage::Error {
         code: code.to_string(),

@@ -25,7 +25,7 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
-use leveler_storage::{Database, EventRepository, TurnRepository};
+use leveler_storage::{Database, EventRepository};
 use leveler_tools::ToolContext;
 use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
 
@@ -168,6 +168,10 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(db),
             runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
         },
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
@@ -244,10 +248,7 @@ async fn seed_ghost_child(
     nickname: &str,
     role: &str,
 ) -> TurnId {
-    let turn = TurnRepository::new(db)
-        .start(session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(db, session.clone());
     log.append(
@@ -295,6 +296,30 @@ fn last_ledger(
 }
 
 // ── MA-RT-2: restart ghost completion truth ──────────────────────────────────
+
+/// A running turn left by a process that died: opened under the ownership of a
+/// boot of this runtime that has since ended.
+async fn crashed_turn(
+    db: &Database,
+    session: &SessionId,
+    kind: &str,
+) -> leveler_storage::TurnRecord {
+    let stores = leveler_storage::EngineStores::from_database(db);
+    let dead = TaskEngine {
+        stores: stores.clone(),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
+    };
+    let token = dead.acquire_ownership(session).await.unwrap();
+    stores
+        .turns
+        .start_owned(&token, session, kind, None, leveler_core::now())
+        .await
+        .unwrap()
+}
 
 /// Control anchor: without a ghost this exact script legitimately reaches
 /// Verified. The treatment test below differs by ONE seeded fact.
@@ -443,10 +468,7 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
     // The wreckage: the child durably finished, but the crash landed between
     // that terminal fact and the ProgressUpdated that would have cleared the
     // outstanding record (C10's exact window).
-    let turn = TurnRepository::new(&db)
-        .start(&session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(&db, &session, "user").await;
     let t1 = TurnId::new(turn.id);
     append_event(
         &db,
@@ -815,10 +837,7 @@ async fn the_total_child_cap_survives_a_restart() {
     let spec = gated_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
 
-    let turn = TurnRepository::new(&db)
-        .start(&session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(&db, &session, "user").await;
     let t1 = TurnId::new(turn.id);
     let consumed = leveler_lifecycle::ProgressLedger {
         children_spawned_total: 6,
@@ -1191,10 +1210,7 @@ async fn seed_ghost_child_with_model(
     files: Vec<String>,
     model: Option<String>,
 ) -> TurnId {
-    let turn = TurnRepository::new(db)
-        .start(session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     EventLog::new(db, session.clone())
         .append(
@@ -1434,9 +1450,9 @@ async fn the_restart_reaper_marks_an_open_child_interrupted() {
     seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
 
     leveler_engine::reap_after_restart(
-        &engine.engine.stores,
-        &engine.engine.runtime_id,
+        &engine.engine,
         Some(&session),
+        leveler_engine::ReapScope::EndedBoots,
     )
     .await
     .unwrap();

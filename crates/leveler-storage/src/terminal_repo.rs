@@ -434,7 +434,12 @@ mod tests {
             .await
             .unwrap();
         let token = db
-            .acquire(&task, &RuntimeId::new("test-runtime"), OwnerEpoch::UNOWNED)
+            .acquire(
+                &task,
+                &RuntimeId::new("test-runtime"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
             .await
             .unwrap();
         let goal = db
@@ -629,6 +634,7 @@ mod tests {
             .acquire(
                 &other_task,
                 &RuntimeId::new("other-runtime"),
+                &leveler_core::BootId::new("test-boot"),
                 OwnerEpoch::UNOWNED,
             )
             .await

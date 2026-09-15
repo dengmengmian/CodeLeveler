@@ -84,10 +84,11 @@ impl TurnStore for Database {
             .map_err(crate::OwnershipError::Storage)?;
         // Ordinal assignment AND ownership guard inside one INSERT.
         let inserted = sqlx::query(
-            "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
+            "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at, \
+                                owner_boot_id) \
              SELECT ?1, ?2, \
                     (SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turns WHERE session_id = ?2), \
-                    ?3, ?4, 'running', ?5 \
+                    ?3, ?4, 'running', ?5, ?9 \
              WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
                            AND id = ?6 AND owner_runtime_id = ?7 AND owner_epoch = ?8)",
         )
@@ -99,6 +100,7 @@ impl TurnStore for Database {
         .bind(token.task_id.as_str())
         .bind(token.runtime_id.as_str())
         .bind(token.owner_epoch.get() as i64)
+        .bind(token.boot_id.as_str())
         .execute(self.pool())
         .await
         .map_err(StorageError::from)?;
@@ -106,7 +108,7 @@ impl TurnStore for Database {
             return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
         }
         Ok(sqlx::query_as::<_, TurnRecord>(
-            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at \
+            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
              FROM turns WHERE id = ?1",
         )
         .bind(&id)
@@ -177,6 +179,7 @@ impl TurnStore for MemoryTurnStore {
             status: "running".to_string(),
             created_at: now.to_rfc3339(),
             finished_at: None,
+            owner_boot_id: None,
         };
         rows.push(record.clone());
         Ok(record)
@@ -239,6 +242,7 @@ impl TurnStore for MemoryTurnStore {
                 status: "running".to_string(),
                 created_at: now.to_rfc3339(),
                 finished_at: None,
+                owner_boot_id: Some(token.boot_id.as_str().to_string()),
             };
             rows.push(record.clone());
             record
@@ -298,5 +302,52 @@ mod tests {
     async fn memory_store_honors_the_contract() {
         let store = MemoryTurnStore::new();
         assert_turn_store_contract(&store, &SessionId::generate(), &SessionId::generate()).await;
+    }
+
+    /// A turn is `running` and owned by a boot in the same insert, and keeps
+    /// that boot as provenance once it ends.
+    #[tokio::test]
+    async fn an_owned_turn_records_its_boot_from_start_through_its_terminal() {
+        use crate::{OwnershipStore, TaskStore, TerminalStore};
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/repo", "a", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let task = TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let boot = leveler_core::BootId::new("boot-1");
+        let token = OwnershipStore::acquire(
+            &db,
+            &task,
+            &leveler_core::RuntimeId::new("rt"),
+            &boot,
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+
+        let turn = TurnStore::start_owned(&db, &token, &session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(turn.status, "running");
+        assert_eq!(turn.owner_boot_id.as_deref(), Some("boot-1"));
+
+        TerminalStore::finish_turn_owned(
+            &db,
+            &token,
+            &session,
+            &TurnId::new(turn.id.clone()),
+            "turn_finished",
+            "{}",
+            leveler_lifecycle::TurnOutcome::Completed,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let ended = TurnRepository::new(&db).list(&session).await.unwrap();
+        assert_eq!(ended[0].status, "completed");
+        assert_eq!(ended[0].owner_boot_id.as_deref(), Some("boot-1"));
     }
 }
