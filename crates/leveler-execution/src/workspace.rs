@@ -26,6 +26,13 @@ pub enum WorkspaceError {
     OutsideWorkspace(String),
     #[error("path `{0}` is denied (sensitive file)")]
     Denied(String),
+    /// An agent definition, which only the agent store writes.
+    #[error(
+        "path `{0}` is an agent definition; tools do not edit it. Change agents \
+         with save_agent or delete_agent, which validate the change and ask the \
+         user to confirm it"
+    )]
+    AgentDefinition(String),
     #[error("failed to canonicalize workspace root {0}")]
     Root(String),
 }
@@ -339,7 +346,9 @@ impl Workspace {
         // atomic), so no tool patches them in place.
         if access == PathAccess::Write && normalized.starts_with(self.root.join(".leveler/agents"))
         {
-            return Err(denied(original));
+            return Err(WorkspaceError::AgentDefinition(
+                original.display().to_string(),
+            ));
         }
 
         for comp in normalized.components() {
@@ -595,13 +604,14 @@ mod tests {
             ".leveler/agents/new-agent/agent.yaml",
             ".leveler/agents",
         ] {
-            assert!(
-                matches!(
-                    ws.resolve_for_write(name, &ws_scope(&ws)),
-                    Err(WorkspaceError::Denied(_))
-                ),
-                "{name} must not be writable"
-            );
+            match ws.resolve_for_write(name, &ws_scope(&ws)) {
+                // The refusal says where to go instead: a model told only
+                // "sensitive file" guesses at its next move.
+                Err(error @ WorkspaceError::AgentDefinition(_)) => {
+                    assert!(error.to_string().contains("save_agent"), "{error}");
+                }
+                other => panic!("{name} must not be writable: {other:?}"),
+            }
             assert!(
                 ws.resolve_for_read(name).is_ok(),
                 "{name} must stay readable"
