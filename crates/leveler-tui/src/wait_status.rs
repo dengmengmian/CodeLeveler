@@ -138,7 +138,7 @@ fn project_background_wait(state: &AppState, running: &[&ToolCallBlock]) -> Opti
 
     let wait_secs = waits
         .iter()
-        .map(|call| elapsed_since(state.elapsed_secs, call.started_elapsed_secs))
+        .map(|call| call.running_secs(state.elapsed_secs))
         .min()
         .unwrap_or(0);
     let count = targets.len();
@@ -190,7 +190,7 @@ fn project_child_wait(state: &AppState, running: &[&ToolCallBlock]) -> Option<Wa
             targets.push(WaitTarget {
                 label: spawn_agent_role_label(&call.arguments, state.t()),
                 detail: None,
-                running_secs: Some(elapsed_since(state.elapsed_secs, call.started_elapsed_secs)),
+                running_secs: Some(call.running_secs(state.elapsed_secs)),
                 lifecycle: TargetLifecycle::Running,
             });
         }
@@ -198,7 +198,7 @@ fn project_child_wait(state: &AppState, running: &[&ToolCallBlock]) -> Option<Wa
 
     let wait_secs = spawns
         .iter()
-        .map(|call| elapsed_since(state.elapsed_secs, call.started_elapsed_secs))
+        .map(|call| call.running_secs(state.elapsed_secs))
         .min()
         .unwrap_or(0);
     let count = targets.len().max(1);
@@ -382,7 +382,7 @@ mod tests {
             "wait_task".into(),
             serde_json::json!({ "task_id": task_id }).to_string(),
             false,
-            started,
+            started as i64,
         );
         state.activity = Some("等待任务".into());
     }

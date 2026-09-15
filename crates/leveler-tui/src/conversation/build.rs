@@ -41,9 +41,27 @@ impl AppState {
         std::rc::Rc<Vec<Line<'static>>>,
         std::rc::Rc<Vec<(usize, usize)>>,
     ) {
+        let (lines, hits, _) = self.conversation_build(width);
+        (lines, hits)
+    }
+
+    /// The memoized build: lines, disclosure hit rows, and command rows.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn conversation_build(
+        &self,
+        width: usize,
+    ) -> (
+        std::rc::Rc<Vec<Line<'static>>>,
+        std::rc::Rc<Vec<(usize, usize)>>,
+        std::rc::Rc<Vec<super::view::CommandHit>>,
+    ) {
         if crate::splash::conversation_is_empty(self) {
-            let (lines, hits) = build_conversation_lines_with_hits(self, width);
-            return (std::rc::Rc::new(lines), std::rc::Rc::new(hits));
+            let (lines, hits, commands) = build_conversation(self, width);
+            return (
+                std::rc::Rc::new(lines),
+                std::rc::Rc::new(hits),
+                std::rc::Rc::new(commands),
+            );
         }
         let key = ConvKey {
             version: self.transcript.version(),
@@ -53,16 +71,31 @@ impl AppState {
             locale: self.locale,
             tools_expanded: self.tools_expanded,
             awaiting_approval: self.approval_gated_call().cloned(),
+            elapsed_secs: self.elapsed_secs,
         };
-        if let Some((k, lines, hits)) = self.conv.cache.borrow().as_ref()
+        if let Some((k, lines, hits, commands)) = self.conv.cache.borrow().as_ref()
             && *k == key
         {
-            return (lines.clone(), hits.clone());
+            return (lines.clone(), hits.clone(), commands.clone());
         }
-        let (lines, hits) = build_conversation_lines_with_hits(self, width);
-        let (lines, hits) = (std::rc::Rc::new(lines), std::rc::Rc::new(hits));
-        *self.conv.cache.borrow_mut() = Some((key, lines.clone(), hits.clone()));
-        (lines, hits)
+        let (lines, hits, commands) = build_conversation(self, width);
+        let (lines, hits, commands) = (
+            std::rc::Rc::new(lines),
+            std::rc::Rc::new(hits),
+            std::rc::Rc::new(commands),
+        );
+        *self.conv.cache.borrow_mut() = Some((key, lines.clone(), hits.clone(), commands.clone()));
+        (lines, hits, commands)
+    }
+
+    /// The command row under content (`abs_line`, display `col`), if any.
+    pub(crate) fn command_hit_at(
+        &self,
+        width: usize,
+        abs_line: usize,
+    ) -> Option<super::view::CommandHit> {
+        let (_, _, commands) = self.conversation_build(width);
+        commands.iter().find(|hit| hit.line == abs_line).copied()
     }
 
     /// The transcript item behind the disclosure row at `abs_line`, if any.
@@ -85,10 +118,26 @@ pub fn build_conversation_lines_with_hits(
     state: &AppState,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let (lines, hits, _) = build_conversation(state, width);
+    (lines, hits)
+}
+
+/// Build the conversation, its disclosure hit rows, and its command rows in
+/// one pass, so no click target can describe lines other than these.
+#[allow(clippy::type_complexity)]
+fn build_conversation(
+    state: &AppState,
+    width: usize,
+) -> (
+    Vec<Line<'static>>,
+    Vec<(usize, usize)>,
+    Vec<super::view::CommandHit>,
+) {
     let theme = &state.theme;
     let t = state.t();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut commands: Vec<super::view::CommandHit> = Vec::new();
 
     // Empty session: brand splash (logo + tagline) instead of a blank void.
     if crate::splash::conversation_is_empty(state) {
@@ -101,6 +150,7 @@ pub fn build_conversation_lines_with_hits(
         return (
             crate::splash::splash_lines(state, width, height, theme, t),
             hits,
+            commands,
         );
     }
 
@@ -155,6 +205,8 @@ pub fn build_conversation_lines_with_hits(
                 if crate::activity_stream::group_has_disclosure(group) {
                     hits.push((out.len(), idx));
                 }
+                let base = out.len();
+                let mut rows = Vec::new();
                 out.extend(crate::activity_stream::render_activity(
                     group,
                     theme,
@@ -163,7 +215,14 @@ pub fn build_conversation_lines_with_hits(
                     t,
                     state.elapsed_secs,
                     state.approval_gated_call(),
+                    &mut rows,
                 ));
+                commands.extend(rows.into_iter().map(|row| super::view::CommandHit {
+                    line: base + row.line,
+                    item: idx,
+                    call: row.call,
+                    stop: row.stop,
+                }));
             }
             TranscriptItem::SubAgent(first) => {
                 // A run of consecutive sub-agent blocks renders as one tree
@@ -215,5 +274,5 @@ pub fn build_conversation_lines_with_hits(
         idx += 1;
     }
 
-    (out, hits)
+    (out, hits, commands)
 }

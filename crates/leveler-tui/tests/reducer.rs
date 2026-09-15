@@ -2379,7 +2379,9 @@ fn turn_end_finalizes_in_flight_blocks() {
             |i| matches!(i, TranscriptItem::Assistant(b) if b.done && b.text == "half a thought"),
         );
     assert!(assistant_done, "unfinished assistant must be finalized");
-    assert_eq!(s.transcript.tool_calls()[0].status, ToolStatus::Failed);
+    // Not running any more, and not "failed" either: no terminal arrived, so
+    // the outcome is unknown.
+    assert_eq!(s.transcript.tool_calls()[0].status, ToolStatus::Unknown);
     let sub_running = s
         .transcript
         .items()
@@ -5808,6 +5810,9 @@ fn a_runtime_rejection_is_not_reported_as_a_lost_connection() {
     reduce(
         &mut s,
         Action::EffectCompleted(EffectCompletion::CommandRejected {
+            command: ClientCommand::CompactContext {
+                session_id: SessionId::new("s1"),
+            },
             message: "当前有进行中的回合，请先等待完成或取消后再压缩".into(),
             snapshot: Some(Box::new(snapshot())),
         }),

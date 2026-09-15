@@ -118,7 +118,14 @@ pub fn item_render(
             let locale = locale_from_ui_text(t);
             // Scrollback: finished tools show their final duration, not live (0).
             out.extend(crate::activity_stream::render_activity(
-                group, theme, wrap_width, locale, t, 0, None,
+                group,
+                theme,
+                wrap_width,
+                locale,
+                t,
+                0,
+                None,
+                &mut Vec::new(),
             ));
         }
         // Scrollback: the agent is finished, so no live elapsed is shown (0).
@@ -642,6 +649,7 @@ pub(crate) fn sub_agent_status(
         ToolStatus::Failed => {
             crate::multi_agent::stop_label(block.stop, t).unwrap_or(t.sub_agent_incomplete)
         }
+        ToolStatus::Cancelled | ToolStatus::Unknown => t.sub_agent_unreported,
     }
 }
 
@@ -697,6 +705,7 @@ fn sub_agent_lines(
         ToolStatus::Running => ("◌", theme.accent.primary),
         ToolStatus::Ok => ("✓", theme.status.success),
         ToolStatus::Failed => ("✗", theme.status.error),
+        ToolStatus::Cancelled | ToolStatus::Unknown => ("?", theme.status.warning),
     };
     let mut head_spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
@@ -1015,6 +1024,10 @@ fn sub_agent_tree_child_status(
             ),
             theme.status.error,
         ),
+        ToolStatus::Cancelled | ToolStatus::Unknown => (
+            format!("? {}", t.sub_agent_unreported),
+            theme.status.warning,
+        ),
     }
 }
 
@@ -1149,10 +1162,10 @@ pub(crate) fn user_shell_lines(
         return out;
     }
     let failed = shell.status == UserShellStatus::Failed;
-    let label = if shell.status == UserShellStatus::Cancelled {
-        format!("{label} · {}", t.user_shell_cancelled)
-    } else {
-        label
+    let label = match shell.status {
+        UserShellStatus::Cancelled => format!("{label} · {}", t.user_shell_cancelled),
+        UserShellStatus::Unknown => format!("{label} · {}", t.shell_status_unknown),
+        _ => label,
     };
     let presentation = crate::presentation::disclosure::DisclosurePresentation {
         label,
@@ -1209,6 +1222,32 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A user shell whose stop could not be confirmed reads as unknown —
+    /// never failed, never cancelled.
+    #[test]
+    fn a_user_shell_with_an_unconfirmed_stop_reads_as_unknown() {
+        use crate::transcript::{UserShellBlock, UserShellStatus};
+        let status = UserShellStatus::from_wire("unknown");
+        let shell = UserShellBlock {
+            id: leveler_core::UserShellId::new("ush-1"),
+            command: "sleep 30".into(),
+            cwd: "/repo".into(),
+            status,
+            output: String::new(),
+            output_truncated: false,
+            exit_code: None,
+            duration_ms: Some(2_000),
+            started_elapsed_secs: 0,
+            expanded: false,
+        };
+        let row: String = user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(row.contains("状态未知"), "{row:?}");
+        assert!(!row.contains('✗') && !row.contains("已取消"), "{row:?}");
     }
 
     // ---- Assistant prose is communication: never folded ----
@@ -1293,6 +1332,11 @@ mod tests {
         let t = Locale::Zh.text();
         let item = TranscriptItem::ToolGroup(ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+                expanded: false,
+                stop: Default::default(),
                 id: ToolCallId::new("g1"),
                 name: "update_goal".into(),
                 arguments: r#"{"status":"complete","summary":"用户询问这是什么项目，已回答"}"#

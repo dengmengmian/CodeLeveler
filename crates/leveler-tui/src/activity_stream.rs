@@ -27,7 +27,7 @@ use crate::render::truncate_display;
 use crate::theme::Theme;
 use crate::tool_cell::{tool_action_label_for, tool_summary_pub};
 use crate::tool_taxonomy::{ActivityVisibility, activity_visibility};
-use crate::transcript::{ToolCallBlock, ToolGroupBlock, ToolStatus};
+use crate::transcript::{StopRequest, ToolCallBlock, ToolGroupBlock, ToolStatus};
 
 /// Render a tool group for the Conversation activity stream.
 ///
@@ -37,6 +37,7 @@ use crate::transcript::{ToolCallBlock, ToolGroupBlock, ToolStatus};
 /// of. Finished history keeps its clickable `▸/▾` summary as a HEADER over
 /// those rows, not in place of them: that row governs how much of each call's
 /// OUTPUT is shown, and output is the only thing a fold may hide.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_group(
     group: &ToolGroupBlock,
@@ -52,7 +53,50 @@ pub(crate) fn render_group(
     // "the latest running call", which would be a guess.
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
 ) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    render_group_rows(
+        group,
+        theme,
+        width,
+        locale,
+        t,
+        now_elapsed_secs,
+        awaiting_approval,
+        &mut rows,
+    )
+}
+
+/// A command call's clickable rows inside a rendered group: its head and
+/// command lines toggle its output, and `stop` is the display-column span of
+/// its stop action on the head line, when it offers one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandRow {
+    pub line: usize,
+    /// Index of the call in its group's `calls`.
+    pub call: usize,
+    pub stop: Option<(usize, usize)>,
+}
+
+/// [`render_group`], also reporting where each command call's rows landed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_group_rows(
+    group: &ToolGroupBlock,
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    rows: &mut Vec<CommandRow>,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    let index_of = |call: &ToolCallBlock| {
+        group
+            .calls
+            .iter()
+            .position(|c| std::ptr::eq(c, call))
+            .unwrap_or(0)
+    };
     let visible: Vec<&ToolCallBlock> = group
         .calls
         .iter()
@@ -70,6 +114,22 @@ pub(crate) fn render_group(
     }
     for unit in plan_units(&group.calls) {
         match unit {
+            StreamUnit::Single(call) if is_shell_call(call) => {
+                let at = out.len();
+                let (lines, stop) = command_unit_lines(
+                    call,
+                    theme,
+                    width,
+                    t,
+                    group.expanded,
+                    now_elapsed_secs,
+                    None,
+                    awaits(call, awaiting_approval),
+                    locale,
+                );
+                push_command_rows(rows, at, index_of(call), stop, lines.len());
+                out.extend(lines);
+            }
             StreamUnit::Single(call) => {
                 out.extend(unit_lines(
                     call,
@@ -106,6 +166,23 @@ pub(crate) fn render_group(
                 let last = calls.len() - 1;
                 for (i, call) in calls.iter().enumerate() {
                     let branch = if i == last { "\u{2514} " } else { "\u{251c} " };
+                    if is_shell_call(call) {
+                        let at = out.len();
+                        let (lines, stop) = command_unit_lines(
+                            call,
+                            theme,
+                            width,
+                            t,
+                            group.expanded,
+                            now_elapsed_secs,
+                            Some(branch),
+                            awaits(call, awaiting_approval),
+                            locale,
+                        );
+                        push_command_rows(rows, at, index_of(call), stop, lines.len());
+                        out.extend(lines);
+                        continue;
+                    }
                     out.extend(unit_lines(
                         call,
                         theme,
@@ -564,7 +641,7 @@ fn unit_lines(
         // when it has not started. Say what it is actually waiting for.
         ToolStatus::Running if awaiting_approval => format!(" · {}", t.approval_pending),
         ToolStatus::Running => {
-            let secs = now_elapsed_secs.saturating_sub(call.started_elapsed_secs);
+            let secs = call.running_secs(now_elapsed_secs);
             if secs > 0 {
                 format!(" · {}", crate::status_line::fmt_elapsed(secs))
             } else {
@@ -670,6 +747,248 @@ fn unit_lines(
     out
 }
 
+/// Record a command unit's head and command lines as click targets.
+fn push_command_rows(
+    rows: &mut Vec<CommandRow>,
+    at: usize,
+    call: usize,
+    stop: Option<(usize, usize)>,
+    lines: usize,
+) {
+    rows.push(CommandRow {
+        line: at,
+        call,
+        stop,
+    });
+    if lines > 1 {
+        rows.push(CommandRow {
+            line: at + 1,
+            call,
+            stop: None,
+        });
+    }
+}
+
+/// Most output rows an expanded command shows; the rest is named, not drawn.
+const COMMAND_OUTPUT_ROWS: usize = 20;
+
+/// A command's lifecycle, as a row states it: a status glyph, what it is doing
+/// or how it ended, and for how long. Every word comes from a runtime fact or
+/// this client's own stop request — never from reading the output.
+fn command_head(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: bool,
+) -> (&'static str, ratatui::style::Color, String, bool) {
+    let duration = || {
+        call.duration_ms
+            .map(|ms| {
+                if ms < 60_000 {
+                    format!(" · {:.1}s", ms as f64 / 1000.0)
+                } else {
+                    format!(" · {}", crate::status_line::fmt_elapsed(ms / 1000))
+                }
+            })
+            .unwrap_or_default()
+    };
+    match call.status {
+        ToolStatus::Running if awaiting_approval => (
+            "\u{26a0}",
+            theme.status.warning,
+            t.approval_pending.to_string(),
+            false,
+        ),
+        ToolStatus::Running => match call.stop {
+            StopRequest::Sent => (
+                "\u{25cc}",
+                theme.accent.primary,
+                t.command_stopping.to_string(),
+                false,
+            ),
+            StopRequest::Uncertain => (
+                "?",
+                theme.status.warning,
+                t.command_stop_unknown.to_string(),
+                true,
+            ),
+            StopRequest::None => (
+                "\u{25cc}",
+                theme.accent.primary,
+                format!(
+                    "{} · {}",
+                    t.command_running,
+                    crate::status_line::fmt_elapsed(call.running_secs(now_elapsed_secs))
+                ),
+                true,
+            ),
+        },
+        ToolStatus::Ok => (
+            "\u{2713}",
+            theme.status.success,
+            format!("{}{}", t.command_done, duration()),
+            false,
+        ),
+        ToolStatus::Failed => {
+            let exit = call
+                .exit_code
+                .filter(|code| *code != 0)
+                .map(|code| format!(" · exit {code}"))
+                .unwrap_or_default();
+            (
+                "\u{2717}",
+                theme.status.error,
+                format!("{}{}{exit}", t.command_failed, duration()),
+                false,
+            )
+        }
+        ToolStatus::Cancelled => (
+            "\u{2298}",
+            theme.text.muted,
+            format!("{}{}", t.command_stopped, duration()),
+            false,
+        ),
+        ToolStatus::Unknown => (
+            "?",
+            theme.status.warning,
+            t.command_unknown.to_string(),
+            false,
+        ),
+    }
+}
+
+/// One command call: a lifecycle head (with its stop action while it runs),
+/// the command line under it, and — when its row is opened or its group is
+/// expanded — its output. Returns the lines and the head's stop-action span.
+#[allow(clippy::too_many_arguments)]
+fn command_unit_lines(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+    group_expanded: bool,
+    now_elapsed_secs: u64,
+    branch: Option<&str>,
+    awaiting_approval: bool,
+    locale: Locale,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let (glyph, glyph_color, state, stoppable) =
+        command_head(call, theme, t, now_elapsed_secs, awaiting_approval);
+    let action = tool_action_label_for(&call.name, locale);
+    let muted = Style::default().fg(theme.text.muted);
+    let mut head = Vec::new();
+    if let Some(branch) = branch {
+        head.push(Span::styled(branch.to_string(), muted));
+    }
+    head.push(Span::styled(
+        format!("{glyph} "),
+        Style::default().fg(glyph_color),
+    ));
+    head.push(Span::styled(
+        action,
+        Style::default().fg(theme.accent.secondary),
+    ));
+    head.push(Span::styled(format!(" · {state}"), muted));
+    let mut stop = None;
+    if stoppable {
+        let used: usize = head
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let label = t.command_stop_action;
+        let label_w = UnicodeWidthStr::width(label);
+        let gap = width.saturating_sub(used + label_w).max(2);
+        head.push(Span::raw(" ".repeat(gap)));
+        let start = used + gap;
+        head.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.accent.primary),
+        ));
+        stop = Some((start, start + label_w));
+    }
+    let mut out = vec![Line::from(head)];
+
+    // Children of a batch keep the tree's rail on their continuation rows.
+    let rail = match branch {
+        Some(b) if b.starts_with('\u{251c}') => "\u{2502} ",
+        Some(_) => "  ",
+        None => "",
+    };
+    let open = call.expanded || group_expanded;
+    let finished = call.status != ToolStatus::Running;
+    let has_output = !call.output.is_empty() || (finished && !preview_body_lines(call).is_empty());
+    let mut line2 = vec![Span::styled(format!("{rail}  "), muted)];
+    if has_output {
+        line2.push(Span::styled(
+            if open { "\u{25be} " } else { "\u{25b8} " },
+            muted,
+        ));
+    }
+    let summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    let prompt = crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
+    if prompt {
+        line2.push(Span::styled(
+            "$ ",
+            Style::default().fg(theme.accent.secondary),
+        ));
+    }
+    let used: usize = line2
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    line2.push(Span::styled(
+        truncate_display(&summary, width.saturating_sub(used + 1).max(8)),
+        Style::default().fg(theme.text.primary),
+    ));
+    out.push(Line::from(line2));
+
+    let body_indent = format!("{rail}    ");
+    if open {
+        // Live output while it streamed; a call seen only finished (history,
+        // replay) has just the runtime's preview.
+        let logical: Vec<&str> = if !call.output.is_empty() {
+            call.output.lines().collect()
+        } else {
+            preview_body_lines(call)
+        };
+        let hidden = logical.len().saturating_sub(COMMAND_OUTPUT_ROWS);
+        if hidden > 0 || call.output_truncated {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "{body_indent}{}",
+                    t.command_output_hidden
+                        .replace("{}", &hidden.max(1).to_string())
+                ),
+                muted,
+            )));
+        }
+        let avail = width
+            .saturating_sub(UnicodeWidthStr::width(body_indent.as_str()))
+            .max(8);
+        for line in &logical[hidden..] {
+            out.push(Line::from(Span::styled(
+                format!("{body_indent}{}", truncate_display(line, avail)),
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+    } else if call.status == ToolStatus::Failed
+        && let Some(note) = failed_one_line_summary(call, t)
+    {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("{rail}  \u{2514} "),
+                Style::default().fg(theme.text.secondary),
+            ),
+            Span::styled(
+                truncate_display(&note, width.saturating_sub(6).max(1)),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
+    (out, stop)
+}
+
 /// Recover the target file of a failed patch from its error preview
 /// (`failed to apply hunk to <file>: …`).
 fn failed_patch_target(preview: Option<&str>) -> Option<String> {
@@ -710,6 +1029,8 @@ fn status_glyph(call: &ToolCallBlock, theme: &Theme) -> (&'static str, ratatui::
     match call.status {
         ToolStatus::Running => ("\u{25cc}", theme.accent.primary),
         ToolStatus::Failed => ("\u{2717}", theme.status.error),
+        ToolStatus::Cancelled => ("\u{2298}", theme.text.muted),
+        ToolStatus::Unknown => ("?", theme.status.warning),
         // A goal update that reports `blocked` is a call that RAN and an
         // outcome that did not. Ok is the runtime fact; ✓ would be a claim the
         // row's own text contradicts. Read from the taxonomy, not a second
@@ -959,6 +1280,21 @@ fn split_placeholder(template: &str) -> (&str, &str) {
     template.split_once("{}").unwrap_or((template, ""))
 }
 
+/// A finished command's output as its preview carries it, without the
+/// runtime's metadata rows (`exit: N`, stream headers).
+fn preview_body_lines(call: &ToolCallBlock) -> Vec<&str> {
+    call.preview
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .filter(|l| {
+            let metadata =
+                l.starts_with("exit: ") || (l.starts_with("--- ") && l.ends_with(" ---"));
+            !l.trim().is_empty() && !metadata
+        })
+        .collect()
+}
+
 /// Output line count for an Ok result row, skipping shell metadata rows.
 fn content_line_count(call: &ToolCallBlock) -> usize {
     let Some(preview) = call
@@ -1074,9 +1410,11 @@ pub(crate) fn render_activity(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(ACTIVITY_INDENT.len());
-    render_group(
+    let mut group_rows = Vec::new();
+    let lines = render_group_rows(
         group,
         theme,
         inner,
@@ -1084,15 +1422,23 @@ pub(crate) fn render_activity(
         t,
         now_elapsed_secs,
         awaiting_approval,
-    )
-    .into_iter()
-    .map(|line| {
-        let mut spans = Vec::with_capacity(line.spans.len() + 1);
-        spans.push(Span::raw(ACTIVITY_INDENT));
-        spans.extend(line.spans);
-        Line::from(spans)
-    })
-    .collect()
+        &mut group_rows,
+    );
+    // The indent shifts every column the group reported.
+    let indent = UnicodeWidthStr::width(ACTIVITY_INDENT);
+    rows.extend(group_rows.into_iter().map(|row| CommandRow {
+        stop: row.stop.map(|(a, b)| (a + indent, b + indent)),
+        ..row
+    }));
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::raw(ACTIVITY_INDENT));
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Plain-text lines for tests (no styling).
@@ -1173,6 +1519,11 @@ mod tests {
 
     fn call(name: &str, args: &str, status: ToolStatus) -> ToolCallBlock {
         ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new(format!("{name}-{}", args.len())),
             name: name.into(),
             arguments: args.into(),
@@ -1674,7 +2025,10 @@ mod tests {
         let other = call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Running);
         let id = gated.id.clone();
         let lines = render_group_awaiting(&open_group(vec![gated, other]), Some(&id));
-        let gated_row = lines.iter().find(|l| l.contains("rm")).expect("gated row");
+        let gated_row = lines
+            .iter()
+            .find(|l| l.contains("执行命令"))
+            .expect("gated row");
         let other_row = lines
             .iter()
             .find(|l| l.contains("a.rs"))
@@ -1875,6 +2229,7 @@ mod tests {
             Locale::Zh.text(),
             0,
             None,
+            &mut Vec::new(),
         );
         let text: Vec<String> = indented
             .iter()
@@ -2176,16 +2531,18 @@ mod tests {
         assert!(lines[0].contains('✗'), "failure stays visible: {lines:?}");
     }
 
-    /// A long multi-line shell script stays a single compact running row —
-    /// current work earns focus, not screen area.
+    /// A long multi-line shell script stays one compact running unit — its
+    /// lifecycle row and one command line — current work earns focus, not
+    /// screen area.
     #[test]
     fn a_long_multi_line_script_renders_one_compact_running_row() {
         let script = "echo start\ncurl -X POST http://127.0.0.1:8090/api/v1/bots/1/permissions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\\\"scope\\\":\\\"repo\\\"}'\ntail -5 out.log";
         let args = serde_json::json!({ "cmd": script }).to_string();
         let g = group(vec![call("shell_command", &args, ToolStatus::Running)]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 1, "one row while running: {lines:?}");
+        assert_eq!(lines.len(), 2, "lifecycle + command line: {lines:?}");
         assert!(lines[0].contains('◌'), "{lines:?}");
+        assert!(lines[1].contains("$ echo start"), "{lines:?}");
     }
 
     #[test]
@@ -2691,13 +3048,17 @@ mod tests {
         c.preview = Some("warning: unused import\nexit: 0".into());
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "one call, one row: {lines:?}");
+        assert_eq!(lines.len(), 2, "lifecycle + command line: {lines:?}");
         assert!(
-            lines[0].starts_with('✓') && lines[0].contains("cargo test"),
-            "the row names the command it ran: {lines:?}"
+            lines[0].starts_with('✓') && lines[1].contains("$ cargo test"),
+            "the unit names the command it ran: {lines:?}"
         );
         assert!(
-            !lines[0].contains("unused import"),
+            lines[1].contains('▸'),
+            "its output is one click away: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("unused import")),
             "OUTPUT stays folded until asked for: {lines:?}"
         );
     }
@@ -2747,13 +3108,17 @@ mod tests {
         let g = group(vec![c]);
         assert!(!g.expanded);
         let lines = render_group_text(&g, 120, Locale::Zh);
-        assert_eq!(lines.len(), 2, "one call: its row and its error: {lines:?}");
-        assert!(
-            lines[0].starts_with('✗') && lines[0].contains("cargo test"),
-            "the row names the failure and the command: {lines:?}"
+        assert_eq!(
+            lines.len(),
+            3,
+            "one call: lifecycle, command and its error: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
+            lines[0].starts_with('✗') && lines[1].contains("$ cargo test"),
+            "the unit names the failure and the command: {lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("  └ ") && lines[2].contains("error: no such command"),
             "result row carries the first error line: {lines:?}"
         );
         assert!(
@@ -2840,10 +3205,10 @@ mod tests {
         let lines = render_group_text(&g, 100, Locale::Zh);
         let head = lines
             .iter()
-            .find(|l| l.contains("执行命令"))
+            .find(|l| l.contains("$ "))
             .expect("command row exists");
         assert!(
-            head.contains("$ ") && head.contains("cargo test --workspace"),
+            head.contains("cargo test --workspace"),
             "command row carries the body with a shell prompt: {lines:?}"
         );
         assert!(
@@ -2870,7 +3235,7 @@ mod tests {
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(lines[0].starts_with('◌'), "{lines:?}");
         assert!(
-            lines[0].contains("$ ") && lines[0].contains("cargo build"),
+            lines[1].contains("$ ") && lines[1].contains("cargo build"),
             "{lines:?}"
         );
     }

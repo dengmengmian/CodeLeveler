@@ -49,6 +49,10 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
             Style::default().fg(theme.status.warning),
         ),
         UserShellStatus::Cancelled => (t.shell_status_cancelled, dim),
+        UserShellStatus::Unknown => (
+            t.shell_status_unknown,
+            Style::default().fg(theme.status.warning),
+        ),
     };
     let runtime_secs = match shell.duration_ms {
         Some(ms) => ms / 1000,
@@ -1594,6 +1598,11 @@ mod tests {
 
         let task = TranscriptItem::ToolGroup(ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+                expanded: false,
+                stop: Default::default(),
                 id: ToolCallId::new("task-1"),
                 name: "task".into(),
                 arguments: r#"{"description":"Inspect provider architecture"}"#.into(),
@@ -2092,6 +2101,11 @@ mod tests {
 
     fn tool_item(name: &str, args: &str, ms: u64) -> ToolCallBlock {
         ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("t"),
             name: name.into(),
             arguments: args.into(),
@@ -2249,6 +2263,11 @@ mod tests {
     #[test]
     fn failed_tool_output_is_available_in_expanded_details() {
         let item = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("t"),
             name: "apply_patch".into(),
             arguments: "{}".into(),
@@ -2274,6 +2293,11 @@ mod tests {
     #[test]
     fn read_file_success_hides_noisy_preview_until_expanded() {
         let item = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("t1"),
             name: "read_file".into(),
             arguments: r#"{"path":"README.md"}"#.into(),
@@ -2304,6 +2328,11 @@ mod tests {
     #[test]
     fn update_goal_success_hides_internal_preview() {
         let item = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("g1"),
             name: "update_goal".into(),
             arguments: r#"{"status":"complete","summary":"完成了对示例 CLI 项目的安装验证"}"#
@@ -2338,6 +2367,11 @@ mod tests {
     fn update_goal_success_expands_full_summary_not_internal_preview() {
         let long = "已通过阅读 README.md, Cargo.toml, AGENTS.md 和目录结构, 确认这是一个 Rust 多 crate workspace 编程 Agent CLI，默认 Goal 模式需要 update_goal 显式结案。";
         let item = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("g2"),
             name: "update_goal".into(),
             arguments: serde_json::json!({

@@ -16,6 +16,13 @@ const SELECTION_EDGE_ROWS: u16 = 2;
 /// The semantic target under a Conversation screen cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
+    /// A command call's row → that call; `stop` when the pointer is on its
+    /// stop action.
+    Command {
+        item: usize,
+        call: usize,
+        stop: bool,
+    },
     /// A tool-disclosure header row → the transcript item to toggle.
     Disclosure { item: usize },
     /// A row containing an http(s) URL under the pointer. Carries the content
@@ -39,6 +46,17 @@ pub fn hit_test(state: &AppState, col: u16, row: u16) -> Hit {
     let Some(pos) = geometry::screen_to_content(state, col, row) else {
         return Hit::Outside;
     };
+    // A command row owns its own disclosure and stop, ahead of its group's.
+    if let Some(hit) = state.command_hit_at(geometry::content_width(state), pos.row) {
+        let stop = hit
+            .stop
+            .is_some_and(|(start, end)| (start..end).contains(&pos.col));
+        return Hit::Command {
+            item: hit.item,
+            call: hit.call,
+            stop,
+        };
+    }
     if let Some(item) = state.disclosure_item_at(geometry::content_width(state), pos.row) {
         return Hit::Disclosure { item };
     }

@@ -181,18 +181,38 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
 fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
     match completion {
         EffectCompletion::CommandDelivered => {}
-        EffectCompletion::CommandRejected { message, snapshot } => {
+        EffectCompletion::CommandRejected {
+            command,
+            message,
+            snapshot,
+        } => {
             if let Some(snapshot) = snapshot {
                 apply_runtime(state, RuntimeEvent::SessionOpened { session: *snapshot });
+            }
+            // Nothing is being stopped: the row goes back to offering a stop.
+            if let ClientCommand::CancelToolCall { call_id, .. } = &command {
+                state
+                    .transcript
+                    .set_tool_stop(call_id, crate::transcript::StopRequest::None);
             }
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
                 message,
             });
         }
-        EffectCompletion::CommandUncertain { snapshot } => {
-            let message = if let Some(snapshot) = snapshot {
+        EffectCompletion::CommandUncertain { command, snapshot } => {
+            let resynced = snapshot.is_some();
+            if let Some(snapshot) = snapshot {
                 apply_runtime(state, RuntimeEvent::SessionOpened { session: *snapshot });
+            }
+            // The stop may or may not have reached the runtime. A call still
+            // running says exactly that; one that settled says how.
+            if let ClientCommand::CancelToolCall { call_id, .. } = &command {
+                state
+                    .transcript
+                    .set_tool_stop(call_id, crate::transcript::StopRequest::Uncertain);
+            }
+            let message = if resynced {
                 state.t().command_outcome_unknown_synced
             } else {
                 // Delivery is uncertain: the runtime may already be executing.
@@ -446,6 +466,18 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // on a URL opens on release when the selection stayed empty
                 // (see Up); anything else begins a selection.
                 match interaction::hit_test(state, mouse.column, mouse.row) {
+                    Hit::Command { item, call, stop } => {
+                        let effects = if stop {
+                            request_tool_stop(state, item, call)
+                        } else {
+                            state.transcript.toggle_call_at(item, call);
+                            Vec::new()
+                        };
+                        state.conv.plain.clear();
+                        interaction::clear_selection_drag(state);
+                        state.conv.selection.clear();
+                        return effects;
+                    }
                     Hit::Disclosure { item } => {
                         // A user shell row opens its Details screen (running
                         // or finished); tool groups / sub-agents toggle
@@ -949,6 +981,29 @@ fn navigate_user_turn(state: &mut AppState, delta: i32) {
     }
 }
 
+/// Ask the runtime to stop one running command. The row says "stopping" from
+/// here on; only the runtime's terminal event says it stopped.
+fn request_tool_stop(state: &mut AppState, item: usize, call: usize) -> Vec<Effect> {
+    let Some(crate::transcript::TranscriptItem::ToolGroup(group)) =
+        state.transcript.items().get(item)
+    else {
+        return Vec::new();
+    };
+    let Some(id) = group.calls.get(call).map(|c| c.id.clone()) else {
+        return Vec::new();
+    };
+    if !state
+        .transcript
+        .set_tool_stop(&id, crate::transcript::StopRequest::Sent)
+    {
+        return Vec::new();
+    }
+    vec![Effect::Send(ClientCommand::CancelToolCall {
+        session_id: state.session_id.clone(),
+        call_id: id,
+    })]
+}
+
 /// Ctrl+O (undocumented fallback): toggle the latest collapsible block —
 /// a tool group or a sub-agent.
 ///
@@ -1142,6 +1197,9 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
 }
 
 #[cfg(test)]
+mod command_row_tests;
+
+#[cfg(test)]
 mod disclosure_tests {
     use super::*;
     use crate::state::Boot;
@@ -1183,12 +1241,9 @@ mod disclosure_tests {
     /// per-group disclosure contract is about.
     fn three_groups(s: &mut AppState) {
         s.transcript.push_user("q1".into());
-        finished_tool(
-            s,
-            "a1",
-            "run_command",
-            r#"{"program":"cargo","args":["test"]}"#,
-        );
+        // Group disclosure is the subject here; a command call's row owns its
+        // own per-call disclosure instead (see `command_row_tests`).
+        finished_tool(s, "a1", "web_search", r#"{"query":"cargo test"}"#);
         s.transcript.push_user("q2".into());
         finished_tool(s, "b1", "read_file", r#"{"path":"a.rs"}"#);
         s.transcript.push_user("q3".into());

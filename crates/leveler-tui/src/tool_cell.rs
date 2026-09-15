@@ -17,6 +17,8 @@ fn tool_glyph(status: ToolStatus) -> &'static str {
         ToolStatus::Running => "◌",
         ToolStatus::Ok => "✓",
         ToolStatus::Failed => "✗",
+        ToolStatus::Cancelled => "⊘",
+        ToolStatus::Unknown => "?",
     }
 }
 
@@ -25,6 +27,8 @@ fn tool_style(theme: &Theme, status: ToolStatus) -> Style {
         ToolStatus::Running => Style::default().fg(theme.accent.primary),
         ToolStatus::Ok => Style::default().fg(theme.status.success),
         ToolStatus::Failed => Style::default().fg(theme.status.error),
+        ToolStatus::Cancelled => Style::default().fg(theme.text.muted),
+        ToolStatus::Unknown => Style::default().fg(theme.status.warning),
     }
 }
 
@@ -1398,6 +1402,11 @@ mod m1_tests {
 
     fn edit_block(name: &str, args: serde_json::Value, applied: Option<&str>) -> ToolCallBlock {
         ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("e1"),
             name: name.into(),
             arguments: args.to_string(),
@@ -1617,6 +1626,11 @@ mod m1_tests {
         .to_string();
         let mut out = Vec::new();
         let block = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("r1"),
             name: "replace".into(),
             arguments: args.clone(),
@@ -1812,6 +1826,8 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
             ToolStatus::Running => t.tools_status_running,
             ToolStatus::Ok => t.tools_status_ok,
             ToolStatus::Failed => t.tools_status_attention,
+            ToolStatus::Cancelled => t.command_stopped,
+            ToolStatus::Unknown => t.command_unknown,
         };
         detail.push(Line::from(vec![
             Span::styled(
@@ -1872,6 +1888,11 @@ mod tests {
 
     fn failed_block(preview: &str) -> ToolCallBlock {
         ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("c1"),
             name: "run_command".to_string(),
             arguments: "{}".to_string(),
@@ -1922,6 +1943,11 @@ mod tests {
     #[test]
     fn replace_edit_renders_an_inline_diff_like_apply_patch() {
         let block = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("r1"),
             name: "replace".to_string(),
             arguments: r#"{"path":"src/lib.rs","old":"fn old() {}","new":"fn renamed() {}\nfn extra() {}"}"#
@@ -1968,6 +1994,11 @@ mod tests {
     #[test]
     fn failed_replace_shows_the_error_not_a_diff() {
         let block = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("r2"),
             name: "replace".to_string(),
             arguments: r#"{"path":"src/lib.rs","old":"zzz","new":"q"}"#.to_string(),
@@ -2005,6 +2036,11 @@ mod tests {
         // the model. The user sees a short localized "plan unchanged" line, not
         // the raw `— plan step "…" cannot …` internals.
         let block = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("p1"),
             name: "update_plan".to_string(),
             arguments: r#"{"explanation":"现在开始第3步"}"#.to_string(),
@@ -2057,6 +2093,11 @@ mod tests {
     fn only_plan_and_goal_failures_get_a_substituted_note() {
         let render = |name: &str, preview: &str| {
             let block = ToolCallBlock {
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+                expanded: false,
+                stop: Default::default(),
                 id: leveler_client_protocol::ToolCallId::new("g1"),
                 name: name.to_string(),
                 arguments: r#"{"path":"backend"}"#.to_string(),
@@ -2146,6 +2187,11 @@ mod tests {
     #[test]
     fn unsupported_task_call_is_actionable_instead_of_raw() {
         let block = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: leveler_client_protocol::ToolCallId::new("task-1"),
             name: "task".into(),
             arguments: r#"{"description":"Explore provider architecture","prompt":"Read the core client files"}"#.into(),

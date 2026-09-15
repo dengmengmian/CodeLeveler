@@ -88,6 +88,7 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
                 ToolStatus::Running => ("●", theme.accent.primary),
                 ToolStatus::Ok => ("✓", theme.status.success),
                 ToolStatus::Failed => ("✗", theme.status.error),
+                ToolStatus::Cancelled | ToolStatus::Unknown => ("?", theme.status.warning),
             };
             let mut spans = vec![
                 Span::styled(format!("{glyph} "), Style::default().fg(color)),

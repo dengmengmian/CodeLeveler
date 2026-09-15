@@ -42,6 +42,33 @@ pub enum ToolStatus {
     Running,
     Ok,
     Failed,
+    /// Stopped, and the runtime confirmed its process tree gone.
+    Cancelled,
+    /// No terminal fact reached this view, or a stop could not be confirmed.
+    /// Never presented as done, failed, or stopped.
+    Unknown,
+}
+
+/// A user's request to stop one running command, as far as this client knows.
+/// Intent only: the call's status changes when the runtime says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StopRequest {
+    #[default]
+    None,
+    /// Sent; the runtime has not settled the call yet.
+    Sent,
+    /// The stop may or may not have reached the runtime.
+    Uncertain,
+}
+
+/// Bounded client-side tail of a running command's live output.
+pub const TOOL_OUTPUT_CAP: usize = 64 * 1024;
+
+impl ToolCallBlock {
+    /// Whole seconds this call has been running at turn clock `now`.
+    pub fn running_secs(&self, now_elapsed_secs: u64) -> u64 {
+        (now_elapsed_secs as i64 - self.started_elapsed_secs).max(0) as u64
+    }
 }
 
 /// A tool invocation .
@@ -72,7 +99,18 @@ pub struct ToolCallBlock {
     pub batch: Option<u32>,
     /// The turn's `elapsed_secs` when this call started, so a running command
     /// can show a live elapsed (`now - started`) instead of a static block.
-    pub started_elapsed_secs: u64,
+    /// SIGNED: a reconnect back-dates it by the runtime's own elapsed.
+    pub started_elapsed_secs: i64,
+    /// The exit code the runtime reported for a command call.
+    pub exit_code: Option<i32>,
+    /// Live output of a command call (bounded tail), from the runtime.
+    pub output: String,
+    /// True when `output` dropped earlier output.
+    pub output_truncated: bool,
+    /// Per-call disclosure of a command's output. Pure display state.
+    pub expanded: bool,
+    /// This client's stop request for a running command.
+    pub stop: StopRequest,
     /// Canonical unified diff of what this edit ACTUALLY changed, reported by
     /// the tool that made it. The inline diff renders from THIS when it is
     /// present: `arguments` say what the model wanted, and only execution
@@ -210,6 +248,8 @@ pub enum UserShellStatus {
     Success,
     Failed,
     Cancelled,
+    /// Stopped, but the runtime could not confirm the process tree gone.
+    Unknown,
 }
 
 impl UserShellStatus {
@@ -217,6 +257,7 @@ impl UserShellStatus {
         match status {
             "success" => Self::Success,
             "cancelled" => Self::Cancelled,
+            "unknown" => Self::Unknown,
             _ => Self::Failed,
         }
     }
@@ -611,9 +652,11 @@ impl TranscriptState {
                 }
                 TranscriptItem::ToolGroup(group) => {
                     group.open = false;
+                    // No terminal reached this view: the outcome is unknown,
+                    // not a failure the UI made up.
                     for call in &mut group.calls {
                         if call.status == ToolStatus::Running {
-                            call.status = ToolStatus::Failed;
+                            call.status = ToolStatus::Unknown;
                         }
                     }
                 }
@@ -680,10 +723,15 @@ impl TranscriptState {
         name: String,
         arguments: String,
         parallel: bool,
-        started_elapsed_secs: u64,
+        started_elapsed_secs: i64,
     ) {
         self.bump();
         let mut call = ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id,
             name,
             arguments,
@@ -730,23 +778,86 @@ impl TranscriptState {
         duration_ms: u64,
         applied_diff: Option<String>,
     ) {
+        self.complete_command(id, ok, preview, duration_ms, applied_diff, None, None);
+    }
+
+    /// Complete a call with the process facts a command reported. A stop
+    /// decides the status on its own: confirmed is stopped, unconfirmed is
+    /// unknown — neither is ever read as a failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_command(
+        &mut self,
+        id: &ToolCallId,
+        ok: bool,
+        preview: String,
+        duration_ms: u64,
+        applied_diff: Option<String>,
+        exit_code: Option<i32>,
+        stop: Option<leveler_client_protocol::UiCommandStop>,
+    ) {
+        use leveler_client_protocol::UiCommandStop;
         self.bump();
-        for item in self.items.iter_mut().rev() {
-            let TranscriptItem::ToolGroup(group) = item else {
-                continue;
+        if let Some(block) = self.tool_call_mut(id) {
+            block.status = match (stop, ok) {
+                (Some(UiCommandStop::Confirmed), _) => ToolStatus::Cancelled,
+                (Some(UiCommandStop::Unconfirmed), _) => ToolStatus::Unknown,
+                (None, true) => ToolStatus::Ok,
+                (None, false) => ToolStatus::Failed,
             };
-            if let Some(block) = group.calls.iter_mut().rev().find(|call| &call.id == id) {
-                block.status = if ok {
-                    ToolStatus::Ok
-                } else {
-                    ToolStatus::Failed
-                };
-                block.preview = Some(preview);
-                block.duration_ms = Some(duration_ms);
-                block.applied_diff = applied_diff;
-                return;
-            }
+            block.preview = Some(preview);
+            block.duration_ms = Some(duration_ms);
+            block.applied_diff = applied_diff;
+            block.exit_code = exit_code;
         }
+    }
+
+    /// Append live output to a running command call (bounded tail).
+    pub fn append_tool_output(&mut self, id: &ToolCallId, chunk: &str) {
+        self.bump();
+        let Some(block) = self.tool_call_mut(id) else {
+            return;
+        };
+        block.output.push_str(chunk);
+        if block.output.len() > TOOL_OUTPUT_CAP {
+            let cut = block.output.len() - TOOL_OUTPUT_CAP;
+            let cut = leveler_core::ceil_char_boundary(&block.output, cut);
+            block.output.drain(..cut);
+            block.output_truncated = true;
+        }
+    }
+
+    /// Record this client's stop request for a call. Returns false when the
+    /// call is not (or no longer) running, so no request is pending on it.
+    pub fn set_tool_stop(&mut self, id: &ToolCallId, stop: StopRequest) -> bool {
+        self.bump();
+        match self.tool_call_mut(id) {
+            Some(block) if block.status == ToolStatus::Running => {
+                block.stop = stop;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle one call's own output disclosure (a command row click).
+    pub fn toggle_call_at(&mut self, item: usize, call: usize) -> Option<bool> {
+        let TranscriptItem::ToolGroup(group) = self.items.get_mut(item)? else {
+            return None;
+        };
+        let block = group.calls.get_mut(call)?;
+        block.expanded = !block.expanded;
+        let expanded = block.expanded;
+        self.bump();
+        Some(expanded)
+    }
+
+    fn tool_call_mut(&mut self, id: &ToolCallId) -> Option<&mut ToolCallBlock> {
+        self.items.iter_mut().rev().find_map(|item| match item {
+            TranscriptItem::ToolGroup(group) => {
+                group.calls.iter_mut().rev().find(|call| &call.id == id)
+            }
+            _ => None,
+        })
     }
 
     /// Begin a user shell execution block (idempotent per id).
@@ -1611,6 +1722,11 @@ mod tests {
     fn group(expanded: bool) -> ToolGroupBlock {
         ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+                expanded: false,
+                stop: Default::default(),
                 id: ToolCallId::new("t1"),
                 name: "read_file".into(),
                 arguments: r#"{"path":"a"}"#.into(),

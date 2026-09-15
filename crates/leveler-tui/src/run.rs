@@ -139,8 +139,9 @@ pub async fn run(
                 } => {
                     let client = Arc::clone(&delivery_client);
                     let issuer = session_id.clone();
+                    let issued = command.clone();
                     let mut attempt =
-                        tokio::spawn(async move { client.issue(issuer, command).await });
+                        tokio::spawn(async move { client.issue(issuer, issued).await });
                     let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
                         Ok(joined) => delivery_answer(joined),
                         Err(_) => DeliveryAnswer::None,
@@ -148,6 +149,7 @@ pub async fn run(
                     match answer {
                         DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
                         DeliveryAnswer::Rejected(message) => EffectCompletion::CommandRejected {
+                            command,
                             message,
                             snapshot: snapshot_within(&delivery_client, &session_id).await,
                         },
@@ -155,6 +157,7 @@ pub async fn run(
                         // were it to, it is still no delivery this client saw.
                         DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
                             EffectCompletion::CommandUncertain {
+                                command,
                                 snapshot: snapshot_within(&delivery_client, &session_id).await,
                             }
                         }

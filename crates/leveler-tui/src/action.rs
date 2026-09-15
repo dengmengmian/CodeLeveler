@@ -20,12 +20,16 @@ pub enum EffectCompletion {
     /// The runtime answered with an error: it is reachable, and it did not
     /// accept the command.
     CommandRejected {
+        /// The command that was refused, so a control waiting on it (a stop
+        /// request) can settle.
+        command: ClientCommand,
         message: String,
         /// Best-effort authoritative state used to roll back optimistic UI.
         snapshot: Option<Box<UiSessionSnapshot>>,
     },
     /// No answer: the command may or may not have run.
     CommandUncertain {
+        command: ClientCommand,
         snapshot: Option<Box<UiSessionSnapshot>>,
     },
     /// The runtime admitted this turn input (now, or on an earlier attempt).

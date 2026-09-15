@@ -173,7 +173,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let started = state.elapsed_secs;
             state
                 .transcript
-                .push_tool_started(id, name, arguments, parallel, started);
+                .push_tool_started(id, name, arguments, parallel, started as i64);
         }
         RuntimeEvent::ToolCallCompleted {
             id,
@@ -181,22 +181,33 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             preview,
             duration_ms,
             applied_diff,
-            ..
+            exit_code,
+            stop,
         } => {
             // Strip ANSI and controls so vitest/npm color codes do not show as
             // `[32m` garbage when ESC was already dropped (cell TUI).
             let preview = leveler_core::sanitize_terminal_output(&preview);
-            state
-                .transcript
-                .complete_tool(&id, ok, preview, duration_ms, applied_diff);
+            state.transcript.complete_command(
+                &id,
+                ok,
+                preview,
+                duration_ms,
+                applied_diff,
+                exit_code,
+                stop,
+            );
             // The tool is done; leaving its label up while the model thinks
             // reads as a hung tool ("读取 x… (4m)"). Fall back to the
             // thinking indicator until the next activity arrives.
             clear_activity(state);
             seal_analysis_segment(state);
         }
-        // Rendered by the shell execution row (next change).
-        RuntimeEvent::ToolCallOutput { .. } => {}
+        RuntimeEvent::ToolCallOutput { id, chunk, .. } => {
+            // Already sanitized by the runtime; strip again like every other
+            // terminal text this client paints.
+            let chunk = leveler_core::sanitize_terminal_output(&chunk);
+            state.transcript.append_tool_output(&id, &chunk);
+        }
         RuntimeEvent::PlanUpdated { plan } => {
             state.plan_settled = false;
             // Fully succeeded plans (incl. 1/1) clear immediately so the chrome
@@ -1266,10 +1277,14 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     for tool in session.active_tools {
         // Restored mid-flight calls are shown as normal (not grouped as parallel);
         // the snapshot does not carry the batch flag.
-        let started = state.elapsed_secs;
+        // Back-dated by the runtime's own clock, so a reconnect does not
+        // restart a long command at zero.
+        let started = state.elapsed_secs as i64 - (tool.elapsed_ms / 1000) as i64;
+        let id = tool.id.clone();
         state
             .transcript
             .push_tool_started(tool.id, tool.name, tool.arguments, false, started);
+        state.transcript.append_tool_output(&id, &tool.output_tail);
     }
 
     // Welcome card removed: Header owns project context; Input owns model/mode.

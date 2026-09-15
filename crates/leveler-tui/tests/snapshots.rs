@@ -637,7 +637,6 @@ fn command_result_renders_as_important_activity_not_file_list() {
         )),
     );
     let expanded = render_at(120, 30, &mut state);
-    assert!(expanded.contains("详情"), "{expanded}");
     assert!(expanded.contains("raw-shell-output"), "{expanded}");
     assert!(expanded.contains("second-line"), "{expanded}");
 }

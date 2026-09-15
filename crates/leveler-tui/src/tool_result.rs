@@ -26,6 +26,8 @@ pub(crate) fn result_lines(
     let (glyph, color, status) = match call.status {
         ToolStatus::Ok => ("✓", theme.status.success, t.tool_status_succeeded),
         ToolStatus::Failed => ("✗", theme.status.error, t.tool_status_failed),
+        ToolStatus::Cancelled => ("⊘", theme.text.muted, t.command_stopped),
+        ToolStatus::Unknown => ("?", theme.status.warning, t.command_unknown),
         ToolStatus::Running => unreachable!("running calls use Tool Activity"),
     };
     let mut summary = format!("{status} · {}", tool_target(call, locale, t));
@@ -194,6 +196,11 @@ mod tests {
 
     fn command(preview: &str) -> ToolCallBlock {
         ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
             id: ToolCallId::new("command-1"),
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test"]}"#.into(),

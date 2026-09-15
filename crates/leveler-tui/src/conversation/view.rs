@@ -24,6 +24,10 @@ pub struct ConvKey {
     /// did not notice would keep painting `◌` over a command nobody has
     /// authorised — or `等待批准` after it was allowed.
     pub(crate) awaiting_approval: Option<leveler_client_protocol::ToolCallId>,
+    /// The app's turn clock. Running rows (a command's elapsed, a sub-agent's
+    /// run time) are painted from it, so a new second is a new frame even when
+    /// no transcript event arrived. Constant while idle.
+    pub(crate) elapsed_secs: u64,
 }
 
 /// One memoized conversation build: cache key, wrapped lines, and the
@@ -34,7 +38,19 @@ pub type ConvCacheEntry = (
     ConvKey,
     std::rc::Rc<Vec<Line<'static>>>,
     std::rc::Rc<Vec<(usize, usize)>>,
+    std::rc::Rc<Vec<CommandHit>>,
 );
+
+/// A command call's clickable row in the built conversation: absolute line,
+/// transcript item, call index within its group, and the display-column span
+/// of its stop action when the row offers one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandHit {
+    pub line: usize,
+    pub item: usize,
+    pub call: usize,
+    pub stop: Option<(usize, usize)>,
+}
 
 /// Viewport + interaction state for the Conversation.
 #[derive(Debug)]
