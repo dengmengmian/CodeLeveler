@@ -79,7 +79,7 @@ export function inspectorVisibleSections(
   if (mode === 'waiting') sections.push('action');
   if (mode === 'running' || mode === 'idle') sections.push('task');
   if (mode === 'terminal') sections.push('result');
-  if (currentPlanProgress(s.plan)) sections.push('plan');
+  if (planProgress(s.plan, s.turnActive)) sections.push('plan');
   if (s.verification && s.verification.checks.length > 0) sections.push('verification');
   if ((s.diff?.files.length ?? 0) > 0) sections.push('changes');
   if (s.agents.length > 0 || extras.delegatedAgents) sections.push('agents');
@@ -88,15 +88,18 @@ export function inspectorVisibleSections(
   return sections;
 }
 
-export function currentPlanProgress(
+/**
+ * The plan is the agent's declared progress: how much it declared done, and —
+ * only while a turn runs — the step it declared in progress. No declared step
+ * means none is shown; a pending step is never promoted to "current". Outside
+ * a running turn the plan is the last record of what was declared.
+ */
+export function planProgress(
   plan: UiPlan | null | undefined,
-): { current: number; total: number; description: string } | null {
+  live: boolean,
+): { done: number; total: number; live: boolean; active: string | null } | null {
   if (!plan || plan.steps.length === 0) return null;
-  const running = plan.steps.find((s) => s.status === 'running');
-  const step = running ?? plan.steps.find((s) => s.status === 'pending') ?? plan.steps[plan.steps.length - 1];
-  return {
-    current: step.index + 1,
-    total: plan.steps.length,
-    description: step.description,
-  };
+  const done = plan.steps.filter((s) => s.status === 'done' || s.status === 'skipped').length;
+  const running = live ? plan.steps.find((s) => s.status === 'running') : undefined;
+  return { done, total: plan.steps.length, live, active: running?.description ?? null };
 }

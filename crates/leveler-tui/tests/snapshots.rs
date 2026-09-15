@@ -754,14 +754,21 @@ fn a_plan_transition_repaints_on_the_same_frame() {
             },
         })
     };
+    // Plan updates arrive while a turn runs.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "run".into(),
+        }),
+    );
     reduce(&mut state, plan(P::Running, P::Pending, P::Pending));
     let before = render_at(100, 30, &mut state);
-    assert!(before.contains("当前 1/3"), "{before}");
+    assert!(before.contains("已完成 0/3"), "{before}");
 
     reduce(&mut state, plan(P::Done, P::Running, P::Pending));
     let after = render_at(100, 30, &mut state);
     assert!(
-        after.contains("1/3 已完成") && after.contains("当前 2/3"),
+        after.contains("已完成 1/3"),
         "the header follows the transition: {after}"
     );
     assert!(after.contains("骨架") && after.contains("首页"), "{after}");

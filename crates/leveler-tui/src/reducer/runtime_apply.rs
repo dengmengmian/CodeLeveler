@@ -195,6 +195,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             seal_analysis_segment(state);
         }
         RuntimeEvent::PlanUpdated { plan } => {
+            state.plan_settled = false;
             // Fully succeeded plans (incl. 1/1) clear immediately so the chrome
             // does not linger after the last ✓; open/failed plans stay.
             if crate::workbench::plan_panel_should_show(&plan) {
@@ -761,22 +762,23 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     };
     state.cancel_armed = false;
     state.force_cancel_armed = false;
-    // The plan is a LIVE progress surface, and this turn's work is over: a
-    // sticky "第 7/9 项进行中" would claim work nobody is doing. This is
-    // presentation retirement only — the plan is NOT the completion authority
-    // (it never blocks a turn from ending), and nothing here marks its open
-    // steps done, because the runtime cannot prove they ran. An unfinished
-    // turn keeps its plan: there it is the continuation context the user
-    // needs. A fully-done plan is dropped whatever the outcome — the answer
-    // is already in the transcript.
-    if work_is_finished(status)
-        || state
-            .plan
-            .as_ref()
-            .is_some_and(|p| !crate::workbench::plan_panel_should_show(p))
+    // The plan is the agent's declared progress and NOT the completion
+    // authority: a task may finish with steps still open, and nothing here
+    // marks them done, because the runtime cannot prove they ran. An open plan
+    // stays as the last record of what was declared — the turn is no longer
+    // running, so the dock presents it as that record, not as work under way.
+    // A finished task's plan is dropped when the next turn starts; an
+    // unfinished task's plan is the continuation context and stays. A
+    // fully-done plan is dropped whatever the outcome — the answer is already
+    // in the transcript.
+    if state
+        .plan
+        .as_ref()
+        .is_some_and(|p| !crate::workbench::plan_panel_should_show(p))
     {
         state.plan = None;
     }
+    state.plan_settled = state.plan.is_some() && work_is_finished(status);
     // If the provider never reported usage, still drive the context gauge from
     // the visible transcript so it is not stuck at empty capacity forever.
     if state.context_tokens == 0 && state.token_input == 0 {
@@ -973,6 +975,10 @@ fn clear_activity(state: &mut AppState) {
 pub(super) fn start_turn(state: &mut AppState) {
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
+    if state.plan_settled {
+        state.plan = None;
+        state.plan_settled = false;
+    }
     state.finalization_stage = None;
     state.project_rule_sources.clear();
     // The previous turn's next step is spent — a new turn is under way.
@@ -1098,6 +1104,7 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     state.plan = session
         .plan
         .filter(crate::workbench::plan_panel_should_show);
+    state.plan_settled = false;
     state.verification = session.verification.clone();
     state.diff = session.diff.clone();
     if state

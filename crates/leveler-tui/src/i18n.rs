@@ -275,7 +275,7 @@ pub struct UiText {
     pub unsupported_task_action: &'static str,
     pub unsupported_task_hint: &'static str,
     /// Shown instead of the internal validation error when an update_plan is
-    /// rejected (e.g. skipping an unfinished step).
+    /// rejected (e.g. an empty plan).
     pub plan_update_rejected: &'static str,
     /// Shown instead of the internal validation error when an `update_goal` is
     /// rejected (a resolution with no status, a close while children still run).
@@ -397,10 +397,16 @@ pub struct UiText {
     pub no_plan: &'static str,
     /// Label fragment for "step k of n" in sticky plan header (e.g. "步").
     pub plan_step_of: &'static str,
-    /// "当前 {current}/{total}" — only when a step is actually Running.
-    pub plan_current_item: &'static str,
-    /// "{done}/{total} 已完成" — no fabricated in-progress item.
+    /// "第 {current}/{total} 步进行中" — the live activity line, only when the
+    /// plan declares a step in progress.
+    pub plan_running_chip: &'static str,
+    /// "进行中：{step}" — the step the plan declares in progress.
+    pub plan_running_item: &'static str,
+    /// "已完成 {done}/{total}" — how much the plan declares done.
     pub plan_n_done: &'static str,
+    /// "最后记录 {done}/{total}" — the plan outside a running turn: the last
+    /// declaration, not work under way.
+    pub plan_last_recorded: &'static str,
     /// "↑ 还有 {} 项" — plan steps scrolled off the top of the dock.
     pub plan_hidden_before: &'static str,
     /// "↓ 还有 {} 项" — plan steps scrolled off the bottom of the dock.
@@ -833,7 +839,7 @@ static ZH: UiText = UiText {
     agents_scroll_hint: "↑↓/PgUp/PgDn 滚动 · Esc 返回",
     unsupported_task_action: "委派（不支持）",
     unsupported_task_hint: "不支持 task，请改用 spawn_agent",
-    plan_update_rejected: "计划未更新：需按顺序完成步骤",
+    plan_update_rejected: "计划未更新",
     goal_update_rejected: "目标未更新：需先说明状态",
     tool_group_calls: "工具调用 {} 次",
     tool_group_running: "正在{}",
@@ -919,8 +925,10 @@ static ZH: UiText = UiText {
     no_context: "暂无上下文信息",
     no_plan: "暂无任务步骤",
     plan_step_of: "当前",
-    plan_current_item: "当前 {current}/{total}",
-    plan_n_done: "{done}/{total} 已完成",
+    plan_running_chip: "第 {current}/{total} 步进行中",
+    plan_running_item: "进行中：{step}",
+    plan_n_done: "已完成 {done}/{total}",
+    plan_last_recorded: "最后记录 {done}/{total}",
     plan_hidden_before: "↑ 还有 {} 项",
     plan_hidden_after: "↓ 还有 {} 项",
     plan_hidden_both: "… 前 {before} 项 · 后 {after} 项",
@@ -1297,7 +1305,7 @@ static EN: UiText = UiText {
     agents_scroll_hint: "↑↓/PgUp/PgDn scroll · Esc back",
     unsupported_task_action: "Delegation (unsupported)",
     unsupported_task_hint: "task is unsupported; use spawn_agent",
-    plan_update_rejected: "plan unchanged: complete steps in order",
+    plan_update_rejected: "plan not updated",
     goal_update_rejected: "goal unchanged: state it explicitly",
     tool_group_calls: "{} tool calls",
     tool_group_running: "running {}",
@@ -1383,8 +1391,10 @@ static EN: UiText = UiText {
     no_context: "No context yet",
     no_plan: "No task steps yet",
     plan_step_of: "step",
-    plan_current_item: "current {current}/{total}",
+    plan_running_chip: "step {current}/{total} in progress",
+    plan_running_item: "in progress: {step}",
     plan_n_done: "{done}/{total} completed",
+    plan_last_recorded: "last recorded {done}/{total}",
     plan_hidden_before: "↑ {} earlier items",
     plan_hidden_after: "↓ {} more items",
     plan_hidden_both: "… {before} earlier · {after} more",

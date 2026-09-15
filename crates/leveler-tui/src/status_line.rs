@@ -389,11 +389,11 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
 
 const WAIT_MARKER: &str = "◌";
 
-/// `当前 2/4` for the live activity line, from the runtime's plan only.
+/// `第 2/4 步进行中` for the live activity line, from the declared plan only.
 ///
-/// The step shown is the one the plan reports Running — never "the next
+/// The step shown is the one the plan declares in progress — never "the next
 /// pending one", which would claim a step had started because the previous one
-/// finished. No plan, or no running step, means no chip.
+/// finished. No plan, or no step in progress, means no chip.
 fn live_plan_step_chip(state: &AppState, t: &crate::i18n::UiText) -> Option<String> {
     let plan = state.plan.as_ref()?;
     let total = plan.steps.len();
@@ -405,7 +405,7 @@ fn live_plan_step_chip(state: &AppState, t: &crate::i18n::UiText) -> Option<Stri
         .iter()
         .find(|s| s.status == leveler_client_protocol::PlanStepStatus::Running)?;
     Some(
-        t.plan_current_item
+        t.plan_running_chip
             .replace("{current}", &(current.index + 1).to_string())
             .replace("{total}", &total.to_string()),
     )
@@ -651,7 +651,11 @@ mod tests {
         state.elapsed_secs = 12;
         let line = busy_line(&state);
         assert!(line.contains("正在检查 WorkerConfig"), "{line}");
-        assert!(line.contains("2/4"), "the running step, 1-based: {line}");
+        assert!(
+            line.contains("第 2/4 步进行中"),
+            "the step the plan declares in progress, 1-based: {line}"
+        );
+        assert!(!line.contains("当前"), "no runtime cursor: {line}");
         assert!(line.contains("3 次工具"), "{line}");
         assert!(line.contains("12s"), "{line}");
     }

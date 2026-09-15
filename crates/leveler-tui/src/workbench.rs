@@ -59,42 +59,48 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     !all_success
 }
 
-/// Summary after `计划`/`plan`: how much is finished, plus which item is
-/// actually Running when one is. The two facts are not exclusive — showing
-/// only "当前 6/9" hid that five steps were already done. Never claims item
-/// #1 is in progress just because nothing is done yet.
-pub(crate) fn plan_summary_label(plan: &UiPlan, t: &UiText) -> String {
+/// Summary after `计划`/`plan`. The plan is the agent's declared progress, so
+/// the summary says how much it declared done — never a "当前 6/9" cursor that
+/// reads as the runtime tracking execution. While a turn runs and the step
+/// list is collapsed, it also names the step declared in progress (expanded,
+/// the list shows it). Outside a running turn the plan is the last record of
+/// what was declared, and nothing in it is presented as under way. Never
+/// claims item #1 is in progress just because nothing is done yet.
+pub(crate) fn plan_summary_label(plan: &UiPlan, collapsed: bool, live: bool, t: &UiText) -> String {
     let (done, total) = plan_done_total(plan);
     if total == 0 {
         return t.active_plan.to_string();
     }
-    let progress = t
-        .plan_n_done
-        .replace("{done}", &done.to_string())
-        .replace("{total}", &total.to_string());
+    let fill = |template: &str| {
+        template
+            .replace("{done}", &done.to_string())
+            .replace("{total}", &total.to_string())
+    };
+    if !live {
+        return fill(t.plan_last_recorded);
+    }
+    let progress = fill(t.plan_n_done);
     match plan
         .steps
         .iter()
         .find(|s| s.status == PlanStepStatus::Running)
+        .filter(|_| collapsed)
     {
-        Some(step) => {
-            let current = t
-                .plan_current_item
-                .replace("{current}", &(step.index + 1).to_string())
-                .replace("{total}", &total.to_string());
-            format!("{progress} · {current}")
-        }
+        Some(step) => format!(
+            "{progress} · {}",
+            t.plan_running_item.replace("{step}", &step.description)
+        ),
         None => progress,
     }
 }
 
-/// One-line plan chrome title: `▼ 计划 · 5/9 已完成 · 当前 6/9`.
-pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, t: &UiText) -> String {
+/// One-line plan chrome title: `▼ 计划 · 已完成 5/9`.
+pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, live: bool, t: &UiText) -> String {
     let disclosure = if collapsed { "▶" } else { "▼" };
     format!(
         "{disclosure} {} · {}",
         t.active_plan,
-        plan_summary_label(plan, t)
+        plan_summary_label(plan, collapsed, live, t)
     )
 }
 
@@ -599,6 +605,9 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let theme = &state.theme;
     let t = state.t();
+    // Only a running turn can have a step under way; outside one, the step the
+    // plan declared in progress is part of the last record, not highlighted.
+    let live = state.is_busy();
     // The plan is task-level state, a sibling of the conversation — so it
     // starts at the same content baseline instead of hanging off the left
     // edge, and its steps sit one level inside their own header.
@@ -608,7 +617,7 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     const STEP_INDENT: &str = "  ";
     let title = truncate(
-        plan_chrome_title(plan, state.plan_collapsed, t),
+        plan_chrome_title(plan, state.plan_collapsed, live, t),
         area.width as usize,
     );
 
@@ -626,9 +635,11 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 PlanViewportRow::Step(step) => {
                     let c = match step.status {
                         PlanStepStatus::Done => theme.status.success,
-                        PlanStepStatus::Running => theme.accent.primary,
+                        PlanStepStatus::Running if live => theme.accent.primary,
                         PlanStepStatus::Failed => theme.status.error,
-                        PlanStepStatus::Skipped | PlanStepStatus::Pending => theme.text.secondary,
+                        PlanStepStatus::Running
+                        | PlanStepStatus::Skipped
+                        | PlanStepStatus::Pending => theme.text.secondary,
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -643,11 +654,13 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                                 format!("{}. {}", step.index + 1, step.description),
                                 body_width,
                             ),
-                            Style::default().fg(if step.status == PlanStepStatus::Running {
-                                theme.text.primary
-                            } else {
-                                theme.text.secondary
-                            }),
+                            Style::default().fg(
+                                if live && step.status == PlanStepStatus::Running {
+                                    theme.text.primary
+                                } else {
+                                    theme.text.secondary
+                                },
+                            ),
                         ),
                     ]));
                 }
@@ -1728,15 +1741,16 @@ mod tests {
         }
     }
 
+    /// The plan is the agent's declared progress: the header says how much it
+    /// has declared done, and no "当前 2/3" cursor that reads as the runtime
+    /// tracking where execution is.
     #[test]
-    fn plan_chrome_title_includes_kn_and_current_step_when_expanded() {
+    fn a_live_plan_title_reports_declared_progress_without_a_cursor() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), false, t);
+        let title = plan_chrome_title(&sample_plan(), false, true, t);
         assert!(title.starts_with('▼'), "{title}");
-        assert!(
-            title.contains("1/3 已完成 · 当前 2/3"),
-            "progress and current item, not one or the other: {title}"
-        );
+        assert!(title.contains("已完成 1/3"), "{title}");
+        assert!(!title.contains("当前"), "no runtime cursor: {title}");
         assert!(
             !title.contains("edit module"),
             "the numbered list under the header already carries the description: {title}"
@@ -2147,12 +2161,33 @@ mod tests {
         );
     }
 
+    /// Collapsed, the step list is gone, so the header names the step the
+    /// agent declared in progress.
     #[test]
     fn plan_chrome_title_keeps_progress_when_collapsed() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), true, t);
+        let title = plan_chrome_title(&sample_plan(), true, true, t);
         assert!(title.starts_with('▶'), "{title}");
-        assert!(title.contains("1/3 已完成 · 当前 2/3"), "{title}");
+        assert!(
+            title.contains("已完成 1/3 · 进行中：edit module"),
+            "{title}"
+        );
+    }
+
+    /// Outside a running turn the plan is the last record of what the agent
+    /// declared, not work under way: no "进行中" anywhere in the header.
+    #[test]
+    fn a_plan_outside_a_running_turn_reads_as_the_last_record() {
+        for collapsed in [false, true] {
+            let t = crate::i18n::Locale::Zh.text();
+            let title = plan_chrome_title(&sample_plan(), collapsed, false, t);
+            assert!(title.contains("最后记录 1/3"), "{title}");
+            assert!(!title.contains("进行中"), "{title}");
+            let t = crate::i18n::Locale::En.text();
+            let title = plan_chrome_title(&sample_plan(), collapsed, false, t);
+            assert!(title.contains("last recorded 1/3"), "{title}");
+            assert!(!title.contains("in progress"), "{title}");
+        }
     }
 
     #[test]
@@ -2182,10 +2217,10 @@ mod tests {
                 },
             ],
         };
-        let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("0/4 已完成"), "{title}");
+        let title = plan_chrome_title(&plan, true, true, t);
+        assert!(title.contains("已完成 0/4"), "{title}");
         assert!(
-            !title.contains("当前"),
+            !title.contains("进行中"),
             "pending is not in-progress: {title}"
         );
     }
@@ -2207,10 +2242,10 @@ mod tests {
                 },
             ],
         };
-        let title = plan_chrome_title(&plan, true, t);
+        let title = plan_chrome_title(&plan, true, true, t);
         assert!(title.contains("1/2 completed"), "{title}");
         assert!(
-            !title.contains("current"),
+            !title.contains("in progress"),
             "a pending step is not claimed as active: {title}"
         );
         assert!(
@@ -2525,18 +2560,19 @@ mod tests {
         assert!(squash(&rows[1]).contains("18.步骤18"), "{rows:?}");
     }
 
-    /// P8: the header carries progress AND the current item, not one or the
-    /// other — "当前 6/9" alone hid that five steps were already done.
+    /// P8: the header carries how much is declared done — "6/9" alone hid that
+    /// five steps were already done — and the expanded list shows which step
+    /// is in progress.
     #[test]
-    fn the_plan_header_carries_both_progress_and_the_current_item() {
+    fn the_plan_header_carries_declared_progress() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&running_plan(9, 5), false, t);
-        assert!(title.contains("5/9 已完成"), "{title}");
-        assert!(title.contains("当前 6/9"), "{title}");
+        let title = plan_chrome_title(&running_plan(9, 5), false, true, t);
+        assert!(title.contains("已完成 5/9"), "{title}");
+        assert!(!title.contains("6/9"), "{title}");
         let t = crate::i18n::Locale::En.text();
-        let title = plan_chrome_title(&running_plan(9, 5), false, t);
+        let title = plan_chrome_title(&running_plan(9, 5), false, true, t);
         assert!(title.contains("5/9 completed"), "{title}");
-        assert!(title.contains("current 6/9"), "{title}");
+        assert!(!title.contains("6/9"), "{title}");
     }
 
     /// P9: one running glyph for both plan surfaces (`/plan` used ●, the dock

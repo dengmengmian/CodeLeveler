@@ -34,7 +34,7 @@ pub(crate) fn render_plan_screen(frame: &mut Frame, area: Rect, state: &AppState
                 let color = match step.status {
                     PlanStepStatus::Done => theme.status.success,
                     PlanStepStatus::Failed => theme.status.error,
-                    PlanStepStatus::Running => theme.accent.primary,
+                    PlanStepStatus::Running if state.is_busy() => theme.accent.primary,
                     _ => theme.text.secondary,
                 };
                 lines.push(Line::from(vec![
@@ -133,10 +133,9 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
 
     match &state.plan {
         Some(plan) if !plan.steps.is_empty() => {
-            let running = plan
-                .steps
-                .iter()
-                .any(|s| s.status == PlanStepStatus::Running);
+            // Running is the runtime's turn status, not a step the plan
+            // still declares in progress after the turn ended.
+            let running = state.is_busy();
             let orch_glyph = if running { "●" } else { "✓" };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -158,7 +157,7 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
                 let color = match step.status {
                     PlanStepStatus::Done => theme.status.success,
                     PlanStepStatus::Failed => theme.status.error,
-                    PlanStepStatus::Running => theme.accent.primary,
+                    PlanStepStatus::Running if state.is_busy() => theme.accent.primary,
                     _ => theme.text.secondary,
                 };
                 lines.push(Line::from(vec![
@@ -187,4 +186,81 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
         Style::default().fg(theme.text.secondary),
     )));
     crate::render::render_scrolled(frame, area, state, lines);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_client_protocol::{RuntimeStatus, SessionId, UiPlan, UiPlanStep};
+
+    fn state_with_open_plan(status: RuntimeStatus) -> AppState {
+        let mut state = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.status = status;
+        state.plan = Some(UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "read".into(),
+                    status: PlanStepStatus::Done,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "edit".into(),
+                    status: PlanStepStatus::Running,
+                },
+            ],
+        });
+        state
+    }
+
+    fn agents_screen_text(state: &AppState) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| render_agents_screen(f, f.area(), state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..20)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether the orchestrator is running is the runtime's turn status. A step
+    /// the plan still declares in progress after the turn ended is not work
+    /// under way.
+    #[test]
+    fn the_orchestrator_is_running_only_while_a_turn_runs() {
+        // English: a wide CJK glyph spans two buffer cells.
+        let t = crate::i18n::Locale::En.text();
+        let idle = agents_screen_text(&state_with_open_plan(RuntimeStatus::Idle));
+        let orchestrator = idle
+            .lines()
+            .find(|l| l.contains(t.agents_orchestrator))
+            .expect("orchestrator row");
+        assert!(orchestrator.contains(t.agents_idle), "{idle}");
+        assert!(!orchestrator.contains(t.sub_agent_running), "{idle}");
+
+        let busy = agents_screen_text(&state_with_open_plan(RuntimeStatus::Busy));
+        let orchestrator = busy
+            .lines()
+            .find(|l| l.contains(t.agents_orchestrator))
+            .expect("orchestrator row");
+        assert!(orchestrator.contains(t.sub_agent_running), "{busy}");
+    }
 }

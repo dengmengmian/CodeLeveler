@@ -187,6 +187,10 @@ pub struct AppState {
 
     /// Latest plan / verification / diff from the current run, if any.
     pub plan: Option<UiPlan>,
+    /// `plan` belongs to a task whose work finished. It stays on screen as the
+    /// last record of what was declared, and is dropped when the next turn
+    /// starts: the runtime carries a plan only into a resumed unfinished task.
+    pub plan_settled: bool,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
     pub verification: Option<UiVerification>,
@@ -378,6 +382,7 @@ impl AppState {
             tools_screen: ToolsScreenState::default(),
             trace: crate::observability::TraceView::default(),
             plan: None,
+            plan_settled: false,
             project_rule_sources: Vec::new(),
             verification: None,
             diff: None,

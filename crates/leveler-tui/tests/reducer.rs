@@ -6297,23 +6297,27 @@ fn stale_open_plan(s: &mut AppState) {
     );
 }
 
-/// D1: the plan is a LIVE progress surface. Once the work is finished, a
-/// sticky "第 7/9 项进行中" claims work is under way that nobody is doing.
-/// The plan is not the completion authority, so it is not asked whether the
-/// task may end — it simply stops being live chrome.
+/// D1: a task can finish while the plan the agent declared is still open —
+/// the plan is not the completion authority. The plan stays as the last
+/// record of what was declared, untouched (no invented N/N), and the turn is
+/// no longer running, so nothing presents it as work under way.
 #[test]
-fn a_completed_turn_retires_the_live_plan() {
+fn a_completed_turn_keeps_the_open_plan_as_its_last_record() {
+    use leveler_client_protocol::PlanStepStatus as P;
     let mut s = busy_state();
     stale_open_plan(&mut s);
-    assert!(s.plan.is_some(), "the plan is live while the turn runs");
+    let declared = s.plan.clone();
     answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-    assert!(s.plan.is_none(), "no live plan after the work is finished");
+    assert_eq!(s.plan, declared, "the declaration is kept exactly as sent");
+    assert_ne!(s.status, RuntimeStatus::Busy, "the turn is not running");
+    let steps = &s.plan.as_ref().unwrap().steps;
+    assert_eq!(steps.iter().filter(|x| x.status == P::Done).count(), 5);
 }
 
 /// D2 / D3: the same holds for the two "done, with a caveat" outcomes.
 #[test]
-fn unverified_and_checks_failed_turns_also_retire_the_live_plan() {
+fn unverified_and_checks_failed_turns_also_keep_the_last_record() {
     for event in [
         RuntimeEvent::TurnCompletedUnverified {
             reason: "无自动验证".into(),
@@ -6324,9 +6328,54 @@ fn unverified_and_checks_failed_turns_also_retire_the_live_plan() {
     ] {
         let mut s = busy_state();
         stale_open_plan(&mut s);
+        let declared = s.plan.clone();
         reduce(&mut s, Action::Runtime(event.clone()));
-        assert!(s.plan.is_none(), "{event:?} finishes the work");
+        assert_eq!(s.plan, declared, "{event:?}");
     }
+}
+
+/// D1b: a finished task's plan is not carried into the next task — the
+/// runtime seeds a plan only into a resumed unfinished task — so the next
+/// turn does not start under the old plan.
+#[test]
+fn the_next_turn_does_not_run_under_a_finished_tasks_plan() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    answer(&mut s, "m-final", "做完了。");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert!(s.plan.is_some());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "next".into(),
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    assert!(
+        s.plan.is_none(),
+        "the old task's plan is not the new turn's"
+    );
+}
+
+/// D4b: an unfinished task may be resumed with its plan, so starting the next
+/// turn keeps it.
+#[test]
+fn the_next_turn_keeps_an_unfinished_tasks_plan() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "continue".into(),
+        }),
+    );
+    assert!(s.plan.is_some());
 }
 
 /// D4 / D5: an unfinished turn keeps its plan — that is exactly the

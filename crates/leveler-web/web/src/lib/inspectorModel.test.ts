@@ -5,7 +5,7 @@ import {
   inspectorMode,
   inspectorTerminalTone,
   inspectorVisibleSections,
-  currentPlanProgress,
+  planProgress,
   headerWaitingCue,
 } from './inspectorModel';
 import type { TurnOutcome } from './turn';
@@ -142,20 +142,39 @@ describe('inspectorTerminalTone', () => {
   }
 });
 
-describe('currentPlanProgress', () => {
-  it('reports the running step', () => {
-    const p = currentPlanProgress({
-      steps: [
-        { index: 0, description: 'explore', status: 'done' },
-        { index: 1, description: 'implement', status: 'running' },
-        { index: 2, description: 'verify', status: 'pending' },
-      ],
+describe('planProgress', () => {
+  const plan = (statuses: Array<'done' | 'running' | 'pending'>) => ({
+    steps: statuses.map((status, index) => ({ index, description: `step ${index + 1}`, status })),
+  });
+
+  it('reports declared progress and the step declared in progress while the turn runs', () => {
+    expect(planProgress(plan(['done', 'running', 'pending']), true)).toEqual({
+      done: 1,
+      total: 3,
+      live: true,
+      active: 'step 2',
     });
-    expect(p).toEqual({ current: 2, total: 3, description: 'implement' });
+  });
+
+  // T2: no declared in-progress step is not "the first pending one".
+  it('never promotes a pending step to the current one', () => {
+    const p = planProgress(plan(['done', 'pending', 'pending']), true);
+    expect(p).toEqual({ done: 1, total: 3, live: true, active: null });
+  });
+
+  // T4: outside a running turn the plan is the last record, not work under way.
+  it('presents an open plan outside a running turn as the last record', () => {
+    const p = planProgress(plan(['done', 'running', 'pending']), false);
+    expect(p).toEqual({ done: 1, total: 3, live: false, active: null });
+  });
+
+  // T3: an open plan is never rounded up to N/N.
+  it('keeps an open plan open after the task ends', () => {
+    expect(planProgress(plan(['done', 'pending']), false)?.done).toBe(1);
   });
 
   it('returns null without a plan', () => {
-    expect(currentPlanProgress(null)).toBeNull();
+    expect(planProgress(null, true)).toBeNull();
   });
 });
 

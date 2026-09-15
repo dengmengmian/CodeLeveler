@@ -9,7 +9,7 @@ import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completi
 import { formatElapsed } from '../lib/format';
 import {
   childStateLabel,
-  currentPlanProgress,
+  planProgress,
   inspectorMode,
   inspectorVisibleSections,
 } from '../lib/inspectorModel';
@@ -180,13 +180,14 @@ function ResultCard({ current }: { current: SessionView }) {
 }
 
 function PlanSection({ current }: { current: SessionView }) {
-  const plan = currentPlanProgress(current.plan);
+  const plan = planProgress(current.plan, current.turnActive);
   if (!plan) return null;
   return (
     <InspectorBlock title="PLAN">
       <div className="plan-now">
-        {plan.current} / {plan.total} {plan.description}
+        {plan.live ? '已完成' : '最后记录'} {plan.done}/{plan.total}
       </div>
+      {plan.active && <div className="t-detail">进行中：{plan.active}</div>}
     </InspectorBlock>
   );
 }
