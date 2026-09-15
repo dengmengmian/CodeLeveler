@@ -96,20 +96,6 @@ impl Drop for BackgroundChildren {
     }
 }
 
-/// Default per-turn round ceiling for BOUNDED work that did not pin its own
-/// `max_rounds` — a measured unit (an eval case, an orchestration node) is
-/// supposed to have a hard edge, so it gets one.
-///
-/// A top-level `UntilTerminal` turn deliberately does NOT get this. A round is
-/// a property of the model's tool cadence, not of the user's task: the same
-/// work costs one model wildly different round counts, so a hidden count made
-/// long tasks stop with "round ceiling reached" and forced the user to type
-/// 「继续」 to resume the very same work. Such a turn ends on a semantic
-/// terminal state or on a real mechanical guard (cancellation, the
-/// token/cost/duration budgets, the no-progress watchdog), never on a round
-/// tally.
-const MAX_BOUNDED_TURN_ROUNDS: u32 = 100;
-
 /// Bounded recovery from a malformed tool call: tool arguments sometimes
 /// arrive as invalid JSON (an unescaped backslash from a regex, a raw newline
 /// from a multi-line script). Rather than failing the whole turn on that Decode
@@ -355,11 +341,18 @@ impl Executor {
 
         // Hard step limits (spec §27) as the kernel enforces them: the epoch's
         // prior spend is what makes them task-level rather than per-drive.
+        // Rounds stop a run only where a caller asked for it: an explicit
+        // `StepLimits.max_rounds` ceiling, or a bounded window (an eval case,
+        // an orchestration node, `leveler run --max-rounds N`), whose N is
+        // itself the hard edge. No hidden count sits under that window — a
+        // 100-round default used to cap every larger window silently. A
+        // top-level `UntilTerminal` turn gets no round count at all: a round is
+        // a property of the model's tool cadence, not of the user's task, so
+        // such a turn ends on a semantic terminal state or a real mechanical
+        // guard (cancellation, the token/cost/duration budgets, the
+        // no-progress watchdog).
         let limits = RoundLimits {
-            round_ceiling: self.step_limits.max_rounds.or(match self.continuation {
-                crate::ContinuationPolicy::UntilTerminal => None,
-                crate::ContinuationPolicy::Bounded { .. } => Some(MAX_BOUNDED_TURN_ROUNDS),
-            }),
+            round_ceiling: self.step_limits.max_rounds,
             window_round_limit: self.continuation.round_limit(),
             max_model_tokens: self.step_limits.max_model_tokens,
             max_cost_usd_micros: self.step_limits.max_cost_usd_micros,

@@ -222,9 +222,9 @@ pub enum Command {
         /// Work profile: economy | balanced | delivery (default balanced).
         #[arg(long, default_value = "balanced")]
         work_mode: String,
-        /// Task round budget for this run: default 200 (extendable +100 up to
-        /// twice when a segment lands a source change and tries to close);
-        /// `0` runs until the goal is resolved with no round budget.
+        /// Task round budget for this run: default 200, a hard stop
+        /// (`budget_limited`) at N model rounds; `0` runs until the goal is
+        /// resolved with no round budget.
         #[arg(long, value_name = "N")]
         max_rounds: Option<u32>,
         /// Collaboration axis: chat | plan | goal.

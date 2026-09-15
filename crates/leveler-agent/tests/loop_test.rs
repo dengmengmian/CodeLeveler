@@ -2356,6 +2356,65 @@ async fn bounded_continuation_still_stops_at_its_window() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A bounded window larger than the old 100-round default is the window that
+/// governs: `leveler run --max-rounds 130` runs 130 rounds and stops on its
+/// window (a hard edge on a loop that never completes), not on a hidden 100.
+#[tokio::test]
+async fn a_bounded_window_above_one_hundred_rounds_is_the_hard_edge() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-wide-window-{}",
+        std::process::id() as u64 * 61 + 19
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..140 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let responses: Vec<_> = (0..140)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        130,
+    );
+
+    let outcome = executor
+        .run(
+            "read forever",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.rounds, 130,
+        "the explicit window governs: {outcome:?}"
+    );
+    assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// C2: an explicit `StepLimits.max_rounds` is still honoured exactly, whatever
 /// the continuation policy says.
 #[tokio::test]

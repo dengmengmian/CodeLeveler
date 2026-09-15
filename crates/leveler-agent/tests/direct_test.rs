@@ -1442,6 +1442,49 @@ async fn cancellation_is_recorded_as_interrupted() {
     assert_eq!(turns[0].status, "interrupted");
 }
 
+/// `leveler run`'s default 200-round window changes only where a run that
+/// never resolves stops: completion and cancellation keep their own terminals.
+#[tokio::test]
+async fn a_wide_round_window_keeps_completion_and_cancellation_terminals() {
+    let window = |h: &Harness| {
+        let mut s = spec(h, VerificationPlan::default());
+        s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(200);
+        s
+    };
+
+    let h = harness(patch_then_resolve()).await;
+    let spec = window(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    h.engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Some(TaskOutcome::Completed));
+
+    let h = harness(patch_then_resolve()).await;
+    let spec = window(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let err = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, token)
+        .await
+        .expect_err("a cancelled run must not succeed");
+    assert!(matches!(err, leveler_engine::EngineError::Cancelled));
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Some(TaskOutcome::Interrupted));
+}
+
 #[tokio::test]
 async fn cancellation_at_the_terminal_publish_boundary_wins_over_completion() {
     let h = harness(patch_then_resolve()).await;
