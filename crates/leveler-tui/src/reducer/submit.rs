@@ -221,6 +221,8 @@ fn turn_input_held(state: &mut AppState) -> bool {
 /// A turn input gets its id here, where the logical command is created — not
 /// per transport attempt — and the client keeps it until the runtime answers.
 fn submit_turn_input(state: &mut AppState, command: ClientCommand) -> Vec<Effect> {
+    // What the user just sent, and the turn it drives, are the live edge.
+    crate::conversation::interaction::jump_to_live_edge(state);
     let command_id = CommandId::generate();
     state.pending_submissions.push(PendingSubmission {
         command_id: command_id.clone(),

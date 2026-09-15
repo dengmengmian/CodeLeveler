@@ -219,6 +219,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
         }
         RuntimeEvent::VerificationUpdated { verification } => {
+            state.turn_verification = Some(verification.clone());
             state.verification = Some(verification);
         }
         RuntimeEvent::DiffUpdated { diff } => {
@@ -334,6 +335,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 turn_end_summary(state, TurnEndStatus::Failed),
                 Some(detail),
             );
+            state.turn_verification = None;
         }
         RuntimeEvent::TurnCancelled => {
             state.status = RuntimeStatus::Idle;
@@ -345,6 +347,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.cancel_armed = false;
             state.force_cancel_armed = false;
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
+            state.turn_verification = None;
             state.transcript.push_turn_end(
                 TurnEndStatus::Cancelled,
                 state.turn_tool_calls,
@@ -842,6 +845,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
             (status == TurnEndStatus::Incomplete).then(|| state.t().suggestion_continue.to_string())
         });
     let summary = turn_end_summary(state, status);
+    state.turn_verification = None;
     state.transcript.push_turn_end(
         status,
         state.turn_tool_calls,
@@ -955,7 +959,7 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
             let (k, n) = crate::workbench::plan_done_total(p);
             (n > 0 && k < n).then_some((k, n))
         });
-    if let Some(v) = &state.verification {
+    if let Some(v) = &state.turn_verification {
         if let Some(passed) = v.passed {
             if passed {
                 if allow_success_verify {

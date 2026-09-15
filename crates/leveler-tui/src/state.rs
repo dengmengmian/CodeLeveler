@@ -196,6 +196,10 @@ pub struct AppState {
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
     pub verification: Option<UiVerification>,
+    /// The verification the current turn produced. `verification` stays the
+    /// latest result for the verification screen; a turn-end summary only
+    /// speaks for checks its own turn ran.
+    pub turn_verification: Option<UiVerification>,
     pub diff: Option<UiDiff>,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
@@ -396,6 +400,7 @@ impl AppState {
             plan_settled: false,
             project_rule_sources: Vec::new(),
             verification: None,
+            turn_verification: None,
             diff: None,
             diff_selected: 0,
             goal_mode_active: false,

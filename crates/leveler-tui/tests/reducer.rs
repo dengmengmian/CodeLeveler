@@ -482,6 +482,78 @@ fn completed_turn_end_may_show_success_verify_chrome() {
     );
 }
 
+/// A verification result belongs to the turn that ran it. Dogfood: the first
+/// turn's green `cargo test` put "验证 ✓" on every later turn — a script run,
+/// a plain answer, even a restarted session — while each of those turns
+/// recorded `verification=not_run`.
+#[test]
+fn a_later_turn_without_verification_does_not_inherit_the_verify_mark() {
+    use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
+    let zh = leveler_tui::Locale::Zh.text();
+    let last_summary = |s: &AppState| -> String {
+        match s
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .find(|item| matches!(item, TranscriptItem::TurnEnd(_)))
+        {
+            Some(TranscriptItem::TurnEnd(end)) => end.summary.clone().unwrap_or_default(),
+            _ => panic!("expected turn end"),
+        }
+    };
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::VerificationUpdated {
+            verification: UiVerification {
+                checks: vec![UiCheck {
+                    name: "cargo test".into(),
+                    status: CheckState::Passed,
+                    evidence: None,
+                }],
+                passed: Some(true),
+            },
+        }),
+    );
+    answer(&mut s, "m-1", "修好了。");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert!(last_summary(&s).contains(zh.summary_verify_ok));
+
+    answer(&mut s, "m-2", "脚本跑完了。");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+    let second = last_summary(&s);
+    assert!(
+        !second.contains(zh.summary_verify_ok),
+        "a turn that ran no verification must not show one: {second:?}"
+    );
+
+    // The verification screen still shows the latest result.
+    assert!(s.verification.is_some());
+}
+
+/// A reopened session starts with the last verification on its screen, but
+/// the next turn has not verified anything.
+#[test]
+fn a_restored_verification_is_not_the_next_turns_verification() {
+    let zh = leveler_tui::Locale::Zh.text();
+    let mut s = state();
+    let mut restored = snapshot();
+    restored.verification = Some(leveler_client_protocol::UiVerification {
+        checks: vec![],
+        passed: Some(true),
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: restored }),
+    );
+    answer(&mut s, "m-1", "一句话答案。");
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+    let text = format!("{:?}", s.transcript.items());
+    assert!(!text.contains(zh.summary_verify_ok), "{text}");
+    assert!(s.verification.is_some());
+}
+
 #[test]
 fn btw_events_fill_ephemeral_block() {
     let mut s = opened();
@@ -4300,6 +4372,30 @@ fn page_up_pins_away_from_bottom_and_enter_jumps_back() {
     // Enter while Conversation focus + not at bottom → jump live.
     reduce(&mut s, key(KeyCode::Enter));
     assert!(s.conv.auto_scroll);
+    assert_eq!(s.conv.unread, 0);
+}
+
+/// Sending a message is reading the live edge. Dogfood: after scrolling up
+/// once, three later messages ran their whole turns below the viewport with
+/// only a "▼N" badge — the user's own input never came into view.
+#[test]
+fn sending_a_message_returns_the_conversation_to_the_live_edge() {
+    use leveler_tui::state::WorkbenchFocus;
+    let mut s = opened();
+    s.size = (100, 40);
+    for i in 0..30 {
+        s.transcript.push_user(format!("msg {i}"));
+    }
+    reduce(&mut s, key(KeyCode::PageUp));
+    assert!(!s.conv.auto_scroll);
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
+    typed(&mut s, "下一个问题");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        s.conv.auto_scroll,
+        "a sent message must follow the live edge again"
+    );
     assert_eq!(s.conv.unread, 0);
 }
 
