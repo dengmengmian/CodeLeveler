@@ -6740,18 +6740,16 @@ fn the_running_command_heartbeat_follows_the_locale() {
     assert!(activity.contains("cargo test"), "{activity}");
 }
 
-// ---- Assistant progress presentation, driven by real event order ----
+// ---- Assistant prose presentation, driven by real event order ----
 
 /// Every visual row the assistant block at `index` currently occupies, as
-/// plain text. The presentation bound is a fact about what the reader sees,
-/// so the assertions below measure exactly that.
+/// plain text.
 fn assistant_rows(s: &AppState, index: usize, width: usize) -> Vec<String> {
     let block = match &s.transcript.items()[index] {
         TranscriptItem::Assistant(b) => b,
         other => panic!("item {index} is not an assistant block: {other:?}"),
     };
-    leveler_tui::render::assistant_render(block, &s.theme, width, leveler_tui::Locale::Zh.text())
-        .0
+    leveler_tui::render::assistant_render(block, &s.theme, width)
         .iter()
         .map(|line| {
             line.spans
@@ -6826,18 +6824,23 @@ const LONG_PROSE: &[&str] = &[
     "再决定 scope",
 ];
 
-/// Streaming prose is bounded while it grows, and the tool call that then
-/// classifies it as progress does not change how much space it takes.
+fn shows_all_of_long_prose(rows: &[String]) -> bool {
+    rows.iter().any(|row| row.contains("关键判断"))
+        && rows.iter().any(|row| row.contains("再决定 scope"))
+        && !rows
+            .iter()
+            .any(|row| row.contains('▸') || row.contains('▾'))
+}
+
+/// Streaming prose grows in place, and the tool call that classifies it as
+/// progress does not hide any of it.
 #[test]
-fn streaming_prose_stays_bounded_and_the_tool_call_does_not_move_it() {
+fn streaming_prose_stays_whole_and_the_tool_call_does_not_fold_it() {
     let mut s = state();
     stream(&mut s, "m1", LONG_PROSE, false);
     let at = assistant_indexes(&s)[0];
     let live = assistant_rows(&s, at, 60);
-    assert!(
-        live.len() <= leveler_tui::render::PROGRESS_VISUAL_LINES,
-        "live prose must not grow up the screen: {live:?}"
-    );
+    assert!(shows_all_of_long_prose(&live), "{live:?}");
 
     reduce(
         &mut s,
@@ -6846,67 +6849,15 @@ fn streaming_prose_stays_bounded_and_the_tool_call_does_not_move_it() {
         }),
     );
     tool(&mut s, "t1");
-    let folded = assistant_rows(&s, at, 60);
-    assert_eq!(
-        folded.len(),
-        live.len(),
-        "classification must not resize the block: {live:?} -> {folded:?}"
-    );
-    assert!(
-        folded.last().is_some_and(|row| row.contains('▸')),
-        "folded prose offers its disclosure: {folded:?}"
-    );
-    assert!(
-        !folded.iter().any(|row| row.contains("再决定 scope")),
-        "folded content leaked: {folded:?}"
-    );
+    let progress = assistant_rows(&s, at, 60);
+    assert!(shows_all_of_long_prose(&progress), "{progress:?}");
 }
 
-/// The message a turn ends on is the answer: shown whole, with no disclosure.
+/// The whole-turn shape: prose / tools / prose / tools / answer. Every message
+/// the agent wrote to the user is on screen in full — the dogfood regression
+/// was interim explanations hidden behind `▸ 展开过程说明 · N 行`.
 #[test]
-fn the_message_a_turn_ends_on_renders_in_full() {
-    let mut s = state();
-    stream(&mut s, "m1", LONG_PROSE, true);
-    tool(&mut s, "t1");
-    stream(
-        &mut s,
-        "m2",
-        &[
-            "改完了。\n\n",
-            "状态色统一到 semantic token。\n\n",
-            "搜索过滤已修复。\n\n",
-            "pnpm lint 通过。",
-        ],
-        true,
-    );
-    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-
-    let blocks = assistant_indexes(&s);
-    let answer = assistant_rows(&s, blocks[1], 60);
-    assert!(
-        answer.len() > leveler_tui::render::PROGRESS_VISUAL_LINES,
-        "the answer is never compacted: {answer:?}"
-    );
-    assert!(
-        answer.iter().any(|row| row.contains("pnpm lint")),
-        "{answer:?}"
-    );
-    assert!(
-        !answer
-            .iter()
-            .any(|row| row.contains('▸') || row.contains('▾')),
-        "the answer owns no disclosure: {answer:?}"
-    );
-    // The interim prose in the same turn stayed folded.
-    let progress = assistant_rows(&s, blocks[0], 60);
-    assert!(progress.len() <= leveler_tui::render::PROGRESS_VISUAL_LINES);
-}
-
-/// The whole-turn shape: prose / tools / prose / tools / answer, where only
-/// the answer is allowed to be large. This is the regression that the closure
-/// exists for — a conversation of prose walls.
-#[test]
-fn a_long_turn_shows_bounded_prose_between_tools_and_one_full_answer() {
+fn a_long_turn_shows_every_message_in_full() {
     let mut s = state();
     reduce(
         &mut s,
@@ -6930,7 +6881,6 @@ fn a_long_turn_shows_bounded_prose_between_tools_and_one_full_answer() {
         &[
             "PaymentRecords 已统一到现有 semantic token。\n\n",
             "- 状态色跟随明暗主题\n",
-            "- 移除硬编码绿/黄色\n",
             "- 搜索支持当前字段过滤\n\n",
             "pnpm lint / pnpm build 通过。",
         ],
@@ -6942,29 +6892,21 @@ fn a_long_turn_shows_bounded_prose_between_tools_and_one_full_answer() {
     assert_eq!(blocks.len(), 3);
     for at in &blocks[..2] {
         let rows = assistant_rows(&s, *at, 80);
-        assert!(
-            rows.len() <= leveler_tui::render::PROGRESS_VISUAL_LINES,
-            "interim prose is bounded: {rows:?}"
-        );
+        assert!(shows_all_of_long_prose(&rows), "{rows:?}");
     }
     let answer = assistant_rows(&s, blocks[2], 80);
     assert!(
         answer.iter().any(|row| row.contains("pnpm lint")),
         "{answer:?}"
     );
-    assert!(
-        answer.len() > leveler_tui::render::PROGRESS_VISUAL_LINES,
-        "{answer:?}"
-    );
 }
 
-/// A reconnect replays messages with no tool ordering at all. The restored
-/// answers must still render whole, or every reconnect would fold history.
+/// A reconnect replays messages with no tool ordering at all; restored
+/// interim prose and answers both render whole.
 #[test]
-fn a_replayed_session_still_shows_each_turns_answer_in_full() {
+fn a_replayed_session_shows_every_message_in_full() {
     let mut s = state();
     let mut snap = snapshot();
-    let long = LONG_PROSE.concat();
     let answer = "改完了。\n\n状态色统一。\n\n搜索已修复。\n\npnpm lint 通过。";
     snap.messages = vec![
         UiMessage {
@@ -6977,7 +6919,7 @@ fn a_replayed_session_still_shows_each_turns_answer_in_full() {
         UiMessage {
             id: MessageId::new("m1"),
             role: UiRole::Assistant,
-            text: long,
+            text: LONG_PROSE.concat(),
             ordinal: Some(2),
             kind: None,
         },
@@ -6996,14 +6938,11 @@ fn a_replayed_session_still_shows_each_turns_answer_in_full() {
     let blocks = assistant_indexes(&s);
     assert_eq!(blocks.len(), 2);
     let interim = assistant_rows(&s, blocks[0], 80);
+    assert!(shows_all_of_long_prose(&interim), "{interim:?}");
     let restored = assistant_rows(&s, blocks[1], 80);
     assert!(
-        interim.len() <= leveler_tui::render::PROGRESS_VISUAL_LINES,
-        "interim prose folds on replay too: {interim:?}"
-    );
-    assert!(
         restored.iter().any(|row| row.contains("pnpm lint")),
-        "the restored answer is whole: {restored:?}"
+        "{restored:?}"
     );
 }
 

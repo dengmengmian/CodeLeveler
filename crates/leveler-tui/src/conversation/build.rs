@@ -143,14 +143,8 @@ pub fn build_conversation_lines_with_hits(
                 }
             }
             TranscriptItem::Assistant(block) => {
-                // Interim prose is held to a visual-line bound; when it folds,
-                // its LAST emitted row is the clickable `▸` disclosure. A Final
-                // answer never folds and so contributes no hit row.
-                let (lines, disclosure) = crate::render::assistant_render(block, theme, width, t);
-                if let Some(offset) = disclosure {
-                    hits.push((out.len() + offset, idx));
-                }
-                out.extend(lines);
+                // Prose is communication: always in full, never a click target.
+                out.extend(crate::render::assistant_render(block, theme, width));
             }
             TranscriptItem::ToolGroup(group) => {
                 // Product activity stream — not a raw tool trace:

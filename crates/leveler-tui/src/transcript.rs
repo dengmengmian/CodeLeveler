@@ -16,24 +16,12 @@ use crate::markdown::MdDoc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantKind {
     /// Streaming, or complete but the turn has not yet shown which it is.
-    /// Presented under the same bound as [`Self::Progress`] so classification
-    /// never moves the rows already on screen.
     Pending,
-    /// Interim narration: a tool call followed it. Compacted by default, full
-    /// text kept and one click away.
+    /// Interim narration: a tool call followed it. Rendered in full like any
+    /// other prose; the distinction only matters for answer bookkeeping.
     Progress,
-    /// The turn's answer: the turn ended on it with no tool call after. Always
-    /// rendered in full, never folded.
+    /// The turn's answer: the turn ended on it with no tool call after.
     Final,
-}
-
-/// What [`TranscriptState::toggle_last_collapsible`] flipped. The caller needs
-/// the distinction because the workbench's tool-expand flag must not follow an
-/// assistant disclosure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToggledBlock {
-    Tool(bool),
-    AssistantProgress(bool),
 }
 
 /// A streaming assistant message.
@@ -46,10 +34,6 @@ pub struct AssistantBlock {
     pub rendered: Option<MdDoc>,
     /// Progress vs. answer, assigned retroactively from event order.
     pub kind: AssistantKind,
-    /// Per-block disclosure for a folded [`AssistantKind::Progress`] message.
-    /// Every historical block owns its own flag — there is no global
-    /// "assistant expanded" mode.
-    pub expanded: bool,
 }
 
 /// The lifecycle state of a tool call.
@@ -566,7 +550,6 @@ impl TranscriptState {
                 done: false,
                 rendered: None,
                 kind: AssistantKind::Pending,
-                expanded: false,
             }));
         }
     }
@@ -599,7 +582,6 @@ impl TranscriptState {
                     done: false,
                     rendered: None,
                     kind: AssistantKind::Pending,
-                    expanded: false,
                 }));
             }
         }
@@ -858,12 +840,6 @@ impl TranscriptState {
                 block.expanded = !block.expanded;
                 Some(block.expanded)
             }
-            // A folded progress block toggles exactly itself. A Final answer
-            // has no disclosure row, so it is not a toggle target at all.
-            TranscriptItem::Assistant(block) if block.kind != AssistantKind::Final => {
-                block.expanded = !block.expanded;
-                Some(block.expanded)
-            }
             _ => None,
         };
         if toggled.is_some() {
@@ -872,34 +848,20 @@ impl TranscriptState {
         toggled
     }
 
-    /// Toggle expand/collapse on whichever collapsible block came last.
-    ///
-    /// Tool groups, sub-agents and folded progress prose all hide detail once
-    /// finished, so one key opens whichever one you are looking at. The
-    /// transcript knows nothing about widths or themes, so `assistant_folds`
-    /// supplies the one fact it cannot derive: whether that block actually has
-    /// a disclosure row on screen right now. Returns what was toggled, or
-    /// `None` when there is nothing collapsible.
-    pub fn toggle_last_collapsible(
-        &mut self,
-        assistant_folds: impl Fn(&AssistantBlock) -> bool,
-    ) -> Option<ToggledBlock> {
+    /// Toggle expand/collapse on whichever collapsible block came last (a
+    /// tool group or sub-agent). Returns the new state, or `None` when there
+    /// is nothing collapsible.
+    pub fn toggle_last_collapsible(&mut self) -> Option<bool> {
         self.bump();
         for item in self.items.iter_mut().rev() {
             match item {
                 TranscriptItem::ToolGroup(group) => {
                     group.expanded = !group.expanded;
-                    return Some(ToggledBlock::Tool(group.expanded));
+                    return Some(group.expanded);
                 }
                 TranscriptItem::SubAgent(block) => {
                     block.expanded = !block.expanded;
-                    return Some(ToggledBlock::Tool(block.expanded));
-                }
-                TranscriptItem::Assistant(block)
-                    if block.kind == AssistantKind::Progress && assistant_folds(block) =>
-                {
-                    block.expanded = !block.expanded;
-                    return Some(ToggledBlock::AssistantProgress(block.expanded));
+                    return Some(block.expanded);
                 }
                 _ => {}
             }
@@ -1646,93 +1608,6 @@ mod tests {
         assert_eq!(kinds(&t), vec![AssistantKind::Final, AssistantKind::Final]);
     }
 
-    /// Each historical progress block owns its disclosure: expanding one
-    /// leaves the others exactly as they were.
-    #[test]
-    fn expanding_one_progress_block_leaves_the_others_folded() {
-        let mut t = TranscriptState::new();
-        say(&mut t, "m1", "一");
-        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
-        say(&mut t, "m2", "二");
-        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
-        let first = t
-            .items()
-            .iter()
-            .position(|i| matches!(i, TranscriptItem::Assistant(_)))
-            .expect("first progress block");
-        t.toggle_tool_group_at(first);
-        let flags: Vec<bool> = t
-            .items()
-            .iter()
-            .filter_map(|i| match i {
-                TranscriptItem::Assistant(b) => Some(b.expanded),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(flags, vec![true, false]);
-    }
-
-    /// A Final answer has no disclosure, so nothing can fold it — not a
-    /// click on its rows, not Ctrl+O.
-    #[test]
-    fn a_final_answer_can_never_be_folded() {
-        let mut t = TranscriptState::new();
-        say(&mut t, "m1", "答案");
-        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
-        let at = t
-            .items()
-            .iter()
-            .position(|i| matches!(i, TranscriptItem::Assistant(_)))
-            .expect("the answer");
-        assert_eq!(t.toggle_tool_group_at(at), None);
-        assert_eq!(t.toggle_last_collapsible(|_| true), None);
-    }
-
-    /// Ctrl+O reaches a folded progress block, and reports it as an assistant
-    /// toggle so the workbench tool flag does not follow.
-    #[test]
-    fn ctrl_o_reaches_a_folded_progress_block() {
-        let mut t = TranscriptState::new();
-        say(&mut t, "m1", "过程");
-        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
-        // The tool group is latest, so it wins — unchanged behaviour.
-        assert_eq!(
-            t.toggle_last_collapsible(|_| true),
-            Some(ToggledBlock::Tool(true))
-        );
-        say(&mut t, "m2", "更多过程");
-        settled(&mut t, "r2", "read_file", r#"{"path":"b"}"#);
-        say(&mut t, "m3", "过程三");
-        t.items_mut().iter_mut().for_each(|i| {
-            if let TranscriptItem::Assistant(b) = i {
-                b.kind = AssistantKind::Progress;
-            }
-        });
-        assert_eq!(
-            t.toggle_last_collapsible(|_| true),
-            Some(ToggledBlock::AssistantProgress(true))
-        );
-    }
-
-    /// A progress block short enough to render whole has no disclosure row,
-    /// so Ctrl+O must skip it and keep reaching the tool group behind it.
-    #[test]
-    fn ctrl_o_skips_a_progress_block_that_did_not_fold() {
-        let mut t = TranscriptState::new();
-        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
-        say(&mut t, "m1", "短");
-        t.items_mut().iter_mut().for_each(|i| {
-            if let TranscriptItem::Assistant(b) = i {
-                b.kind = AssistantKind::Progress;
-            }
-        });
-        assert_eq!(
-            t.toggle_last_collapsible(|_| false),
-            Some(ToggledBlock::Tool(true)),
-            "an unfolded progress block must not swallow the key"
-        );
-    }
-
     fn group(expanded: bool) -> ToolGroupBlock {
         ToolGroupBlock {
             calls: vec![ToolCallBlock {
@@ -1758,8 +1633,8 @@ mod tests {
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
 
-        let new = ts.toggle_last_collapsible(|_| false);
-        assert_eq!(new, Some(ToggledBlock::Tool(true)));
+        let new = ts.toggle_last_collapsible();
+        assert_eq!(new, Some(true));
 
         let groups: Vec<_> = ts
             .items
@@ -1771,8 +1646,8 @@ mod tests {
             .collect();
         assert_eq!(groups, vec![false, true], "only latest group expands");
 
-        let new = ts.toggle_last_collapsible(|_| false);
-        assert_eq!(new, Some(ToggledBlock::Tool(false)));
+        let new = ts.toggle_last_collapsible();
+        assert_eq!(new, Some(false));
         let groups: Vec<_> = ts
             .items
             .iter()
