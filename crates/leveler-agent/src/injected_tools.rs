@@ -95,7 +95,12 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             same rule: when only PART of the stated objective is satisfiable, \
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
-            naming which part cannot be satisfied and why."
+            naming which part cannot be satisfied and why. If you kept a plan \
+            with `update_plan`, bring it up to date BEFORE this call, earlier in \
+            the same response: finished steps `completed`, steps you dropped \
+            removed. A plan left showing open steps beside `complete` tells the \
+            user the work is unfinished; a step you could not finish means \
+            `blocked`."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -644,6 +649,68 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
             },
             "required": ["action"]
         }),
+    }
+}
+
+/// Agent plan synchronization contract. The plan is the user's live view of
+/// the work and the seed a resumed turn reads, so keeping it current is the
+/// model's job — stated where the model reads it, never enforced by the
+/// runtime (the plan is not a completion gate).
+#[cfg(test)]
+mod plan_sync_contract_tests {
+    const BASE_PROMPT: &str = include_str!("../prompts/base.md");
+
+    fn plan_section() -> &'static str {
+        let start = BASE_PROMPT
+            .find("## Plan")
+            .expect("base prompt must carry a plan section");
+        let rest = &BASE_PROMPT[start + 2..];
+        &BASE_PROMPT[start..start + 2 + rest.find("\n## ").unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn base_prompt_says_the_plan_moves_with_the_work() {
+        let section = plan_section();
+        for needle in [
+            "update_plan",
+            "in_progress",
+            "completed",
+            "transition",
+            "Before `update_goal`",
+            "blocked",
+        ] {
+            assert!(
+                section.contains(needle),
+                "plan section lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_goal_asks_for_a_synchronized_plan_before_complete() {
+        let def = super::update_goal_tool_definition();
+        for needle in ["update_plan", "BEFORE this call", "blocked"] {
+            assert!(
+                def.description.contains(needle),
+                "update_goal lost plan sync `{needle}`"
+            );
+        }
+    }
+
+    /// The contract is guidance, not a gate: neither surface may claim the
+    /// runtime refuses completion over the plan.
+    #[test]
+    fn plan_sync_is_not_described_as_enforced() {
+        let def = super::update_goal_tool_definition();
+        for text in [plan_section(), def.description.as_str()] {
+            let lower = text.to_ascii_lowercase();
+            for claim in ["refuse", "reject", "gate"] {
+                assert!(
+                    !lower.contains(claim),
+                    "plan sync must not be described as enforced (`{claim}`):\n{text}"
+                );
+            }
+        }
     }
 }
 

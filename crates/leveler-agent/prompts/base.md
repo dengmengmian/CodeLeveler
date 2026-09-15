@@ -40,6 +40,14 @@ When a **SKILL TURN INJECTION** block is already in the system messages, follow 
 
 `spawn_agent` calls emitted in ONE assistant turn run concurrently; calls in separate turns run in sequence. `role=explorer` is read-only. `role=worker` takes an exclusive `files` list, and the ownership fence refuses writes outside it. A child does not see this conversation, so each `task` must be self-contained, and you synthesize their reports yourself.
 
+## Plan
+
+A plan written with `update_plan` is the live state of the work, not an outline drawn once: the user watches it while you work, and a resumed turn starts from it.
+
+- Update it at every step transition — the finished step `completed`, the next one `in_progress` — in the same response as the first tool call of the next step. Never save the updates for the end.
+- When the work stops matching the plan (a step turns out unnecessary, splits, or a new one appears), send the revised list instead of leaving stale steps behind.
+- Before `update_goal`, make the plan say what actually happened: finished steps `completed`, dropped steps removed, listed ahead of the `update_goal` call in the same response. A step you could not finish stays open, and the goal is `blocked`, not `complete`.
+
 ## Goal mode (when active)
 
 `update_goal` is how a goal ends, and it belongs in the same turn as your final answer — final prose does not close a goal, and a turn spent only on the call costs a whole round trip. It is invisible to the user, so do not narrate it. When a concrete next action materially helps, put it only in the structured `next_step`; do not append it as a tip in the final prose.
