@@ -631,6 +631,42 @@ describe('sub-agents', () => {
     expect(state.current?.agents.map((a) => [a.id, a.state])).toEqual([['c2', 'running']]);
   });
 
+  it('the agent a child was spawned from survives a terminal that does not carry it', () => {
+    const state = stateWithSession();
+    const agent = {
+      name: 'security-reviewer', source: 'project', capability: 'read_only', fingerprint: 'abcdef0123', skills: [],
+    };
+    reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'Curie', role: 'default', done: false, ok: false, detail: 't', agent });
+    expect(state.current?.agents[0]?.agent?.name).toBe('security-reviewer');
+    reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'Curie', role: 'default', done: true, ok: true, detail: 'r' });
+    expect(state.current?.agents[0]?.state).toBe('settled');
+    expect(state.current?.agents[0]?.agent).toEqual(agent);
+  });
+
+  it('a built-in role spawn has no agent identity', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'W', role: 'worker', done: false, ok: false, detail: 't' });
+    expect(state.current?.agents[0]?.agent).toBeNull();
+  });
+
+  it('a snapshot restores the agent identity, and keeps a live one the record lacks', () => {
+    const agent = { name: 'sec', source: 'user', capability: 'writer', fingerprint: 'ff00', skills: [] };
+    const restored = stateWithSession({
+      children: [
+        { id: 'c1', nickname: 'N', role: 'default', purpose: 'p', state: 'running', agent },
+      ],
+    });
+    expect(restored.current?.agents[0]?.agent).toEqual(agent);
+
+    const live = stateWithSession();
+    reducer(live, { type: 'sub_agent_updated', id: 'c1', nickname: 'N', role: 'default', done: false, ok: false, detail: 't', agent });
+    reducer(live, {
+      type: 'snapshot',
+      session: snapshot({ children: [{ id: 'c1', nickname: 'N', role: 'default', purpose: 'p', state: 'running' }] }),
+    });
+    expect(live.current?.agents[0]?.agent).toEqual(agent);
+  });
+
   it('a runtime notice in history is a runtime_notice, not a user turn', () => {
     const state = stateWithSession({
       messages: [
@@ -730,5 +766,58 @@ describe('compaction presentation', () => {
     });
     expect(state.current?.messages[0]?.kind).toBe('compaction_summary');
     expect(state.current?.messages[1]?.kind).toBeUndefined();
+  });
+});
+
+describe('agent registry', () => {
+  it('agents_loaded replaces the listing and ends loading', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'agents_loading' });
+    expect(state.agents.loading).toBe(true);
+    reducer(state, {
+      type: 'agents_loaded',
+      entries: [{ name: 'code-reviewer', source: 'builtin', status: 'available' }],
+      problems: [],
+    });
+    expect(state.agents.loading).toBe(false);
+    expect(state.agents.loaded).toBe(true);
+    expect(state.agents.entries.map((e) => e.name)).toEqual(['code-reviewer']);
+  });
+
+  it('agent_loaded stores the detail by name, or the runtime error', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'agent_loaded',
+      name: 'sec',
+      agent: { entry: { name: 'sec', source: 'user', status: 'available' }, instructions: 'x' },
+      error: null,
+    });
+    expect(state.agents.detail.sec?.agent?.instructions).toBe('x');
+    reducer(state, { type: 'agent_loaded', name: 'gone', agent: null, error: 'not found' });
+    expect(state.agents.detail.gone).toEqual({ agent: null, error: 'not found' });
+  });
+
+  it('agent_mutated records the outcome; a success drops the stale detail', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'agent_loaded',
+      name: 'sec',
+      agent: { entry: { name: 'sec', source: 'user', status: 'available' }, instructions: 'old' },
+      error: null,
+    });
+    reducer(state, { type: 'agent_mutated', name: 'sec', ok: false, error: 'unknown tool: rm', queryId: 'q1' });
+    expect(state.agents.lastMutation).toEqual({ name: 'sec', ok: false, error: 'unknown tool: rm', queryId: 'q1' });
+    expect(state.agents.detail.sec).toBeDefined();
+    reducer(state, { type: 'agent_mutated', name: 'sec', ok: true, error: null, queryId: 'q2' });
+    expect(state.agents.lastMutation?.ok).toBe(true);
+    expect(state.agents.detail.sec).toBeUndefined();
+  });
+
+  it('leaving the session drops a listing that belonged to its project', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'agents_loaded', entries: [{ name: 'p', source: 'project', status: 'available' }], problems: [] });
+    reducer(state, { type: 'new_draft', project: '/other' });
+    expect(state.agents.entries).toEqual([]);
+    expect(state.agents.loaded).toBe(false);
   });
 });

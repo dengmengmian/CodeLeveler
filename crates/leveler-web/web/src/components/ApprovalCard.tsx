@@ -23,7 +23,7 @@ export function ApprovalCard({
         <span style={{ marginLeft: 'auto', color: 'var(--text-tertiary)' }}>{shortId}</span>
       </div>
       <div className="a-body">
-        {request.summary}
+        <div className="a-summary">{request.summary}</div>
         {request.command && <pre>$ {request.command}</pre>}
         {request.risks.length > 0 && (
           <ul className="a-risks">
