@@ -154,8 +154,11 @@ pub trait TerminalStore: Send + Sync {
     ) -> Result<EventRecord, StorageError>;
 
     /// Fenced [`Self::finish_task`]: ownership assertion + terminal event +
-    /// session projection + optional Harness-supplied goal projection in ONE
-    /// transaction. A stale token or invalid goal rolls back everything.
+    /// session projection + optional Harness-supplied goal projection + the
+    /// release of the task's ownership in ONE transaction. A stale token or
+    /// invalid goal rolls back everything. The release keeps the epoch, so the
+    /// finished token is stale from then on — except that repeating this same
+    /// terminal replays it (`inserted: false`) until a later generation exists.
     #[allow(clippy::too_many_arguments)]
     async fn finish_task_owned(
         &self,
@@ -563,9 +566,16 @@ impl TerminalStore for MemoryTerminalStore {
                 "memory terminal store has no ownership authority configured".to_string(),
             )));
         };
-        // Ownership lock held across the WHOLE commit body — no CAS window.
-        ownership
-            .with_current(token, || {
+        // Ownership lock held across the WHOLE commit body — no CAS window —
+        // and the release that an inserted terminal carries.
+        ownership.finish_task(
+            token,
+            || {
+                self.events
+                    .task_terminal_for_epoch(session_id, token)
+                    .is_some()
+            },
+            || {
                 self.finish_task_sync(
                     Some(token),
                     session_id,
@@ -578,8 +588,8 @@ impl TerminalStore for MemoryTerminalStore {
                     goal,
                     now,
                 )
-            })?
-            .map_err(crate::OwnershipError::Storage)
+            },
+        )
     }
 
     async fn finish_turn_owned(

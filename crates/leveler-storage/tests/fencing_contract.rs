@@ -12,7 +12,7 @@ use leveler_storage::{
     Database, EventStore, GoalState, GoalStore, GoalTerminalUpdate, MemoryEventStore,
     MemoryGoalStore, MemoryMessageStore, MemoryOwnershipState, MemoryOwnershipStore,
     MemorySessionStore, MemoryTerminalStore, MemoryTurnStore, MessageStore, OwnershipError,
-    OwnershipStore, SessionRecord, SessionStore, TerminalStore, TurnStore,
+    OwnershipStore, SessionRecord, SessionStore, TaskOwner, TerminalStore, TurnStore,
 };
 
 struct Ports<'a> {
@@ -22,6 +22,7 @@ struct Ports<'a> {
     sessions: &'a dyn SessionStore,
     goals: &'a dyn GoalStore,
     terminal: &'a dyn TerminalStore,
+    ownership: &'a dyn OwnershipStore,
 }
 
 fn assert_stale<T: std::fmt::Debug>(result: Result<T, OwnershipError>, what: &str) {
@@ -379,6 +380,116 @@ async fn assert_fencing_contract(
     let finished_goal = ports.goals.get(&goal).await.unwrap().unwrap();
     assert_eq!(finished_goal.windows_run, 1);
     assert_eq!(finished_goal.state, GoalState::Settled);
+
+    // Scenario R: the committed task terminal ends the execution's ownership.
+    // The task is unowned at the same generation, and the finished token
+    // writes nothing more.
+    let owner = || async {
+        ports
+            .ownership
+            .current(&current.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        owner().await,
+        TaskOwner {
+            runtime: None,
+            boot: None,
+            epoch: current.owner_epoch,
+        },
+        "a task terminal releases the task without rewinding its generation"
+    );
+    assert_stale(
+        ports
+            .events
+            .append_owned(current, session, None, "late_note", "{}", now())
+            .await,
+        "event append after release",
+    );
+    assert_stale(
+        ports
+            .turns
+            .start_owned(current, session, "user", None, now())
+            .await,
+        "turn start after release",
+    );
+
+    // Replaying the same terminal is idempotent and a different one
+    // conflicts; neither takes the task back.
+    let finish = |outcome, status, state| {
+        ports.terminal.finish_task_owned(
+            current,
+            session,
+            "task_finished",
+            "{}",
+            outcome,
+            leveler_lifecycle::VerificationStatus::NotRun,
+            status,
+            state,
+            Some(&goal_update),
+            now(),
+        )
+    };
+    let replay = finish(
+        TaskOutcome::Completed,
+        SessionStatus::Completed,
+        AgentState::Complete,
+    )
+    .await
+    .expect("a repeated terminal replays the recorded one");
+    assert!(!replay.inserted);
+    assert!(
+        finish(
+            TaskOutcome::Failed,
+            SessionStatus::Failed,
+            AgentState::Failed
+        )
+        .await
+        .is_err(),
+        "one generation has one terminal"
+    );
+    assert_eq!(owner().await.runtime, None);
+
+    // A later generation is never released by the earlier one's terminal.
+    let next = ports
+        .ownership
+        .acquire(
+            &current.task_id,
+            &current.runtime_id,
+            &leveler_core::BootId::new("next-boot"),
+            current.owner_epoch,
+        )
+        .await
+        .expect("a released task is acquirable");
+    assert_eq!(next.owner_epoch, current.owner_epoch.next().unwrap());
+    assert_stale(
+        finish(
+            TaskOutcome::Completed,
+            SessionStatus::Completed,
+            AgentState::Complete,
+        )
+        .await,
+        "late terminal replay under a new generation",
+    );
+    assert_eq!(
+        owner().await,
+        TaskOwner {
+            runtime: Some(next.runtime_id.clone()),
+            boot: Some(next.boot_id.clone()),
+            epoch: next.owner_epoch,
+        },
+        "the new generation is untouched"
+    );
+    let events = ports.events.load(session).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "task_finished")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -418,6 +529,7 @@ async fn sqlite_fenced_writes_honor_the_contract() {
             sessions: &db,
             goals: &db,
             terminal: &db,
+            ownership: &db,
         },
         &session,
         &stale,
@@ -480,6 +592,7 @@ async fn memory_fenced_writes_honor_the_contract() {
             sessions: sessions.as_ref(),
             goals: goals.as_ref(),
             terminal: &terminal,
+            ownership: &ownership,
         },
         &session,
         &stale,

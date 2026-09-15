@@ -154,7 +154,14 @@ impl TerminalRepository<'_> {
             .await
             .map_err(StorageError::from)
             .map_err(crate::OwnershipError::Storage)?;
-        if !owner_current_in_tx(&mut tx, token, session_id).await? {
+        // A generation that already released the task through its terminal
+        // may still replay that terminal, and nothing else.
+        let owner = task_owner_in_tx(&mut tx, token, session_id).await?;
+        let current = owner_is_current(owner.as_ref(), token);
+        let released = owner.as_ref().is_some_and(|(runtime, epoch)| {
+            runtime.is_none() && *epoch == token.owner_epoch.get() as i64
+        });
+        if !current && !released {
             let _ = tx.rollback().await;
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
@@ -203,6 +210,10 @@ impl TerminalRepository<'_> {
                 event,
                 inserted: false,
             });
+        }
+        if !current {
+            let _ = tx.rollback().await;
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
         let event = append_event(&mut tx, session_id, None, event_type, &payload, &now)
             .await
@@ -271,6 +282,24 @@ impl TerminalRepository<'_> {
                     return Err(crate::OwnershipError::Storage(error.into()));
                 }
             }
+        }
+        // The task terminal ends the execution, and with it the ownership it
+        // ran under. The generation stays, so this token can never write
+        // again and the next acquisition moves past it.
+        let released = sqlx::query(
+            "UPDATE tasks SET owner_runtime_id = NULL, owner_boot_id = NULL \
+             WHERE id = ?1 AND owner_runtime_id = ?2 AND owner_epoch = ?3",
+        )
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::from)
+        .map_err(crate::OwnershipError::Storage)?;
+        if released.rows_affected() != 1 {
+            let _ = tx.rollback().await;
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
         tx.commit()
             .await
@@ -351,18 +380,34 @@ async fn owner_current_in_tx(
     token: &leveler_core::OwnershipToken,
     session_id: &SessionId,
 ) -> Result<bool, crate::OwnershipError> {
-    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+    let owner = task_owner_in_tx(tx, token, session_id).await?;
+    Ok(owner_is_current(owner.as_ref(), token))
+}
+
+/// The task's (owner runtime, epoch), read inside the transaction.
+async fn task_owner_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    token: &leveler_core::OwnershipToken,
+    session_id: &SessionId,
+) -> Result<Option<(Option<String>, i64)>, crate::OwnershipError> {
+    sqlx::query_as(
         "SELECT owner_runtime_id, owner_epoch FROM tasks WHERE session_id = ?1 AND id = ?2",
     )
     .bind(session_id.as_str())
     .bind(token.task_id.as_str())
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
-    Ok(row.is_some_and(|(runtime, epoch)| {
+    .map_err(|e| crate::OwnershipError::Storage(e.into()))
+}
+
+fn owner_is_current(
+    owner: Option<&(Option<String>, i64)>,
+    token: &leveler_core::OwnershipToken,
+) -> bool {
+    owner.is_some_and(|(runtime, epoch)| {
         runtime.as_deref() == Some(token.runtime_id.as_str())
-            && epoch == token.owner_epoch.get() as i64
-    }))
+            && *epoch == token.owner_epoch.get() as i64
+    })
 }
 
 async fn append_event(

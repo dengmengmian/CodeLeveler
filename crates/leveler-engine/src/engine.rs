@@ -250,8 +250,10 @@ pub struct TaskTerminal {
 
 impl TaskEngine {
     /// Commit the canonical terminal event and every session lifecycle column
-    /// (outcome + status + state) atomically, then forward the event. The
-    /// engine is the one writer of the lifecycle for every session it runs —
+    /// (outcome + status + state) atomically, then forward the event. The same
+    /// commit ends the execution's ownership of the task: the boot that ran it
+    /// may stay open, and the next execution — from any boot — acquires anew.
+    /// The engine is the one writer of the lifecycle for every session it runs —
     /// no app layer stamps a second copy there — and an observer can never see
     /// an uncommitted fact. Normal, daemon, and parallel-parent lifecycles all
     /// pass through this same authority boundary.
@@ -335,8 +337,9 @@ impl TaskEngine {
     /// A task owned by a DIFFERENT runtime is a hard conflict - never
     /// auto-stolen. Within this runtime, a task another boot owns passes only
     /// once that boot is proven dead: a live one keeps it, and one whose
-    /// liveness cannot be established keeps it too. The epoch always
-    /// advances, fencing prior incarnations.
+    /// liveness cannot be established keeps it too. A task whose last
+    /// execution committed its terminal is unowned and passes to any boot.
+    /// The epoch always advances, fencing prior incarnations.
     pub async fn acquire_ownership(
         &self,
         session_id: &SessionId,

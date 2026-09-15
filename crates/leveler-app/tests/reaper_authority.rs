@@ -212,7 +212,8 @@ impl LiveSibling {
     }
 
     /// A still holds a current generation: its own cancel lands its own
-    /// fenced terminal write.
+    /// fenced terminal write, which releases the task at that same generation
+    /// — no sibling moved it.
     async fn assert_a_still_writes(&self) {
         self.client_a
             .send(ClientCommand::CancelCurrentTurn {
@@ -221,16 +222,30 @@ impl LiveSibling {
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while turn_statuses(&self.app_a, &self.session).await == ["running"] {
+        let released = TaskOwner {
+            runtime: None,
+            boot: None,
+            epoch: self.owner_before.epoch,
+        };
+        loop {
+            let owner = task_owner(&self.app_a, &self.session).await;
+            if owner == released {
+                break;
+            }
+            assert_eq!(
+                owner, self.owner_before,
+                "boot A's generation was moved by someone else"
+            );
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "boot A could not settle its own turn: its ownership was fenced"
+                "boot A could not settle its own turn: {:?}",
+                turn_statuses(&self.app_a, &self.session).await
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(
-            task_owner(&self.app_a, &self.session).await,
-            self.owner_before
+            turn_statuses(&self.app_a, &self.session).await,
+            ["interrupted"]
         );
     }
 }

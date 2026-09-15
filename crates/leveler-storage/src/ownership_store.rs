@@ -208,18 +208,56 @@ impl MemoryOwnershipState {
     ) -> Result<T, OwnershipError> {
         let owners = self.owners.lock().unwrap();
         if !Self::is_current_locked(&owners, token) {
-            let (runtime, _, epoch) = owners
-                .get(token.task_id.as_str())
-                .cloned()
-                .unwrap_or((None, None, 0));
-            return Err(OwnershipError::Stale {
-                task_id: token.task_id.clone(),
-                expected_epoch: token.owner_epoch,
-                actual_runtime: runtime.map(RuntimeId::new),
-                actual_epoch: OwnerEpoch::new(epoch),
-            });
+            return Err(Self::stale_locked(&owners, token));
         }
         Ok(write())
+    }
+
+    /// The task-terminal section: `commit` runs while `token` is current, and
+    /// an inserted terminal releases the task in the same critical section,
+    /// keeping its epoch. Once released, the same generation may run `commit`
+    /// again only when its terminal is `recorded` — a replay, never a second
+    /// terminal; any later generation makes the token stale.
+    pub(crate) fn finish_task(
+        &self,
+        token: &OwnershipToken,
+        recorded: impl FnOnce() -> bool,
+        commit: impl FnOnce() -> Result<crate::TaskTerminalCommit, StorageError>,
+    ) -> Result<crate::TaskTerminalCommit, OwnershipError> {
+        let mut owners = self.owners.lock().unwrap();
+        let current = Self::is_current_locked(&owners, token);
+        let released = owners
+            .get(token.task_id.as_str())
+            .is_some_and(|(runtime, _, epoch)| {
+                runtime.is_none() && *epoch == token.owner_epoch.get()
+            });
+        if !(current || released && recorded()) {
+            return Err(Self::stale_locked(&owners, token));
+        }
+        let commit = commit()?;
+        if commit.inserted {
+            owners.insert(
+                token.task_id.as_str().to_string(),
+                (None, None, token.owner_epoch.get()),
+            );
+        }
+        Ok(commit)
+    }
+
+    fn stale_locked(
+        owners: &HashMap<String, MemoryOwner>,
+        token: &OwnershipToken,
+    ) -> OwnershipError {
+        let (runtime, _, epoch) = owners
+            .get(token.task_id.as_str())
+            .cloned()
+            .unwrap_or((None, None, 0));
+        OwnershipError::Stale {
+            task_id: token.task_id.clone(),
+            expected_epoch: token.owner_epoch,
+            actual_runtime: runtime.map(RuntimeId::new),
+            actual_epoch: OwnerEpoch::new(epoch),
+        }
     }
 }
 

@@ -270,3 +270,185 @@ async fn a_boot_reacquires_its_own_task() {
     assert_eq!(second.owner_epoch, first.owner_epoch.next().unwrap());
     assert_eq!(second.boot_id, BootId::new("b1"));
 }
+
+impl World {
+    /// `boot` runs one whole execution in the session: acquire, a turn, the
+    /// turn terminal, the task terminal.
+    async fn finished_execution(
+        &self,
+        boot: &str,
+        session: &SessionId,
+    ) -> leveler_core::OwnershipToken {
+        let engine = self.boot(boot);
+        let token = self.running_turn(boot, session).await;
+        let turn = self.turns(session).await.pop().unwrap();
+        engine
+            .stores
+            .terminal
+            .finish_turn_owned(
+                &token,
+                session,
+                &leveler_core::TurnId::new(turn.id),
+                "turn_finished",
+                "{}",
+                leveler_engine::TurnOutcome::Completed,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        engine
+            .finish_task(&token, session, completed(), &mut |_| {})
+            .await
+            .unwrap();
+        token
+    }
+}
+
+fn completed() -> leveler_engine::TaskTerminal {
+    leveler_engine::TaskTerminal {
+        outcome: leveler_engine::TaskOutcome::Completed,
+        verification: leveler_lifecycle::VerificationStatus::NotRun,
+        reason: None,
+        stop: None,
+        status: leveler_lifecycle::SessionStatus::Completed,
+        state: leveler_lifecycle::AgentState::Complete,
+        goal: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// Ownership lasts as long as an execution, not as long as the boot that ran
+/// it: once its task terminal commits, a live sibling may run the next one,
+/// the generation moves on, and the finished turn keeps who ran it.
+#[tokio::test]
+async fn a_live_boot_releases_its_task_when_its_execution_ends() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.set("b1", BootLiveness::Alive);
+    world.set("b2", BootLiveness::Alive);
+
+    let t1 = world.finished_execution("b1", &session).await;
+    assert_eq!(
+        world.owner(&session).await,
+        TaskOwner {
+            runtime: None,
+            boot: None,
+            epoch: t1.owner_epoch,
+        }
+    );
+
+    let t2 = world
+        .boot("b2")
+        .acquire_ownership(&session)
+        .await
+        .expect("an idle live boot does not hold the session");
+    assert_eq!(t2.owner_epoch, t1.owner_epoch.next().unwrap());
+    assert_eq!(
+        world.turns(&session).await[0].owner_boot_id.as_deref(),
+        Some("b1"),
+        "the finished turn keeps the boot that ran it"
+    );
+    assert!(matches!(
+        world
+            .boot("b1")
+            .stores
+            .turns
+            .start_owned(&t1, &session, "user", None, leveler_core::now())
+            .await,
+        Err(leveler_storage::OwnershipError::Stale { .. })
+    ));
+}
+
+/// The same boot and a sibling take turns: each execution is its own
+/// generation, strictly increasing.
+#[tokio::test]
+async fn boots_alternate_executions_in_one_session() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.set("b1", BootLiveness::Alive);
+    world.set("b2", BootLiveness::Alive);
+
+    let epochs = [
+        world.finished_execution("b1", &session).await,
+        world.finished_execution("b2", &session).await,
+        world.finished_execution("b1", &session).await,
+    ]
+    .map(|token| token.owner_epoch.get());
+    assert_eq!(epochs, [1, 2, 3]);
+    let boots: Vec<_> = world
+        .turns(&session)
+        .await
+        .into_iter()
+        .map(|turn| turn.owner_boot_id.unwrap())
+        .collect();
+    assert_eq!(boots, ["b1", "b2", "b1"]);
+}
+
+/// Released is not up for grabs twice: of several live siblings starting at
+/// once in a session a live boot left idle, exactly one wins and only one
+/// turn runs.
+#[tokio::test]
+async fn one_of_several_boots_takes_an_idle_session() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.set("b1", BootLiveness::Alive);
+    let boots = ["b2", "b3", "b4", "b5", "b6"];
+    for boot in boots {
+        world.set(boot, BootLiveness::Alive);
+    }
+    let released = world.finished_execution("b1", &session).await;
+
+    let starts = boots.map(|boot| {
+        let engine = world.boot(boot);
+        let session = session.clone();
+        async move {
+            let token = engine.acquire_ownership(&session).await?;
+            engine
+                .stores
+                .turns
+                .start_owned(&token, &session, "user", None, leveler_core::now())
+                .await
+                .map_err(EngineError::from)?;
+            Ok::<_, EngineError>(token)
+        }
+    });
+    let results = futures::future::join_all(starts).await;
+    let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    assert_eq!(winners[0].owner_epoch, released.owner_epoch.next().unwrap());
+    assert_eq!(
+        world.statuses(&session).await,
+        ["completed", "running"],
+        "exactly one new turn runs"
+    );
+    assert_eq!(
+        world.owner(&session).await.boot,
+        Some(winners[0].boot_id.clone())
+    );
+}
+
+/// A late or repeated terminal of a finished execution never touches the
+/// execution that followed it.
+#[tokio::test]
+async fn a_late_terminal_does_not_release_the_next_execution() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.set("b1", BootLiveness::Alive);
+    world.set("b2", BootLiveness::Alive);
+    let t1 = world.finished_execution("b1", &session).await;
+    let t2 = world.running_turn("b2", &session).await;
+    let running = world.owner(&session).await;
+
+    let late = world
+        .boot("b1")
+        .finish_task(&t1, &session, completed(), &mut |_| {})
+        .await;
+    assert!(late.is_err(), "{late:?}");
+    assert_eq!(world.owner(&session).await, running);
+    assert_eq!(running.epoch, t2.owner_epoch);
+    assert!(matches!(
+        world.boot("b1").acquire_ownership(&session).await,
+        Err(EngineError::OwnedByLiveBoot { .. })
+    ));
+    assert_eq!(world.statuses(&session).await, ["completed", "running"]);
+}
