@@ -58,7 +58,14 @@ pub(crate) fn extract_command_facts(
 pub(crate) struct OutputLines {
     stdout: String,
     stderr: String,
+    /// The last lines that left, for a result that has no output of its own:
+    /// a stopped command returns only "cancelled".
+    tail: std::collections::VecDeque<String>,
 }
+
+/// How much of a stopped command's output its result repeats.
+const STOPPED_TAIL_LINES: usize = 40;
+const STOPPED_TAIL_BYTES: usize = 4096;
 
 impl OutputLines {
     /// Absorb one chunk; returns the complete lines it finished, sanitized.
@@ -70,7 +77,9 @@ impl OutputLines {
         buffer.push_str(&chunk.text);
         let cut = buffer.rfind('\n')? + 1;
         let complete: String = buffer.drain(..cut).collect();
-        Some((chunk.stream, sanitize_output(&complete)))
+        let text = sanitize_output(&complete);
+        self.remember(&text);
+        Some((chunk.stream, text))
     }
 
     /// Whatever partial lines remain once the command has ended.
@@ -83,7 +92,35 @@ impl OutputLines {
         .into_iter()
         .filter(|(_, rest)| !rest.is_empty())
         .map(|(stream, rest)| (stream, sanitize_output(&rest)))
+        .inspect(|(_, text)| self.remember(text))
         .collect()
+    }
+
+    /// The output that already left, bounded, for a stopped command's result.
+    pub(crate) fn stopped_tail(&self) -> Option<String> {
+        if self.tail.is_empty() {
+            return None;
+        }
+        let mut lines: Vec<&str> = Vec::new();
+        let mut bytes = 0;
+        for line in self.tail.iter().rev() {
+            if bytes + line.len() > STOPPED_TAIL_BYTES {
+                break;
+            }
+            bytes += line.len() + 1;
+            lines.push(line);
+        }
+        lines.reverse();
+        Some(lines.join("\n"))
+    }
+
+    fn remember(&mut self, text: &str) {
+        for line in text.lines() {
+            if self.tail.len() == STOPPED_TAIL_LINES {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(line.to_string());
+        }
     }
 
     fn buffer(&mut self, stream: leveler_execution::OutputStream) -> &mut String {
@@ -444,6 +481,22 @@ mod output_lines_tests {
             vec![(OutputStream::Stdout, "Checking b".to_string())]
         );
         assert!(lines.flush().is_empty());
+    }
+
+    /// A stopped command's result repeats only the latest output, bounded.
+    #[test]
+    fn the_stopped_tail_keeps_the_last_lines_only() {
+        let mut lines = OutputLines::default();
+        assert_eq!(lines.stopped_tail(), None);
+        for i in 1..=100 {
+            lines.push(chunk(OutputStream::Stdout, &format!("tick {i}\n")));
+        }
+        lines.push(chunk(OutputStream::Stdout, "partial"));
+        lines.flush();
+        let tail = lines.stopped_tail().expect("output was printed");
+        assert!(tail.ends_with("tick 100\npartial"), "{tail}");
+        assert!(!tail.contains("tick 60\n"), "{tail}");
+        assert_eq!(tail.lines().count(), 40);
     }
 
     #[test]

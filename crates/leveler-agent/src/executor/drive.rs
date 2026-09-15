@@ -2347,6 +2347,17 @@ impl AgentHarness for Drive<'_> {
                                 text,
                             });
                         }
+                        let mut result = result;
+                        // A stopped command's result is only "cancelled"; the
+                        // output the user already watched is what tells the
+                        // model how far it got.
+                        if result.8.1.is_some()
+                            && let Some(tail) = lines.stopped_tail()
+                        {
+                            result.0.push_str(&format!(
+                                "\n\nOutput before it stopped (last lines):\n{tail}"
+                            ));
+                        }
                         result
                     };
                     // Cancel during a long tool must stop the batch — do not

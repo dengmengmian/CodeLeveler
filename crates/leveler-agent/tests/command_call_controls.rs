@@ -203,6 +203,50 @@ async fn a_host_can_stop_one_running_command_and_the_turn_continues() {
     assert_eq!(*host.ended.lock().unwrap(), vec!["c1".to_string()]);
 }
 
+/// A stopped command's result tells the model what it had printed. Dogfood:
+/// the user watched ten ticks stream by, stopped the command, and the model
+/// — told only "command was cancelled" — could not say where it stopped.
+#[tokio::test]
+async fn a_stopped_command_result_carries_the_output_it_printed() {
+    let (dir, ctx) = workspace("stop-tail");
+    let host = Arc::new(CallHandles::default());
+    let watcher = host.clone();
+    let marker = dir.join("printed");
+    let printed = marker.clone();
+    tokio::spawn(async move {
+        loop {
+            let first = watcher.started.lock().unwrap().first().cloned();
+            if let Some((_, token)) = first
+                && printed.exists()
+            {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                token.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let cmd = format!(
+        "for i in 1 2 3; do echo tick $i; done; touch '{}'; sleep 30",
+        marker.display()
+    );
+    let (outcome, events) = run(vec![shell("c1", &cmd), text("stopped")], ctx, host).await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let (preview, stop) = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id, preview, stop, ..
+            } if id == "c1" => Some((preview.clone(), *stop)),
+            _ => None,
+        })
+        .expect("c1 result");
+    assert_eq!(stop, Some(CommandStop::Confirmed));
+    assert!(preview.contains("cancelled"), "{preview}");
+    assert!(preview.contains("tick 3"), "{preview}");
+}
+
 /// Output arrives while the command runs, before its result, and the result
 /// carries the process's own exit code.
 #[tokio::test]
