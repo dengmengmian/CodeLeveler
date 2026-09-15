@@ -153,6 +153,10 @@ pub enum Command {
     #[command(subcommand)]
     Models(ModelsCommand),
 
+    /// List and inspect agent definitions (project, user, built-in).
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+
     /// Probe a model's text and streaming behavior.
     Model(ModelCommand),
 
@@ -732,6 +736,21 @@ pub enum ThemeCommand {
         /// Palette: auto | dark | light | high-contrast
         #[arg(value_name = "ID")]
         id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentsCommand {
+    /// List the agents this project resolves, with status and shadowing.
+    List {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one agent's full definition.
+    Show {
+        /// Agent name, e.g. `security-reviewer`.
+        name: String,
     },
 }
 

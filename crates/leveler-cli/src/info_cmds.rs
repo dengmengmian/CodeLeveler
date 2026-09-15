@@ -20,8 +20,11 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
     println!("  memory:  {}", layout.memory_dir().display());
     println!();
 
-    let results =
+    let mut results =
         leveler_app::doctor::run_with_memory(&config, Some(layout.memory_dir().as_path()));
+    results.push(leveler_app::doctor::agents_check(
+        &leveler_agent::agent_registry::AgentRoots::for_project(&layout.repo_root),
+    ));
     for r in &results {
         print_check(r);
     }

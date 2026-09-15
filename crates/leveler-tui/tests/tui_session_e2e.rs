@@ -365,9 +365,7 @@ fn tui_session_commands_ui_and_logic() {
         "help lists commands: {help}"
     );
     assert!(
-        !help.contains("/workflow")
-            && !help.contains("/steps")
-            && !help.contains("/confirm-plan"),
+        !help.contains("/workflow") && !help.contains("/steps") && !help.contains("/confirm-plan"),
         "removed commands must not appear in help: {help}"
     );
     pages.push(("11-help", help));
@@ -394,7 +392,10 @@ fn tui_slash_popup_lists_renamed_commands() {
     assert!(!names.contains(&"/steps"), "removed: {names:?}");
     // `/agents` is back as a read-only registry view, but searchable only:
     // the empty-`/` popup stays the high-frequency core.
-    assert!(!names.contains(&"/agents"), "searchable, not core: {names:?}");
+    assert!(
+        !names.contains(&"/agents"),
+        "searchable, not core: {names:?}"
+    );
     assert!(!names.contains(&"/context"), "removed: {names:?}");
     assert!(!names.contains(&"/verify"), "removed: {names:?}");
     assert!(!names.contains(&"/confirm-plan"), "removed: {names:?}");

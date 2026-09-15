@@ -133,6 +133,48 @@ pub fn run_with_memory(
     results
 }
 
+/// Agent definitions this project resolves: counts by source, and every
+/// invalid definition or unloadable directory by name. Structural only — a
+/// model that is not configured is `leveler agents list`'s business.
+pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> CheckResult {
+    use leveler_agent::agent_registry::{AgentRegistry, AgentSource};
+    let registry = AgentRegistry::load(roots);
+    let count = |source: AgentSource| {
+        registry
+            .entries()
+            .iter()
+            .filter(|e| e.source == source)
+            .count()
+    };
+    let invalid: Vec<&str> = registry
+        .entries()
+        .iter()
+        .filter(|e| e.definition().is_none())
+        .map(|e| e.name.as_str())
+        .collect();
+    let mut detail = format!(
+        "{} project, {} user, {} built-in",
+        count(AgentSource::Project),
+        count(AgentSource::User),
+        count(AgentSource::Builtin)
+    );
+    if invalid.is_empty() && registry.problems().is_empty() {
+        return CheckResult::ok("agents", detail);
+    }
+    if !invalid.is_empty() {
+        detail.push_str(&format!(
+            "; {} invalid: {}",
+            invalid.len(),
+            invalid.join(", ")
+        ));
+    }
+    if !registry.problems().is_empty() {
+        detail.push_str(&format!("; {} not loaded", registry.problems().len()));
+    }
+    detail.push_str(" (see `leveler agents list`)");
+    CheckResult::warn("agents", detail)
+}
+
 fn memory_check(dir: &std::path::Path) -> CheckResult {
     match leveler_memory::MemoryStore::open(dir) {
         Ok(store) => match store.counts() {

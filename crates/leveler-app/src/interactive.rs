@@ -644,7 +644,11 @@ impl InProcessRuntimeClient {
     ) {
         let model = self.session_model(&session_id);
         let name = draft.name.trim().to_string();
-        let (ok, error, agent) = match self.app.save_agent(scope, &draft, create, &model).await {
+        let (ok, error, agent) = match self
+            .app
+            .save_agent(scope, &draft, create, Some(&model))
+            .await
+        {
             Ok(entry) => (true, None, Some(entry)),
             Err(error) => (false, Some(error), None),
         };
@@ -2856,7 +2860,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 query_id,
             } => {
                 let model = self.session_model(&session_id);
-                let (agents, problems) = self.app.list_agents(&model).await;
+                let (agents, problems) = self.app.list_agents(Some(&model)).await;
                 let _ = self
                     .events_for(&session_id)
                     .send(RuntimeEvent::AgentsLoaded {
@@ -2872,7 +2876,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 query_id,
             } => {
                 let model = self.session_model(&session_id);
-                let (agent, error) = match self.app.get_agent(&name, &model).await {
+                let (agent, error) = match self.app.get_agent(&name, Some(&model)).await {
                     Ok(detail) => (Some(detail), None),
                     Err(error) => (None, Some(error)),
                 };

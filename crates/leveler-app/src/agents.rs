@@ -24,7 +24,9 @@ use crate::Application;
 /// profiles, read up front) and the skills installed for this project.
 struct AppEnvironment {
     profiles: HashMap<ModelRef, ModelProfile>,
-    session_model: ModelRef,
+    /// The model an agent without its own runs on; `None` when no model is
+    /// configured at all.
+    session_model: Option<ModelRef>,
     root: std::path::PathBuf,
 }
 
@@ -38,7 +40,9 @@ impl AgentEnvironment for AppEnvironment {
         model: Option<&ModelRef>,
         effort: ReasoningEffort,
     ) -> Option<String> {
-        let model = model.unwrap_or(&self.session_model);
+        let Some(model) = model.or(self.session_model.as_ref()) else {
+            return Some("no model is configured to run it on".to_string());
+        };
         match self.profiles.get(model) {
             Some(profile) => leveler_agent::agent_registry::effort_unsupported(profile, effort),
             None => Some(format!("model {model} is not configured")),
@@ -63,7 +67,7 @@ impl Application {
     async fn agent_environment(
         &self,
         registry: &AgentRegistry,
-        session_model: &ModelRef,
+        session_model: Option<&ModelRef>,
     ) -> AppEnvironment {
         let mut wanted: Vec<ModelRef> = registry
             .entries()
@@ -71,7 +75,7 @@ impl Application {
             .filter_map(AgentEntry::definition)
             .filter_map(|d| d.model.clone())
             .collect();
-        wanted.push(session_model.clone());
+        wanted.extend(session_model.cloned());
         let configured = self.model_refs();
         let mut profiles = HashMap::new();
         for model in wanted {
@@ -84,7 +88,7 @@ impl Application {
         }
         AppEnvironment {
             profiles,
-            session_model: session_model.clone(),
+            session_model: session_model.cloned(),
             root: self.layout.repo_root.clone(),
         }
     }
@@ -93,7 +97,7 @@ impl Application {
     /// entries that are not agents at all.
     pub async fn list_agents(
         &self,
-        session_model: &ModelRef,
+        session_model: Option<&ModelRef>,
     ) -> (Vec<UiAgentEntry>, Vec<UiAgentProblem>) {
         let registry = self.agent_registry();
         let env = self.agent_environment(&registry, session_model).await;
@@ -110,7 +114,7 @@ impl Application {
     pub async fn get_agent(
         &self,
         name: &str,
-        session_model: &ModelRef,
+        session_model: Option<&ModelRef>,
     ) -> Result<UiAgentDetail, String> {
         let registry = self.agent_registry();
         let Some(entry) = registry.get(name.trim()) else {
@@ -137,7 +141,7 @@ impl Application {
         scope: UiAgentScope,
         draft: &UiAgentDraft,
         create: bool,
-        session_model: &ModelRef,
+        session_model: Option<&ModelRef>,
     ) -> Result<UiAgentEntry, String> {
         let store = AgentStore::new(self.agent_roots());
         let manifest = manifest_from(draft);
