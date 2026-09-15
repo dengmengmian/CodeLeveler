@@ -95,12 +95,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             same rule: when only PART of the stated objective is satisfiable, \
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
-            naming which part cannot be satisfied and why. If you kept a plan \
-            with `update_plan`, bring it up to date BEFORE this call, earlier in \
-            the same response: finished steps `completed`, steps you dropped \
-            removed. A plan left showing open steps beside `complete` tells the \
-            user the work is unfinished; a step you could not finish means \
-            `blocked`."
+            naming which part cannot be satisfied and why."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -671,12 +666,7 @@ mod plan_sync_contract_tests {
     #[test]
     fn base_prompt_says_the_plan_moves_with_the_work() {
         let section = plan_section();
-        for needle in [
-            "update_plan",
-            "in_progress",
-            "Before `update_goal`",
-            "blocked",
-        ] {
+        for needle in ["update_plan", "in_progress"] {
             assert!(
                 section.contains(needle),
                 "plan section lost `{needle}`:\n{section}"
@@ -745,19 +735,27 @@ mod plan_sync_contract_tests {
         );
     }
 
+    /// No terminal reconciliation instruction. Asking for the plan to be
+    /// brought up to date right before `update_goal` is not needed for
+    /// correctness, and in an A/B run (10 runs per arm) removing it took final
+    /// multi-step catch-up updates from 9/10 to 5/10 with no loss in task
+    /// success or final plan completeness. It is kept out unless new evidence
+    /// says otherwise. No causal link to false completions is claimed.
     #[test]
-    fn update_goal_asks_for_a_synchronized_plan_before_complete() {
+    fn there_is_no_final_plan_reconciliation_instruction() {
+        let section = plan_section();
+        assert!(
+            !section.contains("Before `update_goal`"),
+            "final reconciliation is back in the plan section:\n{section}"
+        );
         let def = super::update_goal_tool_definition();
-        for needle in ["update_plan", "BEFORE this call", "blocked"] {
-            assert!(
-                def.description.contains(needle),
-                "update_goal lost plan sync `{needle}`"
-            );
-        }
+        assert!(
+            !def.description.contains("update_plan"),
+            "final reconciliation is back in update_goal: {}",
+            def.description
+        );
     }
 
-    /// The contract is guidance, not a gate: neither surface may claim the
-    /// runtime refuses completion over the plan.
     #[test]
     fn plan_sync_is_not_described_as_enforced() {
         let def = super::update_goal_tool_definition();

@@ -48,7 +48,6 @@ A plan written with `update_plan` is the high-level state of the work — what i
 - Failure: while you retry, or reach the same outcome another way, the step stays `in_progress`.
 - Revise: when evidence shows the step's outcome itself is no longer the right goal — not just the method — rewrite that step as the work you will actually do and keep it `in_progress`; never mark an abandoned or replaced step `completed` to move on. Also send a revised list when a step turns out unnecessary, splits, or a new one appears.
 - Converge: once your work has moved on, update the plan so it no longer describes a stage you have already left behind — in particular after a recovery or a change of approach, before going further.
-- Before `update_goal`, make the plan say what actually happened: finished steps `completed`, dropped steps removed, listed ahead of the `update_goal` call in the same response. A step you could not finish stays open, and the goal is `blocked`, not `complete`.
 
 ## Goal mode (when active)
 
