@@ -9,30 +9,168 @@ FOUNDATION_FROZEN=YES
 FREEZE_CONDITION=first-attempt main CI success for the commit adding this record
 ```
 
-Every local and base-CI gate below passed on the tested head. A record cannot
-name its own commit or that commit's CI run, so the final run is reported
-against this record rather than written into it. If that run fails on its
-first attempt, this freeze is void and must be withdrawn by a follow-up commit.
+Every local acceptance gate below passed on the tested product head
+(`f1ae044`). A record cannot name its own commit or that commit's CI run, so
+the final run is reported against this record rather than written into it. If
+that run fails on its first attempt, this freeze is void and must be withdrawn
+by a follow-up commit.
 
-This document is the Foundation-wide acceptance record. The W2, daemon,
+This is a **re-freeze**: the earlier record at `30839e3` is superseded by the
+snapshot here, and its content is retained below as history. The W2, daemon,
 Windows canary, and W3-A records remain the authority for their own gates.
 
 ## 2. Accepted Identity
 
 ```text
-FOUNDATION_BASE_HEAD=30839e3e32849dba838f5cef8856c56e2b060150
-FOUNDATION_TESTED_HEAD=30839e3e32849dba838f5cef8856c56e2b060150
-BASE_CI_RUN_ID=34750049988
-BASE_CI_ATTEMPT=1
-BASE_CI_RESULT=success
-BASE_CI_EVENT=push
-BASE_CI_BRANCH=main
+FOUNDATION_TESTED_HEAD=f1ae0441dd8caa0795071f4be0702d5d53108f6e
+FOUNDATION_TESTED_TREE=edf1ee662700d29cd093e072ec7d5184909e12dc
+FOUNDATION_TESTED_BRANCH=main
+PREVIOUS_FREEZE_HEAD=30839e3e32849dba838f5cef8856c56e2b060150
+SUPERSEDED_BY=f1ae0441dd8caa0795071f4be0702d5d53108f6e
+FREEZE_RECORD_COMMIT=the commit that adds this section (documentation only)
 ```
 
-`FOUNDATION_TESTED_HEAD` is the product tree every gate in this record ran on.
-The commit that adds this record changes documentation only.
+`FOUNDATION_TESTED_HEAD`/`FOUNDATION_TESTED_TREE` name the product tree every
+gate below ran on. The commit that adds this record changes documentation only,
+so it is deliberately not written into `FOUNDATION_TESTED_HEAD`.
 
-## 3. Closed Gates
+## 3. Re-freeze Acceptance (f1ae044)
+
+Baseline stability was proven: the workspace was clean and `HEAD`/tree were
+byte-identical before and after the acceptance run.
+
+```text
+TEST_START_HEAD=f1ae0441dd8caa0795071f4be0702d5d53108f6e
+TEST_END_HEAD=f1ae0441dd8caa0795071f4be0702d5d53108f6e
+TEST_START_TREE=edf1ee662700d29cd093e072ec7d5184909e12dc
+TEST_END_TREE=edf1ee662700d29cd093e072ec7d5184909e12dc
+BASELINE_STABLE=YES
+WORKTREE_CLEAN=YES
+```
+
+Static and web gates:
+
+```text
+cargo fmt --all -- --check=PASS
+cargo clippy --workspace --all-targets --all-features -- -D warnings=PASS
+cargo test --workspace=PASS (PASSED=4004, FAILED=0, IGNORED=20)
+web typecheck (gen-protocol --check + tsc --noEmit)=PASS
+web vitest=PASS (198 passed, 19 files)
+```
+
+Architecture proof (Engine owns lifecycle, not agent intelligence):
+
+```text
+ENGINE_AGENT_DEPENDENCY=NONE
+ENGINE_TOOLS_DEPENDENCY=NONE
+ENGINE_VERIFIER_DEPENDENCY=NONE
+ENGINE_APP_DEPENDENCY=NONE
+leveler-engine --test minimal_harness=PASS (6 passed, 0 failed)
+leveler-engine --test ownership_direction=PASS (9 passed, 0 failed)
+ENGINE_LIFECYCLE_OWNERSHIP=PASS
+ENGINE_AGENT_INTELLIGENCE_SEPARATION=PASS
+```
+
+Ownership / crash acceptance:
+
+```text
+leveler-app --test execution_ownership=PASS (8)
+leveler-engine --test boot_authority=PASS (13)
+leveler-app --test reaper_authority=PASS (8)
+leveler-agent --test crash_recovery_test=PASS (18)
+leveler-storage --test fencing_contract=PASS (2)
+leveler-storage --lib ownership_store=PASS (3)
+leveler-cli --test daemon_e2e=PASS (7)
+leveler-app --test goal_identity=PASS (6)
+leveler-app --test goal_settlement=PASS (3)
+leveler-app --test lifecycle_authority=PASS (7)
+```
+
+Browser contract regression (live cross-OS browser CI evidence is inherited
+from the W2 record; this re-freeze re-ran the local contract suites):
+
+```text
+leveler-tools --test browser_surface=PASS (4)
+leveler-tools --test capability_composition=PASS (7)
+leveler-browser (acceptance + selection)=PASS (12)
+leveler-tools --lib web_search=PASS (6)
+```
+
+Real dogfood (real runtime, real provider, no mocks):
+
+```text
+DOGFOOD_TASK=fix add() in calc.py to return a+b, then run python3 test_calc.py
+DOGFOOD_MODEL=deepseek/deepseek-v4-flash
+DOGFOOD_SESSION=75d3b163-369b-4122-95ef-e7904d4c9f50
+DOGFOOD_BINARY=leveler 0.2.0-beta.2 (f1ae0441dd8c)
+DOGFOOD_TOOLS=read_file, read_file, apply_patch, run_command, update_goal (5 started / 5 finished)
+DOGFOOD_EDIT_OCCURRED=YES (calc.py: `return a - b` -> `return a + b`)
+DOGFOOD_TEST=python3 test_calc.py exit 0 ("all tests passed")
+DOGFOOD_STOP_REASON=CompletedUnverified
+DOGFOOD_VERIFICATION=not_run (reason: no_automatic_verification)
+```
+
+Truth review (from the persisted session database and `leveler trace`):
+
+```text
+TASK_RESULT_CORRECT=YES
+COMPLETION_TRUTH=PASS
+TERMINAL_PERSISTED=YES
+OWNERSHIP_RELEASED=YES (task owner_runtime_id/owner_boot_id NULL, owner_epoch=1)
+SESSION_STATE_CORRECT=YES (status=completed, state=complete, outcome=completed, verification=not_run)
+PERSISTENCE_READBACK=PASS
+RESUME_TRUTH=PASS
+FALSE_VERIFIED=0
+INCORRECT_AND_VERIFIED=0
+```
+
+The runtime reported `CompletedUnverified` because its automatic verification
+plan did not run; the model's own `run_command` checking the fixture is not the
+runtime's verification. The terminal records exactly that, so no passing
+verification is claimed that did not happen.
+
+## 4. Authority Model
+
+```text
+Model owns reasoning.
+Harness owns domain semantics.
+Engine owns lifecycle.
+```
+
+A read-only re-audit of the re-frozen head confirmed the W3-A conclusions still
+hold:
+
+```text
+ONE_SESSION_TASK_LIFECYCLE_OWNER=YES
+ENGINE_SELECTS_CODING_WORKFLOW_STATE=NO
+ENGINE_INTERPRETS_CODING_SEEDS=NO
+ENGINE_INTERPRETS_CODING_CHECKPOINTS=NO
+ENGINE_INFERS_DOMAIN_COMPLETION=NO
+PRODUCT_OWNS_PARALLEL_PARENT_LIFECYCLE=NO
+LONG_GOAL_FENCING=PASS
+TASK_GOAL_TERMINAL_ATOMICITY=PASS
+ENGINE_RECOVERY_WORDING_DOMAIN_NEUTRAL=YES
+NEW_ARCHITECTURE_FRAMEWORK_INTRODUCED=NO
+SECOND_LIFECYCLE_SYSTEM=NO
+SECOND_DURABLE_TRUTH_SOURCE=NO
+ENGINE_TO_CODING_DEPENDENCY=NONE
+```
+
+`EngineEvent` and `leveler-lifecycle` still carry Coding/product vocabulary
+(`PlanUpdated`, `EvidenceLedgerUpdated`, `GoalCheckpointCreated`, `AgentState`).
+The Engine only persists, replays, and data-classifies those variants. This is
+compile-time coupling, not semantic authority, and it is not a freeze blocker.
+
+---
+
+# Superseded freeze record (30839e3) — retained as history
+
+The sections below are the original freeze record for product head
+`30839e3e32849dba838f5cef8856c56e2b060150`. They remain valid evidence for
+their own gates; the authoritative snapshot for the current frozen baseline is
+sections 1–4 above.
+
+## Original record: Closed Gates
 
 ```text
 W2=PASS
