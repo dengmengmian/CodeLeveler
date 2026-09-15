@@ -368,6 +368,21 @@ impl TranscriptState {
         self.push_user(text);
     }
 
+    /// Add an admitted steer unless the runtime already announced it in this
+    /// turn: a steer that arrived after its turn ended starts a new turn, whose
+    /// `UserMessageAdded` may precede the admission answer.
+    pub fn push_admitted_steer(&mut self, text: String) {
+        let announced = self
+            .items
+            .iter()
+            .rev()
+            .take_while(|item| !matches!(item, TranscriptItem::TurnEnd(_)))
+            .any(|item| matches!(item, TranscriptItem::User(shown) if shown == &text));
+        if !announced {
+            self.push_user(text);
+        }
+    }
+
     pub fn push_error(&mut self, text: String) {
         self.bump();
         self.close_tool_group();

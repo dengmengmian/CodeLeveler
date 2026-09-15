@@ -135,6 +135,35 @@ fn any_item_can_be_sent_and_it_stays_until_the_runtime_admits_it() {
     assert_eq!(user_messages(&s), vec!["先别继续了"]);
 }
 
+/// The turn a steer aimed at can end first; the runtime then starts a turn
+/// with it and announces the message itself. Admission must not add it twice.
+#[test]
+fn a_steer_that_became_a_new_turn_is_shown_once() {
+    let mut s = state();
+    stage_three(&mut s);
+    let (_, id) = submitted(&send_from_keyboard(&mut s, 0));
+    reduce(
+        &mut s,
+        Action::Runtime(leveler_client_protocol::RuntimeEvent::UserMessageAdded {
+            message: leveler_client_protocol::UiMessage {
+                id: leveler_client_protocol::MessageId::new("u1"),
+                role: leveler_client_protocol::UiRole::User,
+                text: "结果如何？".into(),
+                ordinal: None,
+                kind: None,
+            },
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id: id,
+            snapshot: None,
+        }),
+    );
+    assert_eq!(user_messages(&s), vec!["结果如何？"]);
+}
+
 #[test]
 fn an_unanswered_send_stays_and_says_its_outcome_is_unknown() {
     let mut s = state();

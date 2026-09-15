@@ -259,7 +259,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 let item = state.pending_inputs.remove(index);
                 forget_pending_input_row(state);
                 if matches!(pending.command, ClientCommand::SteerCurrentTurn { .. }) {
-                    state.transcript.push_user(item.text);
+                    state.transcript.push_admitted_steer(item.text);
                 }
             }
             if pending.unconfirmed {
