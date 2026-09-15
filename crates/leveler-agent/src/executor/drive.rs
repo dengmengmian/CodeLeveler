@@ -138,7 +138,6 @@ pub(crate) struct Drive<'a> {
     epoch_duration_at_start: std::time::Duration,
     budget_note_sent: bool,
     plan_state: PlanState,
-    structured_plan_started: bool,
     /// Set whenever the model-visible messages gain something the durable
     /// transcript does not — a transient nudge, a fold.
     context_diverged: bool,
@@ -307,7 +306,6 @@ impl Executor {
             ),
             commands_run: progress.cumulative_commands,
             budget_note_sent: false,
-            structured_plan_started: !self.seeded_plan.is_empty(),
             plan_state: self.seeded_plan.clone(),
             context_diverged,
             session_approved: HashSet::new(),
@@ -1521,10 +1519,10 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
-                // The model's own plan is a cognitive aid, not a completion
-                // gate: the runtime can see that a step is still `pending`,
-                // but not whether that step is still required to satisfy the
-                // user — which is the model's reading of its own goal.
+                // The plan is the model's declared progress, not a completion
+                // authority: the runtime can see that a step is still
+                // `pending`, but not whether that step is still required to
+                // satisfy the user — which is the model's reading of its own goal.
                 if reason == StopReason::Completed {
                     self.ledger.plan = self.plan_state.clone();
                     // HostImplicit single-step completes atomically with the goal.
@@ -2306,9 +2304,9 @@ impl AgentHarness for Drive<'_> {
                 pending_images.push(part);
             }
 
-            // Validate plan updates against the in-memory mirror before
-            // accepting them (skip-step / origin rules). Host mirror only
-            // advances on success; tool text is rewritten on rejection.
+            // A plan update is the model's declaration: the host mirror takes
+            // any structurally valid list as sent (order is intent, not a
+            // rule) and only advances on success.
             let mut content = content;
             let mut is_error = is_error;
             if let Some(steps) = plan
@@ -2316,21 +2314,10 @@ impl AgentHarness for Drive<'_> {
             {
                 match PlanState::from_model_explicit(steps) {
                     Ok(next) => {
-                        if let Err(msg) =
-                            PlanState::validate_no_skip_complete(&self.plan_state, &next)
-                        {
-                            content = msg;
-                            is_error = true;
-                        } else {
-                            self.plan_state = next;
-                            self.structured_plan_started = true;
-                            // The plan now describes the work again: the
-                            // stale interval starts over, and a future one
-                            // may earn its own single reminder.
-                            (self.observer)(AgentEvent::PlanUpdated {
-                                steps: self.plan_state.steps.clone(),
-                            });
-                        }
+                        self.plan_state = next;
+                        (self.observer)(AgentEvent::PlanUpdated {
+                            steps: self.plan_state.steps.clone(),
+                        });
                     }
                     Err(msg) => {
                         content = msg;
@@ -2417,9 +2404,6 @@ impl AgentHarness for Drive<'_> {
                     &self.plan_state,
                     &mut *self.observer,
                 );
-                if self.executor.registry.mutates_files(&call.name) && !self.structured_plan_started
-                {
-                }
             }
             for path in &self.modified_files {
                 push_unique_path(&mut self.scoped_paths, path);

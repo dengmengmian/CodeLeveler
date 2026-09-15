@@ -756,6 +756,43 @@ mod plan_sync_contract_tests {
         );
     }
 
+    /// The plan is the agent's declared progress. The runtime records, persists
+    /// and shows it; it does not observe whether the work is really at the
+    /// declared step, so neither text may present the plan as the live state
+    /// of the work.
+    #[test]
+    fn the_plan_is_described_as_declared_progress() {
+        let def = crate::update_plan::UpdatePlanTool;
+        let description = leveler_tools::Tool::description(&def);
+        for text in [plan_section(), description] {
+            assert!(
+                text.contains("declare"),
+                "plan must be framed as declared progress:\n{text}"
+            );
+            assert!(
+                !text.contains("state of the work"),
+                "plan must not be framed as the live state of the work:\n{text}"
+            );
+        }
+        assert!(
+            plan_section().contains("nothing updates it for you"),
+            "the runtime does not advance the plan:\n{}",
+            plan_section()
+        );
+    }
+
+    /// Plan order is the intended order: completing a later step first is a
+    /// legitimate declaration.
+    #[test]
+    fn plan_order_is_intended_not_mandatory() {
+        let def = crate::update_plan::UpdatePlanTool;
+        let description = leveler_tools::Tool::description(&def);
+        assert!(
+            description.contains("intended order"),
+            "update_plan must say order is intent, not a rule:\n{description}"
+        );
+    }
+
     #[test]
     fn plan_sync_is_not_described_as_enforced() {
         let def = super::update_goal_tool_definition();

@@ -67,16 +67,20 @@ impl Tool for UpdatePlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Record or update your task plan as a checklist. Provide an optional \
-         explanation and a list of plan items, each with a `step` and a `status` \
-         (pending | in_progress | completed). At most one step may be in_progress \
-         at a time. It has no side effects on the workspace.\n\n\
+        "Record or update your task plan as a checklist: your declared plan and \
+         progress. Provide an optional explanation and a list of plan items, each \
+         with a `step` and a `status` (pending | in_progress | completed). At most \
+         one step may be in_progress at a time. It has no side effects on the \
+         workspace, and the plan shows exactly what you declare: nothing advances \
+         it for you.\n\n\
          `in_progress` is the step you are working on now. `completed` means its \
          outcome is true, as shown by a result you have already read — not that \
          you attempted it or moved on to other work. A failed, denied or \
          timed-out action completes nothing: the step stays in_progress \
          while you retry or reach its outcome another way; if the step's goal \
-         itself changes, rewrite the step instead of completing it.\n\n\
+         itself changes, rewrite the step instead of completing it. The list order \
+         is the intended order, not a rule: a later step whose outcome is already \
+         true may be completed while an earlier one is still open.\n\n\
          Call this again when your work moves on to another step, and when the \
          plan itself changes: a step is no longer needed, the work splits \
          differently, or a new fact adds a step. Send the whole list every \

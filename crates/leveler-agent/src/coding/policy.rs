@@ -147,9 +147,6 @@ pub fn resolve_execution_policy(
         context_budget: profile.limits.reliable_context,
         max_parallel_tools,
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
-        // Planning is task-driven, not model-tier-driven. This only shapes the
-        // prompt's planning guidance and the one soft plan reminder; nothing
-        // is refused for a missing plan.
         // Safety rail: only the eval seam may lower it.
         reasoning_effort: leveler_model::resolve_reasoning_effort(
             match role {

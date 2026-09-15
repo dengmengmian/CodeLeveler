@@ -403,6 +403,87 @@ async fn update_plan_tool_call_emits_a_plan_updated_event() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Plan order is the intended order, not an execution order. A later step
+/// whose outcome is already true may be declared completed while an earlier
+/// one is still open: real work detours and returns. Refusing that honest
+/// declaration once pushed a model to mark the unfinished earlier step
+/// completed instead (exp-C-ctl-2, `.env` never created).
+#[tokio::test]
+async fn a_later_step_may_be_completed_while_an_earlier_one_is_still_open() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-out-of-order-{}",
+        std::process::id() as u64 * 31 + 9
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "update_plan",
+            serde_json::json!({
+                "plan": [
+                    {"step": "write the config", "status": "in_progress"},
+                    {"step": "start the service", "status": "pending"},
+                    {"step": "check the endpoints", "status": "pending"},
+                ]
+            }),
+        ),
+        assistant_tool_call(
+            "c2",
+            "update_plan",
+            serde_json::json!({
+                "plan": [
+                    {"step": "write the config", "status": "in_progress"},
+                    {"step": "start the service", "status": "completed"},
+                    {"step": "check the endpoints", "status": "completed"},
+                ]
+            }),
+        ),
+        assistant_text("done"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    executor
+        .run(
+            "do the thing",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refused = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolResult { id, is_error: true, .. } if id == "c2"));
+    assert!(
+        !refused,
+        "an honest out-of-order declaration is accepted: {events:?}"
+    );
+    let plan = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .expect("the declaration is recorded");
+    let statuses: Vec<&str> = plan.iter().map(|s| s.status.as_str()).collect();
+    assert_eq!(statuses, ["in_progress", "completed", "completed"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn assistant_tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),

@@ -1,8 +1,15 @@
-//! Structured plan types shared by agent, engine, and gates.
+//! Structured plan types shared by agent, engine, and hosts.
+//!
+//! A plan is the agent's declared progress: what it intends to do, what it has
+//! declared done, and what it declares it is working on. The runtime accepts a
+//! structurally valid declaration, persists it, restores it on resume and
+//! projects it to clients; it does not observe whether the work is really at
+//! the declared step, and the plan is never a completion authority.
 //!
 //! The sole plan event remains `PlanUpdated` (full-list replace). Hosts keep an
 //! in-memory [`PlanState`] mirror of the latest steps; resume seeds from the
-//! last persisted `PlanUpdated` payload. No parallel plan event type.
+//! last persisted `PlanUpdated` payload — the last declared plan, not a
+//! reconstruction of what happened. No parallel plan event type.
 
 use serde::{Deserialize, Serialize};
 
@@ -113,39 +120,6 @@ impl PlanState {
         }
         Ok(Self { steps })
     }
-
-    /// Reject pending→completed jumps against the previous table (same step text).
-    pub fn validate_no_skip_complete(previous: &PlanState, next: &PlanState) -> Result<(), String> {
-        if previous.is_empty() {
-            return Ok(());
-        }
-        // A step may go straight pending → completed (finishing the current
-        // step in one shot is normal, not a skip). The only real skip is
-        // completing a step while an EARLIER step in the list is still
-        // unfinished — that jumps ahead of outstanding work.
-        for (i, next_step) in next.steps.iter().enumerate() {
-            if next_step.status != "completed" {
-                continue;
-            }
-            let was_pending = previous
-                .steps
-                .iter()
-                .find(|p| p.step == next_step.step)
-                .is_some_and(|p| p.status == "pending");
-            if !was_pending {
-                continue;
-            }
-            let earlier_all_completed = next.steps[..i].iter().all(|s| s.status == "completed");
-            if !earlier_all_completed {
-                return Err(format!(
-                    "plan step \"{}\" cannot be completed while an earlier step is \
-                     still unfinished; complete the steps in order",
-                    next_step.step
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -229,39 +203,5 @@ mod tests {
         assert!(!plan.is_fully_completed());
         plan.steps[1].status = "completed".into();
         assert!(plan.is_fully_completed());
-    }
-
-    fn step(name: &str, status: &str) -> PlanStep {
-        PlanStep {
-            step: name.into(),
-            status: status.into(),
-            id: None,
-            origin: PlanOrigin::ModelExplicit,
-        }
-    }
-
-    #[test]
-    fn allows_completing_the_current_step_directly() {
-        // Finishing the first outstanding step in one shot (pending → completed
-        // without a separate in_progress hop) is normal, not a skip — the model
-        // shouldn't be forced through a two-step ritual it finds unnatural.
-        let prev = PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "pending")])
-            .unwrap();
-        let next =
-            PlanState::from_model_explicit(vec![step("a", "completed"), step("b", "pending")])
-                .unwrap();
-        assert!(PlanState::validate_no_skip_complete(&prev, &next).is_ok());
-    }
-
-    #[test]
-    fn rejects_completing_a_step_before_an_earlier_unfinished_one() {
-        // Completing `b` while `a` (earlier in the list) is still unfinished is
-        // a real skip — that stays rejected.
-        let prev = PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "pending")])
-            .unwrap();
-        let next =
-            PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "completed")])
-                .unwrap();
-        assert!(PlanState::validate_no_skip_complete(&prev, &next).is_err());
     }
 }
