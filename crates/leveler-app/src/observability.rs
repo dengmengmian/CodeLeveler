@@ -678,6 +678,7 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                 nickname,
                 role,
                 task,
+                spec,
                 ..
             } => {
                 if !by_id.contains_key(id) {
@@ -691,6 +692,10 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                         role: role.clone(),
                         status: "running".into(),
                         summary: truncate(task, 64),
+                        agent: spec
+                            .as_ref()
+                            .and_then(|s| s.agent.as_ref())
+                            .map(|a| a.name.clone()),
                     },
                 );
             }
@@ -714,6 +719,7 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                         role: String::new(),
                         status: String::new(),
                         summary: String::new(),
+                        agent: None,
                     }
                 });
                 row.nickname = nickname.clone();
@@ -1382,6 +1388,41 @@ mod tests {
         let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
         assert_eq!(by_agent(&loaded.agents, "agent-1").status, "interrupted");
         assert_eq!(by_agent(&loaded.agents, "agent-2").status, "running");
+    }
+
+    /// A child spawned from a declarative agent is listed under that agent's
+    /// name, not only its capability class — `explorer` does not tell the
+    /// user which of their agents ran.
+    #[tokio::test]
+    async fn a_declared_agent_child_is_listed_with_its_agent_name() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "declared agent", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let mut started = agent_start("agent-1", "Euclid", "explorer", "Review");
+        if let EngineEvent::SubAgentStarted { spec, .. } = &mut started {
+            *spec = Some(leveler_lifecycle::ChildSpawnSpec {
+                agent: Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                    name: "security-reviewer".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        persist(&db, &sid, started).await;
+        persist(
+            &db,
+            &sid,
+            agent_start("agent-2", "Kepler", "explorer", "Map"),
+        )
+        .await;
+        persist(&db, &sid, agent_end("agent-1", "Euclid", true, "done")).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        let declared = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(declared.agent.as_deref(), Some("security-reviewer"));
+        assert_eq!(declared.role, "explorer");
+        assert_eq!(by_agent(&loaded.agents, "agent-2").agent, None);
     }
 
     #[tokio::test]

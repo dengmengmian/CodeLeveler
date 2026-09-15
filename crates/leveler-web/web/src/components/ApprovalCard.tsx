@@ -51,9 +51,11 @@ export function ApprovalCard({
           <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
             本会话内批准<kbd>s</kbd>
           </button>
-          <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_always')}>
-            始终允许<kbd>a</kbd>
-          </button>
+          {request.always_persists && (
+            <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_always')}>
+              始终允许<kbd>a</kbd>
+            </button>
+          )}
           <button className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>
             拒绝<kbd>n</kbd>
           </button>

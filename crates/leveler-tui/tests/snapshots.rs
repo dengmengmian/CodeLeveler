@@ -403,6 +403,7 @@ fn renders_approval_overlay_with_deny_visible() {
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
                 call_id: None,
+                always_persists: true,
             },
         }),
     );
@@ -1290,6 +1291,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
                 call_id: None,
+                always_persists: true,
             },
         }),
     );

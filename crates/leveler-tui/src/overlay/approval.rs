@@ -24,8 +24,6 @@ const OPTIONS: [(&str, ApprovalDecision); 4] = [
     ("拒绝", ApprovalDecision::Deny),
 ];
 
-const DENY_INDEX: usize = 3;
-
 /// Result of a key press on the approval overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalOutcome {
@@ -50,6 +48,7 @@ pub struct ApprovalOverlay {
 impl ApprovalOverlay {
     /// Open the overlay with the cursor on the safe (Deny) option.
     pub fn new(request: UiApprovalRequest) -> Self {
+        let cursor = choices(&request).len() - 1;
         let gated_call = request
             .call_id
             .as_deref()
@@ -59,7 +58,7 @@ impl ApprovalOverlay {
         Self {
             request,
             gated_call,
-            cursor: DENY_INDEX,
+            cursor,
             expanded: false,
         }
     }
@@ -70,7 +69,7 @@ impl ApprovalOverlay {
 
     /// Rows for rendering: `(label, is_cursor)`.
     pub fn options(&self) -> Vec<(&'static str, bool)> {
-        OPTIONS
+        choices(&self.request)
             .iter()
             .enumerate()
             .map(|(i, (label, _))| (*label, i == self.cursor))
@@ -78,6 +77,7 @@ impl ApprovalOverlay {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> ApprovalOutcome {
+        let choices = choices(&self.request);
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             // The headline elides the command to keep the prompt one line;
             // Ctrl+O is how you read the rest before deciding on it.
@@ -94,7 +94,9 @@ impl ApprovalOverlay {
             KeyCode::Char('a') | KeyCode::Char('s') => {
                 ApprovalOutcome::Decide(ApprovalDecision::ApproveSession)
             }
-            KeyCode::Char('w') => ApprovalOutcome::Decide(ApprovalDecision::ApproveAlways),
+            KeyCode::Char('w') if self.request.always_persists => {
+                ApprovalOutcome::Decide(ApprovalDecision::ApproveAlways)
+            }
             KeyCode::Char('d') | KeyCode::Char('n') => {
                 ApprovalOutcome::Decide(ApprovalDecision::Deny)
             }
@@ -103,19 +105,28 @@ impl ApprovalOverlay {
                 ApprovalOutcome::None
             }
             KeyCode::Down => {
-                self.cursor = (self.cursor + 1).min(OPTIONS.len() - 1);
+                self.cursor = (self.cursor + 1).min(choices.len() - 1);
                 ApprovalOutcome::None
             }
             // Numbered rows are the fastest path when the prompt reads as a
             // question with answers rather than a dialog to arrow through.
             KeyCode::Char(c @ '1'..='9') => match c.to_digit(10).map(|d| d as usize - 1) {
-                Some(i) if i < OPTIONS.len() => ApprovalOutcome::Decide(OPTIONS[i].1),
+                Some(i) if i < choices.len() => ApprovalOutcome::Decide(choices[i].1),
                 _ => ApprovalOutcome::None,
             },
-            KeyCode::Enter => ApprovalOutcome::Decide(OPTIONS[self.cursor].1),
+            KeyCode::Enter => ApprovalOutcome::Decide(choices[self.cursor].1),
             _ => ApprovalOutcome::None,
         }
     }
+}
+
+/// The rows this request offers. "Always" is shown only when the runtime
+/// would persist a rule for it; otherwise it would promise what never happens.
+fn choices(request: &UiApprovalRequest) -> Vec<(&'static str, ApprovalDecision)> {
+    OPTIONS
+        .into_iter()
+        .filter(|(_, d)| request.always_persists || *d != ApprovalDecision::ApproveAlways)
+        .collect()
 }
 
 #[cfg(test)]
@@ -131,11 +142,41 @@ mod tests {
             command: Some("git push".into()),
             risks: vec!["将访问网络".into()],
             call_id: None,
+            always_persists: true,
         }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// A consent tool (`save_agent`, `remember`, …) cannot become a project
+    /// rule, so the overlay must not offer one: no row, no `w` shortcut, and
+    /// the numbers follow the rows that are shown.
+    #[test]
+    fn always_is_not_offered_when_no_rule_would_be_written() {
+        let mut ov = ApprovalOverlay::new(UiApprovalRequest {
+            tool: "save_agent".into(),
+            always_persists: false,
+            ..request()
+        });
+        let labels: Vec<&str> = ov.options().into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, vec!["仅允许本次", "本次会话内允许", "拒绝"]);
+        assert_eq!(
+            ov.options().into_iter().find(|(_, f)| *f).unwrap().0,
+            "拒绝"
+        );
+        assert_eq!(ov.on_key(key(KeyCode::Char('w'))), ApprovalOutcome::None);
+        assert_eq!(
+            ov.on_key(key(KeyCode::Char('3'))),
+            ApprovalOutcome::Decide(ApprovalDecision::Deny)
+        );
+        assert_eq!(ov.on_key(key(KeyCode::Char('4'))), ApprovalOutcome::None);
+        ov.on_key(key(KeyCode::Up));
+        assert_eq!(
+            ov.on_key(key(KeyCode::Enter)),
+            ApprovalOutcome::Decide(ApprovalDecision::ApproveSession)
+        );
     }
 
     #[test]

@@ -295,6 +295,7 @@ impl Host {
                     command: Some("rm -rf /tmp/x".to_string()),
                     risks: Vec::new(),
                     call_id: None,
+                    always_persists: true,
                 },
             })
             .unwrap();
@@ -458,6 +459,7 @@ async fn an_observe_stream_does_not_arm_the_countdown() {
                 command: None,
                 risks: Vec::new(),
                 call_id: None,
+                always_persists: true,
             },
         })
         .unwrap();

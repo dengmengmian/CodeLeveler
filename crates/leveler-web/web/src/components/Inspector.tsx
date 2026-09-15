@@ -412,7 +412,7 @@ function DelegationStar({ agents }: { agents: readonly AgentDelegationView[] }) 
             </span>
             <span className="ag-star-body">
               <span className="ag-name">
-                {a.nickname}
+                {childDisplayName(a.nickname, a.agent)}
                 {a.role ? <span className="ag-role">{a.role}</span> : null}
               </span>
               <span className="ag-status">{delegationStatus(a.status)}</span>

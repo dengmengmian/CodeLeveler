@@ -7,12 +7,15 @@ import {
   buildCreateDraft,
   buildEditDraft,
   CAPABILITY_LABEL,
+  definitionProblem,
+  deleteConfirmText,
   draftSummary,
   editFormFromDetail,
   groupAgents,
   newCreateForm,
   permissionSummary,
   REASONING_EFFORTS,
+  SOURCE_HINT,
   SOURCE_LABEL,
   switchTemplate,
   TEMPLATES,
@@ -61,9 +64,10 @@ export function AgentsPanel() {
           {agents.loaded &&
             groupAgents(agents.entries).map((g) => (
               <div key={g.source} className="ag-group">
-                <div className="ag-kicker">
+                <div className="ag-kicker" title={SOURCE_HINT[g.source]}>
                   {SOURCE_LABEL[g.source]} · {g.entries.length}
                 </div>
+                <div className="set-hint">{SOURCE_HINT[g.source]}</div>
                 {g.entries.length === 0 && <div className="insp-empty">无</div>}
                 {g.entries.map((e) => (
                   <AgentEntryRow
@@ -118,7 +122,12 @@ function AgentEntryRow({
         <span className="ae-name">{entry.name}</span>
         <span className="ae-tag">{SOURCE_LABEL[entry.source]}</span>
         {entry.harness_only && <span className="ae-tag">harness only</span>}
-        <span className={`ae-badge ${entry.status}`}>{availabilityLabel(entry)}</span>
+        <span
+          className={`ae-badge ${entry.status}`}
+          title={entry.status === 'available' ? '定义有效，模型与 skills 已配置；不检查 API key' : undefined}
+        >
+          {availabilityLabel(entry)}
+        </span>
       </div>
       {entry.description && <div className="ae-desc">{entry.description}</div>}
       <div className="ae-meta">
@@ -213,7 +222,7 @@ function CapabilitySelect({ value, onChange }: { value: UiAgentCapability; onCha
     <select value={value} onChange={(e) => onChange(e.target.value as UiAgentCapability)}>
       {(Object.keys(CAPABILITY_LABEL) as UiAgentCapability[]).map((c) => (
         <option key={c} value={c}>
-          {CAPABILITY_LABEL[c]}（{permissionSummary({ capability: c })}）
+          {permissionSummary({ capability: c })}
         </option>
       ))}
     </select>
@@ -362,6 +371,7 @@ function AgentEditor({
 }) {
   const bridge = useBridge();
   const loaded = useAppState().agents.detail[name];
+  const problem = loaded?.agent ? definitionProblem(loaded.agent) : null;
   const [form, setForm] = useState<EditAgentForm | null>(null);
   const [scope, setScope] = useState<UiAgentScope>(initialScope);
   const [hint, setHint] = useState<string | null>(null);
@@ -373,7 +383,7 @@ function AgentEditor({
   }, [bridge, name]);
 
   useEffect(() => {
-    if (form || !loaded?.agent) return;
+    if (form || !loaded?.agent || definitionProblem(loaded.agent)) return;
     const base = editFormFromDetail(loaded.agent);
     setForm(mode === 'duplicate' ? { ...base, name: `${base.name}-copy` } : base);
   }, [loaded, form, mode]);
@@ -394,7 +404,7 @@ function AgentEditor({
   };
 
   const remove = () => {
-    if (window.confirm(`删除${scope === 'project' ? '项目' : '用户'} Agent「${name}」？\n正在运行的子 Agent 不受影响。`)) {
+    if (window.confirm(deleteConfirmText(name, scope, loaded?.agent?.entry.location))) {
       track(bridge.deleteAgent(scope, name), '已删除');
     }
   };
@@ -403,9 +413,18 @@ function AgentEditor({
     <AgentModal title={title} onClose={onClose}>
       {error && <div className="ae-error">{error}</div>}
       {hint && <div className="ae-error">{hint}</div>}
-      {!form && loaded?.error && (
+      {!form && (loaded?.error || problem) && (
         <>
-          <div className="ae-error">{loaded.error}</div>
+          {loaded?.error && <div className="ae-error">{loaded.error}</div>}
+          {problem && (
+            <>
+              <div className="ae-meta">
+                {SOURCE_LABEL[scope]} · {loaded?.agent?.entry.location ?? ''}
+              </div>
+              <div className="ae-error">这个定义无效，不能派发：{problem}</div>
+              <div className="set-hint">直接修改上面目录里的 agent.yaml / instructions.md 修复，或删除它。</div>
+            </>
+          )}
           {mode === 'edit' && (
             // 读不出来的定义也要能删掉，否则 UI 里没有出路。
             <div className="af-ops">
@@ -416,7 +435,7 @@ function AgentEditor({
           )}
         </>
       )}
-      {!form && !loaded?.error && <div className="insp-empty">读取定义中…</div>}
+      {!form && !loaded?.error && !problem && <div className="insp-empty">读取定义中…</div>}
       {form && confirm && (
         <Confirm
           draft={confirm}

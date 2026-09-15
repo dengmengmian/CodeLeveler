@@ -212,6 +212,10 @@ pub struct UiAgentObservation {
     pub status: String,
     #[serde(default)]
     pub summary: String,
+    /// The declarative agent the child was spawned from (`security-reviewer`),
+    /// when it was; `role` is then only its capability class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Recovery facts that are already durable and safe to show.

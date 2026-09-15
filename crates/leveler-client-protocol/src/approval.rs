@@ -31,6 +31,13 @@ pub struct UiApprovalRequest {
     /// `request_permissions`), and for a session recorded before this field.
     #[serde(default)]
     pub call_id: Option<String>,
+    /// Whether "always allow" would persist a standing permission rule for
+    /// this action. When `false` (consent tools such as `save_agent` or
+    /// `remember`, actions with no safe rule shape, or a request recorded
+    /// before this field) the runtime could only honour it for this session,
+    /// so a client must not offer it.
+    #[serde(default)]
+    pub always_persists: bool,
 }
 
 /// A mid-task clarification the agent needs answered (spec §35).

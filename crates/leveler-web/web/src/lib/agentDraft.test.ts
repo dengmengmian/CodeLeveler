@@ -8,6 +8,8 @@ import {
   buildCreateDraft,
   buildEditDraft,
   childDisplayName,
+  definitionProblem,
+  deleteConfirmText,
   draftSummary,
   editFormFromDetail,
   groupAgents,
@@ -90,7 +92,7 @@ describe('create form → draft', () => {
     expect(draftSummary(draft, 'user')).toEqual([
       ['名称', 'r'],
       ['位置', '用户（~/.leveler/agents）'],
-      ['读写权限', 'read-only'],
+      ['读写权限', '只读 · 不改文件'],
       ['可写范围', '不写文件'],
       ['工具', 'read_file, grep, git_diff, find_files, list_files'],
       ['模型', 'inherit'],
@@ -175,15 +177,15 @@ describe('edit form', () => {
 });
 
 describe('permission summary', () => {
-  it('names each capability in product words', () => {
-    expect(permissionSummary({ capability: 'read_only' })).toBe('read-only');
-    expect(permissionSummary({ capability: 'writer' })).toBe('writes what it claims');
-    expect(permissionSummary({ capability: 'scoped_writer' })).toBe('writes given files');
+  it('says in plain words whether the agent can change files', () => {
+    expect(permissionSummary({ capability: 'read_only' })).toBe('只读 · 不改文件');
+    expect(permissionSummary({ capability: 'writer' })).toBe('可写 · 自己认领要改的文件');
+    expect(permissionSummary({ capability: 'scoped_writer' })).toBe('限定文件可写 · 只改派发时交给它的文件');
   });
 
   it('adds write roots when present', () => {
     expect(permissionSummary({ capability: 'writer', write_roots: ['src/', 'docs/'] })).toBe(
-      'writes what it claims · only under src/, docs/',
+      '可写 · 自己认领要改的文件 · 仅限 src/, docs/',
     );
   });
 
@@ -193,25 +195,44 @@ describe('permission summary', () => {
 });
 
 describe('registry listing', () => {
-  it('groups by source in Built-in / Project / User order', () => {
+  it('groups by source in precedence order: Project / User / Built-in', () => {
     const groups = groupAgents([
       entry({ name: 'p', source: 'project' }),
       entry({ name: 'b', source: 'builtin' }),
       entry({ name: 'u', source: 'user' }),
     ]);
     expect(groups.map((g) => [g.source, g.entries.map((e) => e.name)])).toEqual([
-      ['builtin', ['b']],
       ['project', ['p']],
       ['user', ['u']],
+      ['builtin', ['b']],
     ]);
   });
 
-  it('availability carries the runtime reason', () => {
-    expect(availabilityLabel(entry())).toBe('available');
+  it('availability carries the runtime reason and claims no more than configuration', () => {
+    // runtime 只检查模型/skills 是否已配置，不检查 API key：不能说「可用」。
+    expect(availabilityLabel(entry())).toBe('已配置');
     expect(availabilityLabel(entry({ status: 'unavailable', reason: 'model x: no key' }))).toBe(
-      'unavailable: model x: no key',
+      '不可用：model x: no key',
     );
-    expect(availabilityLabel(entry({ status: 'invalid', reason: 'bad yaml' }))).toBe('invalid: bad yaml');
+    expect(availabilityLabel(entry({ status: 'invalid', reason: 'bad yaml' }))).toBe('无效：bad yaml');
+  });
+
+  it('an invalid definition is reported, not edited as if it were blank', () => {
+    expect(definitionProblem({ entry: entry({ status: 'invalid', reason: 'unknown tool `x`' }) })).toBe(
+      'unknown tool `x`',
+    );
+    expect(definitionProblem({ entry: entry({ status: 'invalid' }) })).toBe('定义无效（runtime 未给出原因）');
+    expect(definitionProblem({ entry: entry({ status: 'unavailable', reason: 'no model' }), instructions: 'x' })).toBeNull();
+    expect(definitionProblem({ entry: entry(), instructions: 'x' })).toBeNull();
+  });
+
+  it('the delete confirmation names the agent, its scope and the files it removes', () => {
+    expect(deleteConfirmText('sec', 'project', '/repo/.leveler/agents/sec')).toBe(
+      '删除项目 Agent「sec」？\n将从项目中移除 /repo/.leveler/agents/sec（agent.yaml 与 instructions.md）。\n正在运行的子 Agent 不受影响。',
+    );
+    expect(deleteConfirmText('sec', 'user', null)).toBe(
+      '删除用户 Agent「sec」？\n将从本机 ~/.leveler/agents 移除，所有项目都不再可用。\n正在运行的子 Agent 不受影响。',
+    );
   });
 
   it('short fingerprint is the first 8 characters', () => {

@@ -34,7 +34,10 @@ Built-in agents ship with the binary: the runtime roles `default`, `explorer`,
 The directory name is the agent's name. Entries whose name starts with `.` are
 ignored — the store uses them for staging — and so are plain files. The
 single-file `.leveler/agents/<name>.md` format of earlier builds is no longer
-read.
+read. A file in exactly that shape (`<name>.md` with a `---` frontmatter fence,
+directly in an agents directory) is reported by every listing and by
+`leveler doctor` as not loaded, with the directory to move it to. Nothing is
+migrated, renamed or deleted for you.
 
 ## Precedence
 
@@ -148,12 +151,18 @@ Every listing gives each agent one status:
 
 | Status | Meaning | Spawnable |
 | --- | --- | --- |
-| `available` | Valid, and everything it names exists here. | yes |
+| `available` | Valid, and everything it names is configured here. | yes |
 | `unavailable` | Valid, but its model is not configured, a skill is missing, or its effort is not offered. | no |
 | `invalid` | The files themselves are wrong: YAML, schema, name, missing instructions, a symlink. | no |
 
 One bad agent does not affect the others, and does not stop CodeLeveler from
 starting. `leveler doctor` reports invalid definitions by name.
+
+`available` is a configuration check: the model is configured, the effort is
+offered, the skills are installed. It does not check that the model's provider
+has a working API key; a pinned model whose key is missing fails at the child's
+first request, with the provider's error. The Web UI therefore labels this
+state "已配置" (configured), not "available".
 
 ## Using an agent
 
@@ -209,7 +218,9 @@ The agent's own edit tools cannot patch `.leveler/agents/` in place
 (`write_file`/`apply_patch` are refused there, like `.leveler/hooks.yaml`), so a
 change made from the conversation always goes through this path. A shell
 command is not covered by that refusal — the same limit as the hooks file —
-and a definition written that way is still validated when it is loaded.
+and a definition written that way is still validated when it is loaded. The
+refusal matches the directory case-insensitively, so `.LEVELER/Agents/…` is
+refused too (on macOS and Windows it is the same directory).
 
 From the conversation, `save_agent` and `delete_agent` validate the proposal
 first — a contradiction such as a read-only reviewer asking for `apply_patch`
@@ -217,7 +228,9 @@ is refused without asking you — and then always ask you to confirm, in every
 permission mode including full access. The confirmation shows the scope,
 capability, write bounds, tools, model, effort, skills and instructions. A
 session approval covers only that exact proposal. Nobody-present runs cannot
-write agents.
+write agents. An agent write never becomes a standing permission rule, so the
+approval prompt does not offer "always allow" for it (nor for `remember` /
+`forget`).
 
 ## Trust
 

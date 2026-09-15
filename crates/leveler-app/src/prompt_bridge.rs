@@ -191,16 +191,7 @@ pub(crate) struct ChannelApprover {
 #[async_trait]
 impl Approver for ChannelApprover {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        let ui = UiApprovalRequest {
-            id: request.id.clone(),
-            tool: request.tool.clone(),
-            summary: request.description.clone(),
-            command: request.command.clone(),
-            risks: risk_bullets(request),
-            // The call this decision is holding, so the UI can stop painting it
-            // as work in progress while it waits on the human.
-            call_id: Some(request.call_id.clone()),
-        };
+        let ui = ui_approval_request(request);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
             request.id.clone(),
@@ -233,6 +224,21 @@ impl Approver for ChannelApprover {
             id: request.id.clone(),
         });
         decision
+    }
+}
+
+/// The approval as a client shows it.
+fn ui_approval_request(request: &ApprovalRequest) -> UiApprovalRequest {
+    UiApprovalRequest {
+        id: request.id.clone(),
+        tool: request.tool.clone(),
+        summary: request.description.clone(),
+        command: request.command.clone(),
+        risks: risk_bullets(request),
+        // The call this decision is holding, so the UI can stop painting it
+        // as work in progress while it waits on the human.
+        call_id: Some(request.call_id.clone()),
+        always_persists: request.always_persists(),
     }
 }
 
@@ -270,6 +276,34 @@ mod tests {
         }
     }
 
+    /// "Always allow" is offered only where the runtime would write a rule for
+    /// it: a client must not show a choice whose promised effect never happens.
+    #[test]
+    fn always_is_offered_only_when_the_runtime_would_persist_a_rule() {
+        let request = |tool: &str, command: Option<&str>, paths: &[&str]| ApprovalRequest {
+            tool: tool.to_string(),
+            command: command.map(str::to_string),
+            paths: paths.iter().map(std::path::PathBuf::from).collect(),
+            ..approval_request()
+        };
+        for (tool, command, paths, persists) in [
+            ("run_command", Some("cargo test"), &[][..], true),
+            ("apply_patch", None, &["src/lib.rs"][..], true),
+            ("apply_patch", None, &[][..], false),
+            ("write_file", None, &["src/lib.rs"][..], false),
+            ("save_agent", None, &[][..], false),
+            ("delete_agent", None, &[][..], false),
+            ("remember", None, &[][..], false),
+            ("forget", None, &[][..], false),
+        ] {
+            assert_eq!(
+                ui_approval_request(&request(tool, command, paths)).always_persists,
+                persists,
+                "{tool} {command:?} {paths:?}"
+            );
+        }
+    }
+
     #[test]
     fn pending_binding_captures_turn_tool_call_and_action() {
         let request = approval_request();
@@ -296,6 +330,7 @@ mod tests {
                     command: request.command.clone(),
                     risks: vec![],
                     call_id: Some(request.call_id.clone()),
+                    always_persists: true,
                 },
                 reply,
             },

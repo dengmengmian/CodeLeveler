@@ -1066,6 +1066,7 @@ mod tests {
                 command: Some("git push".into()),
                 risks: vec!["network".into()],
                 call_id: None,
+                always_persists: true,
             }),
         )));
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();

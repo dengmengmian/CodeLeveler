@@ -130,6 +130,7 @@ describe('observability projection', () => {
         id: 'agent-1',
         nickname: 'Explorer',
         role: 'explorer',
+        agent: null,
         status: 'running',
         task: 'Inspect authentication flow',
         summary: null,
@@ -138,6 +139,7 @@ describe('observability projection', () => {
         id: 'agent-2',
         nickname: 'Worker',
         role: 'worker',
+        agent: null,
         status: 'completed',
         task: null,
         summary: 'tests added',
@@ -146,11 +148,21 @@ describe('observability projection', () => {
         id: 'agent-3',
         nickname: 'Worker',
         role: 'worker',
+        agent: null,
         status: 'failed',
         task: null,
         summary: 'compile error',
       },
     ]);
+  });
+
+  it('names a child spawned from a declared agent after that agent', () => {
+    const [declared, structural] = projectAgentDelegation([
+      { id: 'c1', nickname: 'Euclid', role: 'explorer', status: 'ok', summary: 'done', agent: 'security-reviewer' },
+      { id: 'c2', nickname: 'Kepler', role: 'explorer', status: 'ok', summary: 'done' },
+    ]);
+    expect(declared?.agent).toBe('security-reviewer');
+    expect(structural?.agent).toBeNull();
   });
 
   it('an interrupted child is interrupted, not running', () => {

@@ -26,13 +26,8 @@ impl Approver for CliApprover {
                 eprintln!("    path: {}", p.display());
             }
         }
-        eprint!(
-            "  Approve? [{}]es once / [{}]ession / [{}]lways (project rule) / [{}]o (default): ",
-            style("y").green(),
-            style("s").green(),
-            style("w").green(),
-            style("N").red()
-        );
+        let persists = request.always_persists();
+        eprint!("  Approve? {}: ", choices_prompt(persists));
 
         let line = tokio::task::spawn_blocking(|| {
             use std::io::BufRead;
@@ -44,12 +39,49 @@ impl Approver for CliApprover {
         .await
         .unwrap_or_default();
 
-        match line.trim().to_lowercase().as_str() {
-            "y" | "yes" | "once" => ApprovalDecision::ApproveOnce,
-            // `a` kept as session for muscle memory; prefer `s` in the prompt.
-            "a" | "all" | "s" | "session" => ApprovalDecision::ApproveSession,
-            "w" | "always" | "forever" => ApprovalDecision::ApproveAlways,
-            _ => ApprovalDecision::Deny,
-        }
+        parse_answer(&line, persists)
+    }
+}
+
+/// The answers offered. "Always" only when the runtime would persist a rule
+/// for it — otherwise the prompt would promise an effect that never happens.
+fn choices_prompt(always_persists: bool) -> String {
+    let always = if always_persists {
+        format!("[{}]lways (project rule) / ", style("w").green())
+    } else {
+        String::new()
+    };
+    format!(
+        "[{}]es once / [{}]ession / {always}[{}]o (default)",
+        style("y").green(),
+        style("s").green(),
+        style("N").red()
+    )
+}
+
+fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" | "once" => ApprovalDecision::ApproveOnce,
+        // `a` kept as session for muscle memory; prefer `s` in the prompt.
+        "a" | "all" | "s" | "session" => ApprovalDecision::ApproveSession,
+        "w" | "always" | "forever" if always_persists => ApprovalDecision::ApproveAlways,
+        _ => ApprovalDecision::Deny,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A consent tool cannot become a project rule: the prompt does not offer
+    /// "always", and typing `w` anyway is not an approval.
+    #[test]
+    fn always_is_offered_and_accepted_only_when_a_rule_would_be_written() {
+        assert!(choices_prompt(true).contains("lways"));
+        assert!(!choices_prompt(false).contains("lways"));
+        assert_eq!(parse_answer("w", true), ApprovalDecision::ApproveAlways);
+        assert_eq!(parse_answer("always", false), ApprovalDecision::Deny);
+        assert_eq!(parse_answer("s", false), ApprovalDecision::ApproveSession);
+        assert_eq!(parse_answer("y", false), ApprovalDecision::ApproveOnce);
     }
 }

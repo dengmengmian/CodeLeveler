@@ -1049,6 +1049,7 @@ fn an_approval_request_stops_its_call_reading_as_running() {
                 command: Some("rm -rf stale".into()),
                 risks: vec!["可能造成破坏性变更".into()],
                 call_id: Some("rm1".into()),
+                always_persists: true,
             },
         }),
     );
@@ -1301,6 +1302,7 @@ fn approval_req() -> UiApprovalRequest {
         command: Some("git push".into()),
         risks: vec!["将访问网络".into()],
         call_id: None,
+        always_persists: true,
     }
 }
 
@@ -1705,6 +1707,7 @@ fn second_approval_queues_and_advances_after_first_resolved() {
         command: Some("rm -rf tmp".into()),
         risks: vec![],
         call_id: None,
+        always_persists: true,
     };
     reduce(
         &mut s,

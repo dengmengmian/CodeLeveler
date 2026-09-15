@@ -328,6 +328,7 @@ mod tests {
                 command: Some("git push".into()),
                 risks: vec![],
                 call_id: None,
+                always_persists: true,
             }),
         )));
         let mut p = TerminalTitleProjection::default();

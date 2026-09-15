@@ -878,6 +878,7 @@ mod tests {
                 command: Some("git push".into()),
                 risks: vec!["network".into()],
                 call_id: None,
+                always_persists: true,
             }),
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);

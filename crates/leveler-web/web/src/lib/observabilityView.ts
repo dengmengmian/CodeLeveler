@@ -38,6 +38,8 @@ export interface AgentDelegationView {
   id: string;
   nickname: string;
   role: string;
+  /** The declared agent it ran as (`security-reviewer`); null for a built-in role spawn. */
+  agent: string | null;
   status: AgentDelegationStatus;
   /** Present while running — protocol stores the task in `summary` until finish. */
   task: string | null;
@@ -140,16 +142,17 @@ function nonempty(s: string | undefined): string | null {
 export function projectAgentDelegation(agents: readonly UiAgentObservation[]): AgentDelegationView[] {
   return agents.map((a) => {
     const text = nonempty(a.summary);
+    const base = { id: a.id, nickname: a.nickname, role: a.role, agent: a.agent ?? null };
     if (a.status === 'ok') {
-      return { id: a.id, nickname: a.nickname, role: a.role, status: 'completed', task: null, summary: text };
+      return { ...base, status: 'completed', task: null, summary: text };
     }
     if (a.status === 'fail') {
-      return { id: a.id, nickname: a.nickname, role: a.role, status: 'failed', task: null, summary: text };
+      return { ...base, status: 'failed', task: null, summary: text };
     }
     if (a.status === 'interrupted') {
-      return { id: a.id, nickname: a.nickname, role: a.role, status: 'interrupted', task: text, summary: null };
+      return { ...base, status: 'interrupted', task: text, summary: null };
     }
-    return { id: a.id, nickname: a.nickname, role: a.role, status: 'running', task: text, summary: null };
+    return { ...base, status: 'running', task: text, summary: null };
   });
 }
 

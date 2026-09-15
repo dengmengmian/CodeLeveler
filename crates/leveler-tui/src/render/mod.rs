@@ -1660,6 +1660,7 @@ mod tests {
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
                 call_id: None,
+                always_persists: true,
             }),
         )));
         // A user turn suppresses the splash card so only overlay chrome remains.

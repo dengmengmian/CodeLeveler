@@ -778,6 +778,7 @@ mod tests {
                     command: Some("ls".to_string()),
                     risks: vec!["network".to_string()],
                     call_id: None,
+                    always_persists: true,
                 },
             },
             "approval_requested",

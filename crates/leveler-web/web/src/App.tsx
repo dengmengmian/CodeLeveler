@@ -13,6 +13,7 @@ import { Inspector } from './components/Inspector';
 import { LevelMeter } from './components/LevelMeter';
 import { Sidebar } from './components/Rail';
 import { Timeline } from './components/Timeline';
+import { approvalKeyDecision } from './lib/approvalKeys';
 import { RuntimeBridge } from './lib/controller';
 import { formatElapsed, repoShortName } from './lib/format';
 import { CTRL_ICON } from './lib/icons';
@@ -20,14 +21,6 @@ import { headerWaitingCue, inspectorMode } from './lib/inspectorModel';
 import { presentTurnEnd } from './lib/turn';
 import { BridgeProvider, useBridge } from './state/bridge';
 import { AppProvider, useAppDispatch, useAppState, type AppState, type StageView } from './state/store';
-import type { ApprovalDecision } from './types/protocol';
-
-const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
-  y: 'approve_once',
-  s: 'approve_session',
-  a: 'approve_always',
-  n: 'deny',
-};
 
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -110,10 +103,11 @@ function Shell() {
       }
 
       if (isTypingTarget(e.target) || e.isComposing) return;
-      const decision = APPROVAL_KEYS[e.key];
-      if (decision && st.current && st.current.pendingApprovals.length > 0) {
+      const pending = st.current?.pendingApprovals[0];
+      const decision = pending ? approvalKeyDecision(e.key, pending) : null;
+      if (pending && decision) {
         e.preventDefault();
-        bridge.decideApproval(st.current.pendingApprovals[0].id, decision);
+        bridge.decideApproval(pending.id, decision);
       }
     };
     document.addEventListener('keydown', onKeyDown);

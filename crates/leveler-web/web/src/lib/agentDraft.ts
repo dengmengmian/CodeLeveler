@@ -181,19 +181,20 @@ export function buildEditDraft(form: EditAgentForm): { draft: UiAgentDraft } | {
 // ── 展示 ────────────────────────────────────────────────────────────
 
 const CAPABILITY_SUMMARY: Record<UiAgentCapability, string> = {
-  read_only: 'read-only',
-  writer: 'writes what it claims',
-  scoped_writer: 'writes given files',
+  read_only: '不改文件',
+  writer: '自己认领要改的文件',
+  scoped_writer: '只改派发时交给它的文件',
 };
 
+/** 普通用户读得懂的权限：能不能改文件、改哪些。 */
 export function permissionSummary(e: {
   capability?: UiAgentCapability | null;
   write_roots?: string[];
 }): string {
   if (!e.capability) return '—';
-  const base = CAPABILITY_SUMMARY[e.capability];
+  const base = `${CAPABILITY_LABEL[e.capability]} · ${CAPABILITY_SUMMARY[e.capability]}`;
   const roots = e.write_roots ?? [];
-  return roots.length > 0 ? `${base} · only under ${roots.join(', ')}` : base;
+  return roots.length > 0 ? `${base} · 仅限 ${roots.join(', ')}` : base;
 }
 
 const SCOPE_LABEL: Record<UiAgentScope, string> = {
@@ -216,7 +217,7 @@ export function draftSummary(draft: UiAgentDraft, scope: UiAgentScope): Array<[s
   return [
     ['名称', draft.name],
     ['位置', SCOPE_LABEL[scope]],
-    ['读写权限', CAPABILITY_SUMMARY[draft.capability]],
+    ['读写权限', permissionSummary({ capability: draft.capability })],
     ['可写范围', writeScope],
     ['工具', draft.tools && draft.tools.length > 0 ? draft.tools.join(', ') : '能力默认全部工具'],
     ['模型', draft.model || 'inherit'],
@@ -230,18 +231,48 @@ export const SOURCE_LABEL: Record<UiAgentSource, string> = {
   user: 'User',
 };
 
+/** 来源对用户意味着什么。 */
+export const SOURCE_HINT: Record<UiAgentSource, string> = {
+  project: '跟随这个仓库，可提交到 Git',
+  user: '本机所有项目可用',
+  builtin: 'CodeLeveler 内置',
+};
+
+/** 按生效优先级分组：同名时 Project 覆盖 User，User 覆盖 Built-in。 */
 export function groupAgents(
   entries: readonly UiAgentEntry[],
 ): Array<{ source: UiAgentSource; entries: UiAgentEntry[] }> {
-  return (['builtin', 'project', 'user'] as const).map((source) => ({
+  return (['project', 'user', 'builtin'] as const).map((source) => ({
     source,
     entries: entries.filter((e) => e.source === source),
   }));
 }
 
+const STATUS_LABEL: Record<UiAgentEntry['status'], string> = {
+  // runtime 只核对模型、推理强度、skills 是否已配置，不检查 API key，
+  // 所以只说「已配置」，不承诺一定能跑起来。
+  available: '已配置',
+  unavailable: '不可用',
+  invalid: '无效',
+};
+
 export function availabilityLabel(e: UiAgentEntry): string {
-  if (e.status === 'available') return 'available';
-  return e.reason ? `${e.status}: ${e.reason}` : e.status;
+  const label = STATUS_LABEL[e.status];
+  return e.status !== 'available' && e.reason ? `${label}：${e.reason}` : label;
+}
+
+/** 无效定义没有可编辑的内容：编辑器应报告原因，而不是给一张空表单。 */
+export function definitionProblem(detail: UiAgentDetail): string | null {
+  if (detail.entry.status !== 'invalid') return null;
+  return detail.entry.reason || '定义无效（runtime 未给出原因）';
+}
+
+export function deleteConfirmText(name: string, scope: UiAgentScope, location: string | null | undefined): string {
+  const what =
+    scope === 'project'
+      ? `将从项目中移除 ${location ?? '.leveler/agents/' + name}（agent.yaml 与 instructions.md）。`
+      : '将从本机 ~/.leveler/agents 移除，所有项目都不再可用。';
+  return `删除${scope === 'project' ? '项目' : '用户'} Agent「${name}」？\n${what}\n正在运行的子 Agent 不受影响。`;
 }
 
 export function shortFingerprint(fingerprint: string): string {

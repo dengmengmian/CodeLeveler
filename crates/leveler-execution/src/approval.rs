@@ -34,6 +34,16 @@ pub struct ApprovalRequest {
     pub paths: Vec<PathBuf>,
 }
 
+impl ApprovalRequest {
+    /// Whether an `ApproveAlways` answer would persist a standing permission
+    /// rule. `false` means the runtime can only honour it for this session
+    /// (consent tools, calls with no safe rule shape), so no prompt may offer it.
+    pub fn always_persists(&self) -> bool {
+        let paths: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
+        !crate::always_rules_for(&self.tool, self.command.as_deref(), &paths).is_empty()
+    }
+}
+
 /// The user's decision on an approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
