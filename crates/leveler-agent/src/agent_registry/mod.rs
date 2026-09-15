@@ -440,6 +440,19 @@ fn read_agents_dir(
             continue;
         }
         if !file_type.is_dir() && !file_type.is_symlink() {
+            if file_type.is_file()
+                && let Some(stem) = legacy_persona_name(&path, &dir_name)
+            {
+                problems.push(AgentProblem {
+                    source,
+                    location: path,
+                    error: format!(
+                        "legacy single-file agent persona; this format is no longer loaded. \
+                         Migrate it to `{stem}/{MANIFEST_FILE}` and `{stem}/{INSTRUCTIONS_FILE}` \
+                         in this agents directory"
+                    ),
+                });
+            }
             continue;
         }
         if let Err(error) = validate_agent_name(&dir_name) {
@@ -471,6 +484,28 @@ fn read_agents_dir(
         };
         candidates.push((name, source, Some(path), state));
     }
+}
+
+/// The agent name of a file in the single-file persona format that earlier
+/// builds read: `<name>.md` directly in an agents directory, starting with a
+/// frontmatter fence. Anything else (a README, notes) is not reported.
+fn legacy_persona_name(path: &Path, file_name: &str) -> Option<String> {
+    use std::io::Read;
+    let stem = file_name.strip_suffix(".md")?;
+    let old_name = !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !old_name {
+        return None;
+    }
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(5)
+        .read_to_end(&mut head)
+        .ok()?;
+    (head.starts_with(b"---\n") || head.starts_with(b"---\r\n")).then(|| stem.to_string())
 }
 
 fn read_definition(

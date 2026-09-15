@@ -344,8 +344,7 @@ impl Workspace {
         // Agent definitions change what future children may do. They are
         // written through the agent store (validated, confirmed by a person,
         // atomic), so no tool patches them in place.
-        if access == PathAccess::Write && normalized.starts_with(self.root.join(".leveler/agents"))
-        {
+        if access == PathAccess::Write && self.is_in_project_agents_dir(normalized) {
             return Err(WorkspaceError::AgentDefinition(
                 original.display().to_string(),
             ));
@@ -367,6 +366,21 @@ impl Workspace {
         }
 
         Ok(())
+    }
+
+    /// Whether `normalized` is inside `<root>/.leveler/agents`. The two names
+    /// compare ASCII-case-insensitively: on macOS and Windows `.LEVELER/Agents`
+    /// is the directory the registry reads.
+    fn is_in_project_agents_dir(&self, normalized: &Path) -> bool {
+        let Ok(rest) = normalized.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut parts = rest.components();
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(dir)), Some(Component::Normal(agents)))
+                if dir.eq_ignore_ascii_case(".leveler") && agents.eq_ignore_ascii_case("agents")
+        )
     }
 
     /// Whether `normalized` is one of this repository's trust-gated config
@@ -615,6 +629,32 @@ mod tests {
             assert!(
                 ws.resolve_for_read(name).is_ok(),
                 "{name} must stay readable"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same refusal for every spelling that lands in the agents directory:
+    /// nested files, `..` detours, and case variants — macOS and Windows
+    /// resolve `.LEVELER/Agents` to the very directory the registry reads.
+    #[test]
+    fn agent_definition_refusal_covers_nested_detoured_and_case_variant_paths() {
+        let (ws, dir) = workspace();
+        std::fs::create_dir_all(dir.join(".leveler/agents/existing")).unwrap();
+        std::fs::write(dir.join(".leveler/agents/existing/agent.yaml"), "x").unwrap();
+        for name in [
+            ".leveler/agents/existing/notes/deep.md",
+            "src/../.leveler/agents/new-agent/agent.yaml",
+            ".LEVELER/agents/new-agent/agent.yaml",
+            ".leveler/Agents/existing/agent.yaml",
+            ".Leveler/AGENTS/existing/instructions.md",
+        ] {
+            assert!(
+                matches!(
+                    ws.resolve_for_write(name, &ws_scope(&ws)),
+                    Err(WorkspaceError::AgentDefinition(_))
+                ),
+                "{name} must not be writable"
             );
         }
         std::fs::remove_dir_all(&dir).ok();

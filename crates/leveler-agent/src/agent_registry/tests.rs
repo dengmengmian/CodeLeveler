@@ -258,11 +258,52 @@ fn hidden_entries_and_plain_files_are_ignored() {
     let fx = Fixture::new();
     let dir = project_agents_dir(&fx.project);
     write_agent(&dir, ".staging-foo", &yaml("foo", ""), "x");
-    std::fs::write(dir.join("old-style.md"), "---\nname: old-style\n---\nbody").unwrap();
+    std::fs::write(dir.join("README.md"), "# Our agents\n\nOne directory each.").unwrap();
+    std::fs::write(dir.join("notes.txt"), "---\nname: notes\n---\n").unwrap();
     let reg = fx.load();
     assert!(reg.get("foo").is_none());
-    assert!(reg.get("old-style").is_none());
+    assert!(reg.get("README").is_none());
     assert!(reg.problems().is_empty(), "{:?}", reg.problems());
+}
+
+/// The single-file persona format is no longer read. A file in that exact
+/// shape — `<name>.md` with frontmatter, directly in an agents directory — is
+/// reported once with where to move it, so an upgrade does not silently lose
+/// the agent. Nothing is migrated, renamed or deleted.
+#[test]
+fn a_legacy_single_file_persona_is_reported_with_its_migration_path() {
+    let fx = Fixture::new();
+    let project_dir = project_agents_dir(&fx.project);
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let legacy = project_dir.join("old-style.md");
+    std::fs::write(&legacy, "---\nname: old-style\nrole: explorer\n---\nbody").unwrap();
+    std::fs::write(
+        fx.user.join("mine.md"),
+        "---\r\ndescription: x\r\n---\r\nbody",
+    )
+    .unwrap();
+    let reg = fx.load();
+    assert!(reg.get("old-style").is_none());
+    assert!(reg.get("mine").is_none());
+    assert_eq!(reg.problems().len(), 2, "{:?}", reg.problems());
+    let project = reg
+        .problems()
+        .iter()
+        .find(|p| p.source == AgentSource::Project)
+        .unwrap();
+    assert_eq!(project.location, legacy);
+    assert!(
+        project.error.contains("no longer loaded"),
+        "{}",
+        project.error
+    );
+    assert!(
+        project.error.contains("old-style/agent.yaml")
+            && project.error.contains("old-style/instructions.md"),
+        "{}",
+        project.error
+    );
+    assert!(std::fs::read_to_string(&legacy).unwrap().ends_with("body"));
 }
 
 #[test]
