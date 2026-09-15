@@ -1421,7 +1421,7 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
         && call.exit_code.is_some()
         && let Some(line) = call.preview.as_deref().and_then(shell_failure_line)
     {
-        return Some(truncate_display(line, 72));
+        return Some(truncate_display(&line, 72));
     }
     let preview = call.preview.as_deref()?.trim();
     if preview.is_empty() {
@@ -1436,22 +1436,51 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
 }
 
 /// The line that says what went wrong in a failed command's preview: the
-/// first `error…` line when it printed one, else the first thing it printed —
-/// never the runtime's own `exit: N` / stream-header rows, which the head
-/// already states.
-fn shell_failure_line(preview: &str) -> Option<&str> {
-    let mut content = preview.lines().map(str::trim).filter(|l| {
-        let metadata = l.starts_with("exit: ")
-            || *l == "[timed out]"
-            || (l.starts_with("--- ") && l.ends_with(" ---"));
-        !l.is_empty() && !metadata
-    });
-    let first = content.clone().next()?;
-    Some(
-        content
-            .find(|l| l.to_ascii_lowercase().starts_with("error"))
-            .unwrap_or(first),
-    )
+/// first line that reports a failure (`error…`, `FAIL`, `✗`, `panic`), else the
+/// first thing it printed — never the runtime's own `exit: N` / stream-header
+/// rows, which the head already states. Color escapes are removed.
+fn shell_failure_line(preview: &str) -> Option<String> {
+    let content: Vec<String> = preview
+        .lines()
+        .map(|l| strip_color(l).trim().to_string())
+        .filter(|l| {
+            let metadata = l.starts_with("exit: ")
+                || l == "[timed out]"
+                || (l.starts_with("--- ") && l.ends_with(" ---"));
+            !l.is_empty() && !metadata
+        })
+        .collect();
+    let reports_failure = |l: &str| {
+        let lower = l.to_lowercase();
+        lower.starts_with("error")
+            || lower.contains("fail")
+            || lower.contains("panic")
+            || l.contains('\u{2717}')
+    };
+    content
+        .iter()
+        .find(|l| reports_failure(l))
+        .or_else(|| content.first())
+        .cloned()
+}
+
+/// A line without its SGR color escapes (`ESC [ … m`).
+fn strip_color(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn strip_inline_md(s: &str) -> String {

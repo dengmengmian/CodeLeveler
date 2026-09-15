@@ -273,10 +273,32 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
     let rows = plain(&s);
     assert!(
         rows.iter()
-            .any(|r| r.contains("└ error: test failed, to rerun pass")),
-        "{rows:?}"
+            .any(|r| r.contains("└ test cli::tests::rollback ... FAILED")),
+        "the first line reporting a failure: {rows:?}"
     );
     assert!(!rows.iter().any(|r| r.contains("└ exit: 101")), "{rows:?}");
+
+    // A runner that prints progress first and marks failures with ✗ (colored).
+    let mut s = state();
+    start(&mut s, "v");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("v"),
+            ok: false,
+            preview: "exit: 1\n--- stdout ---\n▸ 1. userProfile · 首次 get 自动建账\n  \u{1b}[32m✓\u{1b}[0m 建账\n  \u{1b}[31m✗\u{1b}[0m B 第三笔触顶 cap，cut=80\n\u{1b}[31m✗ 11 failed\u{1b}[0m · 85 passed".into(),
+            duration_ms: 200,
+            applied_diff: None,
+            exit_code: Some(1),
+            stop: None,
+        }),
+    );
+    let rows = plain(&s);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("└ ✗ B 第三笔触顶 cap，cut=80")),
+        "{rows:?}"
+    );
 
     let mut s = state();
     start(&mut s, "u");
