@@ -2905,6 +2905,34 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // projection as the live event, oldest boundary first.
         let mut recaps = Vec::new();
         let stores = leveler_storage::EngineStores::from_database(&db);
+
+        // The live view only knows what THIS process forwarded. After a
+        // restart it is empty while the persisted plan — the one a resumed
+        // turn seeds from — still stands, so answer from that row instead of
+        // reporting no plan.
+        let plan = match live.plan {
+            Some(plan) => Some(plan),
+            None => match stores
+                .events
+                .load_last_by_type(session_id, "plan_updated", None)
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?
+            {
+                Some(row) => match leveler_engine::EngineEvent::from_payload(&row.payload)
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?
+                {
+                    leveler_engine::EngineEvent::PlanUpdated { steps } => {
+                        Some(crate::event_bridge::ui_plan(steps))
+                    }
+                    _ => {
+                        return Err(ClientError::Runtime(
+                            "plan_updated row carried a different event".into(),
+                        ));
+                    }
+                },
+                None => None,
+            },
+        };
         if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await
             && let Ok(goals) = stores.goals.for_task(&task).await
         {
@@ -2964,7 +2992,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             vision,
             last_sequence,
             active_tools: live.active_tools,
-            plan: live.plan,
+            plan,
             verification: live.verification,
             diff: live.diff,
             checkpoints,

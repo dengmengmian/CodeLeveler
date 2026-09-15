@@ -16,6 +16,26 @@ use leveler_client_protocol::{
 
 use crate::AppError;
 
+/// The client projection of a persisted plan table. One mapping for the live
+/// event and the reconnect snapshot, so the two cannot disagree on a status.
+pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
+    UiPlan {
+        steps: steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, s)| UiPlanStep {
+                index,
+                description: s.step,
+                status: match s.status.as_str() {
+                    "in_progress" => PlanStepStatus::Running,
+                    "completed" => PlanStepStatus::Done,
+                    _ => PlanStepStatus::Pending,
+                },
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> RuntimeEvent {
     match result {
         Ok(outcome) => turn_end_event(outcome.stop_reason, outcome.stop_detail),
@@ -576,21 +596,7 @@ impl EventBridge {
                 // Engine durability metadata; no standalone UI cell.
             }
             EngineEvent::PlanUpdated { steps } => {
-                let plan = UiPlan {
-                    steps: steps
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, s)| UiPlanStep {
-                            index,
-                            description: s.step,
-                            status: match s.status.as_str() {
-                                "in_progress" => PlanStepStatus::Running,
-                                "completed" => PlanStepStatus::Done,
-                                _ => PlanStepStatus::Pending,
-                            },
-                        })
-                        .collect(),
-                };
+                let plan = ui_plan(steps);
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
             EngineEvent::GoalIntercepted { kind, detail } => {
