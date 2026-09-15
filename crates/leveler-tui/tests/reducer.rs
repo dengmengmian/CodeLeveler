@@ -5525,14 +5525,20 @@ fn memory_forget_still_targets_active_entries() {
     );
 }
 
-/// Submitting while a turn runs steers it: the text reaches the model at the
-/// next round instead of waiting for the turn to end. The runtime falls back to
-/// an ordinary submission if the turn already finished, so nothing is lost.
+/// Enter while a turn runs holds the text in 待发送; it is not sent. Sending it
+/// (Tab to the list, Enter) steers the running turn: the text reaches the model
+/// at the next round, and the runtime falls back to an ordinary submission if
+/// the turn already finished, so nothing is lost.
 #[test]
-fn submitting_while_busy_steers_the_running_turn() {
+fn submitting_while_busy_holds_the_input_and_sending_it_steers_the_running_turn() {
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        reduce(&mut s, key(KeyCode::Enter)).is_empty(),
+        "held, not sent"
+    );
+    assert!(s.composer.is_empty(), "the composer clears into 待发送");
+    let effects = send_first_pending(&mut s);
     assert_eq!(
         submitted(&effects).0,
         ClientCommand::SteerCurrentTurn {
@@ -5540,25 +5546,46 @@ fn submitting_while_busy_steers_the_running_turn() {
             content: "改用另一个模块".to_string(),
         }
     );
-    assert!(s.composer.is_empty(), "the composer must clear on send");
 }
 
+/// Tab from the composer to 待发送, then Enter on its selected item.
+fn send_first_pending(s: &mut AppState) -> Vec<Effect> {
+    reduce(s, key(KeyCode::Tab));
+    reduce(s, key(KeyCode::Up));
+    reduce(s, key(KeyCode::Up));
+    reduce(s, key(KeyCode::Enter))
+}
+
+/// A steer enters the conversation when the runtime admits it — not when it
+/// is typed, and not when it is sent.
 #[test]
-fn steered_text_appears_in_the_conversation() {
+fn steered_text_appears_in_the_conversation_once_admitted() {
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
     reduce(&mut s, key(KeyCode::Enter));
+    let (_, command_id) = submitted(&send_first_pending(&mut s));
+    assert!(!format!("{:?}", s.transcript.items()).contains("改用另一个模块"));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: None,
+        }),
+    );
     let text = format!("{:?}", s.transcript.items());
     assert!(text.contains("改用另一个模块"), "{text}");
 }
 
-/// Several corrections in a row all reach the same next round, in order.
+/// Several held corrections are each sent on their own.
 #[test]
 fn several_steers_are_each_sent() {
     let mut s = busy_state();
     for msg in ["先改模块", "再加测试"] {
         s.composer.replace(msg);
-        let effects = reduce(&mut s, key(KeyCode::Enter));
+        reduce(&mut s, key(KeyCode::Enter));
+    }
+    for msg in ["先改模块", "再加测试"] {
+        let effects = send_first_pending(&mut s);
         assert!(
             matches!(
                 effects.as_slice(),
@@ -5566,6 +5593,15 @@ fn several_steers_are_each_sent() {
             ),
             "{effects:?}"
         );
+        let (_, command_id) = submitted(&effects);
+        reduce(
+            &mut s,
+            Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+                command_id,
+                snapshot: None,
+            }),
+        );
+        reduce(&mut s, key(KeyCode::Esc));
     }
 }
 
@@ -5631,7 +5667,8 @@ fn a_message_keeps_its_command_id_until_the_runtime_answers() {
 fn a_steer_is_a_tracked_submission() {
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
-    let (command, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(&mut s, key(KeyCode::Enter));
+    let (command, command_id) = submitted(&send_first_pending(&mut s));
     assert!(matches!(command, ClientCommand::SteerCurrentTurn { .. }));
     assert_eq!(s.pending_submissions[0].command_id, command_id);
 }
@@ -5666,7 +5703,10 @@ fn an_unanswered_submission_holds_new_input_instead_of_driving_a_second_turn() {
     s.composer.replace("第二条");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "nothing may be sent: {effects:?}");
-    assert_eq!(s.composer.text(), "第二条", "the new input is kept");
+    assert_eq!(s.pending_inputs.len(), 1, "the new input is kept in 待发送");
+    let effects = send_first_pending(&mut s);
+    assert!(effects.is_empty(), "nothing may be sent: {effects:?}");
+    assert!(s.pending_inputs[0].is_unsent(), "still held, still unsent");
     let note = s
         .notification
         .as_ref()
@@ -6060,7 +6100,8 @@ fn steering_expands_large_paste_to_canonical_content() {
     let mut s = busy_state();
     typed(&mut s, "context: ");
     reduce(&mut s, Action::Paste(BIG_PASTE.into()));
-    let effects = reduce(&mut s, key(KeyCode::Enter));
+    reduce(&mut s, key(KeyCode::Enter));
+    let effects = send_first_pending(&mut s);
     let want = format!("context: {BIG_PASTE}");
     assert!(
         matches!(

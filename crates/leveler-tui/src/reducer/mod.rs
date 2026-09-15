@@ -238,6 +238,9 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     message: state.t().submission_unconfirmed.to_string(),
                 });
             }
+            if let Some(item) = pending_input_for(state, &command_id) {
+                item.state = crate::pending_inputs::PendingInputState::Unconfirmed(command_id);
+            }
         }
         EffectCompletion::SubmissionDelivered {
             command_id,
@@ -248,6 +251,16 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             };
             if let Some(snapshot) = snapshot_for_current_session(state, snapshot) {
                 apply_runtime(state, RuntimeEvent::SessionOpened { session: snapshot });
+            }
+            // Admitted: the 待发送 item becomes conversation. A steer has no
+            // runtime message event of its own, so this is where it enters; an
+            // admitted new turn announces its message (`UserMessageAdded`).
+            if let Some(index) = pending_input_index(state, &command_id) {
+                let item = state.pending_inputs.remove(index);
+                forget_pending_input_row(state);
+                if matches!(pending.command, ClientCommand::SteerCurrentTurn { .. }) {
+                    state.transcript.push_user(item.text);
+                }
             }
             if pending.unconfirmed {
                 state.notification = Some(Notification {
@@ -263,6 +276,12 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             let Some(pending) = take_pending_submission(state, &command_id) else {
                 return;
             };
+            // It may have run: out of 待发送 (one click would run it again)
+            // and into the conversation with the note below.
+            if let Some(index) = pending_input_index(state, &command_id) {
+                state.pending_inputs.remove(index);
+                forget_pending_input_row(state);
+            }
             match snapshot_for_current_session(state, snapshot) {
                 Some(snapshot) => {
                     apply_runtime(state, RuntimeEvent::SessionOpened { session: snapshot });
@@ -316,7 +335,14 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 }
                 None => {}
             }
-            submit::restore_turn_input(state, pending.command);
+            // A refused 待发送 item stays where the user left it, still unsent;
+            // any other turn input goes back to the composer.
+            match pending_input_for(state, &command_id) {
+                Some(item) => {
+                    item.state = crate::pending_inputs::PendingInputState::Failed(message.clone());
+                }
+                None => submit::restore_turn_input(state, pending.command),
+            }
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
                 message: format!("{}：{message}", state.t().submission_rejected),
@@ -414,6 +440,37 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         .find(|(y, _)| *y == mouse.row)
         .map(|(_, id)| id.clone());
     let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
+
+    // 待发送 rows: hover reveals an item's actions; a click sends, deletes, or
+    // selects it. Checked first — these rows are outside every other region.
+    let pending_hit = state
+        .pending_hits
+        .iter()
+        .find(|hit| hit.row == mouse.row)
+        .copied();
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        state.pending_hover = pending_hit.and_then(|hit| hit.index);
+        return Vec::new();
+    }
+    if let (MouseEventKind::Down(MouseButton::Left), Some(hit)) = (mouse.kind, pending_hit) {
+        let on =
+            |span: Option<(u16, u16)>| span.is_some_and(|(a, b)| (a..b).contains(&mouse.column));
+        match hit.index {
+            Some(index) if on(hit.send) => return submit::send_pending_input(state, index),
+            Some(index) if on(hit.delete) => submit::delete_pending_input(state, index),
+            Some(index) => {
+                state.workbench_focus = WorkbenchFocus::Pending;
+                state.pending_selected = index;
+            }
+            // "还有 N 条": step the window to the next hidden item.
+            None => {
+                state.workbench_focus = WorkbenchFocus::Pending;
+                let n = state.pending_inputs.len().max(1);
+                state.pending_selected = (state.pending_selected + 1) % n;
+            }
+        }
+        return Vec::new();
+    }
 
     match mouse.kind {
         // Wheel scrolls Conversation (never over Input — keeps history focus).
@@ -700,6 +757,26 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
 
     match key.code {
+        // 待发送 focus: ↑/↓ choose an item, Enter sends it, Delete/Backspace
+        // deletes it, Esc goes back to the composer. Typing still claims Input.
+        KeyCode::Up if state.workbench_focus == WorkbenchFocus::Pending => {
+            state.pending_selected = state.pending_selected.saturating_sub(1);
+        }
+        KeyCode::Down if state.workbench_focus == WorkbenchFocus::Pending => {
+            state.pending_selected =
+                (state.pending_selected + 1).min(state.pending_inputs.len().saturating_sub(1));
+        }
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Pending => {
+            return submit::send_pending_input(state, state.pending_selected);
+        }
+        KeyCode::Delete | KeyCode::Backspace
+            if state.workbench_focus == WorkbenchFocus::Pending =>
+        {
+            submit::delete_pending_input(state, state.pending_selected);
+        }
+        KeyCode::Esc if state.workbench_focus == WorkbenchFocus::Pending => {
+            state.workbench_focus = WorkbenchFocus::Input;
+        }
         KeyCode::Enter if ctrl || alt => {
             state.composer.newline();
             touch_slash_filter(state);
@@ -795,6 +872,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // No completion popup and no ghost: Tab switches Input ↔ Conversation.
         KeyCode::Tab => {
             state.workbench_focus = match state.workbench_focus {
+                // 待发送 sits right above the composer, so it is the next stop.
+                WorkbenchFocus::Input if !state.pending_inputs.is_empty() => {
+                    state.pending_selected =
+                        state.pending_selected.min(state.pending_inputs.len() - 1);
+                    WorkbenchFocus::Pending
+                }
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
                 WorkbenchFocus::Conversation => {
                     crate::activity::ensure_selection(state);
@@ -805,6 +888,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     }
                 }
                 WorkbenchFocus::Activity => WorkbenchFocus::Input,
+                WorkbenchFocus::Pending => WorkbenchFocus::Conversation,
             };
         }
         KeyCode::Char(c) if !ctrl && !c.is_control() => {
@@ -978,6 +1062,33 @@ fn navigate_user_turn(state: &mut AppState, delta: i32) {
             level: NotificationLevel::Info,
             message: state.t().turn_nav_live.to_string(),
         });
+    }
+}
+
+/// The 待发送 item out under `command_id`, if one is.
+fn pending_input_index(state: &AppState, command_id: &CommandId) -> Option<usize> {
+    state
+        .pending_inputs
+        .iter()
+        .position(|item| item.command_id() == Some(command_id))
+}
+
+fn pending_input_for<'a>(
+    state: &'a mut AppState,
+    command_id: &CommandId,
+) -> Option<&'a mut crate::pending_inputs::PendingInput> {
+    let index = pending_input_index(state, command_id)?;
+    state.pending_inputs.get_mut(index)
+}
+
+/// An item left the list: keep selection in range, drop a stale hover.
+fn forget_pending_input_row(state: &mut AppState) {
+    state.pending_hover = None;
+    state.pending_selected = state
+        .pending_selected
+        .min(state.pending_inputs.len().saturating_sub(1));
+    if state.pending_inputs.is_empty() && state.workbench_focus == WorkbenchFocus::Pending {
+        state.workbench_focus = WorkbenchFocus::Input;
     }
 }
 
@@ -1198,6 +1309,9 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
 
 #[cfg(test)]
 mod command_row_tests;
+
+#[cfg(test)]
+mod pending_input_tests;
 
 #[cfg(test)]
 mod disclosure_tests {

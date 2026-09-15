@@ -93,6 +93,8 @@ pub enum WorkbenchFocus {
     Input,
     Conversation,
     Activity,
+    /// The 待发送 list above the composer.
+    Pending,
 }
 
 /// The `/remote` invite, as the screen shows it.
@@ -234,6 +236,15 @@ pub struct AppState {
     pub interaction_command_ids: HashMap<String, CommandId>,
     /// Turn inputs sent but not yet answered by the runtime, oldest first.
     pub pending_submissions: Vec<PendingSubmission>,
+    /// 待发送: inputs written while a turn runs, not yet admitted by the
+    /// runtime. Bottom control state; never painted into the conversation.
+    pub pending_inputs: Vec<crate::pending_inputs::PendingInput>,
+    /// Keyboard selection into `pending_inputs`.
+    pub pending_selected: usize,
+    /// The 待发送 row under the mouse, if any.
+    pub pending_hover: Option<usize>,
+    /// Last-painted 待发送 rows, for mouse hit-testing.
+    pub pending_hits: Vec<crate::pending_inputs::PendingInputHit>,
 
     pub status: RuntimeStatus,
     /// Mechanical post-response stage reported by the runtime. `Some` means
@@ -404,6 +415,10 @@ impl AppState {
             pending_interactions: VecDeque::new(),
             interaction_command_ids: HashMap::new(),
             pending_submissions: Vec::new(),
+            pending_inputs: Vec::new(),
+            pending_selected: 0,
+            pending_hover: None,
+            pending_hits: Vec::new(),
             status: RuntimeStatus::Idle,
             finalization_stage: None,
             turn_tool_calls: 0,

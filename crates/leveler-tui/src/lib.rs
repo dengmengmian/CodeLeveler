@@ -28,6 +28,7 @@ pub mod markdown;
 pub mod multi_agent;
 mod observability;
 pub mod overlay;
+pub mod pending_inputs;
 mod plan_cell;
 mod plan_viewport;
 mod presentation;

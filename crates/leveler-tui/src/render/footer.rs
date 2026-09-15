@@ -615,7 +615,17 @@ fn composer_trust_spans(state: &AppState, max_width: usize) -> Vec<Span<'static>
 /// hints competing with a half-written sentence are noise.
 pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let t = state.t();
-    let hints = if state.is_busy() {
+    let hints = if state.workbench_focus == crate::state::WorkbenchFocus::Pending {
+        format!(
+            "Enter {} · Delete {} · Esc {}",
+            t.pending_input_send, t.pending_input_delete, t.hint_back_to_input
+        )
+    } else if state.is_busy() && !state.pending_inputs.is_empty() {
+        format!(
+            "Tab {} · Esc {} · Ctrl+C {}",
+            t.pending_inputs_hint, t.hint_interrupt, t.hint_cancel
+        )
+    } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.is_empty() && state.turn_nav.is_none() {
         // `!` sits right after `/`: both are composer entry points, and the
@@ -750,6 +760,31 @@ mod p1_tests {
     /// Narrow widths stay bounded via the existing truncation rule, and the
     /// two openers sit early enough to survive it. A busy turn keeps the
     /// interrupt hints — `!` does not displace them.
+    fn hints(state: &AppState) -> String {
+        key_hint_line(state, 200)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    }
+
+    /// Held inputs are reachable from the keyboard, and the hint row says how.
+    #[test]
+    fn held_inputs_name_their_keys() {
+        let mut s = state();
+        s.status = leveler_client_protocol::RuntimeStatus::Busy;
+        s.pending_inputs.push(crate::pending_inputs::PendingInput {
+            text: "结果如何？".into(),
+            state: crate::pending_inputs::PendingInputState::Waiting,
+        });
+        assert!(hints(&s).contains("Tab 待发送"), "{}", hints(&s));
+        s.workbench_focus = crate::state::WorkbenchFocus::Pending;
+        let focused = hints(&s);
+        assert!(
+            focused.contains("Enter 发送") && focused.contains("Delete 删除"),
+            "{focused}"
+        );
+    }
+
     #[test]
     fn hint_row_stays_bounded_and_busy_hints_unchanged() {
         let s = state();

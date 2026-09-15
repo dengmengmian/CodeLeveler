@@ -118,6 +118,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         1
     };
     let team_rows = team_panel_height(state);
+    // 待发送 sits directly above the composer: input the user wrote and has
+    // not sent is part of what they can do now, not of the conversation.
+    let pending_rows = crate::pending_inputs::panel_height(state, area.height);
     // An open overlay takes the composer's slot rather than floating over the
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
@@ -161,7 +164,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let plan_visible = state.plan.as_ref().is_some_and(plan_panel_should_show);
     let chrome_above = status_rows
         .saturating_add(u16::from(plan_visible))
-        .saturating_add(attach_rows);
+        .saturating_add(attach_rows)
+        .saturating_add(pending_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
     // The hint row replaces the blank below the composer rather than adding to
     // it, so hints appearing and disappearing never reflow the transcript.
@@ -180,6 +184,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         .saturating_add(gap_rows)
         .saturating_add(status_rows)
         .saturating_add(attach_rows)
+        .saturating_add(pending_rows)
         .saturating_add(pre_composer_gap)
         .saturating_add(composer_rows)
         .saturating_add(post_composer_gap)
@@ -196,6 +201,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(status_rows),
         Constraint::Length(plan_rows),
         Constraint::Length(attach_rows),
+        Constraint::Length(pending_rows),
         Constraint::Length(pre_composer_gap),
         Constraint::Length(composer_rows),
         Constraint::Length(post_composer_gap),
@@ -211,9 +217,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     ])
     .split(area);
 
-    let input_slot = crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
-    let hint_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
-    let footer_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+    let pending_slot =
+        crate::layout::horizontal_inset(chunks[6], crate::layout::WORKSPACE_GUTTER_X);
+    let input_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
+    let hint_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+    let footer_slot =
+        crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -241,20 +250,21 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     render_plan_panel(frame, chunks[4], state);
     render_attachments(frame, chunks[5], state);
-    // chunks[6] = pre_composer_gap (leave blank)
+    crate::pending_inputs::render(frame, pending_slot, state, area.height);
+    // chunks[7] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
         None => render_input(frame, input_slot, state),
     }
-    // chunks[8]: the key hints when there are any, otherwise the blank gap.
+    // chunks[9]: the key hints when there are any, otherwise the blank gap.
     if let Some(line) = hints.into_iter().next() {
         frame.render_widget(Paragraph::new(line), hint_slot);
     }
     render_footer(frame, footer_slot, state);
-    // chunks[10] = breathing row; the roster docks under the footer.
-    render_team_panel(frame, chunks[11], state);
+    // chunks[11] = breathing row; the roster docks under the footer.
+    render_team_panel(frame, chunks[12], state);
 
     // /btw floats over the conversation viewport (not in the scroll stream).
     render_btw_overlay(frame, chunks[1], state);
@@ -1028,6 +1038,69 @@ mod tests {
             roster_row > footer_row + 1,
             "one breathing row between footer and roster"
         );
+    }
+
+    /// 待发送 joins the bottom control area without displacing anything: the
+    /// roster keeps its dock below the footer, the composer stays on screen,
+    /// and a long list is bounded instead of pushing either out.
+    #[test]
+    fn pending_inputs_sit_above_the_composer_and_leave_the_roster_where_it_was() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 55;
+        state.context_tokens = 59_000;
+        state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
+        for i in 1..=9 {
+            state
+                .pending_inputs
+                .push(crate::pending_inputs::PendingInput {
+                    text: format!("note {i}"),
+                    state: crate::pending_inputs::PendingInputState::Waiting,
+                });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        let pending_row = row_of(&lines, "Not sent · 9");
+        let input_row = row_of(&lines, "Type a message");
+        let footer_row = row_of(&lines, "Context");
+        let roster_row = row_of(&lines, "● Main");
+        assert!(pending_row < input_row, "{lines:#?}");
+        assert!(
+            input_row < footer_row && footer_row < roster_row,
+            "{lines:#?}"
+        );
+        assert!(row_of(&lines, "6 more") > pending_row, "{lines:#?}");
     }
 
     /// Approval state: the approval body, its keyboard hints and the Context

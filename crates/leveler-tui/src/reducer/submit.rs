@@ -2,7 +2,7 @@ use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel};
 
 use crate::action::Effect;
 use crate::screen::{BusyPolicy, Screen};
-use crate::state::{AppState, Notification, PendingSubmission};
+use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
@@ -85,29 +85,20 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         }
     }
     if state.is_busy() {
-        // Steer the running turn instead of queuing behind it: a correction
-        // ("actually use the other module") is worthless once the work is
-        // finished. The runtime injects it at the top of the next round, and
-        // falls back to an ordinary submission if the turn ended in the
-        // meantime — so nothing typed is ever lost.
-        if turn_input_held(state) {
-            return Vec::new();
-        }
+        // Hold it in 待发送 rather than sending it: the user decides which
+        // input steers the running turn, and when. Nothing unsent is shown in
+        // the conversation.
         let text = state.composer.take().trim().to_string();
-        if text.is_empty() {
-            return Vec::new();
+        if !text.is_empty() {
+            state
+                .pending_inputs
+                .push(crate::pending_inputs::PendingInput {
+                    text,
+                    state: crate::pending_inputs::PendingInputState::Waiting,
+                });
+            state.pending_selected = state.pending_inputs.len() - 1;
         }
-        // The user typed it, so it belongs in the transcript like any message.
-        state.transcript.push_user_if_new(text.clone());
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: state.t().steering_sent.to_string(),
-        });
-        let command = ClientCommand::SteerCurrentTurn {
-            session_id: state.session_id.clone(),
-            content: text,
-        };
-        return submit_turn_input(state, command);
+        return Vec::new();
     }
     // Vision gate: block sending images to a non-vision model until the user
     // chooses how to proceed (spec §42). Handled before the request is built.
@@ -148,6 +139,61 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
         attachments,
     };
     submit_turn_input(state, command)
+}
+
+/// Send one 待发送 item through the ordinary turn-input delivery. While a turn
+/// runs it steers that turn; otherwise it starts one. The item stays in the
+/// list — marked sending — until the runtime answers for its id.
+pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effect> {
+    let Some(item) = state.pending_inputs.get(index) else {
+        return Vec::new();
+    };
+    if !item.is_unsent() {
+        return Vec::new();
+    }
+    let content = item.text.clone();
+    if turn_input_held(state) {
+        return Vec::new();
+    }
+    let command = if state.is_busy() {
+        ClientCommand::SteerCurrentTurn {
+            session_id: state.session_id.clone(),
+            content,
+        }
+    } else {
+        // The runtime announces an admitted turn's message itself
+        // (`UserMessageAdded`); only the optimistic Busy is ours to set.
+        start_turn(state);
+        ClientCommand::SubmitMessage {
+            session_id: state.session_id.clone(),
+            content,
+            attachments: Vec::new(),
+        }
+    };
+    let effects = submit_turn_input(state, command);
+    if let Some(Effect::Submit { command_id, .. }) = effects.first() {
+        state.pending_inputs[index].state =
+            crate::pending_inputs::PendingInputState::Sending(command_id.clone());
+    }
+    effects
+}
+
+/// Delete one unsent 待发送 item. Local only: it never reached the runtime.
+pub(super) fn delete_pending_input(state: &mut AppState, index: usize) {
+    if state
+        .pending_inputs
+        .get(index)
+        .is_some_and(crate::pending_inputs::PendingInput::is_unsent)
+    {
+        state.pending_inputs.remove(index);
+        state.pending_hover = None;
+        state.pending_selected = state
+            .pending_selected
+            .min(state.pending_inputs.len().saturating_sub(1));
+        if state.pending_inputs.is_empty() && state.workbench_focus == WorkbenchFocus::Pending {
+            state.workbench_focus = WorkbenchFocus::Input;
+        }
+    }
 }
 
 /// Refuse a new turn input while an earlier one to this session has no answer
