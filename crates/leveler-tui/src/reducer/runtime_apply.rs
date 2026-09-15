@@ -377,6 +377,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             ..
         } => {
             let started = state.elapsed_secs;
+            let agent_name = agent.as_ref().map(|a| a.name.clone());
             state.team.apply_update(crate::multi_agent::ChildUpdate {
                 id: id.clone(),
                 nickname: nickname.clone(),
@@ -385,7 +386,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ok,
                 detail: detail.clone(),
                 profile_id,
-                agent_name: agent.as_ref().map(|a| a.name.clone()),
+                agent_name: agent_name.clone(),
                 read_only,
                 contribution: contribution.clone(),
                 started_elapsed_secs: started,
@@ -405,10 +406,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     &id, &nickname, ok, detail, projected, stop,
                 );
             } else {
-                state
-                    .transcript
-                    .push_sub_agent_started(id, nickname, role, detail, started);
+                state.transcript.push_sub_agent_started(
+                    id.clone(),
+                    nickname,
+                    role,
+                    detail,
+                    started,
+                );
             }
+            state.transcript.set_sub_agent_agent_name(&id, agent_name);
         }
         RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
             state.unfinished_goals = goals;

@@ -95,13 +95,14 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
     }
 
     for child in &state.team.children {
-        let title = if !child.nickname.is_empty() {
+        let base = if !child.nickname.is_empty() {
             child.nickname.clone()
         } else if !child.role.is_empty() {
             child.role.clone()
         } else {
             state.t().sub_agent_default.to_string()
         };
+        let title = crate::multi_agent::child_label(&base, child.agent_name.as_deref());
         let secondary = if !child.purpose.is_empty() {
             Some(child.purpose.clone())
         } else {

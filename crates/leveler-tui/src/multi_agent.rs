@@ -452,6 +452,15 @@ fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
     }
 }
 
+/// How a child is named on screen: its nickname, and the declared agent it
+/// runs as when it has one (`Euclid · rust-reviewer`).
+pub(crate) fn child_label(nickname: &str, agent_name: Option<&str>) -> String {
+    match agent_name.filter(|a| !a.trim().is_empty()) {
+        Some(agent) => format!("{nickname} · {agent}"),
+        None => nickname.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

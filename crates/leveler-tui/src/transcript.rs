@@ -204,6 +204,8 @@ pub struct SubAgentBlock {
     /// Show the full result instead of the first few lines (Ctrl+O).
     pub expanded: bool,
     pub nickname: String,
+    /// The declared agent it was spawned from, when it was.
+    pub agent_name: Option<String>,
     pub role: String,
     pub status: ToolStatus,
     /// The task while running; a short result summary once done.
@@ -1064,6 +1066,16 @@ impl TranscriptState {
         }
     }
 
+    /// Name the declared agent a child runs as, once the runtime says so.
+    pub fn set_sub_agent_agent_name(&mut self, id: &str, name: Option<String>) {
+        if name.is_none() {
+            return;
+        }
+        if let Some(block) = self.sub_agent_mut(id) {
+            block.agent_name = name;
+        }
+    }
+
     fn sub_agent_mut(&mut self, id: &str) -> Option<&mut SubAgentBlock> {
         self.bump();
         self.items.iter_mut().rev().find_map(|item| match item {
@@ -1093,6 +1105,7 @@ impl TranscriptState {
         self.decide_pending_assistants(AssistantKind::Progress);
         self.close_tool_group();
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             expanded: false,
             id,
             nickname,
@@ -1140,6 +1153,7 @@ impl TranscriptState {
             return;
         }
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             id: id.to_string(),
             expanded: false,
             nickname: nickname.to_string(),
@@ -1176,6 +1190,7 @@ impl TranscriptState {
         }
         self.close_tool_group();
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             expanded: false,
             id: id.to_string(),
             nickname: nickname.to_string(),

@@ -710,7 +710,10 @@ fn sub_agent_lines(
     let mut head_spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
-            sub_agent_display_name(block, t),
+            crate::multi_agent::child_label(
+                &sub_agent_display_name(block, t),
+                block.agent_name.as_deref(),
+            ),
             Style::default()
                 .fg(theme.accent.primary)
                 .add_modifier(Modifier::BOLD),
@@ -901,11 +904,12 @@ fn sub_agent_tree_group_lines(
     let names: Vec<String> = blocks
         .iter()
         .map(|b| {
-            if b.nickname.trim().is_empty() {
+            let base = if b.nickname.trim().is_empty() {
                 sub_agent_display_name(b, t)
             } else {
                 b.nickname.clone()
-            }
+            };
+            crate::multi_agent::child_label(&base, b.agent_name.as_deref())
         })
         .collect();
     let name_w = names
@@ -1496,6 +1500,7 @@ mod tests {
         crate::transcript::SubAgentBlock {
             id: id.into(),
             nickname: nickname.into(),
+            agent_name: None,
             role: "explorer".into(),
             status,
             detail: if status == ToolStatus::Failed {

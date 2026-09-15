@@ -1154,6 +1154,7 @@ mod tests {
     fn sub_agent_block_without_role_has_no_empty_brackets() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             expanded: false,
             id: "a1".into(),
             nickname: "Newton".into(),
@@ -1189,6 +1190,7 @@ mod tests {
     fn explorer_failure_is_named_and_explained_for_the_user() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             expanded: false,
             id: "agent-1".into(),
             nickname: "Euclid".into(),
@@ -1229,6 +1231,7 @@ mod tests {
     fn running_explorer_has_a_clear_execution_label() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            agent_name: None,
             expanded: false,
             id: "agent-1".into(),
             nickname: "Euclid".into(),

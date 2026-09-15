@@ -1312,6 +1312,8 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
 }
 
 #[cfg(test)]
+mod child_identity_tests;
+#[cfg(test)]
 mod command_row_tests;
 
 #[cfg(test)]
