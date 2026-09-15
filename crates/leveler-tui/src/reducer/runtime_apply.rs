@@ -245,6 +245,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.verification = Some(verification);
         }
         RuntimeEvent::DiffUpdated { diff } => {
+            state.turn_diff_files = Some(diff.files.len());
             if state.diff_selected >= diff.files.len() {
                 state.diff_selected = 0;
             }
@@ -358,6 +359,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 Some(detail),
             );
             state.turn_verification = None;
+            state.turn_diff_files = None;
         }
         RuntimeEvent::TurnCancelled => {
             state.status = RuntimeStatus::Idle;
@@ -370,6 +372,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.force_cancel_armed = false;
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             state.turn_verification = None;
+            state.turn_diff_files = None;
             state.transcript.push_turn_end(
                 TurnEndStatus::Cancelled,
                 state.turn_tool_calls,
@@ -874,6 +877,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         });
     let summary = turn_end_summary(state, status);
     state.turn_verification = None;
+    state.turn_diff_files = None;
     state.transcript.push_turn_end(
         status,
         state.turn_tool_calls,
@@ -960,10 +964,9 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
 fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
     let t = state.t();
     let mut parts = Vec::new();
-    if let Some(diff) = &state.diff
-        && !diff.files.is_empty()
+    if let Some(n) = state.turn_diff_files
+        && n > 0
     {
-        let n = diff.files.len();
         parts.push(if n == 1 {
             t.summary_files_one.to_string()
         } else {
@@ -996,18 +999,19 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
                         && v.checks
                             .iter()
                             .all(|c| c.status == leveler_client_protocol::CheckState::Passed);
-                    if all_passed || v.checks.is_empty() {
-                        parts.push(t.summary_verify_ok.to_string());
-                    } else {
-                        let ok = v
-                            .checks
-                            .iter()
-                            .filter(|c| c.status == leveler_client_protocol::CheckState::Passed)
-                            .count();
+                    parts.push(t.summary_verify_ok.to_string());
+                    // Verification passed, so a check that failed did not gate
+                    // it: say which, and that it does not block.
+                    let advisory: Vec<&str> = v
+                        .checks
+                        .iter()
+                        .filter(|c| c.status == leveler_client_protocol::CheckState::Failed)
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    if !all_passed && !advisory.is_empty() {
                         parts.push(
-                            t.summary_verify_partial
-                                .replacen("{}", &ok.to_string(), 1)
-                                .replacen("{}", &v.checks.len().to_string(), 1),
+                            t.summary_verify_advisory_failed
+                                .replace("{}", &advisory.join("、")),
                         );
                     }
                 }

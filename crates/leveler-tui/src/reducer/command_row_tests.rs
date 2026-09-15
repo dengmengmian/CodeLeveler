@@ -252,6 +252,162 @@ fn a_network_denied_command_reads_as_needing_network_permission() {
     );
 }
 
+/// A failed command's one-line note is what went wrong, not the exit code the
+/// head already states or a stream header.
+#[test]
+fn a_failed_command_summarizes_its_error_not_its_exit_code() {
+    let mut s = state();
+    start(&mut s, "t");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t"),
+            ok: false,
+            preview: "exit: 101\n--- stdout ---\nrunning 1 test\ntest cli::tests::rollback ... FAILED\n--- stderr ---\n   Compiling envgate v0.1.0\nerror: test failed, to rerun pass `--bin envgate`".into(),
+            duration_ms: 16_900,
+            applied_diff: None,
+            exit_code: Some(101),
+            stop: None,
+        }),
+    );
+    let rows = plain(&s);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("└ error: test failed, to rerun pass")),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("└ exit: 101")), "{rows:?}");
+
+    let mut s = state();
+    start(&mut s, "u");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("u"),
+            ok: false,
+            preview: "exit: 2\n--- stderr ---\nls: nope: No such file or directory".into(),
+            duration_ms: 100,
+            applied_diff: None,
+            exit_code: Some(2),
+            stop: None,
+        }),
+    );
+    let rows = plain(&s);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("└ ls: nope: No such file or directory")),
+        "without an error line, the first thing it printed: {rows:?}"
+    );
+}
+
+/// The runtime passed verification, so a check that failed did not gate it.
+/// "验证 2/3" under a ✓ left the user to guess which one and whether it
+/// mattered; the line names it and says it does not block.
+#[test]
+fn a_passed_verification_names_the_check_that_did_not_block() {
+    use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
+    let mut s = state();
+    start(&mut s, "c");
+    complete(&mut s, "c", true, 1_000, Some(0), None);
+    let check = |name: &str, status| UiCheck {
+        name: name.into(),
+        status,
+        evidence: None,
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::VerificationUpdated {
+            verification: UiVerification {
+                checks: vec![
+                    check("cargo fmt", CheckState::Failed),
+                    check("cargo check", CheckState::Passed),
+                    check("cargo test", CheckState::Passed),
+                ],
+                passed: Some(true),
+            },
+        }),
+    );
+    let message_id = leveler_client_protocol::MessageId::new("m");
+    for event in [
+        RuntimeEvent::AssistantMessageStarted {
+            message_id: message_id.clone(),
+        },
+        RuntimeEvent::AssistantTextDelta {
+            message_id: message_id.clone(),
+            delta: "续期检查通过。".into(),
+        },
+        RuntimeEvent::AssistantMessageCompleted { message_id },
+        RuntimeEvent::TurnCompleted,
+    ] {
+        reduce(&mut s, Action::Runtime(event));
+    }
+    let rows = plain(&s);
+    let end = rows
+        .iter()
+        .find(|r| r.contains("任务已完成"))
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert!(end.contains("验证 ✓"), "{end}");
+    assert!(end.contains("cargo fmt 未通过（不阻断）"), "{end}");
+    assert!(!end.contains("2/3"), "{end}");
+}
+
+/// The diff is whatever `/diff` last fetched; nothing refreshes it when a turn
+/// ends. A later turn's end line must not repeat that old count as if the turn
+/// had changed those files.
+#[test]
+fn a_turn_end_does_not_repeat_an_earlier_diff() {
+    use leveler_client_protocol::{UiDiff, UiDiffFile};
+    let mut s = state();
+    let answer = |s: &mut AppState, id: &str| {
+        let message_id = leveler_client_protocol::MessageId::new(id);
+        for event in [
+            RuntimeEvent::AssistantMessageStarted {
+                message_id: message_id.clone(),
+            },
+            RuntimeEvent::AssistantTextDelta {
+                message_id: message_id.clone(),
+                delta: "好了。".into(),
+            },
+            RuntimeEvent::AssistantMessageCompleted { message_id },
+            RuntimeEvent::TurnCompleted,
+        ] {
+            reduce(s, Action::Runtime(event));
+        }
+    };
+    start(&mut s, "a");
+    complete(&mut s, "a", true, 1_000, Some(0), None);
+    let file = |path: &str| UiDiffFile {
+        path: path.into(),
+        added: 1,
+        removed: 0,
+        patch: None,
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            diff: UiDiff {
+                files: (0..7).map(|i| file(&format!("f{i}.rs"))).collect(),
+            },
+        }),
+    );
+    answer(&mut s, "m1");
+    assert!(
+        plain(&s).iter().any(|r| r.contains("7 个文件")),
+        "the turn that saw the diff may say so: {:?}",
+        plain(&s)
+    );
+
+    start(&mut s, "b");
+    complete(&mut s, "b", true, 1_000, Some(0), None);
+    answer(&mut s, "m2");
+    let ends: Vec<String> = plain(&s)
+        .into_iter()
+        .filter(|r| r.contains("任务已完成"))
+        .collect();
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    assert!(!ends[1].contains("个文件"), "{ends:?}");
+}
+
 #[test]
 fn the_network_permission_tag_is_the_one_the_runtime_writes() {
     assert_eq!(

@@ -1394,6 +1394,14 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
     if needs_network_permission(call) {
         return Some(t.command_needs_network_note.to_string());
     }
+    // Only where the head already states the exit code (`exit_code` arrived
+    // with protocol 1.10); an older row keeps its `exit: N` line.
+    if is_shell_call(call)
+        && call.exit_code.is_some()
+        && let Some(line) = call.preview.as_deref().and_then(shell_failure_line)
+    {
+        return Some(truncate_display(line, 72));
+    }
     let preview = call.preview.as_deref()?.trim();
     if preview.is_empty() {
         return None;
@@ -1404,6 +1412,25 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
         .find(|l| !l.is_empty())
         .unwrap_or(preview);
     Some(truncate_display(first, 72))
+}
+
+/// The line that says what went wrong in a failed command's preview: the
+/// first `error…` line when it printed one, else the first thing it printed —
+/// never the runtime's own `exit: N` / stream-header rows, which the head
+/// already states.
+fn shell_failure_line(preview: &str) -> Option<&str> {
+    let mut content = preview.lines().map(str::trim).filter(|l| {
+        let metadata = l.starts_with("exit: ")
+            || *l == "[timed out]"
+            || (l.starts_with("--- ") && l.ends_with(" ---"));
+        !l.is_empty() && !metadata
+    });
+    let first = content.clone().next()?;
+    Some(
+        content
+            .find(|l| l.to_ascii_lowercase().starts_with("error"))
+            .unwrap_or(first),
+    )
 }
 
 fn strip_inline_md(s: &str) -> String {
@@ -3231,6 +3258,35 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("long help dump line 2")),
             "OUTPUT is what a fold may hide: {lines:?}"
+        );
+    }
+
+    /// A folded batch names what went wrong in its failed command, not the
+    /// runtime's exit row.
+    #[test]
+    fn a_folded_batch_error_line_skips_the_exit_row() {
+        let mut failed = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Failed,
+        );
+        failed.preview = Some("exit: 101\n--- stderr ---\nerror: test failed".into());
+        failed.exit_code = Some(101);
+        let ok = call(
+            "run_command",
+            r#"{"program":"cargo","args":["build"]}"#,
+            ToolStatus::Ok,
+        );
+        let g = group(vec![failed, ok]);
+        let lines = render_group_text(&g, 120, Locale::Zh);
+        assert!(lines[0].starts_with('▸'), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("└ error: test failed")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("└ exit: 101")),
+            "{lines:?}"
         );
     }
 

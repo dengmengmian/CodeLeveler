@@ -200,6 +200,10 @@ pub struct AppState {
     /// latest result for the verification screen; a turn-end summary only
     /// speaks for checks its own turn ran.
     pub turn_verification: Option<UiVerification>,
+    /// How many files the diff reported during the current turn named. `diff`
+    /// is whatever `/diff` last fetched — nothing refreshes it when a turn
+    /// ends — so a turn-end summary counts only a diff its own turn saw.
+    pub turn_diff_files: Option<usize>,
     /// The session-history query this client is waiting on, if any.
     pub history_query: Option<leveler_client_protocol::CommandId>,
     pub diff: Option<UiDiff>,
@@ -403,6 +407,7 @@ impl AppState {
             project_rule_sources: Vec::new(),
             verification: None,
             turn_verification: None,
+            turn_diff_files: None,
             history_query: None,
             diff: None,
             diff_selected: 0,

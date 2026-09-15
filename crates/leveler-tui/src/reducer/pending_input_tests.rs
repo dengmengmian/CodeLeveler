@@ -197,6 +197,34 @@ fn an_unanswered_send_stays_and_says_its_outcome_is_unknown() {
     assert_eq!(user_messages(&s), vec!["结果如何？"]);
 }
 
+/// An answer that is only late is not a lost connection: while the runtime has
+/// not answered, and once it has, the notice claims no disconnect or reconnect
+/// that nobody observed.
+#[test]
+fn a_late_answer_claims_no_disconnect() {
+    let mut s = state();
+    stage_three(&mut s);
+    let (_, id) = submitted(&send_from_keyboard(&mut s, 0));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionUnconfirmed {
+            command_id: id.clone(),
+        }),
+    );
+    let waiting = s.notification.as_ref().unwrap().message.clone();
+    assert!(!waiting.contains("中断"), "{waiting}");
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id: id,
+            snapshot: None,
+        }),
+    );
+    let settled = s.notification.as_ref().unwrap().message.clone();
+    assert!(!settled.contains("重新连接"), "{settled}");
+    assert!(settled.contains("已送达"), "{settled}");
+}
+
 #[test]
 fn a_refused_send_stays_in_the_list_marked_failed_and_the_composer_is_untouched() {
     let mut s = state();
