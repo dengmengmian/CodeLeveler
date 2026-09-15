@@ -259,6 +259,17 @@ URL 和摘要。
 分别配置的能力。当前模式或沙箱禁用网络时，`web_search` 返回错误，而不是绕过
 限制。
 
+## 自定义 Agent
+
+一个 Agent 就是一个目录：`agent.yaml` 说明它能做什么，`instructions.md` 说明它
+怎么做。直接对 CodeLeveler 说“给这个项目创建一个只读的安全审查 Agent”，或在 Web
+UI 的 设置 → Agents 里创建，或者自己写 `.leveler/agents/<name>/` 并提交到 Git。
+项目 Agent 覆盖用户 Agent（`~/.leveler/agents/`），用户 Agent 覆盖内置 Agent；
+定义里的每条边界都由运行时强制执行，运行中的子 Agent 始终使用它 spawn 时的定义。
+`leveler agents list` 查看实际解析结果。
+
+详见 [Custom Agents](docs/AGENT_EXTENSIBILITY.md)（英文）。
+
 ## 安全与平台支持
 
 CodeLeveler 可以修改文件和执行本地命令，因此安全边界会明确展示，而不是隐含处理。
@@ -277,6 +288,7 @@ fail-closed；只有进程树控制时不会声称拥有完整沙箱。
 ## 配置与文档
 
 - [架构说明](docs/ARCHITECTURE.zh-CN.md)
+- [自定义 Agent](docs/AGENT_EXTENSIBILITY.md)
 - [Provider 与模型配置 schema](configs/example.yaml)
 - [评测工具](evals/README.md)
 

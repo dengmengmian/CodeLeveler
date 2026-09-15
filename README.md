@@ -299,6 +299,18 @@ browser and the browser does not fall back to it: two capabilities, configured
 separately. When the active mode or sandbox denies network access, `web_search`
 returns an error instead of bypassing it.
 
+## Custom agents
+
+An agent is a directory: `agent.yaml` says what it may do, `instructions.md`
+says how to do its job. Ask CodeLeveler to "create a read-only security
+reviewer agent for this project", use Settings → Agents in the Web UI, or write
+`.leveler/agents/<name>/` yourself and commit it. Project agents override user
+agents (`~/.leveler/agents/`), which override built-ins; the runtime enforces
+every declared bound, and a running child keeps the definition it was spawned
+with. `leveler agents list` shows what resolved.
+
+See [Custom Agents](docs/AGENT_EXTENSIBILITY.md).
+
 ## Safety and platform support
 
 CodeLeveler can modify files and execute local commands, so its safety boundary
@@ -319,6 +331,7 @@ Permission rules and hooks can be defined per user or per repository.
 ## Configuration and documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Custom agents](docs/AGENT_EXTENSIBILITY.md)
 - [Provider and model configuration schema](configs/example.yaml)
 - [Evaluation harness](evals/README.md)
 
