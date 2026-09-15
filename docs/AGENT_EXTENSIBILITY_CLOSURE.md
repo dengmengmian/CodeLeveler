@@ -24,7 +24,7 @@ No Rust enum, no rebuild. Reference: [Custom Agents](AGENT_EXTENSIBILITY.md).
 
 | Item | Value |
 | --- | --- |
-| Base head | `7e75a7e` (local `main`; see Git and CI) |
+| Base head | `7e75a7e` (local `main`; see residual 1) |
 | Version | `0.2.0-beta.2` — unchanged, no tag, no release |
 | Worktree | detached worktree in the session scratchpad, no branch |
 | Multi-agent capability closure | PASS (unchanged) |
