@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::agent_registry::AgentRoots;
-use leveler_agent::{AgentEvent, Executor, NoopSink};
+use leveler_agent::{AgentEvent, Executor};
 use leveler_core::{RequestId, ToolCallId};
 use leveler_execution::{PermissionProfile, Workspace};
 use leveler_lifecycle::ChildSpawnSpec;
@@ -226,6 +226,26 @@ fn write_agent(dir: &Path, name: &str, yaml_body: &str, instructions: &str) -> P
 struct Run {
     events: Vec<AgentEvent>,
     seen: Vec<Seen>,
+    records: Vec<leveler_agent::ModelRequestRecord>,
+}
+
+/// Keeps the model-request records the run hands its durable sink.
+#[derive(Default)]
+struct Records(Vec<leveler_agent::ModelRequestRecord>);
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for Records {
+    async fn append(&mut self, _messages: &[Message]) -> Result<(), leveler_engine::PortError> {
+        Ok(())
+    }
+
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), leveler_engine::PortError> {
+        self.0.push(record.clone());
+        Ok(())
+    }
 }
 
 impl Run {
@@ -297,6 +317,7 @@ async fn run(repo: &Repo, rt: Rt) -> Run {
     let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
     let rt = Arc::new(rt);
     let mut events = Vec::new();
+    let mut sink = Records::default();
     Executor::new(
         rt.clone(),
         Arc::new(default_registry()),
@@ -311,13 +332,17 @@ async fn run(repo: &Repo, rt: Rt) -> Run {
     .run(
         "delegate",
         &mut |e| events.push(e),
-        &mut NoopSink,
+        &mut sink,
         CancellationToken::new(),
     )
     .await
     .unwrap();
     let seen = rt.seen.lock().unwrap().clone();
-    Run { events, seen }
+    Run {
+        events,
+        seen,
+        records: sink.0,
+    }
 }
 
 async fn spawn_once(repo: &Repo, args: serde_json::Value, child: Vec<ModelResponse>) -> Run {
@@ -747,6 +772,17 @@ async fn the_declared_model_and_reasoning_effort_are_what_the_child_requests() {
     assert_eq!(child.effort, Some(ReasoningEffort::High));
     let parent = r.parent_requests()[0].clone();
     assert_eq!(parent.model, ModelRef::new("mock", "m"));
+    let child_records: Vec<Option<String>> = r
+        .records
+        .iter()
+        .filter(|record| record.agent_id.is_some())
+        .map(|record| record.reasoning_effort.clone())
+        .collect();
+    assert!(!child_records.is_empty());
+    assert!(
+        child_records.iter().all(|e| e.as_deref() == Some("high")),
+        "the durable record carries the effort actually requested: {child_records:?}"
+    );
     let spec = r.started().unwrap().4;
     assert_eq!(spec.model.as_deref(), Some("mock/cheap"));
     assert_eq!(

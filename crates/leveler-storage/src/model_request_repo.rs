@@ -97,6 +97,9 @@ pub struct ModelRequestRecord {
     /// When the call finished. Stored as RFC 3339 text and re-parsed on read,
     /// so an unparseable value surfaces as [`StorageError::InvalidData`].
     pub created_at: Timestamp,
+    /// The reasoning effort the call requested, as sent on the wire. `None`
+    /// for a request that named none and for rows older than migration 0026.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Read/write access to the `model_requests` table, borrowed from a [`Database`].
@@ -122,8 +125,9 @@ impl<'a> ModelRequestRepository<'a> {
             "INSERT INTO model_requests \
              (id, session_id, provider, model, input_tokens, output_tokens, finish_reason, \
               error_kind, latency_ms, retry_count, created_at, kind, \
-              provider_request_id, cached_input_tokens, cost_usd_micros, agent_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              provider_request_id, cached_input_tokens, cost_usd_micros, agent_id, \
+              reasoning_effort) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -153,6 +157,7 @@ impl<'a> ModelRequestRepository<'a> {
                 .map(|value| value.min(i64::MAX as u64) as i64),
         )
         .bind(&record.agent_id)
+        .bind(&record.reasoning_effort)
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -187,11 +192,12 @@ impl<'a> ModelRequestRepository<'a> {
                 Option<i64>,
                 Option<i64>,
                 Option<String>,
+                Option<String>,
             ),
         >(
             "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, error_kind, \
                     latency_ms, retry_count, created_at, kind, provider_request_id, \
-                    cached_input_tokens, cost_usd_micros, agent_id \
+                    cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort \
              FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
         )
         .bind(session_id.as_str())
@@ -216,6 +222,7 @@ impl<'a> ModelRequestRepository<'a> {
                     cached_input_tokens,
                     cost_usd_micros,
                     agent_id,
+                    reasoning_effort,
                 )| {
                     Ok(ModelRequestRecord {
                         id,
@@ -236,6 +243,7 @@ impl<'a> ModelRequestRepository<'a> {
                         created_at: created_at.parse::<Timestamp>().map_err(|error| {
                             StorageError::InvalidData(format!("model request timestamp: {error}"))
                         })?,
+                        reasoning_effort,
                     })
                 },
             )
@@ -358,6 +366,7 @@ mod tests {
             cost_usd_micros: Some(1_234),
             agent_id: None,
             created_at: leveler_core::now(),
+            reasoning_effort: None,
         }
     }
 
@@ -554,6 +563,7 @@ mod tests {
             cost_usd_micros: None,
             agent_id: None,
             created_at: leveler_core::now(),
+            reasoning_effort: Some("high".to_string()),
         };
 
         let repo = ModelRequestRepository::new(&db);
@@ -562,6 +572,11 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            loaded[0].reasoning_effort.as_deref(),
+            Some("high"),
+            "the effort a call asked for is what the row says"
+        );
         assert_eq!(loaded[0].output_tokens, 20);
         assert_eq!(loaded[0].retry_count, 1);
     }
@@ -598,6 +613,7 @@ mod tests {
                 cost_usd_micros: None,
                 agent_id: None,
                 created_at: leveler_core::now(),
+                reasoning_effort: None,
             })
             .await
             .unwrap();
@@ -645,6 +661,7 @@ mod tests {
                 cost_usd_micros: None,
                 agent_id: None,
                 created_at: leveler_core::now(),
+                reasoning_effort: None,
             })
             .await
             .expect("a repeated provider id is not a persistence failure");

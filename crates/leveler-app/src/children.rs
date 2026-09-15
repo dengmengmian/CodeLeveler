@@ -201,6 +201,7 @@ mod tests {
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
             created_at: now(),
+            reasoning_effort: None,
         })
         .await
         .unwrap();

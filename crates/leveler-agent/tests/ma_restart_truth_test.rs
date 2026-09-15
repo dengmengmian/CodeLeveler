@@ -1606,10 +1606,7 @@ async fn seed_interrupted_agent_child(
     snapshot: leveler_lifecycle::ChildAgentSnapshot,
     brief: &str,
 ) {
-    let turn = TurnRepository::new(db)
-        .start(session, "user", None, leveler_core::now())
-        .await
-        .unwrap();
+    let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(db, session.clone());
     log.append(
@@ -1733,6 +1730,27 @@ async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
     }
     let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
     assert_eq!(lib, "pub fn old() {}\n");
+
+    // The durable model-request log, not the configuration, is the evidence of
+    // which effort the child actually ran with.
+    let rows = leveler_storage::ModelRequestRepository::new(&db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    let child_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_id.as_deref() == Some("agent-sr"))
+        .collect();
+    assert!(
+        !child_rows.is_empty(),
+        "the resumed child's calls are recorded"
+    );
+    assert!(
+        child_rows
+            .iter()
+            .all(|row| row.reasoning_effort.as_deref() == Some("high")),
+        "{child_rows:?}"
+    );
 }
 
 /// A deleted definition does not stop a running child: it continues under its

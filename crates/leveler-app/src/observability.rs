@@ -1100,6 +1100,7 @@ mod tests {
             cost_usd_micros: None,
             agent_id: None,
             created_at: now(),
+            reasoning_effort: None,
         })
         .await
         .unwrap();
@@ -1704,6 +1705,7 @@ mod accounting_tests {
             cost_usd_micros: cost,
             agent_id: agent.map(str::to_string),
             created_at: now(),
+            reasoning_effort: None,
         }
     }
 

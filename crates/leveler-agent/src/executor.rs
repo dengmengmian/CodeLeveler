@@ -2577,6 +2577,7 @@ mod child_accounting_tests {
             kind: ModelCallKind::Round,
             agent_id: None,
             cost_usd_micros: None,
+            reasoning_effort: None,
         }
     }
 

@@ -1002,6 +1002,13 @@ impl AgentHarness for Drive<'_> {
             kind: crate::ModelCallKind::Round,
             agent_id: None,
             cost_usd_micros: round_result.cost_usd_micros,
+            // The round's request carried exactly this effort (the agent is
+            // built `with_reasoning_effort(self.policy.reasoning_effort)`).
+            reasoning_effort: self
+                .executor
+                .policy
+                .reasoning_effort
+                .map(|effort| effort.as_wire().to_string()),
         })
         .await?;
         // Cost can cross the limit on the response that tips it; stop after
@@ -3216,6 +3223,7 @@ impl AgentHarness for Drive<'_> {
                         kind: crate::ModelCallKind::Compaction,
                         agent_id: None,
                         cost_usd_micros: None,
+                        reasoning_effort: None,
                     }
                     .priced(self.executor.pricing.as_ref()),
                     None,

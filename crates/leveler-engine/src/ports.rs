@@ -160,6 +160,11 @@ pub struct ModelRequestRecord {
     /// Estimated cost in micro-USD, priced where the model has pricing
     /// configured. `None` means unpriced, never free.
     pub cost_usd_micros: Option<u64>,
+    /// The reasoning effort this call asked the provider for (`high`, …), as
+    /// sent on the wire. `None`: the request named none, so the provider's
+    /// default applied. Recorded so an agent's declared effort can be checked
+    /// against what actually ran, not against configuration.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ModelRequestRecord {
