@@ -275,6 +275,11 @@ impl TurnPermissionGrants {
         !self.network && !self.unrestricted_fs
     }
 
+    /// Whether everything `requested` asks for is already granted.
+    pub fn covers(self, requested: Self) -> bool {
+        (self.network || !requested.network) && (self.unrestricted_fs || !requested.unrestricted_fs)
+    }
+
     pub fn merge(self, other: Self) -> Self {
         Self {
             network: self.network || other.network,

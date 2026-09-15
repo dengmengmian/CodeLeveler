@@ -2115,6 +2115,9 @@ impl AgentHarness for Drive<'_> {
             let mut call_grants = TurnPermissionGrants::default();
             if is_escalatable_tool(&call.name)
                 && let Some((reason, requested)) = parse_escalation(&call.arguments)
+                // Already allowed for this turn: the user answered this
+                // question, so the call runs under the turn grant unasked.
+                && (requested.is_empty() || !self.turn_grants.covers(requested))
             {
                 if requested.is_empty() {
                     // Malformed: no axis named. Refuse without interrupting

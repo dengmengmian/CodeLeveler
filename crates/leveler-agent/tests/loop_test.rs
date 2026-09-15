@@ -7583,6 +7583,109 @@ async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
     }
 }
 
+/// Once the user allowed a permission for the turn, a later command that
+/// escalates for the same permission runs under it without asking again —
+/// otherwise "本轮对话内允许" is a promise every following prompt breaks.
+#[tokio::test]
+async fn an_escalation_already_granted_for_the_turn_does_not_ask_again() {
+    let dir = escalate_dir("turn-covers");
+    let tool_context = ToolContext::new(
+        Workspace::new(&dir).unwrap(),
+        PermissionProfile::RequestApproval,
+    );
+    let asks = Arc::new(Mutex::new(0usize));
+    let escalated = |id: &str, text: &str, escalate: serde_json::Value| {
+        assistant_tool_call(
+            id,
+            "shell_command",
+            serde_json::json!({"cmd": format!("echo {text}"), "escalate": escalate}),
+        )
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        escalated(
+            "c1",
+            "first",
+            serde_json::json!({"reason": "deps", "network": true, "filesystem": "unrestricted"}),
+        ),
+        escalated(
+            "c2",
+            "second",
+            serde_json::json!({"reason": "deps", "network": true}),
+        ),
+        escalated(
+            "c3",
+            "third",
+            serde_json::json!({"reason": "deps", "network": true, "filesystem": "unrestricted"}),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingApprover {
+        asks: asks.clone(),
+        decision: ApprovalDecision::ApproveSession,
+    }));
+
+    executor
+        .run("deps", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(*asks.lock().unwrap(), 1, "only the first escalation asks");
+    let sent = format!("{:?}", runtime.requests.lock().unwrap());
+    for text in ["first", "second", "third"] {
+        assert!(sent.contains(text), "{text} must have run: {sent}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A turn grant covers only what it granted: a later escalation for more
+/// still asks.
+#[tokio::test]
+async fn an_escalation_for_more_than_the_turn_grant_still_asks() {
+    let dir = escalate_dir("turn-wider");
+    let tool_context = ToolContext::new(
+        Workspace::new(&dir).unwrap(),
+        PermissionProfile::RequestApproval,
+    );
+    let asks = Arc::new(Mutex::new(0usize));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({"cmd": "echo a", "escalate": {"reason": "r", "network": true}}),
+        ),
+        assistant_tool_call(
+            "c2",
+            "shell_command",
+            serde_json::json!({"cmd": "echo b", "escalate": {"reason": "r", "network": true, "filesystem": "unrestricted"}}),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingApprover {
+        asks: asks.clone(),
+        decision: ApprovalDecision::ApproveSession,
+    }));
+    executor
+        .run("r", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*asks.lock().unwrap(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A denied escalation must stop the command, not run it unelevated.
 #[tokio::test]
 async fn a_denied_escalation_does_not_run_the_command() {
