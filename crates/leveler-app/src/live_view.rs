@@ -24,7 +24,12 @@ pub(crate) struct LiveSessionView {
     pub diff: Option<UiDiff>,
     pub completion_report: Option<UiCompletionReport>,
     pub finalization_stage: Option<FinalizationStage>,
+    /// When each active tool started, by this runtime's clock.
+    tool_started: HashMap<leveler_core::ToolCallId, std::time::Instant>,
 }
+
+/// Bounded end of a running command's output kept for the reconnect snapshot.
+pub(crate) const TOOL_OUTPUT_TAIL_CAP: usize = 64 * 1024;
 
 /// Per-session live views, shared via `Arc` with the event forwarder tasks.
 #[derive(Default)]
@@ -40,14 +45,22 @@ impl LiveViews {
         fold(view, event);
     }
 
-    /// The session's current live view (for the reconnect snapshot).
+    /// The session's current live view (for the reconnect snapshot). A
+    /// running tool's `elapsed_ms` is measured now, at snapshot time.
     pub fn view(&self, session_id: &SessionId) -> LiveSessionView {
-        self.views
+        let mut view = self
+            .views
             .lock()
             .unwrap()
             .get(session_id)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for tool in &mut view.active_tools {
+            if let Some(started) = view.tool_started.get(&tool.id) {
+                tool.elapsed_ms = started.elapsed().as_millis() as u64;
+            }
+        }
+        view
     }
 
     /// Forget a session's live view (conversation cleared).
@@ -66,14 +79,31 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
             ..
         } => {
             view.active_tools.retain(|tool| tool.id != *id);
+            view.tool_started
+                .insert(id.clone(), std::time::Instant::now());
             view.active_tools.push(UiActiveToolCall {
                 id: id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
+                elapsed_ms: 0,
+                output_tail: String::new(),
+                output_truncated: false,
             });
         }
         RuntimeEvent::ToolCallCompleted { id, .. } => {
             view.active_tools.retain(|tool| tool.id != *id);
+            view.tool_started.remove(id);
+        }
+        RuntimeEvent::ToolCallOutput { id, chunk, .. } => {
+            if let Some(tool) = view.active_tools.iter_mut().find(|tool| tool.id == *id) {
+                tool.output_tail.push_str(chunk);
+                if tool.output_tail.len() > TOOL_OUTPUT_TAIL_CAP {
+                    let cut = tool.output_tail.len() - TOOL_OUTPUT_TAIL_CAP;
+                    let cut = leveler_core::ceil_char_boundary(&tool.output_tail, cut);
+                    tool.output_tail.drain(..cut);
+                    tool.output_truncated = true;
+                }
+            }
         }
         RuntimeEvent::PlanUpdated { plan } => view.plan = Some(plan.clone()),
         RuntimeEvent::VerificationUpdated { verification } => {
@@ -98,6 +128,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnFailed { .. }
         | RuntimeEvent::TurnCancelled => {
             view.active_tools.clear();
+            view.tool_started.clear();
             view.finalization_stage = None;
         }
         _ => {}
@@ -129,6 +160,8 @@ mod tests {
         views.apply(
             &session_id,
             &RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
                 id,
                 ok: true,
                 preview: "ok".to_string(),
@@ -137,6 +170,50 @@ mod tests {
             },
         );
         assert!(views.view(&session_id).active_tools.is_empty());
+    }
+
+    /// A reconnecting client must not restart a long command's clock at zero
+    /// or lose what it already printed.
+    #[test]
+    fn a_running_command_keeps_its_elapsed_and_output_tail_for_reconnect() {
+        let session_id = SessionId::new("s1");
+        let views = LiveViews::default();
+        let id = ToolCallId::new("tool-1");
+        views.apply(
+            &session_id,
+            &RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: "shell_command".to_string(),
+                arguments: r#"{"cmd":"cargo test"}"#.to_string(),
+                parallel: false,
+            },
+        );
+        views.apply(
+            &session_id,
+            &RuntimeEvent::ToolCallOutput {
+                id: id.clone(),
+                stream: "stdout".to_string(),
+                chunk: "Compiling leveler-core\n".to_string(),
+            },
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let tool = views.view(&session_id).active_tools.remove(0);
+        assert!(tool.elapsed_ms >= 30, "{}", tool.elapsed_ms);
+        assert_eq!(tool.output_tail, "Compiling leveler-core\n");
+        assert!(!tool.output_truncated);
+
+        let huge = "x".repeat(TOOL_OUTPUT_TAIL_CAP + 10);
+        views.apply(
+            &session_id,
+            &RuntimeEvent::ToolCallOutput {
+                id,
+                stream: "stdout".to_string(),
+                chunk: huge,
+            },
+        );
+        let tool = views.view(&session_id).active_tools.remove(0);
+        assert_eq!(tool.output_tail.len(), TOOL_OUTPUT_TAIL_CAP);
+        assert!(tool.output_truncated);
     }
 
     #[test]

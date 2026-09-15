@@ -65,6 +65,18 @@ async fn client_with(
     Arc<InProcessRuntimeClient>,
     leveler_core::SessionId,
 ) {
+    client_with_profile(responses, PermissionProfile::Assisted).await
+}
+
+async fn client_with_profile(
+    responses: Vec<MockResponse>,
+    profile: PermissionProfile,
+) -> (
+    tempfile::TempDir,
+    MockServer,
+    Arc<InProcessRuntimeClient>,
+    leveler_core::SessionId,
+) {
     isolate_global_config();
     let server = MockServer::start(responses).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -99,12 +111,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
     let app = Arc::new(Application::assemble(layout).unwrap());
     let model = ModelRef::new("mock", "m");
     let session = app.create_session(&model, "goal").await.unwrap();
-    let client = Arc::new(InProcessRuntimeClient::new(
-        app,
-        model,
-        PermissionProfile::Assisted,
-        false,
-    ));
+    let client = Arc::new(InProcessRuntimeClient::new(app, model, profile, false));
     (tmp, server, client, session)
 }
 
@@ -264,4 +271,90 @@ async fn a_steer_sent_during_a_chat_turn_reaches_the_conversation() {
             .any(|m| m.text.contains("also keep the API stable")),
         "the steer never reached the conversation"
     );
+}
+
+/// A client stops ONE running command the way the TUI does: the command's
+/// process tree is killed and confirmed gone, its completion says so, and the
+/// turn carries on to its own answer.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_stops_one_running_command_and_the_turn_goes_on() {
+    let (_tmp, _server, client, session) = client_with_profile(
+        vec![
+            tool_call("shell_command", serde_json::json!({"cmd": "sleep 30"})),
+            text("stopped as asked"),
+        ],
+        PermissionProfile::FullAccess,
+    )
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "run it".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut call = None;
+    let mut stop = None;
+    let mut answered = false;
+    while tokio::time::Instant::now() < deadline && !(stop.is_some() && answered) {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::ToolCallStarted { id, name, .. })) if name == "shell_command" => {
+                call = Some(id.clone());
+                // The call is announced before it is admitted and executing;
+                // a stop in that window is refused, never silently dropped.
+                let mut sent = false;
+                for _ in 0..250 {
+                    if client
+                        .send(ClientCommand::CancelToolCall {
+                            session_id: session.clone(),
+                            call_id: id.clone(),
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        sent = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(sent, "the running command accepts a stop");
+            }
+            Ok(Ok(RuntimeEvent::ToolCallCompleted {
+                id, stop: stopped, ..
+            })) if Some(&id) == call.as_ref() => {
+                stop = Some(stopped);
+            }
+            Ok(Ok(RuntimeEvent::TurnAnswered | RuntimeEvent::TurnCompleted)) => answered = true,
+            Ok(Ok(RuntimeEvent::TurnCancelled | RuntimeEvent::TurnFailed { .. })) => {
+                panic!("stopping one command must not end the turn")
+            }
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        stop,
+        Some(Some(leveler_client_protocol::UiCommandStop::Confirmed))
+    );
+    assert!(answered, "the turn reached its own answer");
+}
+
+/// A stop for a call that is not executing is refused, so a client can say
+/// so instead of showing "stopping" forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_command_that_is_not_running_is_refused() {
+    let (_tmp, _server, client, session) = client_with(vec![]).await;
+    let result = client
+        .send(ClientCommand::CancelToolCall {
+            session_id: session,
+            call_id: leveler_core::ToolCallId::new("gone"),
+        })
+        .await;
+    assert!(result.is_err(), "{result:?}");
 }

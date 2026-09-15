@@ -111,6 +111,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            "cancel_tool_call",
+            ClientCommand::CancelToolCall {
+                session_id: session(),
+                call_id: leveler_client_protocol::ToolCallId::new("c1"),
+            },
+            true,
+        ),
+        (
             "approval_decision",
             ClientCommand::ApprovalDecision {
                 request_id: ApprovalId::new("a1"),

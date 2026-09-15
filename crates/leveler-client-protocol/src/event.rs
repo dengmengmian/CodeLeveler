@@ -157,6 +157,17 @@ impl ChildContribution {
     }
 }
 
+/// How a stopped command call ended, as the runtime established it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiCommandStop {
+    /// The whole process tree was confirmed gone.
+    Confirmed,
+    /// The tree was signalled, but its termination could not be confirmed.
+    Unconfirmed,
+}
+
 /// An event flowing from the runtime to clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -240,6 +251,22 @@ pub enum RuntimeEvent {
         /// invent one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         applied_diff: Option<String>,
+        /// Exit code of the process a command call ran, when it exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Present only when the call was stopped: whether the runtime
+        /// confirmed its whole process tree gone. A client shows "stopped"
+        /// for `confirmed` alone; `unconfirmed` is an unknown outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<UiCommandStop>,
+    },
+    /// Live output from a running command tool call. `stream` is `stdout` or
+    /// `stderr`; `chunk` is one or more whole, sanitized lines. Transient:
+    /// clients keep a bounded buffer and the completed preview is the record.
+    ToolCallOutput {
+        id: ToolCallId,
+        stream: String,
+        chunk: String,
     },
     /// The execution plan was created or a step's status changed (spec §20).
     PlanUpdated { plan: UiPlan },
@@ -912,6 +939,8 @@ mod tests {
     fn tool_call_completed_roundtrips() {
         roundtrip(
             RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
                 id: ToolCallId::new("tc1"),
                 ok: true,
                 preview: "ok".to_string(),

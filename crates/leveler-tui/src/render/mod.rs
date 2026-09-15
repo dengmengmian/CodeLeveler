@@ -1301,6 +1301,8 @@ mod tests {
         reduce(
             state,
             Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
                 id: ToolCallId::new("s1"),
                 ok,
                 preview: preview.into(),
@@ -1727,6 +1729,8 @@ mod tests {
                 &mut s,
                 crate::action::Action::Runtime(
                     leveler_client_protocol::RuntimeEvent::ToolCallCompleted {
+                        exit_code: None,
+                        stop: None,
                         id,
                         ok: true,
                         preview: "ok".into(),

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId};
+use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId, ToolCallId};
 use leveler_model::ModelRef;
 
 use super::media::AttachmentRef;
@@ -86,6 +86,13 @@ pub enum ClientCommand {
     CancelChild {
         session_id: SessionId,
         child_id: String,
+    },
+    /// Stop ONE running tool call of the session's turn (for a command, its
+    /// whole process tree). The call settles with its own stop outcome; the
+    /// turn keeps running. Rejected when no such call is executing.
+    CancelToolCall {
+        session_id: SessionId,
+        call_id: ToolCallId,
     },
     /// Resolve a pending permission request .
     ApprovalDecision {
@@ -340,6 +347,7 @@ impl ClientCommand {
             | ClientCommand::CancelCurrentTurn { session_id }
             | ClientCommand::ForceCancelCurrentTurn { session_id }
             | ClientCommand::CancelChild { session_id, .. }
+            | ClientCommand::CancelToolCall { session_id, .. }
             | ClientCommand::SelectModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
@@ -524,6 +532,17 @@ mod tests {
                 child_id: "c1".to_string(),
             },
             "cancel_child",
+        );
+    }
+
+    #[test]
+    fn cancel_tool_call_roundtrips() {
+        roundtrip(
+            ClientCommand::CancelToolCall {
+                session_id: SessionId::new("s1"),
+                call_id: ToolCallId::new("c1"),
+            },
+            "cancel_tool_call",
         );
     }
 

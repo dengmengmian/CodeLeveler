@@ -535,7 +535,8 @@ impl EventBridge {
                 preview,
                 agent_id: None,
                 applied_diff,
-                ..
+                exit_code,
+                stop,
             } => {
                 // Pair with the ToolCall by id, whatever order results arrive in.
                 // A denial/guard result has no prior ToolCall — synthesize a
@@ -558,10 +559,28 @@ impl EventBridge {
                     preview,
                     duration_ms: start.elapsed().as_millis() as u64,
                     applied_diff,
+                    exit_code,
+                    stop: stop.map(|stop| match stop {
+                        leveler_execution::CommandStop::Confirmed => {
+                            leveler_client_protocol::UiCommandStop::Confirmed
+                        }
+                        leveler_execution::CommandStop::Unconfirmed => {
+                            leveler_client_protocol::UiCommandStop::Unconfirmed
+                        }
+                    }),
                 });
             }
-            // Projected once the client protocol carries it.
-            EngineEvent::ToolCallOutput { .. } => {}
+            EngineEvent::ToolCallOutput {
+                call_id,
+                stream,
+                chunk,
+            } => {
+                let _ = self.events.send(RuntimeEvent::ToolCallOutput {
+                    id: ToolCallId::new(call_id),
+                    stream,
+                    chunk,
+                });
+            }
             EngineEvent::WorkspaceSnapshotCreated { .. } => {
                 // Durability metadata is persisted by the engine; it has no
                 // standalone transcript cell in the TUI.
@@ -1129,6 +1148,65 @@ mod bridge_tests {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// A command's live output and how it ended both reach clients: output
+    /// as `ToolCallOutput` for that call, exit code and stop outcome on its
+    /// completion.
+    #[test]
+    fn command_output_and_stop_outcome_reach_clients() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "shell_command".into(),
+                arguments: r#"{"cmd":"cargo test"}"#.into(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolOutput {
+                id: "c1".into(),
+                stream: leveler_execution::OutputStream::Stderr,
+                text: "Compiling leveler-core\n".into(),
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                id: "c1".into(),
+                name: "shell_command".into(),
+                is_error: true,
+                preview: "tool error: command was cancelled".into(),
+                applied_diff: None,
+                exit_code: None,
+                stop: Some(leveler_execution::CommandStop::Unconfirmed),
+            },
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::ToolCallOutput { id, stream, chunk }
+                    if id.as_str() == "c1" && stream == "stderr" && chunk == "Compiling leveler-core\n"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::ToolCallCompleted {
+                    id,
+                    exit_code: None,
+                    stop: Some(leveler_client_protocol::UiCommandStop::Unconfirmed),
+                    ..
+                } if id.as_str() == "c1"
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

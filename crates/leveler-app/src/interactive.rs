@@ -373,6 +373,9 @@ pub struct InProcessRuntimeClient {
     /// The cancellation handle of every child running in a session's turn,
     /// by child id, so a user can stop one child without stopping the turn.
     child_cancels: ChildCancels,
+    /// The cancellation handle of every tool call executing in a session's
+    /// turn, by call id, so a user can stop one command without the turn.
+    tool_call_cancels: ChildCancels,
 }
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
@@ -439,6 +442,7 @@ struct SessionSteering {
     session_id: SessionId,
     queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
     children: ChildCancels,
+    tool_calls: ChildCancels,
 }
 
 impl leveler_agent::SteeringSource for SessionSteering {
@@ -461,14 +465,31 @@ impl leveler_agent::SteeringSource for SessionSteering {
     }
 
     fn child_ended(&self, id: &str) {
-        if let Some(running) = self
-            .children
+        release_cancel(&self.children, &self.session_id, id);
+    }
+
+    fn tool_call_started(&self, id: &str, cancel: CancellationToken) {
+        self.tool_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(&self.session_id)
-        {
-            running.remove(id);
-        }
+            .entry(self.session_id.clone())
+            .or_default()
+            .insert(id.to_string(), cancel);
+    }
+
+    fn tool_call_ended(&self, id: &str) {
+        release_cancel(&self.tool_calls, &self.session_id, id);
+    }
+}
+
+/// Drop a settled child's or call's handle.
+fn release_cancel(handles: &ChildCancels, session_id: &SessionId, id: &str) {
+    if let Some(running) = handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(session_id)
+    {
+        running.remove(id);
     }
 }
 
@@ -549,6 +570,7 @@ impl InProcessRuntimeClient {
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
+            tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
@@ -1163,6 +1185,7 @@ impl InProcessRuntimeClient {
             session_id: session_id.clone(),
             queues: self.steering.clone(),
             children: self.child_cancels.clone(),
+            tool_calls: self.tool_call_cancels.clone(),
         })
     }
 
@@ -2737,7 +2760,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 child_id,
             } => {
-                match take_child_cancel(&self.child_cancels, &session_id, &child_id) {
+                match take_cancel(&self.child_cancels, &session_id, &child_id) {
                     // The child observes its token, stops, and settles as
                     // cancelled through the ordinary settlement path.
                     Some(token) => token.cancel(),
@@ -2748,6 +2771,22 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::CancelToolCall {
+                session_id,
+                call_id,
+            } => match take_cancel(&self.tool_call_cancels, &session_id, call_id.as_str()) {
+                // The call observes its token, its process tree is killed,
+                // and it settles through its ordinary completion.
+                Some(token) => {
+                    token.cancel();
+                    Ok(())
+                }
+                // Refused, not notified: the client showing "stopping" must
+                // learn that nothing is being stopped.
+                None => Err(ClientError::Runtime(
+                    "该命令已结束或尚未开始执行,无需停止".to_string(),
+                )),
+            },
             ClientCommand::RunUserShell {
                 session_id,
                 command,
@@ -3786,8 +3825,9 @@ fn checkpoint_ordinal(loaded: Result<usize, String>) -> Option<usize> {
     loaded.ok()
 }
 
-/// Take the cancellation handle of one running child, if it is still running.
-fn take_child_cancel(
+/// Take the cancellation handle of one running child or tool call, if it is
+/// still running.
+fn take_cancel(
     children: &ChildCancels,
     session_id: &SessionId,
     child_id: &str,
@@ -3850,25 +3890,26 @@ mod child_cancel_tests {
             session_id: session.clone(),
             queues: Arc::new(Mutex::new(HashMap::new())),
             children: children.clone(),
+            tool_calls: Arc::new(Mutex::new(HashMap::new())),
         };
         let running = CancellationToken::new();
         steering.child_started("c1", running.clone());
         steering.child_started("c2", CancellationToken::new());
         steering.child_ended("c2");
 
-        take_child_cancel(&children, &session, "c1")
+        take_cancel(&children, &session, "c1")
             .expect("a running child has a handle")
             .cancel();
         assert!(running.is_cancelled());
         assert!(
-            take_child_cancel(&children, &session, "c1").is_none(),
+            take_cancel(&children, &session, "c1").is_none(),
             "a handle is used once"
         );
         assert!(
-            take_child_cancel(&children, &session, "c2").is_none(),
+            take_cancel(&children, &session, "c2").is_none(),
             "an ended child is not running"
         );
-        assert!(take_child_cancel(&children, &SessionId::new("other"), "c1").is_none());
+        assert!(take_cancel(&children, &SessionId::new("other"), "c1").is_none());
     }
 }
 

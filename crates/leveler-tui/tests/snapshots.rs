@@ -434,6 +434,8 @@ fn renders_failed_tool_inline_and_tools_screen() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: false,
             preview: "exit: 101\n--- stderr ---\ncompiler error".into(),
@@ -506,6 +508,8 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "line-one\nline-two\nline-three".into(),
@@ -591,6 +595,8 @@ fn command_result_renders_as_important_activity_not_file_list() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("command-1"),
             ok: true,
             preview: "exit: 0\n--- stdout ---\nraw-shell-output\nsecond-line\n".into(),
@@ -680,6 +686,8 @@ fn list_files_scan_stays_out_of_conversation() {
         reduce(
             &mut state,
             Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
                 id: ToolCallId::new(id),
                 ok: true,
                 preview: format!("{path}\nPROJECT_RULES.md\nMakefile"),
@@ -701,6 +709,8 @@ fn list_files_scan_stays_out_of_conversation() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("edit"),
             ok: true,
             preview: "ok".into(),
@@ -968,6 +978,8 @@ fn recap_does_not_render_raw_markdown_markers() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id,
             ok: true,
             preview: "目标已完成".into(),
@@ -1151,6 +1163,8 @@ fn a_silent_tool_group_leaves_no_hole() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "924 entries".into(),

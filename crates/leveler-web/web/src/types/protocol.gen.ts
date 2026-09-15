@@ -116,8 +116,14 @@ export type ToolCallId = string;
 /** A tool invocation that was still running when a client took its snapshot. */
 export interface UiActiveToolCall {
   arguments: string;
+  /** How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero. */
+  elapsed_ms?: number;
   id: ToolCallId;
   name: string;
+  /** The bounded end of the command's live output so far. */
+  output_tail?: string;
+  /** True when `output_tail` dropped earlier output. */
+  output_truncated?: boolean;
 }
 
 /** The runtime capability class an agent runs under. */
@@ -312,6 +318,13 @@ export interface UiClarificationRequest {
   options: string[];
   question: string;
 }
+
+/** How a stopped command call ended, as the runtime established it. */
+export type UiCommandStop =
+  /** The whole process tree was confirmed gone. */
+  | 'confirmed'
+  /** The tree was signalled, but its termination could not be confirmed. */
+  | 'unconfirmed';
 
 /** The final completion report (spec §23). */
 export interface UiCompletionReport {
@@ -709,6 +722,8 @@ export type ClientCommand =
   | { type: 'force_cancel_current_turn'; session_id: SessionId }
   /** Cancel ONE running delegated child of the session's turn. The child settles as cancelled; its parent turn keeps running. */
   | { type: 'cancel_child'; child_id: string; session_id: SessionId }
+  /** Stop ONE running tool call of the session's turn (for a command, its whole process tree). The call settles with its own stop outcome; the turn keeps running. Rejected when no such call is executing. */
+  | { type: 'cancel_tool_call'; call_id: ToolCallId; session_id: SessionId }
   /** Resolve a pending permission request . */
   | { type: 'approval_decision'; decision: ApprovalDecision; request_id: ApprovalId }
   /** Answer a pending clarification (spec §35). An empty answer means "skip". */
@@ -828,7 +843,9 @@ export type RuntimeEvent =
   /** A tool call started . */
   | { type: 'tool_call_started'; arguments: string; id: ToolCallId; name: string; parallel?: boolean }
   /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
-  | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; id: ToolCallId; ok: boolean; preview: string }
+  | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
+  /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
+  | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
   /** The execution plan was created or a step's status changed (spec §20). */
   | { type: 'plan_updated'; plan: UiPlan }
   /** Verification progress: a check finished or the run concluded (spec §22). */

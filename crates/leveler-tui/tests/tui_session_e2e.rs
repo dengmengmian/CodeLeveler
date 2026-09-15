@@ -293,6 +293,8 @@ fn tui_session_commands_ui_and_logic() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t-ansi"),
             ok: true,
             preview: "\u{1b}[32m✓\u{1b}[39m all tests passed".into(),

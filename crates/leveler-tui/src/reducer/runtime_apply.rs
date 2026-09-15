@@ -181,6 +181,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             preview,
             duration_ms,
             applied_diff,
+            ..
         } => {
             // Strip ANSI and controls so vitest/npm color codes do not show as
             // `[32m` garbage when ESC was already dropped (cell TUI).
@@ -194,6 +195,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             seal_analysis_segment(state);
         }
+        // Rendered by the shell execution row (next change).
+        RuntimeEvent::ToolCallOutput { .. } => {}
         RuntimeEvent::PlanUpdated { plan } => {
             state.plan_settled = false;
             // Fully succeeded plans (incl. 1/1) clear immediately so the chrome

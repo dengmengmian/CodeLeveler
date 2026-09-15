@@ -192,6 +192,8 @@ fn visual_inspect() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "resolver.go:120\tfunc resolveUsage(".into(),
@@ -293,6 +295,8 @@ fn visual_disclosure_matrix() {
         reduce(
             s,
             Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
                 id: ToolCallId::new(id),
                 ok,
                 preview: preview.into(),

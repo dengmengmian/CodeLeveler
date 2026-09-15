@@ -389,11 +389,28 @@
         "arguments": {
           "type": "string"
         },
+        "elapsed_ms": {
+          "description": "How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "id": {
           "$ref": "#/definitions/ToolCallId"
         },
         "name": {
           "type": "string"
+        },
+        "output_tail": {
+          "description": "The bounded end of the command's live output so far.",
+          "default": "",
+          "type": "string"
+        },
+        "output_truncated": {
+          "description": "True when `output_tail` dropped earlier output.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },

@@ -292,6 +292,16 @@ pub struct UiActiveToolCall {
     pub id: ToolCallId,
     pub name: String,
     pub arguments: String,
+    /// How long the call had been running when the snapshot was taken, by the
+    /// runtime's clock, so a reconnecting client does not restart it at zero.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// The bounded end of the command's live output so far.
+    #[serde(default)]
+    pub output_tail: String,
+    /// True when `output_tail` dropped earlier output.
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 /// One user shell execution (`!command`) as the reconnect snapshot carries

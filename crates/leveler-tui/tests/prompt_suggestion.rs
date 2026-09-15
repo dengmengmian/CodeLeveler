@@ -171,6 +171,8 @@ fn goal_turn(s: &mut AppState, status: &str, next_step: Option<&str>) {
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id,
             ok: true,
             preview: "目标已更新".into(),
@@ -314,6 +316,8 @@ fn a5_cancelled_and_failed_turns_offer_nothing() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id,
             ok: true,
             preview: "ok".into(),

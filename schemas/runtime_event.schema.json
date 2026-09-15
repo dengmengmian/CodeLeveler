@@ -435,6 +435,14 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "exit_code": {
+          "description": "Exit code of the process a command call ran, when it exited.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
         "id": {
           "$ref": "#/definitions/ToolCallId"
         },
@@ -444,10 +452,48 @@
         "preview": {
           "type": "string"
         },
+        "stop": {
+          "description": "Present only when the call was stopped: whether the runtime confirmed its whole process tree gone. A client shows \"stopped\" for `confirmed` alone; `unconfirmed` is an unknown outcome.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiCommandStop"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "type": {
           "type": "string",
           "enum": [
             "tool_call_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record.",
+      "type": "object",
+      "required": [
+        "chunk",
+        "id",
+        "stream",
+        "type"
+      ],
+      "properties": {
+        "chunk": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "stream": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_call_output"
           ]
         }
       }
@@ -1948,11 +1994,28 @@
         "arguments": {
           "type": "string"
         },
+        "elapsed_ms": {
+          "description": "How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "id": {
           "$ref": "#/definitions/ToolCallId"
         },
         "name": {
           "type": "string"
+        },
+        "output_tail": {
+          "description": "The bounded end of the command's live output so far.",
+          "default": "",
+          "type": "string"
+        },
+        "output_truncated": {
+          "description": "True when `output_tail` dropped earlier output.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },
@@ -2548,6 +2611,25 @@
           "type": "string"
         }
       }
+    },
+    "UiCommandStop": {
+      "description": "How a stopped command call ended, as the runtime established it.",
+      "oneOf": [
+        {
+          "description": "The whole process tree was confirmed gone.",
+          "type": "string",
+          "enum": [
+            "confirmed"
+          ]
+        },
+        {
+          "description": "The tree was signalled, but its termination could not be confirmed.",
+          "type": "string",
+          "enum": [
+            "unconfirmed"
+          ]
+        }
+      ]
     },
     "UiCompletionReport": {
       "description": "The final completion report (spec §23).",

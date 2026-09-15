@@ -557,6 +557,8 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("a1"),
             ok: true,
             preview: "old-line\n".into(),
@@ -595,6 +597,8 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("b1"),
             ok: true,
             preview: "new-line\n".into(),
@@ -655,6 +659,8 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "ok\n".into(),
@@ -1194,6 +1200,8 @@ fn interim_narration_does_not_satisfy_the_completion_footer() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "ok".into(),
@@ -1645,6 +1653,9 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
     let mut snap = snapshot();
     snap.status = "running".to_string();
     snap.active_tools = vec![UiActiveToolCall {
+        elapsed_ms: 0,
+        output_tail: String::new(),
+        output_truncated: false,
         id: ToolCallId::new("tool-1"),
         name: "run_command".to_string(),
         arguments: r#"{"cmd":"cargo test"}"#.to_string(),
@@ -2115,6 +2126,8 @@ fn tool_completed(s: &mut AppState, id: &str, ok: bool) {
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new(id),
             ok,
             preview: if ok { "done".into() } else { "boom".into() },
@@ -2382,6 +2395,8 @@ fn tool_preview_control_chars_are_neutralized() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "file.go:1\tfunc x(\rmore".into(),
@@ -2403,6 +2418,8 @@ fn tool_preview_ansi_color_codes_are_stripped() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "\u{1b}[32m✓\u{1b}[39m test passed \u{1b}[1m[30m leftover".into(),
@@ -3615,6 +3632,8 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id,
             ok: true,
             preview: "目标已完成".into(),
@@ -3654,6 +3673,8 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id,
             ok: true,
             preview: "目标已完成".into(),
@@ -3823,6 +3844,8 @@ fn activity_clears_when_the_tool_completes() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "ok".into(),
@@ -4057,6 +4080,8 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new("t1"),
             ok: true,
             preview: "ok".into(),
@@ -6810,6 +6835,8 @@ fn tool(s: &mut AppState, id: &str) {
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
             id: ToolCallId::new(id),
             ok: true,
             preview: "ok".into(),
