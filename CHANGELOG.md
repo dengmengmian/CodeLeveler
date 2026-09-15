@@ -22,6 +22,10 @@ All notable changes to CodeLeveler are documented here. The format follows
 - The approval option "本次会话内允许" was not session-scoped: it lasted the current turn, and on a command's `escalate` only that one call. It is now "本轮对话内允许" (CLI `this [t]urn`) everywhere, and on `escalate` it keeps the granted permission for the rest of the turn.
 - **Sandboxed Rust builds no longer recompile every dependency on every command.** Each confined command had its own `CARGO_HOME`, and Cargo fingerprints a registry dependency by the path its source is read from: three identical `cargo build`s in a TUI session each compiled ~140 crates (~16s). One `CARGO_HOME` per workspace now serves online and `--offline` commands alike; the second build took 0.06s.
 - A failed `apply_patch` names the first line that differs between the hunk and the file.
+- 请求批准: after "本轮对话内允许", a later command escalating for the same permission runs without asking again (a `go test` session prompted seven times in one turn). The escalation prompt no longer says "仅此一次" beside that option, and the model is told a network failure needs `network`, not unrestricted filesystem.
+- Go module downloads (`dial tcp`, `no such host`) and local test servers the macOS sandbox refuses (`bind: operation not permitted`, `listen EPERM`) are reported as needing network permission.
+- A sandbox scratch being leased can no longer be reclaimed by another leveler process's cleanup ("create private sandbox scratch directory: No such file or directory").
+- TUI: a question that timed out, had nobody to answer or was skipped shows ⚠ and says so, instead of ✓ with the note meant for the model.
 - TUI: a turn's end line no longer repeats the file count of an old `/diff`; a passed verification names a check that failed without blocking ("cargo fmt 未通过（不阻断）") instead of "验证 2/3"; a failed command's note is its error line, not `exit: N`; a late delivery acknowledgement no longer claims a lost connection.
 
 ## [0.2.0-beta.3] - 2026-09-15
