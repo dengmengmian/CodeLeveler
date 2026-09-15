@@ -1833,6 +1833,7 @@ dependencies = [
  "leveler-model",
  "leveler-project",
  "leveler-provider",
+ "leveler-skills",
  "leveler-storage",
  "leveler-test-support",
  "leveler-tools",

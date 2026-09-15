@@ -393,6 +393,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
             state.unfinished_goals = goals;
         }
+        RuntimeEvent::AgentsLoaded { .. }
+        | RuntimeEvent::AgentLoaded { .. }
+        | RuntimeEvent::AgentMutated { .. } => {}
         RuntimeEvent::GoalRecapCreated { recap } => {
             // History, never the lower runtime stack. Idempotent on
             // checkpoint_id inside push_goal_recap.

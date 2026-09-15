@@ -279,6 +279,47 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// List the agent definitions the session's project resolves.
+    /// Answered by [`crate::RuntimeEvent::AgentsLoaded`].
+    ListAgents {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// One agent with its full definition. Answered by
+    /// [`crate::RuntimeEvent::AgentLoaded`].
+    GetAgent {
+        session_id: SessionId,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// Write a new agent definition. The user's own command is the
+    /// authorization; the runtime validates and writes atomically, and answers
+    /// with [`crate::RuntimeEvent::AgentMutated`].
+    CreateAgent {
+        session_id: SessionId,
+        scope: crate::UiAgentScope,
+        draft: Box<crate::UiAgentDraft>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// Replace an existing agent definition in `scope`.
+    UpdateAgent {
+        session_id: SessionId,
+        scope: crate::UiAgentScope,
+        draft: Box<crate::UiAgentDraft>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// Delete an agent definition from `scope`. Running children keep theirs.
+    DeleteAgent {
+        session_id: SessionId,
+        scope: crate::UiAgentScope,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// The runtime owner is shutting down; all work should stop. Disconnecting
     /// an individual UI client must not issue this command.
     Quit,
@@ -323,6 +364,11 @@ impl ClientCommand {
             | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
+            | ClientCommand::ListAgents { session_id, .. }
+            | ClientCommand::GetAgent { session_id, .. }
+            | ClientCommand::CreateAgent { session_id, .. }
+            | ClientCommand::UpdateAgent { session_id, .. }
+            | ClientCommand::DeleteAgent { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,

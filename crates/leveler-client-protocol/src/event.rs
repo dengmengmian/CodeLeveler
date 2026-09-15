@@ -96,6 +96,10 @@ pub struct UiChildAgent {
     pub profile_id: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    /// The declarative agent it was spawned from, when it was. `None` for a
+    /// built-in role spawn and for children recorded before agents existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::UiChildAgentIdentity>,
     /// What it was asked to do.
     pub purpose: String,
     pub state: UiChildState,
@@ -348,6 +352,11 @@ pub enum RuntimeEvent {
         /// Whether this child holds a physically read-only toolset.
         #[serde(default)]
         read_only: bool,
+        /// The declarative agent it was spawned from, carried on the start.
+        /// `None` for built-in role spawns, on terminals, and on events
+        /// recorded before agents existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiChildAgentIdentity>,
         /// What the parent did with what this child found, once it finished.
         ///
         /// `None` means NOT MEASURED — the runtime produced no projection —
@@ -412,6 +421,38 @@ pub enum RuntimeEvent {
         query_id: Option<leveler_core::CommandId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         goals: Vec<crate::UiUnfinishedGoal>,
+    },
+    /// Result of [`crate::ClientCommand::ListAgents`].
+    AgentsLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        agents: Vec<crate::UiAgentEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<crate::UiAgentProblem>,
+    },
+    /// Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and
+    /// `error` says why when the name does not resolve.
+    AgentLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiAgentDetail>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure
+    /// nothing was written and `error` is the reason.
+    AgentMutated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        name: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// The entry as the registry now resolves it (after a create/update).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiAgentEntry>,
     },
     /// A transient notification for the status line.
     Notification {

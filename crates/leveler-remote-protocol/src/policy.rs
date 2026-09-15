@@ -261,6 +261,19 @@ impl RemotePolicy {
                 reason: "goal listing is local-only",
             },
 
+            // Agent definitions are instructions that shape what future runs
+            // on this machine do, and a user-scope write reaches outside the
+            // repository. Management is a Web/Desktop and TUI concern; a
+            // remote client sees a running child's agent name on its events.
+            ClientCommand::ListAgents { .. }
+            | ClientCommand::GetAgent { .. }
+            | ClientCommand::CreateAgent { .. }
+            | ClientCommand::UpdateAgent { .. }
+            | ClientCommand::DeleteAgent { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "agent definitions are local-only",
+            },
+
             // A recap projects plan wording, findings, and workspace paths —
             // repository content in prose form, same class as the goal list.
             ClientCommand::Recap { .. } => RemoteVerdict::Deny {

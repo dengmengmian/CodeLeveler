@@ -951,6 +951,17 @@
         "type"
       ],
       "properties": {
+        "agent": {
+          "description": "The declarative agent it was spawned from, carried on the start. `None` for built-in role spawns, on terminals, and on events recorded before agents existed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiChildAgentIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "background": {
           "description": "Whether the parent continues while this child runs. Carried on the start; `None` on a terminal, which says nothing about it.",
           "type": [
@@ -1220,6 +1231,139 @@
           "type": "string",
           "enum": [
             "unfinished_goals_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::ListAgents`].",
+      "type": "object",
+      "required": [
+        "agents",
+        "type"
+      ],
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiAgentEntry"
+          }
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiAgentProblem"
+          }
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agents_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and `error` says why when the name does not resolve.",
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiAgentDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agent_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure nothing was written and `error` is the reason.",
+      "type": "object",
+      "required": [
+        "name",
+        "ok",
+        "type"
+      ],
+      "properties": {
+        "agent": {
+          "description": "The entry as the registry now resolves it (after a create/update).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiAgentEntry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agent_mutated"
           ]
         }
       }
@@ -1812,6 +1956,157 @@
         }
       }
     },
+    "UiAgentCapability": {
+      "description": "The runtime capability class an agent runs under.",
+      "type": "string",
+      "enum": [
+        "read_only",
+        "writer",
+        "scoped_writer"
+      ]
+    },
+    "UiAgentDetail": {
+      "description": "One agent with its full definition, for an editor.",
+      "type": "object",
+      "required": [
+        "entry"
+      ],
+      "properties": {
+        "entry": {
+          "$ref": "#/definitions/UiAgentEntry"
+        },
+        "instructions": {
+          "description": "`None` for structural built-ins and invalid definitions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiAgentEntry": {
+      "description": "One resolvable agent name, as the registry resolves it.",
+      "type": "object",
+      "required": [
+        "name",
+        "source",
+        "status"
+      ],
+      "properties": {
+        "capability": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiAgentCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "description": "The fields below are `None`/empty for an invalid definition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness_only": {
+          "description": "Launched by the harness only; a model cannot spawn it.",
+          "default": false,
+          "type": "boolean"
+        },
+        "location": {
+          "description": "The definition's directory; `None` for built-ins.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_duration_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_rounds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it is unavailable or invalid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shadowed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiShadowedAgent"
+          }
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/definitions/UiAgentSource"
+        },
+        "status": {
+          "$ref": "#/definitions/UiAgentStatus"
+        },
+        "structural": {
+          "description": "One of the runtime's structural roles (default, explorer, worker, reviewer): not editable, and not overridable.",
+          "default": false,
+          "type": "boolean"
+        },
+        "tools": {
+          "description": "`None`: the capability's full toolset.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "UiAgentObservation": {
       "description": "Durable sub-agent / reviewer observation.",
       "type": "object",
@@ -1839,6 +2134,61 @@
           "type": "string"
         }
       }
+    },
+    "UiAgentProblem": {
+      "description": "Something under an agents directory that is not an agent at all.",
+      "type": "object",
+      "required": [
+        "error",
+        "location",
+        "source"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/UiAgentSource"
+        }
+      }
+    },
+    "UiAgentSource": {
+      "description": "Where a definition came from.",
+      "type": "string",
+      "enum": [
+        "project",
+        "user",
+        "builtin"
+      ]
+    },
+    "UiAgentStatus": {
+      "description": "Whether an entry can be spawned here.",
+      "oneOf": [
+        {
+          "description": "Valid, and everything it names exists on this machine.",
+          "type": "string",
+          "enum": [
+            "available"
+          ]
+        },
+        {
+          "description": "Valid, but something it names is missing here (model, skill, effort).",
+          "type": "string",
+          "enum": [
+            "unavailable"
+          ]
+        },
+        {
+          "description": "The definition itself is broken; it cannot be spawned anywhere.",
+          "type": "string",
+          "enum": [
+            "invalid"
+          ]
+        }
+      ]
     },
     "UiApprovalRequest": {
       "description": "A pending permission request, projected for display.",
@@ -1942,6 +2292,17 @@
         "state"
       ],
       "properties": {
+        "agent": {
+          "description": "The declarative agent it was spawned from, when it was. `None` for a built-in role spawn and for children recorded before agents existed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiChildAgentIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "background": {
           "description": "Whether its parent continued while it ran.",
           "default": false,
@@ -2040,6 +2401,50 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "UiChildAgentIdentity": {
+      "description": "The definition a running or settled child was spawned from, as resolved at spawn. Deleting or editing the definition does not change it.",
+      "type": "object",
+      "required": [
+        "capability",
+        "fingerprint",
+        "name",
+        "source"
+      ],
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The agent's name, e.g. `security-reviewer`.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "description": "`project`, `user` or `builtin`.",
+          "type": "string"
         }
       }
     },
@@ -3331,6 +3736,24 @@
         },
         "updated_at": {
           "type": "string"
+        }
+      }
+    },
+    "UiShadowedAgent": {
+      "description": "A lower-precedence definition the active one hides.",
+      "type": "object",
+      "required": [
+        "source"
+      ],
+      "properties": {
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/UiAgentSource"
         }
       }
     },

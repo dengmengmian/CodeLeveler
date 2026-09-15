@@ -499,6 +499,17 @@
         "state"
       ],
       "properties": {
+        "agent": {
+          "description": "The declarative agent it was spawned from, when it was. `None` for a built-in role spawn and for children recorded before agents existed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiChildAgentIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "background": {
           "description": "Whether its parent continued while it ran.",
           "default": false,
@@ -597,6 +608,50 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "UiChildAgentIdentity": {
+      "description": "The definition a running or settled child was spawned from, as resolved at spawn. Deleting or editing the definition does not change it.",
+      "type": "object",
+      "required": [
+        "capability",
+        "fingerprint",
+        "name",
+        "source"
+      ],
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The agent's name, e.g. `security-reviewer`.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "description": "`project`, `user` or `builtin`.",
+          "type": "string"
         }
       }
     },

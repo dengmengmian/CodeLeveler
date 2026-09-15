@@ -482,6 +482,7 @@ mod tests {
             profile_id: None,
             read_only: true,
             purpose: "look".into(),
+            agent: None,
             state,
             ok,
             background: true,
