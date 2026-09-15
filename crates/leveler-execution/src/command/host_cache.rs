@@ -65,12 +65,21 @@ impl Drop for SandboxLeaseGuard {
 /// silently proceeding lockless.
 fn acquire_sandbox_lease(scratch_dir: &Path) -> std::io::Result<SandboxLeaseGuard> {
     let lock_path = scratch_dir.with_extension("lock");
+    // Locked under a name the reaper ignores, then renamed into place: a
+    // reaper in another process that finds `<name>.lock` always finds it
+    // held. Opened and locked at its final name, there was a moment it was
+    // not, and that reaper reclaimed the scratch about to be used.
+    let staged = scratch_dir.with_extension("lock-staged");
     let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .write(true)
-        .open(&lock_path)?;
-    fs2::FileExt::try_lock_exclusive(&lock)?;
+        .open(&staged)?;
+    let locked =
+        fs2::FileExt::try_lock_exclusive(&lock).and_then(|()| std::fs::rename(&staged, &lock_path));
+    if let Err(error) = locked {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
     Ok(SandboxLeaseGuard {
         lock_path,
         _lock: lock,
@@ -1215,6 +1224,40 @@ mod tests {
 
         assert!(scratch.exists(), "a live-leased scratch must survive");
         assert!(scratch.with_extension("lock").exists());
+    }
+
+    /// Another process's reaper can run while a command is taking its lease.
+    /// It must never see the lease file before the lock is held, or it reclaims
+    /// a scratch that is about to be used (the command then fails with
+    /// "create private sandbox scratch directory: No such file or directory").
+    #[test]
+    fn a_reaper_racing_a_new_lease_never_reclaims_it() {
+        let root = tempfile::tempdir().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper = {
+            let root = root.path().to_path_buf();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    reap_orphaned_sandboxes(&root);
+                }
+            })
+        };
+        let mut lost = 0;
+        for _ in 0..3000 {
+            let scratch = tempfile::Builder::new()
+                .prefix("codeleveler-sandbox-")
+                .tempdir_in(root.path())
+                .unwrap();
+            let lease = acquire_sandbox_lease(scratch.path()).unwrap();
+            if !scratch.path().is_dir() {
+                lost += 1;
+            }
+            drop(lease);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reaper.join().unwrap();
+        assert_eq!(lost, 0, "scratches reclaimed while being leased");
     }
 
     /// S4: fail-closed — a scratch dir with no lock sidecar is left alone rather
