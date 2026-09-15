@@ -33,7 +33,7 @@ pub enum Overlay {
     ModePicker(Box<SelectionModel>),
     /// Named TUI palettes (`auto` / `dark` / `light` / `high-contrast`).
     ThemePicker(Box<SelectionModel>),
-    /// `/work-mode` — economy / balanced / delivery.
+    /// `/work-mode` — economy / balanced.
     WorkModePicker(Box<SelectionModel>),
     /// `/collab` — chat / plan / goal.
     CollabPicker(Box<SelectionModel>),
