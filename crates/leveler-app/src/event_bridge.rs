@@ -814,6 +814,7 @@ impl EventBridge {
                 contribution,
                 outcome,
                 stop,
+                ..
             } => {
                 let projected = contribution.as_ref().map(project_contribution);
                 // Prefer the role recorded at spawn; a projection carries it
@@ -2190,6 +2191,7 @@ mod projection_equivalence {
             ),
             outcome: None,
             stop: None,
+            limit: None,
         });
         let ev = rx.try_recv().expect("one event");
         match ev {
@@ -2220,6 +2222,7 @@ mod projection_equivalence {
             contribution: None,
             outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
             stop: Some(leveler_lifecycle::ChildStop::Budget),
+            limit: None,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated { outcome, stop, .. } => {
@@ -2303,6 +2306,7 @@ mod projection_equivalence {
             contribution: None,
             outcome: None,
             stop: None,
+            limit: None,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated { background, .. } => assert_eq!(background, None),
@@ -2324,6 +2328,7 @@ mod projection_equivalence {
             contribution: None,
             outcome: None,
             stop: None,
+            limit: None,
         });
         match rx.try_recv().expect("one event") {
             RuntimeEvent::SubAgentUpdated { contribution, .. } => {
@@ -2397,6 +2402,7 @@ mod projection_equivalence {
                 contribution: None,
                 outcome: None,
                 stop: None,
+                limit: None,
             },
         ]);
         assert_eq!(

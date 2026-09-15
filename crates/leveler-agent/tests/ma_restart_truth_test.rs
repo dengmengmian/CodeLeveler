@@ -476,6 +476,7 @@ async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
             summary: "explored the parser: three modules, no defects".into(),
             outcome: None,
             stop: None,
+            limit: None,
         },
     )
     .await;

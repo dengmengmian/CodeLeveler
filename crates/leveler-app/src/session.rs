@@ -203,6 +203,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             contribution,
             outcome,
             stop,
+            limit,
         } => AgentEvent::SubAgentFinished {
             id,
             nickname,
@@ -211,6 +212,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             contribution,
             outcome,
             stop,
+            limit,
         },
         EngineEvent::SubAgentActivity {
             id,

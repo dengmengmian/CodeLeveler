@@ -1079,6 +1079,7 @@ mod tests {
                 }),
                 outcome: None,
                 stop: None,
+                limit: None,
             },
         )
         .await;
@@ -1333,6 +1334,7 @@ mod tests {
             contribution: None,
             outcome: None,
             stop: None,
+            limit: None,
         }
     }
 

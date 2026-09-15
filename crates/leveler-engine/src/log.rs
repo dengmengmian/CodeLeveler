@@ -664,6 +664,7 @@ mod tests {
             contribution: None,
             outcome: None,
             stop: None,
+            limit: None,
         }
     }
 
@@ -1062,6 +1063,7 @@ mod tests {
                 contribution: None,
                 outcome: None,
                 stop: None,
+                limit: None,
             },
             &mut sink,
         )
@@ -1110,6 +1112,7 @@ mod tests {
                 contribution: None,
                 outcome: None,
                 stop: None,
+                limit: None,
             },
             &mut sink,
         )

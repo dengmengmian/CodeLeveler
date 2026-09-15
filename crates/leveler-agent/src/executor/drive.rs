@@ -609,6 +609,7 @@ impl<'a> Drive<'a> {
                 let result = super::handlers::SubAgentRunResult {
                     result: crate::sub_agent::ChildResult::new(false, "", refusal),
                     stop: leveler_lifecycle::ChildStop::Failed,
+                    limit: None,
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                     findings: Vec::new(),
@@ -3550,6 +3551,7 @@ fn fold_child_settlement(
         contribution: Some(contribution),
         outcome: Some(result.result.status),
         stop: Some(result.stop),
+        limit: result.limit,
     });
     (content, result.result.status.completed())
 }
@@ -3575,6 +3577,7 @@ fn join_settlement(
                 format!("its background task ended abnormally: {join_error}"),
             ),
             stop: leveler_lifecycle::ChildStop::Failed,
+            limit: None,
             progress: leveler_lifecycle::ProgressLedger::default(),
             modified_files: Vec::new(),
             findings: Vec::new(),

@@ -343,6 +343,8 @@ pub enum AgentEvent {
         outcome: Option<leveler_lifecycle::ChildStatus>,
         /// How the child's activation ended.
         stop: Option<leveler_lifecycle::ChildStop>,
+        /// Which bound fired when `stop` is `Budget`.
+        limit: Option<leveler_lifecycle::ChildLimit>,
     },
     /// Live step for one spawned sub-agent (tool start/finish). Transient UI
     /// signal — not full child transcript. Attributed by `id` so concurrent

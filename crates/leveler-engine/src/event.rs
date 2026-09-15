@@ -482,6 +482,10 @@ pub enum EngineEvent {
         /// was typed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<leveler_lifecycle::ChildStop>,
+        /// Which bound fired when `stop` is `budget`. `None` for every other
+        /// stop and on rows written before it was typed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<leveler_lifecycle::ChildLimit>,
     },
     /// TRANSIENT: live tool/step for one sub-agent (attributed by `id`).
     SubAgentActivity {
@@ -1134,6 +1138,40 @@ mod contract_tests {
                 outcome: TurnOutcome::Completed,
                 ..
             }
+        ));
+    }
+
+    /// The bound that stopped a child survives the durable row, and rows
+    /// written before it was typed still replay.
+    #[test]
+    fn a_child_budget_limit_is_durable_and_optional() {
+        let event = EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Euclid".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: None,
+            stop: Some(leveler_lifecycle::ChildStop::Budget),
+            limit: Some(leveler_lifecycle::ChildLimit::Duration),
+        };
+        let (_, payload) = event.to_row().unwrap();
+        assert!(payload.contains(r#""limit":"duration""#), "{payload}");
+        assert!(matches!(
+            EngineEvent::from_payload(&payload).unwrap(),
+            EngineEvent::SubAgentFinished {
+                limit: Some(leveler_lifecycle::ChildLimit::Duration),
+                ..
+            }
+        ));
+
+        let legacy = serde_json::json!({
+            "type": "sub_agent_finished",
+            "payload": {"id": "a1", "nickname": "Euclid", "ok": false, "summary": "s", "stop": "budget"}
+        });
+        assert!(matches!(
+            EngineEvent::from_payload(&legacy.to_string()).unwrap(),
+            EngineEvent::SubAgentFinished { limit: None, .. }
         ));
     }
 

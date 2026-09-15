@@ -2072,6 +2072,7 @@ async fn run_review(
                     ),
                     outcome: Some(result.result.status),
                     stop: Some(result.stop),
+                    limit: result.limit,
                 },
                 observer,
             )
@@ -2744,6 +2745,7 @@ mod session_review_tests {
             contribution: None,
             outcome: None,
             stop: None,
+            limit: None,
         }
     }
 

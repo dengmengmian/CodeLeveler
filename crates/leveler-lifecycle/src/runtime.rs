@@ -228,6 +228,23 @@ impl TurnOutcome {
     }
 }
 
+/// Which bound stopped a child whose stop is [`ChildStop::Budget`]. Carried
+/// beside the stop so a wall-clock cap, a token or cost budget and a round
+/// limit are told apart without reading the settlement prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildLimit {
+    Duration,
+    ModelTokens,
+    Cost,
+    Commands,
+    ModifiedFiles,
+    /// The child's own round window.
+    RoundWindow,
+    /// The absolute round ceiling.
+    RoundCeiling,
+}
+
 /// How one delegated child's activation ended, mechanically. Carried on the
 /// child's terminal event so no reader has to recover it from prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

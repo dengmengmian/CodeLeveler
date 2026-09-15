@@ -376,6 +376,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             contribution,
             outcome,
             stop,
+            limit,
         } => serde_json::json!({
             "type": "sub_agent_finished",
             "id": id, "nickname": nickname, "ok": ok, "summary": summary,
@@ -387,6 +388,8 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             // recorded.
             "outcome": outcome,
             "stop": stop,
+            // Which bound fired when `stop` is budget; null otherwise.
+            "limit": limit,
         }),
         AgentEvent::SubAgentActivity {
             id,
@@ -457,6 +460,7 @@ mod jsonl_tests {
             contribution: None,
             outcome: Some(leveler_lifecycle::ChildStatus::IncompleteNoResult),
             stop: Some(leveler_lifecycle::ChildStop::Lost),
+            limit: None,
         });
         assert_eq!(line["outcome"], "incomplete_no_result");
         assert_eq!(line["stop"], "lost");

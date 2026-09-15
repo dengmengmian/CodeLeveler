@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
 use leveler_core::{ApprovalId, ClarificationId};
 use leveler_execution::{ApprovalRequest, RiskLevel};
 use leveler_model::ToolCall;
@@ -16,9 +17,18 @@ use crate::authorization::action_fingerprint;
 use crate::sub_agent::{AgentRole, ChildResult};
 
 /// Plain words for why a run ended, for a parent model rather than a log.
-fn stop_reason_wording(reason: StopReason) -> String {
+/// A budget stop names the limit that fired; one without a resource
+/// dimension is the run's own round window.
+fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>) -> String {
     match reason {
-        StopReason::BudgetExhausted => "its token or cost budget ran out",
+        StopReason::BudgetExhausted => match exhaustion.map(|e| e.dimension) {
+            Some(BudgetDimension::Duration) => "its wall-clock duration limit ran out",
+            Some(BudgetDimension::ModelTokens) => "its model token budget ran out",
+            Some(BudgetDimension::Cost) => "its cost budget ran out",
+            Some(BudgetDimension::Commands) => "its command budget ran out",
+            Some(BudgetDimension::ModifiedFiles) => "its modified-file budget ran out",
+            None => "it reached its round limit",
+        },
         StopReason::TurnLimitReached => "it hit the round ceiling",
         StopReason::Blocked => "it declared the task blocked",
         StopReason::Stalled => "it went quiet without resolving the task",
@@ -41,6 +51,26 @@ fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
         | StopReason::CompletedChecksFailed => ChildStop::Completed,
         StopReason::BudgetExhausted | StopReason::TurnLimitReached => ChildStop::Budget,
         StopReason::Blocked | StopReason::Stalled | StopReason::Incomplete => ChildStop::Incomplete,
+    }
+}
+
+/// Which bound stopped a child whose stop is [`ChildStop::Budget`](leveler_lifecycle::ChildStop::Budget).
+fn child_limit(
+    reason: StopReason,
+    exhaustion: Option<&BudgetExhaustion>,
+) -> Option<leveler_lifecycle::ChildLimit> {
+    use leveler_lifecycle::ChildLimit;
+    match reason {
+        StopReason::BudgetExhausted => Some(match exhaustion.map(|e| e.dimension) {
+            Some(BudgetDimension::Duration) => ChildLimit::Duration,
+            Some(BudgetDimension::ModelTokens) => ChildLimit::ModelTokens,
+            Some(BudgetDimension::Cost) => ChildLimit::Cost,
+            Some(BudgetDimension::Commands) => ChildLimit::Commands,
+            Some(BudgetDimension::ModifiedFiles) => ChildLimit::ModifiedFiles,
+            None => ChildLimit::RoundWindow,
+        }),
+        StopReason::TurnLimitReached => Some(ChildLimit::RoundCeiling),
+        _ => None,
     }
 }
 
@@ -307,6 +337,7 @@ impl Executor {
         DelegatedChildResult {
             ok: result.result.status.completed(),
             stop: result.stop,
+            limit: result.limit,
             result: result.result,
             progress: result.progress,
             modified_files: result.modified_files,
@@ -476,6 +507,7 @@ async fn run_prepared_sub_agent(
             return SubAgentRunResult {
                 result: ChildResult::new(false, "", "no concurrency slot was available to run it"),
                 stop: leveler_lifecycle::ChildStop::Failed,
+                limit: None,
                 progress: ProgressLedger::default(),
                 modified_files: Vec::new(),
                 findings: Vec::new(),
@@ -532,6 +564,7 @@ async fn run_prepared_sub_agent(
                         format!("its model profile could not be read: {error}"),
                     ),
                     stop: leveler_lifecycle::ChildStop::Failed,
+                    limit: None,
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                     findings: Vec::new(),
@@ -682,11 +715,12 @@ async fn run_prepared_sub_agent(
             let stop_reason = if completed {
                 String::new()
             } else {
-                stop_reason_wording(outcome.stop_reason)
+                stop_reason_wording(outcome.stop_reason, outcome.budget_exhaustion.as_ref())
             };
             SubAgentRunResult {
                 result: ChildResult::new(completed, &findings, stop_reason),
                 stop: child_stop(outcome.stop_reason),
+                limit: child_limit(outcome.stop_reason, outcome.budget_exhaustion.as_ref()),
                 progress: outcome.progress,
                 modified_files: outcome.modified_files,
                 findings: reported_findings,
@@ -704,6 +738,7 @@ async fn run_prepared_sub_agent(
                     "stopped before it could finish",
                 ),
                 stop: leveler_lifecycle::ChildStop::Cancelled,
+                limit: None,
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
@@ -715,6 +750,7 @@ async fn run_prepared_sub_agent(
             SubAgentRunResult {
                 result: ChildResult::new(false, &said_before_stopping(), e.to_string()),
                 stop: leveler_lifecycle::ChildStop::Failed,
+                limit: None,
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
@@ -731,6 +767,8 @@ pub struct DelegatedChildResult {
     pub ok: bool,
     /// How the activation ended, mechanically.
     pub stop: leveler_lifecycle::ChildStop,
+    /// Which bound fired when `stop` is `Budget`.
+    pub limit: Option<leveler_lifecycle::ChildLimit>,
     /// What the child established, and how its run ended.
     pub result: ChildResult,
     /// The child's own spend (rounds, tokens, cost, commands, paths), for the
@@ -750,6 +788,8 @@ pub(crate) struct SubAgentRunResult {
     pub result: ChildResult,
     /// How the activation ended, mechanically.
     pub stop: leveler_lifecycle::ChildStop,
+    /// Which bound fired when `stop` is `Budget`.
+    pub limit: Option<leveler_lifecycle::ChildLimit>,
     pub progress: ProgressLedger,
     pub modified_files: Vec<String>,
     /// Typed findings captured from the child's ledger snapshots.

@@ -699,6 +699,7 @@ impl TurnRunner<'_> {
                 ),
                 outcome: None,
                 stop: Some(stop),
+                limit: None,
             };
             let origin = child.turn_id.as_deref().map(TurnId::new);
             self.log.append(origin.as_ref(), event, observer).await?;
@@ -783,6 +784,7 @@ impl TurnRunner<'_> {
                 summary,
                 outcome: note.and_then(|note| note.outcome),
                 stop: Some(stop),
+                limit: None,
             };
             let origin = child.turn_id.clone().map(TurnId::new);
             let attribute_to = origin.as_ref().unwrap_or(current_turn);

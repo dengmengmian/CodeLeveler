@@ -227,6 +227,7 @@ mod tests {
                 contribution: None,
                 outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
                 stop: Some(leveler_lifecycle::ChildStop::Budget),
+                limit: None,
             },
         )
         .await;

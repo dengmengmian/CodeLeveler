@@ -170,6 +170,7 @@ impl From<AgentEvent> for EngineEvent {
                 contribution,
                 outcome,
                 stop,
+                limit,
             } => EngineEvent::SubAgentFinished {
                 id,
                 nickname,
@@ -178,6 +179,7 @@ impl From<AgentEvent> for EngineEvent {
                 contribution,
                 outcome,
                 stop,
+                limit,
             },
             A::SubAgentActivity {
                 id,

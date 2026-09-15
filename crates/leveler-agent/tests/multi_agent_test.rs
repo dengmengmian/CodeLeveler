@@ -1645,6 +1645,75 @@ async fn child_duration_does_not_inflate_parent_wall_clock() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A child stopped by its wall-clock cap must say so. Its settlement used to
+/// read "its token or cost budget ran out" for every budget stop, so a parent
+/// (and the eval that read it) was told the wrong limit fired.
+#[tokio::test]
+async fn a_child_stopped_by_its_duration_cap_says_the_duration_ran_out() {
+    let dir = tmp("child-duration-stop", 208);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "look around", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // The child's only round outlives its one-second grant.
+                read_call("c1"),
+                assistant_text("parent done"),
+            ],
+            Duration::from_millis(0),
+        )
+        .with_delays(vec![Duration::ZERO, Duration::from_millis(1500)]),
+    );
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    // Parent remainder 61 s minus the 60 s settlement reserve: the child gets 1 s.
+    .with_step_limits(leveler_agent::StepLimits {
+        max_duration: Some(Duration::from_secs(61)),
+        ..Default::default()
+    })
+    .run(
+        "spawn one child",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let (summary, limit) = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentFinished { summary, limit, .. } => Some((summary.clone(), *limit)),
+            _ => None,
+        })
+        .expect("SubAgentFinished");
+    assert_eq!(
+        first_terminal(&events).1,
+        Some(leveler_agent::ChildStop::Budget)
+    );
+    assert_eq!(limit, Some(leveler_agent::ChildLimit::Duration));
+    assert!(
+        summary.contains("duration") && !summary.contains("token or cost"),
+        "the settlement must name the duration cap: {summary}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Concurrent children that each run a real tool must emit attributed activity
 /// (agent id + tool name) so clients can show current/recent steps.
 ///
