@@ -20,6 +20,9 @@ All notable changes to CodeLeveler are documented here. The format follows
 - `run_command` refusals show the exact call that would run instead of an example that ran a different program.
 - **请求批准 now enforces the network it promised to ask about.** A command ran with the network open and no prompt (`curl https://example.com` reached the host). Commands still run without asking, but inside a network-denied sandbox (macOS seatbelt, Linux bubblewrap); a command that fails reaching the network is reported as needing network permission (TUI: "⚠ 执行命令 · 需要网络权限") and retried with `escalate`, which asks once. `web_fetch`, `web_search` and MCP tools ask once and run with the network when approved. 完全访问 and 替我审批 are unchanged. On Windows, which cannot deny a command the network, 请求批准 asks before every command and says it will run with the network.
 - The approval option "本次会话内允许" was not session-scoped: it lasted the current turn, and on a command's `escalate` only that one call. It is now "本轮对话内允许" (CLI `this [t]urn`) everywhere, and on `escalate` it keeps the granted permission for the rest of the turn.
+- **Sandboxed Rust builds no longer recompile every dependency on every command.** Each confined command had its own `CARGO_HOME`, and Cargo fingerprints a registry dependency by the path its source is read from: three identical `cargo build`s in a TUI session each compiled ~140 crates (~16s). One `CARGO_HOME` per workspace now serves online and `--offline` commands alike; the second build took 0.06s.
+- A failed `apply_patch` names the first line that differs between the hunk and the file.
+- TUI: a turn's end line no longer repeats the file count of an old `/diff`; a passed verification names a check that failed without blocking ("cargo fmt 未通过（不阻断）") instead of "验证 2/3"; a failed command's note is its error line, not `exit: N`; a late delivery acknowledgement no longer claims a lost connection.
 
 ## [0.2.0-beta.3] - 2026-09-15
 
