@@ -165,7 +165,7 @@ pub async fn query_observability(
             updated_at: session.updated_at,
             status: session.status.as_str().to_string(),
             model: session.model,
-            work_profile: session.work_profile,
+            work_profile: crate::canonical_work_profile(&session.work_profile),
             collaboration: session.collaboration,
             last_sequence: latest,
             request_count,

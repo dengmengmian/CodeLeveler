@@ -2619,7 +2619,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             kind: leveler_engine::ExecutionKind::parse(&kind)?,
                             axes: Some(leveler_engine::NewSessionAxes {
                                 collaboration: record.collaboration.clone(),
-                                work_profile: record.work_profile.clone(),
+                                work_profile: crate::canonical_work_profile(&record.work_profile),
                             }),
                         })
                         .await?;
@@ -3533,7 +3533,7 @@ async fn compact_conversation(
                 user_shells: Vec::new(),
                 completion_report: live.completion_report,
                 reasoning,
-                work_profile: Some(record.work_profile.clone()),
+                work_profile: Some(crate::canonical_work_profile(&record.work_profile)),
                 collaboration: Some(record.collaboration.clone()),
                 children: Vec::new(),
             },

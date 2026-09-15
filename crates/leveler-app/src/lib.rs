@@ -169,7 +169,7 @@ pub struct Application {
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
-    /// Product work profile (economy / balanced / delivery).
+    /// Product work profile (economy / balanced).
     work_profile: WorkProfile,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
@@ -798,6 +798,17 @@ pub(crate) fn axes_from_session_record(
     (work, collab)
 }
 
+/// Canonical wire value for a persisted work-profile column.
+///
+/// A client-facing projection must never emit a value the product no longer
+/// offers: the legacy `delivery` profile (and anything unrecognized) reads as
+/// `balanced`. Living beside [`axes_from_session_record`], this is the single
+/// normalization point every projection shares, so none can drift from the
+/// persistence boundary.
+pub(crate) fn canonical_work_profile(raw: &str) -> String {
+    WorkProfile::from_persisted(raw).as_str().to_string()
+}
+
 /// How many catalog titles reach the system prefix.
 ///
 /// Smaller than the old all-active index: the catalog is a discovery aid for
@@ -1199,5 +1210,19 @@ mod task_round_limit_tests {
             Some(DEFAULT_TASK_ROUNDS)
         );
         assert_eq!(goal_continuation_for(None).round_limit(), None);
+    }
+}
+
+#[cfg(test)]
+mod canonical_work_profile_tests {
+    use super::canonical_work_profile;
+
+    #[test]
+    fn a_persisted_delivery_reads_as_balanced() {
+        assert_eq!(canonical_work_profile("delivery"), "balanced");
+        assert_eq!(canonical_work_profile("balanced"), "balanced");
+        assert_eq!(canonical_work_profile("economy"), "economy");
+        // Unknown values fall back to the default, never to a retired value.
+        assert_eq!(canonical_work_profile("nonsense"), "balanced");
     }
 }
