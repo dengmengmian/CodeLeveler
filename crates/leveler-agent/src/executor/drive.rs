@@ -1613,6 +1613,50 @@ impl AgentHarness for Drive<'_> {
                             .find(|child| child.id == task_id)
                     })
             {
+                let child_id = child.id.clone();
+                // `wait_task` waits on a child the way it waits on a background
+                // task: up to its bounded interval, answering as soon as the
+                // child ends. An instant answer turned every poll into a model
+                // round (MA4-C: 45 and 82 polls ran parents into the round
+                // limit while their children worked).
+                if call.name == "wait_task" && !child.handle.is_finished() {
+                    let deadline = tokio::time::Instant::now()
+                        + leveler_tools::tools::wait_interval(
+                            call.arguments
+                                .get("timeout_seconds")
+                                .and_then(|v| v.as_u64()),
+                        );
+                    loop {
+                        let running = self
+                            .background_children
+                            .children
+                            .iter()
+                            .find(|c| c.id == child_id)
+                            .is_some_and(|c| !c.handle.is_finished());
+                        if !running
+                            || cancellation.is_cancelled()
+                            || tokio::time::Instant::now() >= deadline
+                        {
+                            break;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {}
+                            Some(event) = self.bg_progress_rx.recv() => self.forward_child_event(rt, event).await?,
+                            _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(200))) => {}
+                        }
+                    }
+                }
+                let Some(child) = self
+                    .background_children
+                    .children
+                    .iter()
+                    .find(|c| c.id == child_id)
+                else {
+                    unreachable!(
+                        "a child is only removed at settlement, never inside a tool batch"
+                    );
+                };
                 let state = if child.handle.is_finished() {
                     "It has finished; its result is delivered to you automatically before \
                      your next step."

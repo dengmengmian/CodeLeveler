@@ -46,7 +46,7 @@ pub use read_symbol::ReadSymbolTool;
 pub use run_command::RunCommandTool;
 pub use shell_command::ShellCommandTool;
 pub use skills::LoadSkillTool;
-pub use task_control::{GetTaskTool, KillTaskTool, WaitTaskTool};
+pub use task_control::{GetTaskTool, KillTaskTool, WaitTaskTool, wait_interval};
 pub use view_image::ViewImageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;

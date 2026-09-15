@@ -6739,6 +6739,9 @@ struct TaskToolsOnChildRuntime {
     /// Release the child before issuing the task-tool calls (and give it time
     /// to finish), so it has ended but not yet been settled.
     finish_first: bool,
+    /// Release the child a moment AFTER issuing the task-tool calls, so it
+    /// ends while the parent is inside `wait_task`.
+    release_during_wait: bool,
     release: Arc<tokio::sync::Notify>,
     parent_calls: std::sync::atomic::AtomicUsize,
 }
@@ -6788,6 +6791,13 @@ impl ModelRuntime for TaskToolsOnChildRuntime {
                     self.release.notify_one();
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
+                if self.release_during_wait {
+                    let release = self.release.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        release.notify_one();
+                    });
+                }
                 let id =
                     child_id_from_ack(&request.messages).expect("the spawn ack names the child");
                 let args = serde_json::json!({"task_id": id, "timeout_seconds": 5});
@@ -6827,6 +6837,7 @@ impl ModelRuntime for TaskToolsOnChildRuntime {
 async fn task_tools_on_child(
     tag: &str,
     finish_first: bool,
+    release_during_wait: bool,
 ) -> (Vec<(String, bool)>, Vec<AgentEvent>) {
     let dir = tmp(tag, 93);
     let workspace = Workspace::new(&dir).unwrap();
@@ -6839,6 +6850,7 @@ async fn task_tools_on_child(
     Executor::new(
         Arc::new(TaskToolsOnChildRuntime {
             finish_first,
+            release_during_wait,
             release: Arc::new(tokio::sync::Notify::new()),
             parent_calls: std::sync::atomic::AtomicUsize::new(0),
         }),
@@ -6869,7 +6881,7 @@ async fn task_tools_on_child(
 /// announced call is closed on both channels.
 #[tokio::test]
 async fn task_tools_naming_a_running_child_say_what_the_id_is() {
-    let (answers, events) = task_tools_on_child("task-tools-running", false).await;
+    let (answers, events) = task_tools_on_child("task-tools-running", false, false).await;
     for (content, is_error) in &answers {
         assert!(!is_error, "an informational answer: {content}");
         assert!(!content.contains("unknown task"), "{content}");
@@ -6898,11 +6910,32 @@ async fn task_tools_naming_a_running_child_say_what_the_id_is() {
 /// "still running": the answer says its result is on its way.
 #[tokio::test]
 async fn task_tools_naming_a_finished_unsettled_child_do_not_call_it_running() {
-    let (answers, _) = task_tools_on_child("task-tools-finished", true).await;
+    let (answers, _) = task_tools_on_child("task-tools-finished", true, false).await;
     for (content, _) in &answers {
         assert!(!content.contains("still running"), "{content}");
         assert!(content.contains("finished"), "{content}");
     }
+}
+
+/// MA4-C: a parent that polls a child with `wait_task` got an instant "still
+/// running" and burned one model round per poll (45 and 82 polls in two
+/// round-limited runs). `wait_task` on a child waits like it does on a
+/// background task — up to its bounded interval — and answers as soon as the
+/// child ends.
+#[tokio::test]
+async fn wait_task_on_a_child_waits_for_it_to_end() {
+    let started = std::time::Instant::now();
+    let (answers, _) = task_tools_on_child("task-tools-wait", false, true).await;
+    let (wait, _) = &answers[0];
+    assert!(
+        wait.contains("finished"),
+        "wait_task waited for the child: {wait}"
+    );
+    assert!(!wait.contains("still running"), "{wait}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it returned when the child ended, not at the 5 s timeout"
+    );
 }
 
 /// The spawn result of a one-spawn round with these arguments, and whether a

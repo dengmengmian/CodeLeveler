@@ -39,7 +39,9 @@ struct WaitInput {
     timeout_seconds: Option<u64>,
 }
 
-fn wait_interval(timeout_seconds: Option<u64>) -> Duration {
+/// The bounded interval `wait_task` waits for, shared with a sub-agent wait so
+/// both kinds of task id wait the same way.
+pub fn wait_interval(timeout_seconds: Option<u64>) -> Duration {
     Duration::from_secs(
         timeout_seconds
             .unwrap_or(WAIT_DEFAULT_SECS)
