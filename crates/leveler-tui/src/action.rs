@@ -17,9 +17,41 @@ use crate::state::PendingInteraction;
 #[derive(Debug, Clone)]
 pub enum EffectCompletion {
     CommandDelivered,
-    CommandFailed {
+    /// The runtime answered with an error: it is reachable, and it did not
+    /// accept the command.
+    CommandRejected {
+        message: String,
         /// Best-effort authoritative state used to roll back optimistic UI.
         snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// No answer: the command may or may not have run.
+    CommandUncertain {
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime admitted this turn input (now, or on an earlier attempt).
+    SubmissionDelivered {
+        command_id: CommandId,
+        /// Present when the answer came after a reconnect, so the view resyncs
+        /// with whatever the runtime did meanwhile.
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime answered that it did not run this turn input.
+    SubmissionRejected {
+        command_id: CommandId,
+        message: String,
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime proved this turn input's outcome unrecoverable: admitted,
+    /// but the boot dispatching it ended before recording what happened. Final:
+    /// never re-delivered, and not a failure, a completion, or "not delivered".
+    SubmissionUnresolvable {
+        command_id: CommandId,
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The first attempt got no answer; the same envelope is being re-delivered
+    /// until the runtime gives one.
+    SubmissionUnconfirmed {
+        command_id: CommandId,
     },
     InteractionDelivered {
         key: String,
@@ -79,6 +111,12 @@ pub enum Action {
 pub enum Effect {
     /// Send a command to the runtime.
     Send(ClientCommand),
+    /// Deliver a turn input under the id the reducer minted for it and keeps
+    /// in [`crate::state::AppState::pending_submissions`]. Retries reuse the id.
+    Submit {
+        command: ClientCommand,
+        command_id: CommandId,
+    },
     /// Send an approval/clarification answer with a stable [`CommandId`] for
     /// at-least-once retries. On transport failure the event loop confirms
     /// delivery via snapshot before restoring `restore`.

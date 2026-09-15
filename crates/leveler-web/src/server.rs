@@ -389,6 +389,8 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             ClientError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             ClientError::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ClientError::OutcomeUnknown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ClientError::Unresolvable(_) => StatusCode::CONFLICT,
         };
         let body = serde_json::json!({ "error": self.0.to_string() });
         (status, Json(body)).into_response()

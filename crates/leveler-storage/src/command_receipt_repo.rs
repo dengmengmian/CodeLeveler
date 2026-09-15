@@ -5,7 +5,7 @@
 //! or surfaced, never silently swallowed. Durable, so the lifecycle survives a
 //! restart rather than being forgotten by an in-memory set.
 
-use leveler_core::{CommandId, SessionId, Timestamp};
+use leveler_core::{BootId, CommandId, SessionId, Timestamp};
 
 use crate::database::{Database, StorageError};
 
@@ -24,6 +24,20 @@ pub enum Admission {
     Uncertain,
     /// The id was already bound to another session or payload.
     Conflict,
+    /// Admitted, but the boot responsible for its dispatch ended before
+    /// settling it: the outcome cannot be recovered. Never dispatched again.
+    Unresolvable,
+}
+
+/// Who, if anyone, may still settle a receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchingBoot {
+    /// The receipt is not `dispatching` (settled, or absent).
+    NotDispatching,
+    /// `dispatching`, written before admissions recorded their boot.
+    Unknown,
+    /// `dispatching`, admitted by this boot.
+    Boot(BootId),
 }
 
 /// Read/write access to the `command_receipts` table.
@@ -61,6 +75,7 @@ impl<'a> CommandReceiptRepository<'a> {
         }
         Ok(match status.as_str() {
             "completed" => Some(Admission::AlreadyCompleted),
+            "unresolvable" => Some(Admission::Unresolvable),
             "dispatching" => Some(Admission::Uncertain),
             _ => None,
         })
@@ -75,20 +90,23 @@ impl<'a> CommandReceiptRepository<'a> {
         session_id: &SessionId,
         command_fingerprint: &str,
         issued_at: &str,
+        admitted_by_boot: &BootId,
         now: Timestamp,
     ) -> Result<Admission, StorageError> {
         // First delivery: insert as 'dispatching'. rows_affected == 1 means we
         // won the PRIMARY KEY, so this id had not been seen before.
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO command_receipts \
-             (command_id, session_id, command_fingerprint, issued_at, admitted_at, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching')",
+             (command_id, session_id, command_fingerprint, issued_at, admitted_at, status, \
+              admitted_by_boot) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching', ?6)",
         )
         .bind(command_id.as_str())
         .bind(session_id.as_str())
         .bind(command_fingerprint)
         .bind(issued_at)
         .bind(now.to_rfc3339())
+        .bind(admitted_by_boot.as_str())
         .execute(self.db.pool())
         .await?;
         if inserted.rows_affected() == 1 {
@@ -111,16 +129,19 @@ impl<'a> CommandReceiptRepository<'a> {
         }
         match status.as_str() {
             "completed" => Ok(Admission::AlreadyCompleted),
+            "unresolvable" => Ok(Admission::Unresolvable),
             "failed" => {
                 // The prior attempt errored before doing anything — safe to
                 // dispatch again. Atomically claim it: concurrent redeliveries
                 // may both have observed `failed`, but only one may transition
                 // failed -> dispatching and receive Dispatch.
+                // The claimant is the boot that will dispatch it now.
                 let claimed = sqlx::query(
-                    "UPDATE command_receipts SET status = 'dispatching' \
+                    "UPDATE command_receipts SET status = 'dispatching', admitted_by_boot = ?2 \
                      WHERE command_id = ?1 AND status = 'failed'",
                 )
                 .bind(command_id.as_str())
+                .bind(admitted_by_boot.as_str())
                 .execute(self.db.pool())
                 .await?;
                 if claimed.rows_affected() == 1 {
@@ -133,6 +154,40 @@ impl<'a> CommandReceiptRepository<'a> {
             // in flight or died mid-dispatch: uncertain.
             _ => Ok(Admission::Uncertain),
         }
+    }
+
+    /// The boot that may still settle a `dispatching` receipt.
+    pub async fn dispatching_boot(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<DispatchingBoot, StorageError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, admitted_by_boot FROM command_receipts WHERE command_id = ?1",
+        )
+        .bind(command_id.as_str())
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(match row {
+            Some((status, boot)) if status == "dispatching" => match boot {
+                Some(boot) => DispatchingBoot::Boot(BootId::new(boot)),
+                None => DispatchingBoot::Unknown,
+            },
+            _ => DispatchingBoot::NotDispatching,
+        })
+    }
+
+    /// Settle a `dispatching` receipt as unresolvable. Only for a caller holding
+    /// proof that no execution path can still settle it. Returns `false` when
+    /// the receipt was no longer `dispatching` (it settled first).
+    pub async fn mark_unresolvable(&self, command_id: &CommandId) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE command_receipts SET status = 'unresolvable' \
+             WHERE command_id = ?1 AND status = 'dispatching'",
+        )
+        .bind(command_id.as_str())
+        .execute(self.db.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Mark a dispatched command as successfully completed — a later re-delivery
@@ -169,6 +224,7 @@ impl<'a> CommandReceiptRepository<'a> {
 mod tests {
     use super::*;
     use crate::{SessionRecord, SessionRepository};
+    use leveler_core::BootId;
 
     async fn seed_session(db: &Database) -> SessionId {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
@@ -183,17 +239,31 @@ mod tests {
         let repo = CommandReceiptRepository::new(&db);
         let id = CommandId::new("cmd-1");
         assert_eq!(
-            repo.admit(&id, &session, "fp", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Dispatch,
             "first delivery dispatches"
         );
         repo.mark_completed(&id).await.unwrap();
         assert_eq!(
-            repo.admit(&id, &session, "fp", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::AlreadyCompleted,
             "a re-delivery of a completed command is a duplicate"
         );
@@ -208,16 +278,30 @@ mod tests {
         let repo = CommandReceiptRepository::new(&db);
         let id = CommandId::new("cmd-2");
         assert_eq!(
-            repo.admit(&id, &session, "fp", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Dispatch
         );
         repo.mark_failed(&id).await.unwrap();
         assert_eq!(
-            repo.admit(&id, &session, "fp", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Dispatch,
             "a failed dispatch is retryable, not a duplicate"
         );
@@ -232,7 +316,14 @@ mod tests {
         let id = CommandId::new("cmd-3");
         assert_eq!(
             CommandReceiptRepository::new(&db)
-                .admit(&id, &session, "fp", "t", leveler_core::now())
+                .admit(
+                    &id,
+                    &session,
+                    "fp",
+                    "t",
+                    &BootId::new("boot"),
+                    leveler_core::now()
+                )
                 .await
                 .unwrap(),
             Admission::Dispatch
@@ -241,7 +332,14 @@ mod tests {
         // restart) re-admits.
         assert_eq!(
             CommandReceiptRepository::new(&db)
-                .admit(&id, &session, "fp", "t", leveler_core::now())
+                .admit(
+                    &id,
+                    &session,
+                    "fp",
+                    "t",
+                    &BootId::new("boot"),
+                    leveler_core::now()
+                )
                 .await
                 .unwrap(),
             Admission::Uncertain,
@@ -255,7 +353,14 @@ mod tests {
         let session = seed_session(&db).await;
         let id = CommandId::new("cmd-4");
         let first = CommandReceiptRepository::new(&db)
-            .admit(&id, &session, "fp", "t", leveler_core::now())
+            .admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now(),
+            )
             .await
             .unwrap();
         assert_eq!(first, Admission::Dispatch);
@@ -266,7 +371,14 @@ mod tests {
         // A new handle (restart) still sees it completed.
         assert_eq!(
             CommandReceiptRepository::new(&db)
-                .admit(&id, &session, "fp", "t", leveler_core::now())
+                .admit(
+                    &id,
+                    &session,
+                    "fp",
+                    "t",
+                    &BootId::new("boot"),
+                    leveler_core::now()
+                )
                 .await
                 .unwrap(),
             Admission::AlreadyCompleted
@@ -280,18 +392,26 @@ mod tests {
         let id = CommandId::new("cmd-race");
         let repo = CommandReceiptRepository::new(&db);
         assert_eq!(
-            repo.admit(&id, &session, "fp", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Dispatch
         );
         repo.mark_failed(&id).await.unwrap();
 
         let retry_a = CommandReceiptRepository::new(&db);
         let retry_b = CommandReceiptRepository::new(&db);
+        let boot = BootId::new("boot");
         let (a, b) = tokio::join!(
-            retry_a.admit(&id, &session, "fp", "t", leveler_core::now()),
-            retry_b.admit(&id, &session, "fp", "t", leveler_core::now()),
+            retry_a.admit(&id, &session, "fp", "t", &boot, leveler_core::now()),
+            retry_b.admit(&id, &session, "fp", "t", &boot, leveler_core::now()),
         );
         let admissions = [a.unwrap(), b.unwrap()];
         assert_eq!(
@@ -320,25 +440,184 @@ mod tests {
         let id = CommandId::new("cmd-bound");
         let repo = CommandReceiptRepository::new(&db);
         assert_eq!(
-            repo.admit(&id, &session_a, "fp-a", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session_a,
+                "fp-a",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Dispatch
         );
         repo.mark_completed(&id).await.unwrap();
         assert_eq!(
-            repo.admit(&id, &session_b, "fp-a", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session_b,
+                "fp-a",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Conflict,
             "a command id cannot move to another session"
         );
         assert_eq!(
-            repo.admit(&id, &session_a, "fp-b", "t", leveler_core::now())
-                .await
-                .unwrap(),
+            repo.admit(
+                &id,
+                &session_a,
+                "fp-b",
+                "t",
+                &BootId::new("boot"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
             Admission::Conflict,
             "a command id cannot be reused for another payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatching_receipt_names_the_boot_that_admitted_it() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = seed_session(&db).await;
+        let repo = CommandReceiptRepository::new(&db);
+        let id = CommandId::new("cmd-boot");
+        let boot = BootId::new("boot-a");
+        repo.admit(&id, &session, "fp", "t", &boot, leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.dispatching_boot(&id).await.unwrap(),
+            DispatchingBoot::Boot(boot)
+        );
+        repo.mark_completed(&id).await.unwrap();
+        assert_eq!(
+            repo.dispatching_boot(&id).await.unwrap(),
+            DispatchingBoot::NotDispatching
+        );
+    }
+
+    /// A retry that reclaims a failed receipt is dispatched by the boot that
+    /// reclaims it; the receipt must name that boot, not the one that failed.
+    #[tokio::test]
+    async fn a_reclaimed_receipt_names_the_boot_that_reclaimed_it() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = seed_session(&db).await;
+        let repo = CommandReceiptRepository::new(&db);
+        let id = CommandId::new("cmd-reclaimed");
+        repo.admit(
+            &id,
+            &session,
+            "fp",
+            "t",
+            &BootId::new("boot-old"),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        repo.mark_failed(&id).await.unwrap();
+        assert_eq!(
+            repo.admit(
+                &id,
+                &session,
+                "fp",
+                "t",
+                &BootId::new("boot-new"),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
+            Admission::Dispatch
+        );
+        assert_eq!(
+            repo.dispatching_boot(&id).await.unwrap(),
+            DispatchingBoot::Boot(BootId::new("boot-new"))
+        );
+    }
+
+    /// Rows written before boots were recorded cannot be attributed to any
+    /// boot, so nothing may be proven about them.
+    #[tokio::test]
+    async fn a_legacy_dispatching_receipt_has_no_known_boot() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = seed_session(&db).await;
+        sqlx::query(
+            "INSERT INTO command_receipts \
+             (command_id, session_id, command_fingerprint, issued_at, admitted_at, status) \
+             VALUES ('cmd-legacy', ?1, 'fp', 't', 't', 'dispatching')",
+        )
+        .bind(session.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            CommandReceiptRepository::new(&db)
+                .dispatching_boot(&CommandId::new("cmd-legacy"))
+                .await
+                .unwrap(),
+            DispatchingBoot::Unknown
+        );
+    }
+
+    /// `unresolvable` is terminal: every later delivery is answered from it,
+    /// and nothing moves it back to dispatching or on to completed.
+    #[tokio::test]
+    async fn an_unresolvable_receipt_is_terminal() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = seed_session(&db).await;
+        let repo = CommandReceiptRepository::new(&db);
+        let id = CommandId::new("cmd-orphan");
+        let boot = BootId::new("boot-gone");
+        repo.admit(&id, &session, "fp", "t", &boot, leveler_core::now())
+            .await
+            .unwrap();
+
+        assert!(repo.mark_unresolvable(&id).await.unwrap());
+        assert_eq!(
+            repo.classify_terminal(&id, &session, "fp").await.unwrap(),
+            Some(Admission::Unresolvable)
+        );
+        assert_eq!(
+            repo.admit(&id, &session, "fp", "t", &boot, leveler_core::now())
+                .await
+                .unwrap(),
+            Admission::Unresolvable
+        );
+        assert!(repo.mark_completed(&id).await.is_err());
+        assert!(
+            !repo.mark_unresolvable(&id).await.unwrap(),
+            "only a dispatching receipt becomes unresolvable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_receipt_never_becomes_unresolvable() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = seed_session(&db).await;
+        let repo = CommandReceiptRepository::new(&db);
+        let id = CommandId::new("cmd-done");
+        repo.admit(
+            &id,
+            &session,
+            "fp",
+            "t",
+            &BootId::new("b"),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        repo.mark_completed(&id).await.unwrap();
+        assert!(!repo.mark_unresolvable(&id).await.unwrap());
+        assert_eq!(
+            repo.classify_terminal(&id, &session, "fp").await.unwrap(),
+            Some(Admission::AlreadyCompleted)
         );
     }
 
@@ -348,9 +627,16 @@ mod tests {
         let session = seed_session(&db).await;
         let id = CommandId::new("cmd-terminal");
         let repo = CommandReceiptRepository::new(&db);
-        repo.admit(&id, &session, "fp", "t", leveler_core::now())
-            .await
-            .unwrap();
+        repo.admit(
+            &id,
+            &session,
+            "fp",
+            "t",
+            &BootId::new("boot"),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
         repo.mark_completed(&id).await.unwrap();
         assert!(
             matches!(

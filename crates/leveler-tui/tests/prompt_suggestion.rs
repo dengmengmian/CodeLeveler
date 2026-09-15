@@ -407,7 +407,7 @@ fn b2_enter_after_tab_submits_exactly_once() {
         .filter(|effect| {
             matches!(
                 effect,
-                Effect::Send(ClientCommand::SubmitMessage { content, .. }) if content == NEXT_STEP
+                Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. } if content == NEXT_STEP
             )
         })
         .collect();
@@ -910,7 +910,7 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
         .filter(|effect| {
             matches!(
                 effect,
-                Effect::Send(ClientCommand::SubmitMessage { content, .. }) if content == NEXT_STEP
+                Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. } if content == NEXT_STEP
             )
         })
         .collect();

@@ -1138,6 +1138,8 @@ impl From<ClientError> for EndpointError {
         let status = match &error {
             ClientError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             ClientError::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ClientError::OutcomeUnknown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ClientError::Unresolvable(_) => StatusCode::CONFLICT,
         };
         Self::new(status, error.to_string())
     }

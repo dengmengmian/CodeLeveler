@@ -2289,6 +2289,7 @@ name = "leveler-tui"
 version = "0.2.0-beta.2"
 dependencies = [
  "arboard",
+ "async-trait",
  "chrono",
  "crossterm",
  "futures",

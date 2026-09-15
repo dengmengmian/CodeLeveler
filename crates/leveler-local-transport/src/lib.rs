@@ -302,6 +302,13 @@ enum WireResponse {
 struct WireError {
     message: String,
     session_id: Option<SessionId>,
+    /// [`ClientError::OutcomeUnknown`]: the runtime gave no answer. Absent
+    /// from daemons that predate it, which decode as a plain runtime error.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outcome_unknown: bool,
+    /// [`ClientError::Unresolvable`]. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unresolvable: bool,
 }
 
 #[cfg(unix)]
@@ -311,10 +318,26 @@ impl From<ClientError> for WireError {
             ClientError::SessionNotFound(session_id) => Self {
                 message: format!("session not found: {session_id}"),
                 session_id: Some(session_id),
+                outcome_unknown: false,
+                unresolvable: false,
             },
             ClientError::Runtime(message) => Self {
                 message,
                 session_id: None,
+                outcome_unknown: false,
+                unresolvable: false,
+            },
+            ClientError::OutcomeUnknown(message) => Self {
+                message,
+                session_id: None,
+                outcome_unknown: true,
+                unresolvable: false,
+            },
+            ClientError::Unresolvable(message) => Self {
+                message,
+                session_id: None,
+                outcome_unknown: false,
+                unresolvable: true,
             },
         }
     }
@@ -325,6 +348,8 @@ impl WireError {
     fn into_client_error(self) -> ClientError {
         match self.session_id {
             Some(session_id) => ClientError::SessionNotFound(session_id),
+            None if self.outcome_unknown => ClientError::OutcomeUnknown(self.message),
+            None if self.unresolvable => ClientError::Unresolvable(self.message),
             None => ClientError::Runtime(self.message),
         }
     }
@@ -1273,8 +1298,10 @@ mod unix {
         ClientError::Runtime(format!("unexpected local runtime response: {response:?}"))
     }
 
+    /// A request that did not come back with a response carries no runtime
+    /// answer — whatever the first bytes did on the other side is unknown.
     fn transport_client_error(error: TransportError) -> ClientError {
-        ClientError::Runtime(error.to_string())
+        ClientError::OutcomeUnknown(error.to_string())
     }
 
     // ---- Loopback TCP daemon with bearer-token auth ----------------------
@@ -1312,6 +1339,8 @@ mod unix {
                 WireResponse::Error(WireError {
                     message: "authentication failed".to_string(),
                     session_id: None,
+                    outcome_unknown: false,
+                    unresolvable: false,
                 }),
             )
             .await?;
@@ -2109,6 +2138,70 @@ mod tests {
             "exactly one logical delivery, with the ORIGINAL command id"
         );
         reviver.shutdown.cancel();
+    }
+
+    /// A delivery the transport could not complete has no answer. It must reach
+    /// the caller as the typed outcome-unknown, never as a runtime rejection a
+    /// client would read as "not delivered".
+    #[tokio::test]
+    async fn a_delivery_the_transport_could_not_complete_is_outcome_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        shutdown.cancel();
+        let _ = serve.await;
+
+        let error = client
+            .deliver(leveler_client_protocol::CommandEnvelope {
+                command_id: leveler_client_protocol::CommandId::new("cmd-away"),
+                session_id: SessionId::new("s1"),
+                expected_version: None,
+                issued_at: "2026-09-15T00:00:00Z".to_string(),
+                command: ClientCommand::SubmitMessage {
+                    session_id: SessionId::new("s1"),
+                    content: "runtime is away".to_string(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect_err("nobody is listening");
+        assert!(
+            matches!(error, ClientError::OutcomeUnknown(_)),
+            "a transport failure is no answer: {error:?}"
+        );
+    }
+
+    /// The daemon's own "no answer" (a receipt stuck mid-dispatch) crosses the
+    /// wire typed; a daemon that predates the flag still decodes as before.
+    #[test]
+    fn outcome_unknown_survives_the_wire_error_frame() {
+        let wire = WireError::from(ClientError::OutcomeUnknown("mid-dispatch".to_string()));
+        let json = serde_json::to_string(&wire).unwrap();
+        let back: WireError = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.into_client_error(),
+            ClientError::OutcomeUnknown(message) if message == "mid-dispatch"
+        ));
+
+        let wire = WireError::from(ClientError::Unresolvable("boot ended".to_string()));
+        let back: WireError = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        assert!(matches!(
+            back.into_client_error(),
+            ClientError::Unresolvable(message) if message == "boot ended"
+        ));
+
+        let legacy: WireError =
+            serde_json::from_str(r#"{"message":"busy","session_id":null}"#).unwrap();
+        assert!(matches!(
+            legacy.into_client_error(),
+            ClientError::Runtime(_)
+        ));
     }
 
     /// Raw Send has no idempotency key: after an uncertain failure it fails

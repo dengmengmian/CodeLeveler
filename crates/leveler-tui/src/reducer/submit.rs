@@ -1,8 +1,8 @@
-use leveler_client_protocol::{ClientCommand, NotificationLevel, PermissionProfile};
+use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel, PermissionProfile};
 
 use crate::action::Effect;
 use crate::screen::{BusyPolicy, Screen};
-use crate::state::{AppState, Notification};
+use crate::state::{AppState, Notification, PendingSubmission};
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
@@ -90,6 +90,9 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         // finished. The runtime injects it at the top of the next round, and
         // falls back to an ordinary submission if the turn ended in the
         // meantime — so nothing typed is ever lost.
+        if turn_input_held(state) {
+            return Vec::new();
+        }
         let text = state.composer.take().trim().to_string();
         if text.is_empty() {
             return Vec::new();
@@ -100,10 +103,11 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             level: NotificationLevel::Info,
             message: state.t().steering_sent.to_string(),
         });
-        return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+        let command = ClientCommand::SteerCurrentTurn {
             session_id: state.session_id.clone(),
             content: text,
-        })];
+        };
+        return submit_turn_input(state, command);
     }
     // Vision gate: block sending images to a non-vision model until the user
     // chooses how to proceed (spec §42). Handled before the request is built.
@@ -124,6 +128,9 @@ fn looks_like_unknown_slash_command(name: &str) -> bool {
 /// Build and send the current composer message with its attachments, clearing
 /// both. Assumes vision gating has already passed.
 pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
+    if turn_input_held(state) {
+        return Vec::new();
+    }
     let content = state.composer.take();
     let attachments = std::mem::take(&mut state.pending_attachments);
     state.transcript.push_user_if_new(content.clone());
@@ -135,11 +142,81 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     // Runtime maps collaboration=goal SubmitMessage → goal turn profile.
     state.goal_mode_active =
         state.collaboration.eq_ignore_ascii_case("goal") && attachments.is_empty();
-    vec![Effect::Send(ClientCommand::SubmitMessage {
+    let command = ClientCommand::SubmitMessage {
         session_id: state.session_id.clone(),
         content,
         attachments,
-    })]
+    };
+    submit_turn_input(state, command)
+}
+
+/// Refuse a new turn input while an earlier one to this session has no answer
+/// from the runtime (it may already be running), or while nothing can reach
+/// the runtime at all. The caller leaves the typed text in place.
+fn turn_input_held(state: &mut AppState) -> bool {
+    let message = if !state.runtime_connected {
+        state.t().commands_disabled_disconnected
+    } else if state
+        .pending_submissions
+        .iter()
+        .any(|p| p.unconfirmed && p.command.session_id() == Some(&state.session_id))
+    {
+        state.t().submission_held
+    } else {
+        return false;
+    };
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: message.to_string(),
+    });
+    true
+}
+
+/// A turn input gets its id here, where the logical command is created — not
+/// per transport attempt — and the client keeps it until the runtime answers.
+fn submit_turn_input(state: &mut AppState, command: ClientCommand) -> Vec<Effect> {
+    let command_id = CommandId::generate();
+    state.pending_submissions.push(PendingSubmission {
+        command_id: command_id.clone(),
+        command: command.clone(),
+        unconfirmed: false,
+    });
+    vec![Effect::Submit {
+        command,
+        command_id,
+    }]
+}
+
+/// The text a turn input showed in the conversation when it was sent.
+pub(super) fn turn_input_text(command: &ClientCommand) -> Option<&str> {
+    match command {
+        ClientCommand::SubmitMessage { content, .. }
+        | ClientCommand::SteerCurrentTurn { content, .. }
+        | ClientCommand::RunGoal { content, .. } => Some(content),
+        _ => None,
+    }
+}
+
+/// Put a turn input the runtime did not run back where the user typed it,
+/// ahead of anything typed since.
+pub(super) fn restore_turn_input(state: &mut AppState, command: ClientCommand) {
+    let (text, attachments) = match command {
+        ClientCommand::SubmitMessage {
+            content,
+            attachments,
+            ..
+        } => (content, attachments),
+        ClientCommand::SteerCurrentTurn { content, .. } => (content, Vec::new()),
+        ClientCommand::RunGoal { content, .. } => (format!("/goal {content}"), Vec::new()),
+        _ => return,
+    };
+    let draft = state.composer.canonical_text();
+    if draft.trim().is_empty() {
+        state.composer.replace(text);
+    } else {
+        state.composer.replace(format!("{text}\n{draft}"));
+    }
+    state.pending_attachments.splice(0..0, attachments);
 }
 
 /// Complete a partial slash command to the highlighted match (Tab/Enter, §29).
@@ -743,6 +820,11 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "clear" | "cancel" | "stop" => clear_goal(state),
         _ => {
+            if turn_input_held(state) {
+                // The slash parser already took the composer; hand it back.
+                state.composer.replace(format!("/goal {rest}"));
+                return Vec::new();
+            }
             if state.is_busy() {
                 // Steer the running turn, same as an ordinary message: the
                 // runtime falls back to a fresh submission if it already ended.
@@ -752,18 +834,20 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
                     level: NotificationLevel::Info,
                     message: state.t().steering_sent.to_string(),
                 });
-                return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+                let command = ClientCommand::SteerCurrentTurn {
                     session_id: state.session_id.clone(),
                     content,
-                })];
+                };
+                return submit_turn_input(state, command);
             }
             state.transcript.push_user_if_new(rest.clone());
             start_turn(state);
             state.goal_mode_active = true;
-            vec![Effect::Send(ClientCommand::RunGoal {
+            let command = ClientCommand::RunGoal {
                 session_id: state.session_id.clone(),
                 content: rest,
-            })]
+            };
+            submit_turn_input(state, command)
         }
     }
 }

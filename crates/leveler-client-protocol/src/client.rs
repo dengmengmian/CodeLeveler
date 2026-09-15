@@ -20,6 +20,18 @@ pub enum ClientError {
     /// The runtime rejected or failed to accept the command.
     #[error("runtime error: {0}")]
     Runtime(String),
+    /// No authoritative answer: the transport failed mid-request, or the
+    /// runtime holds this command id in a dispatch that never settled. Nothing
+    /// may be concluded — not delivered, not rejected. Only a retry carrying
+    /// the SAME command id is safe; the runtime's receipt answers it.
+    #[error("outcome unknown: {0}")]
+    OutcomeUnknown(String),
+    /// An authoritative answer that there is no answer: the runtime durably
+    /// admitted this command, but the boot handling its dispatch ended before
+    /// settling it, so its outcome cannot be recovered. It is not failed, not
+    /// completed, not undelivered — and it is never dispatched again.
+    #[error("outcome unresolvable: {0}")]
+    Unresolvable(String),
 }
 
 /// The seam between UI clients and the CodeLeveler runtime.

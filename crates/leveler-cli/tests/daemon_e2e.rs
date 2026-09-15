@@ -102,6 +102,21 @@ fn spawn_serve_with_after_turn_started_barrier(
     ready: &Path,
     barrier: &Path,
 ) -> Child {
+    spawn_serve_with_barrier(
+        env,
+        ready,
+        "LEVELER_TEST_AFTER_TURN_STARTED_BARRIER",
+        barrier,
+    )
+}
+
+#[cfg(feature = "test-crash-barrier")]
+fn spawn_serve_with_barrier(
+    env: &TestEnv,
+    ready: &Path,
+    barrier_var: &str,
+    barrier: &Path,
+) -> Child {
     Command::new(env!("CARGO_BIN_EXE_leveler"))
         .arg("--repo")
         .arg(&env.repo)
@@ -110,7 +125,7 @@ fn spawn_serve_with_after_turn_started_barrier(
         .arg(ready)
         .env("LEVELER_HOME", &env.home)
         .env("LEVELER_CONFIG_DIR", &env.config_dir)
-        .env("LEVELER_TEST_AFTER_TURN_STARTED_BARRIER", barrier)
+        .env(barrier_var, barrier)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -552,6 +567,112 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once() {
         1,
         "repeated restart must not duplicate recovery"
     );
+    stop_daemon(&mut daemon);
+}
+
+/// The dispatching crash window, with a real process and a real SIGKILL: the
+/// daemon admits a submission and dispatches it, then dies before recording
+/// that. Its boot lease dies with it. A restarted daemon must answer the same
+/// command id — over the socket — as unresolvable, every time, and never run it
+/// a second time.
+#[cfg(feature = "test-crash-barrier")]
+#[tokio::test]
+async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready-receipt-1.json");
+    let barrier = env.home.join(format!(
+        ".test-crash-barrier-{}",
+        leveler_core::new_uuid_string()
+    ));
+    let mut daemon = spawn_serve_with_barrier(
+        &env,
+        &ready1,
+        "LEVELER_TEST_BEFORE_RECEIPT_SETTLED_BARRIER",
+        &barrier,
+    );
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "receipt crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let envelope = leveler_client_protocol::CommandEnvelope {
+        command_id: leveler_client_protocol::CommandId::new("cmd-sigkill-receipt"),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: "2026-09-15T00:00:00Z".to_string(),
+        command: ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "RECEIPT_CRASH_MARKER".to_string(),
+            attachments: vec![],
+        },
+    };
+    let first_client = std::sync::Arc::new(client);
+    let in_flight = {
+        let first_client = first_client.clone();
+        let envelope = envelope.clone();
+        tokio::spawn(async move { first_client.deliver(envelope).await })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reached the barrier before settling the receipt"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited before the barrier"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    daemon
+        .kill()
+        .expect("SIGKILL with the receipt still dispatching");
+    let _ = daemon.wait();
+    in_flight.abort();
+    drop(first_client);
+
+    let ready2 = env.home.join("ready-receipt-2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    for attempt in 0..2 {
+        let error = client
+            .deliver(envelope.clone())
+            .await
+            .expect_err("the crashed command must not be answered delivered");
+        assert!(
+            matches!(error, leveler_client_protocol::ClientError::Unresolvable(_)),
+            "attempt {attempt}: {error:?}"
+        );
+    }
+
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "the command ran once, before the crash: {turns:?}"
+    );
+    drop(db);
     stop_daemon(&mut daemon);
 }
 

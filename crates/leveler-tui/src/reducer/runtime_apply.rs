@@ -1050,6 +1050,17 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     } else {
         None
     };
+    // A turn input this client sent and the runtime has not answered is work
+    // still owed. A snapshot taken before it landed must not reopen the
+    // composer for a second one — that is how a retry becomes a second turn.
+    if state.status == RuntimeStatus::Idle
+        && state
+            .pending_submissions
+            .iter()
+            .any(|pending| pending.command.session_id() == Some(&session.id))
+    {
+        state.status = RuntimeStatus::Busy;
+    }
 
     // A reconnect snapshot replaces the live control queue. Only in-process
     // waiters are included, so stale requests from interrupted turns are never

@@ -24,6 +24,7 @@ pub mod mcp_config;
 pub mod observability;
 mod parallel;
 mod prompt_bridge;
+pub mod runtime_boot;
 mod runtime_identity;
 mod session;
 mod user_shell;

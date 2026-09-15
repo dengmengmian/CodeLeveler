@@ -23,8 +23,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 
 use leveler_client_protocol::{
-    ClientCommand, CommandEnvelope, CommandId, InteractiveRuntimeClient, NotificationLevel,
-    ProtocolEnvelope, RuntimeEvent, SessionId,
+    ClientCommand, ClientError, CommandEnvelope, CommandId, InteractiveRuntimeClient,
+    NotificationLevel, ProtocolEnvelope, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 
 use crate::action::{Action, Effect, EffectCompletion, UrlOpener, WebLauncher};
@@ -40,6 +40,9 @@ enum DeliveryJob {
         session_id: SessionId,
         command: ClientCommand,
     },
+    Submission {
+        envelope: CommandEnvelope,
+    },
     Interaction {
         session_id: SessionId,
         command: ClientCommand,
@@ -50,6 +53,13 @@ enum DeliveryJob {
 }
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause between re-deliveries of a submission that got no answer. Grows to
+/// the cap so a runtime that stays away costs a connection attempt every few
+/// seconds, not a busy loop.
+const REDELIVERY_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+type DeliveryAttempt = tokio::task::JoinHandle<Result<(), ClientError>>;
 
 /// Default status-line notification TTL (warnings). Info is shorter; errors stick.
 const NOTIFICATION_TTL_WARNING: Duration = Duration::from_secs(8);
@@ -127,24 +137,43 @@ pub async fn run(
                     session_id,
                     command,
                 } => {
-                    if tokio::time::timeout(
-                        DELIVERY_TIMEOUT,
-                        delivery_client.issue(session_id.clone(), command),
-                    )
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-                    {
-                        EffectCompletion::CommandDelivered
-                    } else {
-                        EffectCompletion::CommandFailed {
-                            snapshot: tokio::time::timeout(
-                                DELIVERY_TIMEOUT,
-                                delivery_client.snapshot(&session_id),
-                            )
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .map(Box::new),
+                    let client = Arc::clone(&delivery_client);
+                    let issuer = session_id.clone();
+                    let mut attempt =
+                        tokio::spawn(async move { client.issue(issuer, command).await });
+                    let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
+                        Ok(joined) => delivery_answer(joined),
+                        Err(_) => DeliveryAnswer::None,
+                    };
+                    match answer {
+                        DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
+                        DeliveryAnswer::Rejected(message) => EffectCompletion::CommandRejected {
+                            message,
+                            snapshot: snapshot_within(&delivery_client, &session_id).await,
+                        },
+                        // A fresh id per issue never meets an unsettled receipt;
+                        // were it to, it is still no delivery this client saw.
+                        DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
+                            EffectCompletion::CommandUncertain {
+                                snapshot: snapshot_within(&delivery_client, &session_id).await,
+                            }
+                        }
+                    }
+                }
+                DeliveryJob::Submission { envelope } => {
+                    match first_submission_attempt(&delivery_client, &envelope).await {
+                        Ok(settled) => settled,
+                        Err(in_flight) => {
+                            let command_id = envelope.command_id.clone();
+                            // Settle off the worker: a Cancel must not queue
+                            // behind a runtime that is away.
+                            let client = Arc::clone(&delivery_client);
+                            let completions = delivery_completions.clone();
+                            tokio::spawn(async move {
+                                let settled = settle_submission(client, envelope, in_flight).await;
+                                let _ = completions.send(Action::EffectCompleted(settled));
+                            });
+                            EffectCompletion::SubmissionUnconfirmed { command_id }
                         }
                     }
                 }
@@ -398,6 +427,134 @@ fn session_exit_hint(session_id: &str) -> String {
     )
 }
 
+/// A delivery attempt runs as its own task: a timeout here abandons only the
+/// wait. Dropping the future instead would cancel an in-process runtime midway
+/// through admitting the command and strand its receipt.
+fn spawn_delivery(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    envelope: CommandEnvelope,
+) -> DeliveryAttempt {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        client
+            .deliver_protocol(ProtocolEnvelope::wrap(envelope))
+            .await
+    })
+}
+
+/// What the runtime answered for one delivery attempt.
+enum DeliveryAnswer {
+    Delivered,
+    /// Rejected, in the runtime's own words.
+    Rejected(String),
+    /// Admitted, with an outcome the runtime proves it cannot recover.
+    Unresolvable,
+    /// No answer — nothing may be concluded.
+    None,
+}
+
+fn delivery_answer(
+    joined: Result<Result<(), ClientError>, tokio::task::JoinError>,
+) -> DeliveryAnswer {
+    match joined {
+        Ok(Ok(())) => DeliveryAnswer::Delivered,
+        Ok(Err(ClientError::OutcomeUnknown(_))) | Err(_) => DeliveryAnswer::None,
+        Ok(Err(ClientError::Unresolvable(_))) => DeliveryAnswer::Unresolvable,
+        Ok(Err(ClientError::Runtime(message))) => DeliveryAnswer::Rejected(message),
+        Ok(Err(error)) => DeliveryAnswer::Rejected(error.to_string()),
+    }
+}
+
+async fn snapshot_within(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    session_id: &SessionId,
+) -> Option<Box<UiSessionSnapshot>> {
+    tokio::time::timeout(DELIVERY_TIMEOUT, client.snapshot(session_id))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(Box::new)
+}
+
+/// The first delivery of a submission, bounded by [`DELIVERY_TIMEOUT`]. `Ok` is
+/// the runtime's answer; `Err` means none yet, carrying the attempt that is
+/// still running (if it is) so its answer is not thrown away.
+async fn first_submission_attempt(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    envelope: &CommandEnvelope,
+) -> Result<EffectCompletion, Option<DeliveryAttempt>> {
+    let mut attempt = spawn_delivery(client, envelope.clone());
+    let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
+        Ok(joined) => delivery_answer(joined),
+        Err(_) => return Err(Some(attempt)),
+    };
+    match answer {
+        DeliveryAnswer::Delivered => Ok(EffectCompletion::SubmissionDelivered {
+            command_id: envelope.command_id.clone(),
+            snapshot: None,
+        }),
+        DeliveryAnswer::Rejected(message) => Ok(EffectCompletion::SubmissionRejected {
+            command_id: envelope.command_id.clone(),
+            message,
+            snapshot: snapshot_within(client, &envelope.session_id).await,
+        }),
+        DeliveryAnswer::Unresolvable => Ok(EffectCompletion::SubmissionUnresolvable {
+            command_id: envelope.command_id.clone(),
+            snapshot: snapshot_within(client, &envelope.session_id).await,
+        }),
+        DeliveryAnswer::None => Err(None),
+    }
+}
+
+/// Re-deliver an unanswered submission until the runtime answers it. Every
+/// attempt carries the same envelope — the same command id — so the runtime's
+/// durable receipt turns them into at most one dispatch, and an attempt that
+/// finds the command already admitted is answered "delivered". Only an answer
+/// ends this; no answer is never read as "not delivered".
+async fn settle_submission(
+    client: Arc<dyn InteractiveRuntimeClient>,
+    envelope: CommandEnvelope,
+    mut in_flight: Option<DeliveryAttempt>,
+) -> EffectCompletion {
+    let mut backoff = REDELIVERY_BACKOFF_MIN;
+    loop {
+        let attempt = match in_flight.take() {
+            Some(attempt) => attempt,
+            None => {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(REDELIVERY_BACKOFF_MAX);
+                spawn_delivery(&client, envelope.clone())
+            }
+        };
+        let answer = delivery_answer(attempt.await);
+        if matches!(answer, DeliveryAnswer::None) {
+            continue;
+        }
+        // The answer may come after a reconnect: resync with what the runtime
+        // did meanwhile.
+        let snapshot = snapshot_within(&client, &envelope.session_id).await;
+        let command_id = envelope.command_id;
+        return match answer {
+            DeliveryAnswer::Delivered => EffectCompletion::SubmissionDelivered {
+                command_id,
+                snapshot,
+            },
+            DeliveryAnswer::Rejected(message) => EffectCompletion::SubmissionRejected {
+                command_id,
+                message,
+                snapshot,
+            },
+            // Final: the loop ends here and the old id is never sent again.
+            DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
+                EffectCompletion::SubmissionUnresolvable {
+                    command_id,
+                    snapshot,
+                }
+            }
+        };
+    }
+}
+
 /// Carry out the reducer's effects. A failed send means the runtime side is
 /// gone — surface that instead of pretending the action happened.
 #[allow(clippy::too_many_arguments)]
@@ -420,7 +577,7 @@ fn dispatch_effects(
                 if !state.runtime_connected {
                     state.notification = Some(Notification {
                         level: NotificationLevel::Error,
-                        message: "事件流已断开；命令已禁用，请退出后重新连接".to_string(),
+                        message: state.t().commands_disabled_disconnected.to_string(),
                     });
                     continue;
                 }
@@ -428,6 +585,22 @@ fn dispatch_effects(
                 let _ = delivery_tx.send(DeliveryJob::Command {
                     session_id,
                     command,
+                });
+            }
+            // The reducer only emits this while the runtime is connected, and
+            // already holds the id in `pending_submissions`.
+            Effect::Submit {
+                command,
+                command_id,
+            } => {
+                let _ = delivery_tx.send(DeliveryJob::Submission {
+                    envelope: CommandEnvelope {
+                        command_id,
+                        session_id: state.session_id.clone(),
+                        expected_version: None,
+                        issued_at: leveler_core::now().to_rfc3339(),
+                        command,
+                    },
                 });
             }
             Effect::SendInteraction {
@@ -802,6 +975,147 @@ mod tests {
                 reasoning_effort: None,
             },
         )
+    }
+
+    /// A runtime whose delivery answers are scripted, recording the id every
+    /// attempt carried.
+    struct ScriptedRuntime {
+        answers: std::sync::Mutex<VecDeque<Result<(), ClientError>>>,
+        delivered: std::sync::Mutex<Vec<CommandId>>,
+        events: tokio::sync::broadcast::Sender<RuntimeEvent>,
+    }
+
+    impl ScriptedRuntime {
+        fn new(answers: Vec<Result<(), ClientError>>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: std::sync::Mutex::new(answers.into()),
+                delivered: std::sync::Mutex::new(Vec::new()),
+                events: tokio::sync::broadcast::channel(1).0,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for ScriptedRuntime {
+        async fn send(&self, _command: ClientCommand) -> Result<(), ClientError> {
+            unreachable!("turn inputs are delivered in envelopes")
+        }
+
+        async fn deliver(&self, envelope: CommandEnvelope) -> Result<(), ClientError> {
+            self.delivered.lock().unwrap().push(envelope.command_id);
+            self.answers.lock().unwrap().pop_front().expect("scripted")
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+
+        async fn snapshot(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<leveler_client_protocol::UiSessionSnapshot, ClientError> {
+            Err(ClientError::OutcomeUnknown("away".into()))
+        }
+    }
+
+    fn submission_envelope() -> CommandEnvelope {
+        CommandEnvelope {
+            command_id: CommandId::new("cmd-logical"),
+            session_id: SessionId::new("s1"),
+            expected_version: None,
+            issued_at: "2026-09-15T00:00:00Z".into(),
+            command: ClientCommand::SubmitMessage {
+                session_id: SessionId::new("s1"),
+                content: "实现登录".into(),
+                attachments: Vec::new(),
+            },
+        }
+    }
+
+    /// Stable identity: however many attempts it takes, each carries the id
+    /// the logical command was born with, and only an answer ends the retries.
+    #[tokio::test]
+    async fn an_unanswered_submission_is_redelivered_under_its_original_command_id() {
+        let runtime = ScriptedRuntime::new(vec![
+            Err(ClientError::OutcomeUnknown("connection reset".into())),
+            Err(ClientError::OutcomeUnknown("unsettled dispatch".into())),
+            Ok(()),
+        ]);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+
+        let settled = settle_submission(client, submission_envelope(), None).await;
+
+        assert!(
+            matches!(
+                &settled,
+                EffectCompletion::SubmissionDelivered { command_id, .. }
+                    if command_id.as_str() == "cmd-logical"
+            ),
+            "{settled:?}"
+        );
+        assert_eq!(
+            runtime.delivered.lock().unwrap().as_slice(),
+            &[
+                CommandId::new("cmd-logical"),
+                CommandId::new("cmd-logical"),
+                CommandId::new("cmd-logical"),
+            ]
+        );
+    }
+
+    /// An attempt that outlived the first wait still answers. Its answer is
+    /// the runtime's, so it must be used — not overwritten by a second attempt
+    /// that could only find the first one's receipt mid-dispatch.
+    #[tokio::test]
+    async fn the_answer_of_an_attempt_still_running_is_not_thrown_away() {
+        let runtime = ScriptedRuntime::new(Vec::new());
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        let in_flight = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(ClientError::Runtime(
+                "session already has an active turn".into(),
+            ))
+        });
+
+        let settled = tokio::time::timeout(
+            Duration::from_secs(5),
+            settle_submission(client, submission_envelope(), Some(in_flight)),
+        )
+        .await
+        .expect("the running attempt's answer settles it");
+
+        assert!(
+            matches!(
+                &settled,
+                EffectCompletion::SubmissionRejected { message, .. }
+                    if message == "session already has an active turn"
+            ),
+            "{settled:?}"
+        );
+        assert!(runtime.delivered.lock().unwrap().is_empty());
+    }
+
+    /// The runtime proved the outcome unrecoverable: that is an answer, so
+    /// redelivery stops for good — no further attempt carries the old id.
+    #[tokio::test]
+    async fn an_unresolvable_answer_ends_redelivery_for_good() {
+        let runtime = ScriptedRuntime::new(vec![
+            Err(ClientError::OutcomeUnknown("daemon restarting".into())),
+            Err(ClientError::Unresolvable("boot ended".into())),
+        ]);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+
+        let settled = settle_submission(client, submission_envelope(), None).await;
+
+        assert!(
+            matches!(
+                &settled,
+                EffectCompletion::SubmissionUnresolvable { command_id, .. }
+                    if command_id.as_str() == "cmd-logical"
+            ),
+            "{settled:?}"
+        );
+        assert_eq!(runtime.delivered.lock().unwrap().len(), 2);
     }
 
     fn note() -> Notification {

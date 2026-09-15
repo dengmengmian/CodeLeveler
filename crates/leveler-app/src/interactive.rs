@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use leveler_core::{CheckpointId, SessionId};
+use leveler_core::{CheckpointId, CommandId, SessionId};
 use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_media::{MediaError, MediaStore};
 use leveler_model::{
@@ -65,6 +65,14 @@ fn ui_reasoning_state(profile: Option<&ModelProfile>) -> Option<UiReasoningState
     })
 }
 
+fn unresolvable(command_id: &CommandId) -> ClientError {
+    ClientError::Unresolvable(format!(
+        "command {} was admitted, but the boot dispatching it ended before its outcome was \
+         recorded",
+        command_id.as_str()
+    ))
+}
+
 fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalDecision {
     match value {
         UiApprovalDecision::ApproveOnce => leveler_execution::ApprovalDecision::ApproveOnce,
@@ -95,7 +103,25 @@ async fn await_turn_acceptance(
 /// never resumes.
 #[cfg(feature = "test-crash-barrier")]
 fn hit_after_turn_started_test_barrier() {
-    let Some(raw_path) = std::env::var_os("LEVELER_TEST_AFTER_TURN_STARTED_BARRIER") else {
+    hit_test_crash_barrier(
+        "LEVELER_TEST_AFTER_TURN_STARTED_BARRIER",
+        b"after_turn_started\n",
+    );
+}
+
+/// Same contract, between a successful dispatch and its receipt being settled:
+/// the exact window that leaves a `dispatching` receipt behind a dead boot.
+#[cfg(feature = "test-crash-barrier")]
+fn hit_before_receipt_settled_test_barrier() {
+    hit_test_crash_barrier(
+        "LEVELER_TEST_BEFORE_RECEIPT_SETTLED_BARRIER",
+        b"before_receipt_settled\n",
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+fn hit_test_crash_barrier(variable: &str, marker: &[u8]) {
+    let Some(raw_path) = std::env::var_os(variable) else {
         return;
     };
     let Some(raw_home) = std::env::var_os("LEVELER_HOME") else {
@@ -115,7 +141,7 @@ fn hit_after_turn_started_test_barrier() {
         .write(true)
         .create_new(true)
         .open(&path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, b"after_turn_started\n"));
+        .and_then(|mut file| std::io::Write::write_all(&mut file, marker));
     if let Err(error) = write_result {
         tracing::warn!(%error, path = %path.display(), "could not announce test crash barrier");
         return;
@@ -128,6 +154,9 @@ fn hit_after_turn_started_test_barrier() {
 /// Production/default builds contain no environment-controlled crash path.
 #[cfg(not(feature = "test-crash-barrier"))]
 fn hit_after_turn_started_test_barrier() {}
+
+#[cfg(not(feature = "test-crash-barrier"))]
+fn hit_before_receipt_settled_test_barrier() {}
 
 /// Pending candidates as UI entries. Kept next to the listing handlers so the
 /// three places that emit `MemoryList` cannot drift on what "pending" means.
@@ -319,6 +348,15 @@ pub struct InProcessRuntimeClient {
     /// input is durable. Embedded callers keep the historical dispatch-only
     /// return so current-thread runtimes never wait on their own worker.
     durable_wire_ack: bool,
+    /// This runtime's boot, started before its first command admission and
+    /// held for its whole life: receipts it admits carry the id, and another
+    /// runtime can tell from the lease whether this boot is still alive.
+    boot: tokio::sync::OnceCell<crate::runtime_boot::RuntimeBootLease>,
+    /// Commands this boot is handling. A command enters before its receipt is
+    /// written and leaves only once the receipt is settled — or once the path
+    /// handling it has ended without settling it — so a `dispatching` receipt
+    /// of this boot that is not in here will never be settled by this boot.
+    in_flight: InFlightCommands,
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
@@ -328,6 +366,62 @@ pub struct InProcessRuntimeClient {
 }
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
+/// Command id → number of deliveries of it this boot is handling.
+type InFlightCommands = Arc<Mutex<HashMap<String, usize>>>;
+
+/// One delivery's membership in [`InProcessRuntimeClient::in_flight`].
+struct InFlightDelivery {
+    registry: InFlightCommands,
+    command_id: String,
+}
+
+impl InFlightDelivery {
+    fn enter(registry: &InFlightCommands, command_id: &CommandId) -> Self {
+        *registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(command_id.as_str().to_string())
+            .or_default() += 1;
+        Self {
+            registry: registry.clone(),
+            command_id: command_id.as_str().to_string(),
+        }
+    }
+
+    /// Register, then write the receipt (`admit`). The order is the invariant:
+    /// a `dispatching` receipt of this boot is never observable while its
+    /// command is missing from the registry.
+    async fn admit<T>(
+        registry: &InFlightCommands,
+        command_id: &CommandId,
+        admit: impl std::future::Future<Output = T>,
+    ) -> (Self, T) {
+        let entry = Self::enter(registry, command_id);
+        (entry, admit.await)
+    }
+
+    /// The receipt could not be settled although the dispatch finished: stay
+    /// registered for the rest of this boot rather than let the receipt read
+    /// as abandoned by a path that did not abandon it. A later boot judges it.
+    fn keep_for_this_boot(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for InFlightDelivery {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = registry.get_mut(&self.command_id) {
+            *count -= 1;
+            if *count == 0 {
+                registry.remove(&self.command_id);
+            }
+        }
+    }
+}
 
 /// Drains one session's steering queue for the agent loop, and holds the
 /// session's running children's cancellation handles.
@@ -451,6 +545,71 @@ impl InProcessRuntimeClient {
             shutting_down: shutting_down.clone(),
             process_shutdown: None,
             durable_wire_ack: false,
+            boot: tokio::sync::OnceCell::new(),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Answer a delivery that found its command's receipt `dispatching`.
+    ///
+    /// Settled meanwhile → that answer. Admitted by an unknown boot (a row
+    /// from before boots were recorded) → no answer. Admitted by this boot →
+    /// still being handled while it is in flight, abandoned otherwise.
+    /// Admitted by another boot → still being handled while that boot holds
+    /// its lease, abandoned once the lease is free. Only an abandoned receipt
+    /// becomes unresolvable, durably, so later deliveries need no probe.
+    async fn answer_unsettled(
+        &self,
+        receipts: &leveler_storage::CommandReceiptRepository<'_>,
+        envelope: &CommandEnvelope,
+        fingerprint: &str,
+    ) -> Result<(), ClientError> {
+        let command_id = &envelope.command_id;
+        let unknown = || {
+            ClientError::OutcomeUnknown(format!(
+                "command {} is still being dispatched, or its outcome is not yet known",
+                command_id.as_str()
+            ))
+        };
+        let abandoned = match receipts
+            .dispatching_boot(command_id)
+            .await
+            .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            leveler_storage::DispatchingBoot::NotDispatching => false,
+            leveler_storage::DispatchingBoot::Unknown => return Err(unknown()),
+            leveler_storage::DispatchingBoot::Boot(boot)
+                if self.boot.get().is_some_and(|own| own.id() == &boot) =>
+            {
+                !self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(command_id.as_str())
+            }
+            leveler_storage::DispatchingBoot::Boot(boot) => matches!(
+                crate::runtime_boot::boot_liveness(&self.app.layout.state_dir, &boot),
+                Ok(crate::runtime_boot::BootLiveness::Ended)
+            ),
+        };
+        if abandoned
+            && receipts
+                .mark_unresolvable(command_id)
+                .await
+                .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            return Err(unresolvable(command_id));
+        }
+        // Not abandoned, or it settled between the read and the write: answer
+        // from whatever the receipt says now.
+        match receipts
+            .classify_terminal(command_id, &envelope.session_id, fingerprint)
+            .await
+            .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            Some(leveler_storage::Admission::AlreadyCompleted) => Ok(()),
+            Some(leveler_storage::Admission::Unresolvable) => Err(unresolvable(command_id)),
+            _ => Err(unknown()),
         }
     }
 
@@ -2707,12 +2866,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .map_err(|e| ClientError::Runtime(e.to_string()))?
         {
             Some(leveler_storage::Admission::AlreadyCompleted) => return Ok(()),
+            Some(leveler_storage::Admission::Unresolvable) => {
+                return Err(unresolvable(&envelope.command_id));
+            }
             Some(leveler_storage::Admission::Uncertain) => {
-                return Err(ClientError::Runtime(format!(
-                    "command {} died mid-dispatch on a prior attempt; its effect is uncertain — \
-                     verify state and resubmit with a fresh command id",
-                    envelope.command_id.as_str()
-                )));
+                return self
+                    .answer_unsettled(&receipts, &envelope, &command_fingerprint)
+                    .await;
             }
             Some(leveler_storage::Admission::Conflict) => {
                 return Err(ClientError::Runtime(format!(
@@ -2769,24 +2929,38 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // prior dispatch actually completed is a true duplicate. One whose send
         // failed is retryable; one that never resolved (crash mid-dispatch) is
         // surfaced as uncertain, not silently swallowed as done.
-        match receipts
-            .admit(
+        let boot = self
+            .boot
+            .get_or_try_init(|| async {
+                crate::runtime_boot::RuntimeBootLease::acquire(&self.app.layout.state_dir)
+            })
+            .await
+            .map_err(|e| ClientError::Runtime(format!("cannot start a runtime boot: {e}")))?;
+        let (in_flight, admission) = InFlightDelivery::admit(
+            &self.in_flight,
+            &envelope.command_id,
+            receipts.admit(
                 &envelope.command_id,
                 &envelope.session_id,
                 &command_fingerprint,
                 &envelope.issued_at,
+                boot.id(),
                 leveler_core::now(),
-            )
-            .await
-            .map_err(|e| ClientError::Runtime(e.to_string()))?
-        {
+            ),
+        )
+        .await;
+        match admission.map_err(|e| ClientError::Runtime(e.to_string()))? {
             leveler_storage::Admission::AlreadyCompleted => return Ok(()),
+            leveler_storage::Admission::Unresolvable => {
+                return Err(unresolvable(&envelope.command_id));
+            }
             leveler_storage::Admission::Uncertain => {
-                return Err(ClientError::Runtime(format!(
-                    "command {} died mid-dispatch on a prior attempt; its effect is uncertain — \
-                     verify state and resubmit with a fresh command id",
-                    envelope.command_id.as_str()
-                )));
+                // This delivery dispatches nothing; only other registrations
+                // may speak for the receipt.
+                drop(in_flight);
+                return self
+                    .answer_unsettled(&receipts, &envelope, &command_fingerprint)
+                    .await;
             }
             leveler_storage::Admission::Conflict => {
                 return Err(ClientError::Runtime(format!(
@@ -2800,18 +2974,22 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let command_id = envelope.command_id.clone();
         match self.send(envelope.command).await {
             Ok(()) => {
-                receipts
-                    .mark_completed(&command_id)
-                    .await
-                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
-                Ok(())
+                hit_before_receipt_settled_test_barrier();
+                let settled = receipts.mark_completed(&command_id).await;
+                match settled {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        in_flight.keep_for_this_boot();
+                        Err(ClientError::Runtime(e.to_string()))
+                    }
+                }
             }
             Err(error) => {
                 // A returned error does not prove the command had no partial
                 // effect. Leave the durable receipt in `dispatching`, so a
-                // retry is surfaced as Uncertain instead of blindly executing
-                // the command again. Only a caller with positive evidence that
-                // nothing started may explicitly mark a receipt retryable.
+                // retry is never blindly executed again. This delivery's
+                // registration ends here: nothing will settle the receipt now,
+                // and a redelivery is answered unresolvable.
                 Err(error)
             }
         }
@@ -3777,5 +3955,47 @@ mod context_ops_tests {
         );
         // All-or-nothing: no partial Vec is returned on error.
         assert!(parse_history_messages_strict(&[good.clone(), good]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    fn registered(registry: &InFlightCommands, command_id: &CommandId) -> bool {
+        registry.lock().unwrap().contains_key(command_id.as_str())
+    }
+
+    /// The local ambiguity window opens before the receipt exists: whenever the
+    /// receipt write runs, the command is already registered.
+    #[tokio::test]
+    async fn a_command_is_in_flight_before_its_receipt_is_written() {
+        let registry: InFlightCommands = Arc::default();
+        let command_id = CommandId::new("cmd-window");
+        let (entry, seen_during_write) = InFlightDelivery::admit(&registry, &command_id, async {
+            registered(&registry, &command_id)
+        })
+        .await;
+        assert!(
+            seen_during_write,
+            "registration must precede the receipt write"
+        );
+        assert!(registered(&registry, &command_id));
+        drop(entry);
+        assert!(!registered(&registry, &command_id));
+    }
+
+    /// One delivery leaving must not unregister another still handling the
+    /// same command; a kept registration outlives its delivery.
+    #[test]
+    fn registrations_are_counted_and_a_kept_one_stays() {
+        let registry: InFlightCommands = Arc::default();
+        let command_id = CommandId::new("cmd-twice");
+        let first = InFlightDelivery::enter(&registry, &command_id);
+        let second = InFlightDelivery::enter(&registry, &command_id);
+        drop(second);
+        assert!(registered(&registry, &command_id));
+        first.keep_for_this_boot();
+        assert!(registered(&registry, &command_id));
     }
 }

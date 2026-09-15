@@ -807,12 +807,12 @@ fn enter_submits_and_clears_composer() {
     }
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SubmitMessage {
+        submitted(&effects).0,
+        ClientCommand::SubmitMessage {
             session_id: SessionId::new("s1"),
             content: "fix bug".to_string(),
             attachments: Vec::new(),
-        })]
+        }
     );
     assert!(s.composer.is_empty(), "composer cleared after submit");
     assert!(matches!(
@@ -2079,7 +2079,7 @@ fn absolute_path_at_message_start_is_sent_instead_of_parsed_as_a_command() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == message
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content == message
         ),
         "absolute path should be submitted as ordinary text: {effects:?}"
     );
@@ -3021,12 +3021,12 @@ fn unsupported_media_text_only_sends_without_images() {
     // Choose option 3 (仅发送文字).
     let effects = reduce(&mut s, key(KeyCode::Char('3')));
     assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SubmitMessage {
+        submitted(&effects).0,
+        ClientCommand::SubmitMessage {
             session_id: SessionId::new("s1"),
             content: "hi".to_string(),
             attachments: Vec::new(),
-        })]
+        }
     );
     assert!(s.pending_attachments.is_empty());
 }
@@ -3045,12 +3045,12 @@ fn submit_with_image_on_vision_model_sends_attachment() {
     typed(&mut s, "hi");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SubmitMessage {
+        submitted(&effects).0,
+        ClientCommand::SubmitMessage {
             session_id: SessionId::new("s1"),
             content: "hi".to_string(),
             attachments: vec![att],
-        })]
+        }
     );
     assert!(s.pending_attachments.is_empty());
 }
@@ -3671,7 +3671,7 @@ fn plain_message_with_default_chat_collab_stays_chat() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "你好"
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content == "你好"
         ),
         "submit still uses SubmitMessage (runtime maps collab→profile): {effects:?}"
     );
@@ -3690,7 +3690,7 @@ fn plain_message_with_goal_collab_marks_goal_mode() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "实现登录"
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content == "实现登录"
         ),
         "{effects:?}"
     );
@@ -3708,7 +3708,7 @@ fn plain_message_with_chat_collab_stays_chat() {
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "随便聊聊"
+        [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content == "随便聊聊"
     ));
     assert!(!s.goal_mode_active);
 }
@@ -3721,7 +3721,7 @@ fn slash_goal_runs_explicit_goal_command() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::RunGoal { content, .. })]
+            [Effect::Submit { command: ClientCommand::RunGoal { content, .. }, .. }]
                 if content == "修复红叉显示"
         ),
         "/goal should run the explicit goal path: {effects:?}"
@@ -5086,7 +5086,7 @@ fn dollar_popup_lists_skills_and_tab_completes_the_mention() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
                 if content == "请 $code-review fix auth"
         ),
         "a $skill message is sent as typed: {effects:?}"
@@ -5111,7 +5111,7 @@ fn dollar_popup_enter_completes_instead_of_sending() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
                 if content.trim() == "$code-review"
         ),
         "second Enter must send the mention once: {effects:?}"
@@ -5236,7 +5236,12 @@ fn the_builtin_feature_dev_skill_is_reachable_as_a_dollar_mention() {
     s.composer.replace("$feature-dev 加一个登录页");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     match effects.as_slice() {
-        [Effect::Send(ClientCommand::SubmitMessage { content, .. })] => {
+        [
+            Effect::Submit {
+                command: ClientCommand::SubmitMessage { content, .. },
+                ..
+            },
+        ] => {
             assert!(content.contains("feature-dev"), "{content}");
             assert!(
                 content.contains("加一个登录页"),
@@ -5396,8 +5401,13 @@ fn remember_while_busy_is_a_write_not_steering() {
     assert!(
         !effects.iter().any(|e| matches!(
             e,
-            Effect::Send(ClientCommand::SteerCurrentTurn { .. })
-                | Effect::Send(ClientCommand::SubmitMessage { .. })
+            Effect::Submit {
+                command: ClientCommand::SteerCurrentTurn { .. },
+                ..
+            } | Effect::Submit {
+                command: ClientCommand::SubmitMessage { .. },
+                ..
+            }
         )),
         "{effects:?}"
     );
@@ -5467,11 +5477,11 @@ fn submitting_while_busy_steers_the_running_turn() {
     s.composer.replace("改用另一个模块");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+        submitted(&effects).0,
+        ClientCommand::SteerCurrentTurn {
             session_id: SessionId::new("s1"),
             content: "改用另一个模块".to_string(),
-        })]
+        }
     );
     assert!(s.composer.is_empty(), "the composer must clear on send");
 }
@@ -5495,7 +5505,7 @@ fn several_steers_are_each_sent() {
         assert!(
             matches!(
                 effects.as_slice(),
-                [Effect::Send(ClientCommand::SteerCurrentTurn { content, .. })] if content == msg
+                [Effect::Submit { command: ClientCommand::SteerCurrentTurn { content, .. }, .. }] if content == msg
             ),
             "{effects:?}"
         );
@@ -5510,10 +5520,251 @@ fn submitting_while_idle_still_submits_normally() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { .. })]
+            [Effect::Submit {
+                command: ClientCommand::SubmitMessage { .. },
+                ..
+            }]
         ),
         "{effects:?}"
     );
+}
+
+// ── Turn-input delivery truth ────────────────────────────────────────────────
+
+/// The one Submit effect and the id it carries.
+fn submitted(effects: &[Effect]) -> (ClientCommand, leveler_client_protocol::CommandId) {
+    match effects {
+        [
+            Effect::Submit {
+                command,
+                command_id,
+            },
+        ] => (command.clone(), command_id.clone()),
+        other => panic!("expected one Submit, got {other:?}"),
+    }
+}
+
+/// The logical command owns its id from the moment the user presses Enter; the
+/// client keeps it until the runtime answers, so every retry can carry it.
+#[test]
+fn a_message_keeps_its_command_id_until_the_runtime_answers() {
+    let mut s = state();
+    s.composer.replace("做个登录页");
+    let (command, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    assert!(
+        matches!(command, ClientCommand::SubmitMessage { ref content, .. } if content == "做个登录页")
+    );
+    assert_eq!(s.pending_submissions.len(), 1);
+    assert_eq!(s.pending_submissions[0].command_id, command_id);
+
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: None,
+        }),
+    );
+    assert!(s.pending_submissions.is_empty());
+    assert_eq!(s.status, RuntimeStatus::Busy, "delivered work stays busy");
+}
+
+/// Steering is a turn input too: pushed into a live turn, or started as a turn
+/// when the one it aimed at just ended. It gets the same identity.
+#[test]
+fn a_steer_is_a_tracked_submission() {
+    let mut s = busy_state();
+    s.composer.replace("改用另一个模块");
+    let (command, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    assert!(matches!(command, ClientCommand::SteerCurrentTurn { .. }));
+    assert_eq!(s.pending_submissions[0].command_id, command_id);
+}
+
+/// No answer is not "not delivered": the runtime may already be running it. A
+/// reconnect snapshot taken before it landed must not reopen the composer, and
+/// a second input must not be sent — that is how a retry becomes a second turn.
+#[test]
+fn an_unanswered_submission_holds_new_input_instead_of_driving_a_second_turn() {
+    let mut s = state();
+    s.composer.replace("第一条");
+    let (_, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionUnconfirmed { command_id }),
+    );
+    assert!(s.pending_submissions[0].unconfirmed);
+    assert!(s.runtime_connected, "no answer is not a dead runtime");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    assert_eq!(
+        s.status,
+        RuntimeStatus::Busy,
+        "an idle snapshot must not expose Idle while delivery is unknown"
+    );
+
+    s.composer.replace("第二条");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "nothing may be sent: {effects:?}");
+    assert_eq!(s.composer.text(), "第二条", "the new input is kept");
+    let note = s
+        .notification
+        .as_ref()
+        .map(|n| n.message.as_str())
+        .unwrap_or("");
+    assert!(note.contains("无法确认"), "{note}");
+}
+
+/// ACK lost, runtime kept going: the answer that arrives later settles the
+/// same command, syncs the runtime's state, and sends nothing new.
+#[test]
+fn a_submission_confirmed_after_reconnect_syncs_runtime_state_without_resending() {
+    let mut s = state();
+    s.composer.replace("实现登录");
+    let (_, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionUnconfirmed {
+            command_id: command_id.clone(),
+        }),
+    );
+    let mut running = snapshot();
+    running.status = "running".into();
+    running.messages = vec![UiMessage {
+        id: MessageId::new("u1"),
+        role: UiRole::User,
+        text: "实现登录".into(),
+        ordinal: Some(0),
+        kind: None,
+    }];
+    let effects = reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: Some(Box::new(running)),
+        }),
+    );
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.pending_submissions.is_empty());
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    let users = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::User(text) if text == "实现登录"))
+        .count();
+    assert_eq!(users, 1, "one message, from the runtime's record");
+    let note = s
+        .notification
+        .as_ref()
+        .map(|n| n.message.as_str())
+        .unwrap_or("");
+    assert!(note.contains("已送达"), "{note}");
+}
+
+/// The runtime answered "not run": the input goes back into the composer, the
+/// optimistic busy state yields to the runtime's, and a new submission is a
+/// new logical command with a new id.
+#[test]
+fn a_rejected_submission_returns_the_text_and_reopens_the_composer() {
+    let mut s = state();
+    s.composer.replace("做个登录页");
+    let (_, first_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionRejected {
+            command_id: first_id.clone(),
+            message: "session already has an active turn".into(),
+            snapshot: Some(Box::new(snapshot())),
+        }),
+    );
+    assert!(s.pending_submissions.is_empty());
+    assert_eq!(s.status, RuntimeStatus::Idle);
+    assert_eq!(s.composer.text(), "做个登录页");
+    let note = s
+        .notification
+        .as_ref()
+        .map(|n| n.message.as_str())
+        .unwrap_or("");
+    assert!(
+        note.contains("active turn"),
+        "the runtime's own words: {note}"
+    );
+
+    let (_, second_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    assert_ne!(second_id, first_id);
+}
+
+/// The answer can land after the user moved to another session. It settles the
+/// command; the old session's snapshot must not pull the view back.
+#[test]
+fn a_late_answer_does_not_switch_the_view_back_to_its_session() {
+    let mut s = state();
+    s.composer.replace("第一条");
+    let (_, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionUnconfirmed {
+            command_id: command_id.clone(),
+        }),
+    );
+    let mut other = snapshot();
+    other.id = SessionId::new("s2");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: other }),
+    );
+
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: Some(Box::new(snapshot())),
+        }),
+    );
+    assert!(s.pending_submissions.is_empty());
+    assert_eq!(s.session_id, SessionId::new("s2"));
+}
+
+/// An answer for a command this client no longer tracks changes nothing.
+#[test]
+fn an_answer_for_an_untracked_command_is_ignored() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionRejected {
+            command_id: leveler_client_protocol::CommandId::new("cmd-stale"),
+            message: "busy".into(),
+            snapshot: None,
+        }),
+    );
+    assert!(s.composer.is_empty());
+    assert!(s.notification.is_none());
+}
+
+/// A runtime that answered with an error is reachable. Saying "cannot connect"
+/// turns a business failure into a transport one.
+#[test]
+fn a_runtime_rejection_is_not_reported_as_a_lost_connection() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::CommandRejected {
+            message: "当前有进行中的回合，请先等待完成或取消后再压缩".into(),
+            snapshot: Some(Box::new(snapshot())),
+        }),
+    );
+    assert!(s.runtime_connected);
+    let note = s
+        .notification
+        .as_ref()
+        .map(|n| n.message.as_str())
+        .unwrap_or("");
+    assert!(note.contains("进行中的回合"), "{note}");
+    assert!(!note.contains("无法连接"), "{note}");
 }
 
 // ── User shell (`!command`) routing / lifecycle / details ───────────────────
@@ -5562,7 +5813,7 @@ fn leading_whitespace_bang_is_a_normal_message() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
                 if content.trim() == "!not a shell"
         ),
         "trimmed submit keeps the text as a message: {effects:?}"
@@ -5738,7 +5989,7 @@ fn slash_goal_expands_large_paste_to_canonical_content() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::RunGoal { content, .. })] if content == BIG_PASTE
+            [Effect::Submit { command: ClientCommand::RunGoal { content, .. }, .. }] if content == BIG_PASTE
         ),
         "/goal must submit the pasted content, not the placeholder: {effects:?}"
     );
@@ -5754,7 +6005,7 @@ fn steering_expands_large_paste_to_canonical_content() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SteerCurrentTurn { content, .. })] if content == &want
+            [Effect::Submit { command: ClientCommand::SteerCurrentTurn { content, .. }, .. }] if content == &want
         ),
         "steering must carry the pasted content: {effects:?}"
     );
@@ -5798,7 +6049,7 @@ fn typed_placeholder_text_is_delivered_literally() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "[Pasted: 5 lines]"
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content == "[Pasted: 5 lines]"
         ),
         "typed literal must stay literal: {effects:?}"
     );
@@ -6156,7 +6407,7 @@ fn slash_goal_with_small_multiline_paste_still_runs_a_goal() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::RunGoal { content, .. })]
+            [Effect::Submit { command: ClientCommand::RunGoal { content, .. }, .. }]
                 if content == "修 README\n第二行要求\n第三行要求"
         ),
         "multiline /goal must stay a goal: {effects:?}"
@@ -6174,7 +6425,7 @@ fn multiline_unknown_slash_prefix_stays_a_message() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content.contains("line3")
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }] if content.contains("line3")
         ),
         "{effects:?}"
     );

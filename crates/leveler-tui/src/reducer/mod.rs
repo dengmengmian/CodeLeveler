@@ -4,12 +4,14 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use leveler_client_protocol::{ClientCommand, NotificationLevel, PermissionProfile, RuntimeEvent};
+use leveler_client_protocol::{
+    ClientCommand, CommandId, NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus,
+};
 
 use crate::action::{Action, Effect, EffectCompletion};
 use crate::conversation::interaction::{self, Hit};
 use crate::screen::Screen;
-use crate::state::{AppState, Notification, WorkbenchFocus};
+use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
 pub mod overlay_keys;
 mod runtime_apply;
@@ -179,18 +181,125 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
 fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
     match completion {
         EffectCompletion::CommandDelivered => {}
-        EffectCompletion::CommandFailed { snapshot } => {
+        EffectCompletion::CommandRejected { message, snapshot } => {
             if let Some(snapshot) = snapshot {
                 apply_runtime(state, RuntimeEvent::SessionOpened { session: *snapshot });
+            }
+            state.notification = Some(Notification {
+                level: NotificationLevel::Error,
+                message,
+            });
+        }
+        EffectCompletion::CommandUncertain { snapshot } => {
+            let message = if let Some(snapshot) = snapshot {
+                apply_runtime(state, RuntimeEvent::SessionOpened { session: *snapshot });
+                state.t().command_outcome_unknown_synced
             } else {
                 // Delivery is uncertain: the runtime may already be executing.
                 // Fail closed until reconnect/snapshot establishes authority;
                 // never expose Idle and permit a duplicate turn.
                 state.runtime_connected = false;
-            }
+                state.t().command_outcome_unknown_unreachable
+            };
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
-                message: "无法连接运行时，命令交付状态未知".to_string(),
+                message: message.to_string(),
+            });
+        }
+        EffectCompletion::SubmissionUnconfirmed { command_id } => {
+            if let Some(pending) = state
+                .pending_submissions
+                .iter_mut()
+                .find(|pending| pending.command_id == command_id)
+            {
+                pending.unconfirmed = true;
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().submission_unconfirmed.to_string(),
+                });
+            }
+        }
+        EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot,
+        } => {
+            let Some(pending) = take_pending_submission(state, &command_id) else {
+                return;
+            };
+            if let Some(snapshot) = snapshot_for_current_session(state, snapshot) {
+                apply_runtime(state, RuntimeEvent::SessionOpened { session: snapshot });
+            }
+            if pending.unconfirmed {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Info,
+                    message: state.t().submission_confirmed.to_string(),
+                });
+            }
+        }
+        EffectCompletion::SubmissionUnresolvable {
+            command_id,
+            snapshot,
+        } => {
+            let Some(pending) = take_pending_submission(state, &command_id) else {
+                return;
+            };
+            match snapshot_for_current_session(state, snapshot) {
+                Some(snapshot) => {
+                    apply_runtime(state, RuntimeEvent::SessionOpened { session: snapshot });
+                }
+                // Busy was this input's own optimism; with no snapshot, undo
+                // exactly that.
+                None if state.pending_submissions.is_empty()
+                    && !matches!(pending.command, ClientCommand::SteerCurrentTurn { .. }) =>
+                {
+                    state.status = RuntimeStatus::Idle;
+                }
+                None => {}
+            }
+            // The old input stays in the conversation, never in the composer:
+            // it may have run, and one Enter would run it again.
+            if let Some(text) = submit::turn_input_text(&pending.command)
+                && !state
+                    .transcript
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, crate::transcript::TranscriptItem::User(shown) if shown == text))
+            {
+                state.transcript.push_user(text.to_string());
+            }
+            state
+                .transcript
+                .push_note(state.t().submission_unresolvable_note.to_string());
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().submission_unresolvable.to_string(),
+            });
+        }
+        EffectCompletion::SubmissionRejected {
+            command_id,
+            message,
+            snapshot,
+        } => {
+            let Some(pending) = take_pending_submission(state, &command_id) else {
+                return;
+            };
+            match snapshot_for_current_session(state, snapshot) {
+                Some(snapshot) => {
+                    apply_runtime(state, RuntimeEvent::SessionOpened { session: snapshot });
+                }
+                // Busy was this input's own optimism (a steer rides a turn the
+                // runtime reported); with no snapshot, undo exactly that.
+                None if state.pending_submissions.is_empty()
+                    && !matches!(pending.command, ClientCommand::SteerCurrentTurn { .. }) =>
+                {
+                    state.status = RuntimeStatus::Idle;
+                }
+                None => {}
+            }
+            submit::restore_turn_input(state, pending.command);
+            state.notification = Some(Notification {
+                level: NotificationLevel::Error,
+                message: format!("{}：{message}", state.t().submission_rejected),
             });
         }
         EffectCompletion::InteractionDelivered { key } => {
@@ -222,6 +331,28 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             }
         }
     }
+}
+
+/// A settle can land after the user switched sessions; resyncing from the old
+/// session's snapshot would switch the view back.
+fn snapshot_for_current_session(
+    state: &AppState,
+    snapshot: Option<Box<leveler_client_protocol::UiSessionSnapshot>>,
+) -> Option<leveler_client_protocol::UiSessionSnapshot> {
+    snapshot
+        .map(|snapshot| *snapshot)
+        .filter(|snapshot| snapshot.id == state.session_id)
+}
+
+fn take_pending_submission(
+    state: &mut AppState,
+    command_id: &CommandId,
+) -> Option<PendingSubmission> {
+    let index = state
+        .pending_submissions
+        .iter()
+        .position(|pending| &pending.command_id == command_id)?;
+    Some(state.pending_submissions.remove(index))
 }
 
 fn snapshot_awaits_interaction(

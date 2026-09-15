@@ -340,6 +340,8 @@ fn error_frame(error: &ClientError, command_id: Option<String>) -> DownstreamMes
     let code = match error {
         ClientError::SessionNotFound(_) => "session_not_found",
         ClientError::Runtime(_) => "runtime_error",
+        ClientError::OutcomeUnknown(_) => "outcome_unknown",
+        ClientError::Unresolvable(_) => "outcome_unresolvable",
     };
     DownstreamMessage::Error {
         code: code.to_string(),

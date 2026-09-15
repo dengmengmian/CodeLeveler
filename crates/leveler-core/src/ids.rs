@@ -152,6 +152,13 @@ string_id!(
  /// Future cloud-worker and embedded runtimes carry the same identity type.
     RuntimeId
 );
+string_id!(
+ /// Identifies one boot of a runtime: a single live execution incarnation.
+ /// Where [`RuntimeId`] survives restarts, a `BootId` never does — every boot
+ /// mints a fresh one and none is ever reused, so evidence that a boot has
+ /// ended stays true forever.
+    BootId
+);
 
 #[cfg(test)]
 mod tests {

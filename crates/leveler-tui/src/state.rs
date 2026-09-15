@@ -4,9 +4,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use leveler_client_protocol::{
-    AttachmentRef, CommandId, ModelRef, NotificationLevel, PermissionProfile, RuntimeStatus,
-    SessionId, UiApprovalRequest, UiCheckpoint, UiClarificationRequest, UiDiff, UiPlan,
-    UiSessionSummary, UiVerification,
+    AttachmentRef, ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile,
+    RuntimeStatus, SessionId, UiApprovalRequest, UiCheckpoint, UiClarificationRequest, UiDiff,
+    UiPlan, UiSessionSummary, UiVerification,
 };
 
 use crate::composer::Composer;
@@ -15,6 +15,22 @@ use crate::overlay::Overlay;
 use crate::screen::{Screen, ToolsScreenState};
 use crate::theme::Theme;
 use crate::transcript::TranscriptState;
+
+/// A turn input (message, steer, `/goal`) the runtime has not answered yet.
+///
+/// `command_id` belongs to the logical command, not to one transport attempt:
+/// every retry re-sends this exact id, and the runtime's durable command
+/// receipt makes those retries one dispatch. Only the runtime's answer —
+/// delivered or rejected — removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubmission {
+    pub command_id: CommandId,
+    pub command: ClientCommand,
+    /// The first attempt ended without an answer. The event loop keeps
+    /// re-delivering the same envelope; until it settles, no new turn input is
+    /// sent, because this one may already be running.
+    pub unconfirmed: bool,
+}
 
 /// A runtime request that must eventually be answered by the user. Parked in
 /// [`AppState::pending_interactions`] while another overlay holds the screen —
@@ -212,6 +228,8 @@ pub struct AppState {
     /// a transport-retry of the same decision reuses the envelope id and hits
     /// runtime command-receipt dedup instead of double-dispatching.
     pub interaction_command_ids: HashMap<String, CommandId>,
+    /// Turn inputs sent but not yet answered by the runtime, oldest first.
+    pub pending_submissions: Vec<PendingSubmission>,
 
     pub status: RuntimeStatus,
     /// Mechanical post-response stage reported by the runtime. `Some` means
@@ -380,6 +398,7 @@ impl AppState {
             overlay: None,
             pending_interactions: VecDeque::new(),
             interaction_command_ids: HashMap::new(),
+            pending_submissions: Vec::new(),
             status: RuntimeStatus::Idle,
             finalization_stage: None,
             turn_tool_calls: 0,

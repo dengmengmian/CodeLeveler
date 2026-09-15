@@ -28,7 +28,7 @@ mod terminal_store;
 mod turn_repo;
 mod turn_store;
 
-pub use command_receipt_repo::{Admission, CommandReceiptRepository};
+pub use command_receipt_repo::{Admission, CommandReceiptRepository, DispatchingBoot};
 pub use context_epoch_repo::EpochEventRow;
 pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use leveler_app::runtime_boot::RuntimeBootLease;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
     ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
@@ -202,6 +203,244 @@ async fn reused_command_id_with_different_payload_is_rejected() {
         matches!(&err, ClientError::Runtime(message) if message.contains("different session or payload")),
         "id reuse with another payload must be a clear conflict, got {err:?}"
     );
+}
+
+fn submission(command_id: &str, session_id: &SessionId, content: &str) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id: CommandId::new(command_id),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-09-15T00:00:00Z".to_string(),
+        command: ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: content.to_string(),
+            attachments: vec![],
+        },
+    }
+}
+
+/// The client retries a submission whose ACK it never saw with the SAME
+/// envelope. After the runtime that admitted it is gone and a new one reads the
+/// same state, that retry must be answered from the durable receipt — delivered —
+/// and must not start a second turn.
+#[tokio::test]
+async fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn() {
+    let (tmp, app, client, session_id) = build_client().await;
+    let envelope = submission("cmd-restart", &session_id, "survive a restart");
+    client.deliver(envelope.clone()).await.unwrap();
+    settle_background_turns(&app, &client, &[&session_id]).await;
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(db);
+    drop(client);
+    drop(app);
+
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let restarted = Arc::new(Application::assemble(layout).unwrap());
+    let client = InProcessRuntimeClient::new_with_options(
+        restarted.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+        false,
+    )
+    .with_durable_wire_ack();
+    let mut events = client.subscribe_session(&session_id);
+
+    client
+        .deliver(envelope)
+        .await
+        .expect("an admitted command is answered as delivered after a restart");
+
+    let db = restarted.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&session_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the retry must not start a second turn"
+    );
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "the retry must not dispatch anything"
+    );
+}
+
+/// Write the `dispatching` receipt a boot leaves when it admits `envelope` and
+/// then never settles it.
+async fn leave_dispatching(
+    app: &Application,
+    envelope: &CommandEnvelope,
+    boot: &leveler_core::BootId,
+) {
+    use sha2::{Digest, Sha256};
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope.command).unwrap())
+    );
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        leveler_storage::CommandReceiptRepository::new(&db)
+            .admit(
+                &envelope.command_id,
+                &envelope.session_id,
+                &fingerprint,
+                &envelope.issued_at,
+                boot,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap(),
+        leveler_storage::Admission::Dispatch
+    );
+}
+
+async fn turns(app: &Application, session_id: &SessionId) -> usize {
+    let db = app.open_database().await.unwrap();
+    TurnRepository::new(&db)
+        .list(session_id)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Another boot admitted the command and still holds its lease: it may yet
+/// settle the receipt. A retry learns nothing new — no answer, and no rerun.
+#[tokio::test]
+async fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let other_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
+    let envelope = submission("cmd-live-elsewhere", &session_id, "still running there");
+    leave_dispatching(&app, &envelope, other_boot.id()).await;
+    let mut events = client.subscribe_session(&session_id);
+
+    let error = client.deliver(envelope.clone()).await.unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::OutcomeUnknown(_)),
+        "a live boot's dispatch is not orphaned: {error:?}"
+    );
+    assert_eq!(turns(&app, &session_id).await, 0);
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    drop(other_boot);
+}
+
+/// The boot that admitted the command is gone — its lease released, as the OS
+/// does for a killed process — and the receipt is still `dispatching`. Nothing
+/// can settle it any more: an authoritative unresolvable answer, the same on
+/// every later delivery, and the command never runs again.
+#[tokio::test]
+async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let crashed_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
+    let envelope = submission("cmd-orphaned", &session_id, "died mid-dispatch");
+    leave_dispatching(&app, &envelope, crashed_boot.id()).await;
+    drop(crashed_boot);
+    let mut events = client.subscribe_session(&session_id);
+
+    for attempt in 0..2 {
+        let error = client.deliver(envelope.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::Unresolvable(_)),
+            "attempt {attempt}: {error:?}"
+        );
+    }
+    assert_eq!(turns(&app, &session_id).await, 0, "never rerun");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+/// This boot admitted the command, and the path that was handling it has
+/// ended without settling the receipt (its dispatch returned an error, which
+/// cannot prove nothing happened). A later delivery of the same id — the
+/// client never saw that answer — is unresolvable, not a second dispatch.
+#[tokio::test]
+async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("cmd-ended-here"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-09-15T00:00:00Z".to_string(),
+        command: ClientCommand::SelectModel {
+            session_id: session_id.clone(),
+            model: ModelRef::new("mock", "not-configured"),
+        },
+    };
+
+    let first = client.deliver(envelope.clone()).await.unwrap_err();
+    assert!(matches!(first, ClientError::Runtime(_)), "{first:?}");
+
+    let again = client.deliver(envelope).await.unwrap_err();
+    assert!(matches!(again, ClientError::Unresolvable(_)), "{again:?}");
+}
+
+/// The hard gate on the local window: a duplicate that lands while this boot
+/// is still admitting or dispatching the command must never be judged
+/// orphaned. Delivered concurrently many times, the answers are only
+/// "delivered" or "no answer yet", and each command makes one turn.
+#[tokio::test]
+async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
+    let (_tmp, app, _client, _session) = build_client().await;
+    let client = Arc::new(
+        InProcessRuntimeClient::new_with_options(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+            false,
+        )
+        .with_durable_wire_ack(),
+    );
+    for round in 0..5 {
+        let session_id = app
+            .create_session(&ModelRef::new("mock", "m"), "race")
+            .await
+            .unwrap();
+        let envelope = submission(&format!("cmd-race-{round}"), &session_id, "race");
+        let (a, b, c) = tokio::join!(
+            client.deliver(envelope.clone()),
+            client.deliver(envelope.clone()),
+            client.deliver(envelope.clone()),
+        );
+        for answer in [&a, &b, &c] {
+            assert!(
+                matches!(answer, Ok(()) | Err(ClientError::OutcomeUnknown(_))),
+                "round {round}: {answer:?}"
+            );
+        }
+        assert!(
+            [&a, &b, &c].iter().any(|answer| answer.is_ok()),
+            "round {round}: one delivery dispatched"
+        );
+        settle_background_turns(&app, &client, &[&session_id]).await;
+        assert_eq!(turns(&app, &session_id).await, 1, "round {round}");
+        client
+            .deliver(envelope)
+            .await
+            .expect("a settled command is answered delivered");
+    }
 }
 
 /// M-3 — a trusted-local AutoApprove session keeps its policy per-session, and a
