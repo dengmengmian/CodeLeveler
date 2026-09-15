@@ -462,6 +462,7 @@ mod tests {
                 nickname: "Worker".into(),
                 role: "执行 Agent".into(),
                 profile_id: Some("worker".into()),
+                agent_name: None,
                 read_only: false,
                 purpose: "check".into(),
                 status: ChildStatus::Running,

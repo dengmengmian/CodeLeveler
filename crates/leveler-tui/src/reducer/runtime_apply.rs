@@ -353,6 +353,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             profile_id,
             profile_role: _,
             read_only,
+            agent,
             contribution,
             stop,
             ..
@@ -366,6 +367,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ok,
                 detail: detail.clone(),
                 profile_id,
+                agent_name: agent.as_ref().map(|a| a.name.clone()),
                 read_only,
                 contribution: contribution.clone(),
                 started_elapsed_secs: started,
@@ -393,9 +395,35 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
             state.unfinished_goals = goals;
         }
-        RuntimeEvent::AgentsLoaded { .. }
-        | RuntimeEvent::AgentLoaded { .. }
-        | RuntimeEvent::AgentMutated { .. } => {}
+        RuntimeEvent::AgentsLoaded {
+            agents, problems, ..
+        } => {
+            state
+                .transcript
+                .push_note(crate::agents_view::listing_note(&agents, &problems));
+        }
+        RuntimeEvent::AgentLoaded {
+            name, agent, error, ..
+        } => {
+            let note = match (agent, error) {
+                (Some(detail), _) => crate::agents_view::detail_note(&detail),
+                (None, Some(error)) => error,
+                (None, None) => format!("Agent \"{name}\" not found."),
+            };
+            state.transcript.push_note(note);
+        }
+        // Another client changed the registry; the TUI does not write agents.
+        // A failure is still said, so a user watching this session sees it.
+        RuntimeEvent::AgentMutated {
+            name, ok, error, ..
+        } => {
+            if !ok {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("agent {name}: {}", error.unwrap_or_default()),
+                });
+            }
+        }
         RuntimeEvent::GoalRecapCreated { recap } => {
             // History, never the lower runtime stack. Idempotent on
             // checkpoint_id inside push_goal_recap.

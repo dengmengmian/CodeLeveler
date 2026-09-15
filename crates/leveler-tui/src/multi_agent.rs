@@ -57,6 +57,9 @@ pub struct ChildAgentView {
     pub role: String,
     /// Built-in capability contract. `None` means the runtime recorded none.
     pub profile_id: Option<String>,
+    /// The declarative agent it was spawned from (`security-reviewer`), when
+    /// it was. `None` for a built-in role spawn and for older records.
+    pub agent_name: Option<String>,
     /// Whether this child holds a physically read-only toolset.
     pub read_only: bool,
     /// What it was asked to do. Leads the running line: a user watching a
@@ -118,6 +121,7 @@ pub struct ChildUpdate {
     /// The task while running; a short result summary once done.
     pub detail: String,
     pub profile_id: Option<String>,
+    pub agent_name: Option<String>,
     pub read_only: bool,
     /// `None` means the runtime produced no projection — not measured.
     pub contribution: Option<ChildContribution>,
@@ -204,6 +208,7 @@ impl TaskTeamView {
             ok,
             detail,
             profile_id,
+            agent_name,
             read_only,
             contribution,
             stop,
@@ -233,6 +238,9 @@ impl TaskTeamView {
             if profile_id.is_some() {
                 existing.profile_id = profile_id;
             }
+            if agent_name.is_some() {
+                existing.agent_name = agent_name;
+            }
             existing.read_only = read_only;
             self.restamp_settlement(started_elapsed_secs);
             return;
@@ -242,6 +250,7 @@ impl TaskTeamView {
             nickname,
             role,
             profile_id,
+            agent_name,
             read_only,
             purpose: detail,
             status,
@@ -311,6 +320,7 @@ impl TaskTeamView {
                 nickname: recorded.nickname.clone(),
                 role: recorded.role.clone(),
                 profile_id: recorded.profile_id.clone(),
+                agent_name: recorded.agent.as_ref().map(|a| a.name.clone()),
                 read_only: recorded.read_only,
                 purpose: recorded.purpose.clone(),
                 status,
@@ -571,6 +581,7 @@ mod tests {
                     "审查 Agent".into()
                 },
                 profile_id: None,
+                agent_name: None,
                 read_only: false,
                 purpose: "look around".into(),
                 status: *st,
@@ -664,6 +675,7 @@ mod tests {
             ok: false,
             detail: purpose.into(),
             profile_id: Some(role.into()),
+            agent_name: None,
             read_only: true,
             contribution: None,
             started_elapsed_secs: 0,
@@ -680,6 +692,7 @@ mod tests {
             ok,
             detail: "summary".into(),
             profile_id: None,
+            agent_name: None,
             read_only: false,
             contribution: c,
             started_elapsed_secs: 0,
@@ -794,6 +807,7 @@ mod tests {
             ok: false,
             detail: "implement".into(),
             profile_id: Some("worker".into()),
+            agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
@@ -814,6 +828,7 @@ mod tests {
             ok: true,
             detail: "done".into(),
             profile_id: None,
+            agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
@@ -1231,7 +1246,7 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
     rows.push(InspectorRow {
         text: format!("{}: {}", t.inspector_purpose, running_line(view, t)),
     });
-    if let Some(profile) = detail.profile_id.as_deref() {
+    if let Some(profile) = view.agent_name.as_deref().or(detail.profile_id.as_deref()) {
         let access = if view.is_read_only() {
             t.inspector_read_only
         } else {
@@ -1398,7 +1413,12 @@ pub fn roster_rows(
         };
         rows.push(AgentRosterRow {
             glyph,
-            label: display_role(&child.role, t),
+            // A declarative agent is named for what it is; a built-in role
+            // spawn keeps its role's name.
+            label: child
+                .agent_name
+                .clone()
+                .unwrap_or_else(|| display_role(&child.role, t)),
             activity,
             meta: child_meta(child, now_elapsed),
             tone,

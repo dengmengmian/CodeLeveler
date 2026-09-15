@@ -15,6 +15,7 @@
 pub mod action;
 pub mod activity;
 mod activity_stream;
+pub mod agents_view;
 mod brand;
 mod code_block;
 pub mod composer;
