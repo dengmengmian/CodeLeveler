@@ -61,6 +61,7 @@ class _ChildTile extends StatelessWidget {
         ? (child.recentStep.isEmpty ? child.purpose : child.recentStep)
         : (child.summary ?? '');
     final bounds = [
+      if (child.agentSource != null) '${child.agentSource} Agent',
       child.readOnly ? '只读' : '可写',
       if (child.background != null) child.background! ? '后台' : '前台',
       if (child.scope.isNotEmpty) '范围 ${child.scope.join(', ')}',
@@ -76,7 +77,7 @@ class _ChildTile extends StatelessWidget {
           children: [
             Expanded(
               child: Text(
-                child.role.isEmpty ? child.displayName : '${child.displayName} · ${child.role}',
+                child.label.isEmpty ? child.displayName : '${child.displayName} · ${child.label}',
                 style: theme.textTheme.titleSmall,
               ),
             ),
