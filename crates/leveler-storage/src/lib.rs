@@ -38,7 +38,7 @@ pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };
 pub use goal_store::{GoalRecord, GoalState, GoalStore, MemoryGoalStore};
-pub use message_repo::MessageRepository;
+pub use message_repo::{MessageRepository, TimedMessage};
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,
 };

@@ -362,6 +362,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "query_session_history",
+            ClientCommand::QuerySessionHistory {
+                session_id: session(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
             "list_agents",
             ClientCommand::ListAgents {
                 session_id: session(),

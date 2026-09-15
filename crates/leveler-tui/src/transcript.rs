@@ -342,6 +342,14 @@ impl TranscriptState {
         &self.items
     }
 
+    /// Take `other`'s content as this transcript's, keeping the version
+    /// moving forward so no cached render of the old content is reused.
+    pub fn replace_with(&mut self, other: TranscriptState) {
+        self.version = self.version.max(other.version).wrapping_add(1);
+        self.items = other.items;
+        self.next_batch = self.next_batch.max(other.next_batch);
+    }
+
     pub fn items_mut(&mut self) -> &mut [TranscriptItem] {
         // The caller takes a mutable slice; assume it mutates and invalidate.
         self.bump();

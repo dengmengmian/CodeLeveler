@@ -276,6 +276,14 @@ impl RemotePolicy {
                 reason: "agent definitions are local-only",
             },
 
+            // A replayed history carries every tool call's arguments and
+            // output — repository content, same class as the observatory. A
+            // remote client reads the conversation from the snapshot.
+            ClientCommand::QuerySessionHistory { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "session history is local-only",
+            },
+
             // A recap projects plan wording, findings, and workspace paths —
             // repository content in prose form, same class as the goal list.
             ClientCommand::Recap { .. } => RemoteVerdict::Deny {

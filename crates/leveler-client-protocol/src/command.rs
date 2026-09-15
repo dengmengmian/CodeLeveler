@@ -286,6 +286,14 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// The session's past turns as clients saw them live: its durable event
+    /// log projected through the same client projection, with the user's
+    /// messages in place. Answered by [`crate::RuntimeEvent::SessionHistoryLoaded`].
+    QuerySessionHistory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// List the agent definitions the session's project resolves.
     /// Answered by [`crate::RuntimeEvent::AgentsLoaded`].
     ListAgents {
@@ -372,6 +380,7 @@ impl ClientCommand {
             | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
+            | ClientCommand::QuerySessionHistory { session_id, .. }
             | ClientCommand::ListAgents { session_id, .. }
             | ClientCommand::GetAgent { session_id, .. }
             | ClientCommand::CreateAgent { session_id, .. }

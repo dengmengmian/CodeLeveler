@@ -640,6 +640,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::QueryObservability { .. } => "query_observability",
         ClientCommand::QueryChildContribution { .. } => "query_child_contribution",
         ClientCommand::ListUnfinishedGoals { .. } => "list_unfinished_goals",
+        ClientCommand::QuerySessionHistory { .. } => "query_session_history",
         ClientCommand::ListAgents { .. } => "list_agents",
         ClientCommand::GetAgent { .. } => "get_agent",
         ClientCommand::CreateAgent { .. } => "create_agent",

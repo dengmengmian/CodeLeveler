@@ -200,6 +200,8 @@ pub struct AppState {
     /// latest result for the verification screen; a turn-end summary only
     /// speaks for checks its own turn ran.
     pub turn_verification: Option<UiVerification>,
+    /// The session-history query this client is waiting on, if any.
+    pub history_query: Option<leveler_client_protocol::CommandId>,
     pub diff: Option<UiDiff>,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
@@ -401,6 +403,7 @@ impl AppState {
             project_rule_sources: Vec::new(),
             verification: None,
             turn_verification: None,
+            history_query: None,
             diff: None,
             diff_selected: 0,
             goal_mode_active: false,

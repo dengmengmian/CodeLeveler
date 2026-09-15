@@ -143,6 +143,9 @@ async fn pump_events<F>(
     loop {
         match events.recv().await {
             Ok(event) => {
+                if !forwards_to_device(&event) {
+                    continue;
+                }
                 let Ok(payload) = serde_json::to_vec(&DownstreamMessage::Event { event }) else {
                     continue;
                 };
@@ -635,4 +638,33 @@ fn command_id_of(frame: &SignedEnvelope) -> Option<String> {
         .get("command_id")
         .and_then(|id| id.as_str())
         .map(|id| id.to_string())
+}
+
+/// Whether a runtime event is streamed to a paired device. A session-history
+/// answer is a local client's query result, not session news.
+fn forwards_to_device(event: &leveler_client_protocol::RuntimeEvent) -> bool {
+    !matches!(
+        event,
+        leveler_client_protocol::RuntimeEvent::SessionHistoryLoaded { .. }
+    )
+}
+
+#[cfg(test)]
+mod downstream_filter_tests {
+    use super::forwards_to_device;
+    use leveler_client_protocol::{RuntimeEvent, SessionId};
+
+    /// A replayed history answers a local client's query: every tool call's
+    /// arguments and output, and possibly megabytes of it. It is not session
+    /// news a paired device should be streamed.
+    #[test]
+    fn a_session_history_answer_is_not_streamed_to_a_device() {
+        assert!(!forwards_to_device(&RuntimeEvent::SessionHistoryLoaded {
+            query_id: None,
+            session_id: SessionId::new("s1"),
+            entries: Vec::new(),
+            omitted_turns: 0,
+        }));
+        assert!(forwards_to_device(&RuntimeEvent::TurnAnswered));
+    }
 }

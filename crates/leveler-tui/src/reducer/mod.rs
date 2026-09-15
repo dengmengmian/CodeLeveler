@@ -34,7 +34,18 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::Runtime(event) => {
             let refresh = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
+            let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
             apply_runtime(state, event);
+            // A reopened conversation shows its text from the snapshot at
+            // once; what ran in it comes from the durable history.
+            if opened && !state.is_busy() && !state.transcript.is_empty() {
+                let query_id = CommandId::generate();
+                state.history_query = Some(query_id.clone());
+                return vec![Effect::Send(ClientCommand::QuerySessionHistory {
+                    session_id: state.session_id.clone(),
+                    query_id: Some(query_id),
+                })];
+            }
             if refresh {
                 let session_id = state
                     .trace
@@ -1315,6 +1326,8 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
 mod child_identity_tests;
 #[cfg(test)]
 mod command_row_tests;
+#[cfg(test)]
+mod history_replay_tests;
 
 #[cfg(test)]
 mod pending_input_tests;

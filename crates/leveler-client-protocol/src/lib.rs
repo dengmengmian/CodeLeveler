@@ -66,7 +66,7 @@ pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding
 pub use event::{
     ChildContribution, ChildOutcome, ChildStop, NotificationLevel,
     REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES, RuntimeEvent, UiChildAgent,
-    UiChildState, UiCommandStop, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind,
+    UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind,
     parse_runtime_event,
 };
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};

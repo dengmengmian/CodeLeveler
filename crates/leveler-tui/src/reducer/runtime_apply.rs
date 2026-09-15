@@ -12,6 +12,28 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::RuntimeReady => {}
         RuntimeEvent::SessionOpened { session } => apply_session(state, session),
+        RuntimeEvent::SessionHistoryLoaded {
+            query_id,
+            session_id,
+            entries,
+            omitted_turns,
+        } => {
+            let ours = query_id.is_some() && query_id == state.history_query;
+            if ours {
+                state.history_query = None;
+            }
+            // Only the answer to this client's own query, for the session on
+            // screen, and never over a turn that is running now.
+            // A user shell still running is live state the log has not closed.
+            if ours
+                && session_id == state.session_id
+                && !state.is_busy()
+                && state.shell_screen_item.is_none()
+                && !entries.is_empty()
+            {
+                replay_history(state, entries, omitted_turns);
+            }
+        }
         RuntimeEvent::SessionUpdated { session } => {
             let previous = state.mode;
             apply_meta(state, &session);
@@ -1052,6 +1074,51 @@ fn mark_turn_busy(state: &mut AppState) {
     if !state.is_busy() {
         start_turn(state);
     }
+}
+
+/// Rebuild the transcript from a session's durable history. Each entry goes
+/// through the same projection a live event does, in a scratch state, so the
+/// replay cannot move this session's status, plan, roster or notifications;
+/// only the rebuilt transcript is kept.
+fn replay_history(
+    state: &mut AppState,
+    entries: Vec<leveler_client_protocol::UiHistoryEntry>,
+    omitted_turns: u32,
+) {
+    let mut scratch = AppState::new(
+        crate::theme::Theme::no_color(),
+        crate::state::Boot {
+            session_id: state.session_id.clone(),
+            user: String::new(),
+            version: String::new(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 0,
+            locale: state.locale,
+            untrusted_config: Vec::new(),
+            reasoning_effort: None,
+        },
+    );
+    scratch.size = state.size;
+    if omitted_turns > 0 {
+        scratch.transcript.push_note(
+            state
+                .t()
+                .history_omitted_turns
+                .replace("{}", &omitted_turns.to_string()),
+        );
+    }
+    for entry in entries {
+        if entry.turn_start {
+            start_turn(&mut scratch);
+        }
+        scratch.elapsed_secs = entry.turn_elapsed_ms / 1000;
+        apply_runtime(&mut scratch, entry.event);
+    }
+    // A turn the log never closed (its runtime died) has no outcome to show.
+    scratch.transcript.finalize_in_flight();
+    state.transcript.replace_with(scratch.transcript);
 }
 
 /// Update header metadata from a snapshot without touching the transcript.

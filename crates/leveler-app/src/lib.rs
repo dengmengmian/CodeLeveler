@@ -28,6 +28,7 @@ mod prompt_bridge;
 pub mod runtime_boot;
 mod runtime_identity;
 mod session;
+pub mod session_history;
 mod user_shell;
 mod vcs;
 mod workspace_view;

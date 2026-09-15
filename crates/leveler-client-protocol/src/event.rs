@@ -134,6 +134,19 @@ pub struct UiChildAgent {
     pub cost_usd_micros: Option<u64>,
 }
 
+/// One fact of a past turn, as the live stream carried it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiHistoryEntry {
+    /// Milliseconds from the start of the turn this entry belongs to, taken
+    /// from the durable record times — a replay has no live clock.
+    pub turn_elapsed_ms: u64,
+    /// The first entry of a turn.
+    #[serde(default)]
+    pub turn_start: bool,
+    pub event: RuntimeEvent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChildContribution {
@@ -537,6 +550,17 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
         observation: crate::UiObservabilityLoaded,
+    },
+    /// Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest
+    /// turns in order. `omitted_turns` older turns were left out to bound the
+    /// response; they are still in the session.
+    SessionHistoryLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        session_id: leveler_core::SessionId,
+        entries: Vec<UiHistoryEntry>,
+        #[serde(default)]
+        omitted_turns: u32,
     },
 }
 

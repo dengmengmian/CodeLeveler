@@ -15,6 +15,17 @@ async fn begin_immediate(
     Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
 }
 
+/// A stored message payload with its position and record time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedMessage {
+    /// Append position in the session's message log.
+    pub ordinal: u64,
+    /// RFC 3339, as written.
+    pub created_at: String,
+    /// The serialized message.
+    pub payload: String,
+}
+
 /// Read/write access to the `session_messages` table.
 pub struct MessageRepository<'a> {
     db: &'a Database,
@@ -319,6 +330,29 @@ impl<'a> MessageRepository<'a> {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
+    /// All of a session's payloads in order, each with its ordinal and record
+    /// time, for a history view that places messages among events.
+    pub async fn load_timed(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<TimedMessage>, StorageError> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT ordinal, created_at, payload FROM session_messages \
+             WHERE session_id = ?1 ORDER BY ordinal ASC",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ordinal, created_at, payload)| TimedMessage {
+                ordinal: ordinal.max(0) as u64,
+                created_at,
+                payload,
+            })
+            .collect())
+    }
+
     /// Load all message payloads for a session, in order.
     pub async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -451,6 +485,29 @@ mod tests {
             repo.load(&id).await.unwrap(),
             vec![r#""a""#, r#""b""#, r#""c""#]
         );
+    }
+
+    /// A history replay interleaves messages with events by record time.
+    #[tokio::test]
+    async fn load_timed_carries_each_payloads_record_time() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+        let repo = MessageRepository::new(&db);
+        let first = leveler_core::now();
+        let later = first + chrono::Duration::seconds(5);
+        repo.append(&id, &[r#""a""#.into()], first).await.unwrap();
+        repo.append(&id, &[r#""b""#.into()], later).await.unwrap();
+
+        let rows = repo.load_timed(&id).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.payload.as_str()).collect::<Vec<_>>(),
+            vec![r#""a""#, r#""b""#]
+        );
+        assert_eq!(rows[0].created_at, first.to_rfc3339());
+        assert_eq!(rows[1].created_at, later.to_rfc3339());
+        assert_eq!((rows[0].ordinal, rows[1].ordinal), (0, 1));
     }
 
     #[tokio::test]

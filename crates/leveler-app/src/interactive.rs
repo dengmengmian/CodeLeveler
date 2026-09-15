@@ -2917,6 +2917,32 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::UnfinishedGoalsLoaded { query_id, goals });
                 Ok(())
             }
+            ClientCommand::QuerySessionHistory {
+                session_id,
+                query_id,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                match crate::session_history::load_session_history(&db, &session_id).await {
+                    Ok((entries, omitted_turns)) => {
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::SessionHistoryLoaded {
+                                    query_id,
+                                    session_id: session_id.clone(),
+                                    entries,
+                                    omitted_turns,
+                                });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("session history: {error}"));
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::ListAgents {
                 session_id,
                 query_id,

@@ -107,6 +107,139 @@ export type RestartReason =
   /** A newer artifact is installed and waiting to take over. Reserved for the updater; nothing sends it yet. */
   | 'update_ready';
 
+/** An event flowing from the runtime to clients. */
+export type RuntimeEvent =
+  /** The runtime finished booting and is ready for commands. */
+  | { type: 'runtime_ready' }
+  /** A session was opened / its snapshot refreshed. */
+  | { type: 'session_opened'; session: UiSessionSnapshot }
+  /** Session metadata changed (model/mode/branch) without touching the transcript — refresh the header only. */
+  | { type: 'session_updated'; session: UiSessionSnapshot }
+  /** The runtime needs the user to approve a risky action . */
+  | { type: 'approval_requested'; request: UiApprovalRequest }
+  /** A pending approval was resolved (by any connected client, or by a timeout/cancel). Clients dismiss the matching prompt so a second client never answers an approval that no longer exists. */
+  | { type: 'approval_resolved'; id: ApprovalId }
+  /** The agent is asking the user a clarifying question (spec §35). */
+  | { type: 'clarification_requested'; request: UiClarificationRequest }
+  /** A pending clarification was resolved (by any client, timeout, or cancel). */
+  | { type: 'clarification_resolved'; id: ClarificationId }
+  /** An imported attachment was processed and stored (spec §39). */
+  | { type: 'attachment_added'; attachment: AttachmentRef }
+  /** Importing an attachment failed. */
+  | { type: 'attachment_processing_failed'; error: string }
+  /** A user message was appended to the transcript. */
+  | { type: 'user_message_added'; message: UiMessage }
+  /** A new assistant message began; deltas will target this id. */
+  | { type: 'assistant_message_started'; message_id: MessageId }
+  /** A retry attempt began. Remove the prior transient message, if present, and clear its reasoning before applying new deltas. */
+  | { type: 'assistant_attempt_reset'; message_id?: MessageId | null }
+  /** A chunk of assistant text for an in-flight message. */
+  | { type: 'assistant_text_delta'; delta: string; message_id: MessageId }
+  /** A chunk of model reasoning/summary, rendered separately from the answer. */
+  | { type: 'reasoning_delta'; delta: string }
+  /** The assistant message is complete. */
+  | { type: 'assistant_message_completed'; message_id: MessageId }
+  /** The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event. */
+  | { type: 'turn_finalizing'; stage: FinalizationStage }
+  /** Coarse progress label from the runtime, shown in the status line. */
+  | { type: 'agent_activity'; label: string }
+  /** Heartbeat while a long command tool runs (runtime observability). Lets a client show "运行 cargo test" with a live elapsed instead of a bare "等待模型". Structured so TUI/Web/logs can consume it uniformly. */
+  | { type: 'command_progress'; elapsed_ms: number; label: string }
+  /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
+  | { type: 'project_rules_loaded'; sources: string[] }
+  /** A tool call started . */
+  | { type: 'tool_call_started'; arguments: string; id: ToolCallId; name: string; parallel?: boolean }
+  /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
+  | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
+  /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
+  | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
+  /** The execution plan was created or a step's status changed (spec §20). */
+  | { type: 'plan_updated'; plan: UiPlan }
+  /** Verification progress: a check finished or the run concluded (spec §22). */
+  | { type: 'verification_updated'; verification: UiVerification }
+  /** The working-tree diff was (re)computed (spec §21). */
+  | { type: 'diff_updated'; diff: UiDiff }
+  /** A conversation checkpoint was created (spec §68). */
+  | { type: 'checkpoint_created'; checkpoint: UiCheckpoint }
+  /** The list of stored sessions (spec §52). */
+  | { type: 'session_list'; sessions: UiSessionSummary[] }
+  /** Context package info from an orchestrated run (spec §53). */
+  | { type: 'context_updated'; candidate_files: string[]; estimated_tokens: number }
+  /** The runtime folded conversation history: `from` transcript messages became `to`. A stable product fact — clients own the wording and the locale; the runtime does not send prose for this. */
+  | { type: 'context_compacted'; from: number; to: number }
+  /** Replay-only. The adaptive-context ladder that climbed the fold threshold was deleted; the variant survives so an old event log still decodes, and nothing emits one. Token budgets, not message counts. */
+  | { type: 'context_expanded'; from_tokens: number; reason: string; to_tokens: number }
+  /** A user shell execution (`!command`) started. User-originated direct host execution — not an agent tool call; clients render it as its own block and never feed it to the model conversation. */
+  | { type: 'user_shell_started'; command: string; cwd: string; execution_id: UserShellId }
+  /** Live output from a running user shell. `stream` is `stdout` or `stderr`. Transient: clients keep a bounded buffer; the runtime does not persist chunks. */
+  | { type: 'user_shell_output'; chunk: string; execution_id: UserShellId; stream: string }
+  /** A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned. */
+  | { type: 'user_shell_exited'; duration_ms: number; execution_id: UserShellId; exit_code?: number | null; status: string }
+  /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. */
+  | { type: 'token_usage'; cached_input_tokens: number; input_tokens: number; output_tokens: number }
+  /** An orchestrated run completed; carries the summary report (spec §23). */
+  | { type: 'session_completed'; report: UiCompletionReport }
+  /** The current turn finished successfully. */
+  | { type: 'turn_completed' }
+  /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. */
+  | { type: 'turn_completed_with_warnings'; reason: string }
+  /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
+  | { type: 'turn_answered' }
+  /** The turn stopped at an output limit even after bounded continuation. */
+  | { type: 'turn_truncated'; error: string }
+  /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
+  | { type: 'turn_incomplete'; reason: string }
+  /** The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish). */
+  | { type: 'turn_completed_unverified'; reason: string }
+  /** The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks. */
+  | { type: 'turn_completed_checks_failed'; reason: string }
+  /** The current turn failed. */
+  | { type: 'turn_failed'; error: string }
+  /** The current turn was cancelled (resumable). */
+  | { type: 'turn_cancelled' }
+  /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
+  | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
+  /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
+  | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
+  /** Live execution state and cumulative model usage for one spawned agent. */
+  | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
+  /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */
+  | { type: 'sub_agent_activity'; id: string; is_error: boolean; phase: string; preview: string; tool: string }
+  /** Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation. */
+  | { type: 'child_contribution_loaded'; detail: UiChildContribution; query_id?: CommandId | null }
+  /** A durable goal checkpoint was cut; render it as a Recap history item (long-goal P3). Emitted for `/recap`, milestones, context compaction, and on surfacing an interruption checkpoint — the recap carries its `checkpoint_id`, so an expanded view presents the same persisted facts. */
+  | { type: 'goal_recap_created'; recap: UiGoalRecap }
+  /** Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only. */
+  | { type: 'unfinished_goals_loaded'; goals?: UiUnfinishedGoal[]; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::ListAgents`]. */
+  | { type: 'agents_loaded'; agents: UiAgentEntry[]; problems?: UiAgentProblem[]; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and `error` says why when the name does not resolve. */
+  | { type: 'agent_loaded'; agent?: UiAgentDetail | null; error?: string | null; name: string; query_id?: CommandId | null }
+  /** Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure nothing was written and `error` is the reason. */
+  | { type: 'agent_mutated'; agent?: UiAgentEntry | null; error?: string | null; name: string; ok: boolean; query_id?: CommandId | null }
+  /** A transient notification for the status line. */
+  | { type: 'notification'; level: NotificationLevel; message: string }
+  /** A background process task was started (`run_command` background=true). */
+  | { type: 'background_task_started'; args: string[]; program: string; task_id: string }
+  /** A background task finished (exit or kill). */
+  | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; task_id: string }
+  /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
+  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
+  /** Side-question (`/btw`) started; not persisted to session history. */
+  | { type: 'btw_started'; question: string }
+  /** Side-question answer chunk (often one full answer in MVP). */
+  | { type: 'btw_text_delta'; delta: string }
+  /** Side-question finished successfully. */
+  | { type: 'btw_completed' }
+  /** Side-question failed. */
+  | { type: 'btw_failed'; error: string }
+  /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
+  | { type: 'turn_progress'; closing: boolean; no_progress_streak: number; phase: string }
+  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a current client must not treat that as ownership. */
+  | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest turns in order. `omitted_turns` older turns were left out to bound the response; they are still in the session. */
+  | { type: 'session_history_loaded'; entries: UiHistoryEntry[]; omitted_turns?: number; query_id?: CommandId | null; session_id: SessionId };
+
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
 
@@ -399,6 +532,15 @@ export interface UiGoalRecap {
   verification: string;
   /** Evidence for a pass, or the failure detail. Absent when unmeasured. */
   verification_detail?: string | null;
+}
+
+/** One fact of a past turn, as the live stream carried it. */
+export interface UiHistoryEntry {
+  event: RuntimeEvent;
+  /** Milliseconds from the start of the turn this entry belongs to, taken from the durable record times — a replay has no live clock. */
+  turn_elapsed_ms: number;
+  /** The first entry of a turn. */
+  turn_start?: boolean;
 }
 
 /** What one lane of a session spent. `lane` is `main`, `children` or `total`. */
@@ -787,6 +929,8 @@ export type ClientCommand =
   | { type: 'recap'; session_id: SessionId }
   /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. */
   | { type: 'list_unfinished_goals'; query_id?: CommandId | null; session_id: SessionId }
+  /** The session's past turns as clients saw them live: its durable event log projected through the same client projection, with the user's messages in place. Answered by [`crate::RuntimeEvent::SessionHistoryLoaded`]. */
+  | { type: 'query_session_history'; query_id?: CommandId | null; session_id: SessionId }
   /** List the agent definitions the session's project resolves. Answered by [`crate::RuntimeEvent::AgentsLoaded`]. */
   | { type: 'list_agents'; query_id?: CommandId | null; session_id: SessionId }
   /** One agent with its full definition. Answered by [`crate::RuntimeEvent::AgentLoaded`]. */
@@ -799,134 +943,3 @@ export type ClientCommand =
   | { type: 'delete_agent'; name: string; query_id?: CommandId | null; scope: UiAgentScope; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
-
-/** An event flowing from the runtime to clients. */
-export type RuntimeEvent =
-  /** The runtime finished booting and is ready for commands. */
-  | { type: 'runtime_ready' }
-  /** A session was opened / its snapshot refreshed. */
-  | { type: 'session_opened'; session: UiSessionSnapshot }
-  /** Session metadata changed (model/mode/branch) without touching the transcript — refresh the header only. */
-  | { type: 'session_updated'; session: UiSessionSnapshot }
-  /** The runtime needs the user to approve a risky action . */
-  | { type: 'approval_requested'; request: UiApprovalRequest }
-  /** A pending approval was resolved (by any connected client, or by a timeout/cancel). Clients dismiss the matching prompt so a second client never answers an approval that no longer exists. */
-  | { type: 'approval_resolved'; id: ApprovalId }
-  /** The agent is asking the user a clarifying question (spec §35). */
-  | { type: 'clarification_requested'; request: UiClarificationRequest }
-  /** A pending clarification was resolved (by any client, timeout, or cancel). */
-  | { type: 'clarification_resolved'; id: ClarificationId }
-  /** An imported attachment was processed and stored (spec §39). */
-  | { type: 'attachment_added'; attachment: AttachmentRef }
-  /** Importing an attachment failed. */
-  | { type: 'attachment_processing_failed'; error: string }
-  /** A user message was appended to the transcript. */
-  | { type: 'user_message_added'; message: UiMessage }
-  /** A new assistant message began; deltas will target this id. */
-  | { type: 'assistant_message_started'; message_id: MessageId }
-  /** A retry attempt began. Remove the prior transient message, if present, and clear its reasoning before applying new deltas. */
-  | { type: 'assistant_attempt_reset'; message_id?: MessageId | null }
-  /** A chunk of assistant text for an in-flight message. */
-  | { type: 'assistant_text_delta'; delta: string; message_id: MessageId }
-  /** A chunk of model reasoning/summary, rendered separately from the answer. */
-  | { type: 'reasoning_delta'; delta: string }
-  /** The assistant message is complete. */
-  | { type: 'assistant_message_completed'; message_id: MessageId }
-  /** The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event. */
-  | { type: 'turn_finalizing'; stage: FinalizationStage }
-  /** Coarse progress label from the runtime, shown in the status line. */
-  | { type: 'agent_activity'; label: string }
-  /** Heartbeat while a long command tool runs (runtime observability). Lets a client show "运行 cargo test" with a live elapsed instead of a bare "等待模型". Structured so TUI/Web/logs can consume it uniformly. */
-  | { type: 'command_progress'; elapsed_ms: number; label: string }
-  /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
-  | { type: 'project_rules_loaded'; sources: string[] }
-  /** A tool call started . */
-  | { type: 'tool_call_started'; arguments: string; id: ToolCallId; name: string; parallel?: boolean }
-  /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
-  | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
-  /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
-  | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
-  /** The execution plan was created or a step's status changed (spec §20). */
-  | { type: 'plan_updated'; plan: UiPlan }
-  /** Verification progress: a check finished or the run concluded (spec §22). */
-  | { type: 'verification_updated'; verification: UiVerification }
-  /** The working-tree diff was (re)computed (spec §21). */
-  | { type: 'diff_updated'; diff: UiDiff }
-  /** A conversation checkpoint was created (spec §68). */
-  | { type: 'checkpoint_created'; checkpoint: UiCheckpoint }
-  /** The list of stored sessions (spec §52). */
-  | { type: 'session_list'; sessions: UiSessionSummary[] }
-  /** Context package info from an orchestrated run (spec §53). */
-  | { type: 'context_updated'; candidate_files: string[]; estimated_tokens: number }
-  /** The runtime folded conversation history: `from` transcript messages became `to`. A stable product fact — clients own the wording and the locale; the runtime does not send prose for this. */
-  | { type: 'context_compacted'; from: number; to: number }
-  /** Replay-only. The adaptive-context ladder that climbed the fold threshold was deleted; the variant survives so an old event log still decodes, and nothing emits one. Token budgets, not message counts. */
-  | { type: 'context_expanded'; from_tokens: number; reason: string; to_tokens: number }
-  /** A user shell execution (`!command`) started. User-originated direct host execution — not an agent tool call; clients render it as its own block and never feed it to the model conversation. */
-  | { type: 'user_shell_started'; command: string; cwd: string; execution_id: UserShellId }
-  /** Live output from a running user shell. `stream` is `stdout` or `stderr`. Transient: clients keep a bounded buffer; the runtime does not persist chunks. */
-  | { type: 'user_shell_output'; chunk: string; execution_id: UserShellId; stream: string }
-  /** A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned. */
-  | { type: 'user_shell_exited'; duration_ms: number; execution_id: UserShellId; exit_code?: number | null; status: string }
-  /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. */
-  | { type: 'token_usage'; cached_input_tokens: number; input_tokens: number; output_tokens: number }
-  /** An orchestrated run completed; carries the summary report (spec §23). */
-  | { type: 'session_completed'; report: UiCompletionReport }
-  /** The current turn finished successfully. */
-  | { type: 'turn_completed' }
-  /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. */
-  | { type: 'turn_completed_with_warnings'; reason: string }
-  /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
-  | { type: 'turn_answered' }
-  /** The turn stopped at an output limit even after bounded continuation. */
-  | { type: 'turn_truncated'; error: string }
-  /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
-  | { type: 'turn_incomplete'; reason: string }
-  /** The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish). */
-  | { type: 'turn_completed_unverified'; reason: string }
-  /** The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks. */
-  | { type: 'turn_completed_checks_failed'; reason: string }
-  /** The current turn failed. */
-  | { type: 'turn_failed'; error: string }
-  /** The current turn was cancelled (resumable). */
-  | { type: 'turn_cancelled' }
-  /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
-  /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
-  | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
-  /** Live execution state and cumulative model usage for one spawned agent. */
-  | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
-  /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */
-  | { type: 'sub_agent_activity'; id: string; is_error: boolean; phase: string; preview: string; tool: string }
-  /** Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation. */
-  | { type: 'child_contribution_loaded'; detail: UiChildContribution; query_id?: CommandId | null }
-  /** A durable goal checkpoint was cut; render it as a Recap history item (long-goal P3). Emitted for `/recap`, milestones, context compaction, and on surfacing an interruption checkpoint — the recap carries its `checkpoint_id`, so an expanded view presents the same persisted facts. */
-  | { type: 'goal_recap_created'; recap: UiGoalRecap }
-  /** Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only. */
-  | { type: 'unfinished_goals_loaded'; goals?: UiUnfinishedGoal[]; query_id?: CommandId | null }
-  /** Result of [`crate::ClientCommand::ListAgents`]. */
-  | { type: 'agents_loaded'; agents: UiAgentEntry[]; problems?: UiAgentProblem[]; query_id?: CommandId | null }
-  /** Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and `error` says why when the name does not resolve. */
-  | { type: 'agent_loaded'; agent?: UiAgentDetail | null; error?: string | null; name: string; query_id?: CommandId | null }
-  /** Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure nothing was written and `error` is the reason. */
-  | { type: 'agent_mutated'; agent?: UiAgentEntry | null; error?: string | null; name: string; ok: boolean; query_id?: CommandId | null }
-  /** A transient notification for the status line. */
-  | { type: 'notification'; level: NotificationLevel; message: string }
-  /** A background process task was started (`run_command` background=true). */
-  | { type: 'background_task_started'; args: string[]; program: string; task_id: string }
-  /** A background task finished (exit or kill). */
-  | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; task_id: string }
-  /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
-  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
-  /** Side-question (`/btw`) started; not persisted to session history. */
-  | { type: 'btw_started'; question: string }
-  /** Side-question answer chunk (often one full answer in MVP). */
-  | { type: 'btw_text_delta'; delta: string }
-  /** Side-question finished successfully. */
-  | { type: 'btw_completed' }
-  /** Side-question failed. */
-  | { type: 'btw_failed'; error: string }
-  /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
-  | { type: 'turn_progress'; closing: boolean; no_progress_streak: number; phase: string }
-  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a current client must not treat that as ownership. */
-  | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null };
