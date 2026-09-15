@@ -674,8 +674,6 @@ mod plan_sync_contract_tests {
         for needle in [
             "update_plan",
             "in_progress",
-            "completed",
-            "transition",
             "Before `update_goal`",
             "blocked",
         ] {
@@ -684,6 +682,67 @@ mod plan_sync_contract_tests {
                 "plan section lost `{needle}`:\n{section}"
             );
         }
+    }
+
+    /// Plan truth contract. COMPLETE / FAILURE / REVISE are the semantics the
+    /// transition experiment showed remove plan-ahead errors (a failed or
+    /// abandoned step marked completed); pinned so a rewording cannot drop them.
+    #[test]
+    fn completed_means_the_outcome_is_true() {
+        let section = plan_section();
+        for needle in ["`completed` only", "outcome is true", "already read"] {
+            assert!(
+                section.contains(needle),
+                "COMPLETE lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_action_completes_nothing() {
+        let section = plan_section();
+        assert!(
+            section.contains("failed, denied or timed-out action never completes a step"),
+            "FAILURE lost:\n{section}"
+        );
+        assert!(
+            section.contains("same outcome another way") && section.contains("stays `in_progress`"),
+            "same-objective retry must keep the step in progress:\n{section}"
+        );
+    }
+
+    #[test]
+    fn a_changed_objective_is_revised_not_completed() {
+        let section = plan_section();
+        for needle in [
+            "rewrite that step",
+            "never mark an abandoned or replaced step `completed`",
+        ] {
+            assert!(
+                section.contains(needle),
+                "REVISE lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    /// The plan tracks steps, not tool calls: a short trail is accepted, a
+    /// plan left describing a stage the work has already left is not. The
+    /// same-response START rule had no measurable effect and must not return.
+    #[test]
+    fn short_lag_is_accepted_but_the_plan_converges() {
+        let section = plan_section();
+        assert!(
+            section.contains("may trail"),
+            "LAG acceptance lost:\n{section}"
+        );
+        assert!(
+            section.contains("already left behind"),
+            "convergence lost:\n{section}"
+        );
+        assert!(
+            !section.contains("same response as the first tool call"),
+            "the same-response START rule was measured ineffective:\n{section}"
+        );
     }
 
     #[test]

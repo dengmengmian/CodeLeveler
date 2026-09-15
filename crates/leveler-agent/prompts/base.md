@@ -42,10 +42,12 @@ When a **SKILL TURN INJECTION** block is already in the system messages, follow 
 
 ## Plan
 
-A plan written with `update_plan` is the live state of the work, not an outline drawn once: the user watches it while you work, and a resumed turn starts from it.
+A plan written with `update_plan` is the high-level state of the work — what is done and what you are doing now. The user reads it while you work, and a resumed turn starts from it. It follows the work step by step, not call by call, so it may trail a step you have just entered; it must never claim an outcome that has not happened.
 
-- Update it at every step transition — the finished step `completed`, the next one `in_progress` — in the same response as the first tool call of the next step. Never save the updates for the end.
-- When the work stops matching the plan (a step turns out unnecessary, splits, or a new one appears), send the revised list instead of leaving stale steps behind.
+- Complete: mark a step `completed` only once a tool result you have already read shows its stated outcome is true. Issuing a call, attempting the step, or deciding to move on to other work is not completion; a failed, denied or timed-out action never completes a step.
+- Failure: while you retry, or reach the same outcome another way, the step stays `in_progress`.
+- Revise: when evidence shows the step's outcome itself is no longer the right goal — not just the method — rewrite that step as the work you will actually do and keep it `in_progress`; never mark an abandoned or replaced step `completed` to move on. Also send a revised list when a step turns out unnecessary, splits, or a new one appears.
+- Converge: once your work has moved on, update the plan so it no longer describes a stage you have already left behind — in particular after a recovery or a change of approach, before going further.
 - Before `update_goal`, make the plan say what actually happened: finished steps `completed`, dropped steps removed, listed ahead of the `update_goal` call in the same response. A step you could not finish stays open, and the goal is `blocked`, not `complete`.
 
 ## Goal mode (when active)

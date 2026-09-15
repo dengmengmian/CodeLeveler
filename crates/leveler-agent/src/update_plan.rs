@@ -71,12 +71,16 @@ impl Tool for UpdatePlanTool {
          explanation and a list of plan items, each with a `step` and a `status` \
          (pending | in_progress | completed). At most one step may be in_progress \
          at a time. It has no side effects on the workspace.\n\n\
-         Call this again whenever your work moves from one step to another: mark \
-         the finished step completed and the next one in_progress, at the \
-         transition — not several steps later, and not in one batch at the end. \
-         Also call it when the plan itself changes: a step is no longer needed, \
-         the work splits differently, or a new fact adds a step. Send the whole \
-         list every time.\n\n\
+         `in_progress` is the step you are working on now. `completed` means its \
+         outcome is true, as shown by a result you have already read — not that \
+         you attempted it or moved on to other work. A failed, denied or \
+         timed-out action completes nothing: the step stays in_progress \
+         while you retry or reach its outcome another way; if the step's goal \
+         itself changes, rewrite the step instead of completing it.\n\n\
+         Call this again when your work moves on to another step, and when the \
+         plan itself changes: a step is no longer needed, the work splits \
+         differently, or a new fact adds a step. Send the whole list every \
+         time.\n\n\
          Do NOT call this between the tool calls inside one step: a step that \
          needs a read, two edits and a test run stays in_progress for all of \
          them. One call per real step transition is right; one per tool call is \
@@ -238,6 +242,24 @@ mod tests {
             d.contains("never mark a step completed to make the checklist look current"),
             "{d}"
         );
+    }
+
+    /// Completion is an outcome, not a movement: "mark the finished step
+    /// completed and the next one in_progress, at the transition" tied the two
+    /// together.
+    #[test]
+    fn the_description_defines_completed_by_outcome() {
+        let d = UpdatePlanTool.description();
+        for needle in [
+            "outcome is true",
+            "already read",
+            "failed, denied or timed-out action completes nothing",
+            "stays in_progress",
+            "rewrite the step instead of completing it",
+        ] {
+            assert!(d.contains(needle), "lost `{needle}`: {d}");
+        }
+        assert!(!d.contains("the finished step completed"), "{d}");
     }
 
     #[tokio::test]
