@@ -885,12 +885,15 @@ fn prepare_cargo_home(
 }
 
 /// The overlay `CARGO_HOME`: the host's Cargo config plus links to a registry
-/// source. It is one directory per workspace and registry source, never one
-/// per command — Cargo fingerprints a registry dependency by the path its
-/// source is read from, so a home that moved between commands rebuilt every
-/// dependency on every command. Concurrent commands share it, so it is
-/// refreshed under a lock and only ever changed atomically: a running Cargo
-/// never meets a missing link or a half-written config.
+/// source. It is one directory per workspace, never one per command or per
+/// source — Cargo fingerprints a registry dependency by the path its source is
+/// read from, so a home that moved between commands (or between an online
+/// command and an `--offline` one) rebuilt every dependency. Concurrent
+/// commands share it, so it is refreshed under a lock and only ever changed
+/// atomically: a running Cargo never meets a missing link or a half-written
+/// config. A command reading the other source switches the links; a Cargo
+/// already running against the old ones may then open a crate from the other
+/// registry, which holds the same published sources.
 #[cfg(not(windows))]
 fn prepare_cargo_home(
     environment: &leveler_core::EnvSnapshot,
@@ -900,11 +903,7 @@ fn prepare_cargo_home(
     workspace: &Path,
     read_host_cache: bool,
 ) -> std::io::Result<PathBuf> {
-    let name = if read_host_cache {
-        "cargo-home-host"
-    } else {
-        "cargo-home-private"
-    };
+    let name = "cargo-home";
     let mut lock_options = cap_std::fs::OpenOptions::new();
     lock_options.create(true).write(true);
     {
@@ -1300,8 +1299,9 @@ mod tests {
     /// Cargo fingerprints a registry dependency by the path its source is read
     /// from, so a `CARGO_HOME` that moves between commands rebuilds every
     /// dependency on every command. Each command in a workspace gets the same
-    /// one (per registry source), and the child may write into it — Cargo keeps
-    /// its package lock there — without being able to replace the directory.
+    /// one — whichever registry source it reads — and the child may write into
+    /// it (Cargo keeps its package lock there) without being able to replace
+    /// the directory.
     #[cfg(unix)]
     #[test]
     fn a_workspace_keeps_one_cargo_home_across_commands() {
@@ -1331,6 +1331,10 @@ mod tests {
             prepare_sandbox_paths(&env, &ws, true).expect("prepare paths"),
         );
         assert_eq!(third.cargo_home, fourth.cargo_home);
+        assert_eq!(
+            third.cargo_home, second.cargo_home,
+            "an offline command reads the same path as an online one"
+        );
         assert!(third.cargo_home.is_dir());
         assert!(second.cargo_home.is_dir(), "a dropped command keeps it");
     }
