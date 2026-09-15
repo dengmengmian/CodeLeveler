@@ -65,8 +65,18 @@ pub(crate) fn result_lines(
         Span::styled(
             format!(
                 " · {}",
-                t.tool_output_lines
-                    .replace("{}", &parsed.content_lines.to_string())
+                t.tool_output_lines.replace(
+                    "{}",
+                    &if call
+                        .preview
+                        .as_deref()
+                        .is_some_and(|p| p.trim_end().ends_with('\u{2026}'))
+                    {
+                        format!("{}+", parsed.content_lines)
+                    } else {
+                        parsed.content_lines.to_string()
+                    }
+                )
             ),
             Style::default().fg(theme.border.normal),
         ),

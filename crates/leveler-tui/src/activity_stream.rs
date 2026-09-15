@@ -719,8 +719,9 @@ fn unit_lines(
         let n = content_line_count(call);
         if n > 0 {
             let (pre, post) = split_placeholder(t.tool_output_lines);
+            let at_least = if preview_truncated(call) { "+" } else { "" };
             head.push(Span::styled(
-                format!(" · {pre}{n}{post}"),
+                format!(" · {pre}{n}{at_least}{post}"),
                 Style::default().fg(theme.text.muted),
             ));
         }
@@ -1135,8 +1136,10 @@ fn result_lines_for(
         Style::default().fg(theme.text.secondary),
     )];
     if let Some(first) = first {
-        let count_w =
-            UnicodeWidthStr::width(pre) + n.to_string().len() + UnicodeWidthStr::width(post);
+        let count_w = UnicodeWidthStr::width(pre)
+            + n.to_string().len()
+            + usize::from(preview_truncated(call))
+            + UnicodeWidthStr::width(post);
         let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
         spans.push(Span::styled(
             truncate_display(&first, avail),
@@ -1152,7 +1155,11 @@ fn result_lines_for(
         Style::default().fg(theme.text.secondary),
     ));
     spans.push(Span::styled(
-        n.to_string(),
+        if preview_truncated(call) {
+            format!("{n}+")
+        } else {
+            n.to_string()
+        },
         Style::default().fg(theme.text.muted),
     ));
     spans.push(Span::styled(
@@ -1293,6 +1300,14 @@ fn preview_body_lines(call: &ToolCallBlock) -> Vec<&str> {
             !l.trim().is_empty() && !metadata
         })
         .collect()
+}
+
+/// The runtime caps a result's preview and marks the cut with a trailing "…",
+/// so a count taken from it is a lower bound.
+fn preview_truncated(call: &ToolCallBlock) -> bool {
+    call.preview
+        .as_deref()
+        .is_some_and(|p| p.trim_end().ends_with('\u{2026}'))
 }
 
 /// Output line count for an Ok result row, skipping shell metadata rows.
@@ -3021,6 +3036,26 @@ mod tests {
         assert!(
             !summary.contains('\t'),
             "line-number gutter must not leak into the summary row: {summary}"
+        );
+    }
+
+    /// The runtime's preview is capped (it ends in "…" when cut), so its line
+    /// count is only a lower bound. Dogfood: a 130-line wait_task result read
+    /// "91 行".
+    #[test]
+    fn a_truncated_preview_reports_its_size_as_a_lower_bound() {
+        let mut c = call("wait_task", r#"{"task_id":"bg-1"}"#, ToolStatus::Ok);
+        let body: Vec<String> = (1..=91).map(|i| format!("soak tick {i}")).collect();
+        c.preview = Some(format!("{}…", body.join("\n")));
+        let joined = render_group_text(&group(vec![c]), 120, Locale::Zh).join("\n");
+        assert!(joined.contains("91+ 行"), "{joined}");
+
+        let mut whole = call("wait_task", r#"{"task_id":"bg-1"}"#, ToolStatus::Ok);
+        whole.preview = Some("a\nb\nc".into());
+        let joined = render_group_text(&group(vec![whole]), 120, Locale::Zh).join("\n");
+        assert!(
+            joined.contains("3 行") && !joined.contains("3+ 行"),
+            "{joined}"
         );
     }
 
