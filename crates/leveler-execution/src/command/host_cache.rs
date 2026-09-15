@@ -443,12 +443,16 @@ pub(crate) fn prepare_sandbox_paths(
     }
     let cargo_home = prepare_cargo_home(
         environment,
-        &scratch,
+        &tool_cache_dir,
         &cache_base,
         &tool_cache,
         &workspace,
         read_host_caches,
     )?;
+    // Cargo keeps its package lock in its home, so the child writes there; as
+    // a cache root the directory itself cannot be replaced.
+    #[cfg(not(windows))]
+    cache_write_roots.push(cargo_home.clone());
     let wrapper_env_overrides = wrapper_env_overrides(
         environment,
         &workspace,
@@ -563,15 +567,34 @@ fn replace_with_readonly_link(
     }
     #[cfg(unix)]
     {
+        let source = source.canonicalize()?;
         match directory.symlink_metadata(destination) {
+            // Already the link it should be: leave it, a running Cargo may be
+            // reading through it.
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && directory
+                        .read_link_contents(destination)
+                        .is_ok_and(|target| target == source) =>
+            {
+                Ok(())
+            }
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 directory.remove_dir_all(destination)?;
+                directory.symlink_contents(source, destination)
             }
-            Ok(_) => directory.remove_file(destination)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            // A link or file is replaced in one step.
+            Ok(_) => {
+                let staged = staged_name(destination);
+                remove_entry(directory, &staged)?;
+                directory.symlink_contents(source, &staged)?;
+                directory.rename(&staged, directory, destination)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                directory.symlink_contents(source, destination)
+            }
+            Err(error) => Err(error),
         }
-        directory.symlink_contents(source.canonicalize()?, destination)
     }
 }
 
@@ -752,9 +775,11 @@ fn is_absent_or_unreadable(error: &std::io::Error) -> bool {
     }
 }
 
-fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result<()> {
+fn sync_cargo_config(host: Option<&Path>, private: &cap_std::fs::Dir) -> std::io::Result<()> {
     const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
-    let host = cap_std::fs::Dir::open_ambient_dir(host, cap_std::ambient_authority())?;
+    let host = host
+        .map(|host| cap_std::fs::Dir::open_ambient_dir(host, cap_std::ambient_authority()))
+        .transpose()?;
     for name in ["config", "config.toml", "credentials", "credentials.toml"] {
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
@@ -763,10 +788,11 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
             use cap_std::fs::OpenOptionsExt as _;
             options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         }
-        let source = match host.open_with(name, &options) {
-            Ok(source) => Some(source),
-            Err(error) if is_absent_or_unreadable(&error) => None,
-            Err(error) => return Err(error),
+        let source = match host.as_ref().map(|host| host.open_with(name, &options)) {
+            Some(Ok(source)) => Some(source),
+            Some(Err(error)) if is_absent_or_unreadable(&error) => None,
+            Some(Err(error)) => return Err(error),
+            None => None,
         };
         let mut copied = false;
         if let Some(source) = source {
@@ -794,22 +820,47 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
                 if matches!(name, "config" | "config.toml")
                     && let Ok(text) = std::str::from_utf8(&bytes)
                 {
-                    private.write(name, neutralize_cache_only_wrappers(text))?;
+                    replace_file(
+                        private,
+                        name,
+                        neutralize_cache_only_wrappers(text).as_bytes(),
+                    )?;
                 } else {
-                    private.write(name, bytes)?;
+                    replace_file(private, name, &bytes)?;
                 }
                 copied = true;
             }
         }
-        if !copied && let Ok(metadata) = private.symlink_metadata(name) {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                private.remove_dir_all(name)?;
-            } else {
-                private.remove_file(name)?;
-            }
+        if !copied {
+            remove_entry(private, name)?;
         }
     }
     Ok(())
+}
+
+/// A sibling name no other preparation in any process is using.
+fn staged_name(name: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".{name}.{}.{n}", std::process::id())
+}
+
+/// Give `name` these contents in one step, and not at all when it already has
+/// them: a Cargo running concurrently reads either the old file or the new one.
+fn replace_file(directory: &cap_std::fs::Dir, name: &str, contents: &[u8]) -> std::io::Result<()> {
+    let unchanged = directory
+        .symlink_metadata(name)
+        .is_ok_and(|metadata| metadata.is_file())
+        && directory
+            .read(name)
+            .is_ok_and(|current| current == contents);
+    if unchanged {
+        return Ok(());
+    }
+    let staged = staged_name(name);
+    remove_entry(directory, &staged)?;
+    directory.write(&staged, contents)?;
+    directory.rename(&staged, directory, name)
 }
 
 /// Windows has no unprivileged symlink, so it cannot build the per-command
@@ -819,7 +870,7 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
 #[cfg(windows)]
 fn prepare_cargo_home(
     environment: &leveler_core::EnvSnapshot,
-    _scratch: &tempfile::TempDir,
+    _tool_cache_dir: &cap_std::fs::Dir,
     private_cache_base: &Path,
     tool_cache: &Path,
     workspace: &Path,
@@ -828,43 +879,81 @@ fn prepare_cargo_home(
     let private = tool_cache.join("cargo");
     std::fs::create_dir_all(&private)?;
     let private_dir = cap_std::fs::Dir::open_ambient_dir(&private, cap_std::ambient_authority())?;
-    if let Some(host) = host_cargo_home(environment, workspace, Some(private_cache_base)) {
-        sync_cargo_config(&host, &private_dir)?;
-    }
+    let host = host_cargo_home(environment, workspace, Some(private_cache_base));
+    sync_cargo_config(host.as_deref(), &private_dir)?;
     Ok(private)
 }
 
+/// The overlay `CARGO_HOME`: the host's Cargo config plus links to a registry
+/// source. It is one directory per workspace and registry source, never one
+/// per command — Cargo fingerprints a registry dependency by the path its
+/// source is read from, so a home that moved between commands rebuilt every
+/// dependency on every command. Concurrent commands share it, so it is
+/// refreshed under a lock and only ever changed atomically: a running Cargo
+/// never meets a missing link or a half-written config.
 #[cfg(not(windows))]
 fn prepare_cargo_home(
     environment: &leveler_core::EnvSnapshot,
-    scratch: &tempfile::TempDir,
+    tool_cache_dir: &cap_std::fs::Dir,
     private_cache_base: &Path,
     tool_cache: &Path,
     workspace: &Path,
     read_host_cache: bool,
 ) -> std::io::Result<PathBuf> {
-    let overlay = scratch.path().join("cargo-overlay");
-    let scratch_dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
-    scratch_dir.create_dir("cargo-overlay")?;
-    let overlay_dir = scratch_dir.open_dir("cargo-overlay")?;
-    if let Some(host) = host_cargo_home(environment, workspace, Some(private_cache_base)) {
-        sync_cargo_config(&host, &overlay_dir)?;
+    let name = if read_host_cache {
+        "cargo-home-host"
+    } else {
+        "cargo-home-private"
+    };
+    let mut lock_options = cap_std::fs::OpenOptions::new();
+    lock_options.create(true).write(true);
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        lock_options.custom_flags(nix::libc::O_NOFOLLOW);
     }
-    for name in ["registry", "git"] {
+    let lock = tool_cache_dir
+        .open_with(format!("{name}.lock"), &lock_options)?
+        .into_std();
+    fs2::FileExt::lock_exclusive(&lock)?;
+
+    let (overlay_dir, overlay) =
+        ensure_real_private_child(tool_cache_dir, tool_cache, name.as_ref())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let host = host_cargo_home(environment, workspace, Some(private_cache_base));
+    sync_cargo_config(host.as_deref(), &overlay_dir)?;
+    for link in ["registry", "git"] {
         let source = if read_host_cache {
-            host_cargo_home(environment, workspace, Some(private_cache_base))
-                .map(|host| host.join(name))
+            host.as_ref().map(|host| host.join(link))
         } else {
-            Some(tool_cache.join("cargo").join(name))
+            Some(tool_cache.join("cargo").join(link))
         };
-        let Some(source) = source else { continue };
-        let source = source.canonicalize().ok();
-        if let Some(source) = source.filter(|source| !source.starts_with(workspace)) {
-            replace_with_readonly_link(&overlay_dir, &source, name)?;
+        let source = source
+            .and_then(|source| source.canonicalize().ok())
+            .filter(|source| !source.starts_with(workspace));
+        match source {
+            Some(source) => replace_with_readonly_link(&overlay_dir, &source, link)?,
+            // No source this time: nothing a previous command left may stand
+            // in for one.
+            None => remove_entry(&overlay_dir, link)?,
         }
     }
+    drop(lock);
     Ok(overlay)
+}
+
+/// Remove one entry without following it, if it is there.
+fn remove_entry(directory: &cap_std::fs::Dir, name: &str) -> std::io::Result<()> {
+    match directory.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            directory.remove_dir_all(name)
+        }
+        Ok(_) => directory.remove_file(name),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_npm_cache(
@@ -1069,7 +1158,7 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(private.path(), cap_std::ambient_authority())
                 .unwrap();
         let started = std::time::Instant::now();
-        sync_cargo_config(host.path(), &private_dir).unwrap();
+        sync_cargo_config(Some(host.path()), &private_dir).unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "opening a hostile FIFO must not block"
@@ -1206,6 +1295,44 @@ mod tests {
         // S4: dropping the background owner cleans up scratch + lock.
         drop(held);
         assert!(!scratch.exists() && !lock.exists());
+    }
+
+    /// Cargo fingerprints a registry dependency by the path its source is read
+    /// from, so a `CARGO_HOME` that moves between commands rebuilds every
+    /// dependency on every command. Each command in a workspace gets the same
+    /// one (per registry source), and the child may write into it — Cargo keeps
+    /// its package lock there — without being able to replace the directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_keeps_one_cargo_home_across_commands() {
+        let (home, workspace, first) = prepared_paths();
+        let env = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.path().as_os_str().to_os_string(),
+            )],
+            std::path::PathBuf::new(),
+            std::env::temp_dir(),
+        );
+        let ws = workspace.path().join("ws");
+        let second = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+        assert_ne!(first.scratch_path(), second.scratch_path());
+        assert_eq!(first.cargo_home, second.cargo_home);
+        assert!(!first.cargo_home.starts_with(first.scratch_path()));
+        assert!(first.cargo_home.starts_with(first.tool_cache_path()));
+        assert!(
+            first.cache_write_roots().contains(&first.cargo_home),
+            "{:?}",
+            first.cache_write_roots()
+        );
+        drop(first);
+        let (third, fourth) = (
+            prepare_sandbox_paths(&env, &ws, true).expect("prepare paths"),
+            prepare_sandbox_paths(&env, &ws, true).expect("prepare paths"),
+        );
+        assert_eq!(third.cargo_home, fourth.cargo_home);
+        assert!(third.cargo_home.is_dir());
+        assert!(second.cargo_home.is_dir(), "a dropped command keeps it");
     }
 
     /// Zero Workspace Pollution, exercised for real: running the full

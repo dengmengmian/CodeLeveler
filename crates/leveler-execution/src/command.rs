@@ -2165,6 +2165,89 @@ mod tests {
         );
     }
 
+    /// The workspace's shared `CARGO_HOME` outlives each command, so what one
+    /// confined command does to it must not reach the next: it may write
+    /// inside (Cargo keeps its package lock there), but it cannot swap the
+    /// directory for a link, and a config it plants is gone before the next
+    /// command runs.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_shared_cargo_home_carries_nothing_from_one_command_to_the_next() {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        let home = base.path().join("home");
+        let outside = base.path().join("outside");
+        for dir in [&workspace, &home, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut variables: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            std::env::vars_os().collect();
+        variables.push(("HOME".into(), home.clone().into_os_string()));
+        variables.push(("LEVELER_HOME".into(), home.join("leveler").into_os_string()));
+        variables.retain(|(name, _)| name != "CARGO_HOME");
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            home.join("tmp"),
+        ));
+        let runner = CommandRunner::with_environment(environment);
+        let run = |script: &str| {
+            let mut request = ProcessRequest::new(
+                "sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "sh".into(),
+                    outside.display().to_string(),
+                ],
+                workspace.clone(),
+            );
+            request.write_scope = WriteScope::Workspace {
+                root: workspace.clone(),
+            };
+            runner.run(request, CancellationToken::new())
+        };
+
+        let planted = run(
+            "printf '[build]\\nrustc-wrapper = \"/bin/evil\"\\n' > \"$CARGO_HOME/config.toml\" && touch \"$CARGO_HOME/.package-cache\" && echo \"$CARGO_HOME\"",
+        )
+        .await
+        .expect("run");
+        assert!(planted.success(), "{planted:?}");
+        let cargo_home = PathBuf::from(planted.stdout.trim());
+
+        let swapped = run("mv \"$CARGO_HOME\" \"$CARGO_HOME.gone\" || rm -rf \"$CARGO_HOME\" && ln -s \"$1\" \"$CARGO_HOME\"")
+            .await
+            .expect("run");
+        assert!(!swapped.success(), "{swapped:?}");
+        assert!(
+            !std::fs::symlink_metadata(&cargo_home)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let next = run("echo \"$CARGO_HOME\"; cat \"$CARGO_HOME/config.toml\" 2>/dev/null || true")
+            .await
+            .expect("run");
+        assert!(next.success(), "{next:?}");
+        assert_eq!(
+            next.stdout.lines().next(),
+            Some(cargo_home.to_str().unwrap())
+        );
+        assert!(!next.stdout.contains("evil"), "{next:?}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cache_symlink_poisoning_cannot_escape_host_initialization() {
