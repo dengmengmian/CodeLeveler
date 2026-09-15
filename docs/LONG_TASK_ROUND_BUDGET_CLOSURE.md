@@ -1,8 +1,10 @@
 # Long-Task Round Budget Closure
 
-Status: **LONG_TASK_ROUND_BUDGET_CLOSURE=PASS (code) — S4 revalidation
-pending.** Two independent defects cut long `leveler run` goals off at 100
-rounds: a hidden 100-round ceiling that overrode every larger explicit round
+Status: **LONG_TASK_ROUND_BUDGET_CLOSURE=PASS.** Main CI `34916971546`
+(attempt 1) green on `f89c1db`; the S4 revalidation ran 6 of 6 runs to
+completion with no round-limit stop (MA4-C: 3 of 4 `high` runs cut at 100).
+
+Two independent defects cut long `leveler run` goals off at 100 rounds: a hidden 100-round ceiling that overrode every larger explicit round
 window, and a `wait_task` that answered a child id instantly, so a parent
 polling its children spent one model round per poll. Both are fixed with
 tests. No number was invented: the windows callers already declare now take

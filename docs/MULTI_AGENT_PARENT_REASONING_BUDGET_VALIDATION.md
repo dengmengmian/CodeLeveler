@@ -1,8 +1,16 @@
 # Multi-Agent MA4-C — Parent Reasoning Budget Validation
 
-Status: **MA4C=INCONCLUSIVE_DUE_TO_ROUND_LIMIT.** Lowering only the parent's
-reasoning effort (`max` → `high`) did not make the parent delegate earlier on
-the workloads that ran to completion (S2, S3). On the largest workload (S4) it
+Status: **MA4C=FAIL — B. PARENT_REASONING_BUDGET_NOT_ROOT_CAUSE** (after the
+Long-Task Round Budget Closure, §16).
+
+```text
+Original MA4-C (§1–§15): E. INCONCLUSIVE_DUE_TO_ROUND_LIMIT
+After Long-Task Round Budget Closure (§16, S4 only): B. PARENT_REASONING_BUDGET_NOT_ROOT_CAUSE
+```
+
+Original result, kept as recorded: lowering only the parent's reasoning
+effort (`max` → `high`) did not make the parent delegate earlier on the
+workloads that ran to completion (S2, S3). On the largest workload (S4) it
 did make the first spawn earlier, but the lower-effort parent then used up the
 product's 100-round turn ceiling in 3 of 4 runs (`max`: 0 of 4). The one bucket
 where the variable changed the timing is therefore censored, and the value
@@ -275,3 +283,100 @@ Stop. One experiment, for the user to choose to run: **Long-Task Round
 Budget Closure** — the 100-round single-turn ceiling truncated S4 in MA4-B
 (4/7) and, at lower parent effort, here (3/4). Until a large task can finish
 under the ceiling, no parent or child change can be judged at S4.
+
+## 16. S4 revalidation after the Long-Task Round Budget Closure
+
+`docs/LONG_TASK_ROUND_BUDGET_CLOSURE.md` found two causes behind the S4
+censoring and fixed both: a hidden 100-round ceiling over every larger round
+window (`35e9055`), and `wait_task` answering a child id instantly, so polling
+parents spent a round per poll (`376bac2`). S4 was re-run; S0–S3 were not
+(no censoring there).
+
+### 16.1 Variable lock
+
+```text
+MODEL=deepseek/deepseek-v4-flash  PROVIDER=deepseek  GATEWAY=taotoken (config unchanged)
+R0 parent effort=max   R1 parent effort=high   CHILD effort=max (per-lane trace, every run)
+BINARY=f89c1db for both arms; harness ada3b73 (stop_limit tells round window / ceiling / budget apart)
+TASK=mat-s4-eight-engines (case window 400, timeout 5400 s, unchanged)
+ONLY CHANGE SINCE MA4-C: the two round-budget fixes; same interleaving (R0 and R1 of a rep at once, 6 runs at once)
+R0_RUNS=3  R1_RUNS=3  (no invalid attempts)
+```
+
+### 16.2 Runs
+
+| Rep | Effort | Oracle | Units | Outcome | Stop limit | Wall s | First spawn s | Pre-spawn parent req / out tok | Parent requests | Polls (`wait_task`/`get_task`) | Children (20-min cap hit) | Delegation quality | Cost |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | max | pass | 8/8 | completed | — | 2243 | 76 | 4 / 9592 | 34 | 0 | 4 (3) | CORRECTLY_DECOMPOSED | $0.85 |
+| 1 | max | fail | 6/8 | completed | — | 1876 | 78 | 7 / 10345 | 30 | 3 | 6 (2) | PARTIALLY_USEFUL | $0.71 |
+| 2 | max | fail | 7/8 | completed | — | 1503 | 85 | 7 / 10246 | 35 | 1 | 6 (0) | PARTIALLY_USEFUL | $1.10 |
+| 0 | high | fail | 5/8 | completed | — | 2670 | 68 | 5 / 8727 | 126 | 1 | 6 (2) | PARTIALLY_USEFUL | $2.36 |
+| 1 | high | fail | 7/8 | completed | — | 1382 | 77 | 5 / 10257 | 87 | 7 | 6 (0) | PARTIALLY_USEFUL | $1.56 |
+| 2 | high | fail | 5/8 | completed | — | 2856 | — | — | 132 | 0 | 0 | — (no delegation) | $2.01 |
+
+Effort evidence: `max` parent Max×99, child Max×317; `high` parent High×345,
+child Max×279; 6 unmatched requests, all Max (cancelled child requests).
+
+### 16.3 Censoring
+
+```text
+ROUND_LIMIT_HITS_R0=0/3   ROUND_LIMIT_HITS_R1=0/3   (every run completed; stop_limit none)
+R1 parent requests 126 and 132: two of three high runs would have been cut at the old 100
+CENSORING_REMOVED=YES
+```
+
+A different mechanical cap is still visible: 7 of 28 children stopped at the
+20-minute sub-agent duration cap (`SUB_AGENT_MAX_DURATION`; runtimes
+1177–1278 s), 5 in `max` runs and 2 in `high` runs. The packages those
+children wrote passed their hidden suites in 6 of 7 attributable cases, and the
+cap hit the better arm (`max`) harder, so it does not favour `max` in this
+comparison. Their terminal summaries say "token or cost budget ran out"
+although the duration cap fired.
+
+### 16.4 Result (high − max)
+
+| | max | high | Delta |
+|---|---|---|---|
+| Task success | 1/3 | 0/3 | −1 |
+| Units | 21/24 | 17/24 | −4 |
+| First spawn (median; values) | 78 s (76, 78, 85) | 72 s (68, 77) | −6 s |
+| Pre-spawn parent output tokens (median) | 10 246 | 9 492 | −7 % |
+| Wall (median) | 1876 s | 2670 s | +794 s (+42 %) |
+| Parent requests (median) | 34 | 126 | ×3.7 |
+| Input / output tokens | 15.5M / 1.76M | 39.6M / 1.54M | +155 % / −13 % |
+| Cost | $2.65 | $5.93 | +124 % |
+| Delegated / correctly decomposed | 3/3 / 1 | 2/3 / 0 | |
+| Child success rate | 0.69 (cap) | 0.83 | |
+| Child rework (children rewritten by the parent) | 2 | 2 | |
+| INCORRECT_AND_VERIFIED (quality metric) | 2/3 | 3/3 | |
+
+With the ceiling gone, both arms spawn their first child after about 75 s.
+The early spawn MA4-C saw at `high` on S4 (445 → 95 s) does not reproduce: this
+time the `max` parent spawned just as early. What `high` does change is the
+parent's cadence — 3.7× the requests, each re-sending its context — which
+costs more than twice as much and runs longer, with fewer correct units.
+
+### 16.5 Decision
+
+```text
+ROOT_CAUSE_CLASSIFICATION=B. PARENT_REASONING_BUDGET_NOT_ROOT_CAUSE
+MA4C_PARENT_REASONING=FAIL
+PARENT_REASONING_BUDGET_ROOT_CAUSE=NO (S2/S3: first spawn not earlier; S4 uncensored: not earlier, worse quality, slower, 2.2× cost)
+CHILD_CONTEXT_HANDOFF_PROBLEM=NOT_ISOLATED (child-owned units mostly pass; 4–8 child writes per run have truncated paths and cannot be attributed)
+TASK_SUCCESS_PRESERVED=NO   QUALITY_PRESERVED=NO   LATENCY_VALUE=NO   COST_ACCEPTABLE=NO   USEFUL_DELEGATION_PROVEN=NO
+SAFETY: FALSE_VERIFIED 0, OWNERSHIP_VIOLATION 0, LOST_ACCEPTED_CHILD 0, DUPLICATE_SETTLEMENT 0, OPEN_ORPHAN 0, CHILD_WRITE_AFTER_TERMINAL 0
+MA4_EVAL_ACCEPTANCE=FAIL (unchanged)
+MULTI_AGENT_PRODUCT_VALUE=NOT_PROVEN
+MULTI_AGENT_PRODUCT_CLOSURE=BLOCKED
+```
+
+Product policy unchanged: parent and child effort stay at the model default;
+the parent-effort seam stays eval-only.
+
+### 16.6 Next
+
+Stop. One task, for the user to choose: **S4 single-agent vs multi-agent value
+re-measurement on the fixed round budget.** MA4-B's S4 verdict (delegated runs
+less correct) compared against single-agent runs that the 100-round ceiling
+had cut off (G2 2 of 2, `budget_limited`), so the multi-agent value at the
+largest workload has never been measured without censoring.
