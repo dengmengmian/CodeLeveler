@@ -191,6 +191,8 @@ pub(crate) fn terminal_status(
         Ok(output) if output.exit_code == Some(0) => "success",
         Ok(_) => "failed",
         Err(ProcessError::Cancelled) => "cancelled",
+        // Stopped, but nothing proves the tree is gone: say only that.
+        Err(ProcessError::CancelUnconfirmed) => "unknown",
         Err(_) => "failed",
     }
 }
@@ -215,6 +217,15 @@ pub(crate) fn started_event(id: &UserShellId, command: &str, cwd: &str) -> Engin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconfirmed_stop_is_unknown_never_cancelled_or_failed() {
+        assert_eq!(terminal_status(&Err(ProcessError::Cancelled)), "cancelled");
+        assert_eq!(
+            terminal_status(&Err(ProcessError::CancelUnconfirmed)),
+            "unknown"
+        );
+    }
 
     #[test]
     fn tail_is_bounded_and_flags_truncation() {

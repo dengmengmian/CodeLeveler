@@ -237,7 +237,16 @@ impl CommandExecution {
         // answer. Background commands never reach here (they return earlier), so a
         // long-lived server cannot hold the gate.
         let _gate = context.execution.command_gate.clone().lock_owned().await;
-        let output = context.execution.runner.run(request, cancellation).await?;
+        let output = match context.output.clone() {
+            Some(chunks) => {
+                context
+                    .execution
+                    .runner
+                    .run_streaming(request, cancellation, chunks)
+                    .await?
+            }
+            None => context.execution.runner.run(request, cancellation).await?,
+        };
 
         // Detect what the command changed so scope checks and budgets see
         // command-driven mutations, not just tool edits.

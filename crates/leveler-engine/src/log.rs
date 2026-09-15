@@ -750,6 +750,8 @@ mod tests {
         log.append(
             Some(&turn),
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: "c1".into(),
                 name: "run_command".into(),
                 is_error: false,
@@ -827,6 +829,8 @@ mod tests {
                 log.append(
                     Some(&turn_id),
                     EngineEvent::ToolCallFinished {
+                        exit_code: None,
+                        stop: None,
                         call_id: call_id.into(),
                         name: "read_file".into(),
                         is_error: false,
@@ -1183,6 +1187,8 @@ mod tests {
                 text: "thinking".into(),
             },
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: "c1".into(),
                 name: "read_file".into(),
                 is_error: false,

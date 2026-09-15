@@ -417,6 +417,8 @@ impl<'a> Drive<'a> {
         index: usize,
     ) {
         (self.observer)(AgentEvent::ToolResult {
+            exit_code: None,
+            stop: None,
             id: call.id.as_str().to_string(),
             name: call.name.clone(),
             is_error: true,
@@ -1415,6 +1417,8 @@ impl AgentHarness for Drive<'_> {
                     }
                 };
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
                     id: call.id.as_str().to_string(),
                     name: REPORT_FINDING_TOOL.to_string(),
                     is_error: !ok,
@@ -1483,6 +1487,8 @@ impl AgentHarness for Drive<'_> {
                         detail: waiting.join(", "),
                     });
                     (self.observer)(AgentEvent::ToolResult {
+                        exit_code: None,
+                        stop: None,
                         id: call.id.as_str().to_string(),
                         name: UPDATE_GOAL_TOOL.to_string(),
                         is_error: true,
@@ -1511,6 +1517,8 @@ impl AgentHarness for Drive<'_> {
                                 .unwrap_or_else(|| "no status".to_string())
                         );
                         (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
                             id: call.id.as_str().to_string(),
                             name: UPDATE_GOAL_TOOL.to_string(),
                             is_error: true,
@@ -1542,6 +1550,8 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
                     id: call.id.as_str().to_string(),
                     name: UPDATE_GOAL_TOOL.to_string(),
                     is_error: false,
@@ -1583,6 +1593,8 @@ impl AgentHarness for Drive<'_> {
                 });
                 let answer = self.executor.handle_ask_user(&call, &cancellation).await?;
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
                     // The answer IS the result. It is short, user-written, and
@@ -1690,6 +1702,8 @@ impl AgentHarness for Drive<'_> {
                     parallel: false,
                 });
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
                     is_error: false,
@@ -1807,6 +1821,8 @@ impl AgentHarness for Drive<'_> {
                     }
                 };
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
                     id: call.id.as_str().to_string(),
                     name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
                     is_error,
@@ -2217,6 +2233,7 @@ impl AgentHarness for Drive<'_> {
                 call_files,
                 executed_commands,
                 applied_diff,
+                command_facts,
                 call,
             ) = match self
                 .executor
@@ -2257,21 +2274,49 @@ impl AgentHarness for Drive<'_> {
                         call_files,
                         executed_commands,
                         applied_diff,
+                        command_facts,
                     ) = {
                         let started = std::time::Instant::now();
+                        // A command's live output is drained here, in the loop's
+                        // own task, so it reaches the observer in order with
+                        // the call's other events.
+                        let call_id = admitted.call.id.as_str().to_string();
+                        let (output_tx, mut output_rx) =
+                            if self.executor.registry.runs_command(&admitted.call.name) {
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                (Some(tx), Some(rx))
+                            } else {
+                                (None, None)
+                            };
+                        let mut lines = super::dispatch::OutputLines::default();
                         let dispatch_fut = self.executor.dispatch(
                             &admitted,
                             &mut self.modified_files,
                             &cancellation,
+                            output_tx,
                         );
                         tokio::pin!(dispatch_fut);
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                             COMMAND_HEARTBEAT_SECS,
                         ));
                         ticker.tick().await; // drop the immediate first tick
-                        loop {
+                        let result = loop {
                             tokio::select! {
                                 r = &mut dispatch_fut => break r,
+                                Some(chunk) = async {
+                                    match output_rx.as_mut() {
+                                        Some(rx) => rx.recv().await,
+                                        None => std::future::pending().await,
+                                    }
+                                } => {
+                                    if let Some((stream, text)) = lines.push(chunk) {
+                                        (self.observer)(AgentEvent::ToolOutput {
+                                            id: call_id.clone(),
+                                            stream,
+                                            text,
+                                        });
+                                    }
+                                }
                                 _ = ticker.tick() => {
                                     if let Some(label) = &progress_label {
                                         (self.observer)(AgentEvent::CommandProgress {
@@ -2281,7 +2326,28 @@ impl AgentHarness for Drive<'_> {
                                     }
                                 }
                             }
+                        };
+                        // The call has returned, so every sender is gone: what
+                        // is still queued is the tail of its output.
+                        if let Some(rx) = output_rx.as_mut() {
+                            while let Ok(chunk) = rx.try_recv() {
+                                if let Some((stream, text)) = lines.push(chunk) {
+                                    (self.observer)(AgentEvent::ToolOutput {
+                                        id: call_id.clone(),
+                                        stream,
+                                        text,
+                                    });
+                                }
+                            }
                         }
+                        for (stream, text) in lines.flush() {
+                            (self.observer)(AgentEvent::ToolOutput {
+                                id: call_id.clone(),
+                                stream,
+                                text,
+                            });
+                        }
+                        result
                     };
                     // Cancel during a long tool must stop the batch — do not
                     // keep running subsequent tools after the user hit Ctrl+C.
@@ -2301,6 +2367,7 @@ impl AgentHarness for Drive<'_> {
                         call_files,
                         executed_commands,
                         applied_diff,
+                        command_facts,
                         admitted.into_call(),
                     )
                 }
@@ -2317,6 +2384,7 @@ impl AgentHarness for Drive<'_> {
                         Vec::new(),
                         Vec::new(),
                         None,
+                        (None, None),
                         call,
                     )
                 }
@@ -2359,6 +2427,8 @@ impl AgentHarness for Drive<'_> {
             }
 
             (self.observer)(AgentEvent::ToolResult {
+                exit_code: command_facts.0,
+                stop: command_facts.1,
                 id: call.id.as_str().to_string(),
                 name: call.name.clone(),
                 is_error,
@@ -2476,7 +2546,9 @@ impl AgentHarness for Drive<'_> {
                         .acquire()
                         .await
                         .expect("tool-batch semaphore is never closed");
-                    let out = executor.dispatch_raw(&job.admitted, cancellation_ref).await;
+                    let out = executor
+                        .dispatch_raw(&job.admitted, cancellation_ref, None)
+                        .await;
                     (job.index, out)
                 });
             }
@@ -2512,7 +2584,10 @@ impl AgentHarness for Drive<'_> {
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
                 }
+                let (exit_code, stop) = super::dispatch::extract_command_facts(&metadata);
                 (self.observer)(AgentEvent::ToolResult {
+                    exit_code,
+                    stop,
                     id: job.admitted.call.id.as_str().to_string(),
                     name: job.admitted.call.name.clone(),
                     is_error,
@@ -2700,6 +2775,8 @@ impl AgentHarness for Drive<'_> {
                 };
                 if let Some(msg) = reject {
                     (self.observer)(AgentEvent::ToolResult {
+                        exit_code: None,
+                        stop: None,
                         id: call.id.as_str().to_string(),
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: true,
@@ -2742,6 +2819,8 @@ impl AgentHarness for Drive<'_> {
                         let msg = rejection.for_model();
                         self.executor.ownership.release_all(&id);
                         (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
                             id: call.id.as_str().to_string(),
                             name: SPAWN_AGENT_TOOL.to_string(),
                             is_error: true,
@@ -2886,6 +2965,8 @@ impl AgentHarness for Drive<'_> {
                     // must be UI-visible too (P2 disclosure): pair the
                     // spawn call with its result like any other tool.
                     (self.observer)(AgentEvent::ToolResult {
+                        exit_code: None,
+                        stop: None,
                         id: call_id.as_str().to_string(),
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: false,

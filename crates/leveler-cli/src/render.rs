@@ -21,6 +21,8 @@ fn render_event_text(event: AgentEvent) {
         AgentEvent::SubAgentModelRequest { .. } => {}
         AgentEvent::AssistantDelta(_) => {}
         AgentEvent::ReasoningDelta(_) => {}
+        // Live command output; the finished tool result carries the record.
+        AgentEvent::ToolOutput { .. } => {}
         AgentEvent::AssistantText(text) => {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -247,6 +249,15 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::StreamAttemptStarted => {
             serde_json::json!({ "type": "stream_attempt_started" })
         }
+        AgentEvent::ToolOutput { id, stream, text } => serde_json::json!({
+            "type": "tool_output",
+            "id": id,
+            "stream": match stream {
+                leveler_execution::OutputStream::Stdout => "stdout",
+                leveler_execution::OutputStream::Stderr => "stderr",
+            },
+            "text": text,
+        }),
         AgentEvent::SubAgentModelRequest { record } => serde_json::json!({
             "type": "sub_agent_model_request",
             "agent_id": record.agent_id,

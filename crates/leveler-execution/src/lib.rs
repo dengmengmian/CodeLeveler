@@ -49,8 +49,8 @@ pub use background::{
 pub use checkpoint::Checkpoint;
 pub use clarify::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
 pub use command::{
-    CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessError, ProcessIdentity,
-    ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,
+    CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, ProcessError,
+    ProcessIdentity, ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,
     is_credential_env_name, looks_like_absolute_path_arg, process_request_for_verify_check,
     seal_read_denials, shell_invocation,
 };

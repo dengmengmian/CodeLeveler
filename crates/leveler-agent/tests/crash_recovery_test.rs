@@ -922,6 +922,8 @@ async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
     log.append(
         Some(&turn_id),
         EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
             call_id: "c1".into(),
             name: "apply_patch".into(),
             is_error: false,

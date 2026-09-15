@@ -277,6 +277,21 @@ pub enum EngineEvent {
         /// edit whose location could not be established.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         applied_diff: Option<String>,
+        /// Exit code of the process a command call ran, when it exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Set when the call's process was cancelled: whether its tree was
+        /// confirmed gone. Absent for every call that was not stopped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<leveler_execution::CommandStop>,
+    },
+    /// TRANSIENT: live output chunk from a running command tool call.
+    /// `stream` is `stdout` or `stderr`. Never persisted — the call's
+    /// finished preview is the durable record.
+    ToolCallOutput {
+        call_id: String,
+        stream: String,
+        chunk: String,
     },
     WorkspaceSnapshotCreated {
         call_id: String,
@@ -317,7 +332,8 @@ pub enum EngineEvent {
         stream: String,
         chunk: String,
     },
-    /// A user shell execution ended (`status`: success | failed | cancelled).
+    /// A user shell execution ended (`status`: success | failed | cancelled |
+    /// unknown — a stop whose process tree could not be confirmed gone).
     /// Persisted alongside its start for audit/recovery.
     UserShellFinished {
         execution_id: leveler_core::UserShellId,
@@ -681,6 +697,7 @@ impl EngineEvent {
             self,
             EngineEvent::StreamAttemptStarted
                 | EngineEvent::UserShellOutput { .. }
+                | EngineEvent::ToolCallOutput { .. }
                 | EngineEvent::AssistantDelta { .. }
                 | EngineEvent::ReasoningDelta { .. }
                 | EngineEvent::TokenUsage { .. }
@@ -791,7 +808,9 @@ impl EngineEvent {
             // local-sensitive by construction.
             | EngineEvent::UserShellStarted { .. }
             | EngineEvent::UserShellOutput { .. }
-            | EngineEvent::UserShellFinished { .. } => LocalOnly,
+            | EngineEvent::UserShellFinished { .. }
+            // Raw command output — local-sensitive like the user shell's.
+            | EngineEvent::ToolCallOutput { .. } => LocalOnly,
         }
     }
 
@@ -959,6 +978,7 @@ impl EngineEvent {
             | EngineEvent::UserShellStarted { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
+            | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::CommandProgress { .. } => return None,
         })
     }
@@ -1193,6 +1213,8 @@ mod contract_tests {
         );
         assert_eq!(
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: "c".into(),
                 name: "read_file".into(),
                 is_error: false,

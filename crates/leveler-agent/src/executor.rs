@@ -251,6 +251,19 @@ pub enum AgentEvent {
         /// could not be established — a presenter must then show no line
         /// numbers rather than derive one from what the model asked for.
         applied_diff: Option<String>,
+        /// Exit code of the process a command call ran, when it exited.
+        exit_code: Option<i32>,
+        /// Set when the call's process was cancelled: whether the execution
+        /// layer confirmed its whole tree gone.
+        stop: Option<leveler_execution::CommandStop>,
+    },
+    /// Live output from a running command call, sanitized, one or more whole
+    /// lines at a time. Transient: the finished `ToolResult` preview is the
+    /// durable record.
+    ToolOutput {
+        id: String,
+        stream: leveler_execution::OutputStream,
+        text: String,
     },
     /// A recoverable pre-command workspace snapshot, correlated to the tool
     /// call that may mutate the workspace. The engine persists this with the
@@ -821,6 +834,15 @@ pub trait SteeringSource: Send + Sync {
 
     /// The child settled; its cancellation handle is no longer meaningful.
     fn child_ended(&self, _id: &str) {}
+
+    /// A tool call began executing; `cancel` stops that call alone (for a
+    /// command, its whole process tree) without cancelling the turn. A host
+    /// that lets its user stop one command keeps the handle until
+    /// [`Self::tool_call_ended`].
+    fn tool_call_started(&self, _id: &str, _cancel: CancellationToken) {}
+
+    /// The call finished executing; its cancellation handle is spent.
+    fn tool_call_ended(&self, _id: &str) {}
 }
 
 /// How one turn runs.

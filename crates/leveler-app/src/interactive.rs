@@ -1045,7 +1045,11 @@ impl InProcessRuntimeClient {
                     Err(_) => None,
                 };
                 if let Err(error) = &result
-                    && !matches!(error, leveler_execution::ProcessError::Cancelled)
+                    && !matches!(
+                        error,
+                        leveler_execution::ProcessError::Cancelled
+                            | leveler_execution::ProcessError::CancelUnconfirmed
+                    )
                 {
                     // Spawn/sandbox failures never produced output — put the host
                     // error where the user will look for it.

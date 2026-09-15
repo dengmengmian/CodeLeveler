@@ -459,6 +459,8 @@ mod tests {
 
     fn result(id: &str, name: &str, is_error: bool, preview: &str) -> AgentEvent {
         AgentEvent::ToolResult {
+            exit_code: None,
+            stop: None,
             id: id.into(),
             name: name.into(),
             is_error,
@@ -666,6 +668,8 @@ mod tests {
     fn ok_call(c: &mut SignalCollector, id: &str, name: &str, args: serde_json::Value) {
         c.observe_agent(&call(id, name, args));
         c.observe_agent(&AgentEvent::ToolResult {
+            exit_code: None,
+            stop: None,
             id: id.to_string(),
             name: name.to_string(),
             is_error: false,
@@ -776,6 +780,8 @@ mod tests {
             serde_json::json!({"path": "internal/dispatch/router.go"}),
         ));
         c.observe_agent(&AgentEvent::ToolResult {
+            exit_code: None,
+            stop: None,
             id: "miss".to_string(),
             name: "read_file".to_string(),
             is_error: true,
@@ -887,6 +893,8 @@ mod tests {
             serde_json::json!({"program": "go", "args": ["build", "./..."]}),
         ));
         c.observe_agent(&AgentEvent::ToolResult {
+            exit_code: None,
+            stop: None,
             id: "build".to_string(),
             name: "run_command".to_string(),
             is_error: true,

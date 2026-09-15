@@ -166,6 +166,8 @@ impl EventBarrier for PumpBarrier {
                 is_error,
                 preview,
             } => EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id,
                 name,
                 is_error,
@@ -337,6 +339,8 @@ mod tests {
                 agent_id: agent_id.clone(),
             });
             emitter.emit(EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: format!("c{i}"),
                 name: "read_file".into(),
                 is_error: false,
@@ -371,6 +375,8 @@ mod tests {
         let (emitter, _rx, state) = EventEmitter::channel(1, cancel.clone());
         emitter.emit(EngineEvent::AssistantDelta { text: "a".into() });
         emitter.emit(EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
             call_id: "c9".into(),
             name: "read_file".into(),
             is_error: false,

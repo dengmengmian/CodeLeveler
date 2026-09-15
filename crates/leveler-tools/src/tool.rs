@@ -43,6 +43,9 @@ pub struct ToolContext {
     /// per-session capability state (e.g. browser pages/refs — §18). `None` for
     /// non-session contexts (eval, one-shot CLI); those share a default scope.
     pub session_scope: Option<Arc<str>>,
+    /// Where a command call sends its live output while it runs. Set per call
+    /// by the host that shows it; `None` runs the command without streaming.
+    pub output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
 }
 
 /// Process-wide execution and write-safety infrastructure. Every handle is an
@@ -268,6 +271,7 @@ impl ToolContext {
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
             session_scope: None,
+            output: None,
         }
     }
 

@@ -720,6 +720,7 @@ impl Executor {
         admitted: &AdmittedCall,
         modified_files: &mut Vec<String>,
         cancellation: &CancellationToken,
+        output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
     ) -> (
         String,
         bool,
@@ -729,8 +730,9 @@ impl Executor {
         Vec<String>,
         Vec<Vec<String>>,
         Option<String>,
+        (Option<i32>, Option<leveler_execution::CommandStop>),
     ) {
-        let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation).await;
+        let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation, output).await;
         // The call's own modified paths, BEFORE merging into the epoch set:
         // a re-edit of an already-modified file is invisible in the merged
         // list, and the caller needs to know the call mutated at all (R011-F1).
@@ -749,6 +751,7 @@ impl Executor {
         let plan = extract_plan(&metadata);
         let executed = extract_executed_commands(&metadata);
         let applied_diff = extract_applied_diff(&metadata);
+        let command = super::dispatch::extract_command_facts(&metadata);
         (
             content,
             is_error,
@@ -758,6 +761,7 @@ impl Executor {
             call_files,
             executed,
             applied_diff,
+            command,
         )
     }
 
@@ -769,6 +773,7 @@ impl Executor {
         &self,
         admitted: &AdmittedCall,
         cancellation: &CancellationToken,
+        output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
     ) -> (String, bool, serde_json::Value) {
         let call = &admitted.call;
         // The tool runs under the policy admission froze — the one place the
@@ -781,17 +786,41 @@ impl Executor {
             authorization = ?resolved.authorization,
             "executing admitted call"
         );
-        let outcome = match self
+        // This call's own cancellation: a child of the turn's, handed to the
+        // host so a user can stop this one call without stopping the turn.
+        let call_cancel = cancellation.child_token();
+        if let Some(host) = &self.steering {
+            host.tool_call_started(call.id.as_str(), call_cancel.clone());
+        }
+        let mut ctx = admitted.execution_context().clone();
+        ctx.output = output;
+        let executed = self
             .registry
-            .execute(
-                &call.name,
-                call.arguments.clone(),
-                admitted.execution_context().clone(),
-                cancellation.child_token(),
-            )
-            .await
-        {
+            .execute(&call.name, call.arguments.clone(), ctx, call_cancel)
+            .await;
+        if let Some(host) = &self.steering {
+            host.tool_call_ended(call.id.as_str());
+        }
+        let outcome = match executed {
             Ok(output) => (output.content, output.is_error, output.metadata),
+            // A stopped command reports HOW it stopped, so a client shows
+            // "stopped" only when the process tree is proven gone.
+            Err(ToolError::Process(
+                e @ (leveler_execution::ProcessError::Cancelled
+                | leveler_execution::ProcessError::CancelUnconfirmed),
+            )) => {
+                let stop = match e {
+                    leveler_execution::ProcessError::Cancelled => {
+                        leveler_execution::CommandStop::Confirmed
+                    }
+                    _ => leveler_execution::CommandStop::Unconfirmed,
+                };
+                (
+                    format!("tool error: {e}"),
+                    true,
+                    serde_json::json!({ "stop": stop }),
+                )
+            }
             Err(ToolError::NotFound(name)) if name == "task" => (
                 "tool error: unsupported tool `task`; use `spawn_agent` for delegation".to_string(),
                 true,

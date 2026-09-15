@@ -42,6 +42,8 @@ impl From<AgentEvent> for EngineEvent {
                 is_error,
                 preview,
                 applied_diff,
+                exit_code,
+                stop,
             } => EngineEvent::ToolCallFinished {
                 call_id: id,
                 name,
@@ -49,6 +51,17 @@ impl From<AgentEvent> for EngineEvent {
                 preview,
                 agent_id: None,
                 applied_diff,
+                exit_code,
+                stop,
+            },
+            A::ToolOutput { id, stream, text } => EngineEvent::ToolCallOutput {
+                call_id: id,
+                stream: match stream {
+                    leveler_execution::OutputStream::Stdout => "stdout",
+                    leveler_execution::OutputStream::Stderr => "stderr",
+                }
+                .to_string(),
+                chunk: text,
             },
             A::WorkspaceSnapshot { call_id, snapshot } => {
                 EngineEvent::WorkspaceSnapshotCreated { call_id, snapshot }

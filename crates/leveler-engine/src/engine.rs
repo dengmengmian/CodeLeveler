@@ -567,6 +567,8 @@ impl TaskEngine {
         log.append(
             turn_ref,
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 is_error: true,
@@ -599,6 +601,8 @@ pub async fn acknowledge_crash_window(
         log.append(
             turn_id.as_ref(),
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 is_error: true,

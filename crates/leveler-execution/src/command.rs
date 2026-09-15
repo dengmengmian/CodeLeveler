@@ -706,13 +706,30 @@ pub enum ProcessError {
         program: String,
         source: std::io::Error,
     },
+    /// Cancelled, and the whole process tree is confirmed gone.
     #[error("command was cancelled")]
     Cancelled,
+    /// Cancellation was requested and the tree was signalled, but the runtime
+    /// could not confirm every process in it exited. Never report this as a
+    /// completed stop.
+    #[error("command was cancelled, but its process tree could not be confirmed terminated")]
+    CancelUnconfirmed,
     #[error("{0}")]
     SandboxPolicy(String),
     /// Windows Job Object create/assign failed; process was not left running plain.
     #[error("process-tree (Job) setup failed: {0}")]
     ProcessTreeSetup(String),
+}
+
+/// How a cancelled command ended, as the execution layer established it.
+/// Carried to clients so "stopped" is only ever shown when it is proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStop {
+    /// The whole process tree was confirmed gone.
+    Confirmed,
+    /// The tree was signalled, but its termination could not be confirmed.
+    Unconfirmed,
 }
 
 /// Which pipe a live output chunk came from.
@@ -1114,15 +1131,41 @@ impl ManagedProcess {
     /// not hold the tool future, the turn, and the TUI. On deadline, kill
     /// once more and fabricate a signalled exit so callers can unwind.
     pub(crate) async fn wait_deadline(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.wait_bounded().await {
+            Some(status) => status,
+            None => Ok(synthetic_killed_status()),
+        }
+    }
+
+    /// Like [`Self::wait_deadline`], but reports whether the direct child was
+    /// actually reaped instead of fabricating an exit.
+    pub(crate) async fn wait_reaped(&mut self) -> bool {
+        matches!(self.wait_bounded().await, Some(Ok(_)))
+    }
+
+    async fn wait_bounded(&mut self) -> Option<std::io::Result<std::process::ExitStatus>> {
         match tokio::time::timeout(POST_KILL_WAIT, self.wait()).await {
-            Ok(status) => status,
+            Ok(status) => Some(status),
             Err(_elapsed) => {
                 self.start_kill();
-                match tokio::time::timeout(Duration::from_millis(500), self.wait()).await {
-                    Ok(status) => status,
-                    Err(_elapsed) => Ok(synthetic_killed_status()),
-                }
+                tokio::time::timeout(Duration::from_millis(500), self.wait())
+                    .await
+                    .ok()
             }
+        }
+    }
+
+    /// After a tree kill: whether the runtime can confirm nothing in the tree
+    /// is left. Unix probes the process group; a Windows Job Object is killed
+    /// as a unit by `terminate_tree`.
+    pub(crate) async fn tree_gone(&self) -> bool {
+        #[cfg(unix)]
+        {
+            process_group_gone(self.identity.pgid, POST_KILL_WAIT).await
+        }
+        #[cfg(windows)]
+        {
+            true
         }
     }
 
@@ -1195,8 +1238,12 @@ async fn drive_to_completion(
         }
         _ = cancellation.cancelled() => {
             process.terminate_tree().await;
-            let _ = process.wait_deadline().await;
-            return Err(ProcessError::Cancelled);
+            let reaped = process.wait_reaped().await;
+            return if reaped && process.tree_gone().await {
+                Err(ProcessError::Cancelled)
+            } else {
+                Err(ProcessError::CancelUnconfirmed)
+            };
         }
     };
 
@@ -1269,6 +1316,27 @@ fn reap_process_group(child_pid: Option<u32>) {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
         let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+}
+
+/// Whether every process in group `pgid` has exited and been reaped, polled
+/// until `deadline`. `ESRCH` from a signal-0 probe is the kernel saying the
+/// group has no members left; anything else (still present, a zombie not yet
+/// reaped by its new parent, `EPERM`) is not proof of that.
+#[cfg(unix)]
+async fn process_group_gone(pgid: i32, deadline: Duration) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    let started = std::time::Instant::now();
+    loop {
+        if killpg(Pid::from_raw(pgid), None) == Err(Errno::ESRCH) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -3903,12 +3971,36 @@ mod tests {
         let result = handle.await.unwrap();
         assert!(matches!(result, Err(ProcessError::Cancelled)));
 
-        // Give signals a moment to propagate, then confirm the grandchild is gone.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // `Cancelled` is the runtime's claim that the tree is gone, so it must
+        // already be true when the error comes back — no grace sleep here.
         let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(gc_pid), None).is_ok();
         assert!(!alive, "grandchild sleep {gc_pid} should have been killed");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The confirmation `Cancelled` rests on: a group with a live member is
+    /// not reported empty however long we wait, and an emptied one is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_emptiness_is_observed_not_assumed() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pgid = child.id() as i32;
+        assert!(
+            !process_group_gone(pgid, Duration::from_millis(50)).await,
+            "a live group must not be reported gone"
+        );
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+        assert!(process_group_gone(pgid, Duration::from_secs(2)).await);
     }
 
     /// WS1: Windows Job Object must kill cmd-spawned grandchildren on cancel.

@@ -1419,6 +1419,8 @@ impl CodingRuntime {
         log.append(
             turn_ref,
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 is_error,

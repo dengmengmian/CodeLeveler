@@ -535,6 +535,7 @@ impl EventBridge {
                 preview,
                 agent_id: None,
                 applied_diff,
+                ..
             } => {
                 // Pair with the ToolCall by id, whatever order results arrive in.
                 // A denial/guard result has no prior ToolCall — synthesize a
@@ -559,6 +560,8 @@ impl EventBridge {
                     applied_diff,
                 });
             }
+            // Projected once the client protocol carries it.
+            EngineEvent::ToolCallOutput { .. } => {}
             EngineEvent::WorkspaceSnapshotCreated { .. } => {
                 // Durability metadata is persisted by the engine; it has no
                 // standalone transcript cell in the TUI.
@@ -1156,6 +1159,8 @@ mod bridge_tests {
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
                 id: "p".into(),
                 name: "apply_patch".into(),
                 is_error: false,
@@ -1166,6 +1171,8 @@ mod bridge_tests {
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
                 id: "g".into(),
                 name: "grep".into(),
                 is_error: false,
@@ -1455,6 +1462,8 @@ mod bridge_tests {
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
                 id: "x".into(),
                 name: "grep".into(),
                 is_error: true,
@@ -1689,6 +1698,8 @@ mod projection_equivalence {
 
     fn tool_finished(id: &str, name: &str, is_error: bool, agent: Option<&str>) -> EngineEvent {
         EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
             call_id: id.into(),
             name: name.into(),
             is_error,

@@ -1035,6 +1035,8 @@ mod tests {
             &db,
             &sid,
             EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
                 call_id: "c1".into(),
                 name: "read_file".into(),
                 is_error: false,
@@ -1178,6 +1180,8 @@ mod tests {
 
     fn tool_end(id: &str, name: &str, is_error: bool) -> EngineEvent {
         EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
             call_id: id.into(),
             name: name.into(),
             is_error,
@@ -1604,6 +1608,8 @@ mod tests {
 
     fn tool_end_by(id: &str, name: &str, agent: &str) -> EngineEvent {
         EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
             call_id: id.into(),
             name: name.into(),
             is_error: false,

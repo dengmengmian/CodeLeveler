@@ -36,6 +36,71 @@ pub(crate) fn extract_applied_diff(metadata: &serde_json::Value) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+/// The process facts a command call reported: its exit code, and — when it
+/// was cancelled — whether its process tree was confirmed gone.
+pub(crate) fn extract_command_facts(
+    metadata: &serde_json::Value,
+) -> (Option<i32>, Option<leveler_execution::CommandStop>) {
+    let exit_code = metadata
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    let stop = metadata
+        .get("stop")
+        .and_then(|stop| serde_json::from_value(stop.clone()).ok());
+    (exit_code, stop)
+}
+
+/// Live command output cut into whole lines before it leaves the loop, so a
+/// client never sees half a line and a secret is never split across two
+/// sanitizer passes. What is left at the end is flushed as-is.
+#[derive(Default)]
+pub(crate) struct OutputLines {
+    stdout: String,
+    stderr: String,
+}
+
+impl OutputLines {
+    /// Absorb one chunk; returns the complete lines it finished, sanitized.
+    pub(crate) fn push(
+        &mut self,
+        chunk: leveler_execution::OutputChunk,
+    ) -> Option<(leveler_execution::OutputStream, String)> {
+        let buffer = self.buffer(chunk.stream);
+        buffer.push_str(&chunk.text);
+        let cut = buffer.rfind('\n')? + 1;
+        let complete: String = buffer.drain(..cut).collect();
+        Some((chunk.stream, sanitize_output(&complete)))
+    }
+
+    /// Whatever partial lines remain once the command has ended.
+    pub(crate) fn flush(&mut self) -> Vec<(leveler_execution::OutputStream, String)> {
+        use leveler_execution::OutputStream::{Stderr, Stdout};
+        [
+            (Stdout, std::mem::take(&mut self.stdout)),
+            (Stderr, std::mem::take(&mut self.stderr)),
+        ]
+        .into_iter()
+        .filter(|(_, rest)| !rest.is_empty())
+        .map(|(stream, rest)| (stream, sanitize_output(&rest)))
+        .collect()
+    }
+
+    fn buffer(&mut self, stream: leveler_execution::OutputStream) -> &mut String {
+        match stream {
+            leveler_execution::OutputStream::Stdout => &mut self.stdout,
+            leveler_execution::OutputStream::Stderr => &mut self.stderr,
+        }
+    }
+}
+
+/// Output leaving the loop gets the same treatment the finished result does:
+/// terminal control sequences stripped and concrete secret values replaced.
+fn sanitize_output(text: &str) -> String {
+    let clean = leveler_core::sanitize_terminal_output(text);
+    leveler_core::sanitize_model_visible(&clean).0
+}
+
 pub(crate) fn extract_executed_commands(metadata: &serde_json::Value) -> Vec<Vec<String>> {
     let Some(commands) = metadata.get("executed_commands").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -219,6 +284,8 @@ pub(crate) fn deny_call(
         parallel: false,
     });
     observer(AgentEvent::ToolResult {
+        exit_code: None,
+        stop: None,
         id: call.id.as_str().to_string(),
         name: call.name.clone(),
         is_error: true,
@@ -345,5 +412,47 @@ mod compact_json_tests {
     fn arguments_that_fit_are_passed_through_untouched() {
         let value = serde_json::json!({ "path": "src/lib.rs", "max_depth": 3 });
         assert_eq!(compact_json(&value), value.to_string());
+    }
+}
+
+#[cfg(test)]
+mod output_lines_tests {
+    use super::OutputLines;
+    use leveler_execution::{OutputChunk, OutputStream};
+
+    fn chunk(stream: OutputStream, text: &str) -> OutputChunk {
+        OutputChunk {
+            stream,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_partial_line_waits_for_its_newline_per_stream() {
+        let mut lines = OutputLines::default();
+        assert_eq!(lines.push(chunk(OutputStream::Stdout, "Check")), None);
+        assert_eq!(
+            lines.push(chunk(OutputStream::Stderr, "warn\n")),
+            Some((OutputStream::Stderr, "warn\n".to_string()))
+        );
+        assert_eq!(
+            lines.push(chunk(OutputStream::Stdout, "ing a\nChecking b")),
+            Some((OutputStream::Stdout, "Checking a\n".to_string()))
+        );
+        assert_eq!(
+            lines.flush(),
+            vec![(OutputStream::Stdout, "Checking b".to_string())]
+        );
+        assert!(lines.flush().is_empty());
+    }
+
+    #[test]
+    fn terminal_control_sequences_never_leave_the_loop() {
+        let mut lines = OutputLines::default();
+        let (_, text) = lines
+            .push(chunk(OutputStream::Stdout, "\u{1b}[31mred\u{1b}[0m\n"))
+            .expect("a whole line");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("red"));
     }
 }
