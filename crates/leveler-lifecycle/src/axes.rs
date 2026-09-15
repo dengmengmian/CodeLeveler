@@ -59,11 +59,14 @@ impl FromStr for CollaborationMode {
 pub enum WorkProfile {
     /// Reduced tool surface; lighter gates.
     Economy,
-    /// Default production path.
+    /// Default production path: the full capability surface.
+    ///
+    /// The legacy `delivery` value deserializes here: it never had runtime
+    /// behavior distinct from `balanced`, so it is a compatibility alias, not
+    /// a user-selectable value.
     #[default]
+    #[serde(alias = "delivery")]
     Balanced,
-    /// Strong process evidence on complete.
-    Delivery,
 }
 
 impl WorkProfile {
@@ -71,7 +74,18 @@ impl WorkProfile {
         match self {
             Self::Economy => "economy",
             Self::Balanced => "balanced",
-            Self::Delivery => "delivery",
+        }
+    }
+
+    /// Decode a value read from persistence.
+    ///
+    /// The single compatibility rule for old session rows: the legacy
+    /// `"delivery"` profile, and anything unrecognized, reads as
+    /// [`Self::Balanced`]. New writes only ever emit [`Self::as_str`].
+    pub fn from_persisted(raw: &str) -> Self {
+        match raw.trim() {
+            "economy" => Self::Economy,
+            _ => Self::Balanced,
         }
     }
 }
@@ -83,7 +97,6 @@ impl FromStr for WorkProfile {
         Ok(match s {
             "economy" => Self::Economy,
             "balanced" => Self::Balanced,
-            "delivery" => Self::Delivery,
             other => {
                 return Err(UnknownVariant {
                     kind: "work profile",
@@ -106,15 +119,24 @@ mod tests {
 
     #[test]
     fn work_profile_round_trips() {
-        for p in [
-            WorkProfile::Economy,
-            WorkProfile::Balanced,
-            WorkProfile::Delivery,
-        ] {
+        for p in [WorkProfile::Economy, WorkProfile::Balanced] {
             assert_eq!(WorkProfile::from_str(p.as_str()).unwrap(), p);
             let v = serde_json::to_value(p).unwrap();
             let back: WorkProfile = serde_json::from_value(v).unwrap();
             assert_eq!(back, p);
         }
+    }
+
+    #[test]
+    fn legacy_delivery_reads_as_balanced() {
+        // `delivery` never had behavior distinct from `balanced`; it is no
+        // longer a user value, but old rows must still resume safely.
+        assert_eq!(
+            WorkProfile::from_persisted("delivery"),
+            WorkProfile::Balanced
+        );
+        assert!(WorkProfile::from_str("delivery").is_err());
+        let back: WorkProfile = serde_json::from_str("\"delivery\"").unwrap();
+        assert_eq!(back, WorkProfile::Balanced);
     }
 }

@@ -570,7 +570,7 @@ impl Application {
     fn capability_selection(work_profile: WorkProfile) -> CapabilityPacks {
         match work_profile {
             WorkProfile::Economy => CapabilityPacks::NONE,
-            WorkProfile::Balanced | WorkProfile::Delivery => CapabilityPacks::ALL,
+            WorkProfile::Balanced => CapabilityPacks::ALL,
         }
     }
 
@@ -730,7 +730,9 @@ pub(crate) fn axes_from_session_record(
     record: &leveler_storage::SessionRecord,
 ) -> (WorkProfile, CollaborationMode) {
     use std::str::FromStr;
-    let work = WorkProfile::from_str(&record.work_profile).unwrap_or(WorkProfile::Balanced);
+    // The legacy `delivery` profile reads as `balanced` here, at the domain
+    // boundary — the single compatibility rule, not one per client.
+    let work = WorkProfile::from_persisted(&record.work_profile);
     let collab =
         CollaborationMode::from_str(&record.collaboration).unwrap_or(CollaborationMode::Chat);
     (work, collab)

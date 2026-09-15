@@ -171,7 +171,7 @@ export interface SessionView {
   model: ModelRef | null;
   availableModels: ModelRef[];
   permission: PermissionProfile;
-  /** 产品轴（economy|balanced|delivery）；SoT 是 session record，snapshot 带回 */
+  /** 产品轴（economy|balanced）；SoT 是 session record，snapshot 带回 */
   workProfile: string;
   /** 产品轴（chat|plan|goal）；goal 时 runtime 把普通提交路由成 goal turn */
   collaboration: string;

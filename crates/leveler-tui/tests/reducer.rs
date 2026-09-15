@@ -3254,9 +3254,9 @@ fn slash_work_mode_sends_product_axes() {
     let mut s = opened();
     // Default collaboration is chat; /work-mode only changes the work profile.
     assert_eq!(s.collaboration, "chat");
-    typed(&mut s, "/work-mode delivery");
+    typed(&mut s, "/work-mode economy");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.work_profile, "delivery");
+    assert_eq!(s.work_profile, "economy");
     assert!(
         effects.iter().any(|e| matches!(
             e,
@@ -3264,10 +3264,21 @@ fn slash_work_mode_sends_product_axes() {
                 work_profile,
                 collaboration,
                 ..
-            }) if work_profile == "delivery" && collaboration == "chat"
+            }) if work_profile == "economy" && collaboration == "chat"
         )),
         "effects={effects:?}"
     );
+}
+
+/// `delivery` has no runtime behavior distinct from `balanced`; it is no longer
+/// a user-selectable value, and typing it must not silently apply something.
+#[test]
+fn slash_work_mode_rejects_delivery() {
+    let mut s = opened();
+    typed(&mut s, "/work-mode delivery");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "effects={effects:?}");
+    assert_eq!(s.work_profile, "balanced", "delivery must not be applied");
 }
 
 #[test]
@@ -3295,11 +3306,10 @@ fn work_mode_picker_enter_applies_and_updates_state() {
     let mut s = opened();
     typed(&mut s, "/work-mode");
     reduce(&mut s, key(KeyCode::Enter));
-    // Options: balanced, economy, delivery — Down twice lands on delivery.
-    reduce(&mut s, key(KeyCode::Down));
+    // Options: balanced, economy — Down once lands on economy.
     reduce(&mut s, key(KeyCode::Down));
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.work_profile, "delivery");
+    assert_eq!(s.work_profile, "economy");
     assert!(s.overlay.is_none());
     assert!(
         effects.iter().any(|e| matches!(
@@ -3307,7 +3317,7 @@ fn work_mode_picker_enter_applies_and_updates_state() {
             Effect::Send(ClientCommand::SetProductAxes {
                 work_profile,
                 ..
-            }) if work_profile == "delivery"
+            }) if work_profile == "economy"
         )),
         "effects={effects:?}"
     );
@@ -3375,12 +3385,18 @@ fn permission_picker_selects_ask_and_the_chip_follows_the_ack() {
 }
 
 #[test]
-fn slash_collab_plan_forces_readonly_mode() {
+fn slash_collab_plan_sets_collaboration_without_touching_permission() {
     let mut s = opened();
+    assert_eq!(s.mode, PermissionProfile::Assisted);
     typed(&mut s, "/collab plan");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.collaboration, "plan");
-    assert_eq!(s.mode, PermissionProfile::RequestApproval);
+    assert_eq!(
+        s.mode,
+        PermissionProfile::Assisted,
+        "plan is a runtime-derived read-only TOOL overlay; the TUI must not fabricate \
+         a permission change it never sent"
+    );
     assert!(
         effects.iter().any(|e| matches!(
             e,
@@ -3390,6 +3406,12 @@ fn slash_collab_plan_forces_readonly_mode() {
             }) if collaboration == "plan"
         )),
         "effects={effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Send(ClientCommand::SetPermissionProfile { .. }))),
+        "plan must not send a permission change: {effects:?}"
     );
 }
 

@@ -43,7 +43,7 @@ pub struct SessionRecord {
     pub updated_at: String,
     /// Collaboration mode wire value: chat | plan | goal.
     pub collaboration: String,
-    /// Work profile wire value: economy | balanced | delivery.
+    /// Work profile wire value: economy | balanced (legacy `delivery` reads as `balanced`).
     pub work_profile: String,
 }
 

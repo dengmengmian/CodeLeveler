@@ -194,7 +194,7 @@ pub struct AppState {
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
-    /// Product work profile: economy | balanced | delivery.
+    /// Product work profile: economy | balanced.
     pub work_profile: String,
     /// Collaboration mode: chat | plan | goal.
     pub collaboration: String,

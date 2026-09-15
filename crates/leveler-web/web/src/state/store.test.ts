@@ -66,8 +66,8 @@ function stateWithSession(over: Partial<UiSessionSnapshot> = {}): AppState {
 
 describe('product axes', () => {
   it('adopts axes from the snapshot (runtime is the source of truth)', () => {
-    const state = stateWithSession({ work_profile: 'delivery', collaboration: 'goal' });
-    expect(state.current?.workProfile).toBe('delivery');
+    const state = stateWithSession({ work_profile: 'economy', collaboration: 'goal' });
+    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
   });
 
@@ -474,7 +474,7 @@ describe('turn terminal truth', () => {
         session: snapshot({
           status: 'idle',
           active_tools: [],
-          work_profile: 'delivery',
+          work_profile: 'economy',
           collaboration: 'goal',
           mode: 'full_access',
         }),
@@ -484,7 +484,7 @@ describe('turn terminal truth', () => {
     expect(state.current?.tools[0]?.status).toBe('done');
     expect(state.current?.agents).toHaveLength(1);
     expect(state.current?.lastTurn?.outcome).toBe('answered');
-    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
     expect(state.current?.permission).toBe('full_access');
   });

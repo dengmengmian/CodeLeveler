@@ -1,5 +1,5 @@
 //! Resume must re-apply product axes from the session row, not Application defaults.
-//! A delivery/economy session resumed after a fresh `assemble()` (balanced default)
+//! An economy session resumed after a fresh `assemble()` (balanced default)
 //! must still build the engine with the persisted work profile (AC5 / skeptic gap).
 
 use std::str::FromStr;
@@ -54,7 +54,7 @@ async fn create_session_persists_work_profile_and_collaboration() {
     let tmp = tempfile::tempdir().unwrap();
     let app = Application::assemble(layout(&tmp))
         .unwrap()
-        .with_work_profile(WorkProfile::Delivery)
+        .with_work_profile(WorkProfile::Economy)
         .with_collaboration(CollaborationMode::Goal);
     let id = app
         .create_session(&ModelRef::new("mock", "m"), "fix the login bug")
@@ -62,7 +62,7 @@ async fn create_session_persists_work_profile_and_collaboration() {
         .unwrap();
     let db = app.open_database().await.unwrap();
     let record = SessionRepository::new(&db).get(&id).await.unwrap().unwrap();
-    assert_eq!(record.work_profile, "delivery");
+    assert_eq!(record.work_profile, "economy");
     assert_eq!(record.collaboration, "goal");
     assert_eq!(
         TaskStore::task_for_session(&db, &id).await.unwrap(),
@@ -133,13 +133,13 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
             false,
             Arc::new(AutoApprove),
             Arc::new(AutoClarify),
-            WorkProfile::Delivery,
+            WorkProfile::Balanced,
             false,
             None,
         )
         .await
         .unwrap();
-    // Delivery composes whatever packs THIS host can offer, which depends on
+    // `balanced` composes whatever packs THIS host can offer, which depends on
     // the machine (a browser runtime, a search key, a vision model). The
     // invariant that does not depend on the machine is that it is a superset
     // of the core surface.
@@ -151,34 +151,37 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
 }
 
 #[tokio::test]
-async fn resume_session_rebuilds_engine_with_persisted_delivery_profile() {
+async fn a_legacy_delivery_row_resumes_as_balanced() {
     isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
-    let creator = Application::assemble(layout(&tmp))
-        .unwrap()
-        .with_work_profile(WorkProfile::Delivery);
+    let creator = Application::assemble(layout(&tmp)).unwrap();
     let id = creator
         .create_session(&ModelRef::new("mock", "m"), "fix the auth bug")
         .await
         .unwrap();
 
-    // Simulate CLI resume: fresh assemble without --work-mode.
+    // Simulate an OLD row written before `delivery` was retired from the product.
+    {
+        let db = creator.open_database().await.unwrap();
+        SessionRepository::new(&db)
+            .set_axes(&id, "chat", "delivery", leveler_core::now())
+            .await
+            .unwrap();
+    }
+
+    // A fresh process-shaped app resumes; the legacy value must read as `balanced`.
     let resumer = Application::assemble(layout(&tmp)).unwrap();
-    assert_eq!(resumer.work_profile(), WorkProfile::Balanced);
-
-    // The axes resume will apply must come from the session row.
     let (wp, _) = resumer.session_product_axes(&id).await.unwrap();
-    assert_eq!(wp, WorkProfile::Delivery);
-
-    // The profile the session row carries is what resume hands the engine
-    // builder; the effect it has (the tool surface) is pinned above.
+    assert_eq!(wp, WorkProfile::Balanced);
 }
 
 #[test]
 fn axes_wire_strings_parse_round_trip() {
+    // `delivery` is no longer a user value; it is only a legacy persisted alias.
+    assert!(WorkProfile::from_str("delivery").is_err());
     assert_eq!(
-        WorkProfile::from_str("delivery").unwrap(),
-        WorkProfile::Delivery
+        WorkProfile::from_persisted("delivery"),
+        WorkProfile::Balanced
     );
     assert_eq!(
         WorkProfile::from_str("economy").unwrap(),

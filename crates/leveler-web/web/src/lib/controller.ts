@@ -30,7 +30,7 @@ import type {
 } from '../types/protocol';
 
 /** 产品轴合法值（wire 契约：SetProductAxes 的注释）。 */
-export const WORK_PROFILES = ['economy', 'balanced', 'delivery'] as const;
+export const WORK_PROFILES = ['economy', 'balanced'] as const;
 export const COLLABORATIONS = ['chat', 'plan', 'goal'] as const;
 
 type GetState = () => AppState;
@@ -841,7 +841,7 @@ export class RuntimeBridge {
         if (!arg) return; // 无参数：由 Composer 打开工作档弹层
         const work = arg.toLowerCase();
         if (!(WORK_PROFILES as readonly string[]).includes(work)) {
-          this.dispatch({ type: 'notice', message: '用法：/work-mode economy|balanced|delivery' });
+          this.dispatch({ type: 'notice', message: '用法：/work-mode economy|balanced' });
           return;
         }
         const cur = this.getState().current;

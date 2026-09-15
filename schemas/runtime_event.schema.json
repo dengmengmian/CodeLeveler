@@ -3291,7 +3291,7 @@
           "type": "boolean"
         },
         "work_profile": {
-          "description": "Product work-profile axis (`economy | balanced | delivery`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
+          "description": "Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
           "type": [
             "string",
             "null"

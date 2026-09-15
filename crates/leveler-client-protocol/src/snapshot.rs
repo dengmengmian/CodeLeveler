@@ -395,7 +395,8 @@ pub struct UiSessionSnapshot {
     /// the model has no controllable effort knob (do not invent one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<UiReasoningState>,
-    /// Product work-profile axis (`economy | balanced | delivery`). The source
+    /// Product work-profile axis (`economy | balanced`; legacy `delivery` reads
+    /// as `balanced`). The source
     /// of truth is the session record (`SetProductAxes`); carried here so a
     /// reconnecting client shows the axis the runtime will actually use
     /// instead of a stale local guess. Absent on old runtimes.

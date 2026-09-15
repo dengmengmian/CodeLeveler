@@ -513,7 +513,7 @@ export interface UiSessionSnapshot {
   verification?: UiVerification | null;
   /** Whether the current model accepts image input (spec §42). */
   vision?: boolean;
-  /** Product work-profile axis (`economy | balanced | delivery`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes. */
+  /** Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes. */
   work_profile?: string | null;
 }
 
@@ -617,7 +617,7 @@ export type ClientCommand =
   | { type: 'select_model'; model: ModelRef; session_id: SessionId }
   /** Switch the execution mode used for subsequent turns . */
   | { type: 'set_permission_profile'; mode: PermissionProfile; session_id: SessionId }
-  /** Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced|delivery; collaboration = chat|plan|goal. */
+  /** Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced (legacy `delivery` reads as `balanced`); collaboration = chat|plan|goal. */
   | { type: 'set_product_axes'; collaboration: string; session_id: SessionId; work_profile: string }
   /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }

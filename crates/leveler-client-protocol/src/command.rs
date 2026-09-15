@@ -108,7 +108,8 @@ pub enum ClientCommand {
         mode: PermissionProfile,
     },
     /// Set product session axes (work profile × collaboration). Wire strings:
-    /// work_profile = economy|balanced|delivery; collaboration = chat|plan|goal.
+    /// work_profile = economy|balanced (legacy `delivery` reads as `balanced`);
+    /// collaboration = chat|plan|goal.
     SetProductAxes {
         session_id: SessionId,
         work_profile: String,

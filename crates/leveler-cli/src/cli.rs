@@ -219,7 +219,7 @@ pub enum Command {
         /// Deny network access to run_command processes (OS sandbox).
         #[arg(long = "deny-network", alias = "sandbox")]
         deny_network: bool,
-        /// Work profile: economy | balanced | delivery (default balanced).
+        /// Work profile: economy | balanced (default balanced).
         #[arg(long, default_value = "balanced")]
         work_mode: String,
         /// Task round budget for this run: default 200, a hard stop
@@ -229,7 +229,7 @@ pub enum Command {
         max_rounds: Option<u32>,
         /// Collaboration axis: chat | plan | goal.
         /// Default **chat** (ordinary turns). Use `goal` for
-        /// delivery runs that must call update_goal to finish.
+        /// long runs that must call update_goal to finish.
         #[arg(long, default_value = "chat")]
         collaboration: String,
         /// Run N agents concurrently in isolated worktrees and integrate the
@@ -847,7 +847,7 @@ mod tests {
             "--collaboration",
             "plan",
             "--work-mode",
-            "delivery",
+            "balanced",
         ]);
         match cli.command {
             Some(Command::Run {
@@ -856,7 +856,7 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(collaboration, "plan");
-                assert_eq!(work_mode, "delivery");
+                assert_eq!(work_mode, "balanced");
             }
             other => panic!("expected Run, got {other:?}"),
         }

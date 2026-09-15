@@ -321,7 +321,7 @@
       }
     },
     {
-      "description": "Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced|delivery; collaboration = chat|plan|goal.",
+      "description": "Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced (legacy `delivery` reads as `balanced`); collaboration = chat|plan|goal.",
       "type": "object",
       "required": [
         "collaboration",

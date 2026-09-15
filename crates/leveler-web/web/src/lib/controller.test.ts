@@ -85,15 +85,15 @@ function harness(): Harness {
 describe('product axes commands', () => {
   it('setAxes sends set_product_axes (the real protocol variant)', () => {
     const { bridge, sent, state } = harness();
-    bridge.setAxes('delivery', 'goal');
+    bridge.setAxes('economy', 'goal');
     expect(sent).toHaveLength(1);
     expect(sent[0]).toEqual({
       type: 'set_product_axes',
       session_id: 's1',
-      work_profile: 'delivery',
+      work_profile: 'economy',
       collaboration: 'goal',
     });
-    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
   });
 
@@ -107,10 +107,16 @@ describe('product axes commands', () => {
 
   it('slash /work-mode and /collab drive the axes', () => {
     const { bridge, sent } = harness();
-    bridge.runSlash('/work-mode delivery');
+    bridge.runSlash('/work-mode economy');
     bridge.runSlash('/collab goal');
     expect(sent.map((c) => c.type)).toEqual(['set_product_axes', 'set_product_axes']);
-    expect(sent[1]).toMatchObject({ work_profile: 'delivery', collaboration: 'goal' });
+    expect(sent[1]).toMatchObject({ work_profile: 'economy', collaboration: 'goal' });
+  });
+
+  it('the retired delivery profile is rejected, not applied', () => {
+    const { bridge, sent } = harness();
+    bridge.runSlash('/work-mode delivery');
+    expect(sent).toHaveLength(0);
   });
 });
 
@@ -389,14 +395,14 @@ describe('session_updated vs session_opened', () => {
         status: 'idle',
         messages: [],
         active_tools: [],
-        work_profile: 'delivery',
+        work_profile: 'economy',
         collaboration: 'goal',
       },
     });
     expect(state.current?.tools).toHaveLength(1);
     expect(state.current?.tools[0]?.status).toBe('done');
     expect(state.current?.permission).toBe('full_access');
-    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
   });
 

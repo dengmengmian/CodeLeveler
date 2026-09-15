@@ -189,7 +189,6 @@ worktree 开始，确保所有修改都能轻松审查或丢弃。
 | 查看一次执行（当时或事后） | TUI `/trace`，或 `leveler trace [session]` |
 | 执行单个任务 | `leveler run "给下单接口加校验"` |
 | 长任务 / 交付到完成为止 | TUI `/goal …`，或 `leveler run "…" --collaboration goal` |
-| 更严的交付门禁 | `--work-mode delivery` 或 TUI `/work-mode delivery` |
 | 并行多 agent 改代码 | `leveler run "…" --parallel 3`（worktree） |
 | 恢复之前的工作 | `leveler resume <session-id>` |
 

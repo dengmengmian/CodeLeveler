@@ -1342,14 +1342,14 @@ mod turn_axes_tests {
     #[tokio::test]
     async fn a_missing_row_falls_back_to_the_create_time_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = isolated_app(&tmp, WorkProfile::Delivery);
+        let app = isolated_app(&tmp, WorkProfile::Economy);
         let db = app.open_database().await.unwrap();
         let repo = SessionRepository::new(&db);
         let (work_profile, read_only) = app
             .turn_axes(&repo, &leveler_core::SessionId::new("no-such-session"))
             .await
             .unwrap();
-        assert_eq!(work_profile, WorkProfile::Delivery);
+        assert_eq!(work_profile, WorkProfile::Economy);
         assert!(!read_only);
     }
 }

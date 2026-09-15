@@ -720,7 +720,11 @@ impl InProcessRuntimeClient {
             model,
             mode,
             sandbox,
-            work_profile: record.work_profile.clone(),
+            // Normalize on read: a legacy `delivery` row surfaces as `balanced`
+            // everywhere (snapshot, footer, next persist), not just in the engine.
+            work_profile: leveler_lifecycle::WorkProfile::from_persisted(&record.work_profile)
+                .as_str()
+                .to_string(),
             collaboration: record.collaboration.clone(),
             // Not persisted in the session record; a restored session prompts
             // unless the daemon-wide `auto_approve` fallback applies. A client
@@ -2164,7 +2168,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 // Idle-only is enforced by the TUI; runtime still accepts while idle.
                 let mut config = self.runtime_config(&session_id).await?;
-                config.work_profile = work_profile;
+                // A new write only ever stores a current value; legacy `delivery`
+                // (from an old client) normalizes to `balanced` rather than
+                // persisting a value the product no longer offers.
+                config.work_profile = leveler_lifecycle::WorkProfile::from_persisted(&work_profile)
+                    .as_str()
+                    .to_string();
                 config.collaboration = collaboration.clone();
                 // Collaboration::Plan forces Safe-only tools via ToolContext.read_only
                 // (orthogonal to the permission profile).

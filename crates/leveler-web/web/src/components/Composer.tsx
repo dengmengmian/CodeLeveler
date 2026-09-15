@@ -58,7 +58,6 @@ const PERMISSIONS: ReadonlyArray<{
 const WORK_OPTIONS: ReadonlyArray<readonly [string, string]> = [
   ['economy', '省着用：更少的探索与验证轮次'],
   ['balanced', '默认：探索、实现、验证均衡'],
-  ['delivery', '交付：更充分的验证与收口'],
 ];
 
 const COLLAB_OPTIONS: ReadonlyArray<readonly [string, string]> = [

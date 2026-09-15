@@ -220,7 +220,6 @@ discard.
 | Run one task | `leveler run "add validation to the order endpoint"` |
 | Resume previous work | `leveler resume <session-id>` |
 | Long task until done | TUI `/goal …`, or `leveler run "…" --collaboration goal` |
-| Stricter delivery gates | `--work-mode delivery` or TUI `/work-mode delivery` |
 | Parallel multi-agent edits | `leveler run "…" --parallel 3` (worktrees) |
 
 On macOS/Linux, a long-running interactive session can use `leveler serve` in

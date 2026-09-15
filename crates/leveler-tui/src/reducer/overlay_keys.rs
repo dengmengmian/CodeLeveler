@@ -324,9 +324,6 @@ pub(super) fn open_work_mode_picker(state: &mut AppState) {
         SelectionOption::new("economy", "economy")
             .description(t.work_mode_economy)
             .current(current == "economy"),
-        SelectionOption::new("delivery", "delivery")
-            .description(t.work_mode_delivery)
-            .current(current == "delivery"),
     ];
     let model = SelectionModel::new(t.overlay_work_mode, options, false).focus_key(current);
     state.overlay = Some(Overlay::WorkModePicker(Box::new(model)));

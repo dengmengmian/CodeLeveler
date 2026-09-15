@@ -120,8 +120,6 @@ export function workProfileLabel(profile: string): string {
   switch (profile) {
     case 'economy':
       return 'Economy';
-    case 'delivery':
-      return 'Delivery';
     case 'balanced':
     default:
       return 'Balanced';

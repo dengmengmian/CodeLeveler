@@ -1,4 +1,4 @@
-use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel, PermissionProfile};
+use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel};
 
 use crate::action::Effect;
 use crate::screen::{BusyPolicy, Screen};
@@ -582,7 +582,9 @@ fn set_work_mode(state: &mut AppState, command: &str) -> Vec<Effect> {
 }
 
 pub(super) fn apply_work_profile(state: &mut AppState, arg: &str) -> Vec<Effect> {
-    if !matches!(arg, "economy" | "balanced" | "delivery") {
+    // Only profiles with distinct runtime behavior are user-selectable. The
+    // legacy `delivery` value had none (it was identical to `balanced`).
+    if !matches!(arg, "economy" | "balanced") {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
             message: state.t().work_mode_usage.to_string(),
@@ -623,18 +625,18 @@ pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
         return Vec::new();
     }
     state.collaboration = collab.to_string();
-    if collab == "plan" {
-        state.mode = PermissionProfile::RequestApproval;
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: "协作=计划（只读）。确认后用 /collab goal 或 /goal <任务> 开始执行".into(),
-        });
+    // `plan` is a runtime-derived read-only TOOL overlay: `collaboration=plan`
+    // makes the runtime compute `read_only`. It does NOT change the permission
+    // profile, and the TUI must not fabricate one it never sent.
+    let message = if collab == "plan" {
+        "协作=计划（只读）。确认后用 /collab goal 或 /goal <任务> 开始执行".to_string()
     } else {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: format!("协作 → {collab}"),
-        });
-    }
+        format!("协作 → {collab}")
+    };
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message,
+    });
     vec![Effect::Send(ClientCommand::SetProductAxes {
         session_id: state.session_id.clone(),
         work_profile: state.work_profile.clone(),
