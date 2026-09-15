@@ -358,10 +358,17 @@ fn disclosure_presentation(
     expanded: bool,
     t: &UiText,
 ) -> crate::presentation::disclosure::DisclosurePresentation {
+    // A command that ran without the network it needed lacks a permission;
+    // it is counted apart from the failures.
+    let needs_network = visible
+        .iter()
+        .filter(|c| c.status == ToolStatus::Failed && needs_network_permission(c))
+        .count();
     let failed = visible
         .iter()
         .filter(|c| c.status == ToolStatus::Failed)
-        .count();
+        .count()
+        - needs_network;
     // Only a single call has an authoritative duration (the runtime supplied
     // it). Summing children fakes wall time for parallel batches — four 5s
     // reads did not take 20s — so a multi-tool disclosure shows none.
@@ -374,6 +381,10 @@ fn disclosure_presentation(
         failed,
         failed_suffix: (failed > 0 && visible.len() > 1)
             .then(|| t.batch_failed.replace("{}", &failed.to_string())),
+        needs_permission_suffix: (needs_network > 0 && visible.len() > 1).then(|| {
+            t.batch_needs_network
+                .replace("{}", &needs_network.to_string())
+        }),
         expanded,
         duration_ms,
         first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
@@ -421,7 +432,7 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
 fn first_error_line(visible: &[&ToolCallBlock]) -> Option<String> {
     visible
         .iter()
-        .find(|c| c.status == ToolStatus::Failed)
+        .find(|c| c.status == ToolStatus::Failed && !needs_network_permission(c))
         .and_then(|c| c.preview.as_deref())
         .and_then(|p| {
             p.lines()
@@ -2521,6 +2532,44 @@ mod tests {
             .find(|l| l.contains("a.rs"))
             .expect("the finished member keeps its row");
         assert!(settled.contains('\u{b7}'), "settled exploration: {settled}");
+    }
+
+    /// A folded batch whose commands all need the network is not a batch that
+    /// failed: it says what they need, and never shows the model-facing tag.
+    #[test]
+    fn a_folded_batch_of_network_denied_commands_is_not_headed_as_failed() {
+        let denied = |url: &str| {
+            let mut c = call(
+                "run_command",
+                &format!(r#"{{"program":"curl","args":["{url}"]}}"#),
+                ToolStatus::Failed,
+            );
+            c.preview = Some(
+                "[network permission required] blocked…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host".into(),
+            );
+            c.exit_code = Some(6);
+            c
+        };
+        let g = group(vec![
+            denied("https://a.example"),
+            denied("https://b.example"),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].starts_with('▸'), "{lines:?}");
+        assert!(
+            !lines[0].contains('✗') && !lines[0].contains("失败"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains('⚠') && lines[0].contains("2 个需要网络权限"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("[network permission required]")),
+            "{lines:?}"
+        );
     }
 
     /// Once every call finishes, the group is history: the live `◌` rows are

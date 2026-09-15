@@ -1178,6 +1178,7 @@ pub(crate) fn user_shell_lines(
             .exit_code
             .filter(|code| failed && *code != 0)
             .map(|code| format!("exit {code}")),
+        needs_permission_suffix: None,
         expanded: shell.expanded,
         duration_ms: shell.duration_ms,
         first_error: (!shell.expanded && failed)

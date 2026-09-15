@@ -24,6 +24,9 @@ pub struct DisclosurePresentation {
     /// Extra failure count suffix for multi-execution batches, already
     /// localized ("2 failed"); shown after the label.
     pub failed_suffix: Option<String>,
+    /// Executions that did not fail on their own but lack a permission
+    /// ("2 need network permission"), already localized. Marked ⚠, not ✗.
+    pub needs_permission_suffix: Option<String>,
     /// Open (`▾`) or folded (`▸`).
     pub expanded: bool,
     /// Authoritative runtime-supplied duration. The adapter must only set
@@ -40,10 +43,11 @@ pub struct DisclosurePresentation {
 pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> Line<'static> {
     let glyph = if p.expanded { "▾" } else { "▸" };
     let failed = p.failed > 0;
+    let attention = failed || p.needs_permission_suffix.is_some();
     let mut spans = vec![
         Span::styled(
             format!("{glyph} "),
-            Style::default().fg(if failed {
+            Style::default().fg(if attention {
                 theme.status.warning
             } else {
                 theme.text.muted
@@ -51,7 +55,7 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
         ),
         Span::styled(
             truncate_display(&p.label, width.saturating_sub(16)),
-            Style::default().fg(if failed {
+            Style::default().fg(if attention {
                 theme.text.primary
             } else {
                 theme.text.muted
@@ -69,6 +73,17 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
                 Style::default().fg(theme.status.warning),
             ));
         }
+    } else if attention {
+        spans.insert(
+            1,
+            Span::styled("⚠ ".to_string(), Style::default().fg(theme.status.warning)),
+        );
+    }
+    if let Some(suffix) = &p.needs_permission_suffix {
+        spans.push(Span::styled(
+            format!(" · {suffix}"),
+            Style::default().fg(theme.status.warning),
+        ));
     }
     if let Some(ms) = p.duration_ms
         && ms >= 1000
