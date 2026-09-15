@@ -44,7 +44,7 @@ sys.path.insert(0, str(EVAL_ROOT / "lib"))
 
 from ab import aggregate, judge_run, plan_slots, unit_results  # noqa: E402
 from child_lifecycle import child_lifecycle, request_usage  # noqa: E402
-from coordination import coordination, reasoning_effort_by_lane  # noqa: E402
+from coordination import coordination, reasoning_effort_by_lane, stop_limit  # noqa: E402
 from eventlog import extract_timeline  # noqa: E402
 from runner import ARM_MULTI, ARM_SINGLE, default_user_config, prepare_home  # noqa: E402
 from spawn_metric import connect_ro, event_rows  # noqa: E402
@@ -209,7 +209,8 @@ def observe(record: dict, home: Path) -> None:
     record["coordination"] = coordination(con)
     trace = "".join(p.read_text(errors="replace") for p in sorted(home.parent.glob("run*.err")))
     record["effort_by_lane"] = reasoning_effort_by_lane(trace, con)
-    record["round_limit_hit"] = record["task_outcome"] == "budget_limited"
+    record["stop_limit"] = stop_limit(con)
+    record["round_limit_hit"] = record["stop_limit"] in ("round_ceiling", "round_window")
     con.close()
 
 

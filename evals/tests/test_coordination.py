@@ -6,7 +6,7 @@ import unittest
 
 from _path import LIB  # noqa: F401
 
-from coordination import coordination, reasoning_effort_by_lane
+from coordination import coordination, reasoning_effort_by_lane, stop_limit
 
 
 def _db(events, requests=()):
@@ -180,6 +180,26 @@ class ReasoningEffortByLaneTests(unittest.TestCase):
         )
         self.assertEqual(reasoning_effort_by_lane(err, con), {
             "parent": {"High": 2}, "child": {"Max": 1}, "unmatched": {"None": 1}})
+
+
+class StopLimitTests(unittest.TestCase):
+    def _finished(self, payload):
+        return _db([(0, "turn_started", {}), (5, "task_finished", payload)])
+
+    def test_the_round_ceiling_the_round_window_and_a_budget_are_told_apart(self):
+        self.assertEqual(stop_limit(self._finished(
+            {"outcome": "budget_limited", "stop": "turn_limit_reached", "reason": "round ceiling reached"})),
+            "round_ceiling")
+        # A window stop carries no budget detail (probe on f89c1db: reason null).
+        self.assertEqual(stop_limit(self._finished(
+            {"outcome": "budget_limited", "stop": "budget_exhausted", "reason": None})), "round_window")
+        self.assertEqual(stop_limit(self._finished(
+            {"outcome": "budget_limited", "stop": "budget_exhausted", "reason": "budget exhausted: duration"})),
+            "budget")
+
+    def test_a_run_that_did_not_stop_on_a_limit_has_none(self):
+        self.assertIsNone(stop_limit(self._finished({"outcome": "completed", "stop": "completed"})))
+        self.assertIsNone(stop_limit(_db([(0, "turn_started", {})])))
 
 
 if __name__ == "__main__":

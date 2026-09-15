@@ -204,3 +204,19 @@ def reasoning_effort_by_lane(err_text: str, con: sqlite3.Connection) -> dict[str
         out.setdefault(lane, {})
         out[lane][effort] = out[lane].get(effort, 0) + 1
     return out
+
+
+def stop_limit(con: sqlite3.Connection) -> str | None:
+    """Which limit ended the run, from the last `task_finished`: the round
+    ceiling (`turn_limit_reached`), the round window (`budget_exhausted` with
+    no budget detail), a duration/token/cost budget (`budget_exhausted` with
+    one), or None when no limit ended it."""
+    rows = con.execute("select payload from events where type = 'task_finished' order by sequence").fetchall()
+    if not rows:
+        return None
+    body = json.loads(rows[-1][0]).get("payload") or {}
+    if body.get("stop") == "turn_limit_reached":
+        return "round_ceiling"
+    if body.get("stop") == "budget_exhausted":
+        return "budget" if body.get("reason") else "round_window"
+    return None
