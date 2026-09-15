@@ -334,6 +334,13 @@ impl Workspace {
         if access == PathAccess::Write && self.is_trust_gated_project_file(normalized) {
             return Err(denied(original));
         }
+        // Agent definitions change what future children may do. They are
+        // written through the agent store (validated, confirmed by a person,
+        // atomic), so no tool patches them in place.
+        if access == PathAccess::Write && normalized.starts_with(self.root.join(".leveler/agents"))
+        {
+            return Err(denied(original));
+        }
 
         for comp in normalized.components() {
             if let Component::Normal(os) = comp {
@@ -575,6 +582,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Agent definitions are written through the agent store — validated,
+    /// confirmed by a person, atomic — never patched in place by a tool: an
+    /// edit tool could otherwise turn a read-only agent into a writer without
+    /// anyone seeing it. Reads stay allowed so the agent can show them.
+    #[test]
+    fn writes_to_project_agent_definitions_are_denied() {
+        let (ws, dir) = workspace();
+        for name in [
+            ".leveler/agents/security-reviewer/agent.yaml",
+            ".leveler/agents/security-reviewer/instructions.md",
+            ".leveler/agents/new-agent/agent.yaml",
+            ".leveler/agents",
+        ] {
+            assert!(
+                matches!(
+                    ws.resolve_for_write(name, &ws_scope(&ws)),
+                    Err(WorkspaceError::Denied(_))
+                ),
+                "{name} must not be writable"
+            );
+            assert!(
+                ws.resolve_for_read(name).is_ok(),
+                "{name} must stay readable"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn other_leveler_files_and_same_named_files_elsewhere_stay_writable() {
         let (ws, dir) = workspace();
@@ -585,6 +620,9 @@ mod tests {
             // `hooks.yaml` elsewhere in the tree is an ordinary file.
             "ci/hooks.yaml",
             "config/permissions.yaml",
+            // Only the project's own agents directory is guarded.
+            "docs/agents/security-reviewer/agent.yaml",
+            ".leveler/agents-notes.md",
         ] {
             assert!(
                 ws.resolve_for_write(name, &ws_scope(&ws)).is_ok(),
