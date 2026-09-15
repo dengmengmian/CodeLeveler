@@ -215,3 +215,47 @@ MULTI_AGENT_PRODUCT_VALUE=NOT_PROVEN
 MULTI_AGENT_PRODUCT_CLOSURE=BLOCKED
 DEFAULT_MULTI_AGENT_POLICY=delegation stays available and model-chosen; not forced, not advertised as a benefit
 ```
+
+## Addendum — MA4-C and the final S4 value closure (2026-09-15)
+
+Every result above is kept as it was recorded. After MA4-B, two more steps
+ran:
+
+- MA4-C (`docs/MULTI_AGENT_PARENT_REASONING_BUDGET_VALIDATION.md`) found the
+  parent's reasoning effort was not the root cause (B), once the Long-Task
+  Round Budget Closure had removed a hidden 100-round ceiling and poll-driven
+  rounds.
+- `docs/MULTI_AGENT_S4_FINAL_VALUE_AND_ROOT_CAUSE_CLOSURE.md` then ran the
+  frozen S4 as a 5 + 5 paired comparison, delegation off vs on, with no
+  censoring.
+
+Results of the S4 comparison:
+
+- Both arms passed the task 0 of 5 times.
+- Delegated runs got 24 of 40 units right against 20 of 40, and cost 43 %
+  less.
+- They were faster only by an amount that could not be told apart from run
+  variance.
+- No delegation counted as useful under the registered definition.
+
+Root cause of the missing value, established mechanically: execution quality
+on the hardest contracts. `lruttl` passed 1 time in 10 runs, and it fails the
+same way in every seat: single agent, child or parent. Child context handoff,
+parent integration and task decomposition were each checked and rejected. The
+latency side is also held back by coordination overhead (pre-spawn
+exploration, the concurrency queue, the longest single package).
+
+The only product change was a truth fix, `adfb61b`: a child stopped by its
+duration cap now says so, and carries a typed `limit`.
+
+```text
+MULTI_AGENT_CAPABILITY_CLOSURE=PASS
+AUTO_DELEGATION_VALUE_CLOSURE=BLOCKED
+AUTO_DELEGATION_VALUE=NOT_PROVEN
+AUTO_DELEGATION_POLICY=CONSERVATIVE (available, model-chosen, not forced, not marketed as faster or better)
+MA4_EVAL_ACCEPTANCE=FAIL (unchanged)
+MULTI_AGENT_PRODUCT_CLOSURE=BLOCKED_ON_VALUE
+```
+
+`BLOCKED_ON_VALUE` is about value, not the runtime: the multi-agent capability,
+runtime, safety and product surface all pass.
