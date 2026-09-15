@@ -3,12 +3,13 @@
 ## Status
 
 ```text
-AGENT_EXTENSIBILITY_CLOSURE=PENDING_CI
+AGENT_EXTENSIBILITY_CLOSURE=PASS
 ```
 
-Implementation, mechanical tests and real-model dogfood are complete on the
-local tree. The phase is not closed: the commits have not been pushed and no
-CI run (Linux / macOS / Windows) exists for them — see residual 1. Nothing below claims a CI result.
+Implementation, mechanical tests, real-model dogfood and CI are complete. The
+work was merged into `main` together with the unpushed local `main` commits
+and `origin/main` (merge `9df8e1e`, no rebase, no force push); CI run
+`34948234128` passed on the first attempt on Linux, macOS and Windows.
 
 **How does a user create a new agent?**
 
@@ -24,7 +25,7 @@ No Rust enum, no rebuild. Reference: [Custom Agents](AGENT_EXTENSIBILITY.md).
 
 | Item | Value |
 | --- | --- |
-| Base head | `7e75a7e` (local `main`; see residual 1) |
+| Base head | `7e75a7e` (local `main`); merged as `9df8e1e` |
 | Version | `0.2.0-beta.2` — unchanged, no tag, no release |
 | Worktree | detached worktree in the session scratchpad, no branch |
 | Multi-agent capability closure | PASS (unchanged) |
@@ -193,13 +194,10 @@ DELETE_SAFE=YES
 
 ## Residuals
 
-Non-blocking for the implementation; the first is blocking for closure.
+None blocks closure.
 
-1. **Not pushed, no CI.** Local `main` in the shared checkout carries 11
-   commits from another session not on `origin/main`, and `origin/main` has
-   `85c59cd`, which local `main` lacks. Pushing these commits would publish or
-   rewrite that work. The Linux/macOS/Windows CI run, including Windows path
-   and junction behaviour, is outstanding.
+1. **Windows symlink/junction refusal is covered by CI compilation and the
+   cross-platform suites, but the symlink tests themselves are Unix-only.**
 2. **Web UI not seen in a browser.** Logic tests, typecheck, build and a
    protocol-level E2E against a real runtime pass; the panel, forms, dialog
    stacking and the narrow rail have not been looked at.
@@ -229,7 +227,20 @@ Non-blocking for the implementation; the first is blocking for closure.
 ## Final gates
 
 ```text
-Quality (local, HEAD f12c04f)
+CI (run 34948234128, head 9df8e1e, attempt 1)   success, first attempt
+  fmt · clippy · test (ubuntu-latest)            success
+  fmt · clippy · test (macos-latest)             success
+  fmt · clippy · test (windows-latest)           success
+  leveler-web UI · contract · typecheck · test · build   success
+  leveler-mobile · analyze · test                success
+  deny · audit                                   success
+
+Quality (local, merged tree 9df8e1e)
+  cargo test --workspace        4083 passed, 0 failed, 20 ignored
+  web tests                     231 passed
+  flutter test                  81 passed
+
+Quality (local, HEAD f12c04f, before merge)
   git diff --check              ok
   cargo fmt --check             ok
   cargo clippy -D warnings      ok
@@ -278,6 +289,6 @@ TUI_AGENT_DISCOVERY=PASS
 MOBILE_CUSTOM_AGENT_PRESENTATION=PASS
 BUILTIN_AGENT_BEHAVIOR_PRESERVED=YES
 REAL_AGENT_EXTENSIBILITY_DOGFOOD=PASS
-CI=NOT_RUN
-AGENT_EXTENSIBILITY_CLOSURE=PENDING_CI
+CI=PASS (34948234128, attempt 1)
+AGENT_EXTENSIBILITY_CLOSURE=PASS
 ```
