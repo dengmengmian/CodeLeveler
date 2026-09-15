@@ -14,8 +14,13 @@
 /// message.
 pub(crate) fn real_text_at_anchor(content: &str, wanted: &str, max_sites: usize) -> Option<String> {
     let file: Vec<&str> = content.lines().collect();
-    let span = wanted.lines().count().max(1);
-    let needle = wanted.lines().find(|l| !l.trim().is_empty())?.trim();
+    let wanted_lines: Vec<&str> = wanted.lines().collect();
+    let span = wanted_lines.len().max(1);
+    let (offset, needle) = wanted_lines
+        .iter()
+        .enumerate()
+        .find(|(_, l)| !l.trim().is_empty())
+        .map(|(i, l)| (i, l.trim()))?;
     if needle.is_empty() {
         return None;
     }
@@ -50,8 +55,32 @@ pub(crate) fn real_text_at_anchor(content: &str, wanted: &str, max_sites: usize)
     for at in hits.into_iter().take(max_sites) {
         s.push_str(&format!("--- file content at line {} ---\n", at + 1));
         s.push_str(&excerpt(&file, at, span));
+        if let Some(difference) = first_difference(&file, at.checked_sub(offset), &wanted_lines) {
+            s.push_str(&difference);
+        }
     }
     Some(s)
+}
+
+/// Line the hunk up with the file where its anchor was found and name the
+/// first line that is not identical — a one-character slip is easy to miss
+/// in an excerpt.
+fn first_difference(file: &[&str], start: Option<usize>, wanted: &[&str]) -> Option<String> {
+    let start = start?;
+    wanted.iter().enumerate().find_map(|(i, hunk)| {
+        let at = start + i;
+        let actual = file.get(at).copied();
+        (actual != Some(*hunk)).then(|| match actual {
+            Some(actual) => format!(
+                "first difference at file line {}:\n  file: `{actual}`\n  hunk: `{hunk}`\n",
+                at + 1
+            ),
+            None => format!(
+                "first difference at file line {}: the file ends there, the hunk continues with `{hunk}`\n",
+                at + 1
+            ),
+        })
+    })
 }
 
 /// Render `file` around 0-based line `around`, wide enough to cover a `span`-line
@@ -98,6 +127,19 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("5\u{2502}     x + 1"), "{hint}");
+    }
+
+    /// The excerpt alone was not enough: a model missed a one-character
+    /// difference (`"#,` for `"#`) four times running, then rewrote the whole
+    /// file. The hint names the first line that differs, side by side.
+    #[test]
+    fn names_the_first_line_that_differs() {
+        let content = "fn t() {\n    write(\n        r#\"\n[a]\n\"#\n    )\n}\n";
+        let wanted = "    write(\n        r#\"\n[a]\n\"#,\n    )";
+        let hint = real_text_at_anchor(content, wanted, 3).unwrap();
+        assert!(hint.contains("first difference at file line 5"), "{hint}");
+        assert!(hint.contains("file: `\"#`"), "{hint}");
+        assert!(hint.contains("hunk: `\"#,`"), "{hint}");
     }
 
     #[test]
