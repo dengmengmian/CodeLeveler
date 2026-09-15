@@ -418,8 +418,10 @@ fn escalation_property() -> serde_json::Value {
         "description": "Retry this EXACT command with elevated permission after the \
             sandbox denied it. The approval prompt this raises is how the user consents \
             — do not ask in prose first, and do not call request_permissions for it. \
-            Ground it in a denial you just saw: never escalate speculatively. The grant \
-            covers this one call only. If the user denies, that answer is final.",
+            Ground it in a denial you just saw: never escalate speculatively. Ask only for \
+            what that denial showed: a network failure needs `network`, not `filesystem`. \
+            The user chooses whether the grant covers this call or the rest of the turn. \
+            If the user denies, that answer is final.",
         "properties": {
             "reason": {
                 "type": "string",
@@ -432,7 +434,7 @@ fn escalation_property() -> serde_json::Value {
             "filesystem": {
                 "type": "string",
                 "enum": ["workspace", "unrestricted"],
-                "description": "unrestricted = drop the workspace write confinement (and the `.git` write protection) for this call."
+                "description": "unrestricted = drop the workspace write confinement (and the `.git` write protection). Only after a write outside the workspace was denied; dependency caches are already writable once the network is granted."
             },
             "full_access": {
                 "type": "boolean",
