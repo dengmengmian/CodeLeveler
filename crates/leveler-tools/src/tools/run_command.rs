@@ -80,7 +80,9 @@ impl Tool for RunCommandTool {
 
     fn description(&self) -> &'static str {
         "Run a program with an explicit argument array (no shell) in the \
-         workspace. Returns exit code, stdout and stderr. Use for formatters, \
+         workspace: {\"program\": \"cargo\", \"args\": [\"test\"]}. There is no \
+         `cmd` field — a whole shell command line goes to shell_command. \
+         Returns exit code, stdout and stderr. Use for formatters, \
          builds, and tests. For npm/yarn/pnpm package scripts, call the package \
          manager script form such as npm run test -- args; do not use npx run \
          for package scripts. In a Node project, prefer the repo-local binary \
@@ -251,27 +253,71 @@ mod hang_guard_tests {
 /// shell line silently re-routed (either direction) would run under the
 /// wrong execution and security model.
 fn cmd_shape_guidance(cmd: &str) -> String {
-    format!(
-        "run_command does not take a `cmd` field — nothing was executed. \
-         run_command runs one executable: {{\"program\": \"go\", \"args\": \
-         [\"test\", \"./...\"]}}. For a whole shell command line like `{}` \
-         (pipes, $(), redirection, &&), call shell_command with its `cmd` field.",
-        if cmd.chars().count() > 120 {
-            let head: String = cmd.chars().take(120).collect();
-            format!("{head}\u{2026}")
-        } else {
-            cmd.to_string()
-        },
-    )
+    let shown = if cmd.chars().count() > 120 {
+        let head: String = cmd.chars().take(120).collect();
+        format!("{head}\u{2026}")
+    } else {
+        cmd.to_string()
+    };
+    // A line with no shell syntax splits into argv exactly; show that call.
+    let needs_shell = cmd.chars().any(|c| {
+        matches!(
+            c,
+            '|' | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '*'
+                | '?'
+                | '~'
+                | '\''
+                | '"'
+                | '\\'
+                | '\n'
+        )
+    });
+    let words: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+    match words.split_first() {
+        Some((program, args)) if !needs_shell => format!(
+            "run_command does not take a `cmd` field — nothing was executed. \
+             run_command runs one executable with an argument array; this line is \
+             {}. Use shell_command with `cmd` only for a command line that needs a \
+             shell (pipes, $(), redirection, &&).",
+            retry_call(program, args)
+        ),
+        _ => format!(
+            "run_command does not take a `cmd` field — nothing was executed. \
+             run_command runs one executable: {{\"program\": \"go\", \"args\": \
+             [\"test\", \"./...\"]}}. For a whole shell command line like `{shown}` \
+             (pipes, $(), redirection, &&), call shell_command with its `cmd` field."
+        ),
+    }
 }
 
 fn missing_program_guidance(args: &[String]) -> String {
-    if args.is_empty() {
+    let Some((first, rest)) = args.split_first() else {
         return "run_command needs a `program` (the executable) and an optional \
                 `args` array — it does not take a shell string. To run a whole \
                 command line (e.g. `./admin-server`, or one with pipes / $() / \
                 redirection / &&), use shell_command with its `cmd` field instead."
             .to_string();
+    };
+    // A first argument that is a path names a file to run, so the retry can
+    // use it. A bare word (`test`) stays unguessed: running argv[0] could be a
+    // different program entirely.
+    if first.contains('/') || first.contains('\\') {
+        return format!(
+            "run_command is missing `program` — nothing was executed. To run \
+             `{first}`, the call is {}. Use shell_command only for a whole command \
+             line with pipes, $(), redirection or &&.",
+            retry_call(first, rest)
+        );
     }
     format!(
         "run_command is missing `program`: the executable that runs `{}`. \
@@ -280,6 +326,15 @@ fn missing_program_guidance(args: &[String]) -> String {
          Use shell_command only for a whole command line with pipes, $(), \
          redirection or &&.",
         args.join(" "),
+        serde_json::to_string(args).unwrap_or_else(|_| "[…]".into()),
+    )
+}
+
+/// `{"program": "<program>", "args": [...]}` as the model should send it.
+fn retry_call(program: &str, args: &[String]) -> String {
+    format!(
+        "{{\"program\": {}, \"args\": {}}}",
+        serde_json::to_string(program).unwrap_or_else(|_| "\"…\"".into()),
         serde_json::to_string(args).unwrap_or_else(|_| "[…]".into()),
     )
 }
@@ -727,6 +782,53 @@ mod tests {
         assert!(shown.contains("elided"));
         assert!(locator.is_none());
         assert!(!shown.contains("full output:"));
+    }
+
+    /// Dogfood: `{"args": ["./scripts/soak.sh"]}` was told to retry with
+    /// `{"program": "go", "args": ["./scripts/soak.sh"]}` — an example that
+    /// would run the wrong program. The retry shape uses the caller's own
+    /// words, without executing a guess.
+    #[test]
+    fn missing_program_guidance_shows_the_callers_own_retry() {
+        let one = missing_program_guidance(&["./scripts/soak.sh".to_string()]);
+        assert!(
+            one.contains(r#"{"program": "./scripts/soak.sh", "args": []}"#),
+            "{one}"
+        );
+        assert!(!one.contains(r#""go""#), "{one}");
+        let with_args = missing_program_guidance(&["bin/tool".into(), "--fast".into()]);
+        assert!(
+            with_args.contains(r#"{"program": "bin/tool", "args": ["--fast"]}"#),
+            "{with_args}"
+        );
+        // A bare word is never promoted to the program.
+        let bare = missing_program_guidance(&["test".into(), "./...".into()]);
+        assert!(!bare.contains(r#"{"program": "test""#), "{bare}");
+    }
+
+    /// A plain command line sent as `cmd` gets the run_command call that runs
+    /// it; one that needs a shell keeps pointing at shell_command.
+    #[test]
+    fn cmd_guidance_shows_the_argv_call_for_a_plain_command_line() {
+        let plain = cmd_shape_guidance("cargo test -q");
+        assert!(
+            plain.contains(r#"{"program": "cargo", "args": ["test","-q"]}"#),
+            "{plain}"
+        );
+        let piped = cmd_shape_guidance("cargo test | tail -5");
+        assert!(!piped.contains(r#""args": ["test","|""#), "{piped}");
+        assert!(piped.contains("shell_command"), "{piped}");
+    }
+
+    #[test]
+    fn description_shows_the_call_shape() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        assert!(
+            tool.description()
+                .contains(r#"{"program": "cargo", "args": ["test"]}"#),
+            "{}",
+            tool.description()
+        );
     }
 
     #[tokio::test]
