@@ -510,6 +510,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             }
             if over_conv {
                 state.workbench_focus = WorkbenchFocus::Conversation;
+                let was_following = state.conv.auto_scroll;
                 // Pin the viewport exactly where it is painted so agent
                 // streaming cannot yank us to the bottom AND the hit test
                 // below maps against the same scroll the user is looking at.
@@ -525,6 +526,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 match interaction::hit_test(state, mouse.column, mouse.row) {
                     Hit::Command { item, call, stop } => {
                         let effects = if stop {
+                            // A stop reflows nothing above the row: keep
+                            // following so its result and the answer show.
+                            state.conv.auto_scroll = was_following;
                             request_tool_stop(state, item, call)
                         } else {
                             state.transcript.toggle_call_at(item, call);

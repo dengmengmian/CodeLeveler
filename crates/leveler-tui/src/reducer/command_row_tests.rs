@@ -201,6 +201,20 @@ fn terminal_rows_name_how_the_command_ended() {
     );
 }
 
+/// Stopping a command at the live edge keeps following it. Dogfood: the stop
+/// click pinned the viewport like a disclosure click, so the stopped row's
+/// result and the model's answer landed below the screen behind a ▼ badge.
+#[test]
+fn stopping_a_command_at_the_live_edge_keeps_following() {
+    let mut s = state();
+    start(&mut s, "c1");
+    s.conv.auto_scroll = true;
+    let (col, row) = cell_of(&s, "停止");
+    click(&mut s, col, row);
+    assert_eq!(call(&s, "c1").stop, StopRequest::Sent);
+    assert!(s.conv.auto_scroll, "a stop must not leave auto-follow");
+}
+
 /// A stop the runtime could not confirm is not a stop, and not a failure.
 #[test]
 fn an_unconfirmed_stop_is_unknown_never_stopped_or_failed() {
