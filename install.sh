@@ -41,7 +41,7 @@ esac
 # `LEVELER_VERSION` pins one explicitly, and it is the ONLY way to reach a
 # pre-release: GitHub's `releases/latest` returns the latest *stable* release
 # and never a pre-release, which is exactly what keeps a beta off the machines
-# of people who did not ask for it. Accepts `v0.2.0-beta.2` or `0.2.0-beta.2`.
+# of people who did not ask for it. Accepts `v0.2.0-beta.3` or `0.2.0-beta.3`.
 if [ -n "${LEVELER_VERSION:-}" ]; then
   case "$LEVELER_VERSION" in
     v*) tag="$LEVELER_VERSION" ;;

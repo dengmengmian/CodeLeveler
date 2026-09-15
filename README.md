@@ -27,7 +27,7 @@ framework are architectural directions — not all shipped yet. See
 [Architecture](docs/ARCHITECTURE.md) for the layer model and the boundaries
 the code does not meet yet.
 
-CodeLeveler is in public beta: **`0.2.0-beta.2`**, published as a pre-release
+CodeLeveler is in public beta: **`0.2.0-beta.3`**, published as a pre-release
 (see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
 
 **The release workflow builds macOS, Linux and Windows binaries for every
@@ -88,7 +88,7 @@ one-line installer, or `leveler upgrade` pick up by default — a beta arrives
 only if you ask for it by name:
 
 ```sh
-LEVELER_VERSION=v0.2.0-beta.2 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
+LEVELER_VERSION=v0.2.0-beta.3 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
 ```
 
 **Option B — Download a prebuilt binary**
@@ -307,7 +307,8 @@ reviewer agent for this project", use Settings → Agents in the Web UI, or writ
 `.leveler/agents/<name>/` yourself and commit it. Project agents override user
 agents (`~/.leveler/agents/`), which override built-ins; the runtime enforces
 every declared bound, and a running child keeps the definition it was spawned
-with. `leveler agents list` shows what resolved.
+with. Instructions never grant tools or write access. `leveler agents list`
+shows what resolved.
 
 See [Custom Agents](docs/AGENT_EXTENSIBILITY.md).
 

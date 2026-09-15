@@ -24,7 +24,7 @@ bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Ex
 架构方向，**并非全部已交付**。分层模型与当前代码尚未达到的边界见
 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
 
-CodeLeveler 目前处于 public beta：**`0.2.0-beta.2`**，以 pre-release 形式发布
+CodeLeveler 目前处于 public beta：**`0.2.0-beta.3`**，以 pre-release 形式发布
 （见[安装 beta](#1-安装)）。最新 stable 版本是 `0.1.4`。
 
 **每个 tag 都会构建 macOS、Linux 与 Windows 二进制。** 三个平台都在 CI 里跑完整
@@ -77,7 +77,7 @@ brew install dengmengmian/tap/leveler
 `leveler upgrade` 默认取到 —— 只有点名要它才会装上：
 
 ```sh
-LEVELER_VERSION=v0.2.0-beta.2 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
+LEVELER_VERSION=v0.2.0-beta.3 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
 ```
 
 **方式 B — 下载预编译二进制**
@@ -265,7 +265,8 @@ URL 和摘要。
 怎么做。直接对 CodeLeveler 说“给这个项目创建一个只读的安全审查 Agent”，或在 Web
 UI 的 设置 → Agents 里创建，或者自己写 `.leveler/agents/<name>/` 并提交到 Git。
 项目 Agent 覆盖用户 Agent（`~/.leveler/agents/`），用户 Agent 覆盖内置 Agent；
-定义里的每条边界都由运行时强制执行，运行中的子 Agent 始终使用它 spawn 时的定义。
+定义里的每条边界都由运行时强制执行，运行中的子 Agent 始终使用它 spawn 时的定义；
+instructions 不会授予任何工具或写权限。
 `leveler agents list` 查看实际解析结果。
 
 详见 [Custom Agents](docs/AGENT_EXTENSIBILITY.md)（英文）。

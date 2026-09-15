@@ -107,11 +107,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # A tag with a SemVer pre-release part (`v0.2.0-beta.2`) is published as a
+      # A tag with a SemVer pre-release part (`v0.2.0-beta.3`) is published as a
       # pre-release, so GitHub's `releases/latest` keeps pointing at the last
       # stable one. That is what keeps `install.sh` and the Homebrew tap from
       # handing a beta to people who did not ask for it; those who do ask use
-      # `LEVELER_VERSION=v0.2.0-beta.2`.
+      # `LEVELER_VERSION=v0.2.0-beta.3`.
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:

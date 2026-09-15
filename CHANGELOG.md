@@ -6,19 +6,61 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0-beta.3] - 2026-09-15
+
+### Highlights
+
+- **Custom Agents.** An agent is a directory — `agent.yaml` states what it may
+  do, `instructions.md` how it should work. Project agents live in
+  `.leveler/agents/<name>/` and travel with the repository; user agents live in
+  `~/.leveler/agents/<name>/` and apply to every project. Create one by asking
+  in the conversation, in Web Settings → Agents, or by writing the two files.
+  Precedence is project > user > built-in.
+- **Instructions do not grant permissions.** An agent runs under an existing
+  capability class and can only narrow it. The tools it holds, where it may
+  write, runtime admission and write ownership are enforced by the runtime,
+  whatever its instructions say. Writing an agent from the conversation always
+  asks you, in every permission mode.
+- **Durable multi-agent runtime.** Sub-agents are persisted as sessions,
+  continue under their own identity after a restart, settle exactly once, and
+  can be stopped one at a time from the TUI, the Web UI and the phone. A child
+  keeps the agent definition it was spawned with, even if the definition is
+  edited or deleted while it runs. Automatic delegation remains conservative
+  and model-controlled: nothing in this release claims that delegating makes a
+  task faster or better.
+- **Commands you can watch and stop.** A running command streams its output
+  into the TUI, can be stopped on its own without cancelling the turn, and
+  reports how it stopped — "stopped" only once its process tree is proven
+  gone, "unknown" otherwise.
+
 ### Added
 
 - Custom agents: `.leveler/agents/<name>/agent.yaml` + `instructions.md` (project) or `~/.leveler/agents/<name>/` (user), resolved project > user > built-in. A definition runs under an existing capability class (`read_only`, `writer`, `scoped_writer`) and can only narrow it; declared tools, write roots, model, reasoning effort, skills and budget are enforced at spawn and on `claim_write_scope`. Invalid definitions are reported and never fall back. A running child keeps the definition it was spawned with across edits, deletion and restart. Agents can be created from the conversation (validated, then confirmed by you in every permission mode), in Web Settings → Agents, or by hand; `/agents` (TUI) and `leveler agents list|show` list them, `leveler doctor` reports invalid ones, and child rows show the agent's name. See `docs/AGENT_EXTENSIBILITY.md`.
 - Model-request records store the reasoning effort each call asked for (migration 0026).
+- Command tool calls stream their output to clients and can be stopped one at a time (`CancelToolCall`) without cancelling the turn. `ToolCallCompleted` carries the exit code and how the command stopped: `confirmed` only once its process tree is observed gone, otherwise `unconfirmed`. Protocol 1.10.
+- TUI 待发送: Enter while a turn is running holds the text above the composer instead of steering at once; send any held item when you choose, or delete it.
+- Sub-agents are persisted as sessions and continue under their own identity after a restart; TUI, Web and the mobile client render children from runtime facts and can stop one child without its turn.
 
 ### Changed
 
 - The single-file `.leveler/agents/<name>.md` persona format is no longer read; use the directory format. The built-in `code-explorer`, `code-architect` and `code-reviewer` personas are now directory definitions. `spawn_agent` refuses a `role`/`profile` that differs from the named agent's class instead of letting the call override it.
+- Approval prompts (TUI, CLI, Web shortcut) offer "always allow" only when the runtime would actually write a standing rule — commands, path-scoped edits and MCP tools. `save_agent`, `delete_agent`, `remember`, `forget` and `write_file` offer allow once / this session / deny. A legacy single-file persona is now reported as not loaded, with the directory to move it to.
+- Web Settings → Agents: invalid definitions show their reason instead of a blank form; permissions are described in plain words; groups follow precedence (Project, User, Built-in); a valid agent is labelled 已配置 (the check covers configuration, not API keys); a finished child in Delegated is named after its agent.
+- TUI assistant prose is never folded. A turn that ends while a tool is still running shows that tool as unknown instead of failed.
 
 - Final assistant text now enters an explicit, observable `Finalizing` lifecycle instead of leaving clients reporting “waiting for model.” The persisted `TaskFinished` event remains the only terminal authority and is projected immediately in TUI and Web; a failed terminal transaction surfaces a recovery error instead of a fabricated terminal. Configured required review settles before that boundary, while non-authoritative process cleanup runs from an immutable ticket afterward.
 - Verification now stores command observation separately from gate disposition. A grounded baseline failure remains an observed failure with typed revision/provenance and a skipped gate, while checks that did not run carry a typed reason and can no longer be described as pre-existing failures.
 - Coding-agent final responses no longer solicit commits or append open-ended offers. Unless explicitly requested, an uncommitted working tree is the normal delivery state.
 - TUI command surface closed to one entry per capability. `/clear` is now `/new`. Skills are invoked only as `$skill-name` (the `$` popup lists them); `/skill` and `/<skill-name>` are gone. Removed commands and where the capability lives now: `/plan` → `/collab plan`; `/paste` → Ctrl+V (or an empty paste); `/editor` → Ctrl+X Ctrl+E; `/tools` → Ctrl+T; `/doctor` → `leveler doctor`; `/quit` / `/q` → Ctrl+C. `/work-mode` moved off the bare `/` list. No runtime command was removed.
+
+### Fixed
+
+- A bounded run stopped at a hidden 100-round ceiling: `--max-rounds N`, the default 200 and eval windows above 100 now run to their own window.
+- `wait_task` on a sub-agent waits for it to end (default 30 s, at most 120 s) instead of returning "still running" at once and spending a model round per poll.
+- A child stopped by its wall-clock cap reports the duration limit; it used to say its token or cost budget ran out. `SubAgentFinished` carries the typed `limit`.
+- A pinned-model child is billed at its own model's price, and a pinned model that cannot run is refused at spawn.
+- `write_file`/`apply_patch` refuse case-variant spellings of `.leveler/agents/` (on macOS and Windows `.LEVELER/Agents` is the same directory), so an agent definition cannot be written past `save_agent`'s validation and confirmation.
+- rustls security advisory addressed.
 
 ## [0.2.0-beta.2] - 2026-09-14
 
