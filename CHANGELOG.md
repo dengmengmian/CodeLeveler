@@ -6,6 +6,19 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `leveler resume` replays what ran: the TUI rebuilds a reopened session's transcript from its durable event log — tool rows and how they ended, children, verification and each turn's terminal — instead of the conversation text alone. The latest 100 turns are replayed and older ones counted. Protocol 1.11 (`QuerySessionHistory` / `SessionHistoryLoaded`, local clients only).
+
+### Fixed
+
+- A turn's end line showed "验证 ✓" whenever an earlier turn had verified; it now speaks only for checks its own turn ran.
+- A stopped command's result carries the last lines it printed, so the model can say how far it got.
+- Sending a message, or stopping a command, keeps the conversation at the live edge.
+- A line count taken from a capped result preview reads as a lower bound ("92+ 行").
+- A child spawned from a declared agent is named `nickname · agent` in the agent tree and the activity lane, matching the roster.
+- `run_command` refusals show the exact call that would run instead of an example that ran a different program.
+
 ## [0.2.0-beta.3] - 2026-09-15
 
 ### Highlights
