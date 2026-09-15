@@ -615,6 +615,14 @@ fn composer_trust_spans(state: &AppState, max_width: usize) -> Vec<Span<'static>
 /// hints competing with a half-written sentence are noise.
 pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let t = state.t();
+    // A question or approval takes the keys and prints what they do there
+    // (Esc skips or denies); an interrupt hint beside it would contradict it.
+    if matches!(
+        state.overlay,
+        Some(crate::overlay::Overlay::Approval(_) | crate::overlay::Overlay::Clarification(_))
+    ) {
+        return Vec::new();
+    }
     let hints = if state.workbench_focus == crate::state::WorkbenchFocus::Pending {
         format!(
             "Enter {} · Delete {} · Esc {}",
@@ -765,6 +773,38 @@ mod p1_tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect()
+    }
+
+    /// A question or approval takes the keys, and its own row says what Esc
+    /// does there (skip / deny). The footer must not also claim "Esc 打断".
+    #[test]
+    fn an_open_question_or_approval_owns_the_esc_hint() {
+        use leveler_client_protocol::{
+            ApprovalId, ClarificationId, UiApprovalRequest, UiClarificationRequest,
+        };
+        let mut s = state();
+        s.status = leveler_client_protocol::RuntimeStatus::Busy;
+        assert!(hints(&s).contains("Esc 打断"), "{}", hints(&s));
+        s.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
+            crate::overlay::ClarificationOverlay::new(UiClarificationRequest {
+                id: ClarificationId::new("c1"),
+                question: "cap 是单人累计还是单笔？".into(),
+                options: vec!["单人累计".into(), "单笔".into()],
+            }),
+        )));
+        assert!(!hints(&s).contains("Esc"), "{}", hints(&s));
+        s.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
+            crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
+                id: ApprovalId::new("a1"),
+                tool: "run_command".into(),
+                summary: "rm -rf tmp".into(),
+                command: Some("rm -rf tmp".into()),
+                risks: vec!["destructive".into()],
+                call_id: None,
+                always_persists: true,
+            }),
+        )));
+        assert!(!hints(&s).contains("Esc"), "{}", hints(&s));
     }
 
     /// Held inputs are reachable from the keyboard, and the hint row says how.
