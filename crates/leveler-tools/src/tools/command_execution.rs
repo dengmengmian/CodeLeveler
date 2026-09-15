@@ -491,6 +491,9 @@ pub(super) fn network_failure_in(body: &str) -> bool {
         "enetunreach",
         "no route to host",
         "connect eperm",
+        // Go: `proxyconnect tcp: dial tcp …`, `dial tcp: lookup host: no such host`.
+        "dial tcp",
+        "no such host",
         "urlopen error",
         "sock.connect",
         "dns error",

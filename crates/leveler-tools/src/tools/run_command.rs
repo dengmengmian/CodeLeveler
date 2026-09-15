@@ -530,6 +530,8 @@ mod tests {
             "Error: getaddrinfo ENOTFOUND registry.npmjs.org",
             "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
             "urllib.error.URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
+            "internal/config/config.go:6:2: github.com/spf13/viper@v1.21.0: Get \"https://goproxy.cn/github.com/spf13/viper/@v/v1.21.0.zip\": proxyconnect tcp: dial tcp 127.0.0.1:7898: connect: operation not permitted",
+            "go: github.com/x/y@v1.0.0: Get \"https://proxy.golang.org/x\": dial tcp: lookup proxy.golang.org: no such host",
         ] {
             assert!(
                 crate::tools::command_execution::network_failure_in(reached),
