@@ -71,8 +71,23 @@ class ChildAgent {
   String nickname = '';
   String role = '';
   String? profileId;
+
+  /// The declarative agent this child was spawned from (`security-reviewer`)
+  /// and where that definition lives. `null` for a built-in role spawn and
+  /// for children recorded before agents existed.
+  String? agentName;
+  String? agentSource;
   bool readOnly = false;
   String purpose = '';
+
+  /// What the child is called in a row: its agent, else its role.
+  String get label => agentName ?? role;
+
+  void _takeAgent(Object? raw) {
+    if (raw is! Map<String, dynamic>) return;
+    agentName = raw['name'] as String? ?? agentName;
+    agentSource = raw['source'] as String? ?? agentSource;
+  }
 
   /// `running`, `interrupted` or `settled`. Only `settled` is final.
   String state = 'running';
@@ -141,6 +156,7 @@ class ChildAgent {
       ..nickname = json['nickname'] as String? ?? ''
       ..role = json['role'] as String? ?? ''
       ..profileId = json['profile_id'] as String?
+      .._takeAgent(json['agent'])
       ..readOnly = json['read_only'] as bool? ?? false
       ..purpose = json['purpose'] as String? ?? ''
       ..state = json['state'] as String? ?? 'running'
@@ -775,6 +791,7 @@ class SessionState extends ChangeNotifier {
       ..nickname = event['nickname'] as String? ?? child.nickname
       ..role = event['role'] as String? ?? child.role
       ..profileId = event['profile_id'] as String? ?? child.profileId
+      .._takeAgent(event['agent'])
       ..readOnly = event['read_only'] as bool? ?? child.readOnly;
     final background = event['background'] as bool?;
     if (background != null) child.background = background;
@@ -820,9 +837,9 @@ class SessionState extends ChangeNotifier {
   }
 
   void _renderChildRow(ChildAgent child) {
-    final title = child.role.isEmpty
+    final title = child.label.isEmpty
         ? '子 Agent ${child.displayName}'
-        : '子 Agent ${child.displayName} · ${child.role}';
+        : '子 Agent ${child.displayName} · ${child.label}';
     final text = child.isOpen ? child.purpose : (child.summary ?? '');
     final body = text.isEmpty ? child.statusLabel : '${child.statusLabel}\n$text';
     final ok = child.isOpen ? null : child.ok;

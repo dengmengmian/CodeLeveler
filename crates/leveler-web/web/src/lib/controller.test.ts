@@ -341,6 +341,78 @@ describe('memory commands', () => {
   });
 });
 
+describe('agent registry commands', () => {
+  const draft = {
+    name: 'security-reviewer',
+    description: '查安全问题',
+    capability: 'read_only' as const,
+    skills: [],
+    write_roots: [],
+    instructions: '你负责评审。',
+  };
+
+  it('list/get send the session id and a fresh query id', () => {
+    const { bridge, sent, state } = harness();
+    const listId = bridge.listAgents();
+    const getId = bridge.getAgent('code-reviewer');
+    expect(sent).toEqual([
+      { type: 'list_agents', session_id: 's1', query_id: listId },
+      { type: 'get_agent', session_id: 's1', name: 'code-reviewer', query_id: getId },
+    ]);
+    expect(listId).toBeTruthy();
+    expect(getId).not.toBe(listId);
+    expect(state.agents.loading).toBe(true);
+  });
+
+  it('create/update/delete carry scope and the draft as given', () => {
+    const { bridge, sent } = harness();
+    const c = bridge.createAgent('project', draft);
+    const u = bridge.updateAgent('user', draft);
+    const d = bridge.deleteAgent('user', 'security-reviewer');
+    expect(sent).toEqual([
+      { type: 'create_agent', session_id: 's1', scope: 'project', draft, query_id: c },
+      { type: 'update_agent', session_id: 's1', scope: 'user', draft, query_id: u },
+      { type: 'delete_agent', session_id: 's1', scope: 'user', name: 'security-reviewer', query_id: d },
+    ]);
+  });
+
+  it('sends nothing without a session (the runtime answers per session)', () => {
+    const { bridge, sent } = emptyHarness();
+    expect(bridge.listAgents()).toBeNull();
+    expect(bridge.createAgent('project', draft)).toBeNull();
+    expect(sent).toEqual([]);
+  });
+
+  it('agents_loaded / agent_loaded reach state', () => {
+    const { apply, state } = harness();
+    apply({
+      type: 'agents_loaded',
+      agents: [{ name: 'explorer', source: 'builtin', status: 'available', structural: true }],
+      problems: [{ source: 'project', location: '.leveler/agents/x', error: 'missing agent.yaml' }],
+    });
+    expect(state.agents.entries.map((e) => e.name)).toEqual(['explorer']);
+    expect(state.agents.problems).toHaveLength(1);
+    apply({ type: 'agent_loaded', name: 'nope', error: 'no agent named nope' });
+    expect(state.agents.detail.nope).toEqual({ agent: null, error: 'no agent named nope' });
+  });
+
+  it('a successful mutation refetches the list; a failure keeps the runtime error verbatim', () => {
+    const { bridge, apply, sent, state } = harness();
+    const q = bridge.createAgent('project', draft);
+    apply({ type: 'agent_mutated', name: 'default', ok: false, error: 'name "default" is reserved', query_id: q });
+    expect(state.agents.lastMutation).toEqual({
+      name: 'default',
+      ok: false,
+      error: 'name "default" is reserved',
+      queryId: q,
+    });
+    expect(sent.filter((c) => c.type === 'list_agents')).toHaveLength(0);
+    apply({ type: 'agent_mutated', name: 'security-reviewer', ok: true, query_id: q });
+    expect(state.agents.lastMutation?.ok).toBe(true);
+    expect(sent[sent.length - 1]).toMatchObject({ type: 'list_agents', session_id: 's1' });
+  });
+});
+
 describe('interaction commands', () => {
   it('sendBtw delivers the typed btw command, not a slash string', () => {
     const { bridge, sent } = harness();

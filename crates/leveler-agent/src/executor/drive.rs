@@ -12,6 +12,7 @@ use leveler_model::{
 };
 use leveler_tools::ToolRegistry;
 
+use super::agent_spawn::SpawnAdmission;
 use super::closeout::{
     CLOSEOUT_NUDGE_BUDGET, CloseoutAction, CloseoutBudget, CloseoutInput, CloseoutReason, decide,
     stalled_detail,
@@ -999,6 +1000,13 @@ impl AgentHarness for Drive<'_> {
             kind: crate::ModelCallKind::Round,
             agent_id: None,
             cost_usd_micros: round_result.cost_usd_micros,
+            // The round's request carried exactly this effort (the agent is
+            // built `with_reasoning_effort(self.policy.reasoning_effort)`).
+            reasoning_effort: self
+                .executor
+                .policy
+                .reasoning_effort
+                .map(|effort| effort.as_wire().to_string()),
         })
         .await?;
         // Cost can cross the limit on the response that tips it; stop after
@@ -1740,6 +1748,30 @@ impl AgentHarness for Drive<'_> {
                              for spawned children."
                             .to_string(),
                         true,
+                    )
+                } else if let Some(outside) = {
+                    let roots = &self.executor.write_roots;
+                    let outside: Vec<&str> = paths
+                        .iter()
+                        .filter(|p| {
+                            !roots.is_empty()
+                                && !crate::agent_registry::within_write_roots(p, roots)
+                        })
+                        .map(String::as_str)
+                        .collect();
+                    (!outside.is_empty()).then(|| outside.join(", "))
+                } {
+                    // A declarative agent's definition bounds what it may ever
+                    // own; the claim is refused before the ownership registry
+                    // is consulted, so it grants nothing.
+                    decision_detail = format!("outside write roots: {outside}");
+                    (
+                        format!(
+                            "not granted — {outside} is outside this agent's write roots ({}). \
+                             Claim paths inside them, or report what needs changing elsewhere.",
+                            self.executor.write_roots.join(", ")
+                        ),
+                        false,
                     )
                 } else {
                     let owner = self
@@ -2533,12 +2565,13 @@ impl AgentHarness for Drive<'_> {
                 String,
                 String,
                 String,
-                Option<leveler_model::ModelRef>,
-                Vec<String>,
-                u32,
+                leveler_lifecycle::ChildSpawnSpec,
+                Option<String>,
                 bool, // run in background (runtime-resolved default: true)
                 CancellationToken,
             )> = Vec::new();
+            // Loaded on the first call in this batch that names an agent.
+            let mut agent_registry: Option<crate::agent_registry::AgentRegistry> = None;
             // Exclusive scopes of workers already admitted in THIS batch.
             // "Exclusive" is only true if admission enforces it: two
             // overlapping scopes in one batch is last-writer-wins waiting
@@ -2553,23 +2586,12 @@ impl AgentHarness for Drive<'_> {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                // A named persona supplies the instructions and, unless the
-                // caller overrides it, the role.
                 let agent_name = call
                     .arguments
                     .get("agent")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let named = agent_name.map(|name| {
-                    (
-                        name,
-                        crate::named_agent::load(
-                            self.executor.tool_context.execution.workspace.root(),
-                            name,
-                        ),
-                    )
-                });
                 let profile_arg = call
                     .arguments
                     .get("profile")
@@ -2577,39 +2599,6 @@ impl AgentHarness for Drive<'_> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let explicit_role = call.arguments.get("role").and_then(|v| v.as_str());
-                // A named persona supplies the role only when the caller
-                // did not override it with `profile` or `role`.
-                let named_role = match &named {
-                    Some((_, Some(agent))) if explicit_role.is_none() && profile_arg.is_none() => {
-                        Some(agent.role.as_str())
-                    }
-                    _ => None,
-                };
-                let role_hint = explicit_role.or(named_role);
-                let task = match &named {
-                    Some((_, Some(agent))) => agent.compose_task(&task),
-                    _ => task,
-                };
-                // A definition may pin its own model (e.g. run investigation
-                // on a cheaper one). An unparsable ref is rejected below
-                // rather than silently falling back to the parent's model.
-                let pinned_model: Option<&str> = match &named {
-                    Some((_, Some(agent))) if !agent.model.trim().is_empty() => {
-                        Some(agent.model.trim())
-                    }
-                    _ => None,
-                };
-                let model_override = pinned_model.and_then(leveler_model::ModelRef::parse);
-                let model_refusal = match &model_override {
-                    Some(model) => self.executor.pinned_model_refusal(model).await,
-                    None => None,
-                };
-                // A definition's own policy: the tools it may hold and how
-                // long it may run. Empty / 0 means inherit.
-                let (agent_tools, agent_max_rounds) = match &named {
-                    Some((_, Some(agent))) => (agent.tools.clone(), agent.max_rounds),
-                    _ => (Vec::new(), 0),
-                };
                 let files: Vec<String> = call
                     .arguments
                     .get("files")
@@ -2623,64 +2612,49 @@ impl AgentHarness for Drive<'_> {
                 // A capability field that is present but not a string is not
                 // "omitted": read that way it would buy the default child, a
                 // writer.
-                let malformed_capability = ["role", "profile"].into_iter().find(|field| {
+                let malformed_capability = ["role", "profile", "agent"].into_iter().find(|field| {
                     call.arguments
                         .get(*field)
                         .is_some_and(|v| !v.is_string() && !v.is_null())
                 });
-                let admitted_profile = ChildProfile::admit_spawn(profile_arg, role_hint, &files)
-                    .map_err(|error| match (&named, named_role) {
-                        // The role came from the agent's own definition, not
-                        // from the call: the definition is what needs fixing.
-                        (Some((name, Some(_))), Some(declared)) => format!(
-                            "Agent `{name}` declares role `{declared}` in its agent definition, \
-                             which is not accepted: {error} Fix the agent definition."
-                        ),
-                        _ => error,
-                    });
+                // Declarative agents are read once per batch, and only when a
+                // call names one: a definition edited between two batches
+                // applies to the later spawn, never to a running child.
+                if agent_name.is_some() && agent_registry.is_none() {
+                    agent_registry = Some(self.executor.load_agent_registry());
+                }
+                // Capability negotiation: the requested agent/profile/role +
+                // scope against the contract. Honest denial, never a silent
+                // downgrade.
+                let admission = if malformed_capability.is_some() {
+                    Err(String::new())
+                } else {
+                    self.executor
+                        .admit_spawn_call(
+                            agent_name,
+                            profile_arg,
+                            explicit_role,
+                            &files,
+                            agent_registry.as_ref(),
+                        )
+                        .await
+                };
 
                 // Reject (no agent started) for depth, empty task, or cap.
-                let reject = if let Some((requested, None)) = &named {
-                    // Never fall back to a personaless spawn: the run would
-                    // look successful while doing something else entirely.
-                    let known = crate::named_agent::discover(
-                        self.executor.tool_context.execution.workspace.root(),
-                    )
-                    .into_iter()
-                    .map(|a| a.name)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                    Some(format!(
-                        "Unknown agent `{requested}`. Available: {known}. Omit `agent` to \
-                             spawn with an inline task instead."
-                    ))
-                } else if let Some(field) = malformed_capability {
+                let reject = if let Some(field) = malformed_capability {
                     Some(format!(
                         "spawn_agent `{field}` must be a string (or omitted); it was {}.",
                         call.arguments[field]
                     ))
                 } else if self.executor.depth >= MAX_SUB_AGENT_DEPTH {
                     Some("Sub-agents may not spawn their own sub-agents.".to_string())
-                } else if let (Some(raw), None) = (pinned_model, &model_override) {
-                    Some(format!(
-                        "Agent `{}` pins model `{raw}`, which is not a valid `provider/model` \
-                             reference. Fix the agent definition.",
-                        agent_name.unwrap_or("?")
-                    ))
-                } else if let Some(refusal) = &model_refusal {
-                    Some(format!(
-                        "{refusal}. Fix the agent definition or omit `agent`."
-                    ))
                 } else if task.is_empty() {
                     Some("spawn_agent requires a non-empty task.".to_string())
-                } else if let Err(msg) = &admitted_profile {
-                    // Capability negotiation: the requested profile/role +
-                    // scope against the contract. Honest denial, never a
-                    // silent downgrade.
+                } else if let Err(msg) = &admission {
                     Some(msg.clone())
-                } else if admitted_profile
+                } else if admission
                     .as_ref()
-                    .is_ok_and(|p| p.role == AgentRole::Worker)
+                    .is_ok_and(|a| a.profile.role == AgentRole::Worker)
                     && admitted_worker_scopes
                         .iter()
                         .any(|scope| scopes_overlap(scope, &files))
@@ -2691,9 +2665,9 @@ impl AgentHarness for Drive<'_> {
                              overlapping work into one worker or re-scope it.",
                         files.join(", ")
                     ))
-                } else if admitted_profile
+                } else if admission
                     .as_ref()
-                    .is_ok_and(|p| p.role == AgentRole::Worker)
+                    .is_ok_and(|a| a.profile.role == AgentRole::Worker)
                     && !self.executor.ownership.conflicts_for(&files, "").is_empty()
                 {
                     // Legacy pre-scoped Worker: its files are an exclusive
@@ -2742,7 +2716,12 @@ impl AgentHarness for Drive<'_> {
                     continue;
                 }
 
-                let Ok(profile) = admitted_profile else {
+                let Ok(SpawnAdmission {
+                    profile,
+                    spec: admitted_spec,
+                    brief,
+                }) = admission
+                else {
                     unreachable!("admission already succeeded");
                 };
                 let role = profile.role;
@@ -2790,6 +2769,11 @@ impl AgentHarness for Drive<'_> {
                     ledger: self.progress.clone(),
                 });
                 let (profile_id, profile_role, read_only) = profile.trace_fields();
+                let spec = leveler_lifecycle::ChildSpawnSpec {
+                    files: files.clone(),
+                    background,
+                    ..admitted_spec
+                };
                 // The host holds the child's cancel handle before anyone can
                 // see the child: a client that reacts to the start event with
                 // "stop this child" must find it.
@@ -2805,27 +2789,10 @@ impl AgentHarness for Drive<'_> {
                     profile_id: Some(profile_id),
                     profile_role: Some(profile_role),
                     read_only,
-                    spec: Some(leveler_lifecycle::ChildSpawnSpec {
-                        files: files.clone(),
-                        model: model_override.as_ref().map(|m| m.to_string()),
-                        tools: agent_tools.clone(),
-                        max_rounds: agent_max_rounds,
-                        background,
-                    }),
+                    spec: Some(spec.clone()),
                 });
                 accepted.push((
-                    index,
-                    call.id,
-                    role,
-                    files,
-                    task,
-                    id,
-                    nickname,
-                    model_override,
-                    agent_tools,
-                    agent_max_rounds,
-                    background,
-                    token,
+                    index, call.id, role, files, task, id, nickname, spec, brief, background, token,
                 ));
             }
             // A child may only begin once its `SubAgentStarted` is durable
@@ -2852,20 +2819,7 @@ impl AgentHarness for Drive<'_> {
             let mut foreground_tokens: Vec<CancellationToken> = Vec::new();
             for (
                 share_of,
-                (
-                    index,
-                    call_id,
-                    role,
-                    files,
-                    task,
-                    id,
-                    nickname,
-                    model_override,
-                    agent_tools,
-                    agent_max_rounds,
-                    background,
-                    token,
-                ),
+                (index, call_id, role, files, task, id, nickname, spec, brief, background, token),
             ) in accepted.into_iter().enumerate()
             {
                 let sem = self.run_agents_semaphore.clone();
@@ -2895,10 +2849,8 @@ impl AgentHarness for Drive<'_> {
                     let fut = self.executor.sub_agent_run_future(
                         id.clone(),
                         role,
-                        files.clone(),
-                        model_override,
-                        agent_tools,
-                        agent_max_rounds,
+                        spec,
+                        brief,
                         task,
                         sem,
                         self.bg_progress_tx.clone(),
@@ -2964,10 +2916,8 @@ impl AgentHarness for Drive<'_> {
                         .run_one_sub_agent_on(
                             id.clone(),
                             role,
-                            files,
-                            model_override,
-                            agent_tools,
-                            agent_max_rounds,
+                            spec,
+                            brief,
                             task,
                             sem,
                             progress_ch,
@@ -3257,6 +3207,7 @@ impl AgentHarness for Drive<'_> {
                         kind: crate::ModelCallKind::Compaction,
                         agent_id: None,
                         cost_usd_micros: None,
+                        reasoning_effort: None,
                     }
                     .priced(self.executor.pricing.as_ref()),
                     None,

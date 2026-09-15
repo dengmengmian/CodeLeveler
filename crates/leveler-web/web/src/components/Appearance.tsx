@@ -4,6 +4,7 @@
 
 import { MoreHorizontal, Settings } from 'lucide-react';
 import { CTRL_ICON } from '../lib/icons';
+import { AgentsPanel } from './Agents';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   THEME_OPTIONS,
@@ -220,7 +221,10 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             ✕
           </button>
         </div>
-        <AppearancePanel />
+        <div className="set-scroll">
+          <AppearancePanel />
+          <AgentsPanel />
+        </div>
       </div>
     </div>
   );

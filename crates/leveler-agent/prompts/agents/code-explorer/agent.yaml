@@ -1,0 +1,4 @@
+version: 1
+name: code-explorer
+description: 沿真实执行路径摸清现有实现，产出入口、流程、关键组件和必读文件
+capability: read_only

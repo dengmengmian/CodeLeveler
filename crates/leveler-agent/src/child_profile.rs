@@ -186,10 +186,13 @@ impl ChildProfile {
     /// tools. Writers keep the full set except MCP proxies, whose effect
     /// cannot be bounded to a claimed scope.
     pub fn apply_to_registry(&self, registry: &ToolRegistry) -> ToolRegistry {
-        match self.tool_policy.access {
+        let class = match self.tool_policy.access {
             ToolAccess::ReadSearch | ToolAccess::ReadTest => registry.read_only_subset(),
             ToolAccess::WriteScoped | ToolAccess::Inherit => registry.without_mcp_tools(),
-        }
+        };
+        // Agent authoring changes what future sessions run; it is the
+        // top-level agent's, never a delegated child's.
+        class.without_named(crate::agent_registry::AUTHORING_TOOLS)
     }
 
     /// The unnamed child `spawn_agent(task)` has always produced.
@@ -370,7 +373,13 @@ impl ChildProfile {
     /// `Err` is an honest denial fed back to the model — never a silent
     /// downgrade.
     pub(crate) fn admit(role: AgentRole, files: &[String]) -> Result<Self, String> {
-        let profile = Self::resolve(role);
+        Self::admit_profile(Self::resolve(role), files)
+    }
+
+    /// [`Self::admit`] for an already-resolved profile (a declarative agent's
+    /// profile carries the agent's name and bounds on its role's contract).
+    pub(crate) fn admit_profile(profile: Self, files: &[String]) -> Result<Self, String> {
+        let role = profile.role;
         if profile.requires_scope() && files.is_empty() {
             return Err(format!(
                 "role='{}' requires a non-empty `files` list naming the files it \

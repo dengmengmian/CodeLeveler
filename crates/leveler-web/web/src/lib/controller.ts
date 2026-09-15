@@ -25,6 +25,8 @@ import type {
   PermissionProfile,
   RuntimeEvent,
   SessionId,
+  UiAgentDraft,
+  UiAgentScope,
   UiMemoryKind,
   UiSessionSnapshot,
 } from '../types/protocol';
@@ -295,6 +297,7 @@ export class RuntimeBridge {
           readOnly: ev.read_only ?? false,
           background: ev.background ?? false,
           scope: ev.scope ?? [],
+          agent: ev.agent ?? null,
         });
         break;
       case 'sub_agent_state_changed':
@@ -342,6 +345,28 @@ export class RuntimeBridge {
           archived: ev.archived,
           pending: ev.pending ?? [],
         });
+        break;
+      case 'agents_loaded':
+        this.dispatch({ type: 'agents_loaded', entries: ev.agents, problems: ev.problems ?? [] });
+        break;
+      case 'agent_loaded':
+        this.dispatch({
+          type: 'agent_loaded',
+          name: ev.name,
+          agent: ev.agent ?? null,
+          error: ev.error ?? null,
+        });
+        break;
+      case 'agent_mutated':
+        this.dispatch({
+          type: 'agent_mutated',
+          name: ev.name,
+          ok: ev.ok,
+          error: ev.error ?? null,
+          queryId: ev.query_id ?? null,
+        });
+        // 写成功才有新列表可拉；失败时 runtime 什么也没写。
+        if (ev.ok) this.listAgents();
         break;
       case 'context_updated':
         this.dispatch({ type: 'context_estimate', tokens: ev.estimated_tokens });
@@ -762,6 +787,50 @@ export class RuntimeBridge {
     if (!text) return;
     this.deliver({ type: 'remember_memory', session_id: current.id, body: text, kind });
     this.listMemory();
+  }
+
+  // ── Agents 注册表（用户命令即授权；runtime 校验并原子写入）──────────
+  // 每个方法返回 query_id，让发起的表单认领自己的应答；无会话时返回 null。
+
+  listAgents(): string | null {
+    const current = this.getState().current;
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.dispatch({ type: 'agents_loading' });
+    this.deliver({ type: 'list_agents', session_id: current.id, query_id: queryId });
+    return queryId;
+  }
+
+  getAgent(name: string): string | null {
+    const current = this.getState().current;
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.deliver({ type: 'get_agent', session_id: current.id, name, query_id: queryId });
+    return queryId;
+  }
+
+  createAgent(scope: UiAgentScope, draft: UiAgentDraft): string | null {
+    const current = this.getState().current;
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.deliver({ type: 'create_agent', session_id: current.id, scope, draft, query_id: queryId });
+    return queryId;
+  }
+
+  updateAgent(scope: UiAgentScope, draft: UiAgentDraft): string | null {
+    const current = this.getState().current;
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.deliver({ type: 'update_agent', session_id: current.id, scope, draft, query_id: queryId });
+    return queryId;
+  }
+
+  deleteAgent(scope: UiAgentScope, name: string): string | null {
+    const current = this.getState().current;
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.deliver({ type: 'delete_agent', session_id: current.id, scope, name, query_id: queryId });
+    return queryId;
   }
 
   restoreCheckpoint(checkpointId: CheckpointId): void {

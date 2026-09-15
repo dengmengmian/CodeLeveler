@@ -144,11 +144,11 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
             exclusive ownership and denies conflicts, so you do not pre-plan file \
             ownership. Keep the work yourself when it is small, tightly coupled, or \
             needs your in-flight context. Do NOT spawn the whole task as one blob. \
-            agent='<name>' runs a reusable named persona (project \
-            `.leveler/agents/<name>.md`, user-level, or built-in); its instructions \
-            are prepended to `task` and supply the role unless you override it. \
-            Optional `profile` selects a capability contract (tools, workspace, \
-            output); omit it for the default child."
+            agent='<name>' runs a declarative agent from the available-agents list \
+            (project `.leveler/agents/<name>/`, user-level, or built-in): its definition \
+            fixes its capability, tools, write bounds, model and instructions, so do not \
+            also pass a different `role` or `profile`. Optional `profile` selects a \
+            built-in capability contract; omit it for the default child."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -171,7 +171,7 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Name of a reusable agent persona to run (project `.leveler/agents/<name>.md`, user-level, or built-in). Its instructions are prepended to `task`."
+                    "description": "Name of an available agent (project `.leveler/agents/<name>/`, user-level, or built-in). Its definition sets the capability; an unknown or invalid name is refused."
                 },
                 "run_in_background": {
                     "type": "boolean",

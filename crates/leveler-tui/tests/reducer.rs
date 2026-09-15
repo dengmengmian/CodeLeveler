@@ -2345,6 +2345,7 @@ fn turn_end_finalizes_in_flight_blocks() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -2458,6 +2459,7 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -2490,6 +2492,7 @@ fn sub_agent_finish_before_start_still_renders() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -2522,6 +2525,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -2548,6 +2552,7 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -6211,6 +6216,7 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -6259,6 +6265,7 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
             profile_id: None,
             profile_role: None,
             read_only: false,
+            agent: None,
             contribution: None,
             outcome: None,
             stop: None,
@@ -7033,6 +7040,7 @@ fn snapshot_child(
         profile_id: None,
         read_only: true,
         purpose: format!("purpose of {id}"),
+        agent: None,
         state,
         ok: false,
         background: true,
@@ -7125,6 +7133,7 @@ fn child_detail_state(status: leveler_tui::multi_agent::ChildStatus) -> AppState
             nickname: "Euclid".into(),
             role: "explorer".into(),
             profile_id: None,
+            agent_name: None,
             read_only: true,
             purpose: "look".into(),
             status,
@@ -7187,4 +7196,201 @@ fn render_screen_text(s: &mut AppState) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ── Agent Extensibility: /agents and a child's agent identity ─────────────
+
+fn last_note(s: &AppState) -> String {
+    s.transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            TranscriptItem::Note(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("a transcript note")
+}
+
+fn agent_entry(
+    name: &str,
+    source: leveler_client_protocol::UiAgentSource,
+) -> leveler_client_protocol::UiAgentEntry {
+    leveler_client_protocol::UiAgentEntry {
+        name: name.into(),
+        source,
+        location: Some(format!("/repo/.leveler/agents/{name}")),
+        status: leveler_client_protocol::UiAgentStatus::Available,
+        reason: None,
+        description: Some(format!("The {name} agent.")),
+        capability: Some(leveler_client_protocol::UiAgentCapability::ReadOnly),
+        structural: false,
+        harness_only: false,
+        model: None,
+        reasoning_effort: None,
+        skills: Vec::new(),
+        tools: None,
+        write_roots: Vec::new(),
+        max_rounds: None,
+        max_duration_secs: None,
+        fingerprint: Some("sha256:0123456789abcdef".into()),
+        shadowed: Vec::new(),
+    }
+}
+
+#[test]
+fn slash_agents_lists_and_slash_agents_name_inspects() {
+    let mut s = opened();
+    typed(&mut s, "/agents");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Send(ClientCommand::ListAgents { .. }))),
+        "effects={effects:?}"
+    );
+    let mut s = opened();
+    typed(&mut s, "/agents security-reviewer");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(ClientCommand::GetAgent { name, .. }) if name == "security-reviewer"
+        )),
+        "effects={effects:?}"
+    );
+}
+
+#[test]
+fn the_agents_listing_names_source_class_and_what_is_wrong() {
+    use leveler_client_protocol::{UiAgentSource, UiAgentStatus};
+    let mut s = opened();
+    let mut invalid = agent_entry("broken", UiAgentSource::Project);
+    invalid.status = UiAgentStatus::Invalid;
+    invalid.reason = Some("agent.yaml: unknown field `wirte`".into());
+    invalid.description = None;
+    invalid.capability = None;
+    let mut unavailable = agent_entry("far-model", UiAgentSource::User);
+    unavailable.status = UiAgentStatus::Unavailable;
+    unavailable.reason = Some("model nowhere/big: not configured".into());
+    let mut shadowing = agent_entry("code-reviewer", UiAgentSource::Project);
+    shadowing.shadowed = vec![leveler_client_protocol::UiShadowedAgent {
+        source: UiAgentSource::Builtin,
+        location: None,
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentsLoaded {
+            query_id: None,
+            agents: vec![
+                invalid,
+                shadowing,
+                unavailable,
+                agent_entry("security-reviewer", UiAgentSource::Project),
+            ],
+            problems: vec![leveler_client_protocol::UiAgentProblem {
+                source: UiAgentSource::Project,
+                location: "/repo/.leveler/agents/worker".into(),
+                error: "`worker` is a built-in agent".into(),
+            }],
+        }),
+    );
+    let note = last_note(&s);
+    assert!(note.contains("security-reviewer"), "{note}");
+    assert!(
+        note.contains("read_only") && note.contains("project"),
+        "{note}"
+    );
+    assert!(note.contains("unknown field `wirte`"), "{note}");
+    assert!(note.contains("nowhere/big"), "{note}");
+    assert!(note.contains("shadows builtin"), "{note}");
+    assert!(note.contains("`worker` is a built-in agent"), "{note}");
+}
+
+#[test]
+fn an_agent_detail_shows_its_bounds_and_instructions() {
+    use leveler_client_protocol::UiAgentSource;
+    let mut s = opened();
+    let mut entry = agent_entry("frontend-worker", UiAgentSource::Project);
+    entry.capability = Some(leveler_client_protocol::UiAgentCapability::ScopedWriter);
+    entry.write_roots = vec!["web".into()];
+    entry.tools = Some(vec!["read_file".into(), "apply_patch".into()]);
+    entry.model = Some("deepseek/deepseek-v4-pro".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentLoaded {
+            query_id: None,
+            name: "frontend-worker".into(),
+            agent: Some(leveler_client_protocol::UiAgentDetail {
+                entry,
+                instructions: Some("Frontend only.\nKeep changes small.".into()),
+            }),
+            error: None,
+        }),
+    );
+    let note = last_note(&s);
+    for needle in [
+        "frontend-worker",
+        "scoped_writer",
+        "web",
+        "read_file, apply_patch",
+        "deepseek/deepseek-v4-pro",
+        "/repo/.leveler/agents/frontend-worker",
+        "Frontend only.",
+    ] {
+        assert!(note.contains(needle), "missing {needle}: {note}");
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentLoaded {
+            query_id: None,
+            name: "nope".into(),
+            agent: None,
+            error: Some("Agent \"nope\" not found.".into()),
+        }),
+    );
+    assert!(last_note(&s).contains("Agent \"nope\" not found."));
+}
+
+#[test]
+fn a_child_spawned_from_an_agent_is_shown_under_its_agent_name() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "a1".into(),
+            nickname: "Curie".into(),
+            role: "explorer".into(),
+            done: false,
+            ok: false,
+            detail: "review the auth change".into(),
+            profile_id: Some("security-reviewer".into()),
+            profile_role: Some("explorer".into()),
+            read_only: true,
+            agent: Some(leveler_client_protocol::UiChildAgentIdentity {
+                name: "security-reviewer".into(),
+                source: "project".into(),
+                capability: "read_only".into(),
+                fingerprint: "sha256:abc".into(),
+                model: None,
+                reasoning_effort: None,
+                skills: Vec::new(),
+            }),
+            contribution: None,
+            outcome: None,
+            stop: None,
+            background: Some(true),
+            scope: Vec::new(),
+        }),
+    );
+    let t = s.t();
+    let rows = leveler_tui::multi_agent::roster_rows(&s.team, None, 0, t);
+    assert!(
+        rows.iter().any(|r| r.label.contains("security-reviewer")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        s.team.children[0].agent_name.as_deref(),
+        Some("security-reviewer")
+    );
 }

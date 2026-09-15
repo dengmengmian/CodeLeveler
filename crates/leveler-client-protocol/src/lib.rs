@@ -36,6 +36,7 @@
 //!   commands, paths, prompts, and full context stay local.
 #![forbid(unsafe_code)]
 
+mod agents;
 mod approval;
 mod client;
 mod command;
@@ -53,6 +54,10 @@ mod snapshot;
 mod version;
 mod wire_types;
 
+pub use agents::{
+    UiAgentCapability, UiAgentDetail, UiAgentDraft, UiAgentEntry, UiAgentProblem, UiAgentScope,
+    UiAgentSource, UiAgentStatus, UiChildAgentIdentity, UiShadowedAgent,
+};
 pub use approval::{UiApprovalRequest, UiClarificationRequest, UiPendingInteraction};
 pub use client::{ClientError, InteractiveRuntimeClient};
 pub use command::{ClientCommand, RestartReason};

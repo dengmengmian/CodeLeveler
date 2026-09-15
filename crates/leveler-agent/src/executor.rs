@@ -1,5 +1,6 @@
 //! The state-driven single-agent tool loop.
 
+mod agent_spawn;
 pub mod closeout;
 mod dispatch;
 mod drive;
@@ -978,6 +979,15 @@ pub struct Executor {
     /// events are attributed to it so the host can tell whose side effect a
     /// dangling call belongs to.
     agent_id: Option<String>,
+    /// Where declarative agent definitions are read from at spawn. `None`:
+    /// the workspace project plus the installed home's user agents.
+    agent_roots: Option<crate::agent_registry::AgentRoots>,
+    /// A child spawned from a declarative agent: its instructions and bound
+    /// skills, rendered into its system prompt. `None` for every other executor.
+    agent_brief: Option<String>,
+    /// The most a child spawned from a declarative agent may ever claim
+    /// (`workspace.write_roots`). Empty: no definition-level bound.
+    write_roots: Vec<String>,
 }
 
 /// A bounded listing of the workspace for the system prompt.
@@ -1063,6 +1073,9 @@ impl Executor {
             compaction_checkpoint: None,
             execution_fence: None,
             agent_id: None,
+            agent_roots: None,
+            agent_brief: None,
+            write_roots: Vec::new(),
         }
     }
 
@@ -1140,6 +1153,13 @@ impl Executor {
 
     pub fn with_memory_catalog(mut self, catalog: impl Into<String>) -> Self {
         self.memory_catalog = catalog.into();
+        self
+    }
+
+    /// Read declarative agent definitions from these roots instead of the
+    /// workspace project and the installed home.
+    pub fn with_agent_roots(mut self, roots: crate::agent_registry::AgentRoots) -> Self {
+        self.agent_roots = Some(roots);
         self
     }
 
@@ -1286,17 +1306,48 @@ impl Executor {
     /// it to another model is worse than falling back to the shared base.
     /// Apply a named agent definition's own policy to this (child) executor.
     ///
-    /// `tools` empty and `max_rounds` 0 both mean "inherit" — see
-    /// [`crate::named_agent::NamedAgent`]. Narrowing only: a definition can take
+    /// `tools` empty and `max_rounds` 0 both mean "inherit" (a spawn recorded in
+    /// [`leveler_lifecycle::ChildSpawnSpec`]). Narrowing only: a definition can take
     /// capability away, never add it back, so an explorer persona cannot name a
     /// write tool into existence.
     pub(crate) fn apply_agent_policy(&mut self, tools: &[String], max_rounds: u32) {
         if !tools.is_empty() {
-            self.registry = Arc::new(self.registry.named_subset(tools));
+            // Harness controls are not capabilities a definition narrows:
+            // a child keeps its plan like every other child.
+            let mut allowed = tools.to_vec();
+            allowed.push("update_plan".to_string());
+            self.registry = Arc::new(self.registry.named_subset(&allowed));
         }
         if max_rounds > 0 {
             self.continuation = ContinuationPolicy::bounded(max_rounds);
         }
+    }
+
+    /// The child a recorded spawn spec re-creates: its role's contract, the
+    /// spec's pinned model, and — for a declarative agent — the snapshot's
+    /// effort and write roots plus its brief. Spawn and restart both build
+    /// children here, so a resumed child runs under exactly what it was
+    /// admitted with.
+    pub(crate) fn child_for_spec(
+        &self,
+        role: AgentRole,
+        spec: &leveler_lifecycle::ChildSpawnSpec,
+        brief: Option<String>,
+    ) -> Executor {
+        let model_override = spec.model.as_deref().and_then(ModelRef::parse);
+        let mut child = self.child_for_role_on(role, spec.files.clone(), model_override);
+        if let Some(agent) = &spec.agent {
+            if let Some(effort) = agent
+                .reasoning_effort
+                .as_deref()
+                .and_then(leveler_model::ReasoningEffort::parse)
+            {
+                child.policy.reasoning_effort = Some(effort);
+            }
+            child.write_roots = agent.write_roots.clone();
+        }
+        child.agent_brief = brief;
+        child
     }
 
     pub(crate) fn child_for_role_on(
@@ -1420,6 +1471,9 @@ impl Executor {
             compaction_checkpoint: None,
             execution_fence: self.execution_fence.clone(),
             agent_id: None,
+            agent_roots: None,
+            agent_brief: None,
+            write_roots: Vec::new(),
         }
     }
 
@@ -1564,6 +1618,10 @@ impl Executor {
                  invent findings to look thorough.",
             ),
             AgentRole::Default => {}
+        }
+        if let Some(brief) = &self.agent_brief {
+            prompt.push_str("\n\n");
+            prompt.push_str(brief);
         }
         if self.policy.goal_mode {
             prompt.push_str(
@@ -1723,6 +1781,9 @@ impl Executor {
         if let Some(injection) = self.skill_turn_injection(&request) {
             seed.push(Message::text(Role::System, injection));
         }
+        if let Some(catalog) = self.agent_catalog_injection() {
+            seed.push(Message::text(Role::System, catalog));
+        }
         if let Some(recall) = self.relevant_memory_injection(&request) {
             seed.push(Message::text(Role::System, recall));
         }
@@ -1733,6 +1794,15 @@ impl Executor {
         sink.append(&seed).await?;
         self.drive(seed, objective, observer, sink, cancellation)
             .await
+    }
+
+    /// The per-turn catalog of agents the top-level agent may delegate to.
+    /// Rebuilt each turn, so a definition created or edited between turns is
+    /// visible on the next one; placed after the system prompt so the cached
+    /// prefix is untouched.
+    fn agent_catalog_injection(&self) -> Option<String> {
+        (self.depth == 0 && self.policy.allow_delegation)
+            .then(|| self.load_agent_registry().render_catalog())
     }
 
     /// Resolve `$name` mentions in the user request into a system injection block.
@@ -1836,6 +1906,9 @@ impl Executor {
         }
         // Drop any stale system messages from the prior transcript.
         seed.extend(prior.into_iter().filter(|m| m.role != Role::System));
+        if let Some(catalog) = self.agent_catalog_injection() {
+            seed.push(Message::text(Role::System, catalog));
+        }
         if let Some(recall) = self.relevant_memory_injection(&request) {
             seed.push(Message::text(Role::System, recall));
         }
@@ -2504,6 +2577,7 @@ mod child_accounting_tests {
             kind: ModelCallKind::Round,
             agent_id: None,
             cost_usd_micros: None,
+            reasoning_effort: None,
         }
     }
 

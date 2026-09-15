@@ -235,6 +235,7 @@ pub fn storage_model_request(
             ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
         },
         created_at: leveler_core::now(),
+        reasoning_effort: record.reasoning_effort.clone(),
     }
 }
 

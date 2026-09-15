@@ -1081,6 +1081,8 @@ struct RoutedRuntime {
     child: Mutex<VecDeque<ModelResponse>>,
     parent: Mutex<VecDeque<ModelResponse>>,
     child_requests: Mutex<Vec<Vec<Message>>>,
+    /// Tools and effort of each child request, in the same order.
+    child_surfaces: Mutex<Vec<(Vec<String>, Option<leveler_model::ReasoningEffort>)>>,
 }
 
 #[async_trait]
@@ -1099,6 +1101,10 @@ impl ModelRuntime for RoutedRuntime {
                 .lock()
                 .unwrap()
                 .push(request.messages.clone());
+            self.child_surfaces.lock().unwrap().push((
+                request.tools.iter().map(|t| t.name.clone()).collect(),
+                request.reasoning_effort,
+            ));
             &self.child
         } else {
             &self.parent
@@ -1247,6 +1253,7 @@ fn routed_engine(
         child: Mutex::new(VecDeque::from(child)),
         parent: Mutex::new(VecDeque::new()),
         child_requests: Mutex::new(Vec::new()),
+        child_surfaces: Mutex::new(Vec::new()),
     });
     let mut engine = engine_on(db, dir, Vec::new());
     engine.factory.runtime = runtime.clone();
@@ -1585,5 +1592,250 @@ async fn a_resumed_child_whose_model_is_gone_settles_as_failed() {
     assert!(
         runtime.child_requests.lock().unwrap().is_empty(),
         "the child never asked a model"
+    );
+}
+
+/// Seed a dead window's declarative-agent child: its durable start carries the
+/// spawn-time snapshot, and its own first round carries the brief it was
+/// admitted with.
+async fn seed_interrupted_agent_child(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+    snapshot: leveler_lifecycle::ChildAgentSnapshot,
+    brief: &str,
+) {
+    let turn = crashed_turn(db, session, "user").await;
+    let turn_id = TurnId::new(turn.id);
+    let log = EventLog::new(db, session.clone());
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentStarted {
+            id: id.to_string(),
+            nickname: "wren".to_string(),
+            role: role.to_string(),
+            task: RESUMED_TASK.to_string(),
+            profile_id: Some(snapshot.name.clone()),
+            profile_role: Some(role.to_string()),
+            read_only: role == "explorer",
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                background: true,
+                agent: Some(Box::new(snapshot)),
+                ..Default::default()
+            }),
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentTranscriptAppended {
+            id: id.to_string(),
+            messages: vec![
+                Message::text(Role::System, format!("you are a sub-agent\n\n{brief}")),
+                Message::text(Role::User, RESUMED_TASK),
+            ],
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+}
+
+fn write_agent_dir(root: &Path, name: &str, yaml_body: &str, instructions: &str) {
+    let dir = root.join(".leveler/agents").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.yaml"),
+        format!("version: 1\nname: {name}\ndescription: d\n{yaml_body}"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("instructions.md"), instructions).unwrap();
+}
+
+/// RESTART_USES_SPAWN_TIME_PROFILE — a child spawned read-only from
+/// `security-reviewer` v1 continues after a restart as v1, even though the
+/// definition on disk now says `writer` with new instructions and effort: its
+/// brief comes from its own transcript and its bounds from its durable
+/// snapshot, never from the edited files.
+#[tokio::test]
+async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
+    let dir = workspace_dir();
+    write_agent_dir(
+        dir.path(),
+        "security-reviewer",
+        "capability: writer\nreasoning_effort: low\n",
+        "V2_INSTRUCTIONS_AFTER_EDIT",
+    );
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content": "pwned"}),
+            ),
+            text("reviewed"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_agent_child(
+        &db,
+        &session,
+        "agent-sr",
+        "explorer",
+        leveler_lifecycle::ChildAgentSnapshot {
+            name: "security-reviewer".into(),
+            source: "project".into(),
+            fingerprint: "sha256:v1".into(),
+            capability: "read_only".into(),
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        },
+        "## Agent profile: security-reviewer\nV1_INSTRUCTIONS_AT_SPAWN",
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = runtime.child_requests.lock().unwrap().clone();
+    assert!(!requests.is_empty(), "the child resumed");
+    for messages in &requests {
+        let blob: String = messages.iter().map(|m| m.text_content()).collect();
+        assert!(
+            blob.contains("V1_INSTRUCTIONS_AT_SPAWN"),
+            "spawn-time brief kept"
+        );
+        assert!(
+            !blob.contains("V2_INSTRUCTIONS_AFTER_EDIT"),
+            "edited file never read"
+        );
+    }
+    for (tools, effort) in runtime.child_surfaces.lock().unwrap().iter() {
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t == "write_file" || t == "apply_patch"),
+            "still read-only: {tools:?}"
+        );
+        assert_eq!(*effort, Some(leveler_model::ReasoningEffort::High));
+    }
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert_eq!(lib, "pub fn old() {}\n");
+
+    // The durable model-request log, not the configuration, is the evidence of
+    // which effort the child actually ran with.
+    let rows = leveler_storage::ModelRequestRepository::new(&db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    let child_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_id.as_deref() == Some("agent-sr"))
+        .collect();
+    assert!(
+        !child_rows.is_empty(),
+        "the resumed child's calls are recorded"
+    );
+    assert!(
+        child_rows
+            .iter()
+            .all(|row| row.reasoning_effort.as_deref() == Some("high")),
+        "{child_rows:?}"
+    );
+}
+
+/// A deleted definition does not stop a running child: it continues under its
+/// snapshot, and the snapshot's write roots still bound what it may claim.
+#[tokio::test]
+async fn a_restarted_agent_child_survives_deletion_and_keeps_its_write_roots() {
+    let dir = workspace_dir();
+    std::fs::create_dir_all(dir.path().join("web")).unwrap();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "c1",
+                "claim_write_scope",
+                serde_json::json!({"paths": ["src/lib.rs"]}),
+            ),
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content": "pwned"}),
+            ),
+            tool_call(
+                "c2",
+                "claim_write_scope",
+                serde_json::json!({"paths": ["web/page.ts"]}),
+            ),
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "web/page.ts", "content": "ok"}),
+            ),
+            text("done"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    // No definition on disk at all: it was deleted after the spawn.
+    seed_interrupted_agent_child(
+        &db,
+        &session,
+        "agent-fw",
+        "default",
+        leveler_lifecycle::ChildAgentSnapshot {
+            name: "frontend-writer".into(),
+            source: "project".into(),
+            fingerprint: "sha256:v1".into(),
+            capability: "writer".into(),
+            write_roots: vec!["web".into()],
+            ..Default::default()
+        },
+        "## Agent profile: frontend-writer\nFRONTEND_BRIEF",
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !runtime.child_requests.lock().unwrap().is_empty(),
+        "resumed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\n",
+        "outside the snapshot's write roots"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("web/page.ts"))
+            .ok()
+            .as_deref(),
+        Some("ok"),
+        "inside the snapshot's write roots"
+    );
+    let events = event_rows(&db, &session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-fw")
+            )
+            .count(),
+        1
     );
 }

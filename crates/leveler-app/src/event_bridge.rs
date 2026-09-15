@@ -790,6 +790,7 @@ impl EventBridge {
                     profile_id,
                     profile_role,
                     read_only,
+                    agent: crate::agents::child_agent_identity(&spec),
                     contribution: None,
                     outcome: None,
                     stop: None,
@@ -845,6 +846,7 @@ impl EventBridge {
                     profile_id: projected.as_ref().and_then(|c| c.profile_id.clone()),
                     profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
                     read_only: projected.as_ref().is_some_and(|c| c.read_only),
+                    agent: None,
                     contribution: projected,
                     outcome: outcome.map(project_child_outcome),
                     stop: stop.map(project_child_stop),
@@ -2237,6 +2239,49 @@ mod projection_equivalence {
                     Some(leveler_client_protocol::ChildOutcome::IncompletePartial)
                 );
                 assert_eq!(stop, Some(leveler_client_protocol::ChildStop::Budget));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// A child spawned from a declarative agent carries the agent it was
+    /// resolved from — name, source, fingerprint, model, effort, skills — so a
+    /// client can say "Curie · security-reviewer", not just "explorer".
+    #[test]
+    fn a_child_start_carries_its_agent_identity() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "a1".into(),
+            nickname: "Curie".into(),
+            role: "explorer".into(),
+            task: "review".into(),
+            profile_id: Some("security-reviewer".into()),
+            profile_role: Some("explorer".into()),
+            read_only: true,
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                model: Some("deepseek/deepseek-v4-pro".into()),
+                agent: Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                    name: "security-reviewer".into(),
+                    source: "project".into(),
+                    fingerprint: "sha256:abc".into(),
+                    capability: "read_only".into(),
+                    reasoning_effort: Some("high".into()),
+                    skills: vec!["sec-audit".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        });
+        match rx.try_recv().expect("start") {
+            RuntimeEvent::SubAgentUpdated { agent, .. } => {
+                let agent = agent.expect("identity carried");
+                assert_eq!(agent.name, "security-reviewer");
+                assert_eq!(agent.source, "project");
+                assert_eq!(agent.fingerprint, "sha256:abc");
+                assert_eq!(agent.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+                assert_eq!(agent.reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(agent.skills, vec!["sec-audit".to_string()]);
             }
             other => panic!("unexpected event: {other:?}"),
         }

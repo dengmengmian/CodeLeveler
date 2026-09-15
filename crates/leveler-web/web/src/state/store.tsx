@@ -18,8 +18,12 @@ import type {
   ProjectStatus,
   SessionId,
   ToolCallId,
+  UiAgentDetail,
+  UiAgentEntry,
+  UiAgentProblem,
   UiApprovalRequest,
   UiCheckpoint,
+  UiChildAgentIdentity,
   UiChildState,
   UiClarificationRequest,
   UiCompletionReport,
@@ -105,6 +109,8 @@ export interface SubAgentView {
   readOnly: boolean;
   background: boolean;
   scope: string[];
+  /** 派生它的声明式 agent（spawn 时解析）；内置角色派生为 null。终态事件不带，保留。 */
+  agent: UiChildAgentIdentity | null;
   /** 运行中 = 任务描述；完成后 = 结果摘要（协议语义） */
   detail: string;
   /** 最近一步工具活动（sub_agent_activity），如 `cargo test ✓` */
@@ -133,6 +139,23 @@ export interface MemoryView {
   active: UiMemoryEntry[];
   archived: UiMemoryEntry[];
   pending: UiMemoryCandidate[];
+}
+
+/** Agents 注册表（list_agents / get_agent / *_agent 的应答）。按会话所在项目解析。 */
+export interface AgentsView {
+  entries: UiAgentEntry[];
+  problems: UiAgentProblem[];
+  loading: boolean;
+  loaded: boolean;
+  /** get_agent 应答，按名字存；agent 为 null 时 error 是 runtime 的原因。 */
+  detail: Record<string, { agent: UiAgentDetail | null; error: string | null }>;
+  /** 最近一次写操作的结果；queryId 让发起它的表单认领自己的应答。 */
+  lastMutation: { name: string; ok: boolean; error: string | null; queryId: string | null } | null;
+}
+
+/** 每次新建：reducer 原地改 state，共享一个常量对象会被改脏。 */
+function emptyAgents(): AgentsView {
+  return { entries: [], problems: [], loading: false, loaded: false, detail: {}, lastMutation: null };
 }
 
 export interface SessionView {
@@ -233,6 +256,7 @@ export interface AppState {
   observationStatus: 'idle' | 'loading' | 'ready' | 'error';
   /** QueryObservability.query_id this view currently owns. */
   pendingObservationQuery: string | null;
+  agents: AgentsView;
 }
 
 export const initialState: AppState = {
@@ -258,6 +282,7 @@ export const initialState: AppState = {
   observation: null,
   observationStatus: 'idle',
   pendingObservationQuery: null,
+  agents: emptyAgents(),
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -306,12 +331,17 @@ export type Action =
       readOnly?: boolean;
       background?: boolean;
       scope?: string[];
+      agent?: UiChildAgentIdentity | null;
     }
   | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   | { type: 'sub_agent_progress'; id: string; active: boolean; input: number; output: number; cached: number }
   | { type: 'sub_agent_activity'; id: string; step: string }
   | { type: 'background_started'; taskId: string; program: string; args: string[] }
   | { type: 'background_exited'; taskId: string; exitCode: number | null; durationMs: number; ok: boolean }
+  | { type: 'agents_loading' }
+  | { type: 'agents_loaded'; entries: UiAgentEntry[]; problems: UiAgentProblem[] }
+  | { type: 'agent_loaded'; name: string; agent: UiAgentDetail | null; error: string | null }
+  | { type: 'agent_mutated'; name: string; ok: boolean; error: string | null; queryId: string | null }
   | { type: 'memory_list'; dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; pending: UiMemoryCandidate[] }
   | { type: 'approval_requested'; request: UiApprovalRequest }
   | { type: 'approval_resolved'; requestId: string }
@@ -468,6 +498,7 @@ function restoreAgents(snap: UiSessionSnapshot, live: SubAgentView[]): SubAgentV
       readOnly: c.read_only ?? false,
       background: c.background ?? false,
       scope: c.scope ?? [],
+      agent: c.agent ?? existing?.agent ?? null,
       detail: existing?.detail ?? c.purpose,
       recentStep: existing?.recentStep ?? null,
       active: existing?.active ?? false,
@@ -490,6 +521,7 @@ function leaveSessionView(state: AppState): void {
   state.pendingObservationQuery = null;
   state.pendingAttachments = [];
   state.composerSeed = null;
+  state.agents = emptyAgents();
 }
 
 /** TUI mark_turn_busy 的对应物：事件到来说明回合在跑。 */
@@ -792,6 +824,7 @@ export function reducer(state: AppState, action: Action): void {
         existing.nickname = action.nickname;
         existing.role = action.role;
         existing.detail = action.detail;
+        if (action.agent) existing.agent = action.agent;
         if (action.done) {
           existing.status = action.ok ? 'done' : 'fail';
           existing.state = 'settled';
@@ -813,6 +846,7 @@ export function reducer(state: AppState, action: Action): void {
         readOnly: action.readOnly ?? false,
         background: action.background ?? false,
         scope: action.scope ?? [],
+        agent: action.agent ?? null,
         detail: action.detail,
         recentStep: null,
         active: !action.done,
@@ -866,6 +900,28 @@ export function reducer(state: AppState, action: Action): void {
       }
       return;
     }
+    case 'agents_loading':
+      state.agents.loading = true;
+      return;
+    case 'agents_loaded':
+      state.agents.entries = action.entries;
+      state.agents.problems = action.problems;
+      state.agents.loading = false;
+      state.agents.loaded = true;
+      return;
+    case 'agent_loaded':
+      state.agents.detail[action.name] = { agent: action.agent, error: action.error };
+      return;
+    case 'agent_mutated':
+      state.agents.lastMutation = {
+        name: action.name,
+        ok: action.ok,
+        error: action.error,
+        queryId: action.queryId,
+      };
+      // 成功写入后旧的详情已过期；失败时 runtime 什么也没写，详情仍然有效。
+      if (action.ok) delete state.agents.detail[action.name];
+      return;
     case 'memory_list':
       if (state.current) {
         state.current.memory = {

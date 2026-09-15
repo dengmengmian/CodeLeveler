@@ -674,6 +674,10 @@ button { font-family: inherit; }
   font-family: var(--mono); font-size: 12px; letter-spacing: .1em; color: var(--warning);
 }
 .approval .a-body { padding: 12px 14px; font-size: 13.5px; }
+/* summary 可能是多行预览（save_agent / delete_agent 附带说明全文）：保留换行，限高滚动。 */
+.approval .a-summary, .action-body {
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow-y: auto;
+}
 .approval .a-body pre {
   font-family: var(--mono); font-size: 12.5px; background: var(--bg-app);
   border: 1px solid var(--border-default); border-radius: 3px; padding: 10px 12px; margin-top: 8px;
@@ -1683,6 +1687,56 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .tc-name { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .tc-cur { font-family: var(--mono); font-size: 10px; color: var(--text-muted); font-weight: 400; }
 .tc-desc { font-size: 12px; color: var(--text-secondary); }
+
+/* ============ 设置 → Agents ============ */
+.set-scroll { overflow-y: auto; min-height: 0; }
+.set-scroll > .set-body { overflow: visible; }
+.agents-panel { border-top: 1px solid var(--border-subtle); }
+.ag-toolbar { display: flex; gap: 6px; margin-bottom: 10px; }
+.ag-group { margin-bottom: 12px; }
+.agent-entry {
+  padding: 8px 0; border-bottom: 1px solid var(--border-subtle);
+  display: flex; flex-direction: column; gap: 3px; font-size: 12.5px;
+}
+.agent-entry:last-child { border-bottom: none; }
+.ae-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ae-name { font-family: var(--mono); color: var(--text-primary); font-weight: 600; }
+.ae-tag {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-muted);
+  border: 1px solid var(--border-subtle); border-radius: 3px; padding: 0 4px;
+}
+.ae-badge { font-family: var(--mono); font-size: 10.5px; overflow-wrap: anywhere; }
+.ae-badge.available { color: var(--success); }
+.ae-badge.unavailable { color: var(--warning); }
+.ae-badge.invalid { color: var(--danger); }
+.ae-desc { color: var(--text-secondary); }
+.ae-meta { font-family: var(--mono); font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+.ae-ops { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.ae-readonly { font-size: 11px; color: var(--text-muted); }
+.ae-error {
+  color: var(--danger); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+  border: 1px solid var(--danger-border); border-radius: 4px; padding: 6px 8px; margin-bottom: 10px;
+}
+.agent-entry .ae-error { margin-bottom: 0; }
+.set-backdrop.agent-modal { z-index: 90; }
+.agent-form { display: flex; flex-direction: column; gap: 10px; }
+.af-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.af-label { font-size: 12px; color: var(--text-secondary); }
+.agent-form input, .agent-form select, .agent-form textarea {
+  font: inherit; font-size: 13px; color: var(--text-primary);
+  background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 4px;
+  padding: 6px 8px; width: 100%; min-width: 0;
+}
+.agent-form textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+.af-pair { display: flex; gap: 10px; flex-wrap: wrap; }
+.af-summary {
+  display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0;
+  font-size: 12.5px;
+}
+.af-summary dt { color: var(--text-muted); }
+.af-summary dd { margin: 0; color: var(--text-primary); font-family: var(--mono); overflow-wrap: anywhere; }
+.af-ops { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.af-ops .abtn.danger { margin-left: 0; margin-right: auto; }
 
 /* ============ 空状态：快捷操作 + 最近会话 ============ */
 .h-actions {

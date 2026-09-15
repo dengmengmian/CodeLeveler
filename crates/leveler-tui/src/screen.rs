@@ -151,6 +151,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::IdleOnly,
     ),
+    // Read-only view of the agent registry: `/agents` lists, `/agents <name>`
+    // inspects. Creating and editing agents is a conversation or Web task.
+    slash(
+        "/agents",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // View
     slash(
         "/diff",
@@ -341,6 +350,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/recap" => s.recap,
         "/work-mode" | "/work_mode" => s.work_mode,
         "/collab" => s.collab,
+        "/agents" => s.agents,
         "/memory" => s.memory,
         "/remember" => s.remember,
         "/diff" => s.diff,
@@ -612,6 +622,7 @@ mod surface_tests {
                 "/recap",
                 "/work-mode",
                 "/collab",
+                "/agents",
                 "/diff",
                 "/trace",
                 "/sessions",
@@ -812,6 +823,7 @@ mod ghost_tests {
         );
         for hidden in [
             "/work-mode",
+            "/agents",
             "/trace",
             "/sessions",
             "/memory",

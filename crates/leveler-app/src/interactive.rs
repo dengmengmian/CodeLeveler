@@ -623,6 +623,46 @@ impl InProcessRuntimeClient {
         }
     }
 
+    /// The model a session runs on, or this runtime's default for a session it
+    /// has not opened.
+    fn session_model(&self, session_id: &SessionId) -> ModelRef {
+        self.session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|config| config.model.clone())
+            .unwrap_or_else(|| self.default_runtime.model.clone())
+    }
+
+    async fn save_agent(
+        &self,
+        session_id: SessionId,
+        scope: leveler_client_protocol::UiAgentScope,
+        draft: leveler_client_protocol::UiAgentDraft,
+        query_id: Option<leveler_core::CommandId>,
+        create: bool,
+    ) {
+        let model = self.session_model(&session_id);
+        let name = draft.name.trim().to_string();
+        let (ok, error, agent) = match self
+            .app
+            .save_agent(scope, &draft, create, Some(&model))
+            .await
+        {
+            Ok(entry) => (true, None, Some(entry)),
+            Err(error) => (false, Some(error), None),
+        };
+        let _ = self
+            .events_for(&session_id)
+            .send(RuntimeEvent::AgentMutated {
+                query_id,
+                name,
+                ok,
+                error,
+                agent,
+            });
+    }
+
     fn events_for(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
         let mut session_events = self.session_events.lock().unwrap();
         if let Some(events) = session_events.get(session_id).cloned() {
@@ -2832,6 +2872,82 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let _ = self
                     .events_for(&session_id)
                     .send(RuntimeEvent::UnfinishedGoalsLoaded { query_id, goals });
+                Ok(())
+            }
+            ClientCommand::ListAgents {
+                session_id,
+                query_id,
+            } => {
+                let model = self.session_model(&session_id);
+                let (agents, problems) = self.app.list_agents(Some(&model)).await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentsLoaded {
+                        query_id,
+                        agents,
+                        problems,
+                    });
+                Ok(())
+            }
+            ClientCommand::GetAgent {
+                session_id,
+                name,
+                query_id,
+            } => {
+                let model = self.session_model(&session_id);
+                let (agent, error) = match self.app.get_agent(&name, Some(&model)).await {
+                    Ok(detail) => (Some(detail), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentLoaded {
+                        query_id,
+                        name,
+                        agent,
+                        error,
+                    });
+                Ok(())
+            }
+            ClientCommand::CreateAgent {
+                session_id,
+                scope,
+                draft,
+                query_id,
+            } => {
+                self.save_agent(session_id, scope, *draft, query_id, true)
+                    .await;
+                Ok(())
+            }
+            ClientCommand::UpdateAgent {
+                session_id,
+                scope,
+                draft,
+                query_id,
+            } => {
+                self.save_agent(session_id, scope, *draft, query_id, false)
+                    .await;
+                Ok(())
+            }
+            ClientCommand::DeleteAgent {
+                session_id,
+                scope,
+                name,
+                query_id,
+            } => {
+                let (ok, error) = match self.app.delete_agent(scope, &name) {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error)),
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentMutated {
+                        query_id,
+                        name,
+                        ok,
+                        error,
+                        agent: None,
+                    });
                 Ok(())
             }
             ClientCommand::ShutdownWhenIdle { reason } => {

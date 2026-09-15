@@ -978,6 +978,27 @@ Web 客户端
 
 角色可以不同，领域语义可以不同，但不能每个子智能体自己再造一套生命周期、权限或持久化系统。
 
+### 15.1 声明式 Agent 位于 Engine 之上
+
+用户或项目定义的 Agent（`.leveler/agents/<name>/agent.yaml` + `instructions.md`）是 **Harness 状态，不是 Runtime 状态**：
+
+```text
+声明式 Agent（agent.yaml + instructions.md + skills）
+        ↓
+Agent Registry（Coding Harness：解析、校验、优先级）
+        ↓
+能力准入（收窄后的既有子 Agent 契约）
+        ↓
+同一个持久化多智能体 Runtime
+```
+
+- Registry 决定有哪些定义、每个是否可用；什么时候用哪个由模型决定。Engine 从不按文件类型或任务内容挑选 Agent。
+- 定义映射到既有能力类（只读、后绑定写入者、限定范围写入者）。新 Agent 不会新增运行时角色，它声明的每条边界只能收窄所属能力类。
+- 解析后的定义会快照进子 Agent 的持久化 spawn 记录。子 Agent 重启后按这份快照运行，不再查询 Registry。
+- Registry 不得下沉到 Engine：Agent 身份是产品和 Harness 概念，Engine 只负责生命周期、所有权与持久化。
+
+参见 [Custom Agents](AGENT_EXTENSIBILITY.md)。
+
 ---
 
 ## 16. 依赖方向：越往下越通用

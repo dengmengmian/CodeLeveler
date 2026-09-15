@@ -3,6 +3,7 @@
 
 import { ArrowUp, CircleHelp, ShieldAlert } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
+import { childDisplayName, shortFingerprint } from '../lib/agentDraft';
 import { choiceOrdinal, splitChoiceOption } from '../lib/choiceLabel';
 import { CTRL_ICON } from '../lib/icons';
 import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
@@ -244,12 +245,17 @@ function AgentRow({ agent }: { agent: SubAgentView }) {
       <span className="ag-glyph">{glyph}</span>
       <span className="ag-main">
         <span className="ag-name">
-          {agent.nickname}
-          <span className="ag-role">{agent.role}</span>
+          {childDisplayName(agent.nickname, agent.agent?.name)}
+          {!agent.agent && <span className="ag-role">{agent.role}</span>}
           <span className="ag-state">{childStateLabel({ ...agent, ok: agent.status === 'done' })}</span>
         </span>
         <span className="ag-detail">{agent.detail}</span>
         {bounds.length > 0 && <span className="ag-bounds">{bounds.join(' · ')}</span>}
+        {agent.agent && (
+          <span className="ag-bounds" title={agent.agent.fingerprint}>
+            {agent.agent.source} · {shortFingerprint(agent.agent.fingerprint)}
+          </span>
+        )}
         {agent.state === 'running' && agent.recentStep && (
           <span className="ag-step">{agent.recentStep}</span>
         )}

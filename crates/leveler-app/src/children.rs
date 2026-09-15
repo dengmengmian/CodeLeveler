@@ -56,6 +56,7 @@ pub(crate) async fn project_children(
                     role,
                     profile_id,
                     read_only,
+                    agent: crate::agents::child_agent_identity(&spec),
                     purpose: task,
                     state: UiChildState::Running,
                     ok: false,
@@ -201,9 +202,49 @@ mod tests {
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
             created_at: now(),
+            reasoning_effort: None,
         })
         .await
         .unwrap();
+    }
+
+    /// The agent a child was spawned from is part of its durable projection,
+    /// and a child recorded before agents existed projects with none.
+    #[tokio::test]
+    async fn a_childs_agent_identity_projects_and_old_rows_have_none() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "children", "mock/m", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let mut with_agent = started("c1", "Curie", true, &[]);
+        if let EngineEvent::SubAgentStarted {
+            spec: Some(spec), ..
+        } = &mut with_agent
+        {
+            spec.agent = Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                name: "security-reviewer".into(),
+                source: "project".into(),
+                fingerprint: "sha256:abc".into(),
+                capability: "read_only".into(),
+                ..Default::default()
+            }));
+        }
+        persist(&db, &sid, with_agent).await;
+        persist(&db, &sid, started("c2", "Newton", true, &[])).await;
+        let children = project_children(&db, &sid, true).await.unwrap();
+        let curie = children.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(
+            curie.agent.as_ref().map(|a| a.name.as_str()),
+            Some("security-reviewer")
+        );
+        assert!(
+            children
+                .iter()
+                .find(|c| c.id == "c2")
+                .unwrap()
+                .agent
+                .is_none()
+        );
     }
 
     /// Settled, interrupted-then-resumed and still-open children project from

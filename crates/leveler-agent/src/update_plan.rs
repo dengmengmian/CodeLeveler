@@ -56,6 +56,10 @@ struct Args {
 /// control is never mistaken for a capability the host could turn off.
 pub fn register_harness_controls(registry: &mut ToolRegistry) {
     registry.register(std::sync::Arc::new(UpdatePlanTool));
+    // Agent authoring: the top-level agent's only; children never hold them.
+    registry.register(std::sync::Arc::new(crate::agent_registry::ListAgentsTool));
+    registry.register(std::sync::Arc::new(crate::agent_registry::SaveAgentTool));
+    registry.register(std::sync::Arc::new(crate::agent_registry::DeleteAgentTool));
 }
 
 pub struct UpdatePlanTool;

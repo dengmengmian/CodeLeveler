@@ -997,6 +997,27 @@ result handoff
 
 Roles may differ. Domain semantics may differ. But child agents must not invent a second lifecycle, permission system, or persistence system beside the Runtime.
 
+### 15.1 Declarative Agents Live Above the Engine
+
+A user- or project-defined agent (`.leveler/agents/<name>/agent.yaml` + `instructions.md`) is **Harness state, not Runtime state**:
+
+```text
+Declarative agent (agent.yaml + instructions.md + skills)
+        ↓
+Agent Registry (Coding Harness: resolve, validate, precedence)
+        ↓
+Capability admission (an existing child contract, narrowed)
+        ↓
+The same durable multi-agent Runtime
+```
+
+- The Registry decides which definitions exist and whether each is usable; the model decides when to use one. The Engine never selects agents by file type or task content.
+- A definition maps onto an existing capability class (read-only, late-bound writer, scoped writer). A new agent never adds a runtime role, and every bound it declares can only narrow its class.
+- The resolved definition is snapshotted into the child's durable spawn record. A restarted child runs under that snapshot; the Registry is not consulted again.
+- The Registry must not move down into the Engine: agent identity is a product and harness concept, and the Engine keeps owning only lifecycle, ownership and persistence.
+
+See [Custom Agents](AGENT_EXTENSIBILITY.md).
+
 ---
 
 ## 16. Dependency Direction: Lower Means More General

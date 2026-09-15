@@ -400,6 +400,42 @@ impl Executor {
             ));
         }
 
+        // An agent definition changes what future sessions run, so a human
+        // confirms each exact proposal in every profile, full access included,
+        // and no permission rule or earlier grant stands in for that. The
+        // proposal is validated first: a contradiction is refused to the model,
+        // never put to the user as a question.
+        if crate::agent_registry::is_agent_definition_write(&call.name) {
+            let description = match crate::agent_registry::authoring_preflight(
+                &call.name,
+                &call.arguments,
+                ctx,
+            ) {
+                Ok(description) => description,
+                Err(reason) => return deny(reason),
+            };
+            let signature = action_fingerprint(call);
+            return PolicyResolution::Ask(Box::new(PendingApproval {
+                request: ApprovalRequest {
+                    id: ApprovalId::generate(),
+                    turn_id: None,
+                    call_id: call.id.to_string(),
+                    agent_id: self.agent_id.clone(),
+                    action_fingerprint: signature.clone(),
+                    tool: call.name.clone(),
+                    risk,
+                    description,
+                    command: None,
+                    paths: Vec::new(),
+                },
+                signature,
+                write,
+                network_allowed,
+                command_line: None,
+                scoped_paths: Vec::new(),
+            }));
+        }
+
         // A tool's declared risk is static: `run_command` carries the same level
         // whether it runs `ls` or `rm -rf`. Name the deletion in the prompt, so
         // it does not read as harmless as a listing.

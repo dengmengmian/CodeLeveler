@@ -251,4 +251,39 @@ void main() {
       'child_id': 'c1',
     });
   });
+
+  group('a child spawned from a declarative agent', () {
+    test('is named by its agent from start to settlement', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        ..._started('c1'),
+        'agent': {
+          'name': 'security-reviewer',
+          'source': 'project',
+          'capability': 'read_only',
+          'fingerprint': 'sha256:abc',
+        },
+      });
+      expect(state.children['c1']!.agentName, 'security-reviewer');
+      expect(state.children['c1']!.agentSource, 'project');
+      expect(state.timeline.single.title, contains('security-reviewer'));
+
+      // A terminal does not carry the identity; the child keeps it.
+      state.applyEvent(_finished('c1'));
+      expect(state.children['c1']!.agentName, 'security-reviewer');
+      expect(state.timeline.single.title, contains('security-reviewer'));
+    });
+
+    test('keeps its agent name through a snapshot, and an old record shows its role', () {
+      final state = SessionState('s1');
+      state.applySnapshot(_snapshot(children: [
+        {..._child('c1', 'running'), 'agent': {'name': 'frontend-worker', 'source': 'user', 'capability': 'scoped_writer', 'fingerprint': 'sha256:def'}},
+        _child('c2', 'running'),
+      ]));
+      expect(state.children['c1']!.agentName, 'frontend-worker');
+      expect(state.children['c2']!.agentName, isNull);
+      expect(state.children['c2']!.label, 'worker');
+      expect(state.children['c1']!.label, 'frontend-worker');
+    });
+  });
 }

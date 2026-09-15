@@ -11,12 +11,12 @@
 //! that reading belongs to the model, and acceptance belongs to the user.
 #![forbid(unsafe_code)]
 
+pub mod agent_registry;
 mod authorization;
 mod child_profile;
 pub mod coding;
 pub mod executor;
 mod injected_tools;
-pub mod named_agent;
 mod nudges;
 pub mod ownership;
 mod prompt;

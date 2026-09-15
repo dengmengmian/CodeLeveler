@@ -224,6 +224,7 @@ mod usage_tests {
             cost_usd_micros: None,
             agent_id: None,
             created_at: leveler_core::now(),
+            reasoning_effort: None,
         }
     }
 

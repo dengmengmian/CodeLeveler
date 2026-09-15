@@ -120,6 +120,59 @@ export interface UiActiveToolCall {
   name: string;
 }
 
+/** The runtime capability class an agent runs under. */
+export type UiAgentCapability = 'read_only' | 'writer' | 'scoped_writer';
+
+/** One agent with its full definition, for an editor. */
+export interface UiAgentDetail {
+  entry: UiAgentEntry;
+  /** `None` for structural built-ins and invalid definitions. */
+  instructions?: string | null;
+}
+
+/** A definition a client asks the runtime to write. */
+export interface UiAgentDraft {
+  capability: UiAgentCapability;
+  description: string;
+  instructions: string;
+  max_duration_secs?: number | null;
+  max_rounds?: number | null;
+  model?: string | null;
+  name: string;
+  reasoning_effort?: string | null;
+  skills?: string[];
+  tools?: string[] | null;
+  write_roots?: string[];
+}
+
+/** One resolvable agent name, as the registry resolves it. */
+export interface UiAgentEntry {
+  capability?: UiAgentCapability | null;
+  /** The fields below are `None`/empty for an invalid definition. */
+  description?: string | null;
+  fingerprint?: string | null;
+  /** Launched by the harness only; a model cannot spawn it. */
+  harness_only?: boolean;
+  /** The definition's directory; `None` for built-ins. */
+  location?: string | null;
+  max_duration_secs?: number | null;
+  max_rounds?: number | null;
+  model?: string | null;
+  name: string;
+  /** Why it is unavailable or invalid. */
+  reason?: string | null;
+  reasoning_effort?: string | null;
+  shadowed?: UiShadowedAgent[];
+  skills?: string[];
+  source: UiAgentSource;
+  status: UiAgentStatus;
+  /** One of the runtime's structural roles (default, explorer, worker, reviewer): not editable, and not overridable. */
+  structural?: boolean;
+  /** `None`: the capability's full toolset. */
+  tools?: string[] | null;
+  write_roots?: string[];
+}
+
 /** Durable sub-agent / reviewer observation. */
 export interface UiAgentObservation {
   id: string;
@@ -128,6 +181,28 @@ export interface UiAgentObservation {
   status: string;
   summary?: string;
 }
+
+/** Something under an agents directory that is not an agent at all. */
+export interface UiAgentProblem {
+  error: string;
+  location: string;
+  source: UiAgentSource;
+}
+
+/** Where a client may write a definition. */
+export type UiAgentScope = 'project' | 'user';
+
+/** Where a definition came from. */
+export type UiAgentSource = 'project' | 'user' | 'builtin';
+
+/** Whether an entry can be spawned here. */
+export type UiAgentStatus =
+  /** Valid, and everything it names exists on this machine. */
+  | 'available'
+  /** Valid, but something it names is missing here (model, skill, effort). */
+  | 'unavailable'
+  /** The definition itself is broken; it cannot be spawned anywhere. */
+  | 'invalid';
 
 /** A pending permission request, projected for display. */
 export interface UiApprovalRequest {
@@ -162,6 +237,8 @@ export interface UiCheckpoint {
 
 /** One delegated child, projected from the durable record — what a client that reconnects, or opens a session, renders without having seen a single live event. */
 export interface UiChildAgent {
+  /** The declarative agent it was spawned from, when it was. `None` for a built-in role spawn and for children recorded before agents existed. */
+  agent?: UiChildAgentIdentity | null;
   /** Whether its parent continued while it ran. */
   background?: boolean;
   /** `None` when no call carried a price — unknown, not zero. */
@@ -187,6 +264,19 @@ export interface UiChildAgent {
   stop?: ChildStop | null;
   /** The recorded settlement summary, once settled. */
   summary?: string | null;
+}
+
+/** The definition a running or settled child was spawned from, as resolved at spawn. Deleting or editing the definition does not change it. */
+export interface UiChildAgentIdentity {
+  capability: string;
+  fingerprint: string;
+  model?: string | null;
+  /** The agent's name, e.g. `security-reviewer`. */
+  name: string;
+  reasoning_effort?: string | null;
+  skills?: string[];
+  /** `project`, `user` or `builtin`. */
+  source: string;
 }
 
 /** Everything the inspector shows for one child. */
@@ -528,6 +618,12 @@ export interface UiSessionSummary {
   updated_at: string;
 }
 
+/** A lower-precedence definition the active one hides. */
+export interface UiShadowedAgent {
+  location?: string | null;
+  source: UiAgentSource;
+}
+
 /** Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration. */
 export interface UiToolAggregate {
   avg_ms?: number | null;
@@ -672,6 +768,16 @@ export type ClientCommand =
   | { type: 'recap'; session_id: SessionId }
   /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. */
   | { type: 'list_unfinished_goals'; query_id?: CommandId | null; session_id: SessionId }
+  /** List the agent definitions the session's project resolves. Answered by [`crate::RuntimeEvent::AgentsLoaded`]. */
+  | { type: 'list_agents'; query_id?: CommandId | null; session_id: SessionId }
+  /** One agent with its full definition. Answered by [`crate::RuntimeEvent::AgentLoaded`]. */
+  | { type: 'get_agent'; name: string; query_id?: CommandId | null; session_id: SessionId }
+  /** Write a new agent definition. The user's own command is the authorization; the runtime validates and writes atomically, and answers with [`crate::RuntimeEvent::AgentMutated`]. */
+  | { type: 'create_agent'; draft: UiAgentDraft; query_id?: CommandId | null; scope: UiAgentScope; session_id: SessionId }
+  /** Replace an existing agent definition in `scope`. */
+  | { type: 'update_agent'; draft: UiAgentDraft; query_id?: CommandId | null; scope: UiAgentScope; session_id: SessionId }
+  /** Delete an agent definition from `scope`. Running children keep theirs. */
+  | { type: 'delete_agent'; name: string; query_id?: CommandId | null; scope: UiAgentScope; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
 
@@ -764,7 +870,7 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
+  | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
   /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
   | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   /** Live execution state and cumulative model usage for one spawned agent. */
@@ -777,6 +883,12 @@ export type RuntimeEvent =
   | { type: 'goal_recap_created'; recap: UiGoalRecap }
   /** Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only. */
   | { type: 'unfinished_goals_loaded'; goals?: UiUnfinishedGoal[]; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::ListAgents`]. */
+  | { type: 'agents_loaded'; agents: UiAgentEntry[]; problems?: UiAgentProblem[]; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and `error` says why when the name does not resolve. */
+  | { type: 'agent_loaded'; agent?: UiAgentDetail | null; error?: string | null; name: string; query_id?: CommandId | null }
+  /** Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure nothing was written and `error` is the reason. */
+  | { type: 'agent_mutated'; agent?: UiAgentEntry | null; error?: string | null; name: string; ok: boolean; query_id?: CommandId | null }
   /** A transient notification for the status line. */
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */

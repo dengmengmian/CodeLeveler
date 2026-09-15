@@ -298,6 +298,38 @@ pub struct ChildSpawnSpec {
     /// Whether the parent continued while the child ran.
     #[serde(default)]
     pub background: bool,
+    /// The declarative agent definition this child was spawned from, as
+    /// resolved at spawn. A restarted child continues under this snapshot and
+    /// never re-reads the definition's files: editing or deleting the agent
+    /// affects future spawns only. `None` for built-in role spawns and for
+    /// children recorded before agent definitions existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Box<ChildAgentSnapshot>>,
+}
+
+/// The spawn-time identity and bounds of a declarative agent. The rest of the
+/// resolved definition travels in [`ChildSpawnSpec`] (`model`, `tools`,
+/// `max_rounds`) and in the child's own transcript (its instructions and bound
+/// skills, which are part of its first system message).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildAgentSnapshot {
+    /// The agent's name, e.g. `security-reviewer`.
+    pub name: String,
+    /// `project`, `user` or `builtin`.
+    pub source: String,
+    /// `sha256:<hex>` of the resolved definition.
+    pub fingerprint: String,
+    /// `read_only`, `writer` or `scoped_writer`.
+    pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// The most this child may ever claim, repository-relative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_secs: Option<u64>,
 }
 
 /// Why the loop stopped. Serialized (snake_case) into terminal engine events

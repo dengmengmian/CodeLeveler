@@ -2006,6 +2006,18 @@ async fn delegation_off_hides_spawn_agent_from_tool_list() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Writes a declarative agent directory: `.leveler/agents/<name>/{agent.yaml,instructions.md}`.
+fn write_agent_dir(root: &std::path::Path, name: &str, yaml_body: &str, instructions: &str) {
+    let dir = root.join(".leveler/agents").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.yaml"),
+        format!("version: 1\nname: {name}\ndescription: The {name} agent.\n{yaml_body}"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("instructions.md"), instructions).unwrap();
+}
+
 /// Named agents: `agent="<name>"` must actually deliver the persona to the
 /// child. A sub-agent starts a FRESH conversation, so if the instructions do
 /// not travel with the task, the child just improvises and the run still looks
@@ -2174,13 +2186,12 @@ mod named_agents {
     #[tokio::test]
     async fn a_declared_tool_list_binds_the_child_toolset() {
         let dir = tmp("named-tools", 73);
-        let agents = dir.join(".leveler").join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(
-            agents.join("narrow.md"),
-            "---\nname: narrow\ndescription: d\nrole: explorer\ntools: [read_file, grep]\n---\n只读查。\n",
-        )
-        .unwrap();
+        write_agent_dir(
+            &dir,
+            "narrow",
+            "capability: read_only\ntools: [read_file, grep]\n",
+            "只读查。\n",
+        );
 
         let (_events, seen, tools) = run_with(
             &dir,
@@ -2236,7 +2247,7 @@ mod named_agents {
                 _ => None,
             })
             .expect("an unknown agent must produce a tool error");
-        assert!(error.contains("Unknown agent"), "{error}");
+        assert!(error.contains("not found"), "{error}");
         assert!(
             error.contains("code-explorer"),
             "the error must list what IS available: {error}"
@@ -6344,12 +6355,12 @@ impl leveler_agent::TranscriptSink for RequestSink {
 #[tokio::test]
 async fn a_child_on_a_pinned_model_is_billed_at_that_models_price() {
     let dir = tmp("pinned-model-pricing", 89);
-    std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
-    std::fs::write(
-        dir.join(".leveler/agents/cheap-explorer.md"),
-        "---\nname: cheap-explorer\ndescription: looks around cheaply\nrole: explorer\nmodel: mock/cheap\n---\nLook around.\n",
-    )
-    .unwrap();
+    write_agent_dir(
+        &dir,
+        "cheap-explorer",
+        "capability: read_only\nmodel: mock/cheap\n",
+        "Look around.\n",
+    );
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(PricedRuntime {
@@ -6641,14 +6652,12 @@ impl ModelRuntime for PartlyPricedRuntime {
 /// `model`), returning the spawn's tool result and whether a child started.
 async fn spawn_under_cost_cap(tag: &str, agent: &'static str, model: &str) -> (String, bool, bool) {
     let dir = tmp(tag, 91);
-    std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
-    std::fs::write(
-        dir.join(format!(".leveler/agents/{agent}.md")),
-        format!(
-            "---\nname: {agent}\ndescription: looks\nrole: explorer\nmodel: {model}\n---\nLook.\n"
-        ),
-    )
-    .unwrap();
+    write_agent_dir(
+        &dir,
+        agent,
+        &format!("capability: read_only\nmodel: {model}\n"),
+        "Look.\n",
+    );
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let mut events = Vec::new();
@@ -7015,11 +7024,8 @@ async fn single_spawn(
     agents: &[(&str, &str)],
 ) -> (String, bool, bool) {
     let dir = tmp(tag, 94);
-    if !agents.is_empty() {
-        std::fs::create_dir_all(dir.join(".leveler/agents")).unwrap();
-        for (name, body) in agents {
-            std::fs::write(dir.join(format!(".leveler/agents/{name}.md")), body).unwrap();
-        }
+    for (name, yaml_body) in agents {
+        write_agent_dir(&dir, name, yaml_body, "Look.\n");
     }
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -7081,23 +7087,22 @@ async fn a_non_string_role_is_refused_not_read_as_omitted() {
     }
 }
 
-/// A bad role in a named agent's definition is the definition's fault; the
-/// refusal says so and names the agent, instead of telling the model to omit
-/// a role it never passed.
+/// A bad capability in an agent's definition is the definition's fault; the
+/// refusal names the agent and says the definition is invalid, instead of
+/// telling the model to omit a role it never passed.
 #[tokio::test]
-async fn a_bad_role_in_an_agent_definition_names_the_definition() {
+async fn a_bad_capability_in_an_agent_definition_names_the_definition() {
     let (content, is_error, started) = single_spawn(
-        "bad-definition-role",
+        "bad-definition-capability",
         serde_json::json!({"task": "look", "agent": "shouty"}),
-        &[(
-            "shouty",
-            "---\nname: shouty\ndescription: d\nrole: Explorer\n---\nLook.\n",
-        )],
+        &[("shouty", "capability: Explorer\n")],
     )
     .await;
     assert!(is_error && !started, "{content}");
     assert!(
-        content.contains("shouty") && content.contains("agent definition"),
+        content.contains("shouty")
+            && content.contains("is invalid")
+            && content.contains("capability"),
         "{content}"
     );
 }

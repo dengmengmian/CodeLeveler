@@ -36,6 +36,40 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "view_image",
 ];
 
+/// Every tool name [`model_surface`] can build with every pack on and every
+/// handle present. The vocabulary a declarative agent definition may narrow
+/// its toolset to; harness controls are not in it.
+pub const MODEL_SURFACE_TOOLS: &[&str] = &[
+    "apply_patch",
+    "blast_radius",
+    "browser_act",
+    "browser_inspect",
+    "browser_tab",
+    "diagnostics",
+    "find_files",
+    "find_references",
+    "find_symbol",
+    "forget",
+    "get_task",
+    "git_diff",
+    "git_status",
+    "grep",
+    "kill_task",
+    "list_files",
+    "load_skill",
+    "memory",
+    "read_file",
+    "read_symbol",
+    "remember",
+    "run_command",
+    "shell_command",
+    "view_image",
+    "wait_task",
+    "web_fetch",
+    "web_search",
+    "write_file",
+];
+
 /// True when `name` is in the canonical observe-class list.
 pub fn is_observe_class_tool(name: &str) -> bool {
     OBSERVE_CLASS_TOOLS.contains(&name)
@@ -129,6 +163,17 @@ impl ToolRegistry {
         let mut subset = ToolRegistry::new();
         for tool in self.tools.values() {
             if !tool.name().starts_with("mcp__") {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
+    /// Every tool except those named.
+    pub fn without_named(&self, names: &[&str]) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        for tool in self.tools.values() {
+            if !names.contains(&tool.name()) {
                 subset.register(tool.clone());
             }
         }
@@ -716,6 +761,24 @@ mod tests {
         // host composes, so `leveler_agent::register_harness_controls` adds
         // them on top.
         assert_eq!(names.len(), 28);
+    }
+
+    /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
+    /// validated against, so it must be exactly the widest surface: a tool
+    /// added to a pack but not to the list would be refused as unknown, and a
+    /// listed name no pack builds would validate and then never exist.
+    #[test]
+    fn the_known_tool_list_is_exactly_the_widest_surface() {
+        let mut built: Vec<String> =
+            model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+        built.sort();
+        let mut known: Vec<String> = MODEL_SURFACE_TOOLS.iter().map(|s| s.to_string()).collect();
+        known.sort();
+        assert_eq!(known, built);
     }
 
     /// In-process handles plus the two a configured host would have found: a

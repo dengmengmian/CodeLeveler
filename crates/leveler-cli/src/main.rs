@@ -5,6 +5,7 @@
 //! here .
 #![forbid(unsafe_code)]
 
+mod agents_cmds;
 mod approver;
 mod cli;
 mod common;
@@ -35,7 +36,10 @@ use clap::Parser;
 
 use leveler_project::Layout;
 
-use cli::{Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode, ThemeCommand};
+use cli::{
+    AgentsCommand, Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode,
+    ThemeCommand,
+};
 use eval_cmd::cmd_eval;
 use info_cmds::{
     cmd_config_show, cmd_doctor, cmd_model_probe, cmd_models_list, cmd_models_show,
@@ -262,6 +266,8 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
         Command::Theme(ThemeCommand::Preview { id }) => cmd_theme_preview(id),
+        Command::Agents(AgentsCommand::List { json }) => agents_cmds::list(layout, json).await,
+        Command::Agents(AgentsCommand::Show { name }) => agents_cmds::show(layout, &name).await,
         Command::Models(ModelsCommand::List) => cmd_models_list(layout),
         Command::Models(ModelsCommand::Show { model }) => cmd_models_show(layout, &model).await,
         Command::Model(m) => match m.command {

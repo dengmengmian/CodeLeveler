@@ -29,6 +29,22 @@ fn session() -> SessionId {
 
 /// Every `ClientCommand` variant with the verdict the design's exhaustive table
 /// assigns it for an `interactive` pairing.
+fn agent_draft() -> leveler_client_protocol::UiAgentDraft {
+    leveler_client_protocol::UiAgentDraft {
+        name: "security-reviewer".to_string(),
+        description: "Reviews auth.".to_string(),
+        capability: leveler_client_protocol::UiAgentCapability::Writer,
+        model: None,
+        reasoning_effort: None,
+        skills: Vec::new(),
+        tools: None,
+        write_roots: Vec::new(),
+        max_rounds: None,
+        max_duration_secs: None,
+        instructions: "x".to_string(),
+    }
+}
+
 fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
     vec![
         (
@@ -334,6 +350,53 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "recap",
             ClientCommand::Recap {
                 session_id: session(),
+            },
+            false,
+        ),
+        (
+            "list_agents",
+            ClientCommand::ListAgents {
+                session_id: session(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
+            "get_agent",
+            ClientCommand::GetAgent {
+                session_id: session(),
+                name: "security-reviewer".to_string(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
+            "create_agent",
+            ClientCommand::CreateAgent {
+                session_id: session(),
+                scope: leveler_client_protocol::UiAgentScope::User,
+                draft: Box::new(agent_draft()),
+                query_id: None,
+            },
+            false,
+        ),
+        (
+            "update_agent",
+            ClientCommand::UpdateAgent {
+                session_id: session(),
+                scope: leveler_client_protocol::UiAgentScope::Project,
+                draft: Box::new(agent_draft()),
+                query_id: None,
+            },
+            false,
+        ),
+        (
+            "delete_agent",
+            ClientCommand::DeleteAgent {
+                session_id: session(),
+                scope: leveler_client_protocol::UiAgentScope::Project,
+                name: "security-reviewer".to_string(),
+                query_id: None,
             },
             false,
         ),

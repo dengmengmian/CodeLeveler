@@ -359,6 +359,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
+        "agents" => agents_slash(state, command),
         "remember" => remember_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
@@ -674,6 +675,23 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
         .map(|s| (s.name, s.description))
         .collect();
     state.skill_catalog_root = Some(key);
+}
+
+/// `/agents` lists the agents this project resolves; `/agents <name>` shows one
+/// definition. Read-only: the TUI does not write agent files.
+fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let name = command.strip_prefix("agents").unwrap_or(command).trim();
+    if name.is_empty() || name == "list" {
+        return vec![Effect::Send(ClientCommand::ListAgents {
+            session_id: state.session_id.clone(),
+            query_id: None,
+        })];
+    }
+    vec![Effect::Send(ClientCommand::GetAgent {
+        session_id: state.session_id.clone(),
+        name: name.to_string(),
+        query_id: None,
+    })]
 }
 
 /// `/memory` — list active (+archived); `/memory forget <id>` archives.

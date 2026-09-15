@@ -23,6 +23,7 @@ import { SIDEBAR_NAV } from '../lib/railNav';
 import { groupByDay } from '../lib/sessionDay';
 import { useBridge } from '../state/bridge';
 import { useAppDispatch, useAppState, type RailNav } from '../state/store';
+import { AgentsPanel } from './Agents';
 import { AppearancePanel } from './Appearance';
 import { BrandMark } from './BrandMark';
 import { useOpenFile } from './FileViewer';
@@ -88,7 +89,12 @@ export function Sidebar() {
           </>
         )}
         {state.railNav === 'search' && <SearchPanel />}
-        {state.railNav === 'settings' && <AppearancePanel />}
+        {state.railNav === 'settings' && (
+          <>
+            <AppearancePanel />
+            <AgentsPanel />
+          </>
+        )}
       </div>
       <button
         type="button"

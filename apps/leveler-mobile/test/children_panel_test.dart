@@ -107,4 +107,25 @@ void main() {
     expect(find.text('运行中'), findsOneWidget);
     expect(find.widgetWithText(OutlinedButton, '停止'), findsNothing);
   });
+
+  testWidgets('a child from a custom agent is titled with the agent name', (tester) async {
+    final session = SessionState('s1')
+      ..applySnapshot({
+        'status': 'running',
+        'messages': const [],
+        'pending_interactions': const [],
+        'children': [
+          {
+            'id': 'c1', 'nickname': 'Curie', 'role': 'explorer', 'read_only': true,
+            'purpose': 'Review auth', 'state': 'running',
+            'agent': {'name': 'security-reviewer', 'source': 'project', 'capability': 'read_only', 'fingerprint': 'sha256:abc'},
+          },
+        ],
+      });
+    await tester.pumpWidget(_sheet(session));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Curie · security-reviewer'), findsOneWidget);
+    expect(find.textContaining('project Agent'), findsOneWidget);
+  });
 }

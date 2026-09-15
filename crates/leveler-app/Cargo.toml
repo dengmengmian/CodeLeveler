@@ -20,6 +20,7 @@ leveler-storage = { workspace = true }
 leveler-project = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-lifecycle = { workspace = true }
+leveler-skills = { workspace = true }
 leveler-memory = { workspace = true }
 leveler-tools = { workspace = true }
 leveler-browser = { workspace = true }

@@ -6,7 +6,14 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Custom agents: `.leveler/agents/<name>/agent.yaml` + `instructions.md` (project) or `~/.leveler/agents/<name>/` (user), resolved project > user > built-in. A definition runs under an existing capability class (`read_only`, `writer`, `scoped_writer`) and can only narrow it; declared tools, write roots, model, reasoning effort, skills and budget are enforced at spawn and on `claim_write_scope`. Invalid definitions are reported and never fall back. A running child keeps the definition it was spawned with across edits, deletion and restart. Agents can be created from the conversation (validated, then confirmed by you in every permission mode), in Web Settings → Agents, or by hand; `/agents` (TUI) and `leveler agents list|show` list them, `leveler doctor` reports invalid ones, and child rows show the agent's name. See `docs/AGENT_EXTENSIBILITY.md`.
+- Model-request records store the reasoning effort each call asked for (migration 0026).
+
 ### Changed
+
+- The single-file `.leveler/agents/<name>.md` persona format is no longer read; use the directory format. The built-in `code-explorer`, `code-architect` and `code-reviewer` personas are now directory definitions. `spawn_agent` refuses a `role`/`profile` that differs from the named agent's class instead of letting the call override it.
 
 - Final assistant text now enters an explicit, observable `Finalizing` lifecycle instead of leaving clients reporting “waiting for model.” The persisted `TaskFinished` event remains the only terminal authority and is projected immediately in TUI and Web; a failed terminal transaction surfaces a recovery error instead of a fabricated terminal. Configured required review settles before that boundary, while non-authoritative process cleanup runs from an immutable ticket afterward.
 - Verification now stores command observation separately from gate disposition. A grounded baseline failure remains an observed failure with typed revision/provenance and a skipped gate, while checks that did not run carry a typed reason and can no longer be described as pre-existing failures.

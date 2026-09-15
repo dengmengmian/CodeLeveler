@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod active_turns;
+pub mod agents;
 mod checkpoints;
 mod children;
 pub mod contribution_query;

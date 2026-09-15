@@ -335,6 +335,119 @@ async function runDemoTurn(sessionId) {
   runners.delete(sessionId);
 }
 
+// ── Agents 注册表（内存版；规则只取几条演示错误展示，真校验在 runtime）──
+
+const STRUCTURAL_AGENTS = [
+  ['default', 'writer', 'General child: starts read-capable and claims its own write scope'],
+  ['explorer', 'read_only', 'Read-only repository investigation; holds no mutating tool'],
+  ['worker', 'scoped_writer', 'Scoped implementation over files it is given exclusively at spawn'],
+  ['reviewer', 'read_only', 'Independent read-only review, launched by the harness only'],
+];
+const PERSONA_AGENTS = [
+  ['code-architect', '依据现有代码惯例设计实现方案，给出组件划分、取舍和落地顺序', '你是架构师。'],
+  ['code-explorer', '沿真实执行路径摸清现有实现，产出入口、流程、关键组件和必读文件', '你是代码探索者。'],
+  ['code-reviewer', '审查改动的正确性、安全与项目规范符合度，只报有把握的问题', '你是代码评审者。任务是找出真实存在的问题。你只读不写。'],
+];
+const MOCK_TOOLS = new Set(['read_file', 'grep', 'git_diff', 'find_files', 'list_files', 'edit_file', 'write_file', 'run_command']);
+const WRITE_TOOLS = new Set(['edit_file', 'write_file']);
+/** scope → Map<name, draft> */
+const agentStore = { project: new Map(), user: new Map() };
+agentStore.project.set('security-reviewer', {
+  name: 'security-reviewer',
+  description: '只看安全：注入、鉴权、密钥泄露',
+  capability: 'read_only',
+  model: 'openai/gpt-5-codex',
+  skills: [],
+  tools: ['read_file', 'grep', 'git_diff'],
+  write_roots: [],
+  instructions: '你负责安全评审。\n\n每条问题指到文件:行。',
+});
+
+const fakeFingerprint = (obj) => createHash('sha256').update(JSON.stringify(obj)).digest('hex');
+
+function entryOf(draft, source) {
+  const location = source === 'builtin' ? null : `${source === 'project' ? '.leveler' : '~/.leveler'}/agents/${draft.name}`;
+  const modelOk = !draft.model || MODELS.some((m) => `${m.provider}/${m.model}` === draft.model);
+  return {
+    name: draft.name,
+    source,
+    location,
+    status: modelOk ? 'available' : 'unavailable',
+    reason: modelOk ? null : `model ${draft.model}: not configured`,
+    description: draft.description,
+    capability: draft.capability,
+    structural: Boolean(draft.structural),
+    harness_only: draft.name === 'reviewer',
+    model: draft.model ?? null,
+    reasoning_effort: draft.reasoning_effort ?? null,
+    skills: draft.skills ?? [],
+    tools: draft.tools ?? null,
+    write_roots: draft.write_roots ?? [],
+    max_rounds: draft.max_rounds ?? null,
+    max_duration_secs: draft.max_duration_secs ?? null,
+    fingerprint: fakeFingerprint(draft),
+    shadowed: [],
+  };
+}
+
+function builtinDrafts() {
+  return [
+    ...STRUCTURAL_AGENTS.map(([name, capability, description]) => ({ name, capability, description, structural: true, instructions: null })),
+    ...PERSONA_AGENTS.map(([name, description, instructions]) => ({ name, capability: 'read_only', description, instructions })),
+  ];
+}
+
+/** 项目 > 用户 > 内置；输家记进 shadowed。 */
+function resolveAgents() {
+  const byName = new Map();
+  for (const [source, drafts] of [['builtin', builtinDrafts()], ['user', [...agentStore.user.values()]], ['project', [...agentStore.project.values()]]]) {
+    for (const d of drafts) {
+      const prev = byName.get(d.name);
+      const entry = entryOf(d, source);
+      if (prev) entry.shadowed = [{ source: prev.entry.source, location: prev.entry.location }, ...prev.entry.shadowed];
+      byName.set(d.name, { entry, instructions: d.instructions });
+    }
+  }
+  return [...byName.values()].sort((a, b) => a.entry.name.localeCompare(b.entry.name));
+}
+
+function validateDraft(draft) {
+  const name = String(draft?.name ?? '').trim();
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) return `invalid agent name "${name}": use lowercase letters, digits and '-'`;
+  if (STRUCTURAL_AGENTS.some(([n]) => n === name)) return `"${name}" is a reserved runtime role`;
+  if (PERSONA_AGENTS.some(([n]) => n === name)) return `"${name}" is a built-in agent name`;
+  if (!String(draft.instructions ?? '').trim()) return 'instructions must not be empty';
+  for (const t of draft.tools ?? []) if (!MOCK_TOOLS.has(t)) return `unknown tool: ${t}`;
+  if (draft.capability === 'read_only') {
+    if ((draft.write_roots ?? []).length > 0) return 'a read_only agent cannot have write_roots';
+    const w = (draft.tools ?? []).find((t) => WRITE_TOOLS.has(t));
+    if (w) return `a read_only agent cannot use write tool ${w}`;
+  }
+  return null;
+}
+
+function mutateAgent(command) {
+  const { scope, query_id } = command;
+  const store = agentStore[scope];
+  if (command.type === 'delete_agent') {
+    const ok = Boolean(store?.delete(command.name));
+    emit({ type: 'agent_mutated', query_id, name: command.name, ok, error: ok ? null : `no ${scope} agent named ${command.name}` });
+    return;
+  }
+  const draft = command.draft;
+  const name = String(draft?.name ?? '').trim();
+  let error = store ? validateDraft(draft) : `unknown scope: ${scope}`;
+  if (!error && command.type === 'create_agent' && store.has(name)) error = `${scope} agent ${name} already exists`;
+  if (!error && command.type === 'update_agent' && !store.has(name)) error = `no ${scope} agent named ${name}`;
+  if (error) {
+    emit({ type: 'agent_mutated', query_id, name, ok: false, error });
+    return;
+  }
+  const saved = { ...draft, name };
+  store.set(name, saved);
+  emit({ type: 'agent_mutated', query_id, name, ok: true, agent: entryOf(saved, scope) });
+}
+
 // ── 命令处理 ────────────────────────────────────────────────────────
 
 function sendFrame(ws, frame) {
@@ -444,6 +557,23 @@ async function handleDeliver(ws, frame) {
         archived: [],
         pending: [{ id: 'mem-p1', title: '项目使用 Rust workspace 布局' }],
       });
+      return;
+    case 'list_agents':
+      emit({ type: 'agents_loaded', query_id: command.query_id, agents: resolveAgents().map((r) => r.entry), problems: [] });
+      return;
+    case 'get_agent': {
+      const hit = resolveAgents().find((r) => r.entry.name === command.name);
+      emit(
+        hit
+          ? { type: 'agent_loaded', query_id: command.query_id, name: command.name, agent: { entry: hit.entry, instructions: hit.instructions } }
+          : { type: 'agent_loaded', query_id: command.query_id, name: command.name, error: `no agent named ${command.name}` },
+      );
+      return;
+    }
+    case 'create_agent':
+    case 'update_agent':
+    case 'delete_agent':
+      mutateAgent(command);
       return;
     case 'accept_memory':
       emit({ type: 'notification', level: 'info', message: `记忆已采纳：${command.id}` });
