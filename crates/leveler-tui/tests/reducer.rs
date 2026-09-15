@@ -1815,7 +1815,7 @@ fn overlay_captures_keys_away_from_composer() {
 }
 
 #[test]
-fn slash_clear_empties_transcript() {
+fn slash_new_starts_a_fresh_session() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -1830,28 +1830,21 @@ fn slash_clear_empties_transcript() {
         }),
     );
     assert!(!s.transcript.is_empty());
-    // `/clear` starts a NEW session on the FIRST press. It used to wipe the
-    // current session in place, which took its checkpoints with it and could
-    // not be undone — hence the old two-step confirm. Starting fresh leaves
-    // the previous session in /sessions, so there is nothing to confirm and
-    // nothing to lose.
-    typed(&mut s, "/clear");
+    // `/new` starts a NEW session on the FIRST press and leaves the previous
+    // one in /sessions, so there is nothing to confirm and nothing to lose.
+    typed(&mut s, "/new");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         matches!(
             effects.as_slice(),
             [Effect::Send(ClientCommand::NewSessionFor { .. })]
         ),
-        "one /clear must start a new session: {effects:?}"
+        "one /new must start a new session: {effects:?}"
     );
     assert!(
         !s.transcript.is_empty(),
         "the view must NOT clear before the host confirms: if creating the \
          session fails, an emptied screen is a lie about work that still exists"
-    );
-    assert!(
-        !s.clear_confirm_armed,
-        "a non-destructive action must not arm a confirmation"
     );
 
     // The switch happens when the host says it happened.
@@ -1868,20 +1861,75 @@ fn slash_clear_empties_transcript() {
     );
 }
 
-/// `/new` is an alias of `/clear`, so it must do the same thing — not a
-/// second, differently-behaved way to start over.
+/// Entry points closed by the command-surface closure. Each capability lives
+/// elsewhere: `/new` (was `/clear`), `/collab plan`, `$skill`, Ctrl+V,
+/// Ctrl+X Ctrl+E, Ctrl+T, `leveler doctor`, Ctrl+C.
 #[test]
-fn slash_new_is_the_same_fresh_start_as_clear() {
+fn closed_commands_are_unknown_and_send_nothing() {
+    for command in [
+        "/clear",
+        "/plan",
+        "/skill",
+        "/skill demo please ship",
+        "/paste",
+        "/editor",
+        "/tools",
+        "/doctor",
+        "/quit",
+        "/q",
+    ] {
+        let mut s = opened();
+        s.composer.replace(command);
+        let effects = reduce(&mut s, key(KeyCode::Enter));
+        assert!(effects.is_empty(), "{command} must not act: {effects:?}");
+        assert!(
+            s.notification
+                .as_ref()
+                .is_some_and(|n| n.message.contains("未知命令")),
+            "{command} must be reported as unknown: {:?}",
+            s.notification
+        );
+        assert_eq!(s.active_screen, Screen::Conversation, "{command}");
+        assert_eq!(s.composer.text(), command, "{command} draft is kept");
+    }
+}
+
+#[test]
+fn ctrl_v_attaches_the_clipboard_image() {
     let mut s = opened();
-    typed(&mut s, "/new");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Send(ClientCommand::NewSessionFor { .. })]
-        ),
-        "/new must start a new session like /clear: {effects:?}"
+    let effects = reduce(&mut s, ctrl('v'));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::AddClipboardImage {
+            session_id: SessionId::new("s1"),
+        })]
     );
+    assert!(s.composer.is_empty(), "Ctrl+V must not type a 'v'");
+}
+
+/// With `/quit`, `/paste` and `/editor` gone, Help is where their keys are
+/// discovered.
+#[test]
+fn help_lists_the_keys_that_replaced_closed_commands() {
+    let mut s = opened();
+    typed(&mut s, "/help");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Help);
+    let frame = rendered(&mut s, 120, 80);
+    for key_name in ["Ctrl+C", "Ctrl+V", "Ctrl+X Ctrl+E", "Ctrl+D/T/S"] {
+        assert!(
+            frame.contains(key_name),
+            "help must list {key_name}: {frame}"
+        );
+    }
+    for closed in [
+        "/quit", "/paste", "/editor", "/clear", "/skill", "/plan", "/doctor",
+    ] {
+        assert!(
+            !frame.contains(closed),
+            "help still lists {closed}: {frame}"
+        );
+    }
 }
 
 #[test]
@@ -3240,9 +3288,9 @@ fn every_menu_slash_command_is_handled() {
     // Guard against menu/handler drift: every command advertised in the slash
     // popup must be wired in the reducer (not fall through to "未知命令").
     // This caught `/tools` being listed but unhandled.
-    for name in leveler_tui::screen::SLASH_NAMES {
+    for name in leveler_tui::screen::SLASH_DEFS.iter().map(|d| d.name) {
         let mut s = state();
-        reduce(&mut s, Action::Paste((*name).to_string()));
+        reduce(&mut s, Action::Paste(name.to_string()));
         reduce(&mut s, key(KeyCode::Enter));
         let unknown = s
             .notification
@@ -3254,55 +3302,6 @@ fn every_menu_slash_command_is_handled() {
             "menu command {name} is advertised but not handled"
         );
     }
-}
-
-#[test]
-fn skill_slash_select_sends_dollar_mention() {
-    // S2: /skill <name> [task] must SubmitMessage with `$name …` so agent S1 injects.
-    let mut s = state();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::SessionOpened {
-            session: snapshot(),
-        }),
-    );
-    reduce(&mut s, Action::Paste("/skill demo please ship".into()));
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
-                if content == "$demo please ship"
-        ),
-        "expected $demo submit, got {effects:?}"
-    );
-    assert!(s.composer.is_empty());
-}
-
-#[test]
-fn skill_slash_list_does_not_send_when_no_args() {
-    let mut s = state();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::SessionOpened {
-            session: snapshot(),
-        }),
-    );
-    reduce(&mut s, Action::Paste("/skill".into()));
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        effects.is_empty(),
-        "list-only /skill should not submit: {effects:?}"
-    );
-    let msg = s
-        .notification
-        .as_ref()
-        .map(|n| n.message.as_str())
-        .unwrap_or("");
-    assert!(
-        msg.contains("技能") || msg.contains("skill") || msg.contains("/skill"),
-        "should notify about skills list/usage: {msg}"
-    );
 }
 
 #[test]
@@ -4816,20 +4815,6 @@ fn an_empty_editor_buffer_clears_the_draft() {
     assert!(s.composer.is_empty());
 }
 
-#[test]
-fn slash_editor_opens_the_same_editor() {
-    let mut s = state();
-    s.composer.replace("/editor");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::OpenExternalEditor {
-            text: String::new()
-        }],
-        "the command itself must not be carried into the editor"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Rewind. `/restore` already rolls the workspace back with the transcript
 // (checkpoint_before_turn captures a git tree per turn), so the picker has to
@@ -4930,56 +4915,132 @@ fn write_project_skill(root: &std::path::Path, name: &str, desc: &str) {
     .unwrap();
 }
 
+/// Skills live in the `$` namespace only: `/<skill>` is not a second entry.
 #[test]
-fn slash_skill_name_submits_like_skill_command() {
+fn slash_skill_name_is_not_a_command() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
     s.repository = dir.path().display().to_string();
 
+    typed(&mut s, "/code");
+    assert!(
+        leveler_tui::screen::visible_slash_popup(&s)
+            .iter()
+            .all(|(n, _)| n != "/code-review"),
+        "the / popup must not list skills"
+    );
     s.composer.replace("/code-review fix auth");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::SubmitMessage { content, .. })
-                if content == "$code-review fix auth"
-        )),
-        "direct skill slash must inject $name: {effects:?}"
-    );
-    assert!(s.composer.is_empty());
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "/code-review fix auth");
 }
 
 #[test]
-fn skill_names_appear_in_slash_popup() {
+fn dollar_popup_lists_skills_and_tab_completes_the_mention() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
     s.repository = dir.path().display().to_string();
-    typed(&mut s, "/code");
-    let matches = leveler_tui::screen::visible_slash_popup(&s);
+
+    typed(&mut s, "请 $code");
+    let matches = leveler_tui::screen::visible_skill_popup(&s);
     assert!(
         matches
             .iter()
-            .any(|(n, d)| n == "/code-review" && d.contains("Review")),
+            .any(|(n, d)| n == "$code-review" && d.contains("Review")),
         "popup must list skill: {matches:?}"
+    );
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.composer.text(), "请 $code-review ");
+
+    typed(&mut s, "fix auth");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+                if content == "请 $code-review fix auth"
+        ),
+        "a $skill message is sent as typed: {effects:?}"
     );
 }
 
 #[test]
-fn builtin_slash_wins_over_skill_with_same_name() {
+fn dollar_popup_enter_completes_instead_of_sending() {
     let dir = tempfile::tempdir().unwrap();
-    // Would collide with /help if we allowed it into the catalog.
-    write_project_skill(dir.path(), "help", "Fake skill");
+    write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
     s.repository = dir.path().display().to_string();
+
+    typed(&mut s, "$code");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "$code-review ");
+
+    // The completed mention is done: the popup closes and the next Enter sends.
+    assert!(leveler_tui::screen::visible_skill_popup(&s).is_empty());
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+                if content.trim() == "$code-review"
+        ),
+        "second Enter must send the mention once: {effects:?}"
+    );
+}
+
+#[test]
+fn dollar_without_a_matching_skill_shows_no_popup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project_skill(dir.path(), "code-review", "Review the change");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+
+    typed(&mut s, "costs $100");
+    assert!(leveler_tui::screen::visible_skill_popup(&s).is_empty());
+}
+
+/// `$` in a shell escape is the shell's, and Enter must run the command.
+#[test]
+fn dollar_in_a_shell_escape_is_not_a_skill_mention() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project_skill(dir.path(), "code-review", "Review the change");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+
+    typed(&mut s, "!echo $");
+    assert!(leveler_tui::screen::visible_skill_popup(&s).is_empty());
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })] if command == "echo $"
+        ),
+        "{effects:?}"
+    );
+}
+
+/// Builtins and skills no longer share a namespace, so a skill may carry a
+/// builtin's name without shadowing it or being filtered out.
+#[test]
+fn a_skill_named_like_a_builtin_keeps_both() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project_skill(dir.path(), "help", "Project help skill");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+
+    typed(&mut s, "$hel");
+    assert!(
+        leveler_tui::screen::visible_skill_popup(&s)
+            .iter()
+            .any(|(n, _)| n == "$help"),
+        "$help must be offered"
+    );
     s.composer.replace("/help");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        s.active_screen,
-        Screen::Help,
-        "builtin /help must win over a skill named help"
-    );
+    assert_eq!(s.active_screen, Screen::Help, "/help stays the builtin");
 }
 
 #[test]
@@ -5028,45 +5089,24 @@ fn slash_goal_clear_cancels_a_busy_goal_turn() {
     );
 }
 
+/// `feature-dev` is a built-in skill: it must reach the composer as `$feature-dev`
+/// with no per-project setup, or shipping it changes nothing for users.
 #[test]
-fn slash_doctor_writes_a_self_check_note() {
-    let mut s = opened();
-    s.model_label = "test-model".into();
-    s.composer.replace("/doctor");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "{effects:?}");
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|i| match i {
-            leveler_tui::transcript::TranscriptItem::Note(n) => Some(n.as_str()),
-            _ => None,
-        })
-        .expect("doctor must leave a transcript note");
-    assert!(note.contains("Doctor"), "{note}");
-    assert!(note.contains("test-model"), "{note}");
-    assert!(note.contains("session"), "{note}");
-}
-
-/// `/feature-dev` is a built-in skill: it must reach the composer as a slash
-/// command with no per-project setup, or shipping it changes nothing for users.
-#[test]
-fn the_builtin_feature_dev_skill_is_reachable_as_a_slash_command() {
+fn the_builtin_feature_dev_skill_is_reachable_as_a_dollar_mention() {
     let dir = std::env::temp_dir().join(format!("leveler-featuredev-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut s = state();
     s.repository = dir.display().to_string();
 
-    // Typing a `/` refreshes the catalog the same way the real composer does.
-    reduce(&mut s, key(KeyCode::Char('/')));
+    // Typing a `$` refreshes the catalog the same way the real composer does.
+    reduce(&mut s, key(KeyCode::Char('$')));
     assert!(
         s.skill_catalog.iter().any(|(n, _)| n == "feature-dev"),
         "feature-dev must be in the skill catalog: {:?}",
         s.skill_catalog
     );
 
-    s.composer.replace("/feature-dev 加一个登录页");
+    s.composer.replace("$feature-dev 加一个登录页");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     match effects.as_slice() {
         [Effect::Send(ClientCommand::SubmitMessage { content, .. })] => {

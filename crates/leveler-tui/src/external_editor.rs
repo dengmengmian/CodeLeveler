@@ -1,4 +1,4 @@
-//! `$EDITOR` round trip for the composer (Ctrl+X Ctrl+E, `/editor`).
+//! `$EDITOR` round trip for the composer (Ctrl+X Ctrl+E).
 //!
 //! Writing a long prompt inside a few-line composer is the worst part of the
 //! input box, so the draft goes out to a real editor and comes back. The TUI is

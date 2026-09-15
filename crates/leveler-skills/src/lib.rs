@@ -1,7 +1,7 @@
 //! Agent Skills: discover, load, and author `SKILL.md` procedural-knowledge
 //! packs. Only each skill's `name` + `description` are injected into context
 //! by default; the full body is loaded on demand (progressive disclosure) or
-//! turn-injected when the user names `$skill` / selects `/skill`.
+//! turn-injected when the user names `$skill`.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -415,8 +415,8 @@ pub const SKILLS_HOW_TO_USE: &str = "\
 How to use skills (progressive disclosure):\n\
 - Discovery: the list above is name + description only. Full instructions live \
   in each skill's `SKILL.md` and are loaded with `load_skill`, or injected \
-  automatically when the user names `$skill-name` or selects `/skill`.\n\
-- Trigger: if the user names a skill (`$name` or `/skill name`) OR the task \
+  automatically when the user names `$skill-name`.\n\
+- Trigger: if the user names a skill (`$name`) OR the task \
   clearly matches a listed description, you MUST use that skill for the turn — \
   read its full instructions before other task actions. Multiple mentions mean \
   use them all. Do not carry skills across turns unless re-mentioned.\n\
@@ -435,7 +435,7 @@ pub fn render_index(skills: &[SkillSummary]) -> String {
     let mut s = String::from(
         "Available skills — reusable procedures for specific tasks. Call \
          `load_skill` with a name to read full instructions before related work, \
-         unless the user already named `$skill` / `/skill` (then follow the \
+         unless the user already named `$skill` (then follow the \
          turn injection):\n",
     );
     for skill in skills {
@@ -711,7 +711,7 @@ mod builtin_tests {
         d
     }
 
-    /// The point of shipping it: a fresh checkout has `/feature-dev` with no
+    /// The point of shipping it: a fresh checkout has `$feature-dev` with no
     /// setup and nothing to copy.
     #[test]
     fn feature_dev_ships_with_the_binary() {

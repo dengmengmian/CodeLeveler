@@ -1154,7 +1154,7 @@ impl TranscriptState {
         }
     }
 
-    /// Clear every block (visual `/clear`; does not delete the session).
+    /// Clear every block (session switch; does not delete the session).
     pub fn clear(&mut self) {
         self.bump();
         self.items.clear();

@@ -20,7 +20,7 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
     crate::suggestion::clear(state);
-    if state.composer.text().starts_with('/') {
+    if crate::screen::skill_mention_query(state).is_some() {
         refresh_skill_catalog(state);
     }
 }
@@ -63,12 +63,7 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        refresh_skill_catalog(state);
         if crate::screen::is_known_slash_token(name) {
-            // /clear confirm arming is handled inside; other commands disarm.
-            if name != "clear" && name != "new" {
-                state.clear_confirm_armed = false;
-            }
             // `take()` returns the canonical content (paste chips expanded);
             // slash ARGUMENTS must come from it, not from the raw buffer, or
             // a pasted goal/question degrades to its placeholder (R004 F1).
@@ -78,20 +73,6 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
             return handle_slash(state, rest_expanded.trim());
         }
-        // Project/user skills are first-class: `/code-review` ≡ `/skill code-review`.
-        if crate::screen::is_skill_slash_token(state, name) {
-            state.clear_confirm_armed = false;
-            let expanded = state.composer.take();
-            let expanded = expanded.trim();
-            let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
-            let task = rest_expanded
-                .strip_prefix(name)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            return run_named_skill(state, name, &task);
-        }
-        state.clear_confirm_armed = false;
         // Reserve unknown-command feedback for SINGLE-LINE command-shaped
         // typos such as `/hlep`. Absolute paths (`/Users/...`), file names,
         // and multiline slash-prefixed prose are ordinary messages.
@@ -103,7 +84,6 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             return Vec::new();
         }
     }
-    state.clear_confirm_armed = false;
     if state.is_busy() {
         // Steer the running turn instead of queuing behind it: a correction
         // ("actually use the other module") is worthless once the work is
@@ -171,6 +151,19 @@ pub(super) fn complete_slash(state: &mut AppState) {
     let idx = state.slash_selected.min(matches.len() - 1);
     let name = matches[idx].0.clone();
     state.composer.replace(format!("{name} "));
+    touch_slash_filter(state);
+}
+
+pub(super) fn complete_skill_mention(state: &mut AppState) {
+    let matches = crate::screen::visible_skill_popup(state);
+    let Some((name, _)) = matches.get(state.slash_selected.min(matches.len().saturating_sub(1)))
+    else {
+        return;
+    };
+    let name = name.clone();
+    state
+        .composer
+        .replace_token_before_cursor(&format!("{name} "));
     touch_slash_filter(state);
 }
 
@@ -282,18 +275,14 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "goal" => run_goal(state, command),
         "btw" => run_btw(state, command),
-        "tools" => toggle_screen(state, Screen::Tools),
         "trace" => {
             let id = command.split_whitespace().nth(1).map(str::to_string);
             open_trace(state, id)
         }
-        // /plan = collaboration Plan mode (read-only planning).
-        "plan" => apply_collab(state, "plan"),
         "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
         "remember" => remember_slash(state, command),
-        "skill" => skill_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
         "remote-loc" => start_remote(state, true),
@@ -318,12 +307,6 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             session_id: state.session_id.clone(),
         })],
         "export" => export_conversation(state, command),
-        "paste" => vec![Effect::Send(ClientCommand::AddClipboardImage {
-            session_id: state.session_id.clone(),
-        })],
-        // The composer was already taken above, so this opens on an empty
-        // buffer — the command itself is never carried into the editor.
-        "editor" => super::open_external_editor(state),
         "theme" => {
             let arg = command.split_whitespace().nth(1).unwrap_or("").trim();
             if arg.is_empty() {
@@ -348,9 +331,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 })]
             }
         }
-        "clear" => clear_conversation(state),
-        "doctor" => doctor_slash(state),
-        "quit" => vec![Effect::Quit],
+        "new" => new_conversation(state),
         "help" => toggle_screen(state, Screen::Help),
         other => {
             state.notification = Some(Notification {
@@ -362,16 +343,12 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     }
 }
 
-/// `/clear` requires a second confirmation so a fat-finger does not wipe history.
-/// `/clear` (alias `/new`): start a fresh conversation.
+/// `/new`: start a fresh conversation.
 ///
 /// This starts a NEW session and switches to it; the current one keeps its
-/// transcript and checkpoints and stays in `/sessions`. It used to wipe the
-/// current session in place — unrecoverable, checkpoints and all — which is
-/// the only reason it needed a two-step confirmation. Starting fresh loses
+/// transcript and checkpoints and stays in `/sessions`. Starting fresh loses
 /// nothing, so there is nothing to confirm.
-fn clear_conversation(state: &mut AppState) -> Vec<Effect> {
-    state.clear_confirm_armed = false;
+fn new_conversation(state: &mut AppState) -> Vec<Effect> {
     // Ask, do not act. Clearing the view here would show success before the
     // host has created anything — and if creation or config persistence
     // fails, the user is left staring at an empty screen with their old
@@ -604,7 +581,7 @@ fn skill_root(state: &AppState) -> std::path::PathBuf {
     std::path::PathBuf::from(raw)
 }
 
-/// Rescan project + user skills when the root changes (or first `/` keystroke).
+/// Rescan project + user skills when the root changes (or first `$` keystroke).
 pub(super) fn refresh_skill_catalog(state: &mut AppState) {
     let root = skill_root(state);
     let key = root.display().to_string();
@@ -613,87 +590,14 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
     }
     state.skill_catalog = leveler_skills::discover(&root)
         .into_iter()
-        // Builtins always win the name; keep only skill-shaped tokens.
-        .filter(|s| {
-            looks_like_unknown_slash_command(&s.name)
-                && !crate::screen::is_known_slash_token(&s.name)
-        })
+        // Keep only names a `$name` mention can spell.
+        .filter(|s| looks_like_unknown_slash_command(&s.name))
         .map(|s| (s.name, s.description))
         .collect();
     state.skill_catalog_root = Some(key);
 }
 
 /// `/memory` — list active (+archived); `/memory forget <id>` archives.
-/// `/skill` — list available skills, or select one (rewrites to `$name` and
-/// submits so the agent turn-injection path matches typing `$name`).
-fn skill_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let rest = command.strip_prefix("skill").unwrap_or(command).trim();
-    refresh_skill_catalog(state);
-
-    if rest.is_empty() {
-        let message = if state.skill_catalog.is_empty() {
-            "暂无技能。在 .leveler/skills/<name>/SKILL.md 或 ~/.leveler/skills/ 添加；\
-             用法: /skill <name> [任务]  或直接  /<name> [任务]"
-                .to_string()
-        } else {
-            let mut lines = vec![
-                "可用技能（/<name> 或 /skill <name> [任务] ≡ 发送 $name；本轮注入全文）："
-                    .to_string(),
-            ];
-            for (name, desc) in &state.skill_catalog {
-                if desc.is_empty() {
-                    lines.push(format!("  /{name}"));
-                } else {
-                    lines.push(format!("  /{name} — {desc}"));
-                }
-            }
-            lines.join("\n")
-        };
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message,
-        });
-        return Vec::new();
-    }
-
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("").trim();
-    let task = parts.next().unwrap_or("").trim();
-    if name.is_empty() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "用法: /skill <name> [任务说明]  或  /<name> [任务说明]".into(),
-        });
-        return Vec::new();
-    }
-
-    run_named_skill(state, name, task)
-}
-
-/// Inject and submit a skill (same path as `$name` / `/skill name`).
-fn run_named_skill(state: &mut AppState, name: &str, task: &str) -> Vec<Effect> {
-    let content = crate::screen::skill_mention_message(name, task);
-    if state.is_busy() {
-        // Same as an ordinary message: steer the running turn.
-        state.transcript.push_user_if_new(content.clone());
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: state.t().steering_sent.to_string(),
-        });
-        return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
-            session_id: state.session_id.clone(),
-            content,
-        })];
-    }
-    state.transcript.push_user_if_new(content.clone());
-    start_turn(state);
-    vec![Effect::Send(ClientCommand::SubmitMessage {
-        session_id: state.session_id.clone(),
-        content,
-        attachments: Vec::new(),
-    })]
-}
-
 fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command.strip_prefix("memory").unwrap_or(command).trim();
     if rest.is_empty() || rest == "list" {
@@ -920,66 +824,6 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
     effects
 }
 
-/// Local self-check: connection, model, permission, repo, skills, checkpoints.
-fn doctor_slash(state: &mut AppState) -> Vec<Effect> {
-    refresh_skill_catalog(state);
-    let conn = if state.runtime_connected {
-        "ok"
-    } else {
-        "断开"
-    };
-    let busy = if state.is_busy() { "busy" } else { "idle" };
-    let repo = if state.repository.is_empty() {
-        "—"
-    } else {
-        state.repository.as_str()
-    };
-    let branch = state.branch.as_deref().unwrap_or("—");
-    let lines = [
-        "Doctor".to_string(),
-        format!("session     {}", state.session_id.as_str()),
-        format!("connected   {conn}"),
-        format!("status      {busy}"),
-        format!("model       {}", state.model_label),
-        format!("vision      {}", state.vision),
-        format!("permission  {} ({:?})", state.mode_label, state.mode),
-        format!(
-            "axes        collab={} work={}",
-            state.collaboration, state.work_profile
-        ),
-        format!("goal_mode   {}", state.goal_mode_active),
-        format!("repo        {repo}"),
-        format!("branch      {branch}"),
-        format!(
-            "context     {} / {} tokens (in={} out={})",
-            state.context_tokens,
-            state.context_window_tokens,
-            state.token_input,
-            state.token_output
-        ),
-        format!("skills      {}", state.skill_catalog.len()),
-        format!("checkpoints {}", state.checkpoints.len()),
-        format!("attachments {}", state.pending_attachments.len()),
-    ];
-    let mut body = lines.join("\n");
-    if !state.untrusted_config.is_empty() {
-        body.push_str("\nuntrusted_config:\n");
-        for p in &state.untrusted_config {
-            body.push_str(&format!("  - {p}\n"));
-        }
-    }
-    state.transcript.push_note(body);
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: format!(
-            "doctor · {conn} · {} · skills={}",
-            state.model_label,
-            state.skill_catalog.len()
-        ),
-    });
-    Vec::new()
-}
-
 /// Route `!command`: enters input history (like slash commands), never the
 /// conversation or the model; opens Shell Details immediately.
 fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
@@ -1196,7 +1040,7 @@ mod export_tests {
             // highlighted suggestion, and that turns on this list. Without the
             // entry, `/remote-loc` + Enter would run `/remote` — the one
             // command it must never be mistaken for.
-            assert!(crate::screen::SLASH_NAMES.contains(&"/remote-loc"));
+            assert!(crate::screen::is_exact_slash_token("/remote-loc"));
 
             // And it says which one is which, rather than leaving two
             // near-identical names to be told apart by guessing.

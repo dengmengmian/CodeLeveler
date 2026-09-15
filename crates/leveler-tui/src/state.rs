@@ -276,8 +276,6 @@ pub struct AppState {
     /// User pressed Esc while the slash popup was open; stay hidden until the
     /// composer text changes (so Esc can actually leave the menu).
     pub slash_popup_dismissed: bool,
-    /// Armed by the first `/clear`; a second `/clear` actually wipes context.
-    pub clear_confirm_armed: bool,
     /// Repository paths used by `@file` completion.
     pub file_candidates: Vec<String>,
     pub file_index_requested: bool,
@@ -407,7 +405,6 @@ impl AppState {
             turn_nav: None,
             slash_selected: 0,
             slash_popup_dismissed: false,
-            clear_confirm_armed: false,
             file_candidates: Vec::new(),
             file_index_requested: false,
             skill_catalog: Vec::new(),

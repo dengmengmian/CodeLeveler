@@ -37,18 +37,18 @@ pub enum SlashCategory {
     Agent,
     /// Screens and inspection.
     View,
-    /// History, export, memory, clear.
+    /// History, export, memory, new.
     Session,
-    /// Attachments, skills, paste.
+    /// Attachments.
     Input,
-    /// Theme, web, remote, help, quit.
+    /// Theme, web, remote, help.
     System,
 }
 
 /// Whether a command may run while a turn is busy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusyPolicy {
-    /// Safe while busy (views, help, quit, most pickers).
+    /// Safe while busy (views, help, most pickers).
     Always,
     /// Axes / destructive session ops — refuse with a notice while busy.
     IdleOnly,
@@ -141,18 +141,11 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         "/work-mode",
         &["/work_mode"],
         SlashCategory::Agent,
-        SlashVisibility::Quick,
+        SlashVisibility::Searchable,
         BusyPolicy::IdleOnly,
     ),
     slash(
         "/collab",
-        &[],
-        SlashCategory::Agent,
-        SlashVisibility::Quick,
-        BusyPolicy::IdleOnly,
-    ),
-    slash(
-        "/plan",
         &[],
         SlashCategory::Agent,
         SlashVisibility::Quick,
@@ -168,13 +161,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
     ),
     slash(
         "/trace",
-        &[],
-        SlashCategory::View,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/tools",
         &[],
         SlashCategory::View,
         SlashVisibility::Searchable,
@@ -234,37 +220,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     slash(
-        "/clear",
-        &["/new"],
+        "/new",
+        &[],
         SlashCategory::Session,
         SlashVisibility::Quick,
         BusyPolicy::IdleOnly,
     ),
     // Input
     slash(
-        "/skill",
-        &[],
-        SlashCategory::Input,
-        SlashVisibility::Quick,
-        BusyPolicy::Always,
-    ),
-    slash(
         "/attach",
         &["/image"],
-        SlashCategory::Input,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/paste",
-        &[],
-        SlashCategory::Input,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/editor",
-        &[],
         SlashCategory::Input,
         SlashVisibility::Searchable,
         BusyPolicy::Always,
@@ -299,24 +264,10 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     slash(
-        "/doctor",
-        &[],
-        SlashCategory::System,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
         "/help",
         &[],
         SlashCategory::System,
         SlashVisibility::Quick,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/quit",
-        &["/q"],
-        SlashCategory::System,
-        SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
 ];
@@ -330,40 +281,6 @@ pub fn all_slash_tokens() -> Vec<&'static str> {
     }
     out
 }
-
-/// Stable listed names (primary only) — same role as the old `SLASH_NAMES`.
-pub const SLASH_NAMES: &[&str] = &[
-    "/model",
-    "/permission",
-    "/goal",
-    "/btw",
-    "/recap",
-    "/work-mode",
-    "/collab",
-    "/plan",
-    "/diff",
-    "/trace",
-    "/tools",
-    "/sessions",
-    "/memory",
-    "/remember",
-    "/restore",
-    "/fork",
-    "/compact",
-    "/export",
-    "/clear",
-    "/skill",
-    "/attach",
-    "/paste",
-    "/editor",
-    "/theme",
-    "/web",
-    "/remote",
-    "/remote-loc",
-    "/doctor",
-    "/help",
-    "/quit",
-];
 
 /// `name` is without the leading `/`. Empty string is `/` → help.
 pub fn is_known_slash_token(name: &str) -> bool {
@@ -424,14 +341,10 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/recap" => s.recap,
         "/work-mode" | "/work_mode" => s.work_mode,
         "/collab" => s.collab,
-        "/plan" => s.plan_collab,
         "/memory" => s.memory,
         "/remember" => s.remember,
-        "/skill" => s.skill,
-        "/feature-dev" => s.feature_dev,
         "/diff" => s.diff,
         "/trace" => s.trace,
-        "/tools" => s.tools,
         "/sessions" => s.sessions,
         "/restore" | "/checkpoint" | "/rewind" => s.restore,
         "/fork" => s.fork,
@@ -441,13 +354,9 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/remote" => s.remote,
         "/remote-loc" => s.remote_loc,
         "/image" | "/attach" => s.attach,
-        "/paste" => s.paste,
-        "/editor" => s.editor,
         "/theme" => s.theme,
-        "/clear" | "/new" => s.clear,
-        "/doctor" => s.doctor,
+        "/new" => s.new,
         "/help" => s.help,
-        "/quit" | "/q" => s.quit,
         _ => "",
     }
 }
@@ -494,17 +403,6 @@ pub fn category_label(cat: SlashCategory, t: &UiText) -> &'static str {
     }
 }
 
-/// Build a user message that names a skill for turn injection (same path as `$name`).
-pub fn skill_mention_message(skill_name: &str, rest: &str) -> String {
-    let name = skill_name.trim().trim_start_matches('$');
-    let rest = rest.trim();
-    if rest.is_empty() {
-        format!("${name}")
-    } else {
-        format!("${name} {rest}")
-    }
-}
-
 /// Whether `def` belongs in the `/` popup for this typed `prefix`.
 pub(crate) fn include_in_slash_popup(def: &SlashDef, prefix: &str) -> bool {
     match def.visibility {
@@ -533,54 +431,16 @@ pub fn slash_matches(prefix: &str, t: &UiText) -> Vec<(String, String)> {
     out
 }
 
-/// Skills that may appear as `/name` (and do not collide with builtins).
-pub fn skill_slash_matches(state: &crate::state::AppState, prefix: &str) -> Vec<(String, String)> {
-    let prefix_name = prefix.trim_start_matches('/');
-    state
-        .skill_catalog
-        .iter()
-        .filter(|(name, _)| {
-            let keyed = format!("/{name}");
-            let hit = name.starts_with(prefix_name) || keyed.starts_with(prefix);
-            if !hit {
-                return false;
-            }
-            // Product skills (those with a popup brief) stay on the empty `/`
-            // list. Project/user skills are searchable only.
-            prefix != "/" || !slash_popup_label(&keyed, state.t()).is_empty()
-        })
-        .map(|(name, desc)| {
-            let keyed = format!("/{name}");
-            let localized = slash_popup_label(&keyed, state.t());
-            let label = if !localized.is_empty() {
-                localized.to_string()
-            } else if desc.is_empty() {
-                state.t().slash.skill_entry.to_string()
-            } else {
-                desc.clone()
-            };
-            (keyed, label)
-        })
-        .collect()
-}
-
 /// The completion popup's entries for the current composer `text`, or empty when
 /// no popup should show. Single source of truth shared by the reducer (key
-/// handling / selection) and the renderer.
-///
-/// Includes discovered project/user skills as `/skill-name` so they feel like
-/// first-class commands (Claude Code / Grok-style).
-pub fn slash_popup(
-    text: &str,
-    t: &UiText,
-    state: &crate::state::AppState,
-) -> Vec<(String, String)> {
+/// handling / selection) and the renderer. Skills are not here: they are the
+/// `$` namespace ([`visible_skill_popup`]).
+pub fn slash_popup(text: &str, t: &UiText) -> Vec<(String, String)> {
     if !text.starts_with('/') || text.contains('\n') {
         return Vec::new();
     }
     let token = text.split_whitespace().next().unwrap_or(text);
-    let mut matches = slash_matches(token, t);
-    matches.extend(skill_slash_matches(state, token));
+    let matches = slash_matches(token, t);
     // Once a full command + argument is being typed, stop offering the popup.
     if text.contains(' ') && matches.len() <= 1 {
         return Vec::new();
@@ -599,16 +459,49 @@ pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(String, Strin
     if state.slash_popup_dismissed {
         return Vec::new();
     }
-    slash_popup(state.composer.text(), state.t(), state)
+    slash_popup(state.composer.text(), state.t())
 }
 
-/// Whether `name` (no leading `/`) is a skill that can be invoked as `/name`.
-pub fn is_skill_slash_token(state: &crate::state::AppState, name: &str) -> bool {
-    !is_known_slash_token(name)
-        && state
-            .skill_catalog
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+/// Active `$skill` query immediately before the composer cursor. A trailing
+/// space means the mention is finished (e.g. just completed), not active.
+pub fn skill_mention_query(state: &crate::state::AppState) -> Option<&str> {
+    let before = state.composer.text_before_cursor();
+    if before.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let token = before.split_whitespace().next_back()?;
+    token.strip_prefix('$')
+}
+
+/// Skills matching the active `$` mention, as `($name, label)` rows. The
+/// runtime injects a skill for any `$name` in the message, so completion is
+/// the whole interaction — there is no separate command.
+pub fn visible_skill_popup(state: &crate::state::AppState) -> Vec<(String, String)> {
+    // In a `!command` the `$` belongs to the shell.
+    if state.slash_popup_dismissed || state.composer.text().starts_with('!') {
+        return Vec::new();
+    }
+    let Some(query) = skill_mention_query(state) else {
+        return Vec::new();
+    };
+    let t = state.t();
+    state
+        .skill_catalog
+        .iter()
+        .filter(|(name, _)| name.starts_with(query))
+        .map(|(name, desc)| {
+            let label = if name == "feature-dev" {
+                // The builtin SKILL.md description is the workflow; the popup
+                // only says what the skill is for, in the UI's language.
+                t.skill_feature_dev
+            } else if desc.is_empty() {
+                t.skill_mention
+            } else {
+                desc
+            };
+            (format!("${name}"), label.to_string())
+        })
+        .collect()
 }
 
 /// Active `@file` query immediately before the composer cursor.
@@ -673,7 +566,6 @@ pub fn slash_arg_ghost(text: &str, t: &UiText) -> Option<&'static str> {
     let (bare, spaced) = match primary {
         "/btw" => (g.btw, g.btw_spaced),
         "/goal" => (g.goal, g.goal_spaced),
-        "/skill" => (g.skill, g.skill_spaced),
         "/attach" => (g.path, g.path_spaced),
         _ => return None,
     };
@@ -696,28 +588,150 @@ pub enum ToolFilter {
 }
 
 #[cfg(test)]
+mod surface_tests {
+    use super::{SLASH_DEFS, all_slash_tokens};
+
+    /// The closed TUI command surface. Adding or removing a command changes
+    /// this list on purpose, never as a side effect.
+    #[test]
+    fn registry_is_the_closed_command_surface() {
+        let names: Vec<_> = SLASH_DEFS.iter().map(|d| d.name).collect();
+        assert_eq!(
+            names,
+            [
+                "/model",
+                "/permission",
+                "/goal",
+                "/btw",
+                "/recap",
+                "/work-mode",
+                "/collab",
+                "/diff",
+                "/trace",
+                "/sessions",
+                "/memory",
+                "/remember",
+                "/restore",
+                "/fork",
+                "/compact",
+                "/export",
+                "/new",
+                "/attach",
+                "/theme",
+                "/web",
+                "/remote",
+                "/remote-loc",
+                "/help",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_token_names_exactly_one_command() {
+        let tokens = all_slash_tokens();
+        for token in &tokens {
+            assert!(token.starts_with('/'), "{token}");
+            assert_eq!(
+                tokens.iter().filter(|t| *t == token).count(),
+                1,
+                "{token} is registered twice"
+            );
+        }
+    }
+
+    /// Source text of the item starting at `signature`, up to its closing
+    /// top-level brace.
+    fn item_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").expect("item end")]
+    }
+
+    /// String literals that open a match arm: `"a" | "b" =>`.
+    fn arm_literals(body: &str) -> Vec<&str> {
+        body.lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with('"') && l.contains("=>"))
+            .flat_map(|l| {
+                l.split("=>")
+                    .next()
+                    .unwrap_or("")
+                    .split('|')
+                    .map(|p| p.trim().trim_matches('"'))
+            })
+            .collect()
+    }
+
+    fn struct_fields<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
+        item_body(src, &format!("pub struct {name} {{"))
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .map(|l| l.split(':').next().unwrap_or("").trim())
+            .collect()
+    }
+
+    /// Registry ↔ copy ↔ dispatch. Copy or a dispatch arm for a command that
+    /// is not registered is dead residue (the old `/feature-dev` copy); a
+    /// registered command without both is a broken promise.
+    #[test]
+    fn copy_and_dispatch_cover_exactly_the_registry() {
+        let tokens = all_slash_tokens();
+        let copy = arm_literals(item_body(include_str!("screen.rs"), "fn slash_copy("));
+        for lit in &copy {
+            assert!(tokens.contains(lit), "copy for unregistered {lit}");
+        }
+        for token in &tokens {
+            assert!(copy.contains(token), "{token} has no copy");
+        }
+
+        let dispatch = arm_literals(item_body(
+            include_str!("reducer/submit.rs"),
+            "fn handle_slash(",
+        ));
+        let primaries: Vec<_> = SLASH_DEFS
+            .iter()
+            .map(|d| d.name.trim_start_matches('/'))
+            .collect();
+        for lit in &dispatch {
+            assert!(primaries.contains(lit), "dispatch for unregistered /{lit}");
+        }
+        for primary in &primaries {
+            assert!(dispatch.contains(primary), "/{primary} is never dispatched");
+        }
+    }
+
+    /// Every command-copy string is reachable from a command.
+    #[test]
+    fn every_slash_copy_field_belongs_to_a_command() {
+        let i18n = include_str!("i18n.rs");
+        let screen = include_str!("screen.rs");
+        let copy = item_body(screen, "fn slash_copy(");
+        for field in struct_fields(i18n, "SlashText") {
+            assert!(
+                copy.contains(&format!("s.{field},")),
+                "SlashText.{field} is copy for no command"
+            );
+        }
+        let ghost = item_body(screen, "pub fn slash_arg_ghost(");
+        for field in struct_fields(i18n, "SlashGhost") {
+            assert!(
+                ghost.contains(&format!("g.{field},")) || ghost.contains(&format!("g.{field})")),
+                "SlashGhost.{field} is never drawn"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod ghost_tests {
-    use super::{skill_mention_message, slash_arg_ghost, slash_commands};
+    use super::{slash_arg_ghost, slash_commands};
     use crate::i18n::Locale;
 
     fn t() -> &'static crate::i18n::UiText {
         Locale::Zh.text()
-    }
-
-    #[test]
-    fn skill_is_in_slash_commands() {
-        let names: Vec<_> = slash_commands(t()).into_iter().map(|(n, _)| n).collect();
-        assert!(names.contains(&"/skill"), "{names:?}");
-    }
-
-    #[test]
-    fn skill_mention_message_matches_dollar_form() {
-        assert_eq!(skill_mention_message("demo", ""), "$demo");
-        assert_eq!(
-            skill_mention_message("$demo", "please ship"),
-            "$demo please ship"
-        );
-        assert_eq!(skill_mention_message(" deploy ", "  x  "), "$deploy x");
     }
 
     #[test]
@@ -774,42 +788,36 @@ mod ghost_tests {
     fn empty_slash_lists_only_quick_commands() {
         let rows = super::slash_matches("/", t());
         let names: Vec<_> = rows.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(
-            names.len() <= 13,
-            "empty / must stay a short capability list: {names:?}"
+        assert_eq!(
+            names,
+            [
+                "/model",
+                "/permission",
+                "/goal",
+                "/btw",
+                "/recap",
+                "/collab",
+                "/diff",
+                "/compact",
+                "/new",
+                "/help",
+            ],
+            "empty / is the high-frequency core only"
         );
-        for must in [
-            "/model",
-            "/permission",
-            "/goal",
-            "/btw",
-            "/work-mode",
-            "/collab",
-            "/plan",
-            "/diff",
-            "/skill",
-            "/compact",
-            "/clear",
-            "/help",
-        ] {
-            assert!(names.contains(&must), "missing quick {must}: {names:?}");
-        }
         for hidden in [
-            "/tools",
+            "/work-mode",
+            "/trace",
             "/sessions",
             "/memory",
+            "/remember",
             "/restore",
             "/fork",
             "/export",
             "/attach",
-            "/paste",
-            "/editor",
             "/theme",
             "/web",
             "/remote",
             "/remote-loc",
-            "/doctor",
-            "/quit",
         ] {
             assert!(!names.contains(&hidden), "searchable leaked on /: {hidden}");
         }
@@ -849,8 +857,7 @@ mod ghost_tests {
         assert!(!super::include_in_slash_popup(&hidden, "/debug"));
     }
 
-    #[test]
-    fn product_skill_is_quick_other_skills_are_searchable() {
+    fn skill_state(locale: Locale, skills: &[(&str, &str)]) -> crate::state::AppState {
         use crate::state::{AppState, Boot};
         use crate::theme::Theme;
         use leveler_client_protocol::SessionId;
@@ -865,29 +872,83 @@ mod ghost_tests {
                 draft_path: None,
                 history_path: None,
                 context_window: 0,
-                locale: Locale::Zh,
+                locale,
                 untrusted_config: Vec::new(),
                 reasoning_effort: None,
             },
         );
-        s.skill_catalog = vec![
-            ("feature-dev".into(), "分阶段实现".into()),
-            ("repo-lint".into(), "本仓库检查".into()),
-        ];
-        let bare = super::slash_popup("/", t(), &s);
-        assert!(
-            bare.iter()
-                .any(|(n, d)| n == "/feature-dev" && d == "功能实现"),
-            "feature-dev is a quick capability: {bare:?}"
+        s.skill_catalog = skills
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        s
+    }
+
+    #[test]
+    fn slash_popup_never_lists_skills() {
+        let mut s = skill_state(
+            Locale::Zh,
+            &[("feature-dev", "分阶段实现"), ("repo-lint", "检查")],
         );
-        assert!(
-            !bare.iter().any(|(n, _)| n == "/repo-lint"),
-            "project skills stay off the empty / list: {bare:?}"
+        for text in ["/", "/feat", "/repo"] {
+            s.composer.replace(text);
+            let rows = super::visible_slash_popup(&s);
+            assert!(
+                rows.iter()
+                    .all(|(n, _)| n != "/feature-dev" && n != "/repo-lint"),
+                "{text}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_lists_every_skill() {
+        let mut s = skill_state(
+            Locale::Zh,
+            &[("feature-dev", "分阶段实现"), ("repo-lint", "本仓库检查")],
         );
-        let search = super::slash_popup("/repo", t(), &s);
-        assert!(
-            search.iter().any(|(n, _)| n == "/repo-lint"),
-            "/repo must find the project skill: {search:?}"
+        s.composer.replace("$");
+        let names: Vec<_> = super::visible_skill_popup(&s)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["$feature-dev", "$repo-lint"]);
+        s.composer.replace("run $repo");
+        let names: Vec<_> = super::visible_skill_popup(&s)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["$repo-lint"]);
+    }
+
+    #[test]
+    fn builtin_skill_label_is_a_capability_not_a_workflow() {
+        let long = "分阶段实现一个新功能：先摸清现状和需求";
+        let mut zh = skill_state(
+            Locale::Zh,
+            &[("feature-dev", long), ("repo-lint", "本仓库的检查脚本")],
+        );
+        zh.composer.replace("$");
+        let rows = super::visible_skill_popup(&zh);
+        assert_eq!(
+            rows,
+            [
+                ("$feature-dev".to_string(), "功能实现".to_string()),
+                ("$repo-lint".to_string(), "本仓库的检查脚本".to_string()),
+            ]
+        );
+        let mut en = skill_state(Locale::En, &[("feature-dev", long), ("bare", "")]);
+        en.composer.replace("$");
+        let rows = super::visible_skill_popup(&en);
+        assert_eq!(
+            rows,
+            [
+                (
+                    "$feature-dev".to_string(),
+                    "Implement a feature".to_string()
+                ),
+                ("$bare".to_string(), "skill".to_string()),
+            ]
         );
     }
 
@@ -918,80 +979,6 @@ mod ghost_tests {
     }
 
     #[test]
-    fn feature_dev_popup_is_a_capability_label_not_a_workflow() {
-        use crate::state::{AppState, Boot};
-        use crate::theme::Theme;
-        use leveler_client_protocol::SessionId;
-
-        let mut zh = AppState::new(
-            Theme::no_color(),
-            Boot {
-                session_id: SessionId::new("s-zh"),
-                user: "u".into(),
-                version: "0".into(),
-                show_welcome: false,
-                draft_path: None,
-                history_path: None,
-                context_window: 0,
-                locale: Locale::Zh,
-                untrusted_config: Vec::new(),
-                reasoning_effort: None,
-            },
-        );
-        zh.skill_catalog.push((
-            "feature-dev".into(),
-            "分阶段实现一个新功能：先摸清现状和需求".into(),
-        ));
-        zh.skill_catalog
-            .push(("repo-lint".into(), "本仓库的检查脚本".into()));
-
-        let rows = super::skill_slash_matches(&zh, "/");
-        let feature = rows
-            .iter()
-            .find(|(n, _)| n == "/feature-dev")
-            .map(|(_, d)| d.as_str())
-            .expect("feature-dev row");
-        assert_eq!(feature, "功能实现");
-        assert!(!feature.contains("分阶段"));
-        assert!(
-            rows.iter().all(|(n, _)| n != "/repo-lint"),
-            "project skills stay off a bare /: {rows:?}"
-        );
-        let custom = super::skill_slash_matches(&zh, "/repo")
-            .into_iter()
-            .find(|(n, _)| n == "/repo-lint")
-            .map(|(_, d)| d)
-            .expect("project skill keeps its own copy when searched");
-        assert_eq!(custom, "本仓库的检查脚本");
-
-        let mut en = AppState::new(
-            Theme::no_color(),
-            Boot {
-                session_id: SessionId::new("s-en"),
-                user: "u".into(),
-                version: "0".into(),
-                show_welcome: false,
-                draft_path: None,
-                history_path: None,
-                context_window: 0,
-                locale: Locale::En,
-                untrusted_config: Vec::new(),
-                reasoning_effort: None,
-            },
-        );
-        en.skill_catalog.push((
-            "feature-dev".into(),
-            "分阶段实现一个新功能：先摸清现状和需求".into(),
-        ));
-        let en_label = super::skill_slash_matches(&en, "/")
-            .into_iter()
-            .find(|(n, _)| n == "/feature-dev")
-            .map(|(_, d)| d)
-            .expect("en feature-dev row");
-        assert_eq!(en_label, "Implement a feature");
-    }
-
-    #[test]
     fn popup_briefs_match_command_capability() {
         let zh = Locale::Zh.text();
         let en = Locale::En.text();
@@ -1002,8 +989,6 @@ mod ghost_tests {
             ("/btw", "临时提问", "quick question"),
             ("/work-mode", "执行策略", "work strategy"),
             ("/collab", "协作模式", "collaboration mode"),
-            ("/plan", "生成计划", "generate plan"),
-            ("/feature-dev", "功能实现", "Implement a feature"),
             ("/diff", "查看改动", "view changes"),
         ];
         for (name, zh_want, en_want) in pairs {

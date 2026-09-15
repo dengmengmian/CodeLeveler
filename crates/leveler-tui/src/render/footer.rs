@@ -249,11 +249,16 @@ pub(crate) fn render_slash_popup(
     }
 }
 
-/// Shared match list for slash / @file popups (name, description).
+/// Shared match list for slash / @file / $skill popups (name, description).
 fn slash_popup_match_rows(state: &AppState) -> Vec<(String, String)> {
     let files = crate::screen::visible_file_popup(state);
     if files.is_empty() {
-        crate::screen::visible_slash_popup(state)
+        let skills = crate::screen::visible_skill_popup(state);
+        if skills.is_empty() {
+            crate::screen::visible_slash_popup(state)
+        } else {
+            skills
+        }
     } else {
         files
             .into_iter()

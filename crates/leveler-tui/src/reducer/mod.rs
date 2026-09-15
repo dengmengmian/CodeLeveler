@@ -20,7 +20,8 @@ use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
 use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, toggle_screen};
 use submit::{
-    complete_file_mention, complete_slash, request_file_candidates, submit, touch_slash_filter,
+    complete_file_mention, complete_skill_mention, complete_slash, request_file_candidates, submit,
+    touch_slash_filter,
 };
 
 const QUIT_CONFIRM_MESSAGE: &str = "再按一次 Ctrl+C 退出";
@@ -492,6 +493,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 toggle_current_expand(state);
                 return Vec::new();
             }
+            // Bracketed paste cannot carry image bytes, and many terminals send
+            // nothing at all for Cmd+V on an image, so the clipboard image has
+            // its own key rather than a command.
+            KeyCode::Char('v') => {
+                return vec![Effect::Send(ClientCommand::AddClipboardImage {
+                    session_id: state.session_id.clone(),
+                })];
+            }
             // Jump back to the live edge after scrolling native history
             // (Approach A). Ctrl+End and Ctrl+↓ — the latter is easier on macOS.
             KeyCode::End | KeyCode::Down => {
@@ -519,7 +528,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // Whether the slash-command popup is showing (drives Up/Down/Tab/Enter/Esc).
     let popup_len = crate::screen::visible_slash_popup(state).len();
     let file_popup_len = crate::screen::visible_file_popup(state).len();
-    let popup_len = popup_len.max(file_popup_len);
+    let skill_popup_len = crate::screen::visible_skill_popup(state).len();
+    let popup_len = popup_len.max(file_popup_len).max(skill_popup_len);
     if popup_len > 0 {
         state.slash_selected = state.slash_selected.min(popup_len - 1);
     } else {
@@ -539,6 +549,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // rather than the highlighted `/model`).
         KeyCode::Enter if file_popup_len > 0 => {
             complete_file_mention(state);
+        }
+        KeyCode::Enter if skill_popup_len > 0 => {
+            complete_skill_mention(state);
         }
         KeyCode::Enter if popup_len > 0 => {
             let text = state.composer.text();
@@ -607,6 +620,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             return toggle_screen(state, Screen::Help);
         }
         KeyCode::Tab if file_popup_len > 0 => complete_file_mention(state),
+        KeyCode::Tab if skill_popup_len > 0 => complete_skill_mention(state),
         KeyCode::Tab if popup_len > 0 => complete_slash(state),
         // A visible next-step ghost claims Tab before focus switching: the
         // suggestion becomes real text and nothing is sent. Enter still has to
@@ -871,7 +885,7 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
         state.force_cancel_armed = true;
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "强制取消中…仍卡住按 Ctrl+C 退出，或输入 /quit".to_string(),
+            message: "强制取消中…仍卡住再按 Ctrl+C 退出".to_string(),
         });
         return vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
             session_id: state.session_id.clone(),
@@ -887,7 +901,7 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
     })]
 }
 
-/// Hand the current draft to `$EDITOR` (Ctrl+X Ctrl+E, or `/editor`).
+/// Hand the current draft to `$EDITOR` (Ctrl+X Ctrl+E).
 pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
     // The seed is the REAL buffer. A ghost suggestion is not a draft and must
     // not travel into `$EDITOR`, so it is dropped rather than hidden.

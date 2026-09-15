@@ -217,7 +217,11 @@ fn empty_session_shows_splash_with_logo() {
         text.contains("让模型真正可靠地完成任务"),
         "zh mission missing: {text}"
     );
-    assert!(text.contains("/feature-dev"), "{text}");
+    assert!(text.contains("$feature-dev"), "{text}");
+    assert!(
+        !text.contains("/feature-dev"),
+        "skills are $, not /: {text}"
+    );
     assert!(!text.contains("/plan"), "plan must stay off splash: {text}");
 }
 
@@ -241,7 +245,7 @@ fn splash_render_review_sizes() {
         );
         assert!(!z.contains("Make models reliably complete tasks"), "{z}");
         assert!(!e.contains("让模型真正可靠地完成任务"), "{e}");
-        for cmd in ["/feature-dev", "/model", "/help"] {
+        for cmd in ["$feature-dev", "/model", "/help"] {
             assert!(z.contains(cmd), "zh {w}x{h} {cmd}");
             assert!(e.contains(cmd), "en {w}x{h} {cmd}");
         }

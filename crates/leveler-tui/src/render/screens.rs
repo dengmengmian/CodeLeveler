@@ -54,6 +54,7 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
         ("PageUp/PageDown", t.key_scroll_page),
         ("Ctrl+C", t.key_cancel_quit),
         ("Ctrl+M", t.key_model),
+        ("Ctrl+V", t.key_paste_image),
         ("Ctrl+O", t.key_expand),
         ("Ctrl+?", t.help_title),
         ("Ctrl+D/T/S", t.key_screens),

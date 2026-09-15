@@ -13,8 +13,8 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::transcript::TranscriptItem;
 
-/// First-run commands only. Not a catalog — `/` still lists the rest.
-const TIP_COMMANDS: &[&str] = &["/feature-dev", "/model", "/help"];
+/// First-run entries only. Not a catalog — `/` and `$` still list the rest.
+const TIP_COMMANDS: &[&str] = &["$feature-dev", "/model", "/help"];
 
 const CTA_CARET: &str = "› ";
 const WORDMARK: &str = "CodeLeveler";
@@ -143,7 +143,7 @@ pub(crate) fn splash_lines(
         right.push(Vec::new());
     }
     for name in TIP_COMMANDS {
-        let label = crate::screen::slash_popup_label(name, t);
+        let label = tip_label(name, t);
         let label = truncate_w(label, content_w.saturating_sub(name_col));
         right.push(vec![
             Span::styled(pad_to(name, name_col), sty.cmd),
@@ -321,6 +321,14 @@ impl SplashStyle {
     }
 }
 
+fn tip_label(name: &str, t: &UiText) -> &'static str {
+    if name == "$feature-dev" {
+        t.skill_feature_dev
+    } else {
+        crate::screen::slash_popup_label(name, t)
+    }
+}
+
 fn command_name_col() -> usize {
     TIP_COMMANDS
         .iter()
@@ -336,7 +344,7 @@ fn content_width(t: &UiText, brand_text: &str, name_col: usize, extras: &[&str])
     w = w.max(disp_w(CTA_CARET) + disp_w(t.splash_start_task));
     w = w.max(disp_w(t.splash_more_commands));
     for name in TIP_COMMANDS {
-        let label = crate::screen::slash_popup_label(name, t);
+        let label = tip_label(name, t);
         w = w.max(name_col + disp_w(label));
     }
     for extra in extras {
@@ -448,7 +456,7 @@ fn fallback_stack(
     )));
     out.push(Line::from(cta_spans(t, width, sty)));
     for name in TIP_COMMANDS {
-        let label = crate::screen::slash_popup_label(name, t);
+        let label = tip_label(name, t);
         let label = truncate_w(label, width.saturating_sub(name_col));
         out.push(Line::from(vec![
             Span::styled(pad_to(name, name_col.min(width)), sty.cmd),
@@ -585,7 +593,14 @@ mod tests {
     fn splash_does_not_list_advanced_commands() {
         for locale in [Locale::Zh, Locale::En] {
             let text = paint(&state(locale), 80, 24);
-            for cmd in ["/plan", "/goal", "/skill", "/permission", "/work-mode"] {
+            for cmd in [
+                "/plan",
+                "/goal",
+                "/skill",
+                "/permission",
+                "/work-mode",
+                "/feature-dev",
+            ] {
                 assert!(!text.contains(cmd), "{locale:?} leaked {cmd}: {text}");
             }
         }
@@ -595,7 +610,7 @@ mod tests {
     fn slash_registry_still_has_commands_removed_from_splash() {
         for locale in [Locale::Zh, Locale::En] {
             let listed = crate::screen::slash_commands(locale.text());
-            for cmd in ["/plan", "/goal", "/skill", "/permission", "/work-mode"] {
+            for cmd in ["/goal", "/collab", "/permission", "/work-mode"] {
                 assert!(
                     listed.iter().any(|(n, _)| *n == cmd),
                     "{locale:?} registry lost {cmd}"
@@ -673,7 +688,7 @@ mod tests {
         assert!(wide.contains("    ██████"), "master on wide:\n{wide}");
         let narrow = paint(&state(Locale::Zh), 48, 16);
         assert!(narrow.contains("CodeLeveler"), "{narrow}");
-        assert!(narrow.contains("/feature-dev"), "{narrow}");
+        assert!(narrow.contains("$feature-dev"), "{narrow}");
         assert!(
             !narrow.contains("    ██████"),
             "master leaked into narrow:\n{narrow}"
@@ -687,7 +702,7 @@ mod tests {
         let text = paint(&s, 40, 16);
         assert!(text.contains("CodeLeveler"), "{text}");
         assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(text.contains("/feature-dev"), "{text}");
+        assert!(text.contains("$feature-dev"), "{text}");
         assert!(
             !text.contains("    ██████"),
             "master leaked into 40-col:\n{text}"
@@ -717,10 +732,10 @@ mod tests {
                     let plain = line_plain(line);
                     let w = disp_w(plain.trim_end());
                     assert!(w <= width, "{locale:?} w={width} overflow {w}: {plain:?}");
-                    if let Some(pos) = plain.find("/feature-dev") {
-                        let after = &plain[pos + "/feature-dev".len()..];
+                    if let Some(pos) = plain.find("$feature-dev") {
+                        let after = &plain[pos + "$feature-dev".len()..];
                         let pad = after.chars().take_while(|c| *c == ' ').count();
-                        let start = "/feature-dev".len() + pad;
+                        let start = "$feature-dev".len() + pad;
                         assert!(
                             start >= name_col || after.trim_start().is_empty(),
                             "{locale:?} w={width} desc overlaps name: {plain:?}"
@@ -738,7 +753,7 @@ mod tests {
             for height in [36, 24, 20, 16, 12] {
                 let text = paint(&s, 80, height);
                 assert!(text.contains("CodeLeveler"), "{locale:?} h={height}");
-                assert!(text.contains("/feature-dev"), "{locale:?} h={height}");
+                assert!(text.contains("$feature-dev"), "{locale:?} h={height}");
             }
         }
     }
@@ -830,7 +845,7 @@ mod tests {
         let text = paint(&s, 40, 16);
         assert!(text.contains("CodeLeveler"), "{text}");
         assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(text.contains("/feature-dev"), "{text}");
+        assert!(text.contains("$feature-dev"), "{text}");
     }
 
     fn col_of(line: &str, needle: &str) -> Option<usize> {
@@ -922,8 +937,8 @@ mod tests {
             .unwrap();
             let cta_x = col_of(text.lines().find(|l| l.contains('›')).unwrap(), "›").unwrap();
             let cmd_x = col_of(
-                text.lines().find(|l| l.contains("/feature-dev")).unwrap(),
-                "/feature-dev",
+                text.lines().find(|l| l.contains("$feature-dev")).unwrap(),
+                "$feature-dev",
             )
             .unwrap();
             let more_x = text

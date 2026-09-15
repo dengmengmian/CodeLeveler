@@ -398,16 +398,16 @@ fn tui_slash_popup_lists_renamed_commands() {
     assert!(!names.contains(&"/verify"), "removed: {names:?}");
     assert!(!names.contains(&"/confirm-plan"), "removed: {names:?}");
     assert!(
-        names.contains(&"/plan"),
-        "menu should list collab /plan: {names:?}"
+        !names.contains(&"/plan"),
+        "plan is `/collab plan`, not a second entry: {names:?}"
     );
-    assert!(names.contains(&"/work-mode"), "got {names:?}");
+    assert!(
+        !names.contains(&"/work-mode"),
+        "work-mode is searchable, not on empty /: {names:?}"
+    );
     assert!(names.contains(&"/collab"), "got {names:?}");
     assert!(names.contains(&"/goal"), "got {names:?}");
-    assert!(
-        !names.contains(&"/doctor"),
-        "doctor is searchable, not on empty /: {names:?}"
-    );
+    assert!(names.contains(&"/new"), "got {names:?}");
     assert!(
         !names.contains(&"/fork"),
         "fork is searchable, not on empty /: {names:?}"
@@ -415,7 +415,7 @@ fn tui_slash_popup_lists_renamed_commands() {
 
     let popup_ui = screen(&mut s);
     assert!(
-        popup_ui.contains("/goal") || popup_ui.contains("/plan") || popup_ui.contains("/help"),
+        popup_ui.contains("/goal") || popup_ui.contains("/help"),
         "popup on screen: {popup_ui}"
     );
 }

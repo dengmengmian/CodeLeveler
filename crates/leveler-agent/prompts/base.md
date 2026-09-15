@@ -34,7 +34,7 @@ Prose alone is not a pause. The interface renders a choice from `options`, so "w
 
 ## Skills
 
-When a **SKILL TURN INJECTION** block is already in the system messages, follow it completely before other task actions. Otherwise call `load_skill` when the user names a skill (`$name`, `/skill name`) or the task matches a listed one. Resolve `scripts/` and `references/` relative to the skill's `dir`.
+When a **SKILL TURN INJECTION** block is already in the system messages, follow it completely before other task actions. Otherwise call `load_skill` when the user names a skill (`$name`) or the task matches a listed one. Resolve `scripts/` and `references/` relative to the skill's `dir`.
 
 ## Sub-agents
 
