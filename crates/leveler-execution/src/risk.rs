@@ -113,6 +113,15 @@ impl PermissionProfile {
         !matches!(self, Self::FullAccess)
     }
 
+    /// Whether commands under this profile reach the network without a grant.
+    /// The network half of the profile, beside [`Self::write_scope`]: 请求批准
+    /// runs commands with the network denied by the OS sandbox until the user
+    /// grants it for a call or the session. Approval decides; the sandbox
+    /// enforces.
+    pub fn network_by_default(self) -> bool {
+        !matches!(self, Self::RequestApproval)
+    }
+
     /// The profile as a preset over [`WriteScope`]. Same answer as
     /// [`Self::confines_workspace`], spelled as the boundary itself.
     pub fn write_scope(self, workspace_root: &Path) -> WriteScope {
@@ -207,6 +216,15 @@ impl Default for SharedPermissionProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profile states the network default beside the write boundary:
+    /// request-approval denies until the user grants it; the others allow.
+    #[test]
+    fn each_profile_states_its_network_default() {
+        assert!(!PermissionProfile::RequestApproval.network_by_default());
+        assert!(PermissionProfile::Assisted.network_by_default());
+        assert!(PermissionProfile::FullAccess.network_by_default());
+    }
 
     #[test]
     fn assisted_blocks_destructive_at_registry() {

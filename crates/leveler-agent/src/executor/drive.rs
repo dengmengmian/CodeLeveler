@@ -2152,8 +2152,16 @@ impl AgentHarness for Drive<'_> {
                     )
                     .await?;
                 match &outcome {
-                    // One-shot by construction: this never touches
-                    // `turn_grants`, so the next call starts confined again.
+                    // "仅允许本次" elevates this call only, so the next call
+                    // starts confined again; "本轮对话内允许" keeps the grant
+                    // for the rest of the turn, as the option says.
+                    PermissionRequestOutcome::Granted {
+                        grants,
+                        for_turn: true,
+                        ..
+                    } => {
+                        self.turn_grants = self.turn_grants.merge(*grants);
+                    }
                     PermissionRequestOutcome::Granted { grants, .. } => {
                         call_grants = *grants;
                     }

@@ -39,6 +39,20 @@ pub fn sandbox_write_denied() -> &'static str {
      pre-existing or unrelated.\n"
 }
 
+/// The first line of a command result the sandbox denied the network.
+pub const NETWORK_PERMISSION_REQUIRED: &str = "[network permission required]";
+
+/// A command the sandbox ran with the network denied, which failed reaching
+/// it. Starts with [`NETWORK_PERMISSION_REQUIRED`].
+pub fn network_permission_required() -> &'static str {
+    "[network permission required] This command ran with network access blocked by \
+     the sandbox and failed reaching the network, so it did not contact anything. It \
+     is not a bug in the code. To run it with network, retry THIS EXACT command once \
+     with `escalate` set — `{\"reason\": \"<one sentence>\", \"network\": true}`. The \
+     approval prompt that raises is how the user consents, so do not ask in prose \
+     first; if the user denies it, report that the command needs network access.\n\n"
+}
+
 /// Generic permission/preflight refusal with next action.
 pub fn permission_refused(detail: &str, next: &str) -> String {
     format!("[recoverable] {detail} Next: {next}")

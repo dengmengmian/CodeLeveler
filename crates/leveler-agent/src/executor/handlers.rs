@@ -223,6 +223,7 @@ impl Executor {
             return Ok(PermissionRequestOutcome::Granted {
                 message: permission_grant_message(true, grants),
                 grants,
+                for_turn: false,
             });
         }
         let description = permission_request_description(action, reason, grants, scope);
@@ -260,9 +261,14 @@ impl Executor {
             request,
         };
         match self.ask(&pending, None, None, cancellation).await {
-            super::host::AskOutcome::Allowed(_) => Ok(PermissionRequestOutcome::Granted {
+            super::host::AskOutcome::Allowed(evidence) => Ok(PermissionRequestOutcome::Granted {
                 message: permission_grant_message(true, grants),
                 grants,
+                for_turn: matches!(
+                    evidence,
+                    leveler_execution::AuthorizationEvidence::SessionGrant { .. }
+                        | leveler_execution::AuthorizationEvidence::ApprovedAlways
+                ),
             }),
             super::host::AskOutcome::DeniedByUser => Ok(PermissionRequestOutcome::DeniedByUser {
                 requested: grants,

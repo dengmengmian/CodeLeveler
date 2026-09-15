@@ -215,6 +215,51 @@ fn stopping_a_command_at_the_live_edge_keeps_following() {
     assert!(s.conv.auto_scroll, "a stop must not leave auto-follow");
 }
 
+/// A command the sandbox ran without the network, and that failed reaching
+/// it, reads as a permission the user has not granted — not as a broken
+/// command followed by an unexplained prompt.
+#[test]
+fn a_network_denied_command_reads_as_needing_network_permission() {
+    let mut s = state();
+    start(&mut s, "net");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("net"),
+            ok: false,
+            preview: "[network permission required] This command ran with network access blocked by the sandbox…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host: example.com".into(),
+            duration_ms: 300,
+            applied_diff: None,
+            exit_code: Some(6),
+            stop: None,
+        }),
+    );
+    let rows = plain(&s);
+    assert!(
+        row_with(&s, "⚠ 执行命令 · 需要网络权限").is_some(),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("✗")), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("本次在断网沙箱中运行")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("[network permission required]")),
+        "the model-facing marker never reaches the user: {rows:?}"
+    );
+}
+
+#[test]
+fn the_network_permission_tag_is_the_one_the_runtime_writes() {
+    assert_eq!(
+        crate::activity_stream::NETWORK_PERMISSION_REQUIRED,
+        leveler_tools::recoverable::NETWORK_PERMISSION_REQUIRED
+    );
+}
+
 /// A stop the runtime could not confirm is not a stop, and not a failure.
 #[test]
 fn an_unconfirmed_stop_is_unknown_never_stopped_or_failed() {

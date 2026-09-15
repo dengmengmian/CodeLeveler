@@ -340,11 +340,19 @@ impl TurnContext {
                  command, retry that exact command once with `escalate` set (`network` = true, \
                  plus `filesystem` = `unrestricted` when it also writes outside the \
                  workspace) — the approval prompt it raises is how the user consents, so \
-                 do not ask in prose first. For anything that is not a command \
-                 (`web_fetch`, `web_search`), call the request_permissions tool with \
-                 network=true, saying what you need and why, and wait for the answer. \
-                 Do not retry the same command hoping it works this time.\n",
+                 do not ask in prose first. ",
             );
+            // Under request-approval a network tool asks the user itself; a
+            // `request_permissions` first would ask the same thing twice.
+            rules.push_str(if self.mode == PermissionProfile::RequestApproval {
+                "Network tools that are not commands (`web_fetch`, `web_search`, MCP tools) \
+                 raise their own approval prompt — just call them. "
+            } else {
+                "For anything that is not a command (`web_fetch`, `web_search`), call the \
+                 request_permissions tool with network=true, saying what you need and why, \
+                 and wait for the answer. "
+            });
+            rules.push_str("Do not retry the same command hoping it works this time.\n");
         }
         rules.push_str(
             "- If the user denies an approval, that answer is final: do NOT reach for another \
@@ -818,6 +826,27 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("Prose alone is not a pause"), "{prompt}");
+    }
+
+    /// Under request-approval a network tool asks the user itself. Sending the
+    /// model through `request_permissions` first would put the same consent in
+    /// front of the user twice.
+    #[test]
+    fn request_approval_calls_a_network_tool_directly_and_escalates_commands() {
+        let prompt = PromptBuilder::new()
+            .turn_context(context(PermissionProfile::RequestApproval, false))
+            .build();
+
+        assert!(prompt.contains("NETWORK IS BLOCKED"), "{prompt}");
+        assert!(prompt.contains("escalate"), "{prompt}");
+        assert!(
+            prompt.contains("raise their own approval prompt"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("call the request_permissions tool with network=true"),
+            "{prompt}"
+        );
     }
 
     /// Full access grants no network prompt, so the blocked-network rules must not fire.

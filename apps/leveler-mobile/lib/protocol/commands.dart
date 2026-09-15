@@ -30,7 +30,7 @@ enum ApprovalChoice {
 
   String get label => switch (this) {
         ApprovalChoice.approveOnce => '允许一次',
-        ApprovalChoice.approveSession => '本次会话内允许',
+        ApprovalChoice.approveSession => '本轮对话内允许',
         ApprovalChoice.deny => '拒绝',
       };
 }

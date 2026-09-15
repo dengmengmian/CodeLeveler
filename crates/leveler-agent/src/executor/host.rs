@@ -309,6 +309,17 @@ impl Executor {
     ) -> PolicyResolution {
         let write = ctx.write_scope();
         let network_allowed = !ctx.policy.network_denied();
+        // Denied only because the profile does not reach the network by
+        // default (请求批准), not by the run itself: a user approval of a call
+        // whose need is the network is the grant for that call.
+        let network_by_profile_default =
+            !network_allowed && !ctx.policy.network_explicitly_denied();
+        // The profile denies the network, and this host cannot make a
+        // command honour that (Windows). Such a command is asked first and
+        // runs open once approved — never under a denial nobody enforces.
+        let network_unenforceable = network_by_profile_default
+            && !self.network_enforceable
+            && self.registry.runs_command(&call.name);
         let deny = |reason: String| PolicyResolution::Deny(PolicyDenial { reason });
         let allow = |authorization: AuthorizationEvidence| {
             PolicyResolution::Allow(ResolvedExecutionPolicy {
@@ -339,7 +350,7 @@ impl Executor {
         // than run it under an authority this runtime cannot enforce — the
         // same reasoning that keeps MCP away from a delegated agent, whose
         // claimed write scope it also could not honour.
-        if !network_allowed && call.name.starts_with("mcp__") {
+        if ctx.policy.network_explicitly_denied() && call.name.starts_with("mcp__") {
             return deny(format!(
                 "{} is unavailable while network access is denied for this run: an \
                  MCP server is a separate process outside the sandbox, so the \
@@ -463,25 +474,46 @@ impl Executor {
             leveler_execution::RuleDecision::Deny => {
                 return deny("forbidden by permission rule".to_string());
             }
-            leveler_execution::RuleDecision::Allow => return allow(AuthorizationEvidence::Rule),
+            // A standing rule is the user's consent; where the network cannot
+            // be denied it is also consent to run the command open.
+            leveler_execution::RuleDecision::Allow => {
+                return PolicyResolution::Allow(ResolvedExecutionPolicy {
+                    write,
+                    network_allowed: network_allowed || network_unenforceable,
+                    authorization: AuthorizationEvidence::Rule,
+                });
+            }
             leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
         }
 
-        match self
-            .approval_policy
-            .evaluate(profile, &call.name, risk, command_view)
-        {
+        let requirement =
+            match self
+                .approval_policy
+                .evaluate(profile, &call.name, risk, command_view)
+            {
+                Requirement::Auto if network_unenforceable => Requirement::NeedApproval,
+                requirement => requirement,
+            };
+        match requirement {
             Requirement::Auto => allow(AuthorizationEvidence::Policy { profile }),
             Requirement::Forbidden => deny("forbidden by policy".to_string()),
             Requirement::NeedApproval => {
                 // Only say something the tool name and command do not already
                 // say. "<tool> requested by the model" is filler, and filler in
                 // a decision prompt trains people to stop reading it.
-                let description = if call_needs_host_escape(call) {
-                    format!("{} 会打开工作区之外的应用或文件", call.name)
-                } else {
-                    String::new()
-                };
+                let mut notes = Vec::new();
+                if call_needs_host_escape(call) {
+                    notes.push(format!("{} 会打开工作区之外的应用或文件", call.name));
+                }
+                if network_unenforceable {
+                    notes.push("此平台无法断网：批准后该命令可以联网运行".to_string());
+                }
+                let description = notes.join("；");
+                // Approving a call whose need is the network grants it.
+                let network_allowed = network_allowed
+                    || network_unenforceable
+                    || (network_by_profile_default
+                        && (risk == RiskLevel::Network || call.name.starts_with("mcp__")));
                 PolicyResolution::Ask(Box::new(PendingApproval {
                     request: ApprovalRequest {
                         id: ApprovalId::generate(),
@@ -1776,6 +1808,175 @@ mod authorize_tests {
             !summary.contains("requested by the model"),
             "description is filler: {summary}"
         );
+    }
+
+    // ---- Network authority follows the profile; the sandbox enforces it ----
+
+    /// A tool whose whole job is the network (`web_fetch`-shaped).
+    struct NetworkTool;
+
+    #[async_trait::async_trait]
+    impl leveler_tools::Tool for NetworkTool {
+        fn name(&self) -> &str {
+            "net_probe"
+        }
+        fn description(&self) -> &str {
+            "reaches the network (test-only)"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "additionalProperties": true })
+        }
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Network
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+            Ok(leveler_tools::ToolOutput::ok("ok"))
+        }
+    }
+
+    fn net_executor(
+        dir: &std::path::Path,
+        mode: PermissionProfile,
+        network_enforceable: bool,
+    ) -> Executor {
+        let mut registry = default_registry();
+        registry.register(Arc::new(NetworkTool));
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(registry),
+            ToolContext::new(Workspace::new(dir).unwrap(), mode),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(Arc::new(FixedApprover::new(ApprovalDecision::Deny)))
+        .with_network_enforceable(network_enforceable)
+    }
+
+    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("n"),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    async fn resolve(exec: &Executor, call: &ToolCall) -> leveler_execution::PolicyResolution {
+        exec.resolve_policy(call, &exec.tool_context, &CancellationToken::new())
+            .await
+    }
+
+    /// 请求批准: an ordinary workspace command runs without a prompt, and runs
+    /// with the network denied. A command that needs the network — curl, a
+    /// Python script, a build.rs — is stopped by the sandbox, not guessed from
+    /// its name.
+    #[tokio::test]
+    async fn request_approval_runs_ordinary_commands_without_network() {
+        use leveler_execution::PolicyResolution;
+        let dir = tempfile::tempdir().unwrap();
+        let exec = net_executor(dir.path(), PermissionProfile::RequestApproval, true);
+        for arguments in [
+            serde_json::json!({"program": "cargo", "args": ["test"]}),
+            serde_json::json!({"program": "curl", "args": ["-sI", "https://example.com"]}),
+            serde_json::json!({"program": "python3", "args": ["fetch.py"]}),
+        ] {
+            match resolve(&exec, &call("run_command", arguments.clone())).await {
+                PolicyResolution::Allow(resolved) => {
+                    assert!(!resolved.network_allowed, "{arguments}")
+                }
+                other => panic!("{arguments}: {other:?}"),
+            }
+        }
+    }
+
+    /// 完全访问 and 替我审批 keep reaching the network directly.
+    #[tokio::test]
+    async fn full_access_and_assisted_commands_reach_the_network() {
+        use leveler_execution::PolicyResolution;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [PermissionProfile::FullAccess, PermissionProfile::Assisted] {
+            let exec = net_executor(dir.path(), mode, true);
+            let curl = call(
+                "run_command",
+                serde_json::json!({"program": "curl", "args": ["-sI", "https://example.com"]}),
+            );
+            match resolve(&exec, &curl).await {
+                PolicyResolution::Allow(resolved) => assert!(resolved.network_allowed, "{mode:?}"),
+                other => panic!("{mode:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Approving a tool whose need IS the network grants the network for that
+    /// call — one prompt, not an approval followed by a sandbox refusal.
+    #[tokio::test]
+    async fn approving_a_network_tool_grants_that_call_the_network() {
+        use leveler_execution::PolicyResolution;
+        let dir = tempfile::tempdir().unwrap();
+        let exec = net_executor(dir.path(), PermissionProfile::RequestApproval, true);
+        match resolve(&exec, &call("net_probe", serde_json::json!({}))).await {
+            PolicyResolution::Ask(pending) => assert!(pending.network_allowed),
+            other => panic!("{other:?}"),
+        }
+        // An MCP server is outside the sandbox: under the profile default it
+        // is asked like any network use...
+        match resolve(&exec, &call("mcp__srv__fetch", serde_json::json!({}))).await {
+            PolicyResolution::Ask(pending) => assert!(pending.network_allowed),
+            other => panic!("{other:?}"),
+        }
+        // ...and refused outright when the run itself denies the network.
+        let mut exec = net_executor(dir.path(), PermissionProfile::RequestApproval, true);
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        assert!(matches!(
+            resolve(&exec, &call("mcp__srv__fetch", serde_json::json!({}))).await,
+            PolicyResolution::Deny(_)
+        ));
+    }
+
+    /// A host that cannot deny a command the network (Windows) must not pretend
+    /// to: under 请求批准 every command is put to the user first, the prompt
+    /// says the network cannot be blocked, and an approval lets it run open.
+    #[tokio::test]
+    async fn without_network_enforcement_request_approval_asks_before_every_command() {
+        use leveler_execution::PolicyResolution;
+        let dir = tempfile::tempdir().unwrap();
+        let exec = net_executor(dir.path(), PermissionProfile::RequestApproval, false);
+        match resolve(
+            &exec,
+            &call(
+                "run_command",
+                serde_json::json!({"program": "cargo", "args": ["test"]}),
+            ),
+        )
+        .await
+        {
+            PolicyResolution::Ask(pending) => {
+                assert!(pending.network_allowed);
+                assert!(
+                    pending.request.description.contains("无法断网"),
+                    "{}",
+                    pending.request.description
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Assisted never denied the network, so nothing changes there.
+        let exec = net_executor(dir.path(), PermissionProfile::Assisted, false);
+        assert!(matches!(
+            resolve(
+                &exec,
+                &call(
+                    "run_command",
+                    serde_json::json!({"program": "cargo", "args": ["test"]})
+                ),
+            )
+            .await,
+            PolicyResolution::Allow(_)
+        ));
     }
 
     // ---- PR 5: authorization is decided in one place and frozen per call ----

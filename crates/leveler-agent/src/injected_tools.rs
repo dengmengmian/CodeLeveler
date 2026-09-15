@@ -568,6 +568,10 @@ pub(crate) fn permission_denied_unattended_message() -> String {
 pub(crate) enum PermissionRequestOutcome {
     Granted {
         grants: TurnPermissionGrants,
+        /// The user chose to allow it for the rest of this turn, not just
+        /// what was asked. Only a single-call escalation reads it; a
+        /// `request_permissions` grant already lasts the turn.
+        for_turn: bool,
         message: String,
     },
     DeniedByUser {

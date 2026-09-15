@@ -49,7 +49,7 @@ export function ApprovalCard({
             批准一次<kbd>y</kbd>
           </button>
           <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
-            本会话内批准<kbd>s</kbd>
+            本轮对话内允许<kbd>s</kbd>
           </button>
           {request.always_persists && (
             <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_always')}>

@@ -924,6 +924,11 @@ pub struct Executor {
     approver: Arc<dyn Approver>,
     auto_reviewer: Arc<dyn AutoReviewer>,
     approval_policy: ApprovalPolicy,
+    /// Whether this host's sandbox can deny a command the network
+    /// ([`leveler_execution::SandboxCapabilities::network_deny`]). Where it
+    /// cannot, a profile that denies the network by default asks before every
+    /// command instead of claiming a denial it cannot enforce.
+    network_enforceable: bool,
     clarifier: Arc<dyn Clarifier>,
     /// Sub-agent nesting depth (0 = the top-level agent). Bounds `spawn_agent`
     /// recursion.
@@ -1066,6 +1071,7 @@ impl Executor {
             approver: Arc::new(AutoApprove),
             auto_reviewer: Arc::new(NeedUserReviewer),
             approval_policy: ApprovalPolicy::default(),
+            network_enforceable: leveler_execution::probe_sandbox_capabilities().network_deny,
             clarifier: Arc::new(AutoClarify),
             policy: TurnPolicy::default(),
             steering: None,
@@ -1104,6 +1110,13 @@ impl Executor {
     /// Install permission rules evaluated before profile approval policy.
     pub fn with_permission_rules(mut self, rules: leveler_execution::PermissionRuleSet) -> Self {
         self.permission_rules = std::sync::RwLock::new(rules);
+        self
+    }
+
+    /// Override the probed network-deny capability (tests of the platform
+    /// that cannot enforce it).
+    pub fn with_network_enforceable(mut self, enforceable: bool) -> Self {
+        self.network_enforceable = enforceable;
         self
     }
 
@@ -1430,6 +1443,7 @@ impl Executor {
             approver: self.approver.clone(),
             auto_reviewer: self.auto_reviewer.clone(),
             approval_policy: self.approval_policy,
+            network_enforceable: self.network_enforceable,
             // A sub-agent never blocks the UI for clarifications.
             clarifier: Arc::new(AutoClarify),
             // A sub-agent runs a self-contained task; steering belongs to the

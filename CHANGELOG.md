@@ -18,6 +18,8 @@ All notable changes to CodeLeveler are documented here. The format follows
 - A line count taken from a capped result preview reads as a lower bound ("92+ 行").
 - A child spawned from a declared agent is named `nickname · agent` in the agent tree and the activity lane, matching the roster.
 - `run_command` refusals show the exact call that would run instead of an example that ran a different program.
+- **请求批准 now enforces the network it promised to ask about.** A command ran with the network open and no prompt (`curl https://example.com` reached the host). Commands still run without asking, but inside a network-denied sandbox (macOS seatbelt, Linux bubblewrap); a command that fails reaching the network is reported as needing network permission (TUI: "⚠ 执行命令 · 需要网络权限") and retried with `escalate`, which asks once. `web_fetch`, `web_search` and MCP tools ask once and run with the network when approved. 完全访问 and 替我审批 are unchanged. On Windows, which cannot deny a command the network, 请求批准 asks before every command and says it will run with the network.
+- The approval option "本次会话内允许" was not session-scoped: it lasted the current turn, and on a command's `escalate` only that one call. It is now "本轮对话内允许" (CLI `this [t]urn`) everywhere, and on `escalate` it keeps the granted permission for the rest of the turn.
 
 ## [0.2.0-beta.3] - 2026-09-15
 

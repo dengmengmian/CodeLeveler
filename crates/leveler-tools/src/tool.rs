@@ -89,10 +89,15 @@ pub struct ToolPolicy {
     /// Collaboration-plan / `leveler plan` read-only overlay: only Safe tools.
     /// Orthogonal to the three-tier [`PermissionProfile`].
     pub read_only: bool,
-    /// Deny network access to `run_command` processes (OS sandbox). PRIVATE:
-    /// loosened only through [`Self::grant_network`], so the elevation surface
-    /// stays auditable in one place.
+    /// An explicit run-level network denial (`--deny-network`), on top of the
+    /// profile's own default. PRIVATE: set only through
+    /// [`ToolContext::with_sandbox`].
     deny_network: bool,
+    /// A user-approved network grant (`request_permissions`, a turn approval,
+    /// or one call's `escalate`). PRIVATE: set only through
+    /// [`Self::grant_network`], so the elevation surface stays auditable in
+    /// one place.
+    network_granted: bool,
     /// Turn-scoped grant from `request_permissions`: drop write
     /// confinement for `run_command` / `shell_command`. PRIVATE: granted only
     /// through [`Self::grant_unrestricted_fs`].
@@ -143,12 +148,23 @@ impl ToolPolicy {
         &self.permission_profile
     }
 
-    /// Whether `run_command` children run with network access denied.
+    /// Whether this execution runs with network access denied: the frozen
+    /// policy of an admitted call, else no grant and either an explicit
+    /// denial or a profile that does not reach the network by default. Reads
+    /// the live profile, so a switch lands on the next call.
     pub fn network_denied(&self) -> bool {
         if let Some(resolved) = &self.resolved {
             return !resolved.network_allowed;
         }
-        self.deny_network
+        !self.network_granted && (self.deny_network || !self.mode().network_by_default())
+    }
+
+    /// Whether the run itself denies the network (`--deny-network`), as
+    /// opposed to the profile's default. A process CodeLeveler cannot confine
+    /// (an MCP server) is refused under an explicit denial; under the profile
+    /// default it goes to the user like any other network use.
+    pub fn network_explicitly_denied(&self) -> bool {
+        self.deny_network && !self.network_granted
     }
 
     /// The frozen per-call policy, when this context belongs to an admitted
@@ -185,7 +201,7 @@ impl ToolPolicy {
     /// User-approved network grant (from `request_permissions`). The ONLY way
     /// to clear the network denial after construction.
     pub fn grant_network(&mut self) {
-        self.deny_network = false;
+        self.network_granted = true;
     }
 
     /// User-approved filesystem elevation (from `request_permissions` or a
@@ -260,6 +276,7 @@ impl ToolContext {
                 permission_profile: SharedPermissionProfile::new(mode),
                 read_only: false,
                 deny_network: false,
+                network_granted: false,
                 turn_unrestricted_fs: false,
                 resolved: None,
                 deny_env: Arc::new(Vec::new()),
@@ -535,6 +552,44 @@ mod write_scope_tests {
     fn full_access_is_unrestricted() {
         let (c, _d) = ctx(PermissionProfile::FullAccess);
         assert_eq!(c.write_scope(), WriteScope::Unrestricted);
+    }
+
+    /// The network half of the profile: request-approval runs commands with
+    /// the network denied until a grant; the others allow; an explicit
+    /// `--deny-network` denies under every profile.
+    #[test]
+    fn the_effective_network_follows_the_live_profile_and_grants() {
+        let (c, _d) = ctx(PermissionProfile::RequestApproval);
+        assert!(c.policy.network_denied());
+        assert!(!c.policy.network_explicitly_denied());
+
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        assert!(!c.policy.network_denied());
+        c.policy
+            .permission_profile()
+            .set(PermissionProfile::RequestApproval);
+        assert!(
+            c.policy.network_denied(),
+            "a switch to request-approval denies the next call"
+        );
+
+        let (mut c, _d) = ctx(PermissionProfile::RequestApproval);
+        c.policy.grant_network();
+        assert!(
+            !c.policy.network_denied(),
+            "a grant lifts the profile default"
+        );
+
+        let (c, _d) = ctx(PermissionProfile::FullAccess);
+        let c = c.with_sandbox(true);
+        assert!(c.policy.network_denied());
+        assert!(c.policy.network_explicitly_denied());
+        let mut c = c;
+        c.policy.grant_network();
+        assert!(
+            !c.policy.network_denied(),
+            "a grant lifts an explicit denial too"
+        );
     }
 
     #[test]

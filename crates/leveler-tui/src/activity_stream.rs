@@ -831,6 +831,12 @@ fn command_head(
             format!("{}{}", t.command_done, duration()),
             false,
         ),
+        ToolStatus::Failed if needs_network_permission(call) => (
+            "\u{26a0}",
+            theme.status.warning,
+            t.command_needs_network.to_string(),
+            false,
+        ),
         ToolStatus::Failed => {
             let exit = call
                 .exit_code
@@ -1287,16 +1293,30 @@ fn split_placeholder(template: &str) -> (&str, &str) {
     template.split_once("{}").unwrap_or((template, ""))
 }
 
+/// The runtime's tag on a command that failed reaching the network inside a
+/// network-blocked sandbox (`leveler_tools::recoverable::NETWORK_PERMISSION_REQUIRED`).
+/// It opens a note addressed to the model; the row states it in the user's words.
+pub(crate) const NETWORK_PERMISSION_REQUIRED: &str = "[network permission required]";
+
+fn needs_network_permission(call: &ToolCallBlock) -> bool {
+    is_shell_call(call)
+        && call
+            .preview
+            .as_deref()
+            .is_some_and(|p| p.trim_start().starts_with(NETWORK_PERMISSION_REQUIRED))
+}
+
 /// A finished command's output as its preview carries it, without the
-/// runtime's metadata rows (`exit: N`, stream headers).
+/// runtime's metadata rows (`exit: N`, stream headers) or its note to the model.
 fn preview_body_lines(call: &ToolCallBlock) -> Vec<&str> {
     call.preview
         .as_deref()
         .unwrap_or("")
         .lines()
         .filter(|l| {
-            let metadata =
-                l.starts_with("exit: ") || (l.starts_with("--- ") && l.ends_with(" ---"));
+            let metadata = l.starts_with("exit: ")
+                || (l.starts_with("--- ") && l.ends_with(" ---"))
+                || l.starts_with(NETWORK_PERMISSION_REQUIRED);
             !l.trim().is_empty() && !metadata
         })
         .collect()
@@ -1359,6 +1379,9 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
         if preview.contains("unknown tool") || preview.contains("spawn_agent") {
             return Some(t.unsupported_task_hint.to_string());
         }
+    }
+    if needs_network_permission(call) {
+        return Some(t.command_needs_network_note.to_string());
     }
     let preview = call.preview.as_deref()?.trim();
     if preview.is_empty() {

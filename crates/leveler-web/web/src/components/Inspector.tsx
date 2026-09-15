@@ -319,7 +319,7 @@ function ApprovalActions({ request }: { request: UiApprovalRequest }) {
           允许一次
         </button>
         <button type="button" className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
-          本会话允许
+          本轮对话内允许
         </button>
         <button type="button" className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>
           拒绝

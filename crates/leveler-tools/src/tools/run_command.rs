@@ -520,6 +520,35 @@ mod tests {
         );
     }
 
+    /// Only a failure to reach the network is read as needing the network; a
+    /// failing test, a compile error or a write denial is the command's own.
+    #[test]
+    fn only_network_failures_read_as_needing_the_network() {
+        for reached in [
+            "curl: (6) Could not resolve host: example.com",
+            "curl: (7) Failed to connect to 127.0.0.1 port 80 after 0 ms: Couldn't connect to server",
+            "Error: getaddrinfo ENOTFOUND registry.npmjs.org",
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
+            "urllib.error.URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
+        ] {
+            assert!(
+                crate::tools::command_execution::network_failure_in(reached),
+                "{reached}"
+            );
+        }
+        for own in [
+            "exit: 101\n--- stdout ---\ntest tests::adds ... FAILED\nassertion failed: left == right",
+            "error[E0425]: cannot find value `x` in this scope",
+            "mkdir /Users/x/.config: operation not permitted",
+            "cannot create .git/x: Read-only file system",
+        ] {
+            assert!(
+                !crate::tools::command_execution::network_failure_in(own),
+                "{own}"
+            );
+        }
+    }
+
     #[test]
     fn sandbox_denial_gets_a_hint_only_when_relevant() {
         let denied = "exit: 1\n--- stderr ---\nmkdir /Users/x/.config: operation not permitted\n";
@@ -829,6 +858,177 @@ mod tests {
             "{}",
             tool.description()
         );
+    }
+
+    /// A loopback server that answers one HTTP request and reports whether
+    /// anything ever connected — the proof a command did or did not reach the
+    /// network, independent of what the client printed.
+    #[cfg(unix)]
+    fn one_shot_http_server() -> (u16, std::sync::mpsc::Receiver<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = tx.send(());
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        (port, rx)
+    }
+
+    #[cfg(unix)]
+    fn have(program: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {program}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[cfg(unix)]
+    async fn run_under(
+        mode: leveler_execution::PermissionProfile,
+        grant_network: bool,
+        program: &str,
+        args: Vec<String>,
+    ) -> ToolOutput {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-net-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let mut ctx = ToolContext::new(ws, mode);
+        if grant_network {
+            ctx.policy.grant_network();
+        }
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": program, "args": args, "timeout_seconds": 20}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    /// 请求批准: curl, a Python socket and a Node socket are all stopped by
+    /// the sandbox — nothing connects — and the result says the command needs
+    /// network permission, whatever program asked for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_approval_blocks_every_client_and_names_the_network_permission() {
+        let clients: Vec<(&str, Box<dyn Fn(u16) -> Vec<String>>)> = vec![
+            (
+                "curl",
+                Box::new(|port| {
+                    vec![
+                        "-sS".into(),
+                        "--noproxy".into(),
+                        "*".into(),
+                        format!("http://127.0.0.1:{port}/"),
+                    ]
+                }),
+            ),
+            (
+                "python3",
+                Box::new(|port| {
+                    vec![
+                        "-c".into(),
+                        format!(
+                            "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=3)"
+                        ),
+                    ]
+                }),
+            ),
+            (
+                "node",
+                Box::new(|port| {
+                    vec![
+                        "-e".into(),
+                        format!(
+                            "require('net').connect({port}, '127.0.0.1').on('connect', () => process.exit(0)).on('error', e => {{ console.error(e.message); process.exit(3) }})"
+                        ),
+                    ]
+                }),
+            ),
+        ];
+        for (program, args) in clients {
+            if !have(program) {
+                continue;
+            }
+            let (port, connected) = one_shot_http_server();
+            let out = run_under(
+                leveler_execution::PermissionProfile::RequestApproval,
+                false,
+                program,
+                args(port),
+            )
+            .await;
+            assert!(out.is_error, "{program}: {}", out.content);
+            assert!(
+                connected
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "{program} reached the network: {}",
+                out.content
+            );
+            assert!(
+                out.content
+                    .starts_with(crate::recoverable::NETWORK_PERMISSION_REQUIRED),
+                "{program}: {}",
+                out.content
+            );
+            assert!(out.content.contains("escalate"), "{}", out.content);
+        }
+    }
+
+    /// 完全访问, or 请求批准 once the user granted the network: the same
+    /// client connects.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_access_or_a_network_grant_reaches_the_network() {
+        if !have("curl") {
+            return;
+        }
+        for (mode, grant) in [
+            (leveler_execution::PermissionProfile::FullAccess, false),
+            (leveler_execution::PermissionProfile::RequestApproval, true),
+        ] {
+            let (port, connected) = one_shot_http_server();
+            let out = run_under(
+                mode,
+                grant,
+                "curl",
+                vec![
+                    "-sS".into(),
+                    "--noproxy".into(),
+                    "*".into(),
+                    format!("http://127.0.0.1:{port}/"),
+                ],
+            )
+            .await;
+            assert!(
+                connected
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok(),
+                "{mode:?} grant={grant}: {}",
+                out.content
+            );
+            assert!(!out.is_error, "{mode:?}: {}", out.content);
+            assert!(
+                !out.content
+                    .contains(crate::recoverable::NETWORK_PERMISSION_REQUIRED),
+                "{}",
+                out.content
+            );
+        }
     }
 
     #[tokio::test]

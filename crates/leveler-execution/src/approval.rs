@@ -36,7 +36,7 @@ pub struct ApprovalRequest {
 
 impl ApprovalRequest {
     /// Whether an `ApproveAlways` answer would persist a standing permission
-    /// rule. `false` means the runtime can only honour it for this session
+    /// rule. `false` means the runtime can only honour it for this turn
     /// (consent tools, calls with no safe rule shape), so no prompt may offer it.
     pub fn always_persists(&self) -> bool {
         let paths: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
@@ -50,7 +50,8 @@ impl ApprovalRequest {
 pub enum ApprovalDecision {
     /// Allow this one action.
     ApproveOnce,
-    /// Allow this action and similar ones for the rest of the session.
+    /// Allow this action and similar ones for the rest of the current turn
+    /// (the executor run that asked). The wire name predates that scope.
     ApproveSession,
     /// Allow this action and persist a project permission rule so matching
     /// actions auto-allow in future sessions too (SEC-1). Falls back to

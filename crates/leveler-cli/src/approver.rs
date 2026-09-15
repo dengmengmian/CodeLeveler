@@ -52,9 +52,9 @@ fn choices_prompt(always_persists: bool) -> String {
         String::new()
     };
     format!(
-        "[{}]es once / [{}]ession / {always}[{}]o (default)",
+        "[{}]es once / this [{}]urn / {always}[{}]o (default)",
         style("y").green(),
-        style("s").green(),
+        style("t").green(),
         style("N").red()
     )
 }
@@ -62,8 +62,9 @@ fn choices_prompt(always_persists: bool) -> String {
 fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
     match line.trim().to_lowercase().as_str() {
         "y" | "yes" | "once" => ApprovalDecision::ApproveOnce,
-        // `a` kept as session for muscle memory; prefer `s` in the prompt.
-        "a" | "all" | "s" | "session" => ApprovalDecision::ApproveSession,
+        // Lasts the rest of this turn. `a` and `s` are kept for muscle memory;
+        // the prompt offers `t`.
+        "t" | "turn" | "a" | "all" | "s" | "session" => ApprovalDecision::ApproveSession,
         "w" | "always" | "forever" if always_persists => ApprovalDecision::ApproveAlways,
         _ => ApprovalDecision::Deny,
     }
@@ -83,5 +84,14 @@ mod tests {
         assert_eq!(parse_answer("always", false), ApprovalDecision::Deny);
         assert_eq!(parse_answer("s", false), ApprovalDecision::ApproveSession);
         assert_eq!(parse_answer("y", false), ApprovalDecision::ApproveOnce);
+    }
+
+    /// The runtime keeps that grant for the rest of the turn, not the session.
+    #[test]
+    fn the_wider_approval_names_the_turn_it_lasts_for() {
+        let prompt = console::strip_ansi_codes(&choices_prompt(false)).to_string();
+        assert!(prompt.contains("this [t]urn"), "{prompt}");
+        assert!(!prompt.contains("ession"), "{prompt}");
+        assert_eq!(parse_answer("t", false), ApprovalDecision::ApproveSession);
     }
 }

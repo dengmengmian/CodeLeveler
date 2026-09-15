@@ -7495,6 +7495,94 @@ async fn an_approved_escalation_runs_the_command_in_the_same_round() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// "本轮对话内允许" on a command's network escalation is what it says: the
+/// network stays open for the rest of this turn, so a later command reaches it
+/// without asking. "仅允许本次" opens it for that one command only.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
+    let have_curl = std::process::Command::new("sh")
+        .args(["-c", "command -v curl"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !have_curl || !leveler_execution::probe_sandbox_capabilities().network_deny {
+        return;
+    }
+    for (decision, reaches) in [
+        (ApprovalDecision::ApproveSession, true),
+        (ApprovalDecision::ApproveOnce, false),
+    ] {
+        let dir = escalate_dir(&format!("turn-net-{decision:?}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, connected) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = tx.send(());
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        let tool_context = ToolContext::new(
+            Workspace::new(&dir).unwrap(),
+            PermissionProfile::RequestApproval,
+        );
+        let asks = Arc::new(Mutex::new(0usize));
+        let runtime = Arc::new(MockRuntime::new(vec![
+            assistant_tool_call(
+                "c1",
+                "shell_command",
+                serde_json::json!({
+                    "cmd": "true",
+                    "escalate": {"reason": "fetch dependencies", "network": true}
+                }),
+            ),
+            assistant_tool_call(
+                "c2",
+                "shell_command",
+                serde_json::json!({
+                    "cmd": format!("curl -sS --noproxy '*' http://127.0.0.1:{port}/")
+                }),
+            ),
+            assistant_text("done"),
+        ]));
+        let executor = Executor::new(
+            runtime.clone(),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(Arc::new(CountingApprover {
+            asks: asks.clone(),
+            decision,
+        }));
+
+        executor
+            .run(
+                "fetch",
+                &mut |_| {},
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*asks.lock().unwrap(), 1, "{decision:?}: one prompt");
+        assert_eq!(
+            connected
+                .recv_timeout(std::time::Duration::from_secs(if reaches { 5 } else { 1 }))
+                .is_ok(),
+            reaches,
+            "{decision:?}: {:?}",
+            runtime.requests.lock().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// A denied escalation must stop the command, not run it unelevated.
 #[tokio::test]
 async fn a_denied_escalation_does_not_run_the_command() {

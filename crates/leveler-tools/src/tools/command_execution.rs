@@ -169,7 +169,8 @@ impl CommandExecution {
         let mut request = ProcessRequest::new(program.to_string(), args, cwd);
         let timeout = resolve_timeout(timeout_seconds);
         request.timeout = timeout;
-        request.deny_network = context.policy.network_denied();
+        let network_denied = context.policy.network_denied();
+        request.deny_network = network_denied;
         request.deny_env = context.policy.deny_env.as_ref().clone();
         // OS confinement from the one write boundary (`WriteScope`):
         // - `Workspace`: broad reads on every host, writes limited to
@@ -392,7 +393,13 @@ impl CommandExecution {
             body.push_str(&shown);
             locators.extend(locator);
         }
-        if let Some(hint) = sandbox_denial_hint(sandboxed, output.success(), &body) {
+        // The sandbox denied this call the network and the command failed
+        // reaching it: a permission the user has not granted, not a broken
+        // command. Said first, so every reader (the model, a client row)
+        // meets the cause before the output.
+        if network_denied && !output.success() && network_failure_in(&body) {
+            body.insert_str(0, crate::recoverable::network_permission_required());
+        } else if let Some(hint) = sandbox_denial_hint(sandboxed, output.success(), &body) {
             body.push_str(hint);
         }
         if let Some(note) = snapshot_note {
@@ -462,6 +469,37 @@ pub(super) fn refuse_zero_write_authority(context: &ToolContext) -> Option<ToolO
 pub(super) fn path_allows(allowed: &str, modified: &str) -> bool {
     let allowed = allowed.trim_end_matches('/');
     modified == allowed || modified.starts_with(&format!("{allowed}/"))
+}
+
+/// Whether a failed command's output shows it could not reach the network:
+/// name resolution, connection or socket-permission failures as the common
+/// clients and runtimes report them. Read only for a call the sandbox ran
+/// with the network denied, so it classifies an effect the sandbox caused —
+/// it never decides what a command may do.
+pub(super) fn network_failure_in(body: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "could not resolve host",
+        "couldn't connect to server",
+        "failed to connect to",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "nodename nor servname",
+        "getaddrinfo",
+        "enotfound",
+        "eai_again",
+        "network is unreachable",
+        "enetunreach",
+        "no route to host",
+        "connect eperm",
+        "urlopen error",
+        "sock.connect",
+        "dns error",
+        "error sending request",
+        "failed to download",
+        "unable to access",
+    ];
+    let body = body.to_ascii_lowercase();
+    SIGNATURES.iter().any(|s| body.contains(s))
 }
 
 /// When a workspace-sandboxed command fails with an OS write denial, explain

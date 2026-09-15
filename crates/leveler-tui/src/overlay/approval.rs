@@ -13,7 +13,9 @@ use leveler_client_protocol::{ApprovalDecision, UiApprovalRequest};
 /// cursor (Deny) sits on it.
 const OPTIONS: [(&str, ApprovalDecision); 4] = [
     ("仅允许本次", ApprovalDecision::ApproveOnce),
-    ("本次会话内允许", ApprovalDecision::ApproveSession),
+    // The runtime keeps this grant for the rest of the current turn; there is
+    // no grant that outlives it.
+    ("本轮对话内允许", ApprovalDecision::ApproveSession),
     // Persisted as a project rule: whole tool (apply_patch), a `program [arg]`
     // prefix (simple shell), or the exact command (compound shell). "不再问"
     // is honest for all three; the scope varies by command shape.
@@ -161,7 +163,7 @@ mod tests {
             ..request()
         });
         let labels: Vec<&str> = ov.options().into_iter().map(|(l, _)| l).collect();
-        assert_eq!(labels, vec!["仅允许本次", "本次会话内允许", "拒绝"]);
+        assert_eq!(labels, vec!["仅允许本次", "本轮对话内允许", "拒绝"]);
         assert_eq!(
             ov.options().into_iter().find(|(_, f)| *f).unwrap().0,
             "拒绝"

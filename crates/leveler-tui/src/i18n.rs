@@ -301,6 +301,10 @@ pub struct UiText {
     pub command_unknown: &'static str,
     pub command_stopping: &'static str,
     pub command_stop_unknown: &'static str,
+    /// A command the sandbox ran without the network and that failed reaching
+    /// it: a permission not yet granted, not a broken command.
+    pub command_needs_network: &'static str,
+    pub command_needs_network_note: &'static str,
     /// The clickable stop action on a running command row.
     pub command_stop_action: &'static str,
     /// Expanded output that dropped its head: "前 {} 行未显示".
@@ -881,6 +885,8 @@ static ZH: UiText = UiText {
     command_unknown: "状态未知",
     command_stopping: "正在停止…",
     command_stop_unknown: "停止状态未知",
+    command_needs_network: "需要网络权限",
+    command_needs_network_note: "本次在断网沙箱中运行，未连接任何地址；授权联网后可重试",
     command_stop_action: "停止",
     command_output_hidden: "前 {} 行未显示",
     pending_inputs_title: "待发送 · {}",
@@ -1367,6 +1373,8 @@ static EN: UiText = UiText {
     command_unknown: "status unknown",
     command_stopping: "stopping…",
     command_stop_unknown: "stop status unknown",
+    command_needs_network: "needs network permission",
+    command_needs_network_note: "ran in a network-blocked sandbox and contacted nothing; retry once network is granted",
     command_stop_action: "stop",
     command_output_hidden: "{} earlier lines hidden",
     pending_inputs_title: "Not sent · {}",
