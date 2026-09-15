@@ -1396,6 +1396,133 @@ fn at_file_popup_filters_candidates_and_tab_inserts_the_selected_path() {
 }
 
 #[test]
+fn at_file_popup_enter_completes_then_second_enter_submits_once() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "@src/mai");
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "first Enter only completes: {effects:?}"
+    );
+    assert_eq!(s.composer.text(), "@src/main.rs ");
+
+    // The completed mention is done: the popup closes and the next Enter
+    // submits (composer cleared) instead of re-completing the same path.
+    assert!(
+        leveler_tui::screen::visible_file_popup(&s).is_empty(),
+        "completed mention must close the popup"
+    );
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        s.composer.is_empty(),
+        "second Enter must submit the mention once, got {:?}",
+        s.composer.text()
+    );
+    assert!(
+        s.transcript.items().iter().any(|item| matches!(
+            item,
+            TranscriptItem::User(text) if text.trim() == "@src/main.rs"
+        )),
+        "the submitted mention must land in the transcript exactly once"
+    );
+}
+
+#[test]
+fn at_file_popup_tab_completes_then_second_tab_does_not_reinsert() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "@src/mai");
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.composer.text(), "@src/main.rs ");
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(
+        s.composer.text(),
+        "@src/main.rs ",
+        "a completed mention must not be completed again"
+    );
+}
+
+#[test]
+fn completed_file_mention_hides_the_popup() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "@src/main.rs ");
+
+    assert!(leveler_tui::screen::visible_file_popup(&s).is_empty());
+}
+
+#[test]
+fn finished_file_mention_followed_by_prose_hides_the_popup() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "@src/main.rs some text");
+
+    assert!(
+        leveler_tui::screen::visible_file_popup(&s).is_empty(),
+        "a finished mention followed by prose must not reopen the popup"
+    );
+}
+
+#[test]
+fn multi_mention_targets_only_the_token_before_the_cursor() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+    typed(&mut s, "@src/main.rs @src/li");
+
+    let popup = leveler_tui::screen::visible_file_popup(&s);
+    assert_eq!(popup, vec!["src/lib.rs"]);
+
+    // Only the second, still-active mention is replaced in place.
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.composer.text(), "@src/main.rs @src/lib.rs ");
+}
+
+#[test]
+fn file_mention_popup_is_cursor_aware() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "@src/main.rs some text");
+
+    // Cursor at the end (plain text): no active `@` token.
+    assert!(leveler_tui::screen::visible_file_popup(&s).is_empty());
+
+    // Move the cursor back into an unfinished `@` token and the popup returns.
+    s.composer.replace("@src/mai some text");
+    for _ in 0.." some text".chars().count() {
+        reduce(&mut s, key(KeyCode::Left));
+    }
+    assert_eq!(
+        leveler_tui::screen::visible_file_popup(&s),
+        vec!["src/main.rs"]
+    );
+}
+
+#[test]
+fn at_in_a_shell_escape_is_not_a_file_mention() {
+    let mut s = opened();
+    s.context_files = vec!["src/main.rs".into()];
+    typed(&mut s, "!echo @src/main.rs");
+
+    assert!(
+        leveler_tui::screen::visible_file_popup(&s).is_empty(),
+        "shell `!` owns the `@`, not the file index"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })]
+                if command == "echo @src/main.rs"
+        ),
+        "Enter must run the shell command, not complete a file mention: {effects:?}"
+    );
+}
+
+#[test]
 fn typing_at_requests_the_repository_file_index_once() {
     let mut s = opened();
 

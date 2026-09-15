@@ -462,15 +462,25 @@ pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(String, Strin
     slash_popup(state.composer.text(), state.t())
 }
 
-/// Active `$skill` query immediately before the composer cursor. A trailing
-/// space means the mention is finished (e.g. just completed), not active.
-pub fn skill_mention_query(state: &crate::state::AppState) -> Option<&str> {
+/// The whitespace-delimited token immediately before the composer cursor,
+/// stripped of `prefix`, while that token is still being typed. This is the
+/// single completion-intent truth shared by `$skill` and `@file` mentions:
+/// trailing whitespace means the token is finished (e.g. just completed), so
+/// the cursor is no longer inside a mention and this returns `None`.
+fn active_prefixed_token_before_cursor(
+    state: &crate::state::AppState,
+    prefix: char,
+) -> Option<&str> {
     let before = state.composer.text_before_cursor();
     if before.ends_with(char::is_whitespace) {
         return None;
     }
-    let token = before.split_whitespace().next_back()?;
-    token.strip_prefix('$')
+    before.split_whitespace().next_back()?.strip_prefix(prefix)
+}
+
+/// Active `$skill` query immediately before the composer cursor.
+pub fn skill_mention_query(state: &crate::state::AppState) -> Option<&str> {
+    active_prefixed_token_before_cursor(state, '$')
 }
 
 /// Skills matching the active `$` mention, as `($name, label)` rows. The
@@ -506,17 +516,13 @@ pub fn visible_skill_popup(state: &crate::state::AppState) -> Vec<(String, Strin
 
 /// Active `@file` query immediately before the composer cursor.
 pub fn file_mention_query(state: &crate::state::AppState) -> Option<&str> {
-    let token = state
-        .composer
-        .text_before_cursor()
-        .split_whitespace()
-        .next_back()?;
-    token.strip_prefix('@')
+    active_prefixed_token_before_cursor(state, '@')
 }
 
 /// Filter repository paths for the active `@file` mention.
 pub fn visible_file_popup(state: &crate::state::AppState) -> Vec<&str> {
-    if state.slash_popup_dismissed {
+    // In a `!command` the `@` belongs to the shell (same rule as `$`).
+    if state.slash_popup_dismissed || state.composer.text().starts_with('!') {
         return Vec::new();
     }
     let Some(query) = file_mention_query(state) else {
