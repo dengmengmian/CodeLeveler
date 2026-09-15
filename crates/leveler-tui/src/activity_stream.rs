@@ -633,7 +633,8 @@ fn unit_lines(
     // are real errors: the result row shows the first error line.
     let guard_denial = call.status == ToolStatus::Failed
         && matches!(call.name.as_str(), "update_plan" | "update_goal");
-    let (glyph, glyph_color) = if guard_denial || awaiting_approval {
+    let unanswered = unanswered_question_note(call, t).is_some();
+    let (glyph, glyph_color) = if guard_denial || awaiting_approval || unanswered {
         ("⚠", theme.status.warning)
     } else {
         status_glyph(call, theme)
@@ -1020,6 +1021,25 @@ fn failed_patch_target(preview: Option<&str>) -> Option<String> {
     }
 }
 
+/// What happened to a question the user did not answer, in their words — the
+/// result otherwise carries the runtime's note to the model
+/// (`leveler_agent` `handle_clarification`). `None` for a real answer.
+fn unanswered_question_note<'a>(call: &ToolCallBlock, t: &'a UiText) -> Option<&'a str> {
+    if !is_user_decision_call(call) || call.status != ToolStatus::Ok {
+        return None;
+    }
+    let preview = call.preview.as_deref()?.trim_start();
+    if preview.starts_with("The user did not respond in time") {
+        Some(t.question_timed_out)
+    } else if preview.starts_with("No user is available to answer") {
+        Some(t.question_unattended)
+    } else if preview.starts_with("The user saw this question and chose to skip it") {
+        Some(t.question_skipped)
+    } else {
+        None
+    }
+}
+
 /// Whether this call's result is a decision the USER made rather than output a
 /// tool produced. Read from the taxonomy kind, not a second tool-name table.
 fn is_user_decision_call(call: &ToolCallBlock) -> bool {
@@ -1129,7 +1149,8 @@ fn result_lines_for(
     // count: "· 1 行" over a decision the user was asked to make tells them
     // how long their answer was and not what it said.
     if is_user_decision_call(call) {
-        let answer = call.preview.as_deref().unwrap_or("").trim();
+        let answer = unanswered_question_note(call, t)
+            .unwrap_or_else(|| call.preview.as_deref().unwrap_or("").trim());
         return vec![Line::from(vec![
             Span::styled("  └ ", Style::default().fg(theme.text.secondary)),
             Span::styled(
@@ -2149,6 +2170,39 @@ mod tests {
             text.contains("回退到主组"),
             "the answer stays on the record: {text}"
         );
+    }
+
+    /// A question nobody answered is not an answer: no ✓, and the row says
+    /// what happened in the user's words instead of the note to the model.
+    #[test]
+    fn an_unanswered_clarification_says_so() {
+        for (preview, note) in [
+            (
+                "The user did not respond in time — this is NOT a user reply. Continue only if the task can proceed without the answer; otherwise state explicitly what is missing.",
+                "未回复（已超时）",
+            ),
+            (
+                "No user is available to answer in this unattended run — this is NOT a user reply.",
+                "无人回答（非交互运行）",
+            ),
+            (
+                "The user saw this question and chose to skip it; proceed using your best judgment.",
+                "已跳过",
+            ),
+        ] {
+            let mut c = call(
+                "request_user_input",
+                r#"{"question":"置顶公告数量是否设上限？","options":["无上限","3 条"]}"#,
+                ToolStatus::Ok,
+            );
+            c.preview = Some(preview.into());
+            let text = render_group_text(&group(vec![c]), 120, Locale::Zh).join("\n");
+            assert!(!text.contains('\u{2713}'), "{text}");
+            assert!(text.contains('\u{26a0}'), "{text}");
+            assert!(text.contains(note), "{text}");
+            assert!(!text.contains("NOT a user reply"), "{text}");
+            assert!(!text.contains("chose to skip"), "{text}");
+        }
     }
 
     /// R11: a tool the taxonomy has never heard of is not silently demoted to

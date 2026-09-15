@@ -142,6 +142,8 @@ impl Executor {
         // Only `Answered` speaks for the user. Everything else must be
         // reported as the absence of a user, so the model cannot mistake an
         // unattended run or a timeout for "the user said nothing is needed".
+        // The TUI recognizes these notes by their opening words to show the
+        // user what happened (`unanswered_question_note`); keep them.
         Ok(match outcome {
             crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => text,
             crate::executor::ClarifyOutcome::Answered(_) | crate::executor::ClarifyOutcome::Skipped => {
