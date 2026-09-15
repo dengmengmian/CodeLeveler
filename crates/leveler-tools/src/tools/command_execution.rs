@@ -494,6 +494,9 @@ pub(super) fn network_failure_in(body: &str) -> bool {
         // Go: `proxyconnect tcp: dial tcp …`, `dial tcp: lookup host: no such host`.
         "dial tcp",
         "no such host",
+        // A local listener, which the macOS sandbox denies with the network.
+        "bind: operation not permitted",
+        "listen eperm",
         "urlopen error",
         "sock.connect",
         "dns error",
