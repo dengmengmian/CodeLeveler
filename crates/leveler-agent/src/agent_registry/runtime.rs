@@ -120,8 +120,7 @@ impl AgentRegistry {
             );
             if out.len() + line.len() + reserve > MAX_CATALOG_BYTES {
                 out.push_str(&format!(
-                    "- … and {} more agents not listed. spawn_agent with an agent name \
-                     that does not exist answers with every available name.\n",
+                    "- … and {} more agents not listed; list_agents shows every one.\n",
                     defs.len() - i
                 ));
                 break;

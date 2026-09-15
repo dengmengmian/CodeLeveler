@@ -950,4 +950,8 @@ async fn a_large_registry_does_not_flood_the_parent_context() {
     let catalog = &parent[start..end];
     assert!(catalog.len() <= 4096, "catalog is {} bytes", catalog.len());
     assert!(catalog.contains("more"), "{catalog}");
+    assert!(
+        catalog.contains("list_agents"),
+        "the overflow says how to see the rest: {catalog}"
+    );
 }

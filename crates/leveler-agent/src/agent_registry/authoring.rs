@@ -44,8 +44,10 @@ const PREVIEW_INSTRUCTIONS_CHARS: usize = 1200;
 fn roots_for(context: &ToolContext) -> AgentRoots {
     AgentRoots {
         project_root: Some(context.execution.workspace.root().to_path_buf()),
-        user_agents_dir: leveler_core::leveler_home_dir(&context.execution.environment)
-            .map(|root| leveler_core::LevelerHome::from_root(root).agents_dir()),
+        user_agents_dir: leveler_core::leveler_home_dir_from(|k| {
+            context.execution.environment.var_os(k)
+        })
+        .map(|root| leveler_core::LevelerHome::from_root(root).agents_dir()),
     }
 }
 
