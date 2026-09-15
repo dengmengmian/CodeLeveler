@@ -365,12 +365,15 @@ pub(crate) fn mode_from_str(s: &str) -> Option<PermissionProfile> {
     PermissionProfile::parse(s)
 }
 
+/// Coding's recovery facts for reaped sessions: an interrupted goal
+/// checkpoint under each recovery token, which then ends. The checkpoint is
+/// cut before the release so it cannot absorb the next execution.
 pub(crate) async fn checkpoint_reaped_sessions(
     engine: &leveler_engine::TaskEngine,
-    reaped: &[leveler_engine::ReapedSession],
+    reaped_sessions: &[leveler_engine::ReapedSession],
 ) {
     let stores = &engine.stores;
-    for reaped in reaped {
+    for reaped in reaped_sessions {
         match leveler_agent::coding::create_goal_checkpoint(
             engine,
             &reaped.session_id,
@@ -403,6 +406,7 @@ pub(crate) async fn checkpoint_reaped_sessions(
             ),
         }
     }
+    leveler_engine::release_reaped(engine, reaped_sessions).await;
 }
 
 impl Application {
@@ -761,14 +765,18 @@ impl Application {
         // Canonical recovery write ⇒ ownership-fenced. The TaskEngine is the
         // single authority that resolves legacy task rows, refuses a foreign
         // owner, and advances the fencing epoch.
-        let token = self
-            .task_engine(&db)?
+        let engine = self.task_engine(&db)?;
+        let token = engine
             .acquire_ownership(session_id)
             .await
             .map_err(app_error_from_engine)?;
-        leveler_engine::acknowledge_crash_window(&db, &token, session_id)
+        let closed = leveler_engine::acknowledge_crash_window(&db, &token, session_id).await;
+        // Acknowledging starts no execution: whatever runs next acquires anew.
+        engine
+            .release_ownership(&token)
             .await
-            .map_err(app_error_from_engine)
+            .map_err(app_error_from_engine)?;
+        closed.map_err(app_error_from_engine)
     }
 
     /// (work_profile / collaboration). Application in-memory defaults are not

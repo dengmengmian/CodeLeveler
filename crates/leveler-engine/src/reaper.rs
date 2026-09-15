@@ -115,7 +115,9 @@ pub struct ReapConflict {
 }
 
 /// A session whose orphan turns were durably reaped under this ownership
-/// token. A harness may use the boundary to persist its own recovery facts.
+/// token. A harness may use the boundary to persist its own recovery facts;
+/// the recovery ends when it passes the session to [`release_reaped`], and the
+/// token must not be kept past that — recovery starts no execution.
 #[derive(Debug, Clone)]
 pub struct ReapedSession {
     pub session_id: SessionId,
@@ -181,7 +183,19 @@ pub async fn reap_after_restart(
     for (session, turns) in candidates {
         let refusal = match engine.acquire_ownership(&session).await {
             Ok(token) => {
-                reap_session(engine, &session, &token, &turns, &mut outcome).await?;
+                if let Err(error) =
+                    reap_session(engine, &session, &token, &turns, &mut outcome).await
+                {
+                    release_reaped(
+                        engine,
+                        &[ReapedSession {
+                            session_id: session,
+                            token,
+                        }],
+                    )
+                    .await;
+                    return Err(error);
+                }
                 continue;
             }
             Err(EngineError::OwnedByLiveBoot { .. }) => ReapRefusal::LiveBoot,
@@ -226,4 +240,21 @@ async fn reap_session(
     });
     outcome.events.extend(events);
     Ok(())
+}
+
+/// End the recovery generations of `reaped`, once the harness has written
+/// whatever recovery facts it keeps under them. Recovery is finite work: the
+/// recovering boot keeps running, and the next execution — from any boot —
+/// acquires anew. A release that fails leaves the session to this boot until
+/// it exits; that is reported, not hidden.
+pub async fn release_reaped(engine: &TaskEngine, reaped: &[ReapedSession]) {
+    for reaped in reaped {
+        if let Err(error) = engine.release_ownership(&reaped.token).await {
+            tracing::warn!(
+                %error,
+                session = %reaped.session_id,
+                "recovery could not release the session it settled"
+            );
+        }
+    }
 }

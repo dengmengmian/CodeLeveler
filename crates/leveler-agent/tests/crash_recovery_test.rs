@@ -667,6 +667,48 @@ async fn acknowledged_crash_window_unblocks_resume() {
         .expect("resume must proceed after explicit acknowledgement");
 }
 
+/// Acknowledging is finite recovery, not an execution: once the markers are
+/// written the session is unowned at the acknowledgement's generation, and a
+/// live sibling boot runs next without waiting for this boot to exit.
+#[tokio::test]
+async fn acknowledging_the_crash_window_leaves_the_session_unowned() {
+    let (engine, db, _dir) = harness(Arc::new(AutoApprove), vec![]).await;
+    let spec = direct_spec(_dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
+
+    assert_eq!(engine.acknowledge_crash_window(&session).await.unwrap(), 1);
+    let stores = &engine.engine.stores;
+    let task = stores
+        .tasks
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stores.ownership.current(&task).await.unwrap().unwrap(),
+        leveler_storage::TaskOwner {
+            runtime: None,
+            boot: None,
+            epoch: leveler_core::OwnerEpoch::new(2),
+        }
+    );
+
+    let boots = Arc::new(leveler_test_support::TestBoots::new());
+    boots.set(&engine.engine.boot.id, leveler_core::BootLiveness::Alive);
+    let sibling = TaskEngine {
+        stores: stores.clone(),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: boots,
+        },
+    };
+    let next = sibling.acquire_ownership(&session).await.unwrap();
+    assert_eq!(next.owner_epoch.get(), 3);
+}
+
 // ── phase 3: the interactive chat path reconciles the crash window too ───────
 
 /// Reopening a crashed session in the TUI/Web continues via `chat`, not

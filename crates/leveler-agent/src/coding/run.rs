@@ -1312,12 +1312,15 @@ impl CodingRuntime {
         session_id: &SessionId,
     ) -> Result<usize, EngineError> {
         let token = self.engine.acquire_ownership(session_id).await?;
-        leveler_engine::acknowledge_crash_window(
+        let closed = leveler_engine::acknowledge_crash_window(
             self.engine.stores.events.as_ref(),
             &token,
             session_id,
         )
-        .await
+        .await;
+        // Acknowledging starts no execution: whatever runs next acquires anew.
+        self.engine.release_ownership(&token).await?;
+        closed
     }
 
     /// Reconcile the crash window on resume: for every tool call that started

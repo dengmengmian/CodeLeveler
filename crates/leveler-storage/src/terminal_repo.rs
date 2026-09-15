@@ -286,18 +286,10 @@ impl TerminalRepository<'_> {
         // The task terminal ends the execution, and with it the ownership it
         // ran under. The generation stays, so this token can never write
         // again and the next acquisition moves past it.
-        let released = sqlx::query(
-            "UPDATE tasks SET owner_runtime_id = NULL, owner_boot_id = NULL \
-             WHERE id = ?1 AND owner_runtime_id = ?2 AND owner_epoch = ?3",
-        )
-        .bind(token.task_id.as_str())
-        .bind(token.runtime_id.as_str())
-        .bind(token.owner_epoch.get() as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(StorageError::from)
-        .map_err(crate::OwnershipError::Storage)?;
-        if released.rows_affected() != 1 {
+        if !crate::ownership_store::release_owner(&mut tx, token)
+            .await
+            .map_err(crate::OwnershipError::Storage)?
+        {
             let _ = tx.rollback().await;
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }

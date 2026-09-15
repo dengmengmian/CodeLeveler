@@ -570,6 +570,11 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped()
         "the killed daemon's turn is reaped"
     );
     assert_eq!(reaped.owner_boot_id, daemon_turn.owner_boot_id);
+    // Recovery is finite: the restarted daemon stays up and leaves the
+    // session it settled unowned, one generation on.
+    let recovered = task_owner(&db, &daemon_session).await;
+    assert_eq!((recovered.runtime, recovered.boot), (None, None));
+    assert_eq!(recovered.epoch, daemon_owner.epoch.next().unwrap());
     let running = running_turns(&db).await;
     assert!(
         running.iter().any(|turn| turn.id == sibling_turn.id),
@@ -579,6 +584,95 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped()
 
     let _ = sibling.kill();
     let _ = sibling.wait();
+    stop_daemon(&mut daemon);
+}
+
+/// Real processes, one repository: a daemon runs a user shell while this test
+/// process is another boot on the same state, probing liveness through the
+/// real boot leases. While the shell runs the session is the daemon's; once it
+/// exits the daemon stays up and the session passes to the other boot.
+#[tokio::test]
+async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready = env.home.join("ready-shell.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "shell work".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::RunUserShell {
+            session_id: session.clone(),
+            command: "sleep 5".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let state_dir = find_state_dir(&env);
+    let db = leveler_storage::Database::connect(&state_dir.join("sessions.db"))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let held = loop {
+        let owner = task_owner(&db, &session).await;
+        if owner.boot.is_some() {
+            break owner;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's shell never took the session"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let sibling = leveler_engine::TaskEngine {
+        stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: held.runtime.clone().unwrap(),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_app::runtime_boot::StateDirBootLiveness::new(
+                &state_dir,
+            )),
+        },
+    };
+
+    let refused = sibling.acquire_ownership(&session).await;
+    assert!(
+        matches!(
+            refused,
+            Err(leveler_engine::EngineError::OwnedByLiveBoot { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(task_owner(&db, &session).await, held);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while task_owner(&db, &session).await.boot.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the finished shell kept the session"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(daemon.try_wait().unwrap().is_none(), "the daemon stays up");
+    let next = sibling
+        .acquire_ownership(&session)
+        .await
+        .expect("another boot takes the session while the daemon stays up");
+    assert_eq!(next.owner_epoch, held.epoch.next().unwrap());
+
+    drop(client);
     stop_daemon(&mut daemon);
 }
 

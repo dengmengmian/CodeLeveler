@@ -452,3 +452,135 @@ async fn a_late_terminal_does_not_release_the_next_execution() {
     ));
     assert_eq!(world.statuses(&session).await, ["completed", "running"]);
 }
+
+/// An ownership store that lets a rival acquire the task at the expected
+/// generation just before the caller's own compare-and-swap — the loser's
+/// side of a genuine race, made deterministic.
+struct RivalFirst {
+    inner: Arc<dyn leveler_storage::OwnershipStore>,
+    rival: std::sync::Mutex<Option<(BootId, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl leveler_storage::OwnershipStore for RivalFirst {
+    async fn current(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskOwner>, leveler_storage::StorageError> {
+        self.inner.current(task_id).await
+    }
+
+    async fn acquire(
+        &self,
+        task_id: &TaskId,
+        runtime: &RuntimeId,
+        boot: &BootId,
+        expected: OwnerEpoch,
+    ) -> Result<leveler_core::OwnershipToken, leveler_storage::OwnershipError> {
+        let rival = self.rival.lock().unwrap().take();
+        if let Some((rival, then_release)) = rival {
+            let won = self
+                .inner
+                .acquire(task_id, runtime, &rival, expected)
+                .await
+                .unwrap();
+            if then_release {
+                self.inner.release(&won).await.unwrap();
+            }
+        }
+        self.inner.acquire(task_id, runtime, boot, expected).await
+    }
+
+    async fn release(
+        &self,
+        token: &leveler_core::OwnershipToken,
+    ) -> Result<(), leveler_storage::OwnershipError> {
+        self.inner.release(token).await
+    }
+}
+
+impl World {
+    /// `boot`'s engine, whose next acquire loses the race to `rival`.
+    fn losing_to(&self, boot: &str, rival: &str, then_release: bool) -> TaskEngine {
+        let mut engine = self.boot(boot);
+        engine.stores.ownership = Arc::new(RivalFirst {
+            inner: engine.stores.ownership.clone(),
+            rival: std::sync::Mutex::new(Some((BootId::new(rival), then_release))),
+        });
+        engine
+    }
+}
+
+/// C1/C2: losing the compare-and-swap is not a storage fault. The loser reads
+/// who won and hears the same typed refusal it would have heard a moment
+/// later; only the winner's generation moved.
+#[tokio::test]
+async fn the_loser_of_an_acquire_race_hears_who_won() {
+    let world = World::new().await;
+    let session = world.session().await;
+    world.set("b1", BootLiveness::Alive);
+    world.set("b2", BootLiveness::Alive);
+    world.set("b3", BootLiveness::Unknown);
+    let idle = world.finished_execution("b1", &session).await;
+
+    let lost = world
+        .losing_to("b2", "b1", false)
+        .acquire_ownership(&session)
+        .await;
+    assert!(
+        matches!(lost, Err(EngineError::OwnedByLiveBoot { .. })),
+        "{lost:?}"
+    );
+    let won = world.owner(&session).await;
+    assert_eq!(won.boot, Some(BootId::new("b1")));
+    assert_eq!(won.epoch, idle.owner_epoch.next().unwrap());
+
+    let session = world.session().await;
+    let lost = world
+        .losing_to("b2", "b3", false)
+        .acquire_ownership(&session)
+        .await;
+    assert!(
+        matches!(lost, Err(EngineError::OwnershipUnknown { .. })),
+        "{lost:?}"
+    );
+}
+
+/// §26/§29: a lost race that no refusal describes stays what it is. The
+/// same boot racing itself, or a winner that already let go, is a stale
+/// generation — never "another CodeLeveler process".
+#[tokio::test]
+async fn a_lost_race_nobody_holds_stays_stale() {
+    let world = World::new().await;
+    world.set("b1", BootLiveness::Alive);
+
+    let session = world.session().await;
+    let lost = world
+        .losing_to("b1", "b1", false)
+        .acquire_ownership(&session)
+        .await;
+    assert!(
+        matches!(
+            lost,
+            Err(EngineError::Ownership(
+                leveler_storage::OwnershipError::Stale { .. }
+            ))
+        ),
+        "{lost:?}"
+    );
+
+    let session = world.session().await;
+    let lost = world
+        .losing_to("b2", "b1", true)
+        .acquire_ownership(&session)
+        .await;
+    assert!(
+        matches!(
+            lost,
+            Err(EngineError::Ownership(
+                leveler_storage::OwnershipError::Stale { .. }
+            ))
+        ),
+        "{lost:?}"
+    );
+}

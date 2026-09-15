@@ -87,6 +87,12 @@ pub trait OwnershipStore: Send + Sync {
         boot: &BootId,
         expected_epoch: OwnerEpoch,
     ) -> Result<OwnershipToken, OwnershipError>;
+
+    /// Fenced release: if `token`'s runtime, boot and epoch are still the
+    /// task's current owner, atomically leave the task unowned at that epoch.
+    /// Anything else — a later generation, an earlier release — is
+    /// [`OwnershipError::Stale`] and changes nothing.
+    async fn release(&self, token: &OwnershipToken) -> Result<(), OwnershipError>;
 }
 
 /// The production SQLite adapter over the `tasks` ownership columns
@@ -152,6 +158,36 @@ impl OwnershipStore for Database {
             }),
         }
     }
+
+    async fn release(&self, token: &OwnershipToken) -> Result<(), OwnershipError> {
+        let mut conn = self.pool().acquire().await.map_err(StorageError::from)?;
+        if release_owner(&mut conn, token).await? {
+            return Ok(());
+        }
+        drop(conn);
+        Err(sqlite_stale_error(self, token).await)
+    }
+}
+
+/// The one fenced ownership release write, shared by [`OwnershipStore::release`]
+/// and the task terminal transaction: the task becomes unowned only while
+/// `token`'s runtime, boot and epoch are its current owner, and the epoch is
+/// kept. Returns whether it released.
+pub(crate) async fn release_owner(
+    conn: &mut sqlx::SqliteConnection,
+    token: &OwnershipToken,
+) -> Result<bool, StorageError> {
+    let released = sqlx::query(
+        "UPDATE tasks SET owner_runtime_id = NULL, owner_boot_id = NULL \
+         WHERE id = ?1 AND owner_runtime_id = ?2 AND owner_boot_id = ?3 AND owner_epoch = ?4",
+    )
+    .bind(token.task_id.as_str())
+    .bind(token.runtime_id.as_str())
+    .bind(token.boot_id.as_str())
+    .bind(token.owner_epoch.get() as i64)
+    .execute(conn)
+    .await?;
+    Ok(released.rows_affected() == 1)
 }
 
 type MemoryOwner = (Option<String>, Option<String>, u64);
@@ -235,13 +271,25 @@ impl MemoryOwnershipState {
             return Err(Self::stale_locked(&owners, token));
         }
         let commit = commit()?;
-        if commit.inserted {
-            owners.insert(
-                token.task_id.as_str().to_string(),
-                (None, None, token.owner_epoch.get()),
-            );
+        if commit.inserted && !Self::release_locked(&mut owners, token) {
+            return Err(Self::stale_locked(&owners, token));
         }
         Ok(commit)
+    }
+
+    /// The memory twin of [`release_owner`]: unowned at the same epoch, only
+    /// while `token`'s runtime, boot and epoch are current.
+    fn release_locked(owners: &mut HashMap<String, MemoryOwner>, token: &OwnershipToken) -> bool {
+        let Some(entry) = owners.get_mut(token.task_id.as_str()) else {
+            return false;
+        };
+        let current = entry.0.as_deref() == Some(token.runtime_id.as_str())
+            && entry.1.as_deref() == Some(token.boot_id.as_str())
+            && entry.2 == token.owner_epoch.get();
+        if current {
+            *entry = (None, None, entry.2);
+        }
+        current
     }
 
     fn stale_locked(
@@ -344,6 +392,14 @@ impl OwnershipStore for MemoryOwnershipStore {
             owner_epoch: next,
         })
     }
+
+    async fn release(&self, token: &OwnershipToken) -> Result<(), OwnershipError> {
+        let mut owners = self.state.owners.lock().unwrap();
+        if MemoryOwnershipState::release_locked(&mut owners, token) {
+            return Ok(());
+        }
+        Err(MemoryOwnershipState::stale_locked(&owners, token))
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +484,45 @@ mod tests {
                 epoch: t3.owner_epoch
             },
             "runtime, boot and epoch change together"
+        );
+
+        // Scenario R: only the current generation releases, once, keeping its
+        // epoch; a stale or forged release changes nothing.
+        let stale = |result: Result<(), OwnershipError>| {
+            assert!(
+                matches!(result, Err(OwnershipError::Stale { .. })),
+                "{result:?}"
+            )
+        };
+        stale(store.release(&t2).await);
+        let forged = OwnershipToken {
+            boot_id: boot_1.clone(),
+            ..t3.clone()
+        };
+        stale(store.release(&forged).await);
+        assert_eq!(
+            store.current(task).await.unwrap().unwrap().boot,
+            Some(boot_2.clone())
+        );
+        store.release(&t3).await.unwrap();
+        let unowned = TaskOwner {
+            runtime: None,
+            boot: None,
+            epoch: t3.owner_epoch,
+        };
+        assert_eq!(store.current(task).await.unwrap().unwrap(), unowned);
+        stale(store.release(&t3).await);
+        assert_eq!(store.current(task).await.unwrap().unwrap(), unowned);
+        let t4 = store
+            .acquire(task, &a, &boot_1, t3.owner_epoch)
+            .await
+            .unwrap();
+        assert_eq!(t4.owner_epoch.get(), 4);
+        stale(store.release(&t3).await);
+        assert_eq!(
+            store.current(task).await.unwrap().unwrap().boot,
+            Some(boot_1.clone()),
+            "a late release never clears the next generation"
         );
 
         // Epoch exhaustion fails loudly, never wraps.

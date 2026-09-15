@@ -360,16 +360,6 @@ impl TaskEngine {
             .current(&task_id)
             .await?
             .ok_or_else(|| EngineError::Config(format!("no task row for session {session_id}")))?;
-        if let Some(owner) = &current.runtime
-            && owner != &self.runtime_id
-        {
-            return Err(EngineError::OwnershipConflict {
-                task_id,
-                owner: owner.clone(),
-                epoch: current.epoch,
-                this_runtime: self.runtime_id.clone(),
-            });
-        }
         // A turn left running before boots were recorded has no boot whose
         // death could be proven; whoever runs it may still be running it.
         if self
@@ -382,26 +372,82 @@ impl TaskEngine {
         {
             return Err(EngineError::OwnershipUnknown { task_id });
         }
-        if let Some(owner) = &current.boot
-            && owner != &self.boot.id
-        {
-            match self.boot.liveness.liveness(owner) {
-                // An ended boot never comes back, so this cannot turn stale
-                // before the compare-and-swap below.
-                leveler_core::BootLiveness::Dead => {}
-                leveler_core::BootLiveness::Alive => {
-                    return Err(EngineError::OwnedByLiveBoot { task_id });
-                }
-                leveler_core::BootLiveness::Unknown => {
-                    return Err(EngineError::OwnershipUnknown { task_id });
-                }
-            }
+        if let Some(refusal) = self.owner_refusal(&task_id, &current) {
+            return Err(refusal);
         }
-        Ok(self
+        match self
             .stores
             .ownership
             .acquire(&task_id, &self.runtime_id, &self.boot.id, current.epoch)
-            .await?)
+            .await
+        {
+            Ok(token) => Ok(token),
+            // Losing the compare-and-swap means someone acquired first. Say
+            // who, by the same rules; a change no refusal describes — this
+            // boot racing itself, a winner already gone — stays stale.
+            Err(error @ leveler_storage::OwnershipError::Stale { .. }) => {
+                let winner = self.stores.ownership.current(&task_id).await?;
+                Err(winner
+                    .and_then(|winner| self.owner_refusal(&task_id, &winner))
+                    .unwrap_or(EngineError::Ownership(error)))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Why this boot may not take a task from `owner`, if it may not: another
+    /// runtime holds it, or another boot that is alive or cannot be probed.
+    fn owner_refusal(
+        &self,
+        task_id: &leveler_core::TaskId,
+        owner: &leveler_storage::TaskOwner,
+    ) -> Option<EngineError> {
+        if let Some(runtime) = &owner.runtime
+            && runtime != &self.runtime_id
+        {
+            return Some(EngineError::OwnershipConflict {
+                task_id: task_id.clone(),
+                owner: runtime.clone(),
+                epoch: owner.epoch,
+                this_runtime: self.runtime_id.clone(),
+            });
+        }
+        let boot = owner.boot.as_ref().filter(|boot| *boot != &self.boot.id)?;
+        match self.boot.liveness.liveness(boot) {
+            // An ended boot never comes back, so this cannot turn stale
+            // before the compare-and-swap.
+            leveler_core::BootLiveness::Dead => None,
+            leveler_core::BootLiveness::Alive => Some(EngineError::OwnedByLiveBoot {
+                task_id: task_id.clone(),
+            }),
+            leveler_core::BootLiveness::Unknown => Some(EngineError::OwnershipUnknown {
+                task_id: task_id.clone(),
+            }),
+        }
+    }
+
+    /// End an ownership generation whose work is over, when no task terminal
+    /// commit carries the release. Fenced and idempotent: a generation that is
+    /// no longer current — released already, or followed by a later one — has
+    /// nothing left to release, and a later generation is never touched. Only
+    /// a storage failure is an error.
+    pub async fn release_ownership(
+        &self,
+        token: &leveler_core::OwnershipToken,
+    ) -> Result<(), EngineError> {
+        match self.stores.ownership.release(token).await {
+            Ok(()) => Ok(()),
+            Err(leveler_storage::OwnershipError::Stale { actual_epoch, .. }) => {
+                tracing::debug!(
+                    task = %token.task_id,
+                    released = %token.owner_epoch,
+                    current = %actual_epoch,
+                    "ownership generation already ended"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Mark the session running before the first turn (fenced), acquiring

@@ -962,7 +962,8 @@ impl InProcessRuntimeClient {
                         return;
                     }
                 };
-                let log = leveler_engine::EventLog::new_owned(&db, session_id.clone(), token);
+                let log =
+                    leveler_engine::EventLog::new_owned(&db, session_id.clone(), token.clone());
                 let mut forward = |event: leveler_engine::EngineEvent| bridge.forward(event);
                 let _ = log
                     .append(
@@ -1035,6 +1036,24 @@ impl InProcessRuntimeClient {
                         &mut forward,
                     )
                     .await;
+                // The shell has exited and its terminal fact is written: the
+                // session is nobody's until the next execution acquires it. A
+                // crash before this line leaves the task to a dead boot, which
+                // the next acquire takes over.
+                let released = async {
+                    app.task_engine(&db)?
+                        .release_ownership(&token)
+                        .await
+                        .map_err(crate::session::app_error_from_engine)
+                }
+                .await;
+                if let Err(error) = released {
+                    tracing::warn!(
+                        %error,
+                        session = session_id.as_str(),
+                        "user shell could not release the session"
+                    );
+                }
             });
         });
         Ok(())

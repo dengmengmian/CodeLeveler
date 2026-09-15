@@ -983,12 +983,11 @@ pub(crate) async fn cmd_serve(
     // The socket lock proves no other daemon is live — not that no TUI or
     // `leveler run` is — so only turns of boots proven dead are reaped.
     let db = app.open_database().await?;
-    let reap = leveler_engine::reap_after_restart(
-        &app.task_engine(&db)?,
-        None,
-        leveler_engine::ReapScope::EndedBoots,
-    )
-    .await?;
+    let engine = app.task_engine(&db)?;
+    let reap =
+        leveler_engine::reap_after_restart(&engine, None, leveler_engine::ReapScope::EndedBoots)
+            .await?;
+    leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
     for conflict in &reap.conflicts {
         tracing::warn!(session = conflict.session_id.as_str(), refusal = ?conflict.refusal,
             "not reaping running turns without proof their boot has ended");
@@ -1137,12 +1136,14 @@ pub(crate) async fn cmd_web(
             ));
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
             let db = app.open_database().await?;
+            let engine = app.task_engine(&db)?;
             let reap = leveler_engine::reap_after_restart(
-                &app.task_engine(&db)?,
+                &engine,
                 None,
                 leveler_engine::ReapScope::EndedBoots,
             )
             .await?;
+            leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
             if !reap.events.is_empty() {
                 tracing::warn!(
                     reaped = reap.events.len(),

@@ -425,3 +425,194 @@ async fn an_execution_awaiting_approval_keeps_the_session() {
     assert_eq!(w.owner().await, waiting);
     assert_eq!(w.turns().await, [row("running", &w.a.boot())]);
 }
+
+/// A running turn — with a dangling mutating tool call when `dangling` — left
+/// in the session by a boot of this runtime that has ended: its boot never
+/// took a lease, so the probe finds it dead.
+async fn crashed_turn(app: &Application, session: &SessionId, dangling: bool) -> BootId {
+    let db = app.open_database().await.unwrap();
+    let mut dead = app.task_engine(&db).unwrap();
+    dead.boot.id = BootId::generate();
+    let token = dead.acquire_ownership(session).await.unwrap();
+    let turn = dead
+        .stores
+        .turns
+        .start_owned(&token, session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    if !dangling {
+        return dead.boot.id;
+    }
+    leveler_engine::EventLog::new(&db, session.clone())
+        .append(
+            Some(&leveler_core::TurnId::new(turn.id)),
+            leveler_engine::EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "apply_patch".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    dead.boot.id
+}
+
+impl Windows {
+    /// Wait for the task's owner to become `expected`.
+    async fn owner_becomes(&self, expected: TaskOwner) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let owner = self.owner().await;
+            if owner == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owner stayed {owner:?}, expected {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Window {
+    async fn shell(&self, session: &SessionId, command: &str) {
+        self.client
+            .send(ClientCommand::RunUserShell {
+                session_id: session.clone(),
+                command: command.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// The next user shell event of `kind` on `events`.
+async fn shell_event(
+    events: &mut tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent>,
+    started: bool,
+) -> leveler_client_protocol::RuntimeEvent {
+    use leveler_client_protocol::RuntimeEvent;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await.unwrap() {
+                event @ RuntimeEvent::UserShellStarted { .. } if started => return event,
+                event @ RuntimeEvent::UserShellExited { .. } if !started => return event,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the user shell event arrives")
+}
+
+/// U1/U4: a user shell is execution too. While it runs, a sibling window is
+/// refused and nothing moves; once it is cancelled, the window stays open and
+/// the sibling runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_user_shell_holds_the_session_until_it_ends() {
+    use leveler_client_protocol::RuntimeEvent;
+    let w = two_windows().await;
+    let mut events = w.a.client.subscribe_session(&w.session);
+    w.a.shell(&w.session, "sleep 30").await;
+    let RuntimeEvent::UserShellStarted { execution_id, .. } = shell_event(&mut events, true).await
+    else {
+        unreachable!()
+    };
+    let running = w.owner().await;
+    assert_eq!(running.boot, Some(w.a.boot()));
+
+    let refused = w.b.submit(&w.session).await;
+    assert!(
+        matches!(refused, Err(ClientError::OwnershipConflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(w.owner().await, running);
+
+    w.a.client
+        .send(ClientCommand::CancelUserShell {
+            session_id: w.session.clone(),
+            execution_id,
+        })
+        .await
+        .unwrap();
+    let RuntimeEvent::UserShellExited { status, .. } = shell_event(&mut events, false).await else {
+        unreachable!()
+    };
+    assert_eq!(status, "cancelled");
+    w.owner_becomes(Windows::unowned_at(running.epoch.get()))
+        .await;
+    w.b.submit(&w.session)
+        .await
+        .expect("B runs once A's shell has ended");
+    assert_eq!(w.owner().await.boot, Some(w.b.boot()));
+}
+
+/// U2/U3: a shell that succeeds and one that fails both end their generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_user_shell_releases_the_session() {
+    use leveler_client_protocol::RuntimeEvent;
+    let w = two_windows().await;
+    let mut events = w.a.client.subscribe_session(&w.session);
+    for (epoch, (command, expected)) in [("echo done", "success"), ("exit 3", "failed")]
+        .into_iter()
+        .enumerate()
+    {
+        w.a.shell(&w.session, command).await;
+        let RuntimeEvent::UserShellExited { status, .. } = shell_event(&mut events, false).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(status, expected, "{command}");
+        w.owner_becomes(Windows::unowned_at(epoch as u64 + 1)).await;
+    }
+    w.b.submit(&w.session)
+        .await
+        .expect("an idle window's finished shells do not hold the session");
+    let owner = w.owner().await;
+    assert_eq!(owner.boot, Some(w.b.boot()));
+    assert_eq!(owner.epoch.get(), 3);
+}
+
+/// R1/R2: recovering a dead boot's turn is finite work. The recovering window
+/// stays open, the dead boot keeps its turn's provenance, and another window
+/// runs next without waiting for the recovering one to exit.
+#[tokio::test]
+async fn recovery_leaves_a_dead_boots_session_to_whoever_runs_next() {
+    let w = two_windows().await;
+    let dead = crashed_turn(&w.a.app, &w.session, false).await;
+
+    // Window B starts up beside it: its startup recovery settles the turn.
+    w.b.app
+        .create_session(&ModelRef::new("mock", "m"), "beside")
+        .await
+        .unwrap();
+    assert_eq!(w.turns().await, [row("interrupted", &dead)]);
+    assert_eq!(w.owner().await, Windows::unowned_at(2));
+
+    w.a.submit(&w.session)
+        .await
+        .expect("A runs next while the recovering window stays open");
+    assert_eq!(w.owner().await.boot, Some(w.a.boot()));
+}
+
+/// A1/A2: acknowledging a crash window closes its dangling calls and is then
+/// done — it starts no execution, so it leaves the session unowned.
+#[tokio::test]
+async fn acknowledging_a_crash_window_leaves_the_session_to_whoever_runs_next() {
+    let w = two_windows().await;
+    crashed_turn(&w.a.app, &w.session, true).await;
+
+    let closed = w.b.app.acknowledge_crash_window(&w.session).await.unwrap();
+    assert_eq!(closed, 1);
+    assert_eq!(w.owner().await, Windows::unowned_at(2));
+
+    w.a.submit(&w.session)
+        .await
+        .expect("A runs next while the acknowledging window stays open");
+    assert_eq!(w.owner().await.boot, Some(w.a.boot()));
+}

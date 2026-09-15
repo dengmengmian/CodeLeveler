@@ -38,7 +38,7 @@ pub use ports::{
 };
 pub use reaper::{
     ReapConflict, ReapOutcome, ReapRefusal, ReapScope, ReapedSession, reap_after_restart,
-    reap_running_turns_owned,
+    reap_running_turns_owned, release_reaped,
 };
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
