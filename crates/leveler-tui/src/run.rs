@@ -219,8 +219,11 @@ pub async fn run(
             let _ = delivery_completions.send(Action::EffectCompleted(completion));
         }
     });
+    // Opening the session can ask the runtime for more (its history), so the
+    // effects are carried into the first loop pass instead of dropped.
+    let mut carried_effects: Vec<Effect> = Vec::new();
     if let Ok(snapshot) = client.snapshot(&state.session_id).await {
-        reduce(
+        carried_effects = reduce(
             &mut state,
             Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
         );
@@ -242,11 +245,13 @@ pub async fn run(
     paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
 
     while state.running {
-        let mut effects: Vec<Effect> = Vec::new();
+        let mut effects: Vec<Effect> = std::mem::take(&mut carried_effects);
         let mut paint_now = false;
         let mut ticked = false;
 
-        if let Some(action) = pending_terminal_actions.pop_front() {
+        if !effects.is_empty() {
+            paint_now = true;
+        } else if let Some(action) = pending_terminal_actions.pop_front() {
             effects = reduce(&mut state, action);
             paint_now = true;
         } else {
@@ -283,7 +288,7 @@ pub async fn run(
                     Err(RecvError::Lagged(_)) => {
                         match client.snapshot(&state.session_id).await {
                             Ok(snapshot) => {
-                                reduce(
+                                effects = reduce(
                                     &mut state,
                                     Action::Runtime(RuntimeEvent::SessionOpened {
                                         session: snapshot,
