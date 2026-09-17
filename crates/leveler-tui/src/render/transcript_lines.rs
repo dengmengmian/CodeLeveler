@@ -945,7 +945,7 @@ fn sub_agent_tree_group_lines(
         let completed = blocks.iter().filter(|b| b.status == ToolStatus::Ok).count();
         let timeout = blocks
             .iter()
-            .filter(|b| b.status == ToolStatus::Failed && sub_agent_hit_round_limit(b))
+            .filter(|b| b.status == ToolStatus::Failed && sub_agent_timed_out(b, t))
             .count();
         let failed = n - completed - timeout;
         let mut parts: Vec<String> = Vec::new();
@@ -1048,10 +1048,11 @@ fn sub_agent_tree_group_lines(
     }
 }
 
-/// Whether a failed sub-agent was stopped by a budget (the "timeout" outcome),
-/// as the runtime typed it — never read out of its summary text.
-fn sub_agent_hit_round_limit(block: &crate::transcript::SubAgentBlock) -> bool {
-    block.stop == Some(leveler_client_protocol::ChildStop::Budget)
+/// True when the runtime typed this child's stop as the wall-clock bound, the
+/// only budget stop that is a timeout. Reads the same `ChildStop + ChildLimit`
+/// mapping the shared label uses, so the transcript cannot drift from it.
+fn sub_agent_timed_out(block: &crate::transcript::SubAgentBlock, t: &crate::i18n::UiText) -> bool {
+    crate::multi_agent::child_stop_label(block.stop, block.limit, t) == Some(t.agent_status_timeout)
 }
 
 /// Compact usage stats for one fully-succeeded tree child (`↑ 87.8k · ↓ 45.8k`).
@@ -1091,13 +1092,11 @@ fn sub_agent_tree_child_status(
             format!("⏸ {}", t.sub_agent_interrupted),
             theme.status.warning,
         ),
-        ToolStatus::Failed if sub_agent_hit_round_limit(block) => {
-            (format!("✗ {}", t.agent_status_timeout), theme.status.error)
-        }
         ToolStatus::Failed => (
             format!(
                 "✗ {}",
-                crate::multi_agent::stop_label(block.stop, t).unwrap_or(t.sub_agent_incomplete)
+                crate::multi_agent::child_stop_label(block.stop, block.limit, t)
+                    .unwrap_or(t.sub_agent_incomplete)
             ),
             theme.status.error,
         ),
@@ -1623,10 +1622,14 @@ mod tests {
             started_elapsed_secs: 0,
             expanded: false,
             contribution: crate::multi_agent::Contribution::Pending,
-            // A failed fixture child was stopped by its round budget — typed,
-            // as the runtime sends it; the summary text above is only prose.
+            // A failed fixture child was stopped by its wall clock — typed, as
+            // the runtime sends it; the summary text above is only prose. The
+            // bound is what makes this fixture a timeout and not a spent
+            // token budget.
             stop: (status == ToolStatus::Failed)
                 .then_some(leveler_client_protocol::ChildStop::Budget),
+            limit: (status == ToolStatus::Failed)
+                .then_some(leveler_client_protocol::ChildLimit::Duration),
             interrupted: false,
             unreported: false,
         }
@@ -1796,6 +1799,120 @@ mod tests {
         assert!(text.contains("1 已完成 · 1 超时"), "{text}");
         assert!(text.contains("├─ Euclid"), "{text}");
         assert!(text.contains("✓ 已完成"), "{text}");
+        assert!(text.contains("✗ 超时"), "{text}");
+    }
+
+    /// The termination label is the shared `ChildStop + ChildLimit` mapping,
+    /// not a transcript-local budget rule. Duration is the wall clock; every
+    /// other budget stop is a spent budget; a missing bound is the honest
+    /// generic word, never a guessed timeout.
+    #[test]
+    fn a_failed_childs_termination_label_reads_the_typed_bound() {
+        use leveler_client_protocol::{ChildLimit, ChildStop};
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let cases: &[(Option<ChildStop>, Option<ChildLimit>, &str)] = &[
+            (Some(ChildStop::Budget), Some(ChildLimit::Duration), "超时"),
+            (
+                Some(ChildStop::Budget),
+                Some(ChildLimit::ModelTokens),
+                "预算耗尽",
+            ),
+            (Some(ChildStop::Budget), Some(ChildLimit::Cost), "预算耗尽"),
+            (
+                Some(ChildStop::Budget),
+                Some(ChildLimit::Commands),
+                "预算耗尽",
+            ),
+            (
+                Some(ChildStop::Budget),
+                Some(ChildLimit::ModifiedFiles),
+                "预算耗尽",
+            ),
+            (
+                Some(ChildStop::Budget),
+                Some(ChildLimit::RoundWindow),
+                "预算耗尽",
+            ),
+            (
+                Some(ChildStop::Budget),
+                Some(ChildLimit::RoundCeiling),
+                "预算耗尽",
+            ),
+            // Old record / replay: no typed bound must not become a timeout.
+            (Some(ChildStop::Budget), None, "预算耗尽"),
+            // Other termination states keep their existing words.
+            (Some(ChildStop::Cancelled), None, "已取消"),
+            (Some(ChildStop::Lost), None, "已丢失"),
+            (Some(ChildStop::Failed), None, "未完成"),
+            (Some(ChildStop::Incomplete), None, "未完成"),
+        ];
+        for (stop, limit, expected) in cases {
+            let mut child = sub_agent("agent-1", "Euclid", ToolStatus::Failed);
+            child.stop = *stop;
+            child.limit = *limit;
+            let (label, _) = sub_agent_tree_child_status(&child, &theme, t);
+            assert_eq!(
+                label,
+                format!("✗ {expected}"),
+                "stop={stop:?} limit={limit:?}"
+            );
+            // Cross-surface contract: the transcript must be the shared
+            // mapping's own label, so Activity Detail can never disagree.
+            let shared = crate::multi_agent::child_stop_label(*stop, *limit, t)
+                .unwrap_or(t.sub_agent_incomplete);
+            assert_eq!(
+                label,
+                format!("✗ {shared}"),
+                "transcript and the shared mapping drifted: stop={stop:?} limit={limit:?}"
+            );
+        }
+    }
+
+    /// A completed child keeps its success word; the typed bound only changes
+    /// the failed/budget branch.
+    #[test]
+    fn a_completed_child_still_reads_as_completed() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let child = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        let (label, _) = sub_agent_tree_child_status(&child, &theme, t);
+        assert_eq!(label, "✓ 已完成");
+    }
+
+    /// The group breakdown is the same truth: only the wall clock is a
+    /// timeout. A spent token budget is not.
+    #[test]
+    fn the_group_breakdown_counts_only_the_wall_clock_as_timeout() {
+        use leveler_client_protocol::{ChildLimit, ChildStop};
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let ok = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+
+        let mut token_budget = sub_agent("agent-2", "Newton", ToolStatus::Failed);
+        token_budget.stop = Some(ChildStop::Budget);
+        token_budget.limit = Some(ChildLimit::ModelTokens);
+        let text = sub_agent_tree_lines(&[&ok, &token_budget], &theme, 100, t, 0)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1 已完成"), "{text}");
+        assert!(
+            !text.contains("超时"),
+            "a spent token budget is not a timeout:\n{text}"
+        );
+        assert!(text.contains("未完成"), "{text}");
+
+        let mut timed_out = sub_agent("agent-2", "Newton", ToolStatus::Failed);
+        timed_out.stop = Some(ChildStop::Budget);
+        timed_out.limit = Some(ChildLimit::Duration);
+        let text = sub_agent_tree_lines(&[&ok, &timed_out], &theme, 100, t, 0)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1 超时"), "{text}");
         assert!(text.contains("✗ 超时"), "{text}");
     }
 

@@ -249,6 +249,11 @@ pub struct SubAgentBlock {
     pub contribution: crate::multi_agent::Contribution,
     /// How the activation ended, once it has (typed by the runtime).
     pub stop: Option<leveler_client_protocol::ChildStop>,
+    /// Which bound fired when `stop` is a budget stop (typed by the runtime).
+    /// `None` when the runtime did not type one, or on rows recorded before it
+    /// was carried — the renderer then says the generic budget word and never
+    /// guesses the wall clock.
+    pub limit: Option<leveler_client_protocol::ChildLimit>,
     /// The runtime recorded its activation as interrupted; the next turn
     /// continues it or settles it as lost. Not a failure.
     pub interrupted: bool,
@@ -1174,6 +1179,7 @@ impl TranscriptState {
             started_elapsed_secs,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
+            limit: None,
             interrupted: false,
             unreported: false,
         }));
@@ -1194,6 +1200,7 @@ impl TranscriptState {
         summary: String,
         contribution: crate::multi_agent::Contribution,
         stop: Option<leveler_client_protocol::ChildStop>,
+        limit: Option<leveler_client_protocol::ChildLimit>,
     ) {
         let status = if ok {
             ToolStatus::Ok
@@ -1205,6 +1212,7 @@ impl TranscriptState {
             block.detail = summary;
             block.contribution = contribution.clone();
             block.stop = stop;
+            block.limit = limit;
             block.interrupted = false;
             block.unreported = false;
             return;
@@ -1222,6 +1230,7 @@ impl TranscriptState {
             started_elapsed_secs: 0,
             contribution,
             stop,
+            limit,
             interrupted: false,
             unreported: false,
         }));
@@ -1259,6 +1268,7 @@ impl TranscriptState {
             started_elapsed_secs: 0,
             contribution,
             stop: None,
+            limit: None,
             interrupted: false,
             unreported: false,
         }));
@@ -1888,5 +1898,55 @@ mod tests {
             "no projection reached the UI; inventing a count from the summary is what this replaced"
         );
         assert_eq!(block.status, ToolStatus::Ok);
+    }
+
+    /// The typed bound travels with the typed stop onto the block. It used to
+    /// be dropped at exactly this boundary, which is why the transcript could
+    /// not tell a wall-clock timeout from a spent token budget.
+    #[test]
+    fn a_childs_typed_limit_is_kept_on_its_block() {
+        use leveler_client_protocol::{ChildLimit, ChildStop};
+        let mut ts = TranscriptState::default();
+        ts.push_sub_agent_started(
+            "agent-1".into(),
+            "Euclid".into(),
+            "explorer".into(),
+            "look around".into(),
+            0,
+        );
+        // The start-then-finish path.
+        ts.complete_sub_agent_with_contribution(
+            "agent-1",
+            "Euclid",
+            false,
+            "stopped".into(),
+            crate::multi_agent::Contribution::NotMeasured,
+            Some(ChildStop::Budget),
+            Some(ChildLimit::ModelTokens),
+        );
+        let block = match ts.items.last() {
+            Some(TranscriptItem::SubAgent(b)) => b,
+            _ => panic!("expected sub-agent"),
+        };
+        assert_eq!(block.stop, Some(ChildStop::Budget));
+        assert_eq!(block.limit, Some(ChildLimit::ModelTokens));
+
+        // The finish-without-a-start fallback must carry it too, and an old
+        // record without a bound must stay `None` rather than be guessed.
+        ts.complete_sub_agent_with_contribution(
+            "agent-2",
+            "Newton",
+            false,
+            "stopped".into(),
+            crate::multi_agent::Contribution::NotMeasured,
+            Some(ChildStop::Budget),
+            None,
+        );
+        let block = match ts.items.last() {
+            Some(TranscriptItem::SubAgent(b)) => b,
+            _ => panic!("expected sub-agent"),
+        };
+        assert_eq!(block.stop, Some(ChildStop::Budget));
+        assert_eq!(block.limit, None, "no bound was typed; none is invented");
     }
 }

@@ -1453,6 +1453,7 @@ mod tests {
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
+            limit: None,
             interrupted: false,
             unreported: false,
         });
@@ -1491,6 +1492,7 @@ mod tests {
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
+            limit: None,
             interrupted: false,
             unreported: false,
         });
@@ -1533,6 +1535,7 @@ mod tests {
             started_elapsed_secs: 0,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
+            limit: None,
             interrupted: false,
             unreported: false,
         });

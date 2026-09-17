@@ -500,7 +500,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .map(|c| c.contribution.clone())
                     .unwrap_or(crate::multi_agent::Contribution::NotMeasured);
                 state.transcript.complete_sub_agent_with_contribution(
-                    &id, &nickname, ok, detail, projected, stop,
+                    &id, &nickname, ok, detail, projected, stop, limit,
                 );
             } else {
                 state.transcript.push_sub_agent_started(
