@@ -64,7 +64,7 @@ type DeliveryAttempt = tokio::task::JoinHandle<Result<(), ClientError>>;
 /// Default status-line notification TTL (warnings). Info is shorter; errors stick.
 const NOTIFICATION_TTL_WARNING: Duration = Duration::from_secs(8);
 const NOTIFICATION_TTL_INFO: Duration = Duration::from_secs(4);
-/// Animation / clock cadence for the busy spinner and header wall clock.
+/// Animation / clock cadence for the busy spinner and footer wall clock.
 ///
 /// Drives the busy spinner AND the animated header progress line, so it must run
 /// subsecond to look smooth. It only forces a repaint while `is_busy()` (line
@@ -106,7 +106,7 @@ pub async fn run(
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
     let (cols, rows) = size().unwrap_or((80, 24));
     state.size = (cols, rows);
-    state.clock_label = chrono::Local::now().format("%H:%M").to_string();
+    state.clock_label = crate::status_line::fmt_clock(chrono::Local::now().time());
 
     // Restore a persisted composer draft (spec §24) and the input history.
     if let Some(path) = state.draft_path()
@@ -353,8 +353,8 @@ pub async fn run(
             state.elapsed_secs = 0;
         }
 
-        // Wall clock in the header — repaint when the minute rolls over.
-        let clock = chrono::Local::now().format("%H:%M").to_string();
+        // Wall clock in the footer — repaint when the minute rolls over.
+        let clock = crate::status_line::fmt_clock(chrono::Local::now().time());
         if clock != state.clock_label {
             state.clock_label = clock;
             paint_now = true;

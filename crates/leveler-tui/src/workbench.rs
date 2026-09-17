@@ -831,8 +831,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let muted = Style::default().fg(theme.text.secondary);
     let width = area.width as usize;
 
-    // Footer: Context + optional cache hit rate. Shortcuts live in /help · Ctrl+?.
-    let text = match crate::status_line::footer_status_line(state) {
+    // Footer: Context + optional cache hit rate + local wall clock. The clock
+    // is dropped by the builder before it would be clipped. Shortcuts live in
+    // /help · Ctrl+?.
+    let text = match crate::status_line::footer_status_line(state, width) {
         Some(line) => crate::render::truncate_display(&line, width),
         None => String::new(),
     };
@@ -1548,6 +1550,49 @@ mod tests {
                 "bottom pad row must be blank, col {x} is {sym:?}"
             );
         }
+    }
+
+    /// The clock is drawn on the footer row, after the runtime chips — never
+    /// right-aligned to the terminal edge and never a second row.
+    #[test]
+    fn footer_renders_the_local_wall_clock_after_the_runtime_chips() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.context_window_tokens = 1_048_576;
+        state.context_tokens = 254_000;
+        state.token_input = 1000;
+        state.token_cached = 990;
+        state.clock_label = "22:22".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+        // Match on the ASCII counts/clock, not the localized labels: a 2-cell
+        // CJK glyph has an empty continuation cell between it and its neighbour.
+        let footer = lines
+            .iter()
+            .find(|l| l.contains("254k/1M"))
+            .unwrap_or_else(|| panic!("footer context line missing:\n{}", lines.join("\n")));
+        // Clock rides the shared ` · ` separator right after the cache chip,
+        // so it is never padded out to the terminal's right edge.
+        assert!(
+            footer.contains("99% · 22:22"),
+            "clock must follow the cache chip with the shared separator: {footer}"
+        );
     }
 
     #[test]

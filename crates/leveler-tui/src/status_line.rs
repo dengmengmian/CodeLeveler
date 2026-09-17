@@ -5,7 +5,7 @@
 //! - **Header** (1 line): branch · repo path (muted; identity only)
 //! - **Status** (1 line): live activity only (empty when idle; toasts float)
 //! - **Input border**: `{model} [(effort)] · work-mode · permission · session`
-//! - **Footer** (1 line): runtime context only — `Context 8k/1M`
+//! - **Footer** (1 line): runtime context + local wall clock — `Context 8k/1M · 22:22`
 //!
 //! Vertical breathing (workbench): blank above the input when status/queue/plan
 //! chrome is visible; blank between input and the Context footer always.
@@ -29,6 +29,14 @@ pub(crate) fn fmt_elapsed(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// Local wall clock as `HH:MM`: 24-hour, no seconds, no date, no label.
+///
+/// The timezone is already baked into `time` by the caller; this only fixes
+/// the presentation format so it can be tested without touching the clock.
+pub(crate) fn fmt_clock(time: chrono::NaiveTime) -> String {
+    time.format("%H:%M").to_string()
 }
 
 pub(crate) fn fmt_tokens(n: u32) -> String {
@@ -227,8 +235,13 @@ pub(crate) fn footer_cache_chip(state: &AppState) -> Option<String> {
     Some(state.t().footer_cache.replace("{}", &pct.to_string()))
 }
 
-/// Full footer status: `Context 21k/1M · cache 42%` — each part optional.
-pub(crate) fn footer_status_line(state: &AppState) -> Option<String> {
+/// Full footer status: `Context 21k/1M · cache 42% · 22:22` — each part optional.
+///
+/// The wall clock is the lowest-priority cell on this row. It is appended last
+/// and, when `max_width` cannot hold it, dropped whole rather than clipped: a
+/// half-drawn `22:2…` is worse than no clock. Context and cache keep their
+/// existing render-time truncation.
+pub(crate) fn footer_status_line(state: &AppState, max_width: usize) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ctx) = footer_ctx_chip(state) {
         parts.push(ctx);
@@ -236,10 +249,22 @@ pub(crate) fn footer_status_line(state: &AppState) -> Option<String> {
     if let Some(cache) = footer_cache_chip(state) {
         parts.push(cache);
     }
-    if parts.is_empty() {
+    let base = parts.join(" · ");
+    if state.clock_label.is_empty() {
+        return (!base.is_empty()).then_some(base);
+    }
+    let clocked = if base.is_empty() {
+        state.clock_label.clone()
+    } else {
+        format!("{base} · {}", state.clock_label)
+    };
+    if UnicodeWidthStr::width(clocked.as_str()) <= max_width {
+        Some(clocked)
+    } else if base.is_empty() {
+        // Nothing else is on the row; a clipped clock reads as a wrong time.
         None
     } else {
-        Some(parts.join(" · "))
+        Some(base)
     }
 }
 
@@ -756,14 +781,69 @@ mod tests {
         state.context_window_tokens = 1_048_576;
         assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 41k/1M"));
         assert_eq!(footer_cache_chip(&state), None);
-        assert_eq!(footer_status_line(&state).as_deref(), Some("上下文 41k/1M"));
+        assert_eq!(
+            footer_status_line(&state, 120).as_deref(),
+            Some("上下文 41k/1M")
+        );
         state.token_input = 1000;
         state.token_cached = 420;
         assert_eq!(footer_cache_chip(&state).as_deref(), Some("缓存 42%"));
         assert_eq!(
-            footer_status_line(&state).as_deref(),
+            footer_status_line(&state, 120).as_deref(),
             Some("上下文 41k/1M · 缓存 42%")
         );
+    }
+
+    #[test]
+    fn clock_formats_as_24h_hh_mm_without_seconds() {
+        let at = |h, m, s| chrono::NaiveTime::from_hms_opt(h, m, s).unwrap();
+        assert_eq!(fmt_clock(at(0, 5, 0)), "00:05");
+        assert_eq!(fmt_clock(at(9, 7, 0)), "09:07");
+        assert_eq!(fmt_clock(at(22, 22, 59)), "22:22");
+        assert_eq!(fmt_clock(at(23, 59, 0)), "23:59");
+    }
+
+    #[test]
+    fn footer_appends_the_clock_after_the_runtime_chips() {
+        let mut state = test_state();
+        state.context_tokens = 254_000;
+        state.context_window_tokens = 1_048_576;
+        state.token_input = 1000;
+        state.token_cached = 990;
+        state.clock_label = "22:22".into();
+        assert_eq!(
+            footer_status_line(&state, 120).as_deref(),
+            Some("上下文 254k/1M · 缓存 99% · 22:22")
+        );
+    }
+
+    /// The clock is the first part dropped when the row narrows; context and
+    /// cache survive it.
+    #[test]
+    fn footer_drops_the_clock_whole_before_the_runtime_chips() {
+        let mut state = test_state();
+        state.context_tokens = 254_000;
+        state.context_window_tokens = 1_048_576;
+        state.token_input = 1000;
+        state.token_cached = 990;
+        state.clock_label = "22:22".into();
+        let full = "上下文 254k/1M · 缓存 99% · 22:22";
+        let width = UnicodeWidthStr::width(full);
+        assert_eq!(footer_status_line(&state, width).as_deref(), Some(full));
+        assert_eq!(
+            footer_status_line(&state, width - 1).as_deref(),
+            Some("上下文 254k/1M · 缓存 99%")
+        );
+    }
+
+    /// A session with no usage keeps the clock; the runtime chips stay hidden.
+    #[test]
+    fn footer_keeps_the_clock_alone_with_no_usage() {
+        let mut state = test_state();
+        state.clock_label = "09:07".into();
+        assert_eq!(footer_status_line(&state, 120).as_deref(), Some("09:07"));
+        // Too narrow even for the clock alone: hidden, never half-drawn.
+        assert_eq!(footer_status_line(&state, 4), None);
     }
 
     #[test]
