@@ -4217,41 +4217,104 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // Written before the fixture starts, so the fixture cannot race the
+        // flag that tells it what it is.
+        std::fs::write(
+            dir.join(GRANDCHILD_FIXTURE_FLAG),
+            GRANDCHILD_FIXTURE_FLAG_BODY,
+        )
+        .unwrap();
         let pidfile = dir.join("gc.pid");
-        let system_root = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-        let ping = system_root.join(r"System32\PING.EXE");
-        let pidfile_str = pidfile.display().to_string().replace('\'', "''");
-        let ping_str = ping.display().to_string().replace('\'', "''");
-        let script = format!(
-            "$p = Start-Process -PassThru -WindowStyle Hidden -FilePath '{ping_str}' -ArgumentList @('-n','60','127.0.0.1'); Set-Content -Encoding Ascii -Path '{pidfile_str}' -Value $p.Id; Wait-Process -Id $p.Id"
-        );
         let request = ProcessRequest::new(
-            powershell.display().to_string(),
-            vec![
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                script,
-            ],
+            std::env::current_exe()
+                .expect("the test binary is the fixture program too")
+                .display()
+                .to_string(),
+            vec![GRANDCHILD_FIXTURE_TEST.into(), "--nocapture".into()],
             dir.clone(),
         );
         (dir, request, pidfile)
     }
 
+    /// The file a fixture run looks for in its working directory.
+    ///
+    /// The filter argument says WHICH test to run; this says WHY. Both matter,
+    /// because an ordinary `cargo test` runs this binary's tests too — including
+    /// the fixture below — and those runs must not spawn a grandchild and block.
+    /// The environment cannot carry the distinction: the runner rebuilds every
+    /// child's environment from an immutable snapshot, so nothing can be
+    /// injected per request. A working directory holding this file is a request
+    /// directory and nothing else.
+    #[cfg(windows)]
+    const GRANDCHILD_FIXTURE_FLAG: &str = "grandchild-fixture";
+
+    /// Its contents, so a stray file of the same name cannot turn a plain test
+    /// run into a fixture that spawns a grandchild and waits a minute for it.
+    #[cfg(windows)]
+    const GRANDCHILD_FIXTURE_FLAG_BODY: &[u8] = b"leveler-grandchild-fixture";
+
+    #[cfg(windows)]
+    const GRANDCHILD_FIXTURE_TEST: &str = "windows_grandchild_fixture_child";
+
+    /// Not a test of its own: the grandchild fixture.
+    ///
+    /// Started with its working directory set to a request directory (see
+    /// [`GRANDCHILD_FIXTURE_FLAG`]), it spawns one long-lived grandchild,
+    /// records that pid, and waits to be killed along with it.
+    ///
+    /// A Rust start rather than a PowerShell one on purpose. The readiness wait
+    /// has to observe the grandchild before the timeout that kills it, and a
+    /// shell cold start on a loaded runner did not fit: CI run 35217861633
+    /// spent the whole 10s budget with the fixture still running and no pid
+    /// file, while the same fixture wrote its pid in 2.7s in the run before.
+    /// A start that is part of this binary removes the shell from the sequence
+    /// that has to fit, and any failure here is now the fixture's own error
+    /// rather than a missing file with no producer left to explain it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_grandchild_fixture_child() {
+        let Ok(dir) = std::env::current_dir() else {
+            return;
+        };
+        let flagged = std::fs::read(dir.join(GRANDCHILD_FIXTURE_FLAG))
+            .is_ok_and(|body| body == GRANDCHILD_FIXTURE_FLAG_BODY);
+        if !flagged {
+            // An ordinary test run, not a fixture start.
+            return;
+        }
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let ping = system_root.join(r"System32\PING.EXE");
+        let mut grandchild = std::process::Command::new(&ping)
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the grandchild");
+        std::fs::write(dir.join("gc.pid"), grandchild.id().to_string())
+            .expect("record the grandchild pid");
+        grandchild.wait().expect("wait for the grandchild");
+    }
+
     /// How long a grandchild fixture's command is given before it is killed.
     ///
-    /// It has to outlast [`GRANDCHILD_PIDFILE_WAIT`] with room to spare. The
-    /// two were 8s and 10s, so a PowerShell cold start on a loaded runner
-    /// outlived the command that was supposed to outlive it: the timeout killed
-    /// the tree before the grandchild had written its pid, and the wait then
-    /// failed reporting a missing file rather than the slowness that caused it.
+    /// Two orderings have to hold at once. It must outlast
+    /// [`GRANDCHILD_PIDFILE_WAIT`] with room to spare, or the timeout kills the
+    /// tree before the readiness wait has seen the grandchild — the wait then
+    /// reports a missing file rather than the timeout it was meant to prove.
+    /// And it must stay well inside the grandchild's own lifetime (`ping -n 60`
+    /// is about a minute), or the command ends normally instead of timing out.
+    /// 20s sits between a 10s wait and a 60s grandchild.
     #[cfg(windows)]
     const GRANDCHILD_TIMEOUT: Duration = Duration::from_secs(20);
 
+    /// How long the fixture is given to declare its grandchild.
+    ///
+    /// The fixture is a start of this test binary, so the pid file normally
+    /// lands in well under a second and this is pure headroom for a loaded
+    /// runner. It must stay below [`GRANDCHILD_TIMEOUT`], for the reason above.
     #[cfg(windows)]
     const GRANDCHILD_PIDFILE_WAIT: Duration = Duration::from_secs(10);
 

@@ -491,6 +491,15 @@ pub(super) fn network_failure_in(body: &str) -> bool {
         "enetunreach",
         "no route to host",
         "connect eperm",
+        // A fresh network namespace has no route out and its loopback is down,
+        // so a client reaching for anything — including 127.0.0.1 — is refused
+        // rather than timing out. Node says `connect ECONNREFUSED 127.0.0.1:…`
+        // and Python `ConnectionRefusedError: [Errno 111] Connection refused`
+        // (measured under `bwrap --unshare-net`). Same condition as curl's
+        // `couldn't connect to server` above: the denied call is why the
+        // connection could not succeed.
+        "connect econnrefused",
+        "connection refused",
         // Go: `proxyconnect tcp: dial tcp …`, `dial tcp: lookup host: no such host`.
         "dial tcp",
         "no such host",

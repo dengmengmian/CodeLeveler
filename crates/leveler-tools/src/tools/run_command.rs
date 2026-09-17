@@ -540,6 +540,10 @@ mod tests {
             // macOS denies a loopback listener too: a test's local server.
             "panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: bind: operation not permitted",
             "Error: listen EPERM: operation not permitted 127.0.0.1",
+            // Linux: a fresh network namespace has loopback down and no route,
+            // so even 127.0.0.1 is refused rather than timed out.
+            "connect ECONNREFUSED 127.0.0.1:44363",
+            "ConnectionRefusedError: [Errno 111] Connection refused",
         ] {
             assert!(
                 crate::tools::command_execution::network_failure_in(reached),
