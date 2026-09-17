@@ -59,7 +59,10 @@ pub use agents::{
     UiAgentCapability, UiAgentDetail, UiAgentDraft, UiAgentEntry, UiAgentProblem, UiAgentScope,
     UiAgentSource, UiAgentStatus, UiChildAgentIdentity, UiShadowedAgent,
 };
-pub use approval::{UiApprovalRequest, UiClarificationRequest, UiPendingInteraction};
+pub use approval::{
+    ClarificationQuestionKind, UiApprovalRequest, UiClarificationQuestion, UiClarificationRequest,
+    UiPendingInteraction,
+};
 pub use client::{ClientError, InteractiveRuntimeClient};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};

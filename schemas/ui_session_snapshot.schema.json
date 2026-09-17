@@ -312,6 +312,32 @@
       "description": "Identifies a pending clarification (ask-user) request.",
       "type": "string"
     },
+    "ClarificationQuestionKind": {
+      "description": "How one question in a clarification is answered.\n\nThe kind is explicit rather than inferred from `options` being empty: a single-choice question with no options is unanswerable, while a text question is the only shape whose answer is typed. A client that guessed would silently turn a missing option list into a free-text prompt.",
+      "oneOf": [
+        {
+          "description": "Exactly one option (or a free-text answer when `allow_other` is set).",
+          "type": "string",
+          "enum": [
+            "single"
+          ]
+        },
+        {
+          "description": "Zero or more options.",
+          "type": "string",
+          "enum": [
+            "multi"
+          ]
+        },
+        {
+          "description": "A free-text answer.",
+          "type": "string",
+          "enum": [
+            "text"
+          ]
+        }
+      ]
+    },
     "FinalizationStage": {
       "description": "The mechanical work still running after the assistant has produced its final response but before the runtime publishes the task terminal.\n\nThis is lifecycle chrome, not a second completion authority: the terminal event remains the only fact that ends the turn.",
       "oneOf": [
@@ -750,6 +776,60 @@
         }
       ]
     },
+    "UiClarificationQuestion": {
+      "description": "One question of a clarification interaction (spec §35).\n\nA clarification is a set of questions the user answers in one sitting; the client shows them as tabs so only one is on screen at a time. `header` is the short tab label, `question` the full prompt.",
+      "type": "object",
+      "required": [
+        "question"
+      ],
+      "properties": {
+        "allow_other": {
+          "description": "Offer a trailing free-text entry (\"其他…\") next to the options.",
+          "default": false,
+          "type": "boolean"
+        },
+        "header": {
+          "description": "Short label for the question's tab. Empty means \"derive one from `question`\" — a display concern the client owns.",
+          "default": "",
+          "type": "string"
+        },
+        "kind": {
+          "default": "single",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClarificationQuestionKind"
+            }
+          ]
+        },
+        "max_choices": {
+          "description": "Maximum number of picks for a `multi` question (`None` = the option count).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "min_choices": {
+          "description": "Minimum number of picks for a `multi` question (0 = none required).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "options": {
+          "description": "Candidate answers for `single` / `multi`. Empty for `text`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      }
+    },
     "UiClarificationRequest": {
       "description": "A mid-task clarification the agent needs answered (spec §35).",
       "type": "object",
@@ -770,7 +850,15 @@
           }
         },
         "question": {
+          "description": "The interaction's headline, and the whole prompt for a request that predates `questions`.",
           "type": "string"
+        },
+        "questions": {
+          "description": "The questions to answer in one interaction. Empty for a legacy single-question request: clients then render `question`/`options` as one question, so an older runtime keeps working against a newer client and vice versa.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiClarificationQuestion"
+          }
         }
       }
     },

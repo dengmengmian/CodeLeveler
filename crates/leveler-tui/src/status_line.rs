@@ -1054,11 +1054,11 @@ mod tests {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
         state.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
-            crate::overlay::ClarificationOverlay::new(UiClarificationRequest {
-                id: ClarificationId::new("c1"),
-                question: "which branch?".into(),
-                options: vec!["main".into(), "dev".into()],
-            }),
+            crate::overlay::ClarificationOverlay::new(UiClarificationRequest::single(
+                ClarificationId::new("c1"),
+                "which branch?",
+                vec!["main".into(), "dev".into()],
+            )),
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
         let text = status_line_content(&state, 120).to_string();

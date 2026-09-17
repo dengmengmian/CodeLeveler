@@ -70,6 +70,15 @@ export type ChildStop = 'completed' | 'incomplete' | 'budget' | 'cancelled' | 'f
 /** Identifies a pending clarification (ask-user) request. */
 export type ClarificationId = string;
 
+/** How one question in a clarification is answered. The kind is explicit rather than inferred from `options` being empty: a single-choice question with no options is unanswerable, while a text question is the only shape whose answer is typed. A client that guessed would silently turn a missing option list into a free-text prompt. */
+export type ClarificationQuestionKind =
+  /** Exactly one option (or a free-text answer when `allow_other` is set). */
+  | 'single'
+  /** Zero or more options. */
+  | 'multi'
+  /** A free-text answer. */
+  | 'text';
+
 /** Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice. */
 export type CommandId = string;
 
@@ -350,6 +359,8 @@ export type RuntimeEvent =
   | { type: 'btw_text_delta'; delta: string }
   /** Side-question finished successfully. */
   | { type: 'btw_completed' }
+  /** Side-question stopped by the user before it finished. Distinct from [`Self::BtwFailed`]: the answer was interrupted, not unsuccessful, and the partial answer (if any) is what the side thread keeps. */
+  | { type: 'btw_cancelled' }
   /** Side-question failed. */
   | { type: 'btw_failed'; error: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
@@ -578,12 +589,31 @@ export type UiChildState =
   /** It has its one terminal. */
   | 'settled';
 
+/** One question of a clarification interaction (spec §35). A clarification is a set of questions the user answers in one sitting; the client shows them as tabs so only one is on screen at a time. `header` is the short tab label, `question` the full prompt. */
+export interface UiClarificationQuestion {
+  /** Offer a trailing free-text entry ("其他…") next to the options. */
+  allow_other?: boolean;
+  /** Short label for the question's tab. Empty means "derive one from `question`" — a display concern the client owns. */
+  header?: string;
+  kind?: ClarificationQuestionKind;
+  /** Maximum number of picks for a `multi` question (`None` = the option count). */
+  max_choices?: number | null;
+  /** Minimum number of picks for a `multi` question (0 = none required). */
+  min_choices?: number;
+  /** Candidate answers for `single` / `multi`. Empty for `text`. */
+  options?: string[];
+  question: string;
+}
+
 /** A mid-task clarification the agent needs answered (spec §35). */
 export interface UiClarificationRequest {
   id: ClarificationId;
   /** Candidate answers, when the model offered a choice. */
   options: string[];
+  /** The interaction's headline, and the whole prompt for a request that predates `questions`. */
   question: string;
+  /** The questions to answer in one interaction. Empty for a legacy single-question request: clients then render `question`/`options` as one question, so an older runtime keeps working against a newer client and vice versa. */
+  questions?: UiClarificationQuestion[];
 }
 
 /** How a stopped command call ended, as the runtime established it. */
@@ -1083,6 +1113,8 @@ export type ClientCommand =
   /** Cancel exactly one user shell execution. Deliberately separate from `CancelCurrentTurn`: a user shell is not an agent turn, and the id match ensures a stale cancel can never kill a newer execution. */
   | { type: 'cancel_user_shell'; execution_id: UserShellId; session_id: SessionId }
   | { type: 'btw'; question: string; session_id: SessionId }
+  /** Stop the in-flight `/btw` side answer for a session. Deliberately separate from `CancelCurrentTurn`: a side thread's answer has its own lifecycle, and stopping it must never stop the main turn. */
+  | { type: 'cancel_btw'; session_id: SessionId }
   /** Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`]. */
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** Read-only context-accounting query. Does not mutate the runtime or the conversation. Answers with [`crate::RuntimeEvent::ContextLoaded`]. */

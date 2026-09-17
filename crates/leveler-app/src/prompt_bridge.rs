@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{ClarificationRequest, Clarifier, ClarifyOutcome};
+use leveler_agent::{ClarificationQuestionKind, ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::{ApprovalId, ClarificationId, SessionId, TurnId};
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, RiskLevel};
 
 use leveler_client_protocol::{
-    ClientError, RuntimeEvent, UiApprovalRequest, UiClarificationRequest,
+    ClientError, RuntimeEvent, UiApprovalRequest, UiClarificationQuestion, UiClarificationRequest,
 };
 
 /// How often a parked question or approval checks that somebody is still
@@ -140,6 +140,29 @@ impl Clarifier for ChannelClarifier {
             id: request.id.clone(),
             question: request.question.clone(),
             options: request.options.clone(),
+            questions: request
+                .questions
+                .iter()
+                .map(|q| UiClarificationQuestion {
+                    header: q.header.clone(),
+                    question: q.question.clone(),
+                    kind: match q.kind {
+                        ClarificationQuestionKind::Single => {
+                            leveler_client_protocol::ClarificationQuestionKind::Single
+                        }
+                        ClarificationQuestionKind::Multi => {
+                            leveler_client_protocol::ClarificationQuestionKind::Multi
+                        }
+                        ClarificationQuestionKind::Text => {
+                            leveler_client_protocol::ClarificationQuestionKind::Text
+                        }
+                    },
+                    options: q.options.clone(),
+                    allow_other: q.allow_other,
+                    min_choices: q.min_choices,
+                    max_choices: q.max_choices,
+                })
+                .collect(),
         };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -415,6 +438,7 @@ mod tests {
             action_fingerprint: "fingerprint-a".to_string(),
             question: "which?".to_string(),
             options: vec![],
+            questions: Vec::new(),
         };
 
         let answer = tokio::time::timeout(
@@ -503,6 +527,7 @@ mod tests {
             action_fingerprint: "fingerprint-a".to_string(),
             question: "which?".to_string(),
             options: vec![],
+            questions: Vec::new(),
         };
         let id = request.id.clone();
         let ask = tokio::spawn(async move { clarifier.clarify(&request).await });
@@ -540,6 +565,7 @@ mod tests {
             action_fingerprint: "fingerprint-a".to_string(),
             question: "which?".to_string(),
             options: vec![],
+            questions: Vec::new(),
         };
         let ask = tokio::spawn(async move { clarifier.clarify(&request).await });
         let _ = receiver.recv().await;
@@ -578,6 +604,7 @@ mod tests {
                 action_fingerprint: "fingerprint-a".to_string(),
                 question: "which?".to_string(),
                 options: vec![],
+                questions: Vec::new(),
             };
             let pending_for_reply = pending.clone();
             let id = request.id.clone();

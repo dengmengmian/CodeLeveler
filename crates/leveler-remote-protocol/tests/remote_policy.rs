@@ -349,6 +349,13 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            "cancel_btw",
+            ClientCommand::CancelBtw {
+                session_id: session(),
+            },
+            true,
+        ),
+        (
             "run_user_shell",
             ClientCommand::RunUserShell {
                 session_id: session(),

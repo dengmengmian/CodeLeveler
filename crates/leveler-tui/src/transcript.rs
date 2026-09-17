@@ -262,16 +262,6 @@ pub struct SubAgentBlock {
     pub unreported: bool,
 }
 
-/// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
-/// back from session storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BtwBlock {
-    pub question: String,
-    pub answer: String,
-    pub done: bool,
-    pub failed: bool,
-}
-
 /// One block in the transcript.
 /// Terminal state of one user shell execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +328,6 @@ pub enum TranscriptItem {
     Recap(RecapBlock),
     /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
     GoalRecap(GoalRecapBlock),
-    Btw(BtwBlock),
 }
 
 /// The ordered list of transcript blocks.
@@ -443,43 +432,6 @@ impl TranscriptState {
         self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Note(text));
-    }
-
-    /// Start a `/btw` side-question block (ephemeral).
-    pub fn begin_btw(&mut self, question: String) {
-        self.bump();
-        self.close_tool_group();
-        self.items.push(TranscriptItem::Btw(BtwBlock {
-            question,
-            answer: String::new(),
-            done: false,
-            failed: false,
-        }));
-    }
-
-    pub fn append_btw(&mut self, delta: &str) {
-        self.bump();
-        if let Some(TranscriptItem::Btw(b)) = self
-            .items
-            .iter_mut()
-            .rev()
-            .find(|i| matches!(i, TranscriptItem::Btw(b) if !b.done))
-        {
-            b.answer.push_str(delta);
-        }
-    }
-
-    pub fn finish_btw(&mut self, failed: bool) {
-        self.bump();
-        if let Some(TranscriptItem::Btw(b)) = self
-            .items
-            .iter_mut()
-            .rev()
-            .find(|i| matches!(i, TranscriptItem::Btw(b) if !b.done))
-        {
-            b.done = true;
-            b.failed = failed;
-        }
     }
 
     pub fn push_completion(&mut self, report: UiCompletionReport) {
@@ -1075,28 +1027,13 @@ impl TranscriptState {
         }
     }
 
-    /// Dismiss the latest finished `/btw` card (done or failed). Returns true
-    /// if a card was removed. Running (incomplete) cards are left alone.
-    pub fn dismiss_latest_finished_btw(&mut self) -> bool {
-        self.bump();
-        if let Some(idx) = self.items.iter().rposition(|item| {
-            matches!(
-                item,
-                TranscriptItem::Btw(b) if b.done
-            )
-        }) {
-            self.items.remove(idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether any finished btw card is still on screen.
-    pub fn has_finished_btw(&self) -> bool {
-        self.items
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::Btw(b) if b.done))
+    /// The last finished turn's terminal marker, if any. The `/btw` surface
+    /// reads it to show the main run's own verdict rather than inventing one.
+    pub fn last_turn_end(&self) -> Option<&TurnEndBlock> {
+        self.items.iter().rev().find_map(|item| match item {
+            TranscriptItem::TurnEnd(block) => Some(block),
+            _ => None,
+        })
     }
 
     /// All tool-call blocks, in order (for the Tools screen).

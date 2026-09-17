@@ -26,6 +26,15 @@ pub enum ChildStatus {
     Failed,
 }
 
+impl ChildStatus {
+    /// Whether the child has reached an outcome. A terminal child is history
+    /// once its turn ends; an open one (`Running`, `Waiting`, `Interrupted`,
+    /// `Unreported`) may still be continued or settled by a later turn.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
 /// What the parent did with what one child produced.
 ///
 /// Three outcomes, deliberately separate. Collapsing `NothingToFlag` and
@@ -331,10 +340,7 @@ impl TaskTeamView {
                 // A terminal already applied is final: a snapshot taken before
                 // it still says running and must not reopen the child. And a
                 // live Running is finer than the record's Running.
-                let settled_here = matches!(
-                    existing.status,
-                    ChildStatus::Completed | ChildStatus::Failed
-                );
+                let settled_here = existing.status.is_terminal();
                 let finer_live =
                     status == ChildStatus::Waiting && existing.status == ChildStatus::Running;
                 if !settled_here && !finer_live {
@@ -404,6 +410,27 @@ impl TaskTeamView {
             }
         }
         self.restamp_settlement(now_elapsed);
+    }
+
+    /// Retire the previous turn's settled children when a new turn begins.
+    ///
+    /// A terminal child ([`ChildStatus::is_terminal`]) belongs to the turn that
+    /// owned it: once that turn is over the child is history. The transcript
+    /// keeps it, and the live team must not — [`Self::restore`] refuses to
+    /// restore a settled child for the same reason. A child still open at the
+    /// boundary stays: the runtime continues or settles it in a later turn, so
+    /// it is cross-turn background activity, not history.
+    ///
+    /// Returns whether anything was retired, so the caller never pays for a
+    /// second look at an unchanged roster.
+    pub fn retire_settled(&mut self, now_elapsed: u64) -> bool {
+        let before = self.children.len();
+        self.children.retain(|c| !c.status.is_terminal());
+        if self.children.len() == before {
+            return false;
+        }
+        self.restamp_settlement(now_elapsed);
+        true
     }
 
     /// A turn ended: a child this view still shows as working got no terminal
@@ -828,6 +855,47 @@ mod tests {
             !TaskTeamView::default().surface_visible(0),
             "no children, no surface"
         );
+    }
+
+    /// A new turn owns the live roster: the previous turn's settled children
+    /// are history once it begins, while a child still open at the boundary
+    /// stays as cross-turn background activity.
+    #[test]
+    fn a_new_turn_retires_settled_children_and_keeps_open_ones() {
+        let mut team = team_with(&[
+            ChildStatus::Completed,
+            ChildStatus::Failed,
+            ChildStatus::Running,
+            ChildStatus::Waiting,
+            ChildStatus::Interrupted,
+            ChildStatus::Unreported,
+        ]);
+        assert!(team.retire_settled(0));
+        let kept: Vec<ChildStatus> = team.children.iter().map(|c| c.status).collect();
+        assert_eq!(
+            kept,
+            vec![
+                ChildStatus::Running,
+                ChildStatus::Waiting,
+                ChildStatus::Interrupted,
+                ChildStatus::Unreported
+            ],
+            "terminal outranks nothing: an open child is background, not history"
+        );
+        assert_eq!(
+            team.settled_at_elapsed, None,
+            "an open child re-opens the surface"
+        );
+
+        let mut all_settled = team_with(&[ChildStatus::Completed, ChildStatus::Failed]);
+        assert!(all_settled.retire_settled(10));
+        assert!(all_settled.children.is_empty());
+        assert_eq!(all_settled.settled_at_elapsed, None);
+
+        // Nothing settled → nothing changes, and the caller is told so.
+        let mut open = team_with(&[ChildStatus::Running]);
+        assert!(!open.retire_settled(10));
+        assert_eq!(open.children.len(), 1);
     }
 
     /// The compact row never words a lost child as success.

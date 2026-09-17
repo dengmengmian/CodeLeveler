@@ -127,3 +127,39 @@ fn crash_acknowledgement_acquires_ownership_through_the_engine() {
         );
     }
 }
+
+/// A `/btw` side answer must be structurally incapable of joining the main
+/// run: its own conversation, its own cancel handle, and no write to the
+/// message store or the main turn's ownership/cancellation.
+#[test]
+fn btw_side_thread_cannot_touch_main_authority() {
+    let source = app_source("interactive.rs");
+    let spawn = source
+        .split_once("fn spawn_btw(")
+        .expect("spawn_btw exists")
+        .1
+        .split_once("fn cancel_btw(")
+        .expect("spawn_btw is followed by cancel_btw")
+        .0;
+    for forbidden in [
+        "MessageRepository",
+        "append_message",
+        "truncate_messages",
+        "stage_turn",
+        "active.admit",
+        "self.active",
+    ] {
+        assert!(
+            !spawn.contains(forbidden),
+            "a side answer must not touch main authority through `{forbidden}`"
+        );
+    }
+    assert!(
+        spawn.contains("thread.cancel = Some"),
+        "the side answer needs its own cancel handle"
+    );
+    assert!(
+        spawn.contains("thread.history"),
+        "the side conversation must live on the side thread"
+    );
+}

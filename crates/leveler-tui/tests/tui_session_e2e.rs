@@ -194,7 +194,14 @@ fn tui_session_commands_ui_and_logic() {
         reduce(&mut s, key(KeyCode::Backspace));
     }
 
-    // --- /btw side card with markdown answer ---
+    // --- /btw side thread: its own surface, not a card in the main history ---
+    typed(&mut s, "/btw 还完事了吗？");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.surface,
+        leveler_tui::btw::SurfaceFocus::Btw,
+        "submitting /btw must land on the side thread"
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::BtwStarted {
@@ -210,16 +217,28 @@ fn tui_session_commands_ui_and_logic() {
     reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
     let btw_ui = screen(&mut s);
     assert!(
-        btw_ui.contains("临时提问") || btw_ui.contains("btw"),
-        "btw card title: {btw_ui}"
+        btw_ui.contains("返回主线程") || btw_ui.contains("Main"),
+        "side-thread header: {btw_ui}"
     );
-    assert!(btw_ui.contains("没有明显问题"), "btw answer text: {btw_ui}");
+    assert!(btw_ui.contains("还完事了吗？"), "side question: {btw_ui}");
+    assert!(btw_ui.contains("没有明显问题"), "side answer: {btw_ui}");
     assert!(
         !btw_ui.contains("**"),
-        "btw must render markdown, not raw **: {btw_ui}"
+        "side thread must render markdown, not raw **: {btw_ui}"
     );
-    pages.push(("06-btw-card", btw_ui));
-    // Dismiss the floating card so it stops covering the conversation viewport.
+    pages.push(("06-btw-surface", btw_ui));
+    // Esc returns to the main surface; it is navigation, not a cancel.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.surface, leveler_tui::btw::SurfaceFocus::Main);
+    // `/btw` alone re-opens the same thread without retyping the question.
+    typed(&mut s, "/btw");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.surface, leveler_tui::btw::SurfaceFocus::Btw);
+    assert_eq!(
+        s.btw.turns.len(),
+        1,
+        "re-entry must not create a second thread"
+    );
     reduce(&mut s, key(KeyCode::Esc));
 
     // Plan updates still land on state (shown in conversation chrome).

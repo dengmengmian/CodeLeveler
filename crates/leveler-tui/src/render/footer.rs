@@ -418,10 +418,17 @@ pub(crate) fn composer_box_lines(
     width: usize,
 ) -> (Vec<Line<'static>>, (u16, u16)) {
     let theme = &state.theme;
-    // Accent border only when Input owns workbench focus.
-    let focused = state.overlay.is_none()
-        && state.active_screen == Screen::Conversation
-        && state.workbench_focus == crate::state::WorkbenchFocus::Input;
+    // Accent border only when Input owns workbench focus. The side thread's
+    // composer is always the focused input on its own surface, even while a
+    // main approval waits behind it.
+    let focused = match state.surface {
+        crate::btw::SurfaceFocus::Btw => true,
+        crate::btw::SurfaceFocus::Main => {
+            state.overlay.is_none()
+                && state.active_screen == Screen::Conversation
+                && state.workbench_focus == crate::state::WorkbenchFocus::Input
+        }
+    };
     let border_color = if focused {
         theme.border.focus
     } else {
@@ -831,11 +838,11 @@ mod p1_tests {
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         assert!(hints(&s).contains("Esc 打断"), "{}", hints(&s));
         s.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
-            crate::overlay::ClarificationOverlay::new(UiClarificationRequest {
-                id: ClarificationId::new("c1"),
-                question: "cap 是单人累计还是单笔？".into(),
-                options: vec!["单人累计".into(), "单笔".into()],
-            }),
+            crate::overlay::ClarificationOverlay::new(UiClarificationRequest::single(
+                ClarificationId::new("c1"),
+                "cap 是单人累计还是单笔？",
+                vec!["单人累计".into(), "单笔".into()],
+            )),
         )));
         assert!(!hints(&s).contains("Esc"), "{}", hints(&s));
         s.overlay = Some(crate::overlay::Overlay::Approval(Box::new(

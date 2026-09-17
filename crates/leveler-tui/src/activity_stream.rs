@@ -1089,6 +1089,11 @@ fn push_command_rows(
 /// Most output rows an expanded command shows; the rest is named, not drawn.
 const COMMAND_OUTPUT_ROWS: usize = 20;
 
+/// Rows a resolved clarification's answer may take in the transcript before
+/// the rest is folded. A multi-question answer is one row per question, and
+/// the whole set is the record of what the user decided.
+const ANSWER_SUMMARY_ROWS: usize = 6;
+
 /// A command's lifecycle, as a row states it: a status glyph, what it is doing
 /// or how it ended, and for how long. Every word comes from a runtime fact or
 /// this client's own stop request — never from reading the output.
@@ -1465,17 +1470,46 @@ fn result_lines_for(
     }
     // An interaction's result is the user's own words. Print them, not a line
     // count: "· 1 行" over a decision the user was asked to make tells them
-    // how long their answer was and not what it said.
+    // how long their answer was and not what it said. A multi-question answer
+    // arrives as one labelled line per question, so it keeps its rows instead
+    // of collapsing to whichever answer happened to be first.
     if is_user_decision_call(call) {
         let answer = unanswered_question_note(call, t)
             .unwrap_or_else(|| call.preview.as_deref().unwrap_or("").trim());
-        return vec![Line::from(vec![
-            Span::styled(stem.clone(), Style::default().fg(theme.text.secondary)),
-            Span::styled(
-                truncate_display(answer, width.saturating_sub(stem_w).max(8)),
-                Style::default().fg(theme.text.primary),
-            ),
-        ])];
+        let indent = " ".repeat(stem_w);
+        let rows: Vec<&str> = answer
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        for (i, line) in rows.iter().take(ANSWER_SUMMARY_ROWS).enumerate() {
+            let lead = if i == 0 { stem.clone() } else { indent.clone() };
+            out.push(Line::from(vec![
+                Span::styled(lead, Style::default().fg(theme.text.secondary)),
+                Span::styled(
+                    truncate_display(line, width.saturating_sub(stem_w + 1).max(8)),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+        }
+        if rows.len() > ANSWER_SUMMARY_ROWS {
+            out.push(Line::from(vec![
+                Span::styled(indent, Style::default().fg(theme.text.secondary)),
+                Span::styled(
+                    t.fold_more_lines_short
+                        .replace("{}", &(rows.len() - ANSWER_SUMMARY_ROWS).to_string()),
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]));
+        }
+        if out.is_empty() {
+            out.push(Line::from(Span::styled(
+                stem,
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+        return out;
     }
     let (pre, post) = split_placeholder(t.tool_output_lines);
     // Collapsed, a success is worth one fact: how much came back. The first

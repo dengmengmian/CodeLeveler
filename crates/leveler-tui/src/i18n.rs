@@ -294,6 +294,9 @@ pub struct UiText {
     pub tool_status_succeeded: &'static str,
     pub tool_status_failed: &'static str,
     pub tool_output_lines: &'static str,
+    /// A clarification that carries several questions, when the model sent no
+    /// one-line headline.
+    pub tool_question_count: &'static str,
     /// Lifecycle words on a command row.
     /// `/agents`: the screen's own words. Agent names, capability classes
     /// (`read_only`), sources (`builtin`), paths, tool ids and fingerprints
@@ -511,6 +514,25 @@ pub struct UiText {
     /// Clarification overlay.
     pub clarify_title: &'static str,
     pub clarify_hint: &'static str,
+    /// Multi-question clarification: the headline with its two `{}` slots
+    /// (answered, total), the tab glyphs, the free-text row label, the
+    /// multi-choice hint and the two selection limits.
+    pub clarify_headline: &'static str,
+    pub clarify_tab_answered: &'static str,
+    pub clarify_tab_current: &'static str,
+    pub clarify_tab_pending: &'static str,
+    pub clarify_other: &'static str,
+    pub clarify_multi_badge: &'static str,
+    pub clarify_min_choices: &'static str,
+    pub clarify_max_choices: &'static str,
+    /// The refusal wording, said when Enter or Space is actually blocked —
+    /// distinct from the constraint badge so "why did nothing happen" has its
+    /// own sentence on screen.
+    pub clarify_min_choices_blocked: &'static str,
+    pub clarify_max_choices_blocked: &'static str,
+    pub clarify_nav_hint: &'static str,
+    pub clarify_nav_hint_multi: &'static str,
+    pub clarify_nav_hint_text: &'static str,
     /// Selection pickers (model, theme, mode, …).
     pub picker_search: &'static str,
     pub picker_recommended: &'static str,
@@ -665,15 +687,27 @@ pub struct UiText {
     pub overlay_theme: &'static str,
     pub overlay_media: &'static str,
     pub overlay_checkpoint: &'static str,
-    pub btw_label: &'static str,
-    pub btw_q: &'static str,
-    pub btw_a: &'static str,
     pub btw_usage: &'static str,
     pub btw_failed: &'static str,
-    /// In-flight status inside the /btw floating card.
+    /// Side-thread turn that is still streaming its answer.
     pub btw_answering: &'static str,
-    /// Footer/card hint: how to close a finished 旁问 card.
-    pub btw_dismiss: &'static str,
+    /// Side-thread header label: how to return to the main surface.
+    pub btw_back_main: &'static str,
+    /// Role labels inside a side-thread turn.
+    pub btw_you: &'static str,
+    pub btw_assistant: &'static str,
+    /// Empty side thread.
+    pub btw_empty: &'static str,
+    /// A side answer the user stopped before it finished.
+    pub btw_cancelled: &'static str,
+    /// Main run's state word when there is no busy turn and no terminal marker.
+    pub btw_main_idle: &'static str,
+    /// Side-thread composer hint.
+    pub btw_footer_hint: &'static str,
+    /// Side-thread composer hint while an answer is streaming.
+    pub btw_footer_hint_stop: &'static str,
+    /// Refusal when a second side question arrives before the first finished.
+    pub btw_busy: &'static str,
 
     // Final status (turn closeout)
     pub final_completed: &'static str,
@@ -1039,6 +1073,7 @@ static ZH: UiText = UiText {
     tool_status_succeeded: "成功",
     tool_status_failed: "失败",
     tool_output_lines: "{} 行",
+    tool_question_count: "{} 个问题",
     memory_title: "项目记忆",
     memory_active: "生效",
     memory_archived: "已归档",
@@ -1209,6 +1244,19 @@ static ZH: UiText = UiText {
     approval_hint_plain: "  ↑↓ 选择 · Enter 确认 · Esc 取消",
     clarify_title: "需要澄清",
     clarify_hint: "1-9 选项 · 输入自定义 · Enter 提交 · Esc 跳过",
+    clarify_headline: "需要你的选择 · {}/{} 已完成",
+    clarify_tab_answered: "✓",
+    clarify_tab_current: "●",
+    clarify_tab_pending: "○",
+    clarify_other: "其他…",
+    clarify_multi_badge: "可多选",
+    clarify_min_choices: "至少 {} 项",
+    clarify_max_choices: "最多 {} 项",
+    clarify_min_choices_blocked: "至少选择 {} 项才能确认",
+    clarify_max_choices_blocked: "最多只能选 {} 项，这一项没有加入",
+    clarify_nav_hint: "↑↓ 选择   Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
+    clarify_nav_hint_multi: "↑↓ 选择   Space 多选   Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
+    clarify_nav_hint_text: "Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
     picker_search: "搜索：",
     picker_recommended: "  推荐",
     picker_current: " 当前",
@@ -1382,13 +1430,18 @@ static ZH: UiText = UiText {
     overlay_theme: "选择主题",
     overlay_media: "模型不支持图片",
     overlay_checkpoint: "恢复检查点",
-    btw_label: "临时提问",
-    btw_q: "问",
-    btw_a: "答",
     btw_usage: "用法: /btw <问题>",
     btw_failed: "临时提问失败",
     btw_answering: "回答中…",
-    btw_dismiss: "关闭",
+    btw_back_main: "← 返回主线程",
+    btw_you: "你",
+    btw_assistant: "助手",
+    btw_empty: "还没有提问。输入问题开始旁路对话，主任务不受影响。",
+    btw_cancelled: "已停止",
+    btw_main_idle: "空闲",
+    btw_footer_hint: "Enter 发送 · Esc 返回主线程 · Ctrl+C 停止回答",
+    btw_footer_hint_stop: "回答中… · Enter 发送 · Esc 返回主线程 · Ctrl+C 停止回答",
+    btw_busy: "上一条旁问还在回答，先等它结束或按 Ctrl+C 停止",
     final_completed: "已完成",
     final_completed_warnings: "已完成，但有警告",
     final_waiting_confirmation: "等待确认",
@@ -1651,6 +1704,7 @@ static EN: UiText = UiText {
     tool_status_succeeded: "succeeded",
     tool_status_failed: "failed",
     tool_output_lines: "{} lines",
+    tool_question_count: "{} questions",
     memory_title: "Memory",
     memory_active: "active",
     memory_archived: "archived",
@@ -1821,6 +1875,19 @@ static EN: UiText = UiText {
     approval_hint_plain: "  ↑↓ select · Enter confirm · Esc cancel",
     clarify_title: "Needs clarification",
     clarify_hint: "1-9 options · type your own · Enter submit · Esc skip",
+    clarify_headline: "Your call · {}/{} answered",
+    clarify_tab_answered: "✓",
+    clarify_tab_current: "●",
+    clarify_tab_pending: "○",
+    clarify_other: "other…",
+    clarify_multi_badge: "pick any",
+    clarify_min_choices: "at least {}",
+    clarify_max_choices: "at most {}",
+    clarify_min_choices_blocked: "pick at least {} to confirm",
+    clarify_max_choices_blocked: "at most {} pick(s); this one was not added",
+    clarify_nav_hint: "↑↓ choose   Enter confirm   Tab next   Shift+Tab back   Esc return",
+    clarify_nav_hint_multi: "↑↓ choose   Space toggle   Enter confirm   Tab next   Shift+Tab back   Esc return",
+    clarify_nav_hint_text: "Enter confirm   Tab next   Shift+Tab back   Esc return",
     picker_search: "Search: ",
     picker_recommended: "  Recommended",
     picker_current: " current",
@@ -1994,13 +2061,18 @@ static EN: UiText = UiText {
     overlay_theme: "select theme",
     overlay_media: "model has no vision",
     overlay_checkpoint: "restore checkpoint",
-    btw_label: "btw",
-    btw_q: "Q",
-    btw_a: "A",
     btw_usage: "usage: /btw <question>",
     btw_failed: "btw failed",
     btw_answering: "Answering…",
-    btw_dismiss: "dismiss",
+    btw_back_main: "← Main",
+    btw_you: "You",
+    btw_assistant: "Assistant",
+    btw_empty: "No side questions yet. Ask something — the main run is unaffected.",
+    btw_cancelled: "stopped",
+    btw_main_idle: "idle",
+    btw_footer_hint: "Enter send · Esc Main · Ctrl+C stop reply",
+    btw_footer_hint_stop: "Answering… · Enter send · Esc Main · Ctrl+C stop reply",
+    btw_busy: "the previous side answer is still streaming — wait or press Ctrl+C",
     final_completed: "Completed",
     final_completed_warnings: "Completed with warnings",
     final_waiting_confirmation: "Waiting for confirmation",

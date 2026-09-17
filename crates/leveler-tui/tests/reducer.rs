@@ -9,6 +9,7 @@ use leveler_client_protocol::{
     UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiReasoningState, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
+use leveler_tui::btw::{BtwTurnState, SurfaceFocus};
 use leveler_tui::overlay::Overlay;
 use leveler_tui::reducer::reduce;
 use leveler_tui::screen::Screen;
@@ -599,15 +600,25 @@ fn a_restored_verification_is_not_the_next_turns_verification() {
     assert!(s.verification.is_some());
 }
 
-#[test]
-fn btw_events_fill_ephemeral_block() {
-    let mut s = opened();
+/// Ask a side question the way the UI does: type `/btw <q>` then Enter.
+fn ask_btw(s: &mut AppState, q: &str) -> Vec<Effect> {
+    s.composer.replace(format!("/btw {q}"));
+    reduce(s, key(KeyCode::Enter))
+}
+
+/// The runtime announced the side answer started.
+fn side_answer_started(s: &mut AppState, q: &str) {
     reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::BtwStarted {
-            question: "why?".into(),
-        }),
+        s,
+        Action::Runtime(RuntimeEvent::BtwStarted { question: q.into() }),
     );
+}
+
+#[test]
+fn btw_events_fill_the_side_thread_not_the_main_transcript() {
+    let mut s = opened();
+    ask_btw(&mut s, "why?");
+    side_answer_started(&mut s, "why?");
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::BtwTextDelta {
@@ -615,46 +626,243 @@ fn btw_events_fill_ephemeral_block() {
         }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
-    let Some(TranscriptItem::Btw(b)) = s.transcript.items().last() else {
-        panic!("expected btw block");
-    };
-    assert_eq!(b.question, "why?");
-    assert_eq!(b.answer, "because");
-    assert!(b.done);
-    assert!(!b.failed);
+    assert_eq!(s.btw.turns.len(), 1);
+    assert_eq!(s.btw.turns[0].question, "why?");
+    assert_eq!(s.btw.turns[0].answer, "because");
+    assert_eq!(s.btw.turns[0].state, BtwTurnState::Done);
+    assert!(
+        s.transcript.items().is_empty(),
+        "side turns must never enter the main transcript"
+    );
+    assert!(
+        s.pending_submissions.is_empty(),
+        "a side question must never stage a main turn"
+    );
 }
 
 #[test]
-fn esc_dismisses_finished_btw_card() {
+fn btw_esc_returns_to_main_and_never_cancels_a_running_turn() {
     let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "现在做到哪了？");
+    assert_eq!(s.surface, SurfaceFocus::Btw);
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(
+        effects.is_empty(),
+        "Esc on the side thread is navigation, not a command: {effects:?}"
+    );
+    assert_eq!(s.surface, SurfaceFocus::Main);
+    assert_eq!(s.status, RuntimeStatus::Busy, "the main run must still run");
+    assert!(
+        !s.cancel_armed,
+        "the side thread must not arm a main cancel"
+    );
+}
+
+#[test]
+fn btw_ctrl_c_stops_only_the_side_answer() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "q1");
+    side_answer_started(&mut s, "q1");
+    assert!(s.btw.generating);
+    let effects = reduce(&mut s, ctrl('c'));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::CancelBtw { .. })]
+        ),
+        "Ctrl+C on the side thread must cancel only the side answer: {effects:?}"
+    );
+    assert_eq!(
+        s.status,
+        RuntimeStatus::Busy,
+        "the main run must be untouched"
+    );
+    assert!(!s.cancel_armed);
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCancelled));
+    assert!(!s.btw.generating);
+    assert_eq!(s.btw.turns.last().unwrap().state, BtwTurnState::Cancelled);
+}
+
+#[test]
+fn btw_ctrl_c_without_an_answer_clears_the_draft_and_never_quits() {
+    let mut s = opened();
+    ask_btw(&mut s, "q1");
+    typed(&mut s, "draft");
+    let effects = reduce(&mut s, ctrl('c'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.composer.is_empty());
+    assert!(s.running, "a side surface must never quit the app");
+    assert!(!s.quit_armed);
+}
+
+#[test]
+fn btw_reentry_keeps_the_side_thread() {
+    let mut s = opened();
+    ask_btw(&mut s, "q1");
+    side_answer_started(&mut s, "q1");
     reduce(
         &mut s,
-        Action::Runtime(RuntimeEvent::BtwStarted {
-            question: "q".into(),
+        Action::Runtime(RuntimeEvent::BtwTextDelta { delta: "a1".into() }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.surface, SurfaceFocus::Main);
+    // `/btw` alone re-opens the existing thread, clearing nothing and sending
+    // nothing.
+    s.composer.replace("/btw");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "re-entry sends nothing: {effects:?}");
+    assert_eq!(s.surface, SurfaceFocus::Btw);
+    assert_eq!(s.btw.turns.len(), 1);
+    assert_eq!(s.btw.turns[0].question, "q1");
+    assert_eq!(s.btw.turns[0].answer, "a1");
+}
+
+#[test]
+fn btw_header_tracks_the_live_main_status() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "q");
+    let before = rendered(&mut s, 100, 24);
+    assert!(
+        before.contains("返回主线程"),
+        "side-thread header: {before}"
+    );
+    // The main plan advances while the side thread holds the screen.
+    s.plan = Some(UiPlan {
+        steps: vec![
+            UiPlanStep {
+                index: 0,
+                description: "一".into(),
+                status: leveler_client_protocol::PlanStepStatus::Done,
+            },
+            UiPlanStep {
+                index: 1,
+                description: "二".into(),
+                status: leveler_client_protocol::PlanStepStatus::Running,
+            },
+        ],
+    });
+    let after = rendered(&mut s, 100, 24);
+    assert!(
+        after.contains("第 2/2 步"),
+        "header must project the live plan, not a snapshot: {after}"
+    );
+}
+
+#[test]
+fn btw_survives_main_completion_and_shows_the_verdict() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "q");
+    side_answer_started(&mut s, "q");
+    // Main finishes (with an answer) while the side thread is open: it must
+    // not crash, and the header must move to the run's own terminal verdict.
+    let message = MessageId::new("m1");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: message.clone(),
         }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: message.clone(),
+            delta: "done".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted {
+            message_id: message,
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert_eq!(s.status, RuntimeStatus::Idle);
+    let text = rendered(&mut s, 100, 24);
+    assert!(text.contains("任务已完成"), "{text}");
+    assert!(
+        s.btw.generating,
+        "the side answer's lifecycle is independent of the main turn"
     );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::BtwTextDelta { delta: "a".into() }),
     );
-    // Still running: Esc must not remove the card.
-    reduce(&mut s, key(KeyCode::Esc));
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
+    assert_eq!(s.btw.turns[0].answer, "a");
+}
+
+#[test]
+fn btw_reports_approval_without_taking_the_decision() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "q");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: approval_req(),
+        }),
+    );
+    // The header must show the wait; the decision stays on Main.
+    let text = rendered(&mut s, 100, 24);
     assert!(
-        s.transcript
-            .items()
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Btw(b) if !b.done)),
-        "running btw must stay"
+        text.contains("审批"),
+        "approval must be visible as state: {text}"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Char('y')));
+    assert!(
+        !matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::ApprovalDecision { .. })]
+        ),
+        "keys on the side thread must not answer a main approval: {effects:?}"
+    );
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+    // Returning to Main restores the decision surface intact.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.surface, SurfaceFocus::Main);
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+}
+
+#[test]
+fn btw_stream_survives_navigation_to_main_and_back() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    ask_btw(&mut s, "q1");
+    side_answer_started(&mut s, "q1");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwTextDelta {
+            delta: "part1 ".into(),
+        }),
+    );
+    // Leave while the answer streams.
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty());
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    // The rest arrives while the side thread is hidden: the view being hidden
+    // must not drop or reorder events.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwTextDelta {
+            delta: "part2".into(),
+        }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
-    assert!(s.transcript.has_finished_btw());
-    reduce(&mut s, key(KeyCode::Esc));
-    assert!(
-        !s.transcript
-            .items()
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Btw(_))),
-        "finished btw must dismiss on Esc"
+    s.composer.replace("/btw");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.surface, SurfaceFocus::Btw);
+    assert_eq!(s.btw.turns.len(), 1);
+    assert_eq!(s.btw.turns[0].answer, "part1 part2");
+    let text = rendered(&mut s, 100, 24);
+    assert_eq!(
+        text.matches("part1 part2").count(),
+        1,
+        "the answer appears exactly once: {text}"
     );
 }
 
@@ -1896,11 +2104,11 @@ fn reconnect_snapshot_restores_live_pending_interactions() {
     snap.pending_interactions = vec![
         leveler_client_protocol::UiPendingInteraction::Approval(approval_req()),
         leveler_client_protocol::UiPendingInteraction::Clarification(
-            leveler_client_protocol::UiClarificationRequest {
-                id: leveler_client_protocol::ClarificationId::new("c1"),
-                question: "which?".into(),
-                options: vec!["a".into(), "b".into()],
-            },
+            leveler_client_protocol::UiClarificationRequest::single(
+                leveler_client_protocol::ClarificationId::new("c1"),
+                "which?",
+                vec!["a".into(), "b".into()],
+            ),
         ),
     ];
 
@@ -2037,11 +2245,11 @@ fn clarification_queues_behind_open_approval_and_both_get_answered() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ClarificationRequested {
-            request: UiClarificationRequest {
-                id: ClarificationId::new("c1"),
-                question: "选哪个方案？".into(),
-                options: vec![],
-            },
+            request: UiClarificationRequest::single(
+                ClarificationId::new("c1"),
+                "选哪个方案？",
+                vec![],
+            ),
         }),
     );
     let Some(Overlay::Approval(ov)) = &s.overlay else {
@@ -2074,11 +2282,11 @@ fn clarification_queues_behind_open_approval_and_both_get_answered() {
             request_id: ClarificationId::new("c1"),
             answer: String::new(),
         },
-        PendingInteraction::Clarification(UiClarificationRequest {
-            id: ClarificationId::new("c1"),
-            question: "选哪个方案？".into(),
-            options: vec![],
-        }),
+        PendingInteraction::Clarification(UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "选哪个方案？",
+            vec![],
+        )),
     );
     assert!(s.overlay.is_none());
 }
@@ -3077,11 +3285,11 @@ fn checkpoint_created_event_is_recorded_and_restore_picker_works() {
 // ---- Clarification (ask_user) ----------------------------------------------
 
 fn clarify_req() -> leveler_client_protocol::UiClarificationRequest {
-    leveler_client_protocol::UiClarificationRequest {
-        id: leveler_client_protocol::ClarificationId::new("c1"),
-        question: "保留旧字段还是替换？".into(),
-        options: vec!["保留".into(), "替换".into()],
-    }
+    leveler_client_protocol::UiClarificationRequest::single(
+        leveler_client_protocol::ClarificationId::new("c1"),
+        "保留旧字段还是替换？",
+        vec!["保留".into(), "替换".into()],
+    )
 }
 
 #[test]
@@ -3097,7 +3305,7 @@ fn clarification_event_opens_overlay() {
 }
 
 #[test]
-fn clarification_digit_answers_option() {
+fn clarification_arrows_choose_the_option_enter_submits() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -3106,8 +3314,8 @@ fn clarification_digit_answers_option() {
         }),
     );
     assert!(
-        reduce(&mut s, key(KeyCode::Char('2'))).is_empty(),
-        "the digit is typed, Enter submits"
+        reduce(&mut s, key(KeyCode::Down)).is_empty(),
+        "the arrow only moves the focus"
     );
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_send_interaction(
@@ -4194,6 +4402,75 @@ fn alt_backspace_deletes_word_not_attachment() {
         1,
         "word delete stops at the image's name"
     );
+}
+
+/// Option+← is word-left, and the Meta encoding macOS terminals send by
+/// default (ESC b → Alt+b) must reach that binding instead of typing a `b`.
+#[test]
+fn option_left_moves_by_word_and_never_types_b() {
+    let mut s = opened();
+    typed(&mut s, "hello world");
+    // CSI-modifier form: a terminal that reports Option+← as Alt+Left.
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+    );
+    assert_eq!(s.composer.text(), "hello world");
+    assert_eq!(s.composer.cursor(), 6);
+    // Meta encoding: Option+← arrives as Alt+b (readline backward-word).
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+    );
+    assert_eq!(s.composer.text(), "hello world", "Meta+b typed a b");
+    assert_eq!(s.composer.cursor(), 0);
+}
+
+/// Option+→ is word-right, and the Meta encoding (ESC f → Alt+f) must not
+/// insert an `f`.
+#[test]
+fn option_right_moves_by_word_and_never_types_f() {
+    let mut s = opened();
+    typed(&mut s, "hello world");
+    reduce(&mut s, key(KeyCode::Home));
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+    );
+    assert_eq!(s.composer.text(), "hello world");
+    assert_eq!(s.composer.cursor(), 5);
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+    );
+    assert_eq!(s.composer.text(), "hello world", "Meta+f typed an f");
+    assert_eq!(s.composer.cursor(), 11);
+}
+
+/// Rapid alternating Option+←/→ leaves the draft exactly as typed.
+#[test]
+fn rapid_option_word_navigation_does_not_pollute_the_draft() {
+    let mut s = opened();
+    typed(&mut s, "hello world test");
+    for _ in 0..4 {
+        reduce(
+            &mut s,
+            Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+        );
+        reduce(
+            &mut s,
+            Action::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+        );
+    }
+    assert_eq!(s.composer.text(), "hello world test");
+}
+
+/// Plain b and f are ordinary text: the word-motion bindings are Alt-only.
+#[test]
+fn plain_b_and_f_still_insert() {
+    let mut s = opened();
+    typed(&mut s, "bf");
+    assert_eq!(s.composer.text(), "bf");
 }
 
 #[test]
@@ -6526,11 +6803,11 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ClarificationRequested {
-            request: leveler_client_protocol::UiClarificationRequest {
-                id: leveler_core::ClarificationId::new("c1"),
-                question: "task content?".into(),
-                options: vec![],
-            },
+            request: leveler_client_protocol::UiClarificationRequest::single(
+                leveler_core::ClarificationId::new("c1"),
+                "task content?",
+                vec![],
+            ),
         }),
     );
     assert!(matches!(s.overlay, Some(Overlay::Clarification(_))));
@@ -6543,9 +6820,9 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
         panic!("overlay closed unexpectedly");
     };
     assert!(
-        ov.input().contains("line a") && ov.input().contains("line f"),
+        ov.active_text().contains("line a") && ov.active_text().contains("line f"),
         "{}",
-        ov.input()
+        ov.active_text()
     );
     assert!(
         s.composer.is_empty(),

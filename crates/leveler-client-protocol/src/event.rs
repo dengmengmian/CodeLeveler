@@ -595,6 +595,10 @@ pub enum RuntimeEvent {
     BtwTextDelta { delta: String },
     /// Side-question finished successfully.
     BtwCompleted,
+    /// Side-question stopped by the user before it finished. Distinct from
+    /// [`Self::BtwFailed`]: the answer was interrupted, not unsuccessful, and
+    /// the partial answer (if any) is what the side thread keeps.
+    BtwCancelled,
     /// Side-question failed.
     BtwFailed { error: String },
     /// Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).
@@ -916,11 +920,11 @@ mod tests {
     fn clarification_requested_roundtrips() {
         roundtrip(
             RuntimeEvent::ClarificationRequested {
-                request: UiClarificationRequest {
-                    id: ClarificationId::new("c1"),
-                    question: "which file?".to_string(),
-                    options: vec!["a.rs".to_string()],
-                },
+                request: UiClarificationRequest::single(
+                    ClarificationId::new("c1"),
+                    "which file?",
+                    vec!["a.rs".to_string()],
+                ),
             },
             "clarification_requested",
         );

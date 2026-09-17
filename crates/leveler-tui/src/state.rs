@@ -155,6 +155,13 @@ pub struct AppState {
     pub runtime_connected: bool,
     pub session_id: SessionId,
     pub transcript: TranscriptState,
+    /// Which conversation surface owns the viewport and the composer. One
+    /// field decides both, so they cannot disagree about who is focused.
+    pub surface: crate::btw::SurfaceFocus,
+    /// The `/btw` side thread: its own conversation, draft and generation
+    /// state. Never part of the main transcript, and never merged into the
+    /// main run's context.
+    pub btw: crate::btw::BtwThread,
     /// Live raw-reasoning scratch. Feeds ONLY the status line's thinking
     /// indicator/token estimate — never rendered into the conversation, never
     /// persisted, cleared at every segment boundary (tool start, assistant
@@ -412,6 +419,8 @@ impl AppState {
             runtime_connected: true,
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
+            surface: crate::btw::SurfaceFocus::Main,
+            btw: crate::btw::BtwThread::default(),
             live_reasoning: String::new(),
             background_task_labels: std::collections::HashMap::new(),
             team: crate::multi_agent::TaskTeamView::default(),
@@ -511,6 +520,7 @@ impl AppState {
         // language, so it needs the template before the first paste.
         let template = state.image_token_template();
         state.composer.set_image_token_template(&template);
+        state.btw.draft.set_image_token_template(&template);
         state
     }
 

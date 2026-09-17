@@ -324,6 +324,46 @@ impl Composer {
         }
     }
 
+    /// `Option+←` / `Meta+b`: move to the start of the previous word.
+    ///
+    /// Word boundaries are whitespace-delimited, exactly as `delete_word_back`
+    /// walks them, and the step counts graphemes, so a CJK or emoji word moves
+    /// as one unit. Like `move_left`/`move_right`, the cursor never rests
+    /// inside an image token: a boundary that lands there snaps to the edge.
+    pub fn move_word_left(&mut self) {
+        let graphs: Vec<&str> = self.buffer.graphemes(true).collect();
+        let mut start = self.cursor;
+        while start > 0 && graphs[start - 1].trim().is_empty() {
+            start -= 1;
+        }
+        while start > 0 && !graphs[start - 1].trim().is_empty() {
+            start -= 1;
+        }
+        self.cursor = start;
+        if let Some(range) = self.token_interior() {
+            self.cursor = grapheme_count(&self.buffer[..range.start]);
+        }
+    }
+
+    /// `Option+→` / `Meta+f`: move to the end of the next word.
+    ///
+    /// The mirror of [`Composer::move_word_left`], with the same
+    /// grapheme-safe, token-aware rules.
+    pub fn move_word_right(&mut self) {
+        let graphs: Vec<&str> = self.buffer.graphemes(true).collect();
+        let mut end = self.cursor;
+        while end < graphs.len() && graphs[end].trim().is_empty() {
+            end += 1;
+        }
+        while end < graphs.len() && !graphs[end].trim().is_empty() {
+            end += 1;
+        }
+        self.cursor = end;
+        if let Some(range) = self.token_interior() {
+            self.cursor = grapheme_count(&self.buffer[..range.end]);
+        }
+    }
+
     /// Move to the start of the current logical line (`Home` / `Ctrl+A`).
     pub fn move_to_line_start(&mut self) {
         self.cursor = self.line_bounds().0;

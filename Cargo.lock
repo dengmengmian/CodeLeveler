@@ -1900,6 +1900,7 @@ dependencies = [
  "leveler-remote-agent",
  "leveler-remote-protocol",
  "leveler-storage",
+ "leveler-test-support",
  "leveler-tools",
  "leveler-tui",
  "leveler-verifier",

@@ -312,7 +312,7 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
         }
         // The question is what the interaction was ABOUT; "询问" alone says
         // nothing, and the generic field walk below never reaches `question`.
-        "request_user_input" | "ask_user" => s("question"),
+        "request_user_input" | "ask_user" => user_input_summary(&v, t),
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
         "find_files" => s("pattern"),
         "update_plan" => s("explanation"),
@@ -380,6 +380,31 @@ fn update_goal_summary_from_arguments(arguments: &str, t: &crate::i18n::UiText) 
         Ok(v) => update_goal_summary_text(&v, t),
         Err(_) => String::new(),
     }
+}
+
+/// The headline of a `request_user_input` call.
+///
+/// The multi-question form may omit `question` (the runtime derives a headline
+/// from the tab labels, but the transcript reads the raw arguments). Falling
+/// back to the question count keeps the row from saying nothing at all.
+fn user_input_summary(v: &serde_json::Value, t: &crate::i18n::UiText) -> String {
+    let headline = v
+        .get("question")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if !headline.is_empty() {
+        return headline.to_string();
+    }
+    let count = v
+        .get("questions")
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if count == 0 {
+        return String::new();
+    }
+    t.tool_question_count.replace("{}", &count.to_string())
 }
 
 /// Human-readable command line for shell / run tools (no JSON, no `cd` noise).
@@ -1906,6 +1931,38 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-question call may omit the headline, and the runtime derives one
+    /// for the interaction while the transcript reads the RAW arguments. Saying
+    /// nothing would leave the row blank on the screen and in history.
+    #[test]
+    fn a_headless_multi_question_call_names_its_question_count() {
+        let t = crate::i18n::Locale::Zh.text();
+        let args = serde_json::json!({
+            "questions": [
+                {"header": "数据策略", "question": "数据策略怎么定？", "kind": "single"},
+                {"header": "验证范围", "question": "需要跑哪些验证？", "kind": "multi"},
+            ],
+        })
+        .to_string();
+        assert_eq!(tool_summary_for("request_user_input", &args, t), "2 个问题");
+        // With a headline, the headline wins: it is what the user read.
+        let with_headline = serde_json::json!({
+            "question": "需要你的选择",
+            "questions": [{"question": "数据策略怎么定？", "kind": "single"}],
+        })
+        .to_string();
+        assert_eq!(
+            tool_summary_for("request_user_input", &with_headline, t),
+            "需要你的选择"
+        );
+        // The legacy single-question shape is unchanged.
+        let legacy = serde_json::json!({"question": "选哪个？", "options": ["a"]}).to_string();
+        assert_eq!(
+            tool_summary_for("request_user_input", &legacy, t),
+            "选哪个？"
+        );
+    }
 
     #[test]
     fn tools_footer_hint_fits_available_width() {

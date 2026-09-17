@@ -184,7 +184,10 @@ impl RemotePolicy {
             | ClientCommand::NewSessionFor { .. }
             | ClientCommand::OpenSession { .. }
             | ClientCommand::OpenSessionFor { .. }
-            | ClientCommand::Btw { .. } => RemoteVerdict::Allow,
+            | ClientCommand::Btw { .. }
+            // Stopping a side answer is narrower than stopping the turn,
+            // which is already allowed above.
+            | ClientCommand::CancelBtw { .. } => RemoteVerdict::Allow,
 
             // Allowed, but only for some payloads.
             ClientCommand::ApprovalDecision { decision, .. } => self.evaluate_decision(*decision),

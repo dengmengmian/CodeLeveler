@@ -19,6 +19,12 @@ use super::screen_nav::{
 /// result, completion) funnels through here, which is why the ghost is
 /// destroyed in one place instead of at two dozen call sites.
 pub(super) fn touch_slash_filter(state: &mut AppState) {
+    // The side thread is a plain conversation: no slash popup, no completions,
+    // no next-step ghost. Leaving the main popup state untouched also means
+    // returning to Main restores it exactly as it was.
+    if state.surface == crate::btw::SurfaceFocus::Btw {
+        return;
+    }
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
     crate::suggestion::clear(state);
@@ -618,14 +624,22 @@ fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {
         .unwrap_or(command)
         .trim()
         .to_string();
+    // `/btw` always lands on the side thread. With a question it starts one;
+    // without, it re-opens the existing thread (never a second one) so a
+    // follow-up does not require retyping the command or re-entering context.
+    super::enter_btw(state);
     if question.is_empty() {
+        return Vec::new();
+    }
+    if state.btw.generating {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: state.t().btw_usage.to_string(),
+            message: state.t().btw_busy.to_string(),
         });
         return Vec::new();
     }
-    // Do not push to the main user transcript or start a main turn — side Q only.
+    // No main user transcript and no main turn — a side question only.
+    state.btw.scroll = 0;
     vec![Effect::Send(ClientCommand::Btw {
         session_id: state.session_id.clone(),
         question,

@@ -458,6 +458,60 @@ mod tests {
         assert!(!line.contains("bg-2"), "{line}");
     }
 
+    /// The activity projection reads the live roster, so retiring a settled
+    /// child at the turn boundary removes it from the current activity area —
+    /// its transcript history is untouched.
+    #[test]
+    fn a_retired_child_leaves_the_activity_projection() {
+        let mut state = test_state();
+        state.elapsed_secs = 100;
+        state.team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: false,
+            ok: false,
+            detail: "加固 extract 模块".into(),
+            title: None,
+            profile_id: None,
+            agent_name: None,
+            read_only: false,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+        state.team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: true,
+            ok: true,
+            detail: "完成".into(),
+            title: None,
+            profile_id: None,
+            agent_name: None,
+            read_only: false,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 100,
+        });
+        assert!(
+            summaries(&state)
+                .iter()
+                .any(|r| r.id == ActivityId::Child("c1".into())),
+            "a settled child is current activity until its turn ends"
+        );
+
+        assert!(state.team.retire_settled(state.elapsed_secs));
+        assert!(
+            summaries(&state).is_empty(),
+            "the previous turn's terminal child is not this turn's activity: {:?}",
+            summaries(&state)
+        );
+    }
+
     /// Three children spawned into the same repository read as three copies of
     /// the same absolute path: the model opens every brief with "你在仓库
     /// <repo>（工作区根目录）中…", which fills the row before the reason starts.

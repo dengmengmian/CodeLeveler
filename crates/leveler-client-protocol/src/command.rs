@@ -268,6 +268,10 @@ pub enum ClientCommand {
         session_id: SessionId,
         question: String,
     },
+    /// Stop the in-flight `/btw` side answer for a session. Deliberately
+    /// separate from `CancelCurrentTurn`: a side thread's answer has its own
+    /// lifecycle, and stopping it must never stop the main turn.
+    CancelBtw { session_id: SessionId },
     /// Read-only observatory query. Does not mutate runtime, tools, or
     /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
     QueryObservability {
@@ -426,6 +430,7 @@ impl ClientCommand {
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
+            | ClientCommand::CancelBtw { session_id }
             | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
@@ -830,6 +835,16 @@ mod tests {
                 question: "这个函数做什么？".to_string(),
             },
             "btw",
+        );
+    }
+
+    #[test]
+    fn cancel_btw_roundtrips() {
+        roundtrip(
+            ClientCommand::CancelBtw {
+                session_id: SessionId::new("s1"),
+            },
+            "cancel_btw",
         );
     }
 }

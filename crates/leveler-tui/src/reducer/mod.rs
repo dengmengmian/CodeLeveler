@@ -9,6 +9,7 @@ use leveler_client_protocol::{
 };
 
 use crate::action::{Action, Effect, EffectCompletion};
+use crate::btw::SurfaceFocus;
 use crate::conversation::interaction::{self, Hit};
 use crate::screen::Screen;
 use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
@@ -713,13 +714,34 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return Vec::new();
     }
 
-    // An open overlay captures all key input .
-    if state.overlay.is_some() {
+    // The side thread owns its own keys. `Esc` is navigation back to Main and
+    // `Ctrl+C` stops only the side answer — both are consumed here, before the
+    // overlay gate and before the main cancel path, so one keystroke can never
+    // act on two surfaces. This is the whole reason `/btw` needs a surface:
+    // without it, Esc/Ctrl+C fell through to the main run's cancellation.
+    if state.surface == SurfaceFocus::Btw {
+        if key.code == KeyCode::Esc {
+            leave_btw(state);
+            return Vec::new();
+        }
+        if is_ctrl_c(&key) {
+            return cancel_btw_answer(state);
+        }
+        if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return submit_btw(state);
+        }
+    }
+
+    // An open overlay captures all key input. On the side thread it does not:
+    // a main approval belongs to the main surface and waits for the user to
+    // return, shown there only as live status in the header.
+    if state.overlay.is_some() && state.surface == SurfaceFocus::Main {
         return handle_overlay_key(state, key);
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let btw = state.surface == SurfaceFocus::Btw;
 
     // Ctrl+C is the one key that reads (and advances) the escalation state.
     if is_ctrl_c(&key) {
@@ -759,7 +781,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             // Bracketed paste cannot carry image bytes, and many terminals send
             // nothing at all for Cmd+V on an image, so the clipboard image has
             // its own key rather than a command.
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if !btw => {
                 return vec![Effect::Send(ClientCommand::AddClipboardImage {
                     session_id: state.session_id.clone(),
                 })];
@@ -776,9 +798,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
     // Shift+Tab cycles the permission profile from anywhere — the one binding
     // every terminal coding agent shares, so muscle memory carries over.
-    // Some terminals report it as Tab+SHIFT rather than BackTab.
-    if matches!(key.code, KeyCode::BackTab)
-        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
+    // Some terminals report it as Tab+SHIFT rather than BackTab. Not on the
+    // side thread: changing the main run's permission profile is exactly the
+    // authority a side conversation must not have.
+    if !btw
+        && (matches!(key.code, KeyCode::BackTab)
+            || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT)))
     {
         return cycle_permission_profile(state);
     }
@@ -789,10 +814,26 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
 
     // Whether the slash-command popup is showing (drives Up/Down/Tab/Enter/Esc).
-    let popup_len = crate::screen::visible_slash_popup(state).len();
-    let file_popup_len = crate::screen::visible_file_popup(state).len();
-    let skill_popup_len = crate::screen::visible_skill_popup(state).len();
-    let popup_len = popup_len.max(file_popup_len).max(skill_popup_len);
+    // The side thread is a plain conversation: no slash popups, no completions,
+    // no next-step ghost.
+    let popup_len = if btw {
+        0
+    } else {
+        crate::screen::visible_slash_popup(state)
+            .len()
+            .max(crate::screen::visible_file_popup(state).len())
+            .max(crate::screen::visible_skill_popup(state).len())
+    };
+    let file_popup_len = if btw {
+        0
+    } else {
+        crate::screen::visible_file_popup(state).len()
+    };
+    let skill_popup_len = if btw {
+        0
+    } else {
+        crate::screen::visible_skill_popup(state).len()
+    };
     if popup_len > 0 {
         state.slash_selected = state.slash_selected.min(popup_len - 1);
     } else {
@@ -800,6 +841,20 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
 
     match key.code {
+        // Side thread: its own conversation scrolls with the shared scroll keys;
+        // an empty composer means the user is reading, not editing.
+        KeyCode::PageUp if btw => {
+            state.btw.scroll = state.btw.scroll.saturating_add(5);
+        }
+        KeyCode::PageDown if btw => {
+            state.btw.scroll = state.btw.scroll.saturating_sub(5);
+        }
+        KeyCode::Up if btw && state.composer.is_empty() => {
+            state.btw.scroll = state.btw.scroll.saturating_add(1);
+        }
+        KeyCode::Down if btw && state.composer.is_empty() => {
+            state.btw.scroll = state.btw.scroll.saturating_sub(1);
+        }
         // 待发送 focus: ↑/↓ choose an item, Enter sends it, Delete/Backspace
         // deletes it, Esc goes back to the composer. Typing still claims Input.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Pending => {
@@ -913,7 +968,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.composer.delete_word_back();
             touch_slash_filter(state);
         }
-        KeyCode::Char('m') if ctrl => open_model_picker(state),
+        KeyCode::Char('m') if ctrl && !btw => open_model_picker(state),
         // Ctrl+? (and Ctrl+/) open Help — low-frequency bindings live there.
         // A terminal without the Kitty keyboard protocol sends 0x1F for both,
         // which crossterm reports as Ctrl+7: without that arm the shortcut the
@@ -927,14 +982,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // A visible next-step ghost claims Tab before focus switching: the
         // suggestion becomes real text and nothing is sent. Enter still has to
         // be pressed. Shift+Tab is untouched — it cycles permissions above.
-        KeyCode::Tab if crate::suggestion::is_visible(state) => {
+        KeyCode::Tab if crate::suggestion::is_visible(state) && !btw => {
             crate::suggestion::accept(state);
             touch_slash_filter(state);
         }
         // No completion popup and no ghost: Tab cycles the workbench regions.
         // A live running command earns a stop right after the transcript's
         // scroll, so the contextual `x` is reachable without the mouse.
-        KeyCode::Tab => {
+        KeyCode::Tab if !btw => {
             state.workbench_focus = match state.workbench_focus {
                 // 待发送 sits right above the composer, so it is the next stop.
                 WorkbenchFocus::Input if !state.pending_inputs.is_empty() => {
@@ -956,6 +1011,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 WorkbenchFocus::Pending => WorkbenchFocus::Conversation,
             };
         }
+        // macOS terminals with "Option as Meta" encode Option+←/→ as the
+        // readline backward-word/forward-word sequences ESC b / ESC f, which
+        // crossterm decodes as Alt+b / Alt+f. Recognize both those Meta-encoded
+        // forms and the CSI-modifier form (Alt+←/→), before the generic Char
+        // arm, so a Meta-encoded arrow can never fall through to InsertChar.
+        KeyCode::Char('b') if alt => state.composer.move_word_left(),
+        KeyCode::Char('f') if alt => state.composer.move_word_right(),
+        KeyCode::Left if alt => state.composer.move_word_left(),
+        KeyCode::Right if alt => state.composer.move_word_right(),
         KeyCode::Char(c) if !ctrl && !c.is_control() => {
             // Typing always claims Input focus.
             state.workbench_focus = WorkbenchFocus::Input;
@@ -988,10 +1052,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.slash_selected = (state.slash_selected + 1).min(popup_len - 1);
         }
         // Shift+↑/↓: jump between user turns without touching the composer draft.
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && !btw => {
             navigate_user_turn(state, -1);
         }
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) && !btw => {
             navigate_user_turn(state, 1);
         }
         KeyCode::Left => state.composer.move_left(),
@@ -999,7 +1063,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Home => state.composer.move_to_line_start(),
         // Empty composer: End jumps to the live bottom (Approach A). With text,
         // End stays "end of line" so multi-line editing is unchanged.
-        KeyCode::End if state.composer.is_empty() => {
+        KeyCode::End if state.composer.is_empty() && !btw => {
             request_jump_to_bottom(state);
         }
         KeyCode::End => state.composer.move_to_line_end(),
@@ -1042,11 +1106,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.composer.down();
             dismiss_suggestion_on_history_browse(state);
         }
-        KeyCode::Char('p') if !ctrl && state.composer.is_empty() => {
+        KeyCode::Char('p') if !ctrl && state.composer.is_empty() && !btw => {
             // Toggle plan panel when not typing.
             state.plan_collapsed = !state.plan_collapsed;
         }
-        KeyCode::Char('a') if !ctrl && state.composer.is_empty() => {
+        KeyCode::Char('a') if !ctrl && state.composer.is_empty() && !btw => {
             // Toggle collaboration surface density when not typing — the
             // same convention as `p` for the plan dock.
             state.collaboration_collapsed = !state.collaboration_collapsed;
@@ -1068,17 +1132,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         // Dismissing the next-step ghost is the narrowest undo on this screen,
         // so it wins while it is showing — and it does nothing else.
-        KeyCode::Esc if crate::suggestion::is_visible(state) => {
+        KeyCode::Esc if crate::suggestion::is_visible(state) && !btw => {
             crate::suggestion::clear(state);
         }
         // Esc is the interrupt every other coding-agent CLI uses. It escalates
         // cancel → force-cancel like Ctrl+C does, but stops there: quitting on
-        // a keypress the user reached for to *stay* would be a trap.
+        // a keypress the user reached for to *stay* would be a trap. This arm
+        // is reachable only on the MAIN surface; the side thread consumed Esc
+        // above, so a side-thread Esc can never cancel the main run.
         KeyCode::Esc if state.is_busy() => return request_cancel(state),
-        KeyCode::Esc if state.transcript.has_finished_btw() => {
-            let _ = state.transcript.dismiss_latest_finished_btw();
-            state.notification = None;
-        }
         KeyCode::Esc => {
             state.notification = None;
         }
@@ -1329,6 +1391,77 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
         message: "正在取消当前任务，再按一次强制取消".to_string(),
     });
     vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+        session_id: state.session_id.clone(),
+    })]
+}
+
+/// Move keyboard focus to the `/btw` side thread.
+///
+/// The main draft is stashed in the side thread's slot and the side thread's
+/// own draft becomes the live composer, so one composer implementation serves
+/// both surfaces without leaking text across them.
+pub(super) fn enter_btw(state: &mut AppState) {
+    if state.surface == SurfaceFocus::Btw {
+        return;
+    }
+    std::mem::swap(&mut state.composer, &mut state.btw.draft);
+    state.surface = SurfaceFocus::Btw;
+    state.workbench_focus = WorkbenchFocus::Input;
+    state.notification = None;
+    // A main cancel armed before the user came here must not stay armed across
+    // a surface where Ctrl+C means something else.
+    state.disarm_ctrlc();
+    crate::suggestion::clear(state);
+}
+
+/// Return to the main surface. Navigation only — never a cancellation.
+pub(super) fn leave_btw(state: &mut AppState) {
+    if state.surface != SurfaceFocus::Btw {
+        return;
+    }
+    std::mem::swap(&mut state.composer, &mut state.btw.draft);
+    state.surface = SurfaceFocus::Main;
+    state.workbench_focus = WorkbenchFocus::Input;
+}
+
+/// Send the side thread's draft as its next question.
+fn submit_btw(state: &mut AppState) -> Vec<Effect> {
+    if state.btw.generating {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().btw_busy.to_string(),
+        });
+        return Vec::new();
+    }
+    let text = state.composer.take();
+    let trimmed = text.trim();
+    let question = trimmed
+        .strip_prefix("/btw")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if question.is_empty() {
+        return Vec::new();
+    }
+    state.btw.scroll = 0;
+    vec![Effect::Send(ClientCommand::Btw {
+        session_id: state.session_id.clone(),
+        question: question.to_string(),
+    })]
+}
+
+/// `Ctrl+C` on the side thread: stop only its own answer.
+///
+/// With nothing streaming it clears a draft instead. A side surface never
+/// quits the app and never cancels the main run.
+fn cancel_btw_answer(state: &mut AppState) -> Vec<Effect> {
+    if !state.btw.generating {
+        if !state.composer.is_empty() {
+            state.composer.replace("");
+        }
+        state.notification = None;
+        return Vec::new();
+    }
+    vec![Effect::Send(ClientCommand::CancelBtw {
         session_id: state.session_id.clone(),
     })]
 }

@@ -16,13 +16,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::i18n::UiText;
 use crate::plan_viewport::PlanViewportRow;
 use crate::render::{
-    COMPOSER_MAX_ROWS, btw_card_lines, composer_box_lines, composer_visible_rows,
-    render_attachments, render_slash_popup,
+    COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
+    render_slash_popup,
 };
 use crate::screen::Screen;
 use crate::state::AppState;
 use crate::status_line::status_lines;
-use crate::transcript::TranscriptItem;
 
 /// The conversation never shrinks below this, whatever the plan dock wants.
 const MIN_CONVERSATION_ROWS: u16 = 3;
@@ -272,8 +271,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // chunks[11] = breathing row; the roster docks under the footer.
     render_team_panel(frame, chunks[12], state);
 
-    // /btw floats over the conversation viewport (not in the scroll stream).
-    render_btw_overlay(frame, chunks[1], state);
+    // /btw is its own surface (see `crate::btw`), not an overlay here.
     // Toast over conversation bottom — must not change vertical layout.
     render_notification_toast(frame, chunks[1], state);
 
@@ -757,51 +755,6 @@ fn render_notification_toast(frame: &mut Frame, conv: Rect, state: &AppState) {
         )),
         area,
     );
-}
-
-// ── /btw floating card (over Conversation bottom) ───────────────────────────
-
-fn render_btw_overlay(frame: &mut Frame, conv: Rect, state: &AppState) {
-    if conv.height < 4 || conv.width < 12 {
-        return;
-    }
-    let Some(block) = state
-        .transcript
-        .items()
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            TranscriptItem::Btw(b) => Some(b),
-            _ => None,
-        })
-    else {
-        return;
-    };
-
-    let width = conv.width as usize;
-    let lines = btw_card_lines(
-        block,
-        &state.theme,
-        width.saturating_sub(2).max(12),
-        state.t(),
-    );
-    if lines.is_empty() {
-        return;
-    }
-    // Float above the bottom of the conversation viewport with a 1-col margin.
-    let h = (lines.len() as u16)
-        .min(conv.height.saturating_sub(1))
-        .max(1);
-    let y = conv.y + conv.height.saturating_sub(h);
-    let x = conv.x.saturating_add(1);
-    let w = conv.width.saturating_sub(2).max(1);
-    let area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 // ── Input box ───────────────────────────────────────────────────────────────

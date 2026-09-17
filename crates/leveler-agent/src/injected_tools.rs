@@ -10,18 +10,65 @@ pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
 pub(crate) const ASK_USER_TOOL: &str = "ask_user";
 
 /// Shared schema for `request_user_input` and `ask_user`.
+///
+/// `questions` is the multi-question form: one interaction the user answers
+/// as a set, shown as tabs. `question`/`options` remain the single-question
+/// form so a model that asks one thing keeps working unchanged.
 fn user_input_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "question": { "type": "string", "description": "The question to ask." },
+            "question": {
+                "type": "string",
+                "description": "The question to ask. With `questions`, use it as the interaction's one-line headline."
+            },
             "options": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Optional candidate answers."
+                "description": "Candidate answers for the single-question form."
+            },
+            "questions": {
+                "type": "array",
+                "description": "Ask several questions at once. The user answers them in one interaction, one tab each. Use it when the answers depend on each other or belong to the same decision; do not split one question into several.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "header": {
+                            "type": "string",
+                            "description": "Short tab label (2-6 characters), e.g. 数据策略."
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "The full question, one short sentence."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["single", "multi", "text"],
+                            "description": "single = exactly one of `options`; multi = any number of `options`; text = the user types the answer."
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Candidate answers for single/multi. Put the recommended one first."
+                        },
+                        "allow_other": {
+                            "type": "boolean",
+                            "description": "Add a free-text entry ('其他…') after the options. Use it when the options may not cover the user's case."
+                        },
+                        "min_choices": {
+                            "type": "integer",
+                            "description": "multi only: fewest picks the user must make (default 0)."
+                        },
+                        "max_choices": {
+                            "type": "integer",
+                            "description": "multi only: most picks the user may make (default: all options)."
+                        }
+                    },
+                    "required": ["question", "kind"]
+                }
             }
         },
-        "required": ["question"]
+        "required": []
     })
 }
 
@@ -41,7 +88,11 @@ fn user_input_description(primary_name: &str, alias: Option<&str>) -> String {
          put the recommended option first when you have a preference. Do not rely on \
          open-ended chat prose alone (\"想问一下\", \"waiting for confirmation\") — that \
          is a fake pause. Omit `options` only for free-form answers (credentials, \
-         names, paths the user must type). Keep `question` to one short sentence."
+         names, paths the user must type). \
+         Several related forks can be asked at once: pass `questions` (each with \
+         `header`, `question`, `kind`, and `options`) and give the interaction a \
+         one-line `question` headline. The user answers them in one interaction; do \
+         not ask more than about four at a time. Keep `question` to one short sentence."
     )
 }
 
@@ -1066,6 +1117,44 @@ mod tests {
         assert!(
             !required.iter().any(|field| field == "next_step"),
             "next_step must be omitted when there is no genuine follow-up"
+        );
+    }
+
+    #[test]
+    fn request_user_input_advertises_multi_question_shape() {
+        let tool = request_user_input_tool_definition();
+        let questions = &tool.input_schema["properties"]["questions"];
+        assert_eq!(questions["type"], "array");
+        let item = &questions["items"];
+        for field in [
+            "header",
+            "question",
+            "kind",
+            "options",
+            "allow_other",
+            "min_choices",
+            "max_choices",
+        ] {
+            assert!(
+                item["properties"].get(field).is_some(),
+                "the question schema must carry `{field}`: {item}"
+            );
+        }
+        let kinds = item["properties"]["kind"]["enum"].as_array().unwrap();
+        assert_eq!(
+            kinds.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>(),
+            vec!["single", "multi", "text"]
+        );
+        // Neither form may be forced on the model: a single-question call
+        // omits `questions`, and a multi-question call may omit the headline.
+        assert!(
+            !tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "questions" || f == "question"),
+            "both shapes must stay optional: {}",
+            tool.input_schema
         );
     }
 

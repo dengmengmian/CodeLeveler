@@ -634,6 +634,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::ForkSession { .. } => "fork_session",
         ClientCommand::RestoreCheckpoint { .. } => "restore_checkpoint",
         ClientCommand::Btw { .. } => "btw",
+        ClientCommand::CancelBtw { .. } => "cancel_btw",
         ClientCommand::Recap { .. } => "recap",
         ClientCommand::RunUserShell { .. } => "run_user_shell",
         ClientCommand::CancelUserShell { .. } => "cancel_user_shell",

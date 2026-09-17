@@ -42,7 +42,10 @@ pub use leveler_engine::{
     ChildToolEvent, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError,
     TranscriptSink,
 };
-pub use leveler_execution::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
+pub use leveler_execution::{
+    AutoClarify, ClarificationQuestion, ClarificationQuestionKind, ClarificationRequest, Clarifier,
+    ClarifyOutcome,
+};
 pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,

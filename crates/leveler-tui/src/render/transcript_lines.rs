@@ -171,7 +171,6 @@ pub fn item_render(
             );
         }
         TranscriptItem::GoalRecap(block) => goal_recap_lines(block, theme, wrap_width, &mut out, t),
-        TranscriptItem::Btw(block) => out.extend(btw_card_lines(block, theme, wrap_width, t)),
     }
     out
 }
@@ -278,148 +277,6 @@ fn goal_recap_lines(
             out,
         );
     }
-}
-
-/// Floating `/btw` card (overlay on Conversation). Full border, question on top,
-/// answer or Answering… / Esc status on the bottom — not mixed into main history.
-pub(crate) fn btw_card_lines(
-    block: &crate::transcript::BtwBlock,
-    theme: &Theme,
-    wrap_width: usize,
-    t: &crate::i18n::UiText,
-) -> Vec<Line<'static>> {
-    let border = Style::default().fg(theme.accent.secondary);
-    let muted = Style::default().fg(theme.text.secondary);
-    let text = Style::default().fg(theme.text.primary);
-    let err = Style::default().fg(theme.status.error);
-    let accent = Style::default().fg(theme.accent.secondary);
-
-    let box_w = wrap_width.max(16);
-    let inner_w = box_w.saturating_sub(2).max(8);
-
-    let framed = |payload: Vec<Span<'static>>| -> Line<'static> {
-        let used: usize = payload
-            .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
-        let pad = inner_w.saturating_sub(used);
-        let mut spans = Vec::with_capacity(payload.len() + 3);
-        spans.push(Span::styled("│", border));
-        spans.extend(payload);
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        spans.push(Span::styled("│", border));
-        Line::from(spans)
-    };
-
-    let mut out = vec![Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(inner_w)),
-        border,
-    ))];
-
-    // Question: `/btw <question>`
-    let q_prefix = "/btw ";
-    let q_budget = inner_w
-        .saturating_sub(1 + UnicodeWidthStr::width(q_prefix))
-        .max(4);
-    let q_lines = wrap(&block.question, q_budget);
-    for (i, line) in q_lines.into_iter().enumerate() {
-        if i == 0 {
-            out.push(framed(vec![
-                Span::raw(" "),
-                Span::styled(q_prefix.to_string(), accent.add_modifier(Modifier::BOLD)),
-                Span::styled(line, text),
-            ]));
-        } else {
-            out.push(framed(vec![
-                Span::raw(" "),
-                Span::raw(" ".repeat(UnicodeWidthStr::width(q_prefix))),
-                Span::styled(line, text),
-            ]));
-        }
-    }
-
-    // Blank separator row.
-    out.push(framed(vec![Span::raw(" ".repeat(inner_w))]));
-
-    // Answer body or status row with Esc hint on the right.
-    let status_right = "[Esc]";
-    let status_right_w = UnicodeWidthStr::width(status_right);
-
-    if block.answer.is_empty() && !block.done {
-        let left = if block.failed {
-            t.btw_failed
-        } else {
-            t.btw_answering
-        };
-        let left_style = if block.failed { err } else { muted };
-        let gap = inner_w
-            .saturating_sub(1 + UnicodeWidthStr::width(left) + status_right_w)
-            .max(1);
-        out.push(framed(vec![
-            Span::raw(" "),
-            Span::styled(left.to_string(), left_style),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(status_right.to_string(), muted),
-        ]));
-    } else if block.failed && block.answer.is_empty() {
-        let left = t.btw_failed;
-        let gap = inner_w
-            .saturating_sub(1 + UnicodeWidthStr::width(left) + status_right_w)
-            .max(1);
-        out.push(framed(vec![
-            Span::raw(" "),
-            Span::styled(left.to_string(), err),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(status_right.to_string(), muted),
-        ]));
-    } else {
-        let doc = crate::markdown::MdDoc::parse(&block.answer);
-        let mut answer_lines = doc.to_lines(inner_w.saturating_sub(2).max(4), theme);
-        const MAX_A: usize = 8;
-        let truncated = answer_lines.len() > MAX_A;
-        if truncated {
-            answer_lines.truncate(MAX_A);
-        }
-        for line in answer_lines {
-            let mut spans = vec![Span::raw(" ")];
-            let mut used = 1usize;
-            for sp in line.spans {
-                used += UnicodeWidthStr::width(sp.content.as_ref());
-                spans.push(sp);
-            }
-            let _ = used;
-            out.push(framed(spans));
-        }
-        if truncated {
-            out.push(framed(vec![Span::styled(" …", muted)]));
-        }
-        // Status footer with Esc when finished.
-        if block.done || block.failed {
-            let left = if block.failed {
-                t.btw_failed
-            } else {
-                t.btw_dismiss
-            };
-            let left_style = if block.failed { err } else { muted };
-            let gap = inner_w
-                .saturating_sub(1 + UnicodeWidthStr::width(left) + status_right_w)
-                .max(1);
-            out.push(framed(vec![
-                Span::raw(" "),
-                Span::styled(left.to_string(), left_style),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(status_right.to_string(), muted),
-            ]));
-        }
-    }
-
-    out.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(inner_w)),
-        border,
-    )));
-    out
 }
 
 /// The single terminal-failure block. The primary lines carry product copy and
@@ -680,7 +537,6 @@ pub fn item_is_final(item: &TranscriptItem) -> bool {
         TranscriptItem::SubAgent(b) => b.status != ToolStatus::Running,
         // Sealed = another item followed. Never a completion claim; it only
         // says this text will not grow, which is all scrollback needs.
-        TranscriptItem::Btw(b) => b.done,
         _ => true,
     }
 }

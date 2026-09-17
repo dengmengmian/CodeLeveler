@@ -392,7 +392,7 @@ pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
 };
-pub(crate) use transcript_lines::{btw_card_lines, sub_agent_detail, user_shell_lines};
+pub(crate) use transcript_lines::{sub_agent_detail, user_shell_lines};
 
 pub(crate) use panes::pad_line_to_width;
 pub(crate) use panes::{render_list_focused, render_scrolled};
@@ -417,7 +417,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     state.theme.paint_canvas(frame, area);
 
     if state.active_screen == Screen::Conversation {
-        crate::workbench::render_workbench(frame, state);
+        // The side thread is a surface of its own, not a card over the main
+        // workbench: it owns the viewport and the composer while focused.
+        if state.surface == crate::btw::SurfaceFocus::Btw {
+            crate::btw::render(frame, area, state);
+        } else {
+            crate::workbench::render_workbench(frame, state);
+        }
         return;
     }
 
@@ -1947,16 +1953,18 @@ mod tests {
         );
     }
 
+    /// A text question puts the terminal cursor in its input; a choice list
+    /// does not, because its focus marker is a cell in the list.
     #[test]
     fn clarification_overlay_places_cursor_on_its_input() {
         let s = test_state();
         let overlay = crate::overlay::Overlay::Clarification(Box::new(
             crate::overlay::ClarificationOverlay::new(
-                leveler_client_protocol::UiClarificationRequest {
-                    id: leveler_client_protocol::ClarificationId::new("c1"),
-                    question: "选哪个？".into(),
-                    options: vec!["A".into()],
-                },
+                leveler_client_protocol::UiClarificationRequest::single(
+                    leveler_client_protocol::ClarificationId::new("c1"),
+                    "补充要求？",
+                    vec![],
+                ),
             ),
         ));
         // The shared overlay content builder feeds both the workbench inline
@@ -1965,45 +1973,89 @@ mod tests {
             crate::overlay::content_lines(&overlay, &s.theme, 76, s.locale);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
         assert!(
-            title.contains("选哪个？") || joined.contains("选哪个？"),
+            title.contains("补充要求？") || joined.contains("补充要求？"),
             "{title} / {joined}"
         );
         assert!(
             cursor.is_some(),
             "clarification input needs a visible cursor"
         );
+
+        let choice = crate::overlay::Overlay::Clarification(Box::new(
+            crate::overlay::ClarificationOverlay::new(
+                leveler_client_protocol::UiClarificationRequest::single(
+                    leveler_client_protocol::ClarificationId::new("c2"),
+                    "选哪个？",
+                    vec!["A".into(), "B".into()],
+                ),
+            ),
+        ));
+        let (_, lines, cursor) = crate::overlay::content_lines(&choice, &s.theme, 76, s.locale);
+        assert!(cursor.is_none(), "a list needs no terminal cursor");
+        let rows: Vec<String> = lines.iter().map(line_str).collect();
+        assert!(
+            rows.iter().any(|r| r.starts_with('❯')),
+            "the list marks focus in a cell instead: {rows:#?}"
+        );
         // The explicit waiting-state copy is asserted on the live status line in
         // status_line::tests::clarification_overlay_is_awaiting_user.
     }
 
-    /// Enter submits, so a typed digit must say which option it stands for
-    /// before it is sent — otherwise the only feedback is the bare character.
+    /// The focused option is marked with a cursor, not with a digit typed
+    /// into the answer field: the answer is the option the arrows are on.
     #[test]
-    fn a_typed_digit_marks_the_option_it_answers() {
+    fn the_focused_option_carries_the_cursor_marker() {
         let s = test_state();
         let mut ov = crate::overlay::ClarificationOverlay::new(
-            leveler_client_protocol::UiClarificationRequest {
-                id: leveler_client_protocol::ClarificationId::new("c1"),
-                question: "选哪个？".into(),
-                options: vec!["保留".into(), "替换".into()],
-            },
+            leveler_client_protocol::UiClarificationRequest::single(
+                leveler_client_protocol::ClarificationId::new("c1"),
+                "选哪个？",
+                vec!["保留".into(), "替换".into()],
+            ),
         );
+        // Arrows, not digits: the second option takes the cursor.
         ov.on_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('2'),
+            crossterm::event::KeyCode::Down,
             crossterm::event::KeyModifiers::empty(),
         ));
         let overlay = crate::overlay::Overlay::Clarification(Box::new(ov));
         let (_, lines, _) = crate::overlay::content_lines(&overlay, &s.theme, 76, s.locale);
         let rows: Vec<String> = lines.iter().map(line_str).collect();
-        let marked: Vec<&String> = rows.iter().filter(|r| r.starts_with("› ")).collect();
+        let marked: Vec<&String> = rows.iter().filter(|r| r.starts_with('❯')).collect();
+        assert_eq!(marked.len(), 1, "exactly one row is focused: {rows:#?}");
+        assert!(marked[0].contains("替换"), "the cursor moved: {rows:#?}");
         assert!(
-            marked.iter().any(|r| r.contains("2. 替换")),
-            "the answered option is marked: {rows:#?}"
+            !rows
+                .iter()
+                .any(|r| r.starts_with("  保留") && r.contains('❯')),
+            "focus is not color-only: {rows:#?}"
         );
-        assert!(
-            !rows.iter().any(|r| r.starts_with("› 1. ")),
-            "only the answered option is marked: {rows:#?}"
+    }
+
+    #[test]
+    fn an_answered_single_choice_marks_the_option_it_recorded() {
+        let s = test_state();
+        let mut ov = crate::overlay::ClarificationOverlay::new(
+            leveler_client_protocol::UiClarificationRequest::single(
+                leveler_client_protocol::ClarificationId::new("c1"),
+                "选哪个？",
+                vec!["保留".into(), "替换".into()],
+            ),
         );
+        ov.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        ov.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        let overlay = crate::overlay::Overlay::Clarification(Box::new(ov));
+        let (_, lines, _) = crate::overlay::content_lines(&overlay, &s.theme, 76, s.locale);
+        let rows: Vec<String> = lines.iter().map(line_str).collect();
+        let chosen: Vec<&String> = rows.iter().filter(|r| r.contains('✓')).collect();
+        assert_eq!(chosen.len(), 1, "one recorded pick is marked: {rows:#?}");
+        assert!(chosen[0].contains("替换"), "{rows:#?}");
     }
 
     #[test]
@@ -2839,31 +2891,19 @@ mod tests {
     }
 
     #[test]
-    fn btw_answer_renders_markdown_bold_not_raw_asterisks() {
-        let state = test_state();
-        let block = crate::transcript::BtwBlock {
-            question: "还没有完事吗？".into(),
-            answer: "审查完成。**没有发现明显问题**。\n\n- 编译通过\n- 测试通过".into(),
-            done: true,
-            failed: false,
-        };
-        let lines = super::btw_card_lines(&block, &state.theme, 60, state.t());
-        let text = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<String>();
-        assert!(
-            text.contains("没有发现明显问题"),
-            "bold text should appear: {text:?}"
-        );
-        assert!(
-            !text.contains("**"),
-            "raw markdown markers must not remain: {text:?}"
-        );
-        assert!(
-            text.contains("编译通过") || text.contains("•"),
-            "list content: {text:?}"
-        );
+    fn btw_surface_renders_markdown_bold_not_raw_asterisks() {
+        let mut state = test_state();
+        state.surface = crate::btw::SurfaceFocus::Btw;
+        state.btw.begin("还没有完事吗？".into());
+        state
+            .btw
+            .append("审查完成。**没有发现明显问题**。\n\n- 编译通过\n- 测试通过");
+        state.btw.finish(crate::btw::BtwTurnState::Done, None);
+        let text = render_text(&mut state, 80, 24);
+        assert!(text.contains("没有发现明显问题"), "{text}");
+        assert!(!text.contains("**"), "raw markdown markers: {text}");
+        assert!(text.contains("编译通过"), "list content: {text}");
+        assert!(text.contains("返回主线程"), "side-thread header: {text}");
     }
 
     fn sample_remote() -> crate::state::RemoteState {

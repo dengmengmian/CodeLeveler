@@ -47,7 +47,10 @@ pub use background::{
     BackgroundTaskStatus, MutationBaseline,
 };
 pub use checkpoint::Checkpoint;
-pub use clarify::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
+pub use clarify::{
+    AutoClarify, ClarificationQuestion, ClarificationQuestionKind, ClarificationRequest, Clarifier,
+    ClarifyOutcome,
+};
 pub use command::{
     CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, ProcessError,
     ProcessIdentity, ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,

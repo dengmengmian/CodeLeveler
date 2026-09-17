@@ -4,7 +4,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
 use leveler_core::{ApprovalId, ClarificationId};
-use leveler_execution::{ApprovalRequest, RiskLevel};
+use leveler_execution::{
+    ApprovalRequest, ClarificationQuestion, ClarificationQuestionKind, RiskLevel,
+};
 use leveler_model::ToolCall;
 
 use leveler_lifecycle::ProgressLedger;
@@ -15,6 +17,73 @@ use super::{
 };
 use crate::authorization::action_fingerprint;
 use crate::sub_agent::{AgentRole, ChildResult};
+
+/// Read the structured `questions` array of a `request_user_input` call.
+///
+/// The tool input is model-authored, so every field is optional here and a
+/// question that names neither a prompt nor options is dropped rather than
+/// shown as an empty tab. Absent or unusable shapes yield no questions, which
+/// the caller reads as the legacy single-question request.
+fn parse_clarification_questions(arguments: &serde_json::Value) -> Vec<ClarificationQuestion> {
+    let Some(items) = arguments.get("questions").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let question = item
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let options: Vec<String> = item
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if question.is_empty() && options.is_empty() {
+                return None;
+            }
+            let kind = match item.get("kind").and_then(|v| v.as_str()) {
+                Some("multi") => ClarificationQuestionKind::Multi,
+                Some("text") => ClarificationQuestionKind::Text,
+                _ => ClarificationQuestionKind::Single,
+            };
+            let min_choices = item
+                .get("min_choices")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let max_choices = item
+                .get("max_choices")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.min(u32::MAX as u64) as u32);
+            Some(ClarificationQuestion {
+                header: item
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                question,
+                kind,
+                options,
+                allow_other: item
+                    .get("allow_other")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                min_choices,
+                max_choices,
+            })
+        })
+        .collect()
+}
 
 /// Plain words for why a run ended, for a parent model rather than a log.
 /// A budget stop names the limit that fired; one without a resource
@@ -109,11 +178,12 @@ impl Executor {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let question = call
+        let mut question = call
             .arguments
             .get("question")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+            .trim()
             .to_string();
         let options = call
             .arguments
@@ -125,6 +195,25 @@ impl Executor {
                     .collect()
             })
             .unwrap_or_default();
+        let questions = parse_clarification_questions(&call.arguments);
+        // A multi-question call may omit the headline. The interaction still
+        // needs one: it is the transcript row's summary and the engine's
+        // record of what was asked. Derive it from the tab labels rather than
+        // leaving the record blank.
+        if question.is_empty() && !questions.is_empty() {
+            question = questions
+                .iter()
+                .map(|q| {
+                    if q.header.trim().is_empty() {
+                        q.question.trim()
+                    } else {
+                        q.header.trim()
+                    }
+                })
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ");
+        }
         let request = ClarificationRequest {
             id: ClarificationId::generate(),
             turn_id: None,
@@ -133,6 +222,7 @@ impl Executor {
             action_fingerprint: action_fingerprint(call),
             question,
             options,
+            questions,
         };
         let outcome = tokio::select! {
             biased;
@@ -865,5 +955,105 @@ mod reviewer_wall_budget_tests {
         let wall = reviewer_wall_budget(&limits, Duration::from_secs(3000));
         assert_eq!(wall.cap, Some(Duration::from_secs(3600)));
         assert_eq!(wall.epoch_duration_at_start, Duration::from_secs(3000));
+    }
+}
+
+#[cfg(test)]
+mod clarification_question_tests {
+    use super::parse_clarification_questions;
+    use leveler_execution::{ClarificationQuestion, ClarificationQuestionKind};
+    use serde_json::json;
+
+    #[test]
+    fn no_questions_key_is_the_legacy_single_question_shape() {
+        let args = json!({"question": "选哪个？", "options": ["A", "B"]});
+        assert!(parse_clarification_questions(&args).is_empty());
+    }
+
+    #[test]
+    fn a_full_question_keeps_its_kind_options_and_limits() {
+        let args = json!({
+            "questions": [{
+                "header": "验证范围",
+                "question": "需要跑哪些验证？",
+                "kind": "multi",
+                "options": ["单元测试", "TUI 测试"],
+                "allow_other": true,
+                "min_choices": 1,
+                "max_choices": 2,
+            }],
+        });
+        assert_eq!(
+            parse_clarification_questions(&args),
+            vec![ClarificationQuestion {
+                header: "验证范围".into(),
+                question: "需要跑哪些验证？".into(),
+                kind: ClarificationQuestionKind::Multi,
+                options: vec!["单元测试".into(), "TUI 测试".into()],
+                allow_other: true,
+                min_choices: 1,
+                max_choices: Some(2),
+            }]
+        );
+    }
+
+    /// An unknown or missing kind is single, not text: the model asked a
+    /// choice question and merely omitted the label.
+    #[test]
+    fn a_missing_kind_reads_as_single() {
+        let args = json!({"questions": [{"question": "选哪个？", "options": ["A"]}]});
+        let parsed = parse_clarification_questions(&args);
+        assert_eq!(parsed[0].kind, ClarificationQuestionKind::Single);
+    }
+
+    #[test]
+    fn an_unknown_kind_reads_as_single() {
+        let args = json!({
+            "questions": [{"question": "选哪个？", "kind": "checkbox", "options": ["A"]}],
+        });
+        assert_eq!(
+            parse_clarification_questions(&args)[0].kind,
+            ClarificationQuestionKind::Single
+        );
+    }
+
+    /// A question with neither a prompt nor options is not a question. Showing
+    /// it would add an empty, unanswerable tab to the interaction.
+    #[test]
+    fn an_empty_question_is_dropped() {
+        let args = json!({
+            "questions": [
+                {"header": "空", "kind": "single"},
+                {"header": "真", "question": "有内容吗？", "kind": "text"},
+            ],
+        });
+        let parsed = parse_clarification_questions(&args);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].header, "真");
+    }
+
+    /// Options are model-authored: blank entries are not choices.
+    #[test]
+    fn blank_options_are_dropped_and_trimmed() {
+        let args = json!({
+            "questions": [{"question": "选哪个？", "options": ["  A  ", "", "   ", "B"]}],
+        });
+        assert_eq!(
+            parse_clarification_questions(&args)[0].options,
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    /// `questions` that is not an array, or carries no usable entry, must not
+    /// panic and must not fabricate a question.
+    #[test]
+    fn a_malformed_questions_value_yields_nothing() {
+        for args in [
+            json!({"questions": "two"}),
+            json!({"questions": []}),
+            json!({"questions": [1, 2]}),
+        ] {
+            assert!(parse_clarification_questions(&args).is_empty(), "{args}");
+        }
     }
 }

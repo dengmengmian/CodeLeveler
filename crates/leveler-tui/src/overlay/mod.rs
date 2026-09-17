@@ -19,6 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use leveler_client_protocol::ClarificationQuestionKind;
+
+use crate::render::text::truncate_display;
 use crate::theme::Theme;
 
 pub use approval::{ApprovalOutcome, ApprovalOverlay};
@@ -207,7 +210,7 @@ fn build_content(
             None,
         ),
         Overlay::Clarification(ov) => {
-            let (lines, cursor) = clarification_content(ov, theme, locale);
+            let (lines, cursor) = clarification_content(ov, theme, width, locale);
             (locale.text().clarify_title.to_string(), lines, cursor)
         }
     }
@@ -241,62 +244,422 @@ pub fn render_overlay(
     // the conversation directly above; a box around them adds a border to
     // parse and a column of padding to nothing, and having some framed and
     // some bare made the same keys feel like different modes.
-    let (_, lines, _) = content_lines(overlay, theme, area.width as usize, locale);
+    let (_, lines, cursor) = content_lines(overlay, theme, area.width as usize, locale);
     let h = (lines.len() as u16).min(area.height);
     let [row] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::End)
         .areas(area);
     theme.paint_surface(frame, row, theme.surface.elevated);
     frame.render_widget(Paragraph::new(lines), row);
+    // A text field in an overlay needs a visible insertion point. The
+    // composer's cursor is suppressed while an overlay owns the slot, so if
+    // this does not place it, a question the user must type into has none.
+    if let Some((crow, ccol)) = cursor {
+        let x = row.x.saturating_add(ccol as u16);
+        let y = row.y.saturating_add(crow as u16);
+        if (crow as u16) < row.height && x < row.x.saturating_add(row.width) {
+            frame.set_cursor_position(ratatui::layout::Position::new(x, y));
+        }
+    }
+}
+
+/// Gap between two tabs in the strip.
+const TAB_SEP: usize = 3;
+/// `… ` / ` …` — the marker that says tabs are clipped on that side.
+const TAB_ELLIPSIS: usize = 2;
+
+/// One tab, measured once so the strip can be laid out without re-measuring.
+struct TabCell {
+    marker: &'static str,
+    label: String,
+    style: Style,
+    width: usize,
+    active: bool,
+}
+
+fn clarification_tabs(
+    ov: &ClarificationOverlay,
+    theme: &Theme,
+    max_label: usize,
+    t: &crate::i18n::UiText,
+) -> Vec<TabCell> {
+    ov.questions()
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let current = i == ov.active();
+            // The three states are exclusive: the tab you are on says where
+            // you are, and the headline's count already says how far along the
+            // interaction is.
+            let marker = if current {
+                t.clarify_tab_current
+            } else if q.answer.is_some() {
+                t.clarify_tab_answered
+            } else {
+                t.clarify_tab_pending
+            };
+            let label = truncate_display(&q.display_header(), max_label);
+            let style = if current {
+                Style::default()
+                    .fg(theme.accent.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else if q.answer.is_some() {
+                Style::default().fg(theme.status.success)
+            } else {
+                Style::default().fg(theme.text.muted)
+            };
+            let width = 2 + UnicodeWidthStr::width(label.as_str());
+            TabCell {
+                marker,
+                label,
+                style,
+                width,
+                active: current,
+            }
+        })
+        .collect()
+}
+
+/// The widest window of tabs containing `active` that fits `budget` columns,
+/// including the `…` markers for what it clips on each side.
+///
+/// Keeping the ACTIVE tab visible is the whole contract: an 8-question
+/// interaction on an 80-column terminal must never scroll the tab you are on
+/// off the strip.
+fn tab_window(cells: &[TabCell], active: usize, budget: usize) -> (usize, usize) {
+    let n = cells.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let cost = |s: usize, e: usize| -> usize {
+        let body: usize = (s..=e).map(|i| cells[i].width).sum::<usize>() + TAB_SEP * (e - s);
+        let left = if s > 0 { TAB_ELLIPSIS + TAB_SEP } else { 0 };
+        let right = if e + 1 < n { TAB_SEP + TAB_ELLIPSIS } else { 0 };
+        body + left + right
+    };
+    if cost(0, n - 1) <= budget {
+        return (0, n - 1);
+    }
+    let (mut s, mut e) = (active, active);
+    let mut prefer_left = active > 0;
+    loop {
+        let mut grew = false;
+        for left in [prefer_left, !prefer_left] {
+            if left && s > 0 && cost(s - 1, e) <= budget {
+                s -= 1;
+                grew = true;
+                break;
+            }
+            if !left && e + 1 < n && cost(s, e + 1) <= budget {
+                e += 1;
+                grew = true;
+                break;
+            }
+        }
+        if !grew {
+            break;
+        }
+        prefer_left = !prefer_left;
+    }
+    (s, e)
+}
+
+/// The tab row and its underline row. Both fit `width` exactly, so the
+/// underline stays under the tab it belongs to and `wrap_to_width` never has
+/// to break either one.
+fn clarification_tab_rows(
+    ov: &ClarificationOverlay,
+    theme: &Theme,
+    width: usize,
+    t: &crate::i18n::UiText,
+) -> (Line<'static>, Line<'static>) {
+    // Markers, separators and a possible ellipsis on each side come out of the
+    // label budget before a single label is measured.
+    let chrome = 2 + TAB_SEP * 2 + TAB_ELLIPSIS * 2 + 2;
+    let max_label = width.saturating_sub(chrome).max(1);
+    let cells = clarification_tabs(ov, theme, max_label, t);
+    let (start, end) = tab_window(&cells, ov.active(), width);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut active_col = 0usize;
+    let mut active_width = 0usize;
+    fn push(spans: &mut Vec<Span<'static>>, used: &mut usize, span: Span<'static>) {
+        *used += UnicodeWidthStr::width(span.content.as_ref());
+        spans.push(span);
+    }
+    if start > 0 {
+        push(
+            &mut spans,
+            &mut used,
+            Span::styled("… ".to_string(), Style::default().fg(theme.text.muted)),
+        );
+    }
+    for (i, cell) in cells.iter().enumerate().take(end + 1).skip(start) {
+        if i > start {
+            push(&mut spans, &mut used, Span::raw(" ".repeat(TAB_SEP)));
+        }
+        if cell.active {
+            active_col = used;
+            active_width = cell.width;
+        }
+        push(&mut spans, &mut used, Span::styled(cell.marker, cell.style));
+        push(
+            &mut spans,
+            &mut used,
+            Span::styled(format!(" {}", cell.label), cell.style),
+        );
+    }
+    if end + 1 < cells.len() {
+        push(
+            &mut spans,
+            &mut used,
+            Span::styled(" …".to_string(), Style::default().fg(theme.text.muted)),
+        );
+    }
+    let underline = format!(
+        "{}{}",
+        " ".repeat(active_col.min(width)),
+        "\u{2501}".repeat(active_width.min(width.saturating_sub(active_col)))
+    );
+    (
+        Line::from(spans),
+        Line::from(Span::styled(
+            underline,
+            Style::default().fg(theme.accent.primary),
+        )),
+    )
+}
+
+/// Push one list row, wrapping its label to the space left after `prefix` and
+/// indenting the continuation under the label rather than under the margin.
+fn push_wrapped_row(
+    lines: &mut Vec<Line<'static>>,
+    prefix: Vec<Span<'static>>,
+    label: &str,
+    label_style: Style,
+    suffix: Option<Span<'static>>,
+    width: usize,
+) {
+    let prefix_width: usize = prefix
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let indent = " ".repeat(prefix_width);
+    let suffix_width = suffix
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .unwrap_or(0);
+    let first_room = width.saturating_sub(prefix_width + suffix_width).max(1);
+    let cont_room = width.saturating_sub(prefix_width + suffix_width).max(1);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut rest = label;
+    while !rest.is_empty() {
+        let room = if chunks.is_empty() {
+            first_room
+        } else {
+            cont_room
+        };
+        let (piece, tail) = crate::render::text::take_display_prefix(rest, room);
+        // Prefer breaking after a space: splitting a word is lossless and
+        // unreadable. A token longer than the row still breaks hard.
+        if !tail.is_empty()
+            && !tail.starts_with(' ')
+            && let Some(cut) = piece.rfind(' ')
+            && cut > 0
+        {
+            let kept = piece[..cut].to_string();
+            chunks.push(kept);
+            rest = rest[cut..].trim_start();
+            continue;
+        }
+        chunks.push(piece);
+        rest = tail;
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut spans = if i == 0 {
+            prefix.clone()
+        } else {
+            vec![Span::raw(indent.clone())]
+        };
+        spans.push(Span::styled(chunk, label_style));
+        if i == last
+            && let Some(suffix) = suffix.clone()
+        {
+            spans.push(suffix);
+        }
+        lines.push(Line::from(spans));
+    }
 }
 
 fn clarification_content(
     ov: &ClarificationOverlay,
     theme: &Theme,
+    width: usize,
     locale: crate::i18n::Locale,
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
+    let headline = if ov.legacy() {
+        t.clarify_title.to_string()
+    } else {
+        t.clarify_headline
+            .replacen("{}", &ov.answered_count().to_string(), 1)
+            .replacen("{}", &ov.len().to_string(), 1)
+    };
     lines.push(Line::from(Span::styled(
-        t.clarify_title,
+        headline,
         Style::default()
             .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::raw(ov.request.question.clone())));
-    lines.push(Line::from(""));
-    // A lone digit in the input is an option pick that Enter will send; say so
-    // on the option itself, so the answer is visible before it is submitted.
-    let picked = ov.selected_option();
-    for (i, opt) in ov.request.options.iter().enumerate() {
-        let chosen = picked == Some(i);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}{}. ", if chosen { "› " } else { "  " }, i + 1),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                opt.clone(),
-                if chosen {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
-        ]));
-    }
-    if !ov.request.options.is_empty() {
+    // A strip of one tab is chrome, not information: the legacy single-question
+    // shape renders exactly as it always did.
+    if !ov.legacy() {
         lines.push(Line::from(""));
+        let (tabs, underline) = clarification_tab_rows(ov, theme, width, t);
+        lines.push(tabs);
+        lines.push(underline);
     }
-    let input_row = lines.len();
-    let input_col = 2 + UnicodeWidthStr::width(ov.input());
-    lines.push(Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.accent.primary)),
-        Span::raw(ov.input().to_string()),
-    ]));
     lines.push(Line::from(""));
-    lines.push(help_line(theme, t.clarify_hint));
-    (lines, Some((input_row, input_col)))
+
+    let questions = ov.questions();
+    let Some(active) = questions.get(ov.active()) else {
+        lines.push(help_line(theme, t.clarify_hint));
+        return (lines, None);
+    };
+
+    let mut prompt = vec![Span::styled(
+        active.prompt.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let mut badges: Vec<String> = Vec::new();
+    if active.is_multi() {
+        badges.push(t.clarify_multi_badge.to_string());
+        if active.min_choices > 0 {
+            badges.push(
+                t.clarify_min_choices
+                    .replace("{}", &active.min_choices.to_string()),
+            );
+        }
+        if let Some(max) = active.max_choices {
+            badges.push(t.clarify_max_choices.replace("{}", &max.to_string()));
+        }
+    }
+    if !badges.is_empty() {
+        prompt.push(Span::styled(
+            format!("  · {}", badges.join(" · ")),
+            Style::default().fg(theme.text.secondary),
+        ));
+    }
+    lines.push(Line::from(prompt));
+    lines.push(Line::from(""));
+
+    let mut cursor_at: Option<(usize, usize)> = None;
+    if active.kind == ClarificationQuestionKind::Text {
+        let row = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent.primary)),
+            Span::raw(active.text.clone()),
+        ]));
+        cursor_at = Some((row, 2 + UnicodeWidthStr::width(active.text.as_str())));
+    } else {
+        let recorded = match active.answer.as_ref() {
+            Some(crate::overlay::clarification::Answer::Picks(picks)) => picks.first().copied(),
+            _ => None,
+        };
+        for (i, option) in active.options.iter().enumerate() {
+            let focused = i == active.cursor;
+            let marker = if focused { "❯ " } else { "  " };
+            let marker_style = if focused {
+                Style::default().fg(theme.accent.primary)
+            } else {
+                Style::default()
+            };
+            let prefix = if active.is_multi() {
+                let box_ = if active.selected[i] { "[x] " } else { "[ ] " };
+                vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(box_, Style::default().fg(theme.text.secondary)),
+                ]
+            } else {
+                vec![Span::styled(marker, marker_style)]
+            };
+            let label_style = if focused {
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text.primary)
+            };
+            // A recorded single pick is marked so reopening a settled question
+            // shows what was chosen; the cursor only says where the arrows are.
+            let suffix = (recorded == Some(i))
+                .then(|| Span::styled(" ✓", Style::default().fg(theme.status.success)));
+            push_wrapped_row(&mut lines, prefix, option, label_style, suffix, width);
+        }
+        if active.allow_other {
+            let focused = active.on_other_row();
+            let marker = if focused { "❯ " } else { "  " };
+            let marker_style = if focused {
+                Style::default().fg(theme.accent.primary)
+            } else {
+                Style::default()
+            };
+            let label_style = if focused {
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text.primary)
+            };
+            let row = lines.len();
+            let text = active.text.clone();
+            let spans = vec![
+                Span::styled(marker, marker_style),
+                Span::styled(format!("{} ", t.clarify_other), label_style),
+                Span::raw(text.clone()),
+            ];
+            if focused {
+                let col = 2
+                    + UnicodeWidthStr::width(t.clarify_other)
+                    + 1
+                    + UnicodeWidthStr::width(text.as_str());
+                cursor_at = Some((row, col));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    if let Some(notice) = ov.notice() {
+        let text = match notice {
+            crate::overlay::clarification::ClarificationNotice::MinChoices(n) => {
+                t.clarify_min_choices_blocked.replace("{}", &n.to_string())
+            }
+            crate::overlay::clarification::ClarificationNotice::MaxChoices(n) => {
+                t.clarify_max_choices_blocked.replace("{}", &n.to_string())
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            Style::default().fg(theme.status.warning),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    let hint = if active.kind == ClarificationQuestionKind::Text || active.on_other_row() {
+        t.clarify_nav_hint_text
+    } else if active.is_multi() {
+        t.clarify_nav_hint_multi
+    } else {
+        t.clarify_nav_hint
+    };
+    lines.push(help_line(theme, hint));
+    (lines, cursor_at)
 }
 
 fn selection_content(
@@ -595,11 +958,11 @@ mod layout_tests {
         // box, and content must wrap inside it rather than be cut by it.
         let long = "请确认这一步该怎么做，".repeat(6);
         let ov = Overlay::Clarification(Box::new(crate::overlay::ClarificationOverlay::new(
-            leveler_client_protocol::UiClarificationRequest {
-                id: leveler_client_protocol::ClarificationId::new("c1"),
-                question: long.clone(),
-                options: vec![],
-            },
+            leveler_client_protocol::UiClarificationRequest::single(
+                leveler_client_protocol::ClarificationId::new("c1"),
+                long.clone(),
+                vec![],
+            ),
         )));
         let screen = frame_of(&ov, 110, 32).join("\n");
         let flat: String = screen

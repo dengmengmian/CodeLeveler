@@ -770,26 +770,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.notification = Some(Notification { level, message });
         }
         RuntimeEvent::BtwStarted { question } => {
-            state.transcript.begin_btw(question);
-            state.activity = Some(state.t().btw_label.to_string());
+            state.btw.begin(question);
         }
         RuntimeEvent::BtwTextDelta { delta } => {
-            state.transcript.append_btw(&delta);
+            state.btw.append(&delta);
         }
         RuntimeEvent::BtwCompleted => {
-            state.transcript.finish_btw(false);
-            if state.activity.as_deref() == Some(state.t().btw_label) {
-                clear_activity(state);
-            }
+            state.btw.finish(crate::btw::BtwTurnState::Done, None);
+        }
+        RuntimeEvent::BtwCancelled => {
+            state.btw.finish(crate::btw::BtwTurnState::Cancelled, None);
         }
         RuntimeEvent::BtwFailed { error } => {
             state
-                .transcript
-                .append_btw(&format!("{}: {error}", state.t().btw_failed));
-            state.transcript.finish_btw(true);
-            if state.activity.as_deref() == Some(state.t().btw_label) {
-                clear_activity(state);
-            }
+                .btw
+                .finish(crate::btw::BtwTurnState::Failed, Some(&error));
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
                 message: error,
@@ -1024,8 +1019,6 @@ fn estimate_transcript_tokens(state: &AppState) -> u32 {
                     }
                 }
             }
-            // Side questions are ephemeral and not part of main context usage.
-            TranscriptItem::Btw(_) => {}
             TranscriptItem::Recap(_) => {}
             _ => {}
         }
@@ -1225,6 +1218,11 @@ fn clear_activity(state: &mut AppState) {
 }
 
 pub(super) fn start_turn(state: &mut AppState) {
+    // A new turn owns the current activity view. The previous turn's settled
+    // children are history now — the transcript kept them — and must not keep
+    // rendering as work in flight. A child still open at the boundary stays:
+    // the runtime continues or settles it in a later turn.
+    state.team.retire_settled(state.elapsed_secs);
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
     if state.plan_settled {
@@ -1457,6 +1455,15 @@ fn apply_session_with(
         state.command_selected = None;
         // Another session's children are not this session's.
         state.team = crate::multi_agent::TaskTeamView::default();
+        // A side thread is scoped to the run it observed: leaving it behind
+        // would let a follow-up reference a conversation this session never
+        // had. Return to Main and drop it (the main draft is swapped back in).
+        let template = state.image_token_template();
+        if state.surface == crate::btw::SurfaceFocus::Btw {
+            super::leave_btw(state);
+        }
+        state.btw = crate::btw::BtwThread::default();
+        state.btw.draft.set_image_token_template(&template);
     }
     state.team.restore(&session.children, state.elapsed_secs);
 

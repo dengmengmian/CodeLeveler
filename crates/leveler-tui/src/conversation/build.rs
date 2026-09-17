@@ -159,11 +159,6 @@ fn build_conversation(
     let mut idx = 0;
     while idx < items.len() {
         let item = &items[idx];
-        // /btw is a floating overlay, not scroll content.
-        if matches!(item, TranscriptItem::Btw(_)) {
-            idx += 1;
-            continue;
-        }
         // Remember where this item starts: a group whose tools are all Silent
         // (ls / probe runs) renders nothing, and a separator emitted before it
         // would leave a blank gap with no content — the reader sees a hole

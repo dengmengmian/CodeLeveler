@@ -351,3 +351,64 @@ fn a_token_survives_submission_as_text() {
     c.insert_str("这是什么");
     assert_eq!(c.take(), "[图片 #1] 这是什么");
 }
+
+// ---- Word movement (Option+←/→) ------------------------------------------
+
+/// Option+← lands on the start of the previous word and edits nothing.
+#[test]
+fn move_word_left_reaches_the_previous_word_start() {
+    let mut c = Composer::new();
+    c.insert_str("hello world");
+    assert_eq!(c.cursor(), 11);
+    c.move_word_left();
+    assert_eq!(c.cursor(), 6);
+    assert_eq!(c.text(), "hello world", "cursor movement must not edit");
+}
+
+/// Option+→ lands on the end of the next word and does not type an `f`.
+#[test]
+fn move_word_right_reaches_the_next_word_end() {
+    let mut c = Composer::new();
+    c.insert_str("hello world");
+    c.move_to_line_start();
+    c.move_word_right();
+    assert_eq!(c.cursor(), 5);
+    assert_eq!(c.text(), "hello world", "cursor movement must not edit");
+}
+
+/// Alternating Option+←/→ never touches the text.
+#[test]
+fn alternating_word_moves_leave_the_text_untouched() {
+    let mut c = Composer::new();
+    c.insert_str("hello world test");
+    c.move_word_left();
+    c.move_word_left();
+    c.move_word_right();
+    c.move_word_right();
+    assert_eq!(c.text(), "hello world test");
+    assert_eq!(c.cursor(), 16, "back where it started");
+}
+
+/// The step is grapheme-based: a CJK word moves whole, never by byte.
+#[test]
+fn word_moves_are_grapheme_safe() {
+    let mut c = Composer::new();
+    c.insert_str("你好 世界");
+    c.move_word_left();
+    assert_eq!(c.cursor(), 3, "start of 世界");
+    c.move_word_left();
+    assert_eq!(c.cursor(), 0, "start of 你好");
+    assert_eq!(c.text(), "你好 世界");
+}
+
+/// A word move never leaves the caret inside an image token.
+#[test]
+fn word_moves_step_over_a_token_whole() {
+    let mut c = with_tokens();
+    c.insert_image_token(); // "[图片 #1] "
+    c.insert_str("看");
+    c.move_word_left();
+    assert_eq!(c.cursor(), 8, "lands after the token, before 看");
+    c.move_word_left();
+    assert_eq!(c.cursor(), 0, "the token is one word, not two");
+}

@@ -10,6 +10,36 @@ use async_trait::async_trait;
 
 use leveler_core::{ClarificationId, TurnId};
 
+/// How one question of a clarification is answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClarificationQuestionKind {
+    /// Exactly one option, or a free-text answer when `allow_other` is set.
+    #[default]
+    Single,
+    /// Zero or more options.
+    Multi,
+    /// A free-text answer.
+    Text,
+}
+
+/// One question of a clarification interaction (spec §35).
+///
+/// A clarification can carry several questions the user answers in one
+/// sitting. The kind is explicit so the UI never has to guess a text prompt
+/// out of an empty option list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClarificationQuestion {
+    /// Short label for the question's tab (empty = derive from `question`).
+    pub header: String,
+    pub question: String,
+    pub kind: ClarificationQuestionKind,
+    pub options: Vec<String>,
+    /// Offer a trailing free-text entry ("其他…") next to the options.
+    pub allow_other: bool,
+    pub min_choices: u32,
+    pub max_choices: Option<u32>,
+}
+
 /// A request for the user to clarify something mid-task (spec §35): the model
 /// calls `request_user_input` (or legacy `ask_user`), which blocks until the UI answers.
 #[derive(Debug, Clone)]
@@ -20,8 +50,13 @@ pub struct ClarificationRequest {
     pub tool: String,
     pub call_id: String,
     pub action_fingerprint: String,
+    /// The headline: what the interaction is about. For a legacy
+    /// single-question request this is also the whole prompt.
     pub question: String,
     pub options: Vec<String>,
+    /// The questions to answer together. Empty means the legacy
+    /// single-question shape (`question`/`options`).
+    pub questions: Vec<ClarificationQuestion>,
 }
 
 /// How a clarification request ended. `Answered` is the ONLY variant that may

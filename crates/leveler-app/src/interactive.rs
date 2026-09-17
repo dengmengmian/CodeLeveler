@@ -322,6 +322,25 @@ pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
 use crate::Application;
 use crate::active_turns::ActiveTurns;
 
+/// A session's `/btw` side thread: its own model conversation and the cancel
+/// handle of its in-flight answer.
+///
+/// `history` is deliberately separate from the session's stored messages. A
+/// side thread observes the main run but never becomes part of it, so a long
+/// side chat cannot grow the main turn's context.
+#[derive(Default)]
+struct BtwSession {
+    /// The side thread's own user/assistant turns, oldest first.
+    history: Vec<Message>,
+    /// Cancel handle of the answer being generated right now, if any. `None`
+    /// when the side thread is idle.
+    cancel: Option<CancellationToken>,
+}
+
+/// Per-session side threads, keyed by session. Wrapped in `Arc<Mutex<..>>`
+/// because a detached answer worker clears its own handle on completion.
+type BtwThreads = Arc<Mutex<HashMap<SessionId, BtwSession>>>;
+
 /// An in-process runtime client backed by an [`Application`].
 pub struct InProcessRuntimeClient {
     app: Arc<Application>,
@@ -350,6 +369,9 @@ pub struct InProcessRuntimeClient {
     /// Live client-facing state that is not part of the message transcript.
     /// A reconnecting UI receives this through `snapshot()`.
     live_views: Arc<crate::live_view::LiveViews>,
+    /// Per-session `/btw` side threads: their own conversation and the cancel
+    /// handle of an in-flight side answer. Never merged into a main turn.
+    btw: BtwThreads,
     /// Per-session ownership and cancellation of active main turns.
     active: Arc<ActiveTurns>,
     /// Set when the runtime owner begins an explicit shutdown (Quit);
@@ -586,6 +608,7 @@ impl InProcessRuntimeClient {
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
+            btw: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
             shutting_down: shutting_down.clone(),
             process_shutdown: None,
@@ -1852,13 +1875,43 @@ impl InProcessRuntimeClient {
             .unwrap_or_default()
     }
 
-    /// Side question: one generate call over a fork of the session transcript.
-    /// Does not take the main turn cancel token, so a running agent turn keeps
-    /// going; does not append to MessageRepository.
+    /// Answer one `/btw` question on the session's side thread.
+    ///
+    /// The side thread owns its own conversation (`BtwSession::history`) and
+    /// its own cancel handle; it never takes the main turn's cancel token and
+    /// never appends to `MessageRepository`. Each round re-reads the main
+    /// transcript so a follow-up sees the main run's current state, while the
+    /// side thread's own earlier turns carry the side conversation.
     fn spawn_btw(&self, session_id: SessionId, question: String, config: SessionRuntimeConfig) {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let model = config.model;
+        let btw = self.btw.clone();
+
+        // One answer at a time per side thread: a second question while one is
+        // streaming would race the history append and the single "generating"
+        // state. Refuse it visibly instead of interleaving two answers.
+        let (cancel, history) = {
+            let mut threads = btw
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = threads
+                .get(&session_id)
+                .and_then(|thread| thread.cancel.as_ref())
+                .is_some_and(|token| !token.is_cancelled());
+            if running {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: NotificationLevel::Warning,
+                    message: "上一条旁问还在回答，先等它结束或按 Ctrl+C 停止".to_string(),
+                });
+                return;
+            }
+            let thread = threads.entry(session_id.clone()).or_default();
+            let token = CancellationToken::new();
+            thread.cancel = Some(token.clone());
+            (token, thread.history.clone())
+        };
+
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
@@ -1884,7 +1937,12 @@ impl InProcessRuntimeClient {
                         )
                         .await
                         .map_err(|e| e.to_string())?;
+                    // Fresh main projection, then this side thread's own turns,
+                    // then the new question. Only the newest question carries the
+                    // "no tools" instruction so the stored history reads as a
+                    // natural dialogue.
                     let mut messages = context.prior;
+                    messages.extend(history);
                     messages.push(Message::text(
                         Role::User,
                         format!(
@@ -1896,26 +1954,76 @@ impl InProcessRuntimeClient {
                     request.tool_choice = ToolChoice::None;
                     let resp = app
                         .registry
-                        .generate(request, CancellationToken::new())
+                        .generate(request, cancel.clone())
                         .await
                         .map_err(|e| e.to_string())?;
                     Ok(resp.message.text_content())
                 }
                 .await;
 
-                match result {
+                let (event, record) = match result {
                     Ok(text) => {
                         if !text.is_empty() {
-                            let _ = events.send(RuntimeEvent::BtwTextDelta { delta: text });
+                            let _ = events.send(RuntimeEvent::BtwTextDelta {
+                                delta: text.clone(),
+                            });
                         }
-                        let _ = events.send(RuntimeEvent::BtwCompleted);
+                        // A fulfilled answer joins the side thread's own history
+                        // so the next question can reference it.
+                        (RuntimeEvent::BtwCompleted, Some(text))
                     }
-                    Err(error) => {
-                        let _ = events.send(RuntimeEvent::BtwFailed { error });
+                    // Cancelled: the user stopped it. Anyone could have stopped
+                    // it, so this path reports the truth instead of calling it a
+                    // completion or a failure.
+                    Err(_) if cancel.is_cancelled() => (RuntimeEvent::BtwCancelled, None),
+                    Err(error) => (RuntimeEvent::BtwFailed { error }, None),
+                };
+                {
+                    let mut threads = btw
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let thread = threads.entry(session_id.clone()).or_default();
+                    thread.cancel = None;
+                    if let Some(text) = record {
+                        thread
+                            .history
+                            .push(Message::text(Role::User, question.clone()));
+                        if !text.is_empty() {
+                            thread.history.push(Message::text(Role::Assistant, text));
+                        }
                     }
                 }
+                let _ = events.send(event);
             });
         });
+    }
+
+    /// Stop a session's in-flight `/btw` answer. Idempotent and scoped to the
+    /// side thread: it can never touch a main turn.
+    fn cancel_btw(&self, session_id: &SessionId) {
+        let token = self
+            .btw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(|thread| thread.cancel.clone());
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }
+
+    /// Drop a session's side thread, stopping any in-flight answer. Used when
+    /// the main conversation it observed is replaced (clear / checkpoint
+    /// restore), so a follow-up cannot reference turns that no longer exist.
+    fn drop_btw_thread(&self, session_id: &SessionId) {
+        let thread = self
+            .btw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some(token) = thread.and_then(|thread| thread.cancel) {
+            token.cancel();
+        }
     }
 
     /// Save a message that is ONLY a memory command, and report it.
@@ -2102,6 +2210,7 @@ impl InProcessRuntimeClient {
                             format!("对话已回滚,但任务状态重置失败: {error}"),
                         );
                     }
+                    self.drop_btw_thread(&session_id);
                     // Roll the workspace back to the checkpoint's
                     // snapshot (git repos). A failure is surfaced —
                     // the transcript rolled back but files did not.
@@ -2236,6 +2345,7 @@ impl InProcessRuntimeClient {
                 }
                 self.live_views.clear(&session_id);
                 self.drop_session_checkpoints(&session_id);
+                self.drop_btw_thread(&session_id);
                 if let Ok(session) = self.snapshot(&session_id).await {
                     let _ = self
                         .events_for(&session_id)
@@ -2965,6 +3075,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let config = self.runtime_config(&session_id).await?;
                 self.spawn_btw(session_id, question, config);
+                Ok(())
+            }
+            ClientCommand::CancelBtw { session_id } => {
+                self.cancel_btw(&session_id);
                 Ok(())
             }
             ClientCommand::CancelCurrentTurn { session_id } => {
