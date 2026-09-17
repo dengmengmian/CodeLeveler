@@ -21,7 +21,7 @@ use leveler_execution::PermissionProfile;
 use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{MessageRepository, TurnRepository};
+use leveler_storage::{MessageRepository, SessionRepository, TurnRepository};
 use tokio_util::sync::CancellationToken;
 
 fn isolate_global_config() {
@@ -144,6 +144,30 @@ async fn wait_for_message(app: &Application, session: &SessionId, needle: &str, 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("{label}: {needle:?} never reached the transcript");
+}
+
+/// Wait until the session row itself carries `status`.
+///
+/// The two snapshots below are two reads at two instants, so comparing them
+/// across a transition in flight reports a fork that never happened. The
+/// `created → running` write is the turn's own first act (`engine.start_task`),
+/// which lands *after* the `UserMessageAdded` both clients wait for — so the
+/// turn has to be observed as started before the comparison means anything.
+async fn wait_for_session_status(h: &Harness, session: &SessionId, status: &str) {
+    let db = h.app.open_database().await.unwrap();
+    let repo = SessionRepository::new(&db);
+    for _ in 0..400 {
+        let reached = repo
+            .get(session)
+            .await
+            .unwrap()
+            .is_some_and(|record| record.status.as_str() == status);
+        if reached {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("session {session} never reached status {status:?}");
 }
 
 /// The core relay property: client A creates a session and speaks, A goes
@@ -339,9 +363,12 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
     )
     .await;
 
-    // UserMessageAdded is past the created→running transition, so both
-    // snapshots are looking at the same live turn. Do not wait for a
-    // terminal: the unreachable model waits for the network now.
+    // Wait for the durable created→running transition before comparing: it is
+    // written by the spawned turn, not by the staging that emitted
+    // UserMessageAdded, and it has to have settled or the two reads below
+    // straddle it. Do not wait for a terminal: the unreachable model waits for
+    // the network now, so the live turn parks in running.
+    wait_for_session_status(&h, &session, "running").await;
 
     // Both clients' snapshots agree on the same facts.
     let via_socket = socket_client.snapshot(&session).await.unwrap();
