@@ -182,9 +182,54 @@ fn scan_bad_prompt(text: &str, hits: &mut Vec<String>) {
     }
 }
 
+/// Drive one turn to its terminal event, then wait for the runtime to release
+/// the session's admit lease.
+///
+/// The lease is released *after* the terminal client event is enqueued (see
+/// `InProcessRuntimeClient::has_live_turn`), so returning on the terminal event
+/// alone leaves a window where the next command's admission still sees the
+/// previous turn as active and is refused with "already has an active turn".
+/// That window is a scheduling accident: macOS CI lost it in run 35226980480
+/// after these same scenarios had passed on the four runs before. Waiting on
+/// the lease is waiting on the runtime's own answer to "may the next turn
+/// start", which is the question the next `drive_turn` is about to ask.
+///
+/// Only a turn that reached a terminal event is waited for. A `TimedOut`
+/// report means no terminal was observed and the turn really is still running,
+/// so its lease is still legitimately held.
 async fn drive_turn(
     client: &InProcessRuntimeClient,
-    _session_id: &leveler_core::SessionId,
+    session_id: &leveler_core::SessionId,
+    command: ClientCommand,
+    wall_limit: Duration,
+) -> TurnReport {
+    let report = drive_turn_to_terminal(client, command, wall_limit).await;
+    if report.kind != TerminalKind::TimedOut {
+        wait_for_admit_release(client, session_id).await;
+    }
+    report
+}
+
+/// How long the runtime is given to release a finished turn's admit lease.
+const ADMIT_RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+async fn wait_for_admit_release(
+    client: &InProcessRuntimeClient,
+    session_id: &leveler_core::SessionId,
+) {
+    let deadline = Instant::now() + ADMIT_RELEASE_WAIT;
+    while client.has_live_turn(session_id) {
+        assert!(
+            Instant::now() < deadline,
+            "the runtime still holds session {session_id}'s admit lease \
+             {ADMIT_RELEASE_WAIT:?} after the turn's terminal event, so no next turn can start"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn drive_turn_to_terminal(
+    client: &InProcessRuntimeClient,
     command: ClientCommand,
     wall_limit: Duration,
 ) -> TurnReport {
