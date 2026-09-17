@@ -140,4 +140,27 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: false
           body_path: /tmp/release-body.md
-          files: dist/*
+          # Upload is done by the next step, not this action: its parallel
+          # uploader does not retry transient 5xx responses from GitHub, so a
+          # single hiccup on any of the 8 assets fails the whole job.
+
+      - name: Upload release assets (serial, with retries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            uploaded=0
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$GITHUB_REF_NAME" "$f" --clobber; then
+                uploaded=1
+                break
+              fi
+              echo "upload of $f failed (attempt $attempt), retrying in 10s"
+              sleep 10
+            done
+            if [ "$uploaded" -ne 1 ]; then
+              echo "::error::failed to upload $f after 5 attempts"
+              exit 1
+            fi
+          done
