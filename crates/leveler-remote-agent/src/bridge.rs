@@ -609,6 +609,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::ApprovalDecision { .. } => "approval_decision",
         ClientCommand::AnswerClarification { .. } => "answer_clarification",
         ClientCommand::SelectModel { .. } => "select_model",
+        ClientCommand::SetDefaultModel { .. } => "set_default_model",
         ClientCommand::SetPermissionProfile { .. } => "set_permission_profile",
         ClientCommand::SetProductAxes { .. } => "set_product_axes",
         ClientCommand::ConfirmPlanToGoal { .. } => "confirm_plan_to_goal",

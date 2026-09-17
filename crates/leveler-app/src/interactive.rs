@@ -878,6 +878,27 @@ impl InProcessRuntimeClient {
         Ok(())
     }
 
+    /// Apply a model change to the active session: in-memory truth and the
+    /// durable session record, then the client-visible snapshot. Shared by
+    /// [`ClientCommand::SelectModel`] (session-scoped) and
+    /// [`ClientCommand::SetDefaultModel`] (the user's explicit default), which
+    /// differ only in whether configuration is rewritten afterwards.
+    async fn switch_session_model(
+        &self,
+        session_id: &SessionId,
+        model: &ModelRef,
+    ) -> Result<(), ClientError> {
+        let mut config = self.runtime_config(session_id).await?;
+        config.model = model.clone();
+        self.persist_runtime_config(session_id, config).await?;
+        if let Ok(session) = self.snapshot(session_id).await {
+            let _ = self
+                .events_for(session_id)
+                .send(RuntimeEvent::SessionUpdated { session });
+        }
+        Ok(())
+    }
+
     /// Record a checkpoint at the current transcript length, before a turn runs.
     ///
     /// When the transcript length cannot be determined the checkpoint is
@@ -2444,15 +2465,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         "model `{model}` is not configured"
                     )));
                 }
-                let mut config = self.runtime_config(&session_id).await?;
-                config.model = model.clone();
-                self.persist_runtime_config(&session_id, config).await?;
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&session_id)
-                        .send(RuntimeEvent::SessionUpdated { session });
+                self.switch_session_model(&session_id, &model).await
+            }
+            ClientCommand::SetDefaultModel { session_id, model } => {
+                if !self.app.model_refs().contains(&model) {
+                    return Err(ClientError::Runtime(format!(
+                        "model `{model}` is not configured"
+                    )));
                 }
-                Ok(())
+                // The active session switches first, because the user's
+                // immediate effect must not be lost to a config write. If the
+                // default cannot be persisted the switch still stands, but the
+                // result says so plainly — runtime success is not persistence
+                // success, and the caller must never be told otherwise.
+                self.switch_session_model(&session_id, &model).await?;
+                crate::global_config::GlobalConfig::save_default_model(&model).map_err(|error| {
+                    ClientError::Runtime(format!(
+                        "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
+                    ))
+                })
             }
             ClientCommand::SetPermissionProfile { session_id, mode } => {
                 let mut config = self.runtime_config(&session_id).await?;

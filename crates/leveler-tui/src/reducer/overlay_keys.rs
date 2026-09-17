@@ -65,7 +65,7 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                         level: NotificationLevel::Info,
                         message: format!("已切换模型并设为默认: {model}"),
                     });
-                    vec![Effect::Send(ClientCommand::SelectModel {
+                    vec![Effect::Send(ClientCommand::SetDefaultModel {
                         session_id: state.session_id.clone(),
                         model,
                     })]

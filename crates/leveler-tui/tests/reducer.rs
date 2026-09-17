@@ -1592,15 +1592,17 @@ fn slash_model_opens_picker_and_is_not_sent() {
 }
 
 #[test]
-fn model_picker_confirm_sends_select_model_and_closes() {
+fn model_picker_confirm_selects_and_sets_default() {
     let mut s = opened();
     typed(&mut s, "/model");
     reduce(&mut s, key(KeyCode::Enter)); // open picker
     // Two models (not searchable): quick-select the 2nd → glm/5.
     let effects = reduce(&mut s, key(KeyCode::Char('2')));
+    // The picker is the user's explicit selection, so it carries the authority
+    // to persist the default — not the session-scoped `SelectModel`.
     assert_eq!(
         effects,
-        vec![Effect::Send(ClientCommand::SelectModel {
+        vec![Effect::Send(ClientCommand::SetDefaultModel {
             session_id: SessionId::new("s1"),
             model: leveler_client_protocol::ModelRef::parse("glm/5").unwrap(),
         })]

@@ -135,6 +135,19 @@ pub enum ClientCommand {
         session_id: SessionId,
         model: ModelRef,
     },
+    /// The user's explicit "use this model from now on": switch the active
+    /// session's model AND persist it as the user's default model for future
+    /// sessions.
+    ///
+    /// Distinct from [`Self::SelectModel`] on purpose. Only this command carries
+    /// the authority to rewrite the user's persisted configuration, because only
+    /// an explicit user action does. Runtime fallbacks, provider failover,
+    /// retries, temporary CLI/session overrides and internal routing MUST use
+    /// [`Self::SelectModel`] (session-scoped) and never touch the default.
+    SetDefaultModel {
+        session_id: SessionId,
+        model: ModelRef,
+    },
     /// Switch the execution mode used for subsequent turns .
     SetPermissionProfile {
         session_id: SessionId,
@@ -392,6 +405,7 @@ impl ClientCommand {
             | ClientCommand::CancelChild { session_id, .. }
             | ClientCommand::CancelToolCall { session_id, .. }
             | ClientCommand::SelectModel { session_id, .. }
+            | ClientCommand::SetDefaultModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
@@ -638,6 +652,17 @@ mod tests {
                 model: ModelRef::new("openai", "gpt-4o"),
             },
             "select_model",
+        );
+    }
+
+    #[test]
+    fn set_default_model_roundtrips() {
+        roundtrip(
+            ClientCommand::SetDefaultModel {
+                session_id: SessionId::new("s1"),
+                model: ModelRef::new("openai", "gpt-4o"),
+            },
+            "set_default_model",
         );
     }
 

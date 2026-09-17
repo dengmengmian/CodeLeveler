@@ -154,6 +154,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            "set_default_model",
+            ClientCommand::SetDefaultModel {
+                session_id: session(),
+                model: ModelRef::new("anthropic", "claude"),
+            },
+            false,
+        ),
+        (
             "set_permission_profile",
             ClientCommand::SetPermissionProfile {
                 session_id: session(),

@@ -352,6 +352,8 @@ pub enum GlobalConfigError {
         "global config MCP server `{server}` env `{key}` must be a string UPPER_SNAKE environment variable name reference (e.g. `{key} = \"{key}\"`)"
     )]
     McpEnvNotString { server: String, key: String },
+    #[error("{0}")]
+    Write(String),
 }
 impl GlobalConfig {
     /// The config path: `<leveler-home>/config.toml`, or `None` when no home is
@@ -360,6 +362,46 @@ impl GlobalConfig {
     pub fn path() -> Option<PathBuf> {
         leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
             .map(|root| leveler_core::LevelerHome::from_root(root).config_file())
+    }
+
+    /// Persist `default_model` in the user's config, preserving the rest of
+    /// the document (comments, key order, unrelated tables) via `toml_edit`.
+    ///
+    /// This is the ONE write path for the persisted default model. It must only
+    /// be reached from a user's explicit "use this model from now on" action —
+    /// never from a runtime fallback, a retry, or a session-scoped override.
+    /// Those only change the active session (see `ClientCommand::SelectModel`)
+    /// and must not rewrite what the user starts with next time.
+    pub fn save_default_model(model: &leveler_model::ModelRef) -> Result<(), GlobalConfigError> {
+        let path = Self::path().ok_or_else(|| {
+            GlobalConfigError::Write("no config path (set HOME or LEVELER_HOME)".to_string())
+        })?;
+        Self::save_default_model_at(&path, model)
+    }
+
+    /// [`Self::save_default_model`] against an explicit path (tests).
+    pub fn save_default_model_at(
+        path: &std::path::Path,
+        model: &leveler_model::ModelRef,
+    ) -> Result<(), GlobalConfigError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(GlobalConfigError::Write(format!("{}: {e}", path.display()))),
+        };
+        let mut doc: DocumentMut = if text.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse()
+                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))?
+        };
+        doc["default_model"] = value(model.to_string());
+        std::fs::write(path, doc.to_string())
+            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))
     }
 
     /// Load the global config, or an empty one if the file is absent. A present
@@ -1229,5 +1271,60 @@ provider = "deepseek"
             "explicit true must reach the profile"
         );
         assert!(!find("legacy"), "legacy profiles never send the key");
+    }
+
+    #[test]
+    fn save_default_model_preserves_unrelated_keys_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\ndefault_model = \"old/a\"\n\n[providers.p]\nbase_url = \"http://x\"\n",
+        )
+        .unwrap();
+
+        GlobalConfig::save_default_model_at(&path, &leveler_model::ModelRef::new("new", "b"))
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "comments must survive: {text}");
+        assert!(
+            text.contains("[providers.p]") && text.contains("http://x"),
+            "unrelated tables must survive: {text}"
+        );
+        let reloaded = GlobalConfig::from_toml_str(&text).unwrap();
+        assert_eq!(reloaded.default_model.as_deref(), Some("new/b"));
+    }
+
+    #[test]
+    fn save_default_model_creates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+
+        GlobalConfig::save_default_model_at(&path, &leveler_model::ModelRef::new("p", "m"))
+            .unwrap();
+
+        assert_eq!(
+            GlobalConfig::from_toml_str(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .default_model
+                .as_deref(),
+            Some("p/m")
+        );
+    }
+
+    #[test]
+    fn save_default_model_reports_a_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the config file belongs is never writable, so the
+        // caller (and the TUI above it) sees a real failure instead of a
+        // silently unchanged default.
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let error =
+            GlobalConfig::save_default_model_at(&path, &leveler_model::ModelRef::new("p", "m"))
+                .unwrap_err();
+        assert!(matches!(error, GlobalConfigError::Write(_)), "{error:?}");
     }
 }

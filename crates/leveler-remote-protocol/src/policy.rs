@@ -205,6 +205,14 @@ impl RemotePolicy {
                 reason: "attachments from a remote client go through the upload RPC",
             },
 
+            // The host's persisted default model is host-local configuration.
+            // A paired device may switch the active session (SelectModel is
+            // allowed above) but must not rewrite what the host starts with.
+            ClientCommand::SetDefaultModel { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "the persisted default model is host-local",
+            },
+
             // Memory is durable, cross-session and unreviewable from a phone.
             // `AcceptMemory` especially: it IS the consent K36 requires, and a
             // phone is the wrong place to give it.

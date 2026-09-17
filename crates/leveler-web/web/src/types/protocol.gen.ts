@@ -53,6 +53,14 @@ export interface ChildContribution {
   role: string;
 }
 
+/** Which bound stopped a child whose stop is [`ChildStop::Budget`]. A mirror of the runtime's typed limit, not a second reason vocabulary: without it a client can only say "budget", which renders a wall-clock timeout and a spent token budget the same. `Duration` is the wall clock — the bound the runtime's child cap enforces. */
+export type ChildLimit =
+  | 'duration' | 'model_tokens' | 'cost' | 'commands' | 'modified_files'
+  /** The child's own round window. */
+  | 'round_window'
+  /** The absolute round ceiling. */
+  | 'round_ceiling';
+
 /** The four-way reading of a settled child's result. "Finished with nothing to flag" and "stopped with nothing to show" are opposite facts; a client renders them from this field, never from the summary text. */
 export type ChildOutcome = 'completed_with_findings' | 'completed_no_findings' | 'incomplete_partial' | 'incomplete_no_result';
 
@@ -309,7 +317,7 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null }
+  | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; limit?: ChildLimit | null; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null; title?: string | null }
   /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
   | { type: 'sub_agent_state_changed'; id: string; state: UiChildState }
   /** Live execution state and cumulative model usage for one spawned agent. */
@@ -511,6 +519,8 @@ export interface UiChildAgent {
   id: string;
   /** Model usage recorded under this child's id. */
   input_tokens?: number;
+  /** Which bound fired when `stop` is [`ChildStop::Budget`]. `None` for every other stop and for terminals recorded before it was carried. */
+  limit?: ChildLimit | null;
   nickname: string;
   /** Whether it reached the end of its task, once settled. Carried beside `outcome` because rows settled before the outcome was typed have only this bit. */
   ok?: boolean;
@@ -529,6 +539,8 @@ export interface UiChildAgent {
   stop?: ChildStop | null;
   /** The recorded settlement summary, once settled. */
   summary?: string | null;
+  /** The child's short task title, fixed at spawn: its identity, distinct from the full instructions in `purpose`. `None` on children recorded before titles existed; a presentation fallback may project `purpose`. */
+  title?: string | null;
 }
 
 /** The definition a running or settled child was spawned from, as resolved at spawn. Deleting or editing the definition does not change it. */
@@ -1016,6 +1028,8 @@ export type ClientCommand =
   | { type: 'answer_clarification'; answer: string; request_id: ClarificationId }
   /** Switch the model used for subsequent turns . */
   | { type: 'select_model'; model: ModelRef; session_id: SessionId }
+  /** The user's explicit "use this model from now on": switch the active session's model AND persist it as the user's default model for future sessions. Distinct from [`Self::SelectModel`] on purpose. Only this command carries the authority to rewrite the user's persisted configuration, because only an explicit user action does. Runtime fallbacks, provider failover, retries, temporary CLI/session overrides and internal routing MUST use [`Self::SelectModel`] (session-scoped) and never touch the default. */
+  | { type: 'set_default_model'; model: ModelRef; session_id: SessionId }
   /** Switch the execution mode used for subsequent turns . */
   | { type: 'set_permission_profile'; mode: PermissionProfile; session_id: SessionId }
   /** Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced (legacy `delivery` reads as `balanced`); collaboration = chat|plan|goal. */
