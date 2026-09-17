@@ -224,7 +224,64 @@ async fn non_retryable_400_fails_fast() {
     assert_eq!(err.delivery_state, leveler_model::DeliveryState::Responded);
     assert_eq!(err.retryability(), leveler_model::Retryability::Never);
     assert_eq!(err.provider.as_deref(), Some("mock"));
+    assert_eq!(err.model(), Some("m"), "the addressed model is stamped");
+    assert_eq!(err.status, Some(400));
+    assert_eq!(
+        err.message, "bad",
+        "the provider's own message is the reason, not the raw envelope"
+    );
     assert_eq!(server.request_count(), 1, "400 must not be retried");
+}
+
+/// A provider's structured error code and correlation id survive the whole
+/// transport, so a report can name exactly what the vendor rejected and which
+/// request to look up. Extracted once here; nothing downstream parses the body.
+#[tokio::test]
+async fn provider_error_code_and_request_id_are_preserved() {
+    let server = MockServer::start_one(MockResponse::StatusWithHeaders {
+        code: 400,
+        body: r#"{"error":{"message":"tools.function.parameters is not a valid moonshot flavored json schema","type":"invalid_request_error","code":"invalid_request"}}"#.into(),
+        headers: vec![("x-request-id".to_string(), "req_live_123".to_string())],
+    })
+    .await;
+    let reg = registry(&server);
+
+    let err = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .expect("400 must fail");
+    assert_eq!(err.status, Some(400));
+    assert_eq!(err.provider_code(), Some("invalid_request"));
+    assert_eq!(err.request_id(), Some("req_live_123"));
+    assert_eq!(
+        err.message,
+        "tools.function.parameters is not a valid moonshot flavored json schema"
+    );
+}
+
+/// A provider body is untrusted external text. A secret-shaped token in it must
+/// be redacted at the transport boundary, before anything stores or shows it.
+#[tokio::test]
+async fn a_secret_in_a_provider_error_body_is_redacted() {
+    let server = MockServer::start_one(MockResponse::Status {
+        code: 401,
+        body: r#"{"error":{"message":"invalid key: sk-live-supersecret"}}"#.into(),
+    })
+    .await;
+    let reg = registry(&server);
+
+    let err = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .expect("401 must fail");
+    assert!(
+        !err.message.contains("sk-live-supersecret"),
+        "secret leaked: {}",
+        err.message
+    );
+    assert!(err.message.contains("[redacted]"), "{}", err.message);
 }
 
 /// A gateway failure the model never saw is transient: it is retried.

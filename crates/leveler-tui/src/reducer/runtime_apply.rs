@@ -403,7 +403,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                         title: t.failure_title.to_string(),
                         summary: f.summary.clone(),
                         subtitle: failure_subtitle(f),
-                        detail: f.detail.clone(),
+                        detail: failure_detail_text(f, t),
                         expanded: false,
                     },
                     // A failure the runtime could not type (legacy event, or a
@@ -1065,14 +1065,65 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
     )
 }
 
-/// Muted machine subtitle for a failure: `provider · category_code`, or just
-/// the category code when there is no provider.
+/// Muted machine subtitle for a failure: `provider · category_code` and the
+/// HTTP status when there was one (`kimi · invalid_request · HTTP 400`). The
+/// status is the first thing a provider report needs, so it rides on the
+/// always-visible line rather than only the disclosure.
 fn failure_subtitle(failure: &leveler_client_protocol::UiFailure) -> Option<String> {
-    let category = failure.category.code();
-    match failure.provider.as_deref().filter(|p| !p.is_empty()) {
-        Some(provider) => Some(format!("{provider} · {category}")),
-        None => Some(category.to_string()),
+    let mut parts = Vec::new();
+    if let Some(provider) = failure.provider.as_deref().filter(|p| !p.is_empty()) {
+        parts.push(provider.to_string());
     }
+    parts.push(failure.category.code().to_string());
+    if let Some(status) = failure.status {
+        parts.push(format!("HTTP {status}"));
+    }
+    Some(parts.join(" · "))
+}
+
+/// The failure's disclosure text: every machine fact the runtime proved, one
+/// per line, then the provider's own (already sanitized) reason.
+///
+/// Built here from the typed failure so the renderer never parses a provider
+/// payload and raw request/response bodies are never dumped. Absent facts are
+/// omitted rather than shown blank.
+fn failure_detail_text(
+    failure: &leveler_client_protocol::UiFailure,
+    t: &crate::i18n::UiText,
+) -> String {
+    const LABEL_WIDTH: usize = 10;
+    let mut lines: Vec<String> = Vec::new();
+    let mut field = |label: &str, value: &str| {
+        let value = value.trim();
+        if !value.is_empty() {
+            lines.push(format!(
+                "{}  {value}",
+                crate::render::pad_display(label, LABEL_WIDTH)
+            ));
+        }
+    };
+    field(
+        t.failure_provider_label,
+        failure.provider.as_deref().unwrap_or(""),
+    );
+    field(
+        t.failure_model_label,
+        failure.model.as_deref().unwrap_or(""),
+    );
+    field(t.failure_category_label, failure.category.code());
+    if let Some(status) = failure.status {
+        field(t.failure_http_label, &status.to_string());
+    }
+    field(
+        t.failure_code_label,
+        failure.provider_code.as_deref().unwrap_or(""),
+    );
+    field(
+        t.failure_request_id_label,
+        failure.request_id.as_deref().unwrap_or(""),
+    );
+    field(t.failure_reason_label, &failure.detail);
+    lines.join("\n")
 }
 
 fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {

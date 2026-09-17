@@ -2119,7 +2119,9 @@ mod tests {
                     category: FailureCategory::InvalidRequest,
                     source: FailureSource::Provider,
                     provider: Some("moonshot".into()),
+                    model: None,
                     provider_code: None,
+                    request_id: None,
                     status: Some(400),
                     retryability: FailureRetryability::Never,
                     delivery: FailureDelivery::Responded,
@@ -2158,6 +2160,70 @@ mod tests {
             expanded.contains("flavored json schema"),
             "the raw detail must be readable once disclosed:\n{expanded}"
         );
+    }
+
+    /// The disclosure names every machine fact the runtime proved, so a user
+    /// report carries the provider, model, status, vendor code and request id
+    /// without anyone parsing a payload.
+    #[test]
+    fn a_failure_disclosure_names_the_provider_facts() {
+        use leveler_client_protocol::{
+            FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+        };
+        let mut s = test_state();
+        s.status = leveler_client_protocol::RuntimeStatus::Busy;
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::Runtime(leveler_client_protocol::RuntimeEvent::TurnFailed {
+                error: "legacy".into(),
+                failure: Some(UiFailure {
+                    category: FailureCategory::InvalidRequest,
+                    source: FailureSource::Provider,
+                    provider: Some("kimi".into()),
+                    model: Some("k3".into()),
+                    provider_code: Some("invalid_request".into()),
+                    request_id: Some("req_live_1".into()),
+                    status: Some(400),
+                    retryability: FailureRetryability::Never,
+                    delivery: FailureDelivery::Responded,
+                    summary: "模型服务拒绝了当前请求。".into(),
+                    detail: "tools.function.parameters is not a valid json schema".into(),
+                }),
+            }),
+        );
+        let default: String = crate::conversation::build::build_conversation_lines(&s, 120)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            default.contains("kimi · invalid_request · HTTP 400"),
+            "the status must ride the always-visible subtitle:\n{default}"
+        );
+        assert!(
+            !default.contains("not a valid json schema"),
+            "the reason stays behind the disclosure:\n{default}"
+        );
+
+        let _ = s.transcript.toggle_last_collapsible();
+        let expanded: String = crate::conversation::build::build_conversation_lines(&s, 120)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "kimi",
+            "k3",
+            "invalid_request",
+            "400",
+            "req_live_1",
+            "not a valid json schema",
+        ] {
+            assert!(
+                expanded.contains(needle),
+                "missing {needle} in:\n{expanded}"
+            );
+        }
     }
 
     #[test]

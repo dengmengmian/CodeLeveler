@@ -5265,6 +5265,13 @@
           "description": "The raw technical detail. Disclosure only — never the primary line.",
           "type": "string"
         },
+        "model": {
+          "description": "The model id the failing request was addressed to, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "The provider id, when the failure came from a provider call.",
           "type": [
@@ -5274,6 +5281,13 @@
         },
         "provider_code": {
           "description": "The provider's own error code, when it reported one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "description": "The provider's correlation id for the failing request, when the response exposed one. The single most useful field for a support report against a vendor.",
           "type": [
             "string",
             "null"

@@ -634,10 +634,14 @@ export interface UiFailure {
   delivery: FailureDelivery;
   /** The raw technical detail. Disclosure only — never the primary line. */
   detail: string;
+  /** The model id the failing request was addressed to, when known. */
+  model?: string | null;
   /** The provider id, when the failure came from a provider call. */
   provider?: string | null;
   /** The provider's own error code, when it reported one. */
   provider_code?: string | null;
+  /** The provider's correlation id for the failing request, when the response exposed one. The single most useful field for a support report against a vendor. */
+  request_id?: string | null;
   retryability: FailureRetryability;
   source: FailureSource;
   /** HTTP status, when the failure had one. */

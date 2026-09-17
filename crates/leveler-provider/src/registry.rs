@@ -183,11 +183,12 @@ impl ModelRuntime for ProviderRegistry {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
-        // Stamp the provider onto any failure from this call. The registry is
-        // the one place that knows which provider the request was addressed
-        // to, and downstream presentation must not re-derive it from the raw
-        // message.
+        // Stamp the provider and model onto any failure from this call. The
+        // registry is the one place that knows which provider/model the
+        // request was addressed to, and downstream presentation must not
+        // re-derive them from the raw message.
         let provider_id = request.model.provider.clone();
+        let model_id = request.model.model.clone();
         let out = async move {
             let provider = self.provider(&request.model.provider)?;
             let entry = self.entry(&request.model)?;
@@ -234,7 +235,7 @@ impl ModelRuntime for ProviderRegistry {
             Ok(stream)
         }
         .await;
-        out.map_err(|error: ModelError| error.with_provider(provider_id))
+        out.map_err(|error: ModelError| error.with_provider(provider_id).with_model(model_id))
     }
 
     async fn generate(
@@ -243,6 +244,7 @@ impl ModelRuntime for ProviderRegistry {
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
         let provider_id = request.model.provider.clone();
+        let model_id = request.model.model.clone();
         let out = async move {
             let provider = self.provider(&request.model.provider)?;
             let entry = self.entry(&request.model)?;
@@ -294,7 +296,7 @@ impl ModelRuntime for ProviderRegistry {
             Ok(decoded)
         }
         .await;
-        out.map_err(|error: ModelError| error.with_provider(provider_id))
+        out.map_err(|error: ModelError| error.with_provider(provider_id).with_model(model_id))
     }
 
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {

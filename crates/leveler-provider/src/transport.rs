@@ -107,8 +107,23 @@ pub(crate) async fn send_with_retry(
                 }
                 let code = status.as_u16();
                 let retry_after = parse_retry_after(response.headers());
+                let header_request_id = request_id_from_headers(response.headers());
                 let text = response.text().await.unwrap_or_default();
-                let mut err = ModelError::from_status(code, truncate(&text, 500));
+                let detail = parse_provider_error(&text);
+                // Prefer the provider's own explanation over the raw envelope;
+                // fall back to the bounded body so an unknown shape still says
+                // something. `from_status` sanitizes whatever it receives.
+                let reason = detail
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| truncate(&text, 500));
+                let mut err = ModelError::from_status(code, reason);
+                if let Some(code) = detail.code {
+                    err = err.with_provider_code(code);
+                }
+                if let Some(id) = header_request_id.or(detail.request_id) {
+                    err = err.with_request_id(id);
+                }
                 if let Some(ms) = retry_after {
                     err = err.with_retry_after_ms(ms);
                 }
@@ -211,6 +226,64 @@ fn deadline_exceeded(last_error: Option<ModelError>) -> ModelError {
 /// Hard cap on a provider-advertised wait so a hostile/buggy `Retry-After`
 /// cannot park the turn for minutes.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// Structured fields a provider's error response carried.
+///
+/// Extracted once, here at the transport boundary, so no downstream layer —
+/// runtime, transcript, or TUI — ever parses a vendor error body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProviderErrorDetail {
+    code: Option<String>,
+    message: Option<String>,
+    request_id: Option<String>,
+}
+
+/// Extract the error envelope most OpenAI-compatible and Anthropic gateways
+/// use. Shape-tolerant and best-effort: an unrecognized body leaves every
+/// field `None` and the caller keeps the sanitized raw text as the reason.
+fn parse_provider_error(body: &str) -> ProviderErrorDetail {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ProviderErrorDetail::default();
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let field = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    ProviderErrorDetail {
+        code: field(error, "code").or_else(|| field(error, "type")),
+        message: field(error, "message"),
+        request_id: field(error, "request_id")
+            .or_else(|| field(&value, "request_id"))
+            .or_else(|| field(&value, "id").filter(|s| s.starts_with("req"))),
+    }
+}
+
+/// Correlation headers gateways expose, in priority order. A correlation id is
+/// the single most useful thing a provider report can carry, so the common
+/// spellings are all read.
+const REQUEST_ID_HEADERS: &[&str] = &[
+    "x-request-id",
+    "request-id",
+    "x-ms-request-id",
+    "x-amzn-requestid",
+    "cf-ray",
+];
+
+fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in REQUEST_ID_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Parse `Retry-After` as delay-seconds into milliseconds. The HTTP-date form
 /// is rare on LLM gateways and is ignored (falls back to exponential backoff).

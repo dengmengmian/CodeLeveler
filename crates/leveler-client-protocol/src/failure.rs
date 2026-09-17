@@ -152,9 +152,17 @@ pub struct UiFailure {
     /// The provider id, when the failure came from a provider call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The model id the failing request was addressed to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The provider's own error code, when it reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
+    /// The provider's correlation id for the failing request, when the
+    /// response exposed one. The single most useful field for a support
+    /// report against a vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// HTTP status, when the failure had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,

@@ -120,7 +120,9 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
         category,
         source: FailureSource::Provider,
         provider: error.provider.clone(),
-        provider_code: None,
+        model: error.model().map(str::to_string),
+        provider_code: error.provider_code().map(str::to_string),
+        request_id: error.request_id().map(str::to_string),
         status: error.status,
         retryability,
         delivery,
@@ -1238,6 +1240,29 @@ mod bridge_tests {
             "the summary is product copy, not the raw body: {}",
             failure.summary
         );
+    }
+
+    /// The vendor's own code, the model addressed, and the correlation id are
+    /// part of the structured failure — a report must not have to parse the
+    /// raw body to name them.
+    #[test]
+    fn provider_code_model_and_request_id_project_into_the_failure() {
+        use leveler_model::{ModelError, ModelErrorKind};
+        let error = ModelError::new(ModelErrorKind::InvalidRequest, "bad schema")
+            .with_status(400)
+            .with_provider("kimi")
+            .with_model("k3")
+            .with_provider_code("invalid_request_error")
+            .with_request_id("req_abc");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.provider.as_deref(), Some("kimi"));
+        assert_eq!(failure.model.as_deref(), Some("k3"));
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(failure.request_id.as_deref(), Some("req_abc"));
+        assert_eq!(failure.status, Some(400));
     }
 
     /// A failed turn's structured failure survives the durable `TaskFinished`
