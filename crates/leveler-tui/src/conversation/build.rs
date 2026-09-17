@@ -72,6 +72,7 @@ impl AppState {
             tools_expanded: self.tools_expanded,
             awaiting_approval: self.approval_gated_call().cloned(),
             elapsed_secs: self.elapsed_secs,
+            focused_command: self.focused_command().cloned(),
         };
         if let Some((k, lines, hits, commands)) = self.conv.cache.borrow().as_ref()
             && *k == key
@@ -215,13 +216,14 @@ fn build_conversation(
                     t,
                     state.elapsed_secs,
                     state.approval_gated_call(),
+                    state.focused_command(),
                     &mut rows,
                 ));
                 commands.extend(rows.into_iter().map(|row| super::view::CommandHit {
                     line: base + row.line,
                     item: idx,
                     call: row.call,
-                    stop: row.stop,
+                    stoppable: row.stoppable,
                 }));
             }
             TranscriptItem::SubAgent(first) => {

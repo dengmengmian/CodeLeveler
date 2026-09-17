@@ -87,6 +87,8 @@ pub struct Notification {
 /// - [`Input`](WorkbenchFocus::Input): history browse, typing
 /// - [`Conversation`](WorkbenchFocus::Conversation): viewport scroll
 /// - [`Activity`](WorkbenchFocus::Activity): compact activity rows (Enter opens detail)
+/// - [`Command`](WorkbenchFocus::Command): the transcript's running command
+///   rows (Enter toggles output, `x` stops the focused execution)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkbenchFocus {
     #[default]
@@ -95,6 +97,8 @@ pub enum WorkbenchFocus {
     Activity,
     /// The 待发送 list above the composer.
     Pending,
+    /// A running command row in the transcript holds the keyboard focus.
+    Command,
 }
 
 /// The `/remote` invite, as the screen shows it.
@@ -313,6 +317,11 @@ pub struct AppState {
     pub activity_selected: Option<crate::activity::ActivityId>,
     /// Last-painted status-strip hits: (row y, activity). Mouse open uses this.
     pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
+    /// The running command row under the Command workbench focus, by the
+    /// execution's authoritative [`ToolCallId`]. Presentation only: the stop
+    /// path re-checks it against the live transcript before acting, so a
+    /// finished or replayed row can never be stopped by a stale reference.
+    pub command_selected: Option<leveler_client_protocol::ToolCallId>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
     /// Collapse the collaboration surface to its one-line compact row.
@@ -466,6 +475,7 @@ impl AppState {
             activity_open: None,
             activity_selected: None,
             activity_hits: Vec::new(),
+            command_selected: None,
             plan_collapsed: false,
             collaboration_collapsed: false,
             tools_expanded: false,
@@ -547,6 +557,80 @@ impl AppState {
 
     pub fn is_busy(&self) -> bool {
         self.status == RuntimeStatus::Busy
+    }
+
+    /// Whether this client may offer a stop for a running command at all.
+    ///
+    /// A stop is a live execution action. Without a connected runtime and a
+    /// live turn there is nothing to cancel: a residual `Running` row left by
+    /// replay or a lagged resync must not expose a `CancelToolCall`.
+    pub fn can_stop_commands(&self) -> bool {
+        self.runtime_connected && self.is_busy()
+    }
+
+    /// The call id that should be painted with the Command focus marker, when
+    /// the Command workbench focus is active and the selection is still a
+    /// stoppable running command. `None` clears the marker for any stale
+    /// selection, so a finished row never keeps wearing it.
+    pub fn focused_command(&self) -> Option<&leveler_client_protocol::ToolCallId> {
+        if self.workbench_focus != WorkbenchFocus::Command || !self.can_stop_commands() {
+            return None;
+        }
+        let id = self.command_selected.as_ref()?;
+        let (item, call) = self.command_location(id)?;
+        self.command_is_stoppable(item, call).then_some(id)
+    }
+
+    /// The running commands this client may stop, in transcript order, as
+    /// `(item, call, id)`. Empty unless [`Self::can_stop_commands`].
+    pub fn stoppable_commands(&self) -> Vec<(usize, usize, leveler_client_protocol::ToolCallId)> {
+        if !self.can_stop_commands() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (item, entry) in self.transcript.items().iter().enumerate() {
+            let crate::transcript::TranscriptItem::ToolGroup(group) = entry else {
+                continue;
+            };
+            for (call, block) in group.calls.iter().enumerate() {
+                if self.command_is_stoppable(item, call) {
+                    out.push((item, call, block.id.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the call at `(item, call)` is a running command this client may
+    /// stop: still running, not already asked to stop, not awaiting approval.
+    fn command_is_stoppable(&self, item: usize, call: usize) -> bool {
+        let Some(crate::transcript::TranscriptItem::ToolGroup(group)) =
+            self.transcript.items().get(item)
+        else {
+            return false;
+        };
+        let Some(block) = group.calls.get(call) else {
+            return false;
+        };
+        block.status == crate::transcript::ToolStatus::Running
+            && block.stop != crate::transcript::StopRequest::Sent
+            && self.approval_gated_call() != Some(&block.id)
+    }
+
+    /// The transcript location of a running command by its authoritative id.
+    pub fn command_location(
+        &self,
+        id: &leveler_client_protocol::ToolCallId,
+    ) -> Option<(usize, usize)> {
+        for (item, entry) in self.transcript.items().iter().enumerate() {
+            let crate::transcript::TranscriptItem::ToolGroup(group) = entry else {
+                continue;
+            };
+            if let Some(call) = group.calls.iter().position(|c| &c.id == id) {
+                return Some((item, call));
+            }
+        }
+        None
     }
 
     /// The active model's context window in tokens (0 = unknown).

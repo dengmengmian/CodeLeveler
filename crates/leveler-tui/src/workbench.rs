@@ -152,7 +152,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         .iter()
         .any(|line| line.spans.iter().any(|span| !span.content.is_empty()))
     {
-        status_block.len().min(5) as u16
+        status_block
+            .len()
+            .min(1 + crate::activity::MAX_STATUS_ROWS * 2) as u16
     } else {
         0
     };
@@ -233,17 +235,21 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // chunks[2] = gap (leave blank)
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_block.clone()), chunks[3]);
-        let (_, ids) =
+        let activity_rows =
             crate::activity::status_activity_lines(state, area.width as usize, state.t());
         let headline = status_block
             .len()
-            .saturating_sub(ids.len())
+            .saturating_sub(activity_rows.len())
             .min(status_rows as usize);
-        state.activity_hits = ids
-            .into_iter()
+        state.activity_hits = activity_rows
+            .iter()
             .enumerate()
             .filter(|(i, _)| headline + i < status_rows as usize)
-            .map(|(i, id)| (chunks[3].y + (headline + i) as u16, id))
+            .filter_map(|(i, row)| {
+                row.id
+                    .clone()
+                    .map(|id| (chunks[3].y + (headline + i) as u16, id))
+            })
             .collect();
     } else {
         state.activity_hits.clear();
@@ -1370,12 +1376,14 @@ mod tests {
                 done: false,
                 ok: false,
                 detail: (*purpose).into(),
+                title: None,
                 profile_id: Some((*role).into()),
                 agent_name: None,
                 read_only: true,
                 contribution: None,
                 started_elapsed_secs: 0,
                 stop: None,
+                limit: None,
             });
         }
         team
@@ -1856,6 +1864,7 @@ mod tests {
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "check deps".into(),
                 status: *st,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -1867,6 +1876,7 @@ mod tests {
                 detail: None,
                 steps: Vec::new(),
                 stop: None,
+                limit: None,
             });
         }
         team
@@ -1954,12 +1964,14 @@ mod tests {
             done: false,
             ok: false,
             detail: "审计生命周期与身份".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
             stop: None,
+            limit: None,
         });
         team.apply_progress("c1", true, 120_000, 48_000);
         state.team = team;
@@ -2001,12 +2013,14 @@ mod tests {
             done: true,
             ok: true,
             detail: "done".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 4,
             stop: None,
+            limit: None,
         });
         team.apply_update(crate::multi_agent::ChildUpdate {
             id: "bad1".into(),
@@ -2015,12 +2029,14 @@ mod tests {
             done: true,
             ok: false,
             detail: "died".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 5,
             stop: None,
+            limit: None,
         });
         // A third child still active keeps the surface in full roster shape
         // (frozen transience: all-settled collapses to the terminal line).
@@ -2031,12 +2047,14 @@ mod tests {
             done: false,
             ok: false,
             detail: "audit c".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 6,
             stop: None,
+            limit: None,
         });
         state.team = team;
         let rows = panel_rows(&state, 5).join("\n");
@@ -2071,12 +2089,14 @@ mod tests {
                 done: true,
                 ok,
                 detail: "done".into(),
+                title: None,
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
                 contribution: None,
                 started_elapsed_secs: 3,
                 stop: None,
+                limit: None,
             });
         }
         state.team = team;

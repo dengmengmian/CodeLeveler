@@ -341,8 +341,9 @@ pub struct UiText {
     pub question_timed_out: &'static str,
     pub question_unattended: &'static str,
     pub question_skipped: &'static str,
-    /// The clickable stop action on a running command row.
-    pub command_stop_action: &'static str,
+    /// The contextual hint while a running command row holds the keyboard
+    /// focus: enter toggles its output, `x` stops that execution.
+    pub command_focus_hint: &'static str,
     /// Expanded output that dropped its head: "前 {} 行未显示".
     pub command_output_hidden: &'static str,
     /// 待发送 area: "待发送 · {}", actions, per-item delivery labels, overflow.
@@ -1065,7 +1066,7 @@ static ZH: UiText = UiText {
     question_timed_out: "未回复（已超时）",
     question_unattended: "无人回答（非交互运行）",
     question_skipped: "已跳过",
-    command_stop_action: "停止",
+    command_focus_hint: "Enter 展开 · x 停止",
     command_output_hidden: "前 {} 行未显示",
     pending_inputs_title: "待发送 · {}",
     pending_input_send: "发送",
@@ -1670,7 +1671,7 @@ static EN: UiText = UiText {
     question_timed_out: "not answered (timed out)",
     question_unattended: "nobody to answer (unattended run)",
     question_skipped: "skipped",
-    command_stop_action: "stop",
+    command_focus_hint: "Enter expand · x stop",
     command_output_hidden: "{} earlier lines hidden",
     pending_inputs_title: "Not sent · {}",
     pending_input_send: "send",

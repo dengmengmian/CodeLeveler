@@ -62,6 +62,9 @@ pub struct ChildAgentView {
     pub agent_name: Option<String>,
     /// Whether this child holds a physically read-only toolset.
     pub read_only: bool,
+    /// The child's short task title, fixed at spawn. `None` for children
+    /// recorded before titles existed; renderers project `purpose` then.
+    pub title: Option<String>,
     /// What it was asked to do. Leads the running line: a user watching a
     /// spinner needs the reason, not the state.
     pub purpose: String,
@@ -74,6 +77,9 @@ pub struct ChildAgentView {
     /// How the activation ended, once it has. `None` while running and for
     /// terminals recorded before it was typed.
     pub stop: Option<leveler_client_protocol::ChildStop>,
+    /// Which bound fired when `stop` is a budget stop, once the runtime typed
+    /// one. Read, never inferred from the summary text.
+    pub limit: Option<leveler_client_protocol::ChildLimit>,
     pub started_elapsed_secs: u64,
     /// Elapsed when this child settled, once it has. A finished row shows the
     /// time it took; without the stamp it followed the turn clock, so a
@@ -124,6 +130,8 @@ pub struct ChildUpdate {
     pub ok: bool,
     /// The task while running; a short result summary once done.
     pub detail: String,
+    /// The child's short task title, carried on the start only.
+    pub title: Option<String>,
     pub profile_id: Option<String>,
     pub agent_name: Option<String>,
     pub read_only: bool,
@@ -131,6 +139,10 @@ pub struct ChildUpdate {
     pub contribution: Option<ChildContribution>,
     /// How the activation ended, when it did. Read, never inferred.
     pub stop: Option<leveler_client_protocol::ChildStop>,
+    /// Which bound fired when `stop` is a budget stop. Distinguishes the
+    /// wall-clock cap from a spent token or cost budget, so the surface can
+    /// say the actual reason.
+    pub limit: Option<leveler_client_protocol::ChildLimit>,
     pub started_elapsed_secs: u64,
 }
 
@@ -211,11 +223,13 @@ impl TaskTeamView {
             done,
             ok,
             detail,
+            title,
             profile_id,
             agent_name,
             read_only,
             contribution,
             stop,
+            limit,
             started_elapsed_secs,
         } = update;
         let contribution = if !done {
@@ -229,9 +243,13 @@ impl TaskTeamView {
             (true, false) => ChildStatus::Failed,
         };
         if let Some(existing) = self.children.iter_mut().find(|c| c.id == id) {
-            // A finish event carries no purpose; keep the one from the spawn.
+            // A finish event carries no purpose or title; keep the ones from
+            // the spawn.
             if !done {
                 existing.purpose = detail;
+            }
+            if title.is_some() {
+                existing.title = title;
             }
             existing.status = status;
             // The first settlement owns the clock: a repeated finish event
@@ -243,6 +261,9 @@ impl TaskTeamView {
             }
             existing.contribution = contribution;
             existing.stop = stop;
+            if limit.is_some() {
+                existing.limit = limit;
+            }
             if !role.is_empty() {
                 existing.role = role;
             }
@@ -263,6 +284,7 @@ impl TaskTeamView {
             profile_id,
             agent_name,
             read_only,
+            title,
             purpose: detail,
             status,
             contribution,
@@ -270,6 +292,7 @@ impl TaskTeamView {
             input_tokens: 0,
             output_tokens: 0,
             stop,
+            limit,
             started_elapsed_secs,
             settled_elapsed_secs: done.then_some(started_elapsed_secs),
             detail: None,
@@ -317,6 +340,7 @@ impl TaskTeamView {
                 if !settled_here && !finer_live {
                     existing.status = status;
                     existing.stop = recorded.stop;
+                    existing.limit = recorded.limit;
                 }
                 existing.input_tokens = existing.input_tokens.max(input);
                 existing.output_tokens = existing.output_tokens.max(output);
@@ -334,6 +358,7 @@ impl TaskTeamView {
                 profile_id: recorded.profile_id.clone(),
                 agent_name: recorded.agent.as_ref().map(|a| a.name.clone()),
                 read_only: recorded.read_only,
+                title: recorded.title.clone(),
                 purpose: recorded.purpose.clone(),
                 status,
                 contribution: Contribution::Pending,
@@ -341,6 +366,8 @@ impl TaskTeamView {
                 input_tokens: input,
                 output_tokens: output,
                 stop: None,
+                // The runtime holds no bound for a child still open.
+                limit: None,
                 started_elapsed_secs: now_elapsed,
                 // Restored children are still open by the branch above; a
                 // settled one never joins the live team.
@@ -446,6 +473,24 @@ pub fn stop_label(
     }
 }
 
+/// The same words, using the bound the runtime typed beside the stop.
+///
+/// A wall-clock cap and a spent token budget are different events: the child
+/// that ran out of time is `超时`/`timeout`, the one that ran out of tokens is
+/// `预算耗尽`/`budget exhausted`. The generic label is only for terminals that
+/// carry no bound (older records, or a stop the runtime did not type).
+pub fn child_stop_label(
+    stop: Option<leveler_client_protocol::ChildStop>,
+    limit: Option<leveler_client_protocol::ChildLimit>,
+    t: &crate::i18n::UiText,
+) -> Option<&'static str> {
+    use leveler_client_protocol::{ChildLimit, ChildStop};
+    if stop == Some(ChildStop::Budget) && limit == Some(ChildLimit::Duration) {
+        return Some(t.agent_status_timeout);
+    }
+    stop_label(stop, t)
+}
+
 /// `None` is the runtime saying "not measured". It is not a zero, and the
 /// difference is the whole reason this function exists.
 fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
@@ -495,11 +540,13 @@ mod tests {
                 done: false,
                 ok: false,
                 detail: "任务".into(),
+                title: None,
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
                 contribution: None,
                 stop: None,
+                limit: None,
                 started_elapsed_secs: 0,
             });
         }
@@ -524,11 +571,13 @@ mod tests {
             done: false,
             ok: false,
             detail: "复核".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: true,
             contribution: None,
             stop: None,
+            limit: None,
             started_elapsed_secs: 0,
         });
         let labels: Vec<String> = roster_rows(&single, None, 10, t)
@@ -563,6 +612,66 @@ mod tests {
         );
     }
 
+    /// The spawn title is task identity: it arrives on the start event, a
+    /// terminal carries none and must not erase it, and a snapshot restores it.
+    #[test]
+    fn a_childs_spawn_title_is_kept_across_its_terminal() {
+        let mut team = TaskTeamView::default();
+        team.apply_update(ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            title: Some("调查 Windows CI 两个 flaky tests".into()),
+            done: false,
+            ok: false,
+            detail: "the full instructions".into(),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+        assert_eq!(
+            team.children[0].title.as_deref(),
+            Some("调查 Windows CI 两个 flaky tests")
+        );
+        assert_eq!(team.children[0].purpose, "the full instructions");
+
+        // A terminal carries no title; it must keep the spawn's.
+        team.apply_update(ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: String::new(),
+            title: None,
+            done: true,
+            ok: true,
+            detail: String::new(),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 5,
+        });
+        assert_eq!(
+            team.children[0].title.as_deref(),
+            Some("调查 Windows CI 两个 flaky tests")
+        );
+
+        // A snapshot (replay) restores it from the runtime's own record.
+        let mut restored = TaskTeamView::default();
+        let mut child = recorded("c2", leveler_client_protocol::UiChildState::Running, false);
+        child.title = Some("audit the refund path".into());
+        restored.restore(&[child], 0);
+        assert_eq!(
+            restored.children[0].title.as_deref(),
+            Some("audit the refund path")
+        );
+    }
+
     fn recorded(
         id: &str,
         state: leveler_client_protocol::UiChildState,
@@ -574,6 +683,7 @@ mod tests {
             role: "explorer".into(),
             profile_id: None,
             read_only: true,
+            title: None,
             purpose: "look".into(),
             agent: None,
             state,
@@ -583,6 +693,7 @@ mod tests {
             resumes: 0,
             outcome: None,
             stop: None,
+            limit: None,
             summary: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -666,6 +777,7 @@ mod tests {
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "look around".into(),
                 status: *st,
                 contribution: Contribution::Pending,
@@ -677,6 +789,7 @@ mod tests {
                 detail: None,
                 steps: Vec::new(),
                 stop: None,
+                limit: None,
             });
         }
         team
@@ -758,12 +871,14 @@ mod tests {
             done: false,
             ok: false,
             detail: purpose.into(),
+            title: None,
             profile_id: Some(role.into()),
             agent_name: None,
             read_only: true,
             contribution: None,
             started_elapsed_secs: 0,
             stop: None,
+            limit: None,
         });
     }
 
@@ -775,12 +890,14 @@ mod tests {
             done: true,
             ok,
             detail: "summary".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: c,
             started_elapsed_secs: 0,
             stop: None,
+            limit: None,
         });
     }
 
@@ -890,12 +1007,14 @@ mod tests {
             done: false,
             ok: false,
             detail: "implement".into(),
+            title: None,
             profile_id: Some("worker".into()),
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
             stop: None,
+            limit: None,
         });
         assert!(!team2.children[0].is_read_only());
     }
@@ -911,12 +1030,14 @@ mod tests {
             done: true,
             ok: true,
             detail: "done".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             started_elapsed_secs: 0,
             stop: None,
+            limit: None,
         });
         assert_eq!(team.children[0].role, "explorer");
     }
@@ -1649,7 +1770,7 @@ pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine>
                 ChildStatus::Waiting | ChildStatus::Running => running_line(c, t),
                 ChildStatus::Interrupted => t.sub_agent_interrupted.to_string(),
                 ChildStatus::Unreported => t.sub_agent_unreported.to_string(),
-                ChildStatus::Failed => stop_label(c.stop, t)
+                ChildStatus::Failed => child_stop_label(c.stop, c.limit, t)
                     .unwrap_or(t.sub_agent_incomplete)
                     .to_string(),
                 ChildStatus::Completed => {

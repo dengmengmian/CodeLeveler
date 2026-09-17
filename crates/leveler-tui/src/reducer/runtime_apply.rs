@@ -458,6 +458,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             id,
             nickname,
             role,
+            title,
             done,
             ok,
             detail,
@@ -467,6 +468,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             agent,
             contribution,
             stop,
+            limit,
             ..
         } => {
             let started = state.elapsed_secs;
@@ -478,12 +480,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 done,
                 ok,
                 detail: detail.clone(),
+                title,
                 profile_id,
                 agent_name: agent_name.clone(),
                 read_only,
                 contribution: contribution.clone(),
                 started_elapsed_secs: started,
                 stop,
+                limit,
             });
             if done {
                 // The projection is the source of truth now, not a count
@@ -1399,6 +1403,7 @@ fn apply_session_with(
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;
         state.pending_attachments.clear();
+        state.command_selected = None;
         // Another session's children are not this session's.
         state.team = crate::multi_agent::TaskTeamView::default();
     }
@@ -1413,6 +1418,8 @@ fn apply_session_with(
     // Rebuild the transcript from the session's persisted messages. Opening a
     // different session (or a lagged resync) replaces the current view.
     state.transcript.clear();
+    // Any command row focus referred to a call in the transcript just dropped.
+    state.command_selected = None;
     // Durable goal recaps (long-goal P3) interleave at the transcript
     // position their checkpoint represents: messages `[0..ordinal)` precede
     // the recap. A recap without a usable position lands after the messages

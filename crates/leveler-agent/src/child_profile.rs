@@ -131,6 +131,16 @@ pub(crate) struct BudgetPolicy {
 /// [`crate::sub_agent::SUB_AGENT_MAX_DURATION`].
 pub(crate) const CHILD_MAX_DURATION_SECS: u64 = 20 * 60;
 
+/// Wall clock reserved at the end of a child's cap for it to turn what it has
+/// established into a final report. The hard cap above is unchanged — this
+/// only decides whether the child gets to synthesize before it is cut off.
+///
+/// Sized from measurement, not taste: on this repository a model round over a
+/// full child transcript returned in 70–120 s, so three minutes fits one
+/// synthesis round (plus a bounded closing check) with margin while staying
+/// well under the 20-minute cap.
+pub(crate) const CHILD_FINALIZATION_GRACE_SECS: u64 = 3 * 60;
+
 /// The capability contract of one child. Resolved in exactly one place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChildProfile {

@@ -41,7 +41,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::goal_resolve_nudge;
+use crate::nudges::{finalization_nudge, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
     multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
@@ -111,6 +111,21 @@ const MAX_DECODE_RETRIES: u32 = 2;
 /// to execute and fail immediately.
 const MAX_LENGTH_CONTINUATIONS: u32 = 2;
 
+/// The wall-clock point (on the same task-level axis as `max_duration`) at
+/// which a bounded run is asked to stop expanding and return what it has.
+///
+/// `None` when the run has no duration bound, no finalization reserve, or a
+/// reserve that would swallow the whole run. The point is strictly before
+/// `max_duration`, so it can request a synthesis but never extend a run.
+pub(crate) fn finalization_point(
+    max_duration: Option<std::time::Duration>,
+    finalization_grace: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let max = max_duration?;
+    let grace = finalization_grace?;
+    max.checked_sub(grace).filter(|at| !at.is_zero())
+}
+
 /// The CodeLeveler coding harness around the generic agent kernel.
 ///
 /// The kernel (`leveler-agent-core`) owns the round loop, the model round,
@@ -160,6 +175,9 @@ pub(crate) struct Drive<'a> {
     /// Finalization is a one-way lifecycle boundary for this drive. Keeping
     /// the latch here prevents multiple exit helpers from publishing it twice.
     finalization_started: bool,
+    /// Set once the wall-clock finalization request has been put in front of
+    /// the model, so a run that ignores it is not told again every round.
+    finalization_requested_sent: bool,
     verification_ran: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
@@ -333,6 +351,7 @@ impl Executor {
             injected_rule_sources: Vec::new(),
             last_text: String::new(),
             finalization_started: false,
+            finalization_requested_sent: false,
             verification_ran: false,
             ledger: seeded_ledger,
             // Unified closeout nudge budget shared by every quiet-round
@@ -366,6 +385,10 @@ impl Executor {
             max_model_tokens: self.step_limits.max_model_tokens,
             max_cost_usd_micros: self.step_limits.max_cost_usd_micros,
             max_duration: self.step_limits.max_duration,
+            finalize_at: finalization_point(
+                self.step_limits.max_duration,
+                self.step_limits.finalization_grace,
+            ),
             spent_before: SpentBefore {
                 model_tokens: harness.epoch_tokens_at_start,
                 cost_usd_micros: harness.progress.cumulative_cost_usd_micros,
@@ -950,6 +973,28 @@ impl AgentHarness for Drive<'_> {
             // next turn, so this never duplicates the system prompt).
             self.sink.append(std::slice::from_ref(&rules)).await?;
             messages.push(rules);
+        }
+
+        // The wall clock is near its bound: tell the model ONCE to stop
+        // expanding and return what it has, rather than let the hard deadline
+        // cut off an in-flight round with nothing but partial work. This is a
+        // request, not a stop: the kernel's deadline still ends the run if the
+        // model keeps working, and it is never issued again after this round.
+        //
+        // The transcript check makes it once across activations too: a resumed
+        // child's saved transcript already holds the request, and repeating it
+        // would buy nothing.
+        if !self.finalization_requested_sent && rt.finalization_requested() {
+            self.finalization_requested_sent = true;
+            let text = finalization_nudge();
+            if !messages
+                .iter()
+                .any(|m| m.role == Role::User && m.text_content() == text)
+            {
+                let nudge = Message::text(Role::User, text);
+                self.sink.append(std::slice::from_ref(&nudge)).await?;
+                messages.push(nudge);
+            }
         }
 
         // A pinned task budget is the model's to spend: at 80% it is told
@@ -2709,6 +2754,16 @@ impl AgentHarness for Drive<'_> {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                // Spawn-time task identity, distinct from the instructions in
+                // `task`. Absent on calls from clients that predate it; the
+                // renderer then falls back to a projection of the task.
+                let title = call
+                    .arguments
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 let agent_name = call
                     .arguments
                     .get("agent")
@@ -2897,6 +2952,7 @@ impl AgentHarness for Drive<'_> {
                 });
                 let (profile_id, profile_role, read_only) = profile.trace_fields();
                 let spec = leveler_lifecycle::ChildSpawnSpec {
+                    title,
                     files: files.clone(),
                     background,
                     ..admitted_spec
@@ -3723,6 +3779,11 @@ fn residual_step_limits(
 
     let mut limits = StepLimits {
         max_duration: Some(crate::sub_agent::SUB_AGENT_MAX_DURATION),
+        // A parent that configured a reserve (a test, or a future profile
+        // policy) passes it down; when it did not, the child runner applies
+        // the standard reserve. The child wall clock is the child's to
+        // finalize against, so this is inherited, not re-decided here.
+        finalization_grace: parent.finalization_grace,
         ..StepLimits::default()
     };
     if let Some(max) = parent.max_commands {
@@ -4042,5 +4103,72 @@ mod residual_budget_tests {
             None,
             "re-edit of counted path must be allowed at residual 0 new"
         );
+    }
+
+    /// The finalization point is strictly before the hard bound and never
+    /// exists without both a duration bound and a reserve that fits inside it.
+    #[test]
+    fn the_finalization_point_is_before_the_hard_bound_or_absent() {
+        assert_eq!(
+            finalization_point(
+                Some(Duration::from_secs(1200)),
+                Some(Duration::from_secs(180))
+            ),
+            Some(Duration::from_secs(1020))
+        );
+        assert_eq!(
+            finalization_point(Some(Duration::from_secs(1200)), None),
+            None,
+            "no reserve configured means no request"
+        );
+        assert_eq!(
+            finalization_point(None, Some(Duration::from_secs(180))),
+            None,
+            "an unbounded run has nothing to finalize for"
+        );
+        assert_eq!(
+            finalization_point(
+                Some(Duration::from_secs(60)),
+                Some(Duration::from_secs(180))
+            ),
+            None,
+            "a reserve larger than the run would eat the whole budget"
+        );
+        assert_eq!(
+            finalization_point(
+                Some(Duration::from_secs(180)),
+                Some(Duration::from_secs(180))
+            ),
+            None,
+            "a point at the hard bound is not before it"
+        );
+    }
+
+    /// Every child inherits a finalization reserve even though the top-level
+    /// parent leaves it unset; a parent that configured one passes it down.
+    #[test]
+    fn a_child_inherits_the_configured_finalization_reserve() {
+        let overridden = StepLimits {
+            finalization_grace: Some(Duration::from_secs(5)),
+            ..StepLimits::default()
+        };
+        let child =
+            residual_step_limits(overridden, 0, 0, 0, 0, Duration::ZERO, Instant::now(), 0, 1);
+        assert_eq!(child.finalization_grace, Some(Duration::from_secs(5)));
+        // An unconfigured parent leaves it unset; the child runner applies
+        // the standard reserve (see `CHILD_FINALIZATION_GRACE_SECS`), so both
+        // launch paths get it without each deciding it here.
+        let child = residual_step_limits(
+            StepLimits::default(),
+            0,
+            0,
+            0,
+            0,
+            Duration::ZERO,
+            Instant::now(),
+            0,
+            1,
+        );
+        assert_eq!(child.finalization_grace, None);
     }
 }

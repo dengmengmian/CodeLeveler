@@ -464,6 +464,7 @@ mod tests {
                 profile_id: Some("worker".into()),
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "check".into(),
                 status: ChildStatus::Running,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -475,6 +476,7 @@ mod tests {
                 detail: None,
                 steps: Vec::new(),
                 stop: None,
+                limit: None,
             });
 
         let view = project(&state).expect("child wait");

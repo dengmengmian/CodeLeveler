@@ -150,6 +150,33 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
     frame.render_widget(Paragraph::new(visible), area);
 }
 
+/// Whether the child behind this activity was stopped at a bound rather than
+/// failing. Reads the typed stop, never the summary prose: `Incomplete`,
+/// `Budget`, `Cancelled` and `Lost` are all "did not finish", and only a
+/// runtime-typed `Failed` (or an untyped terminal) is a failure.
+fn child_stopped_at_a_bound(state: &AppState, id: &crate::activity::ActivityId) -> bool {
+    use leveler_client_protocol::ChildStop;
+    let crate::activity::ActivityId::Child(child_id) = id else {
+        return false;
+    };
+    state
+        .team
+        .children
+        .iter()
+        .find(|c| &c.id == child_id)
+        .is_some_and(|c| {
+            matches!(
+                c.stop,
+                Some(
+                    ChildStop::Incomplete
+                        | ChildStop::Budget
+                        | ChildStop::Cancelled
+                        | ChildStop::Lost
+                )
+            )
+        })
+}
+
 /// Activity Detail: observational overlay-as-screen. Does not cancel work.
 fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
     use crate::activity::{ActivityId, ActivityStatus, summaries};
@@ -175,6 +202,10 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         ActivityStatus::Running => t.wait_target_running,
         ActivityStatus::Waiting => t.sub_agent_waiting,
         ActivityStatus::Completed => t.title_completed,
+        // A child stopped at a bound (budget, cancel, lost) did not FAIL —
+        // it did not finish. "失败" over a partial result is the same
+        // conflation the typed reason beside it exists to undo.
+        ActivityStatus::Failed if child_stopped_at_a_bound(state, &id) => t.sub_agent_incomplete,
         ActivityStatus::Failed => t.title_failed,
         ActivityStatus::Interrupted => t.sub_agent_interrupted,
         ActivityStatus::Unreported => t.sub_agent_unreported,
@@ -224,7 +255,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
                 .children
                 .iter()
                 .find(|c| &c.id == child_id)
-                .and_then(|c| crate::multi_agent::stop_label(c.stop, t))
+                .and_then(|c| crate::multi_agent::child_stop_label(c.stop, c.limit, t))
             {
                 meta.push_str(&format!(" · {reason}"));
             }
@@ -1196,6 +1227,89 @@ mod tests {
         );
     }
 
+    /// A child the wall clock stopped is not a child that "failed on its
+    /// budget". The runtime typed the bound; the surface must say it: the
+    /// detail reads unfinished, and the reason is the timeout, not the
+    /// generic budget word that also covers a spent token budget.
+    #[test]
+    fn a_wall_clock_timeout_detail_reads_as_unfinished_timeout() {
+        let mut state =
+            stopped_child_state_hit(Some(leveler_client_protocol::ChildLimit::Duration));
+        let text = render_text(&mut state, 90, 30);
+        let meta = text
+            .lines()
+            .find(|l| l.contains("超时"))
+            .unwrap_or_else(|| panic!("the detail must name the wall-clock bound:\n{text}"));
+        assert!(
+            meta.contains("未完成") && !meta.contains("失败"),
+            "a stopped child did not fail; it did not finish: {meta:?}"
+        );
+        assert!(
+            !meta.contains("预算耗尽"),
+            "the duration bound must not read as a spent budget: {meta:?}"
+        );
+    }
+
+    /// The distinction is the typed limit, not the wording: a token-budget
+    /// stop keeps the budget label.
+    #[test]
+    fn a_token_budget_stop_keeps_the_budget_word() {
+        let mut state =
+            stopped_child_state_hit(Some(leveler_client_protocol::ChildLimit::ModelTokens));
+        let text = render_text(&mut state, 90, 30);
+        assert!(text.contains("预算耗尽"), "{text}");
+        assert!(!text.contains("超时"), "{text}");
+    }
+
+    /// Cross-feature: the two concurrent closures meet on one row. A child that
+    /// timed out keeps the semantic task title from its spawn — not the full
+    /// purpose — and its detail reads the wall-clock bound, not a generic
+    /// budget word. Neither feature may overwrite the other's fact.
+    #[test]
+    fn a_timed_out_child_keeps_its_task_title_and_reads_as_timeout() {
+        use crate::multi_agent::ChildUpdate;
+        let mut state = test_state();
+        let update = |done: bool, stop, limit| ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done,
+            ok: false,
+            detail: "你在 CodeLeveler 仓库里做一次只读调查，解释 Windows CI 的两个 flaky tests。"
+                .into(),
+            title: Some("调查 Windows CI 两个 flaky tests".into()),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop,
+            limit,
+            started_elapsed_secs: 0,
+        };
+        state.team.apply_update(update(false, None, None));
+        state.team.apply_update(update(
+            true,
+            Some(leveler_client_protocol::ChildStop::Budget),
+            Some(leveler_client_protocol::ChildLimit::Duration),
+        ));
+
+        let summary = crate::activity::summaries(&state)
+            .into_iter()
+            .find(|s| s.id == crate::activity::ActivityId::Child("c1".into()))
+            .expect("the child row");
+        assert_eq!(
+            summary.task_title.as_deref(),
+            Some("调查 Windows CI 两个 flaky tests"),
+            "the semantic title must survive the terminal and must not fall back to the purpose"
+        );
+
+        state.activity_open = Some(crate::activity::ActivityId::Child("c1".into()));
+        state.active_screen = Screen::Activity;
+        let text = render_text(&mut state, 90, 30);
+        assert!(text.contains("未完成") && text.contains("超时"), "{text}");
+        assert!(!text.contains("预算耗尽"), "{text}");
+    }
+
     /// Same rule `collaboration_glyph` already enforces one panel over: a call
     /// that ran is not an outcome that succeeded. Every step of an aborted
     /// child carried a success check, so a reviewer that was cut off mid-way
@@ -1232,6 +1346,10 @@ mod tests {
     }
 
     fn stopped_child_state() -> AppState {
+        stopped_child_state_hit(None)
+    }
+
+    fn stopped_child_state_hit(limit: Option<leveler_client_protocol::ChildLimit>) -> AppState {
         use crate::multi_agent::ChildUpdate;
         let mut state = test_state();
         let update = |done: bool, stop| ChildUpdate {
@@ -1241,11 +1359,13 @@ mod tests {
             done,
             ok: false,
             detail: "审查持久化改动".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: true,
             contribution: None,
             stop,
+            limit,
             started_elapsed_secs: 0,
         };
         state.team.apply_update(update(false, None));
@@ -1457,6 +1577,7 @@ mod tests {
                     id: "agent-1".into(),
                     nickname: "Euclid".into(),
                     role: "explorer".into(),
+                    title: None,
                     done: false,
                     ok: false,
                     detail: "SPAWNED survey".into(),
@@ -1467,6 +1588,7 @@ mod tests {
                     contribution: None,
                     outcome: None,
                     stop: None,
+                    limit: None,
                     background: Some(true),
                     scope: Vec::new(),
                 }),
@@ -1496,6 +1618,7 @@ mod tests {
             id: id.into(),
             nickname: "Euclid".into(),
             role: "explorer".into(),
+            title: None,
             done,
             ok,
             detail: if done {
@@ -1510,6 +1633,7 @@ mod tests {
             contribution: None,
             outcome: None,
             stop,
+            limit: None,
             background: Some(true),
             scope: Vec::new(),
         }
@@ -1661,6 +1785,7 @@ mod tests {
                     id: id.into(),
                     nickname: nickname.into(),
                     role: "explorer".into(),
+                    title: None,
                     done: false,
                     ok: false,
                     detail: task.into(),
@@ -1671,6 +1796,7 @@ mod tests {
                     contribution: None,
                     outcome: None,
                     stop: None,
+                    limit: None,
                     background: None,
                     scope: Vec::new(),
                 }),

@@ -13,8 +13,10 @@ use crate::status_line::fmt_elapsed;
 
 /// How many completed background entries the TUI keeps reopenable.
 pub(crate) const MAX_COMPLETED_BACKGROUND: usize = 8;
-/// Compact status-strip cap. Remaining stay available on the Activity screen.
-const MAX_STATUS_ROWS: usize = 4;
+/// Compact status-strip cap: how many ACTIVITIES are shown. Remaining stay
+/// available on the Activity screen. A child occupies two physical lines, so
+/// the strip's own row cap is derived from this in the workbench layout.
+pub(crate) const MAX_STATUS_ROWS: usize = 4;
 
 /// Stable identity. Never derived from the display title.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +56,16 @@ pub enum ActivityStatus {
 pub struct ActivitySummary {
     pub id: ActivityId,
     pub kind: ActivityKind,
+    /// The subject: the child's nickname (with its agent name) or the
+    /// background task's label. Identity, not the task description.
     pub title: String,
+    /// The child's short semantic task title, when the runtime recorded one.
+    /// `None` for background tasks and for children spawned before titles
+    /// existed; the renderer then projects `secondary` instead.
+    pub task_title: Option<String>,
+    /// Supporting text: a child's task/recent step, unused for background
+    /// tasks here. Kept separate from `title` so a two-line child row can put
+    /// identity and task on their own lines.
     pub secondary: Option<String>,
     pub status: ActivityStatus,
     pub started_elapsed_secs: u64,
@@ -81,6 +92,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             id: ActivityId::Background(task_id.clone()),
             kind: ActivityKind::BackgroundTask,
             title: chrome.label.clone(),
+            task_title: None,
             secondary: None,
             status,
             started_elapsed_secs: chrome.started_elapsed_secs,
@@ -125,6 +137,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             id: ActivityId::Child(child.id.clone()),
             kind: ActivityKind::ChildAgent,
             title,
+            task_title: child.title.clone(),
             secondary,
             status,
             started_elapsed_secs: child.started_elapsed_secs,
@@ -153,34 +166,87 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
     running
 }
 
+/// Blank columns before a child row's task line: aligned under the identity,
+/// past `→ ` (2) plus the status glyph and its space (2).
+const CHILD_TASK_INDENT: &str = "    ";
+
+/// One physical line of the status-strip activity block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityRow {
+    pub text: String,
+    /// The activity this line opens. Both lines of a two-line child carry the
+    /// same id, so either one opens the same detail.
+    pub id: Option<ActivityId>,
+    /// Whether this line belongs to the currently selected activity.
+    pub selected: bool,
+}
+
+/// The header line: identity, its status glyph, and the run time. A child's
+/// task text goes on its own line ([`child_task_line`]) rather than being
+/// concatenated here, so the identity group stays legible at any width.
+///
+/// The duration and `↗` sit directly after the identity; they are part of the
+/// identity group, never right-aligned to the terminal edge.
 pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usize) -> String {
-    let glyph = match summary.status {
-        ActivityStatus::Running => "●",
-        ActivityStatus::Waiting => "◌",
-        ActivityStatus::Completed => "✓",
-        ActivityStatus::Failed => "✕",
-        ActivityStatus::Interrupted => "⏸",
-        ActivityStatus::Unreported => "?",
-    };
+    let glyph = activity_glyph(summary.status);
     let dur = fmt_elapsed(summary.duration_secs);
-    let title = match summary.secondary.as_deref() {
-        Some(sec) if summary.kind == ActivityKind::ChildAgent && !sec.is_empty() => {
-            format!("{} · {sec}", summary.title)
-        }
-        _ => summary.title.clone(),
-    };
     let prefix = if selected { "→ " } else { "  " };
-    let suffix = format!(" {dur} ↗");
+    // `·` separates the identity from its run time, the same separator the
+    // rest of the strip and the composer use.
+    let suffix = format!(" · {dur} ↗");
     // Display columns, not UTF-8 bytes: `◌`/`↗`/`→` are 3 bytes and 1 cell.
-    // Byte arithmetic steals four columns and ellipsizes the reason the row
+    // Byte arithmetic steals four columns and ellipsizes the identity the row
     // exists to show (Windows CI: `extract` became `extrac…` at width 80).
     let chrome = UnicodeWidthStr::width(prefix)
         + UnicodeWidthStr::width(glyph)
         + UnicodeWidthStr::width(" ")
         + UnicodeWidthStr::width(suffix.as_str());
     let budget = width.saturating_sub(chrome).max(8);
-    let title = truncate_display(&title, budget);
-    format!("{prefix}{glyph} {title}{suffix}")
+    let identity = truncate_display(&summary.title, budget);
+    format!("{prefix}{glyph} {identity}{suffix}")
+}
+
+/// A child's compact task line, or `None` when there is nothing to show (a
+/// background task, or a child with neither a title nor a task).
+///
+/// The semantic title is preferred. A child recorded before titles existed
+/// falls back to the first line of its purpose: a plain projection of the
+/// text the runtime recorded, not a semantic title.
+fn child_task_line(summary: &ActivitySummary, width: usize) -> Option<String> {
+    if summary.kind != ActivityKind::ChildAgent {
+        return None;
+    }
+    let semantic = summary
+        .task_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let fallback = summary
+        .secondary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.lines().next().unwrap_or(s).trim().to_string());
+    let text = semantic.or(fallback)?;
+    let avail = width
+        .saturating_sub(UnicodeWidthStr::width(CHILD_TASK_INDENT))
+        .max(1);
+    Some(format!(
+        "{CHILD_TASK_INDENT}{}",
+        truncate_display(&text, avail)
+    ))
+}
+
+fn activity_glyph(status: ActivityStatus) -> &'static str {
+    match status {
+        ActivityStatus::Running => "●",
+        ActivityStatus::Waiting => "◌",
+        ActivityStatus::Completed => "✓",
+        ActivityStatus::Failed => "✕",
+        ActivityStatus::Interrupted => "⏸",
+        ActivityStatus::Unreported => "?",
+    }
 }
 
 pub(crate) fn prune_completed_background(state: &mut AppState) {
@@ -232,27 +298,39 @@ pub(crate) fn status_activity_lines(
     state: &AppState,
     width: usize,
     t: &UiText,
-) -> (Vec<String>, Vec<ActivityId>) {
+) -> Vec<ActivityRow> {
     let all = summaries(state);
     if all.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     }
-    let mut lines = Vec::new();
-    let mut ids = Vec::new();
-    let shown = all.iter().take(MAX_STATUS_ROWS);
-    for row in shown {
+    let mut rows = Vec::new();
+    for row in all.iter().take(MAX_STATUS_ROWS) {
         let selected = state.activity_selected.as_ref() == Some(&row.id);
-        lines.push(compact_row(row, selected, width));
-        ids.push(row.id.clone());
+        rows.push(ActivityRow {
+            text: compact_row(row, selected, width),
+            id: Some(row.id.clone()),
+            selected,
+        });
+        if let Some(text) = child_task_line(row, width) {
+            rows.push(ActivityRow {
+                text,
+                id: Some(row.id.clone()),
+                selected,
+            });
+        }
     }
     let hidden = all.len().saturating_sub(MAX_STATUS_ROWS);
     if hidden > 0 {
-        lines.push(truncate_display(
-            &t.activity_more.replace("{}", &hidden.to_string()),
-            width.max(1),
-        ));
+        rows.push(ActivityRow {
+            text: truncate_display(
+                &t.activity_more.replace("{}", &hidden.to_string()),
+                width.max(1),
+            ),
+            id: None,
+            selected: false,
+        });
     }
-    (lines, ids)
+    rows
 }
 
 pub(crate) fn select_delta(state: &mut AppState, delta: isize) {
@@ -395,28 +473,39 @@ mod tests {
             done: false,
             ok: false,
             detail: "你在仓库 /private/tmp/agent-501/-Users-example-long-scratch/example-etl（工作区根目录）中加固 ETL 的 extract 模块。".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: false,
             contribution: None,
             stop: None,
+            limit: None,
             started_elapsed_secs: 0,
         });
-        let rows = summaries(&state);
-        let line = compact_row(&rows[0], false, 80);
+        let rows = crate::activity::status_activity_lines(&state, 80, state.t());
+        let header = &rows[0].text;
+        let task = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .find(|t| t.contains("extract"))
+            .expect("the task line");
+        for line in [header, task] {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 80,
+                "the row must budget display columns, not bytes: {line}"
+            );
+        }
+        assert!(header.contains("Euclid"), "{header}");
         assert!(
-            unicode_width::UnicodeWidthStr::width(line.as_str()) <= 80,
-            "compact_row must budget display columns, not bytes: {line}"
+            !header.contains("/private/tmp"),
+            "the repo path never spends the header: {header}"
         );
-        assert!(!line.contains("/private/tmp"), "{line}");
+        assert!(!task.contains("/private/tmp"), "{task}");
         assert!(
-            line.contains("example-etl"),
-            "the repository is still named: {line}"
+            task.contains("example-etl"),
+            "the repository is still named: {task}"
         );
-        assert!(
-            line.contains("extract"),
-            "the reason survives the width: {line}"
-        );
+        assert!(task.contains("extract"), "{task}");
     }
 
     /// A child that finished took the time it took. The row followed the turn
@@ -433,11 +522,13 @@ mod tests {
             done: false,
             ok: false,
             detail: "读代码".into(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: true,
             contribution: None,
             stop: None,
+            limit: None,
             started_elapsed_secs: 100,
         });
         state.elapsed_secs = 200;
@@ -448,11 +539,13 @@ mod tests {
             done: true,
             ok: true,
             detail: String::new(),
+            title: None,
             profile_id: None,
             agent_name: None,
             read_only: true,
             contribution: None,
             stop: None,
+            limit: None,
             started_elapsed_secs: 200,
         });
 
@@ -524,6 +617,7 @@ mod tests {
                 profile_id: Some("worker".into()),
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "修复 permission inheritance".into(),
                 status: ChildStatus::Running,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -535,15 +629,97 @@ mod tests {
                 detail: None,
                 steps: Vec::new(),
                 stop: None,
+                limit: None,
             });
-        let rows = summaries(&state);
-        assert_eq!(rows[0].kind, ActivityKind::ChildAgent);
-        assert_eq!(rows[0].status, ActivityStatus::Running);
-        let line = compact_row(&rows[0], false, 80);
-        assert!(line.contains("Worker"), "{line}");
-        assert!(line.contains("permission inheritance"), "{line}");
-        assert!(!line.contains("child-uuid-hidden"), "{line}");
-        assert!(line.contains('↗'), "{line}");
+        let summary = summaries(&state);
+        assert_eq!(summary[0].kind, ActivityKind::ChildAgent);
+        assert_eq!(summary[0].status, ActivityStatus::Running);
+        let rows = crate::activity::status_activity_lines(&state, 80, state.t());
+        assert_eq!(rows.len(), 2, "identity and task take one line each");
+        let header = &rows[0].text;
+        let task = &rows[1].text;
+        assert!(header.contains("Worker"), "{header}");
+        assert!(header.contains('↗'), "{header}");
+        assert!(!header.contains("child-uuid-hidden"), "{header}");
+        assert!(task.contains("permission inheritance"), "{task}");
+        assert!(!task.contains("child-uuid-hidden"), "{task}");
+    }
+
+    /// The header is identity + duration + affordance, in that order and
+    /// adjacent — the duration is part of the identity group, not pushed to
+    /// the terminal's right edge.
+    #[test]
+    fn a_child_header_keeps_the_duration_beside_the_identity() {
+        let mut state = test_state();
+        state.elapsed_secs = 1266; // 21m06s
+        state
+            .team
+            .children
+            .push(crate::multi_agent::ChildAgentView {
+                id: "c1".into(),
+                nickname: "Euclid".into(),
+                role: "explorer".into(),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                title: Some("调查 Windows CI 两个 flaky tests".into()),
+                purpose: "你在 CodeLeveler 仓库里做一次只读调查，目标是解释 Windows CI 上两个测试的偶发失败……".into(),
+                status: ChildStatus::Running,
+                contribution: crate::multi_agent::Contribution::Pending,
+                recent_step: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_elapsed_secs: 0,
+                settled_elapsed_secs: None,
+                detail: None,
+                steps: Vec::new(),
+                stop: None,
+                limit: None,
+            });
+        let rows = crate::activity::status_activity_lines(&state, 120, state.t());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].text, "  ● Euclid · 21m 06s ↗", "{rows:?}");
+        assert_eq!(
+            rows[1].text, "    调查 Windows CI 两个 flaky tests",
+            "{rows:?}"
+        );
+        assert_eq!(rows[0].id, rows[1].id, "both lines open the same child");
+    }
+
+    /// A child recorded before titles existed has no semantic title; the task
+    /// line falls back to its purpose rather than hiding the row's reason.
+    #[test]
+    fn a_titleless_child_falls_back_to_its_purpose() {
+        let mut state = test_state();
+        state
+            .team
+            .children
+            .push(crate::multi_agent::ChildAgentView {
+                id: "c1".into(),
+                nickname: "Newton".into(),
+                role: "explorer".into(),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                title: None,
+                purpose: "audit the refund path
+second line ignored"
+                    .into(),
+                status: ChildStatus::Running,
+                contribution: crate::multi_agent::Contribution::Pending,
+                recent_step: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_elapsed_secs: 0,
+                settled_elapsed_secs: None,
+                detail: None,
+                steps: Vec::new(),
+                stop: None,
+                limit: None,
+            });
+        let rows = crate::activity::status_activity_lines(&state, 120, state.t());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].text, "    audit the refund path", "{rows:?}");
     }
 
     #[test]
@@ -559,6 +735,7 @@ mod tests {
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "检查 CI".into(),
                 status: ChildStatus::Completed,
                 contribution: crate::multi_agent::Contribution::NothingToFlag,
@@ -570,6 +747,7 @@ mod tests {
                 detail: None,
                 steps: Vec::new(),
                 stop: None,
+                limit: None,
             });
         let rows = summaries(&state);
         assert_eq!(rows[0].status, ActivityStatus::Completed);
@@ -792,6 +970,7 @@ mod tests {
                 profile_id: Some("worker".into()),
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "检查 Runtime permission".into(),
                 status: ChildStatus::Running,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -803,6 +982,7 @@ mod tests {
                 detail: None,
                 steps: vec!["read_file".into()],
                 stop: None,
+                limit: None,
             });
         let wait = crate::wait_status::project(&state).expect("child wait");
         assert_eq!(wait.kind, crate::wait_status::WaitKind::ChildAgent);
@@ -841,6 +1021,7 @@ mod tests {
                 profile_id: None,
                 agent_name: None,
                 read_only: false,
+                title: None,
                 purpose: "修权限".into(),
                 status: ChildStatus::Running,
                 contribution: crate::multi_agent::Contribution::Pending,
@@ -852,6 +1033,7 @@ mod tests {
                 detail: None,
                 steps: vec!["read_file".into()],
                 stop: None,
+                limit: None,
             });
         let row = &summaries(&state)[0];
         let line = compact_row(row, false, 80);

@@ -21,23 +21,31 @@ const W: u16 = 100;
 const H: u16 = 34;
 
 fn dump(state: &mut AppState, label: &str) {
-    let backend = TestBackend::new(W, H);
+    dump_wh(state, label, W, H);
+}
+
+fn dump_wh(state: &mut AppState, label: &str, w: u16, h: u16) {
+    let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| render(f, state)).unwrap();
     let buf = term.backend().buffer();
     println!("\n===== {label} =====");
-    println!("+{}+", "-".repeat(W as usize));
-    for y in 0..H {
+    println!("+{}+", "-".repeat(w as usize));
+    for y in 0..h {
         let mut line = String::new();
         let mut x = 0u16;
-        while x < W {
+        while x < w {
             let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
             line.push_str(sym);
             x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
         }
         println!("|{}|", line.trim_end());
     }
-    println!("+{}+", "-".repeat(W as usize));
+    println!("+{}+", "-".repeat(w as usize));
+}
+
+fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
 }
 
 fn opened(goal: &str) -> AppState {
@@ -378,6 +386,136 @@ fn s05_long_plan() {
         &mut s,
         "05 long plan / terminal Completed with plan at 5 done, 1 running, 3 pending",
     );
+}
+
+// --- 11. running command focus + contextual stop --------------------------
+
+#[test]
+#[ignore = "manual product harness"]
+fn s11_command_focus_and_stop() {
+    use PlanStepStatus::*;
+    let mut s = opened("修 refund 的并发 bug");
+    s.status = leveler_client_protocol::RuntimeStatus::Busy;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[
+                ("定位 Linux 网络失败与 Windows 进程测试失败", Done),
+                ("复现 Linux 网络命名空间错误，确认缺失的错误签名", Running),
+                ("补全 network_failure_in 错误分类并增加回归测试", Pending),
+                ("定位并修复 Windows 子进程 fixture 的时序问题", Pending),
+                ("运行受影响测试与静态检查，确认没有回归", Pending),
+                ("提交改动并跟踪远端 CI 验证结果", Pending),
+            ]),
+        }),
+    );
+    say(
+        &mut s,
+        "a1",
+        "Linux 侧根因已确认：bwrap --unshare-net 下命名空间的 lo 是 DOWN，\
+         Node 报 connect ECONNREFUSED。",
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("c1"),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "program": "cargo",
+                "args": ["test", "-p", "leveler-win-confine", "windows_job_kills_grandchildren"]
+            })
+            .to_string(),
+            parallel: false,
+        }),
+    );
+    s.elapsed_secs = 34;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "agent-1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            title: Some("调查 Windows CI 两个 flaky tests".into()),
+            done: false,
+            ok: false,
+            detail: "你在 CodeLeveler 仓库（Rust workspace，cwd 即仓库根）里做一次只读调查，\
+                     目标是解释 Windows CI 上两个测试的偶发失败……"
+                .into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: true,
+            agent: None,
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+            background: Some(true),
+            scope: Vec::new(),
+        }),
+    );
+    s.elapsed_secs = 1266;
+    dump(&mut s, "11 running command / euclid two-line / plan");
+
+    // Tab: Input -> Conversation -> Command (the running command is there).
+    reduce(&mut s, Action::Key(key(crossterm::event::KeyCode::Tab)));
+    reduce(&mut s, Action::Key(key(crossterm::event::KeyCode::Tab)));
+    dump(&mut s, "11 focused command / Enter 展开 · x 停止");
+
+    reduce(
+        &mut s,
+        Action::Key(key(crossterm::event::KeyCode::Char('x'))),
+    );
+    dump(&mut s, "11 stopping (◌ 正在停止…), x no longer offered");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("c1"),
+            ok: false,
+            preview: "exit: cancelled\n".into(),
+            duration_ms: 34_000,
+            applied_diff: None,
+            exit_code: None,
+            stop: Some(leveler_client_protocol::UiCommandStop::Confirmed),
+        }),
+    );
+    dump(&mut s, "11 stopped (⊘ 已停止), no stop action");
+}
+
+/// Narrow terminal: the Euclid identity group keeps its controls and duration
+/// together, and the task title wraps rather than pushing them off the row.
+#[test]
+#[ignore = "manual product harness"]
+fn s12_euclid_two_line_at_narrow_width() {
+    let mut s = opened("给 navsvc 加一条端到端的退款审计链路");
+    s.status = leveler_client_protocol::RuntimeStatus::Busy;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "agent-1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            title: Some("调查 Windows CI 两个 flaky tests".into()),
+            done: false,
+            ok: false,
+            detail: "你在 CodeLeveler 仓库（Rust workspace，cwd 即仓库根）里做一次只读调查，\
+                     目标是解释 Windows CI 上两个测试的偶发失败……"
+                .into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: true,
+            agent: None,
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+            background: Some(true),
+            scope: Vec::new(),
+        }),
+    );
+    s.elapsed_secs = 1266;
+    dump_wh(&mut s, "12 euclid two-line at width 100", 100, 24);
+    dump_wh(&mut s, "12 euclid two-line at width 58", 58, 24);
 }
 
 // --- 6. no plan -----------------------------------------------------------

@@ -57,6 +57,7 @@ pub(crate) async fn project_children(
                     profile_id,
                     read_only,
                     agent: crate::agents::child_agent_identity(&spec),
+                    title: spec.title.clone(),
                     purpose: task,
                     state: UiChildState::Running,
                     ok: false,
@@ -65,6 +66,8 @@ pub(crate) async fn project_children(
                     resumes: 0,
                     outcome: None,
                     stop: None,
+                    // No bound has fired while the child is unstarted/resumed.
+                    limit: None,
                     summary: None,
                     input_tokens: 0,
                     output_tokens: 0,
@@ -77,6 +80,7 @@ pub(crate) async fn project_children(
                 summary,
                 outcome,
                 stop,
+                limit,
                 ..
             } => {
                 if let Some(child) = children.iter_mut().find(|c| c.id == id)
@@ -87,6 +91,7 @@ pub(crate) async fn project_children(
                     child.summary = Some(summary);
                     child.outcome = outcome.map(crate::event_bridge::project_child_outcome);
                     child.stop = stop.map(crate::event_bridge::project_child_stop);
+                    child.limit = limit.map(crate::event_bridge::project_child_limit);
                 }
             }
             EngineEvent::SubAgentInterrupted { id } => {
@@ -146,7 +151,7 @@ pub(crate) async fn project_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_client_protocol::{ChildOutcome, ChildStop};
+    use leveler_client_protocol::{ChildLimit, ChildOutcome, ChildStop};
     use leveler_core::now;
     use leveler_storage::{ModelRequestRecord, SessionRecord, SessionRepository};
 
@@ -247,6 +252,41 @@ mod tests {
         );
     }
 
+    /// The child's short task title is spawn-time identity, persisted with the
+    /// spawn record and projected read-only. A child recorded before titles
+    /// existed projects with none, and the client falls back to its purpose.
+    #[tokio::test]
+    async fn a_childs_task_title_projects_and_old_rows_have_none() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "children", "mock/m", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let mut titled = started("c1", "Euclid", true, &[]);
+        if let EngineEvent::SubAgentStarted {
+            spec: Some(spec), ..
+        } = &mut titled
+        {
+            spec.title = Some("调查 Windows CI 两个 flaky tests".into());
+        }
+        persist(&db, &sid, titled).await;
+        persist(&db, &sid, started("c2", "Newton", true, &[])).await;
+        let children = project_children(&db, &sid, true).await.unwrap();
+        let euclid = children.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(
+            euclid.title.as_deref(),
+            Some("调查 Windows CI 两个 flaky tests")
+        );
+        assert_eq!(euclid.purpose, "task of Euclid", "the full task is kept");
+        assert!(
+            children
+                .iter()
+                .find(|c| c.id == "c2")
+                .unwrap()
+                .title
+                .is_none()
+        );
+    }
+
     /// Settled, interrupted-then-resumed and still-open children project from
     /// the log alone, with their typed terminal and their own usage.
     #[tokio::test]
@@ -268,7 +308,7 @@ mod tests {
                 contribution: None,
                 outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
                 stop: Some(leveler_lifecycle::ChildStop::Budget),
-                limit: None,
+                limit: Some(leveler_lifecycle::ChildLimit::Duration),
             },
         )
         .await;
@@ -301,6 +341,11 @@ mod tests {
         assert_eq!(c1.state, UiChildState::Settled);
         assert_eq!(c1.outcome, Some(ChildOutcome::IncompletePartial));
         assert_eq!(c1.stop, Some(ChildStop::Budget));
+        assert_eq!(
+            c1.limit,
+            Some(ChildLimit::Duration),
+            "the bound is projected from the durable terminal, not dropped"
+        );
         assert_eq!(c1.summary.as_deref(), Some("stopped at its cap"));
         assert_eq!((c1.input_tokens, c1.output_tokens), (150, 20));
         assert_eq!(

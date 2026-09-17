@@ -583,6 +583,13 @@ async fn run_prepared_sub_agent(
         residual_limits.max_duration =
             Some(residual_limits.max_duration.map_or(own, |d| d.min(own)));
     }
+    // Every child gets a finalization reserve from its own cap. Applied here,
+    // the one body every child run passes through, so a harness-launched
+    // reviewer inherits it exactly like a model-spawned worker; a spawn that
+    // set its own reserve keeps it.
+    residual_limits.finalization_grace.get_or_insert_with(|| {
+        std::time::Duration::from_secs(crate::child_profile::CHILD_FINALIZATION_GRACE_SECS)
+    });
     // Task-level residual budgets: child cannot spend more than its share
     // of the parent remainder (Some(0) hard-blocks that dimension).
     child.step_limits = residual_limits;

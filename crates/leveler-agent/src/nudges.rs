@@ -28,6 +28,24 @@ pub(crate) fn goal_resolve_nudge() -> String {
         .to_string()
 }
 
+/// Wall clock near its bound: the run is told to stop expanding and return
+/// what it has.
+///
+/// The only fact behind it is mechanical — the task's wall-clock budget is
+/// almost spent — plus the one instruction that follows from it. It does not
+/// read the work for meaning, does not decide the task is finished, and does
+/// not name a tool or a proof standard. The run still ends on its own terms;
+/// the hard deadline remains the bound that stops it.
+pub(crate) fn finalization_nudge() -> String {
+    "Your wall-clock budget for this task is almost spent.\n\n\
+     Stop expanding the investigation now. Do not start new searches, reads, or \
+     sub-agents; use what you have already established. Return your final result \
+     immediately: what you confirmed, what remains unconfirmed, and any remaining \
+     risk. A closing check is warranted only when it is required to state your \
+     result truthfully."
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +70,20 @@ mod tests {
             "<objective>",
         ] {
             assert!(!n.contains(banned), "must not coach (`{banned}`): {n}");
+        }
+    }
+
+    /// The finalization nudge states the budget fact and the one instruction
+    /// that follows: converge and report. It must not decide the task is done
+    /// (only the model can), promise more time, or name a tool to use.
+    #[test]
+    fn the_finalization_nudge_asks_for_a_result_and_teaches_nothing() {
+        let n = finalization_nudge();
+        assert!(n.contains("wall-clock budget"), "{n}");
+        assert!(n.contains("Return your final result"), "{n}");
+        assert!(n.contains("unconfirmed") && n.contains("risk"), "{n}");
+        for banned in ["update_goal", "you are done", "more time", "keep going"] {
+            assert!(!n.contains(banned), "must not claim (`{banned}`): {n}");
         }
     }
 }

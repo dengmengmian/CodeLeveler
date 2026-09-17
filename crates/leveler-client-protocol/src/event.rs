@@ -60,6 +60,26 @@ pub enum ChildStop {
     Lost,
 }
 
+/// Which bound stopped a child whose stop is [`ChildStop::Budget`]. A mirror
+/// of the runtime's typed limit, not a second reason vocabulary: without it a
+/// client can only say "budget", which renders a wall-clock timeout and a
+/// spent token budget the same. `Duration` is the wall clock — the bound the
+/// runtime's child cap enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ChildLimit {
+    Duration,
+    ModelTokens,
+    Cost,
+    Commands,
+    ModifiedFiles,
+    /// The child's own round window.
+    RoundWindow,
+    /// The absolute round ceiling.
+    RoundCeiling,
+}
+
 /// What one child contributed, as counts plus its capability contract.
 ///
 /// A flat mirror of the runtime's projection rather than the runtime type
@@ -100,6 +120,11 @@ pub struct UiChildAgent {
     /// built-in role spawn and for children recorded before agents existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<crate::UiChildAgentIdentity>,
+    /// The child's short task title, fixed at spawn: its identity, distinct
+    /// from the full instructions in `purpose`. `None` on children recorded
+    /// before titles existed; a presentation fallback may project `purpose`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// What it was asked to do.
     pub purpose: String,
     pub state: UiChildState,
@@ -121,6 +146,10 @@ pub struct UiChildAgent {
     pub outcome: Option<ChildOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<ChildStop>,
+    /// Which bound fired when `stop` is [`ChildStop::Budget`]. `None` for
+    /// every other stop and for terminals recorded before it was carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<ChildLimit>,
     /// The recorded settlement summary, once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -406,6 +435,10 @@ pub enum RuntimeEvent {
         id: String,
         nickname: String,
         role: String,
+        /// The child's short task title, carried on the start only. `None` on
+        /// terminals and on children recorded before titles existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         /// false while running; true once the agent finished.
         done: bool,
         /// Whether it finished successfully (only meaningful when `done`).
@@ -441,6 +474,10 @@ pub enum RuntimeEvent {
         /// How the activation ended, once done.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<ChildStop>,
+        /// Which bound fired when `stop` is `Budget`. `None` for every other
+        /// stop, on the start, and for terminals recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<ChildLimit>,
         /// Whether the parent continues while this child runs. Carried on the
         /// start; `None` on a terminal, which says nothing about it.
         #[serde(default, skip_serializing_if = "Option::is_none")]

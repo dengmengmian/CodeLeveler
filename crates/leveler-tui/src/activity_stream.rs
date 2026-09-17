@@ -70,19 +70,21 @@ pub(crate) fn render_group(
         t,
         now_elapsed_secs,
         awaiting_approval,
+        None,
         &mut rows,
     )
 }
 
 /// A command call's clickable rows inside a rendered group: its head and
-/// command lines toggle its output, and `stop` is the display-column span of
-/// its stop action on the head line, when it offers one.
+/// command lines toggle its output. `stoppable` says whether the call is still
+/// running and can be stopped by this client — the row no longer carries a
+/// permanent stop label; the stop is a contextual action on the focused row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CommandRow {
     pub line: usize,
     /// Index of the call in its group's `calls`.
     pub call: usize,
-    pub stop: Option<(usize, usize)>,
+    pub stoppable: bool,
 }
 
 /// [`render_group`], also reporting where each command call's rows landed.
@@ -95,6 +97,7 @@ pub(crate) fn render_group_rows(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -137,7 +140,7 @@ pub(crate) fn render_group_rows(
         match unit {
             StreamUnit::Single(call) if is_shell_call(call) => {
                 let at = out.len();
-                let (lines, stop) = command_unit_lines(
+                let (lines, stoppable) = command_unit_lines(
                     call,
                     theme,
                     width,
@@ -147,8 +150,9 @@ pub(crate) fn render_group_rows(
                     None,
                     awaits(call, awaiting_approval),
                     locale,
+                    focused_command,
                 );
-                push_command_rows(rows, at, index_of(call), stop, lines.len());
+                push_command_rows(rows, at, index_of(call), stoppable, lines.len());
                 out.extend(lines);
             }
             StreamUnit::Single(call) => {
@@ -222,7 +226,7 @@ pub(crate) fn render_group_rows(
                     let branch = if i == last { "\u{2514} " } else { "\u{251c} " };
                     if is_shell_call(call) {
                         let at = out.len();
-                        let (lines, stop) = command_unit_lines(
+                        let (lines, stoppable) = command_unit_lines(
                             call,
                             theme,
                             width,
@@ -232,8 +236,9 @@ pub(crate) fn render_group_rows(
                             Some(branch),
                             awaits(call, awaiting_approval),
                             locale,
+                            focused_command,
                         );
-                        push_command_rows(rows, at, index_of(call), stop, lines.len());
+                        push_command_rows(rows, at, index_of(call), stoppable, lines.len());
                         out.extend(lines);
                         continue;
                     }
@@ -1064,19 +1069,19 @@ fn push_command_rows(
     rows: &mut Vec<CommandRow>,
     at: usize,
     call: usize,
-    stop: Option<(usize, usize)>,
+    stoppable: bool,
     lines: usize,
 ) {
     rows.push(CommandRow {
         line: at,
         call,
-        stop,
+        stoppable,
     });
     if lines > 1 {
         rows.push(CommandRow {
             line: at + 1,
             call,
-            stop: None,
+            stoppable,
         });
     }
 }
@@ -1186,9 +1191,13 @@ fn command_head(
     }
 }
 
-/// One command call: a lifecycle head (with its stop action while it runs),
-/// the command line under it, and — when its row is opened or its group is
-/// expanded — its output. Returns the lines and the head's stop-action span.
+/// One command call: a lifecycle head, the command line under it, and — when
+/// its row is opened or its group is expanded — its output. Returns the lines
+/// and whether the call is stoppable right now.
+///
+/// The head carries NO permanent stop label: stopping is a contextual action
+/// on the focused row (see the Command workbench focus). The focused row's
+/// opener becomes the selection marker, the same one the activity strip uses.
 #[allow(clippy::too_many_arguments)]
 fn command_unit_lines(
     call: &ToolCallBlock,
@@ -1200,21 +1209,26 @@ fn command_unit_lines(
     branch: Option<&str>,
     awaiting_approval: bool,
     locale: Locale,
-) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    focused_command: Option<&leveler_client_protocol::ToolCallId>,
+) -> (Vec<Line<'static>>, bool) {
     let (glyph, glyph_color, state, stoppable) =
         command_head(call, theme, t, now_elapsed_secs, awaiting_approval);
     let action = tool_action_label_for(&call.name, locale);
     let muted = Style::default().fg(theme.text.muted);
+    let focused = focused_command == Some(&call.id);
     let mut head = Vec::new();
     // Same opener as every other tool row: a tree child wears its branch, a
-    // standalone command wears the execution anchor. The lifecycle glyph that
-    // follows is a status, which the anchor never is.
-    head.push(Span::styled(
+    // standalone command wears the execution anchor. A command holding the
+    // keyboard focus wears the selection marker instead, so the focused row is
+    // obvious among several running ones.
+    let opener = if focused {
+        "\u{2192} ".to_string()
+    } else {
         branch
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{TOOL_ANCHOR} ")),
-        muted,
-    ));
+            .unwrap_or_else(|| format!("{TOOL_ANCHOR} "))
+    };
+    head.push(Span::styled(opener, muted));
     head.push(Span::styled(
         format!("{glyph} "),
         Style::default().fg(glyph_color),
@@ -1224,23 +1238,6 @@ fn command_unit_lines(
         Style::default().fg(theme.accent.secondary),
     ));
     head.push(Span::styled(format!(" · {state}"), muted));
-    let mut stop = None;
-    if stoppable {
-        let used: usize = head
-            .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
-        let label = t.command_stop_action;
-        let label_w = UnicodeWidthStr::width(label);
-        let gap = width.saturating_sub(used + label_w).max(2);
-        head.push(Span::raw(" ".repeat(gap)));
-        let start = used + gap;
-        head.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(theme.accent.primary),
-        ));
-        stop = Some((start, start + label_w));
-    }
     let mut out = vec![Line::from(head)];
 
     // Children of a batch keep the tree's rail on their continuation rows.
@@ -1320,7 +1317,7 @@ fn command_unit_lines(
             ),
         ]));
     }
-    (out, stop)
+    (out, stoppable)
 }
 
 /// Recover the target file of a failed patch from its error preview
@@ -1907,6 +1904,7 @@ pub(crate) fn render_activity(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(ACTIVITY_INDENT.len());
@@ -1919,14 +1917,12 @@ pub(crate) fn render_activity(
         t,
         now_elapsed_secs,
         awaiting_approval,
+        focused_command,
         &mut group_rows,
     );
-    // The indent shifts every column the group reported.
-    let indent = UnicodeWidthStr::width(ACTIVITY_INDENT);
-    rows.extend(group_rows.into_iter().map(|row| CommandRow {
-        stop: row.stop.map(|(a, b)| (a + indent, b + indent)),
-        ..row
-    }));
+    // The indent shifts every line, so the reported line offsets stay in the
+    // conversation's own coordinate space.
+    rows.extend(group_rows);
     lines
         .into_iter()
         .map(|line| {
@@ -3180,6 +3176,7 @@ mod tests {
             Locale::Zh,
             Locale::Zh.text(),
             0,
+            None,
             None,
             &mut Vec::new(),
         );

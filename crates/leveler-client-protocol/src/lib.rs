@@ -69,7 +69,7 @@ pub use failure::{
 };
 
 pub use event::{
-    ChildContribution, ChildOutcome, ChildStop, NotificationLevel,
+    ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel,
     REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES, RuntimeEvent, UiChildAgent,
     UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind,
     parse_runtime_event,

@@ -2,7 +2,7 @@
 //! it is still running, for how long, how it ended, what it printed — and lets
 //! the user stop that one command.
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use leveler_client_protocol::{
     ClientCommand, RuntimeEvent, RuntimeStatus, SessionId, ToolCallId, UiActiveToolCall,
     UiCommandStop,
@@ -127,6 +127,33 @@ fn click(s: &mut AppState, col: u16, row: u16) -> Vec<Effect> {
     )
 }
 
+fn key(s: &mut AppState, code: KeyCode) -> Vec<Effect> {
+    reduce(s, Action::Key(KeyEvent::new(code, KeyModifiers::empty())))
+}
+
+fn hint(s: &AppState) -> String {
+    crate::render::key_hint_line(s, 120)
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+        .collect()
+}
+
+/// Tab until the Command focus owns the keys (regions with nothing are
+/// skipped by the cycle).
+fn focus_command(s: &mut AppState) {
+    for _ in 0..4 {
+        if s.workbench_focus == crate::state::WorkbenchFocus::Command {
+            return;
+        }
+        key(s, KeyCode::Tab);
+    }
+    assert_eq!(
+        s.workbench_focus,
+        crate::state::WorkbenchFocus::Command,
+        "the Command focus must be reachable"
+    );
+}
+
 /// Screen (col, row) of the first occurrence of `needle`.
 fn cell_of(s: &AppState, needle: &str) -> (u16, u16) {
     let (line, text) = row_with(s, needle).expect(needle);
@@ -136,14 +163,17 @@ fn cell_of(s: &AppState, needle: &str) -> (u16, u16) {
 }
 
 #[test]
-fn a_running_command_says_it_is_running_for_how_long_and_offers_stop() {
+fn a_running_command_says_it_is_running_without_a_permanent_stop_label() {
     let mut s = state();
     s.elapsed_secs = 3;
     start(&mut s, "c1");
     s.elapsed_secs = 45;
     let (line, head) = row_with(&s, "执行命令").expect("command row");
     assert!(head.contains("◌ 执行命令 · 运行中 · 42s"), "{head:?}");
-    assert!(head.contains("停止"), "{head:?}");
+    assert!(
+        !head.contains("停止"),
+        "the stop is contextual, never a permanent right-hand label: {head:?}"
+    );
     assert!(
         plain(&s)[line + 1].contains("$ certbot renew --dry-run"),
         "{:?}",
@@ -209,8 +239,8 @@ fn stopping_a_command_at_the_live_edge_keeps_following() {
     let mut s = state();
     start(&mut s, "c1");
     s.conv.auto_scroll = true;
-    let (col, row) = cell_of(&s, "停止");
-    click(&mut s, col, row);
+    focus_command(&mut s);
+    key(&mut s, KeyCode::Char('x'));
     assert_eq!(call(&s, "c1").stop, StopRequest::Sent);
     assert!(s.conv.auto_scroll, "a stop must not leave auto-follow");
 }
@@ -534,12 +564,12 @@ fn a_turn_ending_under_a_running_command_leaves_it_unknown() {
 }
 
 #[test]
-fn clicking_stop_requests_a_stop_of_that_command_only() {
+fn x_stops_the_focused_command_requesting_only_that_one() {
     let mut s = state();
     start(&mut s, "c1");
     s.elapsed_secs = 5;
-    let (col, row) = cell_of(&s, "停止");
-    let effects = click(&mut s, col, row);
+    focus_command(&mut s);
+    let effects = key(&mut s, KeyCode::Char('x'));
     assert_eq!(
         effects,
         vec![Effect::Send(ClientCommand::CancelToolCall {
@@ -568,12 +598,118 @@ fn clicking_stop_requests_a_stop_of_that_command_only() {
     );
 }
 
+/// The focused row wears the selection marker so several running commands are
+/// distinguishable, and the marker leaves with the focus.
+#[test]
+fn only_the_focused_running_command_wears_the_selection_marker() {
+    let mut s = state();
+    start(&mut s, "c1");
+    assert!(
+        !plain(&s).iter().any(|l| l.contains("→ ◌ 执行命令")),
+        "unfocused rows keep the execution anchor: {:?}",
+        plain(&s)
+    );
+    focus_command(&mut s);
+    assert!(
+        plain(&s).iter().any(|l| l.contains("→ ◌ 执行命令")),
+        "the focused row takes the selection marker: {:?}",
+        plain(&s)
+    );
+}
+
+/// With several commands running, `x` stops the focused one and leaves the
+/// others alone — the id is the execution's, never "the latest" one.
+#[test]
+fn x_among_several_running_commands_stops_only_the_focused_one() {
+    let mut s = state();
+    start(&mut s, "c1");
+    start(&mut s, "c2");
+    start(&mut s, "c3");
+    focus_command(&mut s);
+    // The first candidate is focused; step to the second.
+    key(&mut s, KeyCode::Down);
+    let effects = key(&mut s, KeyCode::Char('x'));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::CancelToolCall {
+            session_id: SessionId::new("s1"),
+            call_id: ToolCallId::new("c2"),
+        })]
+    );
+    assert_eq!(call(&s, "c1").stop, StopRequest::None, "A keeps running");
+    assert_eq!(call(&s, "c2").stop, StopRequest::Sent, "B was stopped");
+    assert_eq!(call(&s, "c3").stop, StopRequest::None, "C keeps running");
+}
+
+/// The contextual hint names the stop only while a running command holds the
+/// focus, and gives the row back when the focus leaves.
+#[test]
+fn the_stop_hint_appears_only_with_a_focused_running_command() {
+    let mut s = state();
+    start(&mut s, "c1");
+    assert!(!hint(&s).contains("x 停止"), "{}", hint(&s));
+    focus_command(&mut s);
+    assert!(hint(&s).contains("Enter 展开 · x 停止"), "{}", hint(&s));
+    key(&mut s, KeyCode::Tab);
+    assert!(!hint(&s).contains("x 停止"), "{}", hint(&s));
+}
+
+/// Without a live turn there is no execution to cancel. A residual `Running`
+/// row from replay or a lagged resync must not expose `CancelToolCall`.
+#[test]
+fn a_command_is_not_stoppable_without_a_live_turn() {
+    let mut s = state();
+    start(&mut s, "c1");
+    // The turn ended with no terminal for the call: the row still reads
+    // Running, but nothing is executing it now.
+    s.status = RuntimeStatus::Idle;
+    assert!(s.stoppable_commands().is_empty());
+    assert!(s.focused_command().is_none());
+    s.workbench_focus = crate::state::WorkbenchFocus::Command;
+    s.command_selected = Some(ToolCallId::new("c1"));
+    let effects = key(&mut s, KeyCode::Char('x'));
+    assert!(effects.is_empty(), "no live stop: {effects:?}");
+    assert_eq!(call(&s, "c1").stop, StopRequest::None);
+}
+
+/// A finished command leaves the candidate set: `x` can no longer reach it.
+#[test]
+fn a_finished_command_leaves_the_candidate_set() {
+    let mut s = state();
+    start(&mut s, "c1");
+    focus_command(&mut s);
+    complete(&mut s, "c1", true, 10, Some(0), None);
+    assert!(s.stoppable_commands().is_empty());
+    assert!(s.focused_command().is_none());
+    let effects = key(&mut s, KeyCode::Char('x'));
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// A selection left pointing at a finished execution must never fall through
+/// to a different, still-running one.
+#[test]
+fn a_stale_selection_stops_nothing() {
+    let mut s = state();
+    start(&mut s, "c1");
+    focus_command(&mut s);
+    assert_eq!(s.command_selected, Some(ToolCallId::new("c1")));
+    complete(&mut s, "c1", true, 10, Some(0), None);
+    start(&mut s, "c2");
+    let effects = key(&mut s, KeyCode::Char('x'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(
+        call(&s, "c2").stop,
+        StopRequest::None,
+        "C2 must not be stopped by C1's stale focus"
+    );
+}
+
 #[test]
 fn a_stop_whose_delivery_is_unknown_says_so() {
     let mut s = state();
     start(&mut s, "c1");
-    let (col, row) = cell_of(&s, "停止");
-    let effects = click(&mut s, col, row);
+    focus_command(&mut s);
+    let effects = key(&mut s, KeyCode::Char('x'));
     let Effect::Send(command) = effects[0].clone() else {
         panic!("{effects:?}")
     };
@@ -594,8 +730,8 @@ fn a_stop_whose_delivery_is_unknown_says_so() {
 fn a_refused_stop_returns_the_row_to_running() {
     let mut s = state();
     start(&mut s, "c1");
-    let (col, row) = cell_of(&s, "停止");
-    let effects = click(&mut s, col, row);
+    focus_command(&mut s);
+    let effects = key(&mut s, KeyCode::Char('x'));
     let Effect::Send(command) = effects[0].clone() else {
         panic!("{effects:?}")
     };
@@ -609,7 +745,7 @@ fn a_refused_stop_returns_the_row_to_running() {
     );
     assert_eq!(call(&s, "c1").stop, StopRequest::None);
     let (_, head) = row_with(&s, "执行命令").unwrap();
-    assert!(head.contains("运行中") && head.contains("停止"), "{head:?}");
+    assert!(head.contains("运行中"), "{head:?}");
 }
 
 #[test]

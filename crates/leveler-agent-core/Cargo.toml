@@ -21,7 +21,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 # The example and the tests build `ToolCall` / `RequestId` values by hand.
 leveler-core = { workspace = true }
-tokio = { workspace = true }
+# `test-util` is what lets the deadline tests run on a paused clock instead of
+# waiting out real wall clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "minimal"

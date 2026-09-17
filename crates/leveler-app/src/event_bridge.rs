@@ -433,6 +433,25 @@ pub(crate) fn project_child_stop(
     }
 }
 
+/// The wire spelling of the runtime's typed limit for a budget stop. Carried
+/// so a client can say a wall-clock timeout instead of folding every budget
+/// stop into one word.
+pub(crate) fn project_child_limit(
+    limit: leveler_lifecycle::ChildLimit,
+) -> leveler_client_protocol::ChildLimit {
+    use leveler_client_protocol::ChildLimit as Wire;
+    use leveler_lifecycle::ChildLimit;
+    match limit {
+        ChildLimit::Duration => Wire::Duration,
+        ChildLimit::ModelTokens => Wire::ModelTokens,
+        ChildLimit::Cost => Wire::Cost,
+        ChildLimit::Commands => Wire::Commands,
+        ChildLimit::ModifiedFiles => Wire::ModifiedFiles,
+        ChildLimit::RoundWindow => Wire::RoundWindow,
+        ChildLimit::RoundCeiling => Wire::RoundCeiling,
+    }
+}
+
 /// Map the runtime's projection onto the wire type.
 ///
 /// Deliberately total: every field crosses. Dropping one here is invisible at
@@ -942,6 +961,7 @@ impl EventBridge {
                     id,
                     nickname,
                     role,
+                    title: spec.title.clone(),
                     done: false,
                     ok: false,
                     detail: task,
@@ -952,6 +972,8 @@ impl EventBridge {
                     contribution: None,
                     outcome: None,
                     stop: None,
+                    // No bound has fired while the child is still running.
+                    limit: None,
                     background: Some(spec.background),
                     scope: spec.files,
                 });
@@ -979,6 +1001,7 @@ impl EventBridge {
                 contribution,
                 outcome,
                 stop,
+                limit,
                 ..
             } => {
                 let projected = contribution.as_ref().map(project_contribution);
@@ -998,6 +1021,8 @@ impl EventBridge {
                     id,
                     nickname,
                     role,
+                    // The title was fixed at spawn; a terminal does not restate it.
+                    title: None,
                     done: true,
                     ok,
                     detail: summary,
@@ -1008,6 +1033,7 @@ impl EventBridge {
                     contribution: projected,
                     outcome: outcome.map(project_child_outcome),
                     stop: stop.map(project_child_stop),
+                    limit: limit.map(project_child_limit),
                     background: None,
                     scope: Vec::new(),
                 });
@@ -2623,6 +2649,45 @@ mod projection_equivalence {
                     Some(leveler_client_protocol::ChildOutcome::IncompletePartial)
                 );
                 assert_eq!(stop, Some(leveler_client_protocol::ChildStop::Budget));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The bound behind a budget stop crosses the bridge typed. Without it a
+    /// client cannot tell a wall-clock timeout from a spent token budget, and
+    /// every budget stop has to read the same generic word.
+    #[test]
+    fn a_child_budget_limit_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Euclid".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+            stop: Some(leveler_lifecycle::ChildStop::Budget),
+            limit: Some(leveler_lifecycle::ChildLimit::Duration),
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated {
+                outcome,
+                stop,
+                limit,
+                ..
+            } => {
+                assert_eq!(
+                    outcome,
+                    Some(leveler_client_protocol::ChildOutcome::IncompletePartial)
+                );
+                assert_eq!(stop, Some(leveler_client_protocol::ChildStop::Budget));
+                assert_eq!(
+                    limit,
+                    Some(leveler_client_protocol::ChildLimit::Duration),
+                    "the bound must not be dropped at the bridge"
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

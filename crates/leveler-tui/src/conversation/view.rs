@@ -28,6 +28,10 @@ pub struct ConvKey {
     /// run time) are painted from it, so a new second is a new frame even when
     /// no transcript event arrived. Constant while idle.
     pub(crate) elapsed_secs: u64,
+    /// The command row holding the keyboard focus, when the Command workbench
+    /// focus is active. Part of the key because focus paints the row's opener
+    /// (§11), and a cache that did not notice would keep two rows marked.
+    pub(crate) focused_command: Option<leveler_client_protocol::ToolCallId>,
 }
 
 /// One memoized conversation build: cache key, wrapped lines, and the
@@ -42,14 +46,14 @@ pub type ConvCacheEntry = (
 );
 
 /// A command call's clickable row in the built conversation: absolute line,
-/// transcript item, call index within its group, and the display-column span
-/// of its stop action when the row offers one.
+/// transcript item, call index within its group, and whether the call is
+/// stoppable right now (running and not already stopped by this client).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandHit {
     pub line: usize,
     pub item: usize,
     pub call: usize,
-    pub stop: Option<(usize, usize)>,
+    pub stoppable: bool,
 }
 
 /// Viewport + interaction state for the Conversation.

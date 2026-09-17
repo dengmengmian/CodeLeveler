@@ -106,6 +106,14 @@ pub struct RoundLimits {
     /// Max wall-clock duration. The loop arms a deadline timer that cancels
     /// in-flight work through the run's cancellation token.
     pub max_duration: Option<Duration>,
+    /// Wall-clock point (measured on the same axis as `max_duration`, prior
+    /// spend included) at which the run is told to stop expanding and turn
+    /// what it has into a final result. This is a request, not a stop: the
+    /// run keeps working, and `max_duration` above remains the only bound
+    /// that cancels it. `None` skips the finalization request; a point at or
+    /// beyond `max_duration` is ignored, so the soft deadline can never
+    /// extend a run.
+    pub finalize_at: Option<Duration>,
     /// Spend already made against these caps before this run.
     pub spent_before: SpentBefore,
 }
@@ -118,6 +126,7 @@ impl Default for RoundLimits {
             max_model_tokens: None,
             max_cost_usd_micros: None,
             max_duration: None,
+            finalize_at: None,
             spent_before: SpentBefore::default(),
         }
     }

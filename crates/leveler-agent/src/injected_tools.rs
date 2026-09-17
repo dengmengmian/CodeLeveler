@@ -134,7 +134,8 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
         description: "Delegate a self-contained subtask to a focused sub-agent so it \
             does not consume this conversation's context. The child shares your model \
             and workspace but starts a FRESH conversation — put everything it needs \
-            in `task`; that is the only required argument. This tool runs the child \
+            in `task`, and give the delegation a short `title` that names the task \
+            itself. This tool runs the child \
             IN THE BACKGROUND BY DEFAULT: the call returns immediately with the \
             child's id, you continue working, and the runtime tells you when it \
             settles (its truthful result, partial work included). Start independent \
@@ -153,6 +154,10 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "A short, stable title for the delegated task — its identity in the UI, not a copy of `task`. Keep it a scannable line (roughly 3–8 words): the task's subject plus what to do to it. `investigate the two flaky Windows CI tests` is right; a paragraph of instructions or a bare `investigate` is not. Fixed for the child's lifetime; do not change it on a resume."
+                },
                 "task": { "type": "string", "description": "The complete, self-contained instruction for the sub-agent." },
                 "profile": {
                     "type": "string",
@@ -178,7 +183,7 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                     "description": "Defaults to true — the call returns immediately with the child's id and you continue useful work; the runtime tells you when it settles. Set false only when your next action depends on this child's result."
                 }
             },
-            "required": ["task"]
+            "required": ["task", "title"]
         }),
     }
 }
@@ -930,6 +935,29 @@ mod tests {
             .to_ascii_lowercase();
         assert!(param.contains("defaults to true"), "{param}");
         assert!(param.contains("next action depends"), "{param}");
+    }
+
+    /// The child's short task title is spawn-time identity, separate from the
+    /// full `task` instructions. The schema has to require it and say how it
+    /// differs, or the UI has only the instructions to show.
+    #[test]
+    fn spawn_agent_requires_a_separate_short_task_title() {
+        let def = spawn_agent_tool_definition();
+        assert_eq!(
+            def.input_schema["required"],
+            serde_json::json!(["task", "title"]),
+            "title is part of the spawn contract"
+        );
+        let title = def.input_schema["properties"]["title"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(title.contains("not a copy of `task`"), "{title}");
+        assert!(title.contains("3–8 words"), "{title}");
+        assert!(
+            def.description.contains("short `title`"),
+            "{}",
+            def.description
+        );
     }
 
     #[test]

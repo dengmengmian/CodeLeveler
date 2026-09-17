@@ -277,11 +277,19 @@ impl ChildStop {
     }
 }
 
-/// What re-creates a delegated child's activation: everything its spawn fixed
-/// that is not in its own transcript. Recorded on the child's durable start so
-/// a later window can continue the same child instead of guessing.
+/// What re-creates a delegated child's activation, plus the spawn-time
+/// identity fixed with it: everything its spawn determined that is not in its
+/// own transcript. Recorded on the child's durable start so a later window can
+/// continue the same child instead of guessing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildSpawnSpec {
+    /// The child's short task title, fixed at spawn: a stable, scannable name
+    /// for the delegated task, distinct from the full `task` instructions the
+    /// child runs on. Persisted with the spawn record so replay and resume
+    /// reconstruct the same identity. `None` on children recorded before
+    /// titles existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The exclusive write scope fixed at spawn (empty for late-bound or
     /// read-only children).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -476,5 +484,31 @@ mod tests {
         assert_eq!(err.kind, "session status");
         assert_eq!(err.value, "bogus");
         assert!(TaskOutcome::from_str("done").is_err());
+    }
+
+    /// The child's short task title is part of the durable spawn record, so a
+    /// `SubAgentStarted` replayed after restart still names the task. It is
+    /// optional: rows written before titles existed deserialize with `None`
+    /// rather than failing, and `None` is skipped on the wire.
+    #[test]
+    fn child_spawn_spec_carries_an_optional_task_title() {
+        let with_title = ChildSpawnSpec {
+            title: Some("audit the refund path".into()),
+            ..ChildSpawnSpec::default()
+        };
+        let json = serde_json::to_value(&with_title).unwrap();
+        assert_eq!(json["title"], "audit the refund path");
+        assert_eq!(
+            serde_json::from_value::<ChildSpawnSpec>(json).unwrap(),
+            with_title
+        );
+
+        let legacy: ChildSpawnSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(legacy.title, None);
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            encoded.get("title").is_none(),
+            "an absent title is not written as null: {encoded}"
+        );
     }
 }

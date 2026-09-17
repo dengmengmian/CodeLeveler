@@ -579,6 +579,13 @@ pub struct StepLimits {
     pub max_modified_files: Option<usize>,
     /// Max wall-clock duration for this run.
     pub max_duration: Option<std::time::Duration>,
+    /// How much of `max_duration` is reserved at the end for the run to turn
+    /// what it has into a final result. At `max_duration - finalization_grace`
+    /// the model is told once to stop expanding and report; `max_duration`
+    /// still cancels an unresponsive run. `None`, or a grace that leaves no
+    /// time, skips the request. Delegated children always carry one; top-level
+    /// turns leave it unset, so their exits are unchanged.
+    pub finalization_grace: Option<std::time::Duration>,
     /// Max provider-reported input + output tokens across model requests.
     pub max_model_tokens: Option<u64>,
     /// Max auditable model cost in micro-USD. Requires pricing in the selected

@@ -556,7 +556,6 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             }
             if over_conv {
                 state.workbench_focus = WorkbenchFocus::Conversation;
-                let was_following = state.conv.auto_scroll;
                 // Pin the viewport exactly where it is painted so agent
                 // streaming cannot yank us to the bottom AND the hit test
                 // below maps against the same scroll the user is looking at.
@@ -570,20 +569,14 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // on a URL opens on release when the selection stayed empty
                 // (see Up); anything else begins a selection.
                 match interaction::hit_test(state, mouse.column, mouse.row) {
-                    Hit::Command { item, call, stop } => {
-                        let effects = if stop {
-                            // A stop reflows nothing above the row: keep
-                            // following so its result and the answer show.
-                            state.conv.auto_scroll = was_following;
-                            request_tool_stop(state, item, call)
-                        } else {
-                            state.transcript.toggle_call_at(item, call);
-                            Vec::new()
-                        };
+                    Hit::Command { item, call } => {
+                        // Clicking a command row toggles its output. Stopping
+                        // is the contextual `x` on the keyboard-focused row.
+                        state.transcript.toggle_call_at(item, call);
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();
-                        return effects;
+                        return Vec::new();
                     }
                     Hit::Disclosure { item } => {
                         // A user shell row opens its Details screen (running
@@ -858,6 +851,22 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Activity => {
             return crate::activity::open_selected(state);
         }
+        // Command focus: Enter toggles the focused command's output, exactly
+        // as clicking its row does.
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Command => {
+            toggle_selected_command(state);
+        }
+        // `x` stops exactly the focused running command — never "the latest
+        // one" and never the whole turn. Only bound while the Command focus
+        // owns the keys, so plain typing is unaffected elsewhere.
+        KeyCode::Char('x')
+            if !ctrl
+                && !alt
+                && popup_len == 0
+                && state.workbench_focus == WorkbenchFocus::Command =>
+        {
+            return stop_selected_command(state);
+        }
         // Conversation focus while reading history: Enter = jump to live edge.
         KeyCode::Enter
             if state.workbench_focus == WorkbenchFocus::Conversation && !state.conv.auto_scroll =>
@@ -922,7 +931,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             crate::suggestion::accept(state);
             touch_slash_filter(state);
         }
-        // No completion popup and no ghost: Tab switches Input ↔ Conversation.
+        // No completion popup and no ghost: Tab cycles the workbench regions.
+        // A live running command earns a stop right after the transcript's
+        // scroll, so the contextual `x` is reachable without the mouse.
         KeyCode::Tab => {
             state.workbench_focus = match state.workbench_focus {
                 // 待发送 sits right above the composer, so it is the next stop.
@@ -933,13 +944,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
                 WorkbenchFocus::Conversation => {
-                    crate::activity::ensure_selection(state);
-                    if crate::activity::summaries(state).is_empty() {
-                        WorkbenchFocus::Input
+                    if !state.stoppable_commands().is_empty() {
+                        ensure_command_selection(state);
+                        WorkbenchFocus::Command
                     } else {
-                        WorkbenchFocus::Activity
+                        ensure_activity_focus(state)
                     }
                 }
+                WorkbenchFocus::Command => ensure_activity_focus(state),
                 WorkbenchFocus::Activity => WorkbenchFocus::Input,
                 WorkbenchFocus::Pending => WorkbenchFocus::Conversation,
             };
@@ -1005,6 +1017,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Down if state.workbench_focus == WorkbenchFocus::Activity && popup_len == 0 => {
             crate::activity::select_delta(state, 1);
+        }
+        KeyCode::Up if state.workbench_focus == WorkbenchFocus::Command && popup_len == 0 => {
+            select_command_delta(state, -1);
+        }
+        KeyCode::Down if state.workbench_focus == WorkbenchFocus::Command && popup_len == 0 => {
+            select_command_delta(state, 1);
         }
         // Conversation focus: ↑/↓ scroll the viewport only.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Conversation && popup_len == 0 => {
@@ -1143,22 +1161,96 @@ fn forget_pending_input_row(state: &mut AppState) {
     }
 }
 
-/// Ask the runtime to stop one running command. The row says "stopping" from
-/// here on; only the runtime's terminal event says it stopped.
-fn request_tool_stop(state: &mut AppState, item: usize, call: usize) -> Vec<Effect> {
-    let Some(crate::transcript::TranscriptItem::ToolGroup(group)) =
-        state.transcript.items().get(item)
-    else {
+/// Move the workbench focus to the activity strip, or back to the composer
+/// when there is no activity to select.
+fn ensure_activity_focus(state: &mut AppState) -> WorkbenchFocus {
+    crate::activity::ensure_selection(state);
+    if crate::activity::summaries(state).is_empty() {
+        WorkbenchFocus::Input
+    } else {
+        WorkbenchFocus::Activity
+    }
+}
+
+/// Keep the Command focus on a command that still exists: the current pick if
+/// it is still a candidate, otherwise the first one.
+fn ensure_command_selection(state: &mut AppState) {
+    let candidates = state.stoppable_commands();
+    if candidates.is_empty() {
+        state.command_selected = None;
+        return;
+    }
+    if state
+        .command_selected
+        .as_ref()
+        .is_none_or(|id| !candidates.iter().any(|(_, _, c)| c == id))
+    {
+        state.command_selected = Some(candidates[0].2.clone());
+    }
+}
+
+/// Move the Command focus by one command, clamped to the candidate list.
+fn select_command_delta(state: &mut AppState, delta: isize) {
+    let candidates = state.stoppable_commands();
+    if candidates.is_empty() {
+        state.command_selected = None;
+        return;
+    }
+    let current = state
+        .command_selected
+        .as_ref()
+        .and_then(|id| candidates.iter().position(|(_, _, c)| c == id))
+        .unwrap_or(0);
+    let next = if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current + delta as usize).min(candidates.len() - 1)
+    };
+    state.command_selected = Some(candidates[next].2.clone());
+}
+
+/// Toggle the focused command's output. Clicking its row does the same.
+fn toggle_selected_command(state: &mut AppState) {
+    let Some(id) = state.command_selected.clone() else {
+        return;
+    };
+    let Some((item, call)) = state.command_location(&id) else {
+        state.command_selected = None;
+        return;
+    };
+    state.transcript.toggle_call_at(item, call);
+    state.conv.plain.clear();
+}
+
+/// Ask the runtime to stop ONE focused running command. The row says
+/// "stopping" from here on; only the runtime's terminal event says it stopped.
+///
+/// The id is re-resolved against the current candidate set first, so a stale
+/// selection — a command that finished, or a turn that ended — stops nothing.
+fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
+    let Some(selected) = state.command_selected.clone() else {
         return Vec::new();
     };
-    let Some(id) = group.calls.get(call).map(|c| c.id.clone()) else {
+    let Some((_, _, id)) = state
+        .stoppable_commands()
+        .into_iter()
+        .find(|(_, _, c)| c == &selected)
+    else {
+        state.command_selected = None;
         return Vec::new();
     };
     if !state
         .transcript
         .set_tool_stop(&id, crate::transcript::StopRequest::Sent)
     {
+        state.command_selected = None;
         return Vec::new();
+    }
+    // The stopped command leaves the candidate set; keep the focus on the next
+    // one rather than dropping the user back to the composer mid-batch.
+    ensure_command_selection(state);
+    if state.command_selected.is_none() && state.workbench_focus == WorkbenchFocus::Command {
+        state.workbench_focus = WorkbenchFocus::Input;
     }
     vec![Effect::Send(ClientCommand::CancelToolCall {
         session_id: state.session_id.clone(),

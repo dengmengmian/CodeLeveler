@@ -59,6 +59,9 @@ pub struct LoopContext {
     /// deadline timer. Every model stream, tool, and wait uses this one.
     cancellation: CancellationToken,
     deadline_expired: Arc<AtomicBool>,
+    /// Set by the soft-deadline timer. It never cancels anything; the
+    /// harness reads it to tell the model to bring the work to a close.
+    finalization_requested: Arc<AtomicBool>,
     _deadline_guard: CancelOnDrop,
     last_text: String,
 }
@@ -67,19 +70,43 @@ impl LoopContext {
     pub(crate) fn new(limits: RoundLimits, external: CancellationToken) -> Self {
         let run_cancellation = external.child_token();
         let deadline_expired = Arc::new(AtomicBool::new(false));
+        let finalization_requested = Arc::new(AtomicBool::new(false));
         let deadline_done = CancellationToken::new();
         let guard = CancelOnDrop(deadline_done.clone());
         if let Some(max) = limits.max_duration {
             let remaining = max.saturating_sub(limits.spent_before.duration);
             let expired = Arc::clone(&deadline_expired);
             let deadline_token = run_cancellation.clone();
+            let done = deadline_done.clone();
+            let external = external.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = external.cancelled() => {}
-                    _ = deadline_done.cancelled() => {}
+                    _ = done.cancelled() => {}
                     _ = tokio::time::sleep(remaining) => {
                         expired.store(true, Ordering::Release);
                         deadline_token.cancel();
+                    }
+                }
+            });
+        }
+        // Soft deadline: the hard bound above still owns cancellation. This
+        // timer only raises a flag for the harness, and only strictly before
+        // the hard bound — a finalization point at or past it is ignored, so
+        // the request can never buy a run more wall clock.
+        if let Some(at) = limits.finalize_at
+            && limits.max_duration.is_some_and(|max| at < max)
+        {
+            let remaining = at.saturating_sub(limits.spent_before.duration);
+            let requested = Arc::clone(&finalization_requested);
+            let done = deadline_done.clone();
+            let external = external.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = external.cancelled() => {}
+                    _ = done.cancelled() => {}
+                    _ = tokio::time::sleep(remaining) => {
+                        requested.store(true, Ordering::Release);
                     }
                 }
             });
@@ -91,6 +118,7 @@ impl LoopContext {
             started: Instant::now(),
             cancellation: run_cancellation,
             deadline_expired,
+            finalization_requested,
             _deadline_guard: guard,
             last_text: String::new(),
         }
@@ -121,6 +149,14 @@ impl LoopContext {
     /// caller).
     pub fn deadline_expired(&self) -> bool {
         self.deadline_expired.load(Ordering::Acquire)
+    }
+
+    /// Whether the run has crossed its finalization point: the harness should
+    /// stop expanding the work and bring it to a close. This is a request to
+    /// the harness, never a stop by itself — [`Self::deadline_expired`] and
+    /// the `max_duration` bound remain the only things that end a run.
+    pub fn finalization_requested(&self) -> bool {
+        self.finalization_requested.load(Ordering::Acquire)
     }
 
     pub fn usage(&self) -> &UsageProjection {
@@ -399,5 +435,75 @@ impl<T: ToolRuntime> AgentHarness for BasicHarness<T> {
         stop: LoopStop,
     ) -> Result<Self::Stop, Self::Error> {
         Ok(stop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limits::RoundLimits;
+
+    /// The soft deadline is a request, never a stop. It raises the flag while
+    /// the run keeps its full hard bound, so the harness can ask the model to
+    /// synthesize before the hard timer cancels anything.
+    #[tokio::test(start_paused = true)]
+    async fn the_soft_deadline_requests_finalization_without_stopping() {
+        let limits = RoundLimits {
+            max_duration: Some(Duration::from_secs(600)),
+            finalize_at: Some(Duration::from_secs(300)),
+            ..RoundLimits::default()
+        };
+        let ctx = LoopContext::new(limits, CancellationToken::new());
+        assert!(!ctx.finalization_requested());
+        assert!(!ctx.deadline_expired());
+
+        tokio::time::sleep(Duration::from_secs(310)).await;
+        assert!(
+            ctx.finalization_requested(),
+            "the soft deadline must request finalization"
+        );
+        assert!(
+            !ctx.deadline_expired() && !ctx.cancellation().is_cancelled(),
+            "the soft deadline must not cancel in-flight work"
+        );
+
+        // Past the hard bound the timer cancels through the run's token.
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(ctx.deadline_expired(), "the hard deadline must cancel");
+        assert!(ctx.cancellation().is_cancelled());
+    }
+
+    /// A finalization point at or beyond the hard bound is ignored: the soft
+    /// deadline can never extend a run.
+    #[tokio::test(start_paused = true)]
+    async fn a_finalization_point_past_the_hard_bound_is_ignored() {
+        let limits = RoundLimits {
+            max_duration: Some(Duration::from_secs(60)),
+            finalize_at: Some(Duration::from_secs(120)),
+            ..RoundLimits::default()
+        };
+        let ctx = LoopContext::new(limits, CancellationToken::new());
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(!ctx.finalization_requested());
+        assert!(ctx.deadline_expired());
+    }
+
+    /// Prior spend is measured into both deadlines, so a continuation that
+    /// already used most of its budget is asked to finalize immediately.
+    #[tokio::test(start_paused = true)]
+    async fn prior_spend_is_measured_into_the_soft_deadline() {
+        let limits = RoundLimits {
+            max_duration: Some(Duration::from_secs(600)),
+            finalize_at: Some(Duration::from_secs(300)),
+            spent_before: crate::limits::SpentBefore {
+                duration: Duration::from_secs(400),
+                ..crate::limits::SpentBefore::default()
+            },
+            ..RoundLimits::default()
+        };
+        let ctx = LoopContext::new(limits, CancellationToken::new());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(ctx.finalization_requested());
+        assert!(!ctx.deadline_expired());
     }
 }

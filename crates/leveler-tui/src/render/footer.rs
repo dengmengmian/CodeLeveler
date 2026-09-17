@@ -625,6 +625,13 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
             // prints the rest itself.
             format!("Tab {}", t.pending_inputs_hint)
         }
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Command
+        && !state.stoppable_commands().is_empty()
+    {
+        // The focused running command owns the row: Enter toggles its output,
+        // `x` stops exactly that execution. Takes precedence over the generic
+        // interrupt hint, which is still reachable (Esc/Ctrl+C are global).
+        t.command_focus_hint.to_string()
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.text().starts_with('!') {

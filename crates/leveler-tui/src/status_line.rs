@@ -563,12 +563,10 @@ fn append_activity_rows(
     width: usize,
     theme: &crate::theme::Theme,
 ) {
-    let (rows, _) = crate::activity::status_activity_lines(state, width, state.t());
-    for row in rows {
-        let selected = row.starts_with('→');
+    for row in crate::activity::status_activity_lines(state, width, state.t()) {
         lines.push(Line::from(Span::styled(
-            truncate_to_width(&row, width),
-            Style::default().fg(if selected {
+            truncate_to_width(&row.text, width),
+            Style::default().fg(if row.selected {
                 theme.text.primary
             } else {
                 theme.text.muted

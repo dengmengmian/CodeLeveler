@@ -35,7 +35,9 @@ enum StepStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct PlanItem {
-    /// The step text.
+    /// The step text: a compact action + object (+ essential intent) that
+    /// stays scannable in a checklist rendered beside the running turn. Not a
+    /// paragraph of background, and not a bare category verb either.
     step: String,
     /// One of `pending`, `in_progress`, `completed`.
     status: StepStatus,
@@ -89,6 +91,14 @@ impl Tool for UpdatePlanTool {
          plan itself changes: a step is no longer needed, the work splits \
          differently, or a new fact adds a step. Send the whole list every \
          time.\n\n\
+         Keep each step at a readable density: the action, the object it acts \
+         on, and — only when it clarifies acceptance — the intent. A step that \
+         reads `fix the Windows subprocess fixture timing` is right; `fix \
+         Windows` is too thin to navigate by, and a full sentence of background, \
+         cwd, repository boilerplate or step-by-step implementation detail is \
+         too heavy for a checklist that stays on screen. There is no character \
+         limit: cut whatever does not help a reader tell this step apart from \
+         the next.\n\n\
          Do NOT call this between the tool calls inside one step: a step that \
          needs a read, two edits and a test run stays in_progress for all of \
          them. One call per real step transition is right; one per tool call is \
@@ -250,6 +260,20 @@ mod tests {
             d.contains("never mark a step completed to make the checklist look current"),
             "{d}"
         );
+    }
+
+    /// The plan is permanent chrome, so the contract has to name a density:
+    /// action + object + essential intent. Without it the model wrote either
+    /// full task sentences or one-word category labels, and both read badly in
+    /// a dock that stays on screen for the whole turn.
+    #[test]
+    fn the_description_names_a_readable_step_density() {
+        let d = UpdatePlanTool.description();
+        assert!(d.contains("readable density"), "{d}");
+        assert!(d.contains("action, the object it acts"), "{d}");
+        assert!(d.contains("too thin to navigate by"), "{d}");
+        assert!(d.contains("too heavy for a checklist"), "{d}");
+        assert!(d.contains("There is no character limit"), "{d}");
     }
 
     /// The declared schema is what the provider validates. `update_plan` is the

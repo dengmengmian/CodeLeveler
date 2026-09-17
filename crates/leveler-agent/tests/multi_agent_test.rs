@@ -787,6 +787,68 @@ async fn sub_agent_events_carry_nickname_and_task() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The parent's short task title is spawn-time identity, carried on the start
+/// with the durable spawn spec so a replay still names the task.
+#[tokio::test]
+async fn sub_agent_started_carries_the_spawn_task_title() {
+    let dir = tmp("title", 4);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "Investigate the two flaky Windows CI tests and report the cause.",
+                        "title": "调查 Windows CI 两个 flaky tests",
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Reported."),
+            assistant_text("Done."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "delegate the investigation",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let title = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentStarted {
+                spec: Some(spec), ..
+            } => spec.title.clone(),
+            _ => None,
+        })
+        .expect("a started child with a spawn-title spec");
+    assert_eq!(
+        title, "调查 Windows CI 两个 flaky tests",
+        "the title is task identity, separate from the instructions"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn total_agent_cap_rejects_excess_spawns() {
     let dir = tmp("cap", 5);
@@ -1710,6 +1772,322 @@ async fn a_child_stopped_by_its_duration_cap_says_the_duration_ran_out() {
     assert!(
         summary.contains("duration") && !summary.contains("token or cost"),
         "the settlement must name the duration cap: {summary}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Whether any request the model received carried the wall-clock finalization
+/// request. The nudge is injected into the child's own transcript, so it can
+/// only be observed in the request that follows it.
+fn saw_finalization_request(runtime: &SleepyRuntime) -> bool {
+    runtime.requests.lock().unwrap().iter().any(|messages| {
+        messages
+            .iter()
+            .any(|m| m.text_content().contains("wall-clock budget for this task"))
+    })
+}
+
+/// The child's terminal as `(ok, summary, stop, limit)`.
+fn child_terminal_event(
+    events: &[AgentEvent],
+) -> (
+    bool,
+    String,
+    Option<leveler_agent::ChildStop>,
+    Option<leveler_agent::ChildLimit>,
+) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentFinished {
+                ok,
+                summary,
+                stop,
+                limit,
+                ..
+            } => Some((*ok, summary.clone(), *stop, *limit)),
+            _ => None,
+        })
+        .expect("a child terminal")
+}
+
+/// CASE A: a child that finishes inside its normal budget never sees the
+/// finalization request. The reserve must not touch a clean run.
+#[tokio::test]
+async fn a_child_that_finishes_early_is_never_asked_to_finalize() {
+    let dir = tmp("child-finalize-a", 230);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "look around", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            read_call("c1"),
+            assistant_text("child findings"),
+            assistant_text("parent done"),
+        ],
+        Duration::ZERO,
+    ));
+    let mut events = Vec::new();
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_duration: Some(Duration::from_secs(68)),
+        finalization_grace: Some(Duration::from_secs(3)),
+        ..Default::default()
+    })
+    .run(
+        "spawn one child",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first_terminal(&events),
+        (
+            Some(leveler_agent::ChildStatus::CompletedWithFindings),
+            Some(leveler_agent::ChildStop::Completed)
+        )
+    );
+    assert!(
+        !saw_finalization_request(&runtime),
+        "a child that finished inside its budget must not be told to finalize"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// CASE B: a child still working when the soft deadline passes is told once to
+/// converge, and the final synthesis it produces still counts as completion —
+/// the soft deadline is not a failure and does not become a timeout.
+#[tokio::test]
+async fn a_child_near_its_cap_is_asked_to_finalize_and_can_still_finish() {
+    let dir = tmp("child-finalize-b", 231);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "look around", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Child round 1 ends after the soft deadline (5 s) but inside
+                // the hard cap (8 s); the next round must carry the request.
+                read_call("c1"),
+                // The synthesis round.
+                assistant_text("child final findings"),
+                assistant_text("parent done"),
+            ],
+            Duration::ZERO,
+        )
+        .with_delays(vec![
+            Duration::ZERO,
+            Duration::from_secs(6),
+            Duration::ZERO,
+            Duration::ZERO,
+        ]),
+    );
+    let mut events = Vec::new();
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_duration: Some(Duration::from_secs(68)),
+        finalization_grace: Some(Duration::from_secs(3)),
+        ..Default::default()
+    })
+    .run(
+        "spawn one child",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let (ok, summary, stop, _limit) = child_terminal_event(&events);
+    assert!(
+        ok,
+        "the child converged inside its grace window, so it completed: {summary}"
+    );
+    assert_eq!(stop, Some(leveler_agent::ChildStop::Completed));
+    assert!(
+        summary.contains("child final findings"),
+        "the synthesis must be the result the parent reads: {summary}"
+    );
+    assert!(
+        saw_finalization_request(&runtime),
+        "the child must have been asked to finalize before its hard cap"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// CASE C: a child that keeps working after the finalization request is still
+/// stopped by the hard cap, and everything it had established survives as an
+/// explicit partial with the duration limit named. The floor is real.
+#[tokio::test]
+async fn a_child_that_ignores_the_finalization_request_is_cut_at_the_hard_cap() {
+    let dir = tmp("child-finalize-c", 232);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "look around", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Round 1 both states something and asks for one more tool, so
+                // the child has partial evidence when it is cut off.
+                assistant_with(
+                    vec![
+                        ContentPart::Text {
+                            text: "established: Linux root cause confirmed.".into(),
+                        },
+                        tool_call_part("c1", "list_files", serde_json::json!({"path": "./a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                // Round 2 outlives the hard cap and is cancelled.
+                assistant_text("late synthesis"),
+                assistant_text("parent done"),
+            ],
+            Duration::ZERO,
+        )
+        .with_delays(vec![
+            Duration::ZERO,
+            Duration::from_secs(6),
+            Duration::from_secs(4),
+            Duration::ZERO,
+        ]),
+    );
+    let mut events = Vec::new();
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_duration: Some(Duration::from_secs(68)),
+        finalization_grace: Some(Duration::from_secs(3)),
+        ..Default::default()
+    })
+    .run(
+        "spawn one child",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let (ok, summary, stop, limit) = child_terminal_event(&events);
+    assert!(!ok, "the child did not finish: {summary}");
+    assert_eq!(
+        first_terminal(&events).0,
+        Some(leveler_agent::ChildStatus::IncompletePartial),
+        "partial work is a partial result, not an empty one: {summary}"
+    );
+    assert_eq!(stop, Some(leveler_agent::ChildStop::Budget));
+    assert_eq!(limit, Some(leveler_agent::ChildLimit::Duration));
+    assert!(
+        summary.contains("established: Linux root cause confirmed."),
+        "everything the child established must survive the cut: {summary}"
+    );
+    assert!(
+        saw_finalization_request(&runtime),
+        "the child was asked to finalize before the hard cap fired"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// CASE E: a user cancel is a cancellation, never a timeout. Even with a
+/// duration budget and a finalization reserve in force, a cancel that lands
+/// first keeps its own reason and injects no finalization request.
+#[tokio::test]
+async fn an_external_cancel_before_the_soft_deadline_stays_a_cancellation() {
+    let dir = tmp("child-finalize-e", 233);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "look around", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // The child's only round is still in flight when the user
+                // cancels, long before its soft or hard deadline.
+                assistant_text("never delivered"),
+                assistant_text("parent unused"),
+            ],
+            Duration::ZERO,
+        )
+        .with_delays(vec![Duration::ZERO, Duration::from_secs(1), Duration::ZERO]),
+    );
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+    });
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_duration: Some(Duration::from_secs(68)),
+        finalization_grace: Some(Duration::from_secs(3)),
+        ..Default::default()
+    })
+    .run(
+        "spawn one child",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        token,
+    )
+    .await;
+
+    assert_eq!(
+        first_terminal(&events).1,
+        Some(leveler_agent::ChildStop::Cancelled),
+        "an external cancel must not be re-labelled as a budget stop"
+    );
+    assert!(
+        !saw_finalization_request(&runtime),
+        "the user cancelled before the soft deadline, so nothing should have asked the child to finalize"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
