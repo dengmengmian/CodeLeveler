@@ -301,19 +301,32 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
         })
         .await
         .unwrap();
-    // Wait until B's turn produced activity and settled (unreachable model
-    // → fails on its own).
-    loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(30), b_events.recv())
-            .await
-            .expect("B's turn must settle")
-            .expect("B's stream open");
-        if matches!(
-            event,
-            RuntimeEvent::TurnFailed { .. } | RuntimeEvent::TurnCancelled
-        ) {
+    // Dispatch is the activity. An unreachable model no longer emits
+    // TurnFailed: it waits for the network and heartbeats
+    // ModelWaitingForNetwork, which resets a per-recv timeout forever and
+    // hung Ubuntu/macOS CI on `cargo test --workspace`.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match b_events.recv().await {
+                Ok(RuntimeEvent::UserMessageAdded { .. }) => return,
+                Ok(_) => continue,
+                Err(_) => panic!("B's stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("B's submit is visible on B's stream");
+    h.runtime
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session_b.clone(),
+        })
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if !h.runtime.has_live_turn(&session_b) {
             break;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     // Give the transport a moment to (incorrectly) forward anything to A.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
