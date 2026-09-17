@@ -363,11 +363,25 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
     )
     .await;
 
-    // Wait for the durable created→running transition before comparing: it is
-    // written by the spawned turn, not by the staging that emitted
-    // UserMessageAdded, and it has to have settled or the two reads below
-    // straddle it. Do not wait for a terminal: the unreachable model waits for
-    // the network now, so the live turn parks in running.
+    // Both facts the comparison below rests on are written by the SPAWNED turn,
+    // not by the staging that emitted the UserMessageAdded both clients just
+    // saw: the message row lands when the turn records its initiation, and
+    // `running` when it starts the task. The snapshots are two reads at two
+    // instants, so without waiting for them to settle the comparison can
+    // straddle a write and report a fork that never happened — macOS CI run
+    // 35234103251 read 0 messages through the socket and 1 in process, after
+    // ubuntu CI run 35229563806 read the same two snapshots across
+    // created→running.
+    //
+    // Do not wait for a terminal: the unreachable model waits for the network
+    // now, so the live turn parks in running.
+    wait_for_message(
+        &h.app,
+        &session,
+        "SHARED_FACT",
+        "the shared session transcript",
+    )
+    .await;
     wait_for_session_status(&h, &session, "running").await;
 
     // Both clients' snapshots agree on the same facts.
