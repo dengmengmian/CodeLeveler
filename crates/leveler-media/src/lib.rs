@@ -1,0 +1,515 @@
+//! `leveler-media` — the image attachment pipeline (spec §41, §45).
+//!
+//! Imports an image safely: the real MIME is detected from content (never the
+//! extension), the image is decoded and bounded by pixel count and byte size,
+//! EXIF is stripped by re-encoding, oversized images are downscaled, and the
+//! result is hashed and written to a content-addressed store. The processed
+//! bytes — not the original path — are what later requests reference, so a
+//! session's images survive the source file being moved or deleted.
+
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use image::imageops::FilterType;
+use image::{ImageFormat, ImageReader, Limits};
+use sha2::{Digest, Sha256};
+
+/// Maximum accepted source file size (spec §41).
+pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Maximum decoded pixel count, to defeat decompression bombs (spec §45).
+pub const MAX_PIXELS: u64 = 40_000_000;
+/// Maximum memory the image decoder may allocate while importing one image.
+const MAX_DECODE_ALLOC_BYTES: u64 = MAX_PIXELS * 8;
+/// Longest-edge cap; larger images are downscaled (spec §41).
+pub const MAX_DIMENSION: u32 = 2048;
+
+/// Errors importing an image.
+#[derive(Debug, thiserror::Error)]
+pub enum MediaError {
+    #[error("io error: {0}")]
+    Io(String),
+    #[error("file too large: {0} bytes (max {MAX_IMAGE_BYTES})")]
+    TooLarge(u64),
+    #[error("unsupported media type: {0}")]
+    Unsupported(String),
+    #[error("image too large: {0} pixels (max {MAX_PIXELS})")]
+    TooManyPixels(u64),
+    #[error("decode error: {0}")]
+    Decode(String),
+    #[error("attachment not found")]
+    NotFound,
+    #[error("invalid attachment id")]
+    InvalidId,
+}
+
+/// A supported input image type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+}
+
+impl ImageKind {
+    fn from_mime(mime: &str) -> Option<Self> {
+        match mime {
+            "image/png" => Some(Self::Png),
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/webp" => Some(Self::Webp),
+            "image/gif" => Some(Self::Gif),
+            _ => None,
+        }
+    }
+
+    fn image_format(self) -> ImageFormat {
+        match self {
+            Self::Png => ImageFormat::Png,
+            Self::Jpeg => ImageFormat::Jpeg,
+            Self::Webp => ImageFormat::WebP,
+            Self::Gif => ImageFormat::Gif,
+        }
+    }
+}
+
+/// A processed, stored image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredImage {
+    /// SHA-256 (hex) of the processed bytes — the store key.
+    pub sha256: String,
+    pub path: PathBuf,
+    /// Normalized MIME type of the stored bytes (always `image/png`).
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u64,
+}
+
+/// The MIME type every processed image carries. Processing always re-encodes,
+/// so a stored or request-bound image is always a PNG whatever came in.
+pub const PROCESSED_MIME: &str = "image/png";
+
+/// An image that has been through the import pipeline: bounded, decoded,
+/// downscaled if needed, and re-encoded to PNG (which is what strips EXIF).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessedImage {
+    /// The normalized PNG bytes.
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Validate and normalize source image bytes.
+///
+/// The ONE image pipeline: the real type comes from the CONTENT and never from
+/// a filename (spec §45), the byte size and pixel count are bounded before the
+/// decoder allocates anything, an oversized image is downscaled to
+/// [`MAX_DIMENSION`], and the result is re-encoded to PNG — which is how EXIF
+/// (camera model, GPS) stops reaching a provider.
+///
+/// Both callers go through here: [`MediaStore::import_bytes`], which then
+/// hashes and stores the result, and the `view_image` tool, which base64-encodes
+/// it for the next model request. `view_image` used to carry its own path —
+/// extension-derived MIME, a byte cap and nothing else — so an image the model
+/// was shown could be mislabelled, unbounded in pixels, and still carrying its
+/// EXIF.
+pub fn process_image(bytes: &[u8]) -> Result<ProcessedImage, MediaError> {
+    let len = bytes.len() as u64;
+    if len > MAX_IMAGE_BYTES {
+        return Err(MediaError::TooLarge(len));
+    }
+
+    // Real type from content, not the extension (spec §45).
+    let mime = infer::get(bytes).map(|t| t.mime_type().to_string());
+    let Some(kind) = mime.as_deref().and_then(ImageKind::from_mime) else {
+        return Err(MediaError::Unsupported(
+            mime.unwrap_or_else(|| "unknown".to_string()),
+        ));
+    };
+    let format = kind.image_format();
+
+    // Read dimensions without materializing the pixel buffer. This must
+    // happen before decode so the pixel cap actually prevents image bombs.
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+    validate_pixel_count(width, height)?;
+
+    // Re-open the immutable byte slice for the full decode and enforce both
+    // the dimensions observed above and a bounded decoder allocation budget.
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+
+    // Downscale if the longest edge exceeds the cap.
+    let processed = if decoded.width().max(decoded.height()) > MAX_DIMENSION {
+        decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+
+    // Re-encode to PNG: deterministic and EXIF-free.
+    let mut png = Vec::new();
+    processed
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|e| MediaError::Decode(e.to_string()))?;
+
+    Ok(ProcessedImage {
+        png,
+        width: processed.width(),
+        height: processed.height(),
+    })
+}
+
+/// A content-addressed image store, rooted at a directory (`.leveler/media`).
+pub struct MediaStore {
+    root: PathBuf,
+}
+
+impl MediaStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Import an image from a file path.
+    pub fn import_path(&self, path: &Path) -> Result<StoredImage, MediaError> {
+        let bytes = fs::read(path).map_err(|e| MediaError::Io(e.to_string()))?;
+        self.import_bytes(&bytes)
+    }
+
+    /// Import immutable base64-encoded source bytes received over the client
+    /// protocol. Bound the encoded form before allocating the decoded buffer.
+    pub fn import_base64(&self, encoded: &str) -> Result<StoredImage, MediaError> {
+        const MAX_ENCODED_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+        if encoded.len() > MAX_ENCODED_BYTES {
+            return Err(MediaError::TooLarge(MAX_IMAGE_BYTES + 1));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|error| MediaError::Decode(format!("invalid base64 attachment: {error}")))?;
+        self.import_bytes(&bytes)
+    }
+
+    /// Import an image from raw bytes: process it through [`process_image`],
+    /// then hash and store the result (deduplicating by hash).
+    pub fn import_bytes(&self, bytes: &[u8]) -> Result<StoredImage, MediaError> {
+        let processed = process_image(bytes)?;
+        let sha256 = hex(&Sha256::digest(&processed.png));
+        fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        let path = self.root.join(format!("{sha256}.png"));
+        if !path.exists() {
+            fs::write(&path, &processed.png).map_err(|e| MediaError::Io(e.to_string()))?;
+        }
+
+        Ok(StoredImage {
+            sha256,
+            path,
+            mime_type: PROCESSED_MIME.to_string(),
+            width: processed.width,
+            height: processed.height,
+            size_bytes: processed.png.len() as u64,
+        })
+    }
+
+    /// Import raw RGBA pixels (e.g. from the clipboard) by encoding to PNG and
+    /// running the normal import pipeline (spec §38.1).
+    pub fn import_rgba(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<StoredImage, MediaError> {
+        let pixels = validate_pixel_count(width, height)?;
+        let expected_len = pixels
+            .checked_mul(4)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| MediaError::Decode("clipboard dimensions overflow".to_string()))?;
+        if rgba.len() != expected_len {
+            return Err(MediaError::Decode(
+                "clipboard pixel buffer size mismatch".to_string(),
+            ));
+        }
+        // Copy only after all dimensions and lengths have been validated.
+        let buffer = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .expect("validated RGBA dimensions and length");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .map_err(|e| MediaError::Decode(e.to_string()))?;
+        self.import_bytes(&png)
+    }
+
+    /// Load a stored image as `(mime_type, base64)` for a provider request.
+    /// Base64 is produced here, at the request boundary, and never logged.
+    pub fn load_base64(&self, sha256: &str) -> Result<(String, String), MediaError> {
+        let (mime, bytes) = self.load_bytes(sha256)?;
+        Ok((mime, BASE64.encode(bytes)))
+    }
+
+    /// Store non-image bytes under their content hash. Images still go through
+    /// [`Self::import_bytes`] so they stay decoded, bounded, and EXIF-stripped.
+    ///
+    /// The phone fetches by this same hash; this is not a second filesystem.
+    pub fn put_blob(&self, bytes: &[u8], mime_type: &str) -> Result<(String, u64), MediaError> {
+        let len = bytes.len() as u64;
+        if len > MAX_IMAGE_BYTES {
+            return Err(MediaError::TooLarge(len));
+        }
+        let sha256 = hex(&Sha256::digest(bytes));
+        fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        let path = self.root.join(&sha256);
+        if !path.exists() {
+            fs::write(&path, bytes).map_err(|e| MediaError::Io(e.to_string()))?;
+            let mime = sanitize_mime(mime_type);
+            fs::write(self.root.join(format!("{sha256}.mime")), mime)
+                .map_err(|e| MediaError::Io(e.to_string()))?;
+        }
+        Ok((sha256, len))
+    }
+
+    /// Decode immutable base64 and [`Self::put_blob`].
+    pub fn put_base64(&self, encoded: &str, mime_type: &str) -> Result<(String, u64), MediaError> {
+        const MAX_ENCODED_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+        if encoded.len() > MAX_ENCODED_BYTES {
+            return Err(MediaError::TooLarge(MAX_IMAGE_BYTES + 1));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|error| MediaError::Decode(format!("invalid base64 attachment: {error}")))?;
+        self.put_blob(&bytes, mime_type)
+    }
+
+    /// Load processed bytes by content hash. `sha256` must be 64 lowercase hex
+    /// characters — anything else is refused before it touches the filesystem.
+    pub fn load_bytes(&self, sha256: &str) -> Result<(String, Vec<u8>), MediaError> {
+        if !is_sha256_hex(sha256) {
+            return Err(MediaError::InvalidId);
+        }
+        let png = self.root.join(format!("{sha256}.png"));
+        if png.is_file() {
+            let bytes = fs::read(&png).map_err(|e| MediaError::Io(e.to_string()))?;
+            return Ok(("image/png".to_string(), bytes));
+        }
+        let blob = self.root.join(sha256);
+        if blob.is_file() {
+            let mime = fs::read_to_string(self.root.join(format!("{sha256}.mime")))
+                .ok()
+                .map(|value| sanitize_mime(value.trim()))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let bytes = fs::read(&blob).map_err(|e| MediaError::Io(e.to_string()))?;
+            return Ok((mime, bytes));
+        }
+        Err(MediaError::NotFound)
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn sanitize_mime(mime: &str) -> String {
+    let trimmed = mime.trim();
+    if trimmed.len() <= 80
+        && trimmed.bytes().all(
+            |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'+' | b'-'),
+        )
+        && trimmed.contains('/')
+    {
+        trimmed.to_ascii_lowercase()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn validate_pixel_count(width: u32, height: u32) -> Result<u64, MediaError> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        return Err(MediaError::TooManyPixels(pixels));
+    }
+    Ok(pixels)
+}
+
+/// Lowercase hex encoding of a byte slice.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, RgbImage};
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = DynamicImage::ImageRgb8(RgbImage::new(w, h));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn png_with_declared_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut png = png_bytes(1, 1);
+        // PNG signature (8), IHDR length (4), type (4), then width and height.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn imports_and_stores_a_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let stored = store.import_bytes(&png_bytes(10, 8)).unwrap();
+        assert_eq!(stored.width, 10);
+        assert_eq!(stored.height, 8);
+        assert!(stored.path.exists());
+        assert_eq!(stored.mime_type, "image/png");
+    }
+
+    #[test]
+    fn dedupes_identical_images_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let a = store.import_bytes(&png_bytes(4, 4)).unwrap();
+        let b = store.import_bytes(&png_bytes(4, 4)).unwrap();
+        assert_eq!(a.sha256, b.sha256);
+        assert_eq!(a.path, b.path);
+    }
+
+    #[test]
+    fn rejects_non_image_bytes_regardless_of_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.import_bytes(b"this is not an image").unwrap_err();
+        assert!(matches!(err, MediaError::Unsupported(_)));
+    }
+
+    #[test]
+    fn downscales_oversized_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let stored = store.import_bytes(&png_bytes(4000, 1000)).unwrap();
+        assert!(stored.width <= MAX_DIMENSION && stored.height <= MAX_DIMENSION);
+        assert_eq!(
+            stored.width, MAX_DIMENSION,
+            "longest edge scaled to the cap"
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_declared_dimensions_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let width = 200_000;
+        let height = 201;
+        let err = store
+            .import_bytes(&png_with_declared_dimensions(width, height))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::TooManyPixels(pixels)
+                if pixels == u64::from(width) * u64::from(height)
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_rgba_dimensions_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.import_rgba(u32::MAX, u32::MAX, &[]).unwrap_err();
+        assert!(matches!(err, MediaError::TooManyPixels(_)));
+    }
+
+    #[test]
+    fn rejects_rgba_length_mismatch_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.import_rgba(2, 2, &[0; 15]).unwrap_err();
+        assert!(matches!(err, MediaError::Decode(message) if message.contains("size mismatch")));
+    }
+
+    #[test]
+    fn load_base64_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let stored = store.import_bytes(&png_bytes(3, 3)).unwrap();
+        let (mime, b64) = store.load_base64(&stored.sha256).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(!b64.is_empty());
+    }
+
+    #[test]
+    fn import_base64_uses_the_encoded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = png_bytes(1, 1);
+        let encoded = BASE64.encode(&png);
+        let stored = MediaStore::new(dir.path()).import_base64(&encoded).unwrap();
+        assert_eq!(stored.mime_type, "image/png");
+        assert_eq!(stored.width, 1);
+        assert_eq!(stored.height, 1);
+    }
+
+    #[test]
+    fn put_blob_roundtrips_markdown_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let body = b"# review\n\npass\n";
+        let (sha, size) = store.put_blob(body, "text/markdown").unwrap();
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha.len(), 64);
+        let (mime, loaded) = store.load_bytes(&sha).unwrap();
+        assert_eq!(mime, "text/markdown");
+        assert_eq!(loaded, body);
+    }
+
+    #[test]
+    fn load_bytes_refuses_path_traversal_before_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.load_bytes("../passwd").unwrap_err();
+        assert!(matches!(err, MediaError::InvalidId));
+        let err = store.load_bytes("abc").unwrap_err();
+        assert!(matches!(err, MediaError::InvalidId));
+    }
+
+    #[test]
+    fn missing_hash_is_not_found_not_an_io_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let sha = "ab".repeat(32);
+        let err = store.load_bytes(&sha).unwrap_err();
+        assert!(matches!(err, MediaError::NotFound));
+    }
+}

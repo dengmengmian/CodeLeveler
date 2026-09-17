@@ -1,0 +1,862 @@
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
+use leveler_core::{ApprovalId, ClarificationId};
+use leveler_execution::{ApprovalRequest, RiskLevel};
+use leveler_model::ToolCall;
+
+use leveler_lifecycle::ProgressLedger;
+
+use super::{
+    AgentError, AgentEvent, ClarificationRequest, Executor, StepLimits, StopReason,
+    SubAgentProgressSink,
+};
+use crate::authorization::action_fingerprint;
+use crate::sub_agent::{AgentRole, ChildResult};
+
+/// Plain words for why a run ended, for a parent model rather than a log.
+/// A budget stop names the limit that fired; one without a resource
+/// dimension is the run's own round window.
+fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>) -> String {
+    match reason {
+        StopReason::BudgetExhausted => match exhaustion.map(|e| e.dimension) {
+            Some(BudgetDimension::Duration) => "its wall-clock duration limit ran out",
+            Some(BudgetDimension::ModelTokens) => "its model token budget ran out",
+            Some(BudgetDimension::Cost) => "its cost budget ran out",
+            Some(BudgetDimension::Commands) => "its command budget ran out",
+            Some(BudgetDimension::ModifiedFiles) => "its modified-file budget ran out",
+            None => "it reached its round limit",
+        },
+        StopReason::TurnLimitReached => "it hit the round ceiling",
+        StopReason::Blocked => "it declared the task blocked",
+        StopReason::Stalled => "it went quiet without resolving the task",
+        StopReason::Incomplete => "it stopped without finishing",
+        StopReason::Completed
+        | StopReason::Answered
+        | StopReason::CompletedUnverified
+        | StopReason::CompletedChecksFailed => "",
+    }
+    .to_string()
+}
+
+/// The mechanical class of a child run that returned on its own.
+fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
+    use leveler_lifecycle::ChildStop;
+    match reason {
+        StopReason::Completed
+        | StopReason::Answered
+        | StopReason::CompletedUnverified
+        | StopReason::CompletedChecksFailed => ChildStop::Completed,
+        StopReason::BudgetExhausted | StopReason::TurnLimitReached => ChildStop::Budget,
+        StopReason::Blocked | StopReason::Stalled | StopReason::Incomplete => ChildStop::Incomplete,
+    }
+}
+
+/// Which bound stopped a child whose stop is [`ChildStop::Budget`](leveler_lifecycle::ChildStop::Budget).
+fn child_limit(
+    reason: StopReason,
+    exhaustion: Option<&BudgetExhaustion>,
+) -> Option<leveler_lifecycle::ChildLimit> {
+    use leveler_lifecycle::ChildLimit;
+    match reason {
+        StopReason::BudgetExhausted => Some(match exhaustion.map(|e| e.dimension) {
+            Some(BudgetDimension::Duration) => ChildLimit::Duration,
+            Some(BudgetDimension::ModelTokens) => ChildLimit::ModelTokens,
+            Some(BudgetDimension::Cost) => ChildLimit::Cost,
+            Some(BudgetDimension::Commands) => ChildLimit::Commands,
+            Some(BudgetDimension::ModifiedFiles) => ChildLimit::ModifiedFiles,
+            None => ChildLimit::RoundWindow,
+        }),
+        StopReason::TurnLimitReached => Some(ChildLimit::RoundCeiling),
+        _ => None,
+    }
+}
+
+impl Executor {
+    /// Why a child pinned to `model` cannot run, if it cannot: the runtime
+    /// does not resolve the model, or a cost cap is in force and the model
+    /// carries no price to enforce it with. Checked before the child exists,
+    /// so the refusal reaches the model instead of a child that fails before
+    /// its first call — and the cap is never quietly dropped to let it run.
+    pub(crate) async fn pinned_model_refusal(
+        &self,
+        model: &leveler_model::ModelRef,
+    ) -> Option<String> {
+        match self.runtime.profile(model).await {
+            Err(error) => Some(format!(
+                "model `{model}` pinned for this sub-agent is not available: {error}"
+            )),
+            Ok(profile)
+                if profile.pricing.is_none() && self.step_limits.max_cost_usd_micros.is_some() =>
+            {
+                Some(format!(
+                    "model `{model}` pinned for this sub-agent has no pricing, and this task \
+                     runs under a cost limit that cannot be enforced without it"
+                ))
+            }
+            Ok(_) => None,
+        }
+    }
+
+    /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
+    pub(crate) async fn handle_ask_user(
+        &self,
+        call: &ToolCall,
+        cancellation: &CancellationToken,
+    ) -> Result<String, AgentError> {
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        let question = call
+            .arguments
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let options = call
+            .arguments
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let request = ClarificationRequest {
+            id: ClarificationId::generate(),
+            turn_id: None,
+            tool: call.name.clone(),
+            call_id: call.id.to_string(),
+            action_fingerprint: action_fingerprint(call),
+            question,
+            options,
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+            outcome = self.clarifier.clarify(&request) => outcome,
+        };
+        // Only `Answered` speaks for the user. Everything else must be
+        // reported as the absence of a user, so the model cannot mistake an
+        // unattended run or a timeout for "the user said nothing is needed".
+        // The TUI recognizes these notes by their opening words to show the
+        // user what happened (`unanswered_question_note`); keep them.
+        Ok(match outcome {
+            crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => text,
+            crate::executor::ClarifyOutcome::Answered(_) | crate::executor::ClarifyOutcome::Skipped => {
+                "The user saw this question and chose to skip it; proceed using your best judgment."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::Unattended => {
+                "No user is available to answer in this unattended run — this is NOT a user reply. \
+                 Continue only if the task can be completed without this information; otherwise \
+                 finish what is safely possible and state explicitly what is missing instead of guessing."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::TimedOut => {
+                "The user did not respond in time — this is NOT a user reply. Continue only if the \
+                 task can proceed without the answer; otherwise state explicitly what is missing."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::Cancelled => return Err(AgentError::Cancelled),
+        })
+    }
+
+    /// Handle a `request_permissions` call: ask the user to approve elevated
+    /// network and/or filesystem access.
+    pub(crate) async fn handle_request_permissions(
+        &self,
+        call: &ToolCall,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::injected_tools::PermissionRequestOutcome, AgentError> {
+        let (action, reason, grants) =
+            crate::injected_tools::parse_permission_request(&call.arguments);
+        self.decide_permission(
+            call,
+            &action,
+            &reason,
+            grants,
+            crate::injected_tools::GrantScope::Turn,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Ask the user to approve one elevation.
+    ///
+    /// Shared by `request_permissions` and by a command call's `escalate`, so
+    /// the two spell the same prompt, the same risk level, and the same
+    /// human-vs-headless distinction. Only the grant's LIFETIME differs, and
+    /// that belongs to the caller: `request_permissions` merges into the turn,
+    /// `escalate` applies to its own call and nothing else.
+    pub(crate) async fn decide_permission(
+        &self,
+        call: &ToolCall,
+        action: &str,
+        reason: &str,
+        grants: crate::injected_tools::TurnPermissionGrants,
+        scope: crate::injected_tools::GrantScope,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::injected_tools::PermissionRequestOutcome, AgentError> {
+        use crate::injected_tools::{
+            PermissionRequestOutcome, permission_denied_by_user_message,
+            permission_denied_unattended_message, permission_grant_message,
+            permission_request_description,
+        };
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if grants.is_empty() {
+            return Ok(PermissionRequestOutcome::Invalid {
+                message:
+                    "未请求任何可识别权限:请设置 network、filesystem=unrestricted 或 full_access。"
+                        .to_string(),
+            });
+        }
+        // 完全访问 means no prompts at all. This path calls the approver
+        // directly, so without this check it bypasses `ApprovalPolicy::evaluate`
+        // — which returns Auto for FullAccess before anything else — and
+        // interrupts a user who opted out of prompting, to grant a permission
+        // they already hold.
+        if self.tool_context.policy.mode() == leveler_execution::PermissionProfile::FullAccess {
+            return Ok(PermissionRequestOutcome::Granted {
+                message: permission_grant_message(true, grants),
+                grants,
+                for_turn: false,
+            });
+        }
+        let description = permission_request_description(action, reason, grants, scope);
+        // Risk: filesystem elevation is at least as sensitive as network.
+        let risk = if grants.unrestricted_fs {
+            RiskLevel::Privileged
+        } else {
+            RiskLevel::Network
+        };
+        // A permission request is a risky ACTION, not a question — it is exactly
+        // the yes/no an Approver exists to answer. Routing it to the Clarifier
+        // instead put it outside the approval policy, so `--auto-approve` (whose
+        // whole purpose is unattended driving) still stopped dead on a human.
+        let request = ApprovalRequest {
+            id: ApprovalId::generate(),
+            turn_id: None,
+            call_id: call.id.to_string(),
+            agent_id: self.agent_id.clone(),
+            action_fingerprint: action_fingerprint(call),
+            tool: call.name.clone(),
+            risk,
+            description,
+            command: None,
+            paths: Vec::new(),
+        };
+        // Through the host's one ask path (PR 5): the reviewer, the human, and
+        // the human-vs-headless distinction mean the same here as for a tool
+        // call. The grant's lifetime is still the caller's business.
+        let pending = leveler_execution::PendingApproval {
+            signature: action_fingerprint(call),
+            write: self.tool_context.write_scope(),
+            network_allowed: !self.tool_context.policy.network_denied(),
+            command_line: None,
+            scoped_paths: Vec::new(),
+            request,
+        };
+        match self.ask(&pending, None, None, cancellation).await {
+            super::host::AskOutcome::Allowed(evidence) => Ok(PermissionRequestOutcome::Granted {
+                message: permission_grant_message(true, grants),
+                grants,
+                for_turn: matches!(
+                    evidence,
+                    leveler_execution::AuthorizationEvidence::SessionGrant { .. }
+                        | leveler_execution::AuthorizationEvidence::ApprovedAlways
+                ),
+            }),
+            super::host::AskOutcome::DeniedByUser => Ok(PermissionRequestOutcome::DeniedByUser {
+                requested: grants,
+                message: permission_denied_by_user_message(),
+            }),
+            super::host::AskOutcome::DeniedUnattended(_) => {
+                Ok(PermissionRequestOutcome::DeniedUnattended {
+                    requested: grants,
+                    message: permission_denied_unattended_message(),
+                })
+            }
+            super::host::AskOutcome::Cancelled => Err(AgentError::Cancelled),
+        }
+    }
+
+    /// Run one independent reviewer child.
+    ///
+    /// R007b N7: this is the second entrance to the same child primitive the
+    /// `spawn_agent` tool uses — same lifecycle, registry, limits, cancellation
+    /// and event attribution. It exists because the reviewer designation was
+    /// only honoured when a model chose to delegate, which R008 and R009 both
+    /// declined to do. `AgentRole::parse` deliberately does not accept
+    /// "reviewer", so this role can only be entered from here.
+    ///
+    /// The caller owns the `SubAgentStarted` / `SubAgentFinished` pair, exactly
+    /// as `drive.rs` does for the model-facing entrance; the transient
+    /// progress/activity events are forwarded into `observer` when the child
+    /// returns.
+    pub async fn run_reviewer_child(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        // How much of the task's wall budget is already spent when the review
+        // starts. The review is a tail of the task, not a fresh task: it gets
+        // the residual minus the settlement reserve, like any other child.
+        parent_elapsed: std::time::Duration,
+        // A pinned `provider/model` for this child. `None` runs it on the
+        // parent's model, which is what the closure reviewer does. The
+        // Develop workflow's reading stages pass one so Analyze and Review
+        // can be a different model from the one writing the code — the same
+        // per-child pin `spawn_agent` and agent definitions already use, not
+        // a second model-selection mechanism.
+        model: Option<String>,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
+        // R013r: an unbounded reviewer burned the full 100-round turn ceiling
+        // reading a repo it was only asked to judge. The bound now lives on
+        // the role's capability profile; a reviewer that has not concluded by
+        // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
+        // instead of burning the parent's budget.
+        let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
+            .max_rounds()
+            .unwrap_or(0);
+        let result = self
+            .run_one_sub_agent_on(
+                id,
+                AgentRole::Reviewer,
+                leveler_lifecycle::ChildSpawnSpec {
+                    files,
+                    max_rounds: reviewer_rounds,
+                    model,
+                    ..Default::default()
+                },
+                None,
+                brief,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                progress_tx,
+                self.step_limits,
+                cancellation,
+                parent_wall,
+            )
+            .await;
+        // The sender was moved into the call, so the channel is closed by now
+        // and this drains what the child emitted while it ran.
+        while let Ok(event) = progress_rx.try_recv() {
+            observer(event);
+        }
+        DelegatedChildResult {
+            ok: result.result.status.completed(),
+            stop: result.stop,
+            limit: result.limit,
+            result: result.result,
+            progress: result.progress,
+            modified_files: result.modified_files,
+            findings: result.findings,
+        }
+    }
+
+    /// Run one spawned sub-agent to completion on its own fresh conversation,
+    /// returning text + ok + spend for parent rollup. A permit from the shared
+    /// semaphore bounds how many run at once. The child streams silently —
+    /// only its start/finish bubbles to the parent observer (see the batch in
+    /// `drive`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_one_sub_agent_on(
+        &self,
+        id: String,
+        role: AgentRole,
+        spec: leveler_lifecycle::ChildSpawnSpec,
+        brief: Option<String>,
+        task: String,
+        permit: Arc<tokio::sync::Semaphore>,
+        progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        residual_limits: StepLimits,
+        cancellation: CancellationToken,
+        parent_wall: ParentWallBudget,
+    ) -> SubAgentRunResult {
+        self.sub_agent_run_future(
+            id,
+            role,
+            spec,
+            brief,
+            task,
+            permit,
+            progress,
+            residual_limits,
+            cancellation,
+            parent_wall,
+        )
+        .await
+    }
+
+    /// Build the child's run as an OWNED `'static` future, so a background
+    /// delegation can be `tokio::spawn`ed and keep executing while the parent's
+    /// model loop continues (V2 background-first). The child executor and every
+    /// capture it needs are constructed here, synchronously, from `&self`; the
+    /// returned future borrows nothing from the parent.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sub_agent_run_future(
+        &self,
+        id: String,
+        role: AgentRole,
+        spec: leveler_lifecycle::ChildSpawnSpec,
+        brief: Option<String>,
+        task: String,
+        permit: Arc<tokio::sync::Semaphore>,
+        progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        residual_limits: StepLimits,
+        cancellation: CancellationToken,
+        parent_wall: ParentWallBudget,
+    ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
+        let prepared_child = self
+            .child_for_spec(role, &spec, brief)
+            .with_agent_id(id.clone());
+        let hook_runner = self.hook_runner.clone();
+        run_prepared_sub_agent(
+            prepared_child,
+            hook_runner,
+            id,
+            role,
+            spec,
+            ChildStart::Task(task),
+            permit,
+            progress,
+            residual_limits,
+            cancellation,
+            parent_wall,
+        )
+    }
+
+    /// The owned future of a NEW activation of an interrupted child: the same
+    /// id, rebuilt from its spec, continuing its restored transcript after the
+    /// recovery note. Everything else — permit, budgets, cancellation, spend
+    /// capture, settlement — is the spawn path's, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sub_agent_resume_future(
+        &self,
+        child: &crate::sub_agent::ResumableChild,
+        permit: Arc<tokio::sync::Semaphore>,
+        progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        residual_limits: StepLimits,
+        cancellation: CancellationToken,
+        parent_wall: ParentWallBudget,
+    ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
+        // The brief is already in the restored transcript's system message;
+        // the definition's files are never read again.
+        let prepared_child = self
+            .child_for_spec(child.role, &child.spec, None)
+            .with_agent_id(child.id.clone());
+        run_prepared_sub_agent(
+            prepared_child,
+            self.hook_runner.clone(),
+            child.id.clone(),
+            child.role,
+            child.spec.clone(),
+            ChildStart::Resume {
+                prior: child.prior.clone(),
+                note: child.note.clone(),
+            },
+            permit,
+            progress,
+            residual_limits,
+            cancellation,
+            parent_wall,
+        )
+    }
+}
+
+/// How an activation begins: a fresh task, or a restored child session.
+enum ChildStart {
+    Task(String),
+    Resume {
+        prior: Vec<leveler_model::Message>,
+        /// Persisted to the child's transcript before it runs, so a second
+        /// interruption restores it too.
+        note: leveler_model::Message,
+    },
+}
+
+/// The owned body of one sub-agent run (see [`Executor::sub_agent_run_future`]).
+#[allow(clippy::too_many_arguments)]
+async fn run_prepared_sub_agent(
+    mut child: Executor,
+    hook_runner: leveler_execution::HookRunner,
+    id: String,
+    role: AgentRole,
+    spec: leveler_lifecycle::ChildSpawnSpec,
+    start: ChildStart,
+    permit: Arc<tokio::sync::Semaphore>,
+    progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    mut residual_limits: StepLimits,
+    cancellation: CancellationToken,
+    parent_wall: ParentWallBudget,
+) -> SubAgentRunResult {
+    let _slot = match permit.acquire().await {
+        Ok(slot) => slot,
+        Err(_) => {
+            return SubAgentRunResult {
+                result: ChildResult::new(false, "", "no concurrency slot was available to run it"),
+                stop: leveler_lifecycle::ChildStop::Failed,
+                limit: None,
+                progress: ProgressLedger::default(),
+                modified_files: Vec::new(),
+                findings: Vec::new(),
+            };
+        }
+    };
+    // Refresh wall residual after queue wait. A child that waited behind
+    // others would otherwise keep a pre-queue residual past the parent
+    // deadline and continue running after the parent budget is exhausted.
+    if let Some(parent_max) = parent_wall.cap {
+        let elapsed = parent_wall
+            .epoch_duration_at_start
+            .saturating_add(parent_wall.run_started.elapsed());
+        let residual = parent_max.saturating_sub(elapsed);
+        // Hand the child the residual MINUS what the parent still needs to
+        // finish: fold the result in, reconcile, and write the outcome down.
+        // Handing over the whole remainder let an optional reviewer spend the
+        // last second of a task it had already been told was done — a Phase C
+        // run settled with 115s of a 3600s budget left, behind a reviewer that
+        // returned nothing. A child is a tail, not a claim on the deadline.
+        let for_child = residual.saturating_sub(CHILD_SETTLEMENT_RESERVE);
+        let sub_cap = crate::sub_agent::SUB_AGENT_MAX_DURATION;
+        residual_limits.max_duration = Some(sub_cap.min(for_child));
+    }
+    let _ = progress.send(AgentEvent::SubAgentProgress {
+        id: id.clone(),
+        active: true,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+    });
+    // Sub-agents run concurrently and silently; without an event here there
+    // is no way to observe what a fleet of them is doing.
+    if hook_runner.has_lifecycle() {
+        hook_runner
+            .run_lifecycle(
+                leveler_execution::LifecycleEvent::SubagentStart,
+                &format!(r#"{{"id":"{id}","role":"{}"}}"#, role.label()),
+                &cancellation,
+            )
+            .await;
+    }
+    // The child runs on a model other than its parent's, so it is priced from
+    // that model's own profile. Pricing that cannot be read records no cost:
+    // the parent's rate would be a wrong number, not an estimate.
+    if spec.model.is_some() {
+        // Admission already refused a model it could not price under a cap;
+        // this read is the child's own, and a failure here is reported, never
+        // replaced by the parent's rate or by running without the cap.
+        match child.runtime.profile(&child.model).await {
+            Ok(profile) => child.pricing = profile.pricing,
+            Err(error) => {
+                return SubAgentRunResult {
+                    result: ChildResult::new(
+                        false,
+                        "",
+                        format!("its model profile could not be read: {error}"),
+                    ),
+                    stop: leveler_lifecycle::ChildStop::Failed,
+                    limit: None,
+                    progress: ProgressLedger::default(),
+                    modified_files: Vec::new(),
+                    findings: Vec::new(),
+                };
+            }
+        }
+    }
+    // A definition that declares its own tools / round budget binds every
+    // spawn of it — otherwise the field is decoration.
+    child.apply_agent_policy(&spec.tools, spec.max_rounds);
+    // A declarative agent's own wall-clock bound only ever shortens the
+    // child's; it never extends past what the parent can give.
+    if let Some(secs) = spec.agent.as_ref().and_then(|a| a.max_duration_secs) {
+        let own = std::time::Duration::from_secs(secs);
+        residual_limits.max_duration =
+            Some(residual_limits.max_duration.map_or(own, |d| d.min(own)));
+    }
+    // Task-level residual budgets: child cannot spend more than its share
+    // of the parent remainder (Some(0) hard-blocks that dimension).
+    child.step_limits = residual_limits;
+    // Capture ProgressUpdated even when the child is cancelled mid-run so
+    // partial spend still rolls up to the parent. Also re-emit tool
+    // start/finish as attributed SubAgentActivity for the UI.
+    let partial = std::sync::Arc::new(std::sync::Mutex::new(ProgressLedger::default()));
+    let partial_obs = partial.clone();
+    // R007b N1: a child stopped by its budget used to hand back only the
+    // stop string, throwing away everything it had already established.
+    // Keep its last report so an interrupted run is partial, not empty.
+    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let said_obs = said.clone();
+    // Typed findings the child has reported so far. Captured from every
+    // ledger snapshot — not just a terminal one — so an interrupted child
+    // still hands over what it had established (the same principle as
+    // `said` above).
+    let findings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let findings_obs = findings.clone();
+    let activity_id = id.clone();
+    let activity_tx = progress.clone();
+    let mut capture = move |event: AgentEvent| match &event {
+        AgentEvent::ProgressUpdated { ledger } => {
+            if let Ok(mut guard) = partial_obs.lock() {
+                *guard = ledger.clone();
+            }
+        }
+        AgentEvent::EvidenceLedgerUpdated { ledger } => {
+            if let Ok(mut guard) = findings_obs.lock() {
+                *guard = ledger.findings.clone();
+            }
+        }
+        AgentEvent::AssistantText(text) if !text.trim().is_empty() => {
+            if let Ok(mut guard) = said_obs.lock() {
+                *guard = text.clone();
+            }
+        }
+        AgentEvent::ToolCall {
+            name, arguments, ..
+        } => {
+            let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                id: activity_id.clone(),
+                phase: "tool_started".to_string(),
+                tool: name.clone(),
+                preview: cap_activity_preview(arguments),
+                is_error: false,
+            });
+        }
+        AgentEvent::ToolResult {
+            name,
+            is_error,
+            preview,
+            ..
+        } => {
+            let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                id: activity_id.clone(),
+                phase: "tool_finished".to_string(),
+                tool: name.clone(),
+                preview: cap_activity_preview(preview),
+                is_error: *is_error,
+            });
+        }
+        // An ownership transition decides what this child may mutate, and
+        // child activity is transient — forward it verbatim so it lands on
+        // the parent's DURABLE delegation channel. Without this an offline
+        // audit cannot distinguish an authorized write from a bypass (the M7
+        // measurement failure).
+        AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_") => {
+            let _ = activity_tx.send(event.clone());
+        }
+        _ => {}
+    };
+    let mut sink = SubAgentProgressSink::new(id, progress, child.event_barrier.clone());
+    // Box the recursive future (agent → spawn_agent → agent) so its size is
+    // finite.
+    let hook_token = cancellation.clone();
+    let outcome = match start {
+        ChildStart::Task(task) => {
+            Box::pin(child.run(&task, &mut capture, &mut sink, cancellation)).await
+        }
+        ChildStart::Resume { mut prior, note } => {
+            match leveler_engine::TranscriptSink::append(&mut sink, std::slice::from_ref(&note))
+                .await
+            {
+                Ok(()) => {
+                    prior.push(note);
+                    Box::pin(child.resume(prior, &mut capture, &mut sink, cancellation)).await
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    };
+    if hook_runner.has_lifecycle() {
+        let ok = outcome.is_ok();
+        hook_runner
+            .run_lifecycle(
+                leveler_execution::LifecycleEvent::SubagentStop,
+                &format!(r#"{{"ok":{ok}}}"#),
+                &hook_token,
+            )
+            .await;
+    }
+    let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
+    let reported_findings = findings.lock().map(|g| g.clone()).unwrap_or_default();
+    match outcome {
+        Ok(outcome) => {
+            let completed = matches!(
+                outcome.stop_reason,
+                StopReason::Completed
+                    | StopReason::Answered
+                    | StopReason::CompletedUnverified
+                    | StopReason::CompletedChecksFailed
+            );
+            // A non-clean stop's `final_text` is usually the SYNTHETIC stop
+            // sentence ("reached the N-round ceiling…"), not the child's
+            // findings — R013r lost a voiced finding to exactly that. For
+            // interrupted runs, prefer what the child actually said; the
+            // stop reason is carried separately.
+            let mut findings = if completed {
+                outcome.final_text
+            } else {
+                let said = said_before_stopping();
+                if said.trim().is_empty() {
+                    outcome.final_text
+                } else {
+                    said
+                }
+            };
+            // Typed findings ARE a result. An empty prose wrap-up must
+            // not be classified COMPLETED_NO_FINDINGS when the child
+            // already recorded structured findings.
+            if findings.trim().is_empty() && !reported_findings.is_empty() {
+                findings = format!(
+                    "{} structured finding(s) reported.",
+                    reported_findings.len()
+                );
+            }
+            let stop_reason = if completed {
+                String::new()
+            } else {
+                stop_reason_wording(outcome.stop_reason, outcome.budget_exhaustion.as_ref())
+            };
+            SubAgentRunResult {
+                result: ChildResult::new(completed, &findings, stop_reason),
+                stop: child_stop(outcome.stop_reason),
+                limit: child_limit(outcome.stop_reason, outcome.budget_exhaustion.as_ref()),
+                progress: outcome.progress,
+                modified_files: outcome.modified_files,
+                findings: reported_findings,
+            }
+        }
+        Err(AgentError::Cancelled) => {
+            // Partial ProgressUpdated still rolls up so cancel cannot erase
+            // commands/files/tokens already spent by the child.
+            let ledger = partial.lock().map(|g| g.clone()).unwrap_or_default();
+            let paths = ledger.cumulative_modified_paths.clone();
+            SubAgentRunResult {
+                result: ChildResult::new(
+                    false,
+                    &said_before_stopping(),
+                    "stopped before it could finish",
+                ),
+                stop: leveler_lifecycle::ChildStop::Cancelled,
+                limit: None,
+                progress: ledger,
+                modified_files: paths,
+                findings: reported_findings,
+            }
+        }
+        Err(e) => {
+            let ledger = partial.lock().map(|g| g.clone()).unwrap_or_default();
+            let paths = ledger.cumulative_modified_paths.clone();
+            SubAgentRunResult {
+                result: ChildResult::new(false, &said_before_stopping(), e.to_string()),
+                stop: leveler_lifecycle::ChildStop::Failed,
+                limit: None,
+                progress: ledger,
+                modified_files: paths,
+                findings: reported_findings,
+            }
+        }
+    }
+}
+
+/// Outcome of a child the **harness** launched, rather than one a model asked
+/// for with `spawn_agent`.
+#[derive(Debug, Clone)]
+pub struct DelegatedChildResult {
+    /// Whether the child reached a clean terminal state.
+    pub ok: bool,
+    /// How the activation ended, mechanically.
+    pub stop: leveler_lifecycle::ChildStop,
+    /// Which bound fired when `stop` is `Budget`.
+    pub limit: Option<leveler_lifecycle::ChildLimit>,
+    /// What the child established, and how its run ended.
+    pub result: ChildResult,
+    /// The child's own spend (rounds, tokens, cost, commands, paths), for the
+    /// caller to fold into whatever ledger it answers to.
+    pub progress: ProgressLedger,
+    /// Files the child touched (a reviewer is read-only, so normally empty).
+    pub modified_files: Vec<String>,
+    /// Typed findings the child reported (partial ones survive an abnormal
+    /// stop). Still keyed by the CHILD's ids — the consumer adopts them.
+    pub findings: Vec<leveler_lifecycle::FindingRecord>,
+}
+
+/// Spend + structured result from one sub-agent so the parent can roll up
+/// budgets and read what actually happened.
+#[derive(Debug, Clone)]
+pub(crate) struct SubAgentRunResult {
+    pub result: ChildResult,
+    /// How the activation ended, mechanically.
+    pub stop: leveler_lifecycle::ChildStop,
+    /// Which bound fired when `stop` is `Budget`.
+    pub limit: Option<leveler_lifecycle::ChildLimit>,
+    pub progress: ProgressLedger,
+    pub modified_files: Vec<String>,
+    /// Typed findings captured from the child's ledger snapshots.
+    pub findings: Vec<leveler_lifecycle::FindingRecord>,
+}
+
+/// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.
+fn cap_activity_preview(s: &str) -> String {
+    const MAX: usize = 160;
+    leveler_core::truncate_head_bytes(s.trim(), MAX, "…")
+}
+
+/// Wall time held back from a child so the parent can still settle.
+///
+/// Settlement is not free: the parent folds the child's result into its
+/// ledger and writes the outcome. A child
+/// granted the parent's entire remainder leaves none of that, and the run ends
+/// on a deadline rather than on a decision.
+pub(crate) const CHILD_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Parent wall-clock budget context for refreshing a child's residual duration
+/// after it finishes waiting on the concurrency semaphore.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParentWallBudget {
+    pub cap: Option<std::time::Duration>,
+    pub epoch_duration_at_start: std::time::Duration,
+    pub run_started: std::time::Instant,
+}
+
+/// The wall budget a harness-launched reviewer runs under: the task's cap,
+/// with the task's elapsed time already counted, so the child is granted the
+/// residual (minus the settlement reserve) and never a fresh full cap.
+pub(crate) fn reviewer_wall_budget(
+    limits: &StepLimits,
+    parent_elapsed: std::time::Duration,
+) -> ParentWallBudget {
+    ParentWallBudget {
+        cap: limits.max_duration,
+        epoch_duration_at_start: parent_elapsed,
+        run_started: std::time::Instant::now(),
+    }
+}
+
+#[cfg(test)]
+mod reviewer_wall_budget_tests {
+    use super::reviewer_wall_budget;
+    use crate::StepLimits;
+    use std::time::Duration;
+
+    /// exp9/c3: a reviewer launched 79 rounds into a run started its clock at
+    /// zero and saw the whole cap as its own.
+    #[test]
+    fn the_reviewer_starts_its_clock_where_the_task_left_it() {
+        let limits = StepLimits {
+            max_duration: Some(Duration::from_secs(3600)),
+            ..StepLimits::default()
+        };
+        let wall = reviewer_wall_budget(&limits, Duration::from_secs(3000));
+        assert_eq!(wall.cap, Some(Duration::from_secs(3600)));
+        assert_eq!(wall.epoch_duration_at_start, Duration::from_secs(3000));
+    }
+}

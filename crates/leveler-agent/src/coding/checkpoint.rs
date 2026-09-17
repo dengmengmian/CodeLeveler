@@ -1,0 +1,741 @@
+//! Coding's canonical GoalCheckpoint builder (long-goal P3).
+//!
+//! Every trigger — `/recap`, milestone, interruption, context compaction —
+//! projects through this module, so a Recap in the TUI, the compaction
+//! breadcrumb, and the resume context all present the SAME persisted facts.
+//! Nothing here asks the model what the runtime already knows: structured
+//! facts come from the event log, the evidence ledger, and whatever bounded
+//! workspace metadata the Coding harness captures. The optional semantic
+//! wording is applied by the caller on top and can fail without costing the
+//! structured checkpoint.
+//!
+//! Cursor discipline: [`project_goal_checkpoint`] reads the committed
+//! `MAX(sequence)` of the session's event log. The CALLER owns making that
+//! read safe — every trigger sits behind a durable boundary (the event flush
+//! barrier, a committed terminal turn, or the reaper's fenced commit), so
+//! the cursor can never point beyond durable EventLog state.
+
+use leveler_core::SessionId;
+use leveler_lifecycle::{
+    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
+    CheckpointWorkspace, EvidenceLedger, GoalCheckpoint,
+};
+use leveler_storage::{EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore};
+
+use leveler_engine::{EngineError, EngineEvent, EventEmitter, PortError};
+
+use crate::executor::CompactionCheckpoint;
+
+/// Bounded facts about the Coding workspace at a checkpoint boundary.
+#[async_trait::async_trait]
+pub trait WorkspaceFacts: Send + Sync {
+    async fn capture(&self) -> CheckpointWorkspace;
+}
+
+pub(crate) struct CodingCompactionCheckpoint {
+    engine: leveler_engine::TaskEngine,
+    session_id: SessionId,
+    workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+    events: EventEmitter,
+}
+
+pub struct CodingCheckpointContext {
+    pub engine: leveler_engine::TaskEngine,
+    pub workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+}
+
+impl CodingCheckpointContext {
+    pub fn new(
+        engine: leveler_engine::TaskEngine,
+        workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+    ) -> Self {
+        Self { engine, workspace }
+    }
+}
+
+impl CodingCompactionCheckpoint {
+    pub(crate) fn new(
+        engine: leveler_engine::TaskEngine,
+        session_id: SessionId,
+        workspace: Option<std::sync::Arc<dyn WorkspaceFacts>>,
+        events: EventEmitter,
+    ) -> Self {
+        Self {
+            engine,
+            session_id,
+            workspace,
+            events,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionCheckpoint for CodingCompactionCheckpoint {
+    async fn checkpoint_before_compaction(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, PortError> {
+        self.events.flush().await.map_err(PortError::Persistence)?;
+        let record = create_goal_checkpoint(
+            &self.engine,
+            &self.session_id,
+            CheckpointReason::ContextCompaction,
+            self.workspace.as_deref(),
+            SemanticRecap::briefing(summary),
+        )
+        .await
+        .map_err(|e| PortError::Persistence(e.to_string()))?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        self.events.emit(checkpoint_created_event(&record));
+        Ok(Some(record.payload.context_block()))
+    }
+}
+
+/// How many settled children / finding refs / changed paths a checkpoint
+/// carries at most. Counts stay authoritative when a list is truncated.
+const MAX_REFS: usize = 20;
+
+/// The deterministic projection: payload plus the boundary it represents.
+#[derive(Debug, Clone)]
+pub struct ProjectedCheckpoint {
+    pub payload: GoalCheckpoint,
+    /// Inclusive committed event boundary of the goal's session.
+    /// `0` = no events yet (the delta is the whole log).
+    pub event_cursor: i64,
+}
+
+/// Project the structured checkpoint facts for `goal` out of authoritative
+/// state. Pure reads; nothing is persisted and no model is called.
+pub async fn project_goal_checkpoint(
+    events: &dyn EventStore,
+    messages: &dyn MessageStore,
+    goal: &GoalRecord,
+    session_id: &SessionId,
+    workspace: Option<&dyn WorkspaceFacts>,
+) -> Result<ProjectedCheckpoint, EngineError> {
+    let event_cursor = events.latest_sequence(session_id).await?.unwrap_or(0);
+    let transcript_ordinal = messages.load(session_id).await?.len() as u64;
+
+    let ledger = last_ledger(events, session_id).await?;
+    let (findings, verification) = match &ledger {
+        Some(ledger) => (findings_from(ledger), verification_from(ledger)),
+        // The ledger could not be read / was never written: explicitly
+        // unknown and unmeasured — never zero, never passed.
+        None => (
+            CheckpointFindings::Unknown,
+            CheckpointVerification::Unmeasured,
+        ),
+    };
+    let plan = match &ledger {
+        Some(ledger) => CheckpointPlan::from_state(&ledger.plan),
+        None => last_plan(events, session_id)
+            .await?
+            .as_ref()
+            .and_then(CheckpointPlan::from_state),
+    };
+
+    let payload = GoalCheckpoint {
+        objective: goal.objective.clone(),
+        transcript_ordinal: Some(transcript_ordinal),
+        plan,
+        verification,
+        findings,
+        children: settled_children(events, session_id).await?,
+        artifact_refs: Vec::new(),
+        workspace: match workspace {
+            Some(facts) => facts.capture().await,
+            None => CheckpointWorkspace::default(),
+        },
+        ..Default::default()
+    }
+    .bounded();
+
+    Ok(ProjectedCheckpoint {
+        payload,
+        event_cursor,
+    })
+}
+
+/// The optional semantic wording a trigger may add on top of the structured
+/// facts. Every field is optional and bounded later; absence degrades the
+/// wording, never the checkpoint.
+#[derive(Debug, Clone, Default)]
+pub struct SemanticRecap {
+    /// Concise prose summary of the work so far (feeds the context block).
+    pub goal_summary: Option<String>,
+    /// The 1–2 line presentation; deterministic fallback used when absent.
+    pub display_summary: Option<String>,
+    /// Next-action wording; the plan's next step stands in when absent.
+    pub next_action: Option<String>,
+}
+
+impl SemanticRecap {
+    /// Wrap a compaction-style briefing paragraph: it becomes the goal
+    /// summary only — display stays deterministic.
+    pub fn briefing(summary: Option<&str>) -> Option<Self> {
+        summary.map(|s| Self {
+            goal_summary: Some(s.to_string()),
+            ..Default::default()
+        })
+    }
+}
+
+/// Resolve the session's goal, project, and PERSIST a checkpoint. The one
+/// creation seam every trigger calls.
+///
+/// `Ok(None)` = the session has no goal to checkpoint (truthful absence, not
+/// an error): triggers proceed without one, `/recap` reports it to the user.
+/// A running goal is preferred; a settled one is accepted only for `Manual`
+/// (a user may ask for a recap after the run ended). `semantic_summary`, when
+/// present, becomes the payload's goal summary — structured facts never
+/// depend on it.
+///
+/// The caller owns the durable barrier BEFORE this call (event flush /
+/// committed terminal / reaper commit), so the captured cursor is
+/// committed-only by construction.
+pub async fn create_goal_checkpoint(
+    engine: &leveler_engine::TaskEngine,
+    session_id: &SessionId,
+    reason: CheckpointReason,
+    workspace: Option<&dyn WorkspaceFacts>,
+    semantic: Option<SemanticRecap>,
+) -> Result<Option<GoalCheckpointRecord>, EngineError> {
+    let stores = &engine.stores;
+    let Some(task) = stores.tasks.task_for_session(session_id).await? else {
+        return Ok(None);
+    };
+    let goals = stores.goals.for_task(&task).await?;
+    let goal = goals
+        .iter()
+        .find(|g| g.state == GoalState::Running)
+        .or_else(|| {
+            matches!(reason, CheckpointReason::Manual)
+                .then(|| goals.first())
+                .flatten()
+        });
+    let Some(goal) = goal else {
+        return Ok(None);
+    };
+    let projected = project_goal_checkpoint(
+        stores.events.as_ref(),
+        stores.messages.as_ref(),
+        goal,
+        session_id,
+        workspace,
+    )
+    .await?;
+    let mut payload = projected.payload;
+    if let Some(semantic) = semantic {
+        payload.goal_summary = semantic.goal_summary;
+        payload.display_summary = semantic.display_summary;
+        payload.next_action = semantic.next_action;
+    }
+    let record = engine
+        .commit_goal_checkpoint(leveler_storage::NewGoalCheckpoint {
+            goal_id: goal.id.clone(),
+            session_id: session_id.clone(),
+            reason,
+            event_cursor: projected.event_cursor,
+            payload: payload.bounded(),
+        })
+        .await?;
+    Ok(Some(record))
+}
+
+/// The canonical event announcing a persisted checkpoint. Emitted AFTER the
+/// row exists, so replay never names a checkpoint that was not stored.
+pub fn checkpoint_created_event(record: &GoalCheckpointRecord) -> EngineEvent {
+    EngineEvent::GoalCheckpointCreated {
+        checkpoint_id: record.id.as_str().to_string(),
+        goal_id: record.goal_id.as_str().to_string(),
+        reason: record.reason.as_str().to_string(),
+        created_at: record.created_at.to_rfc3339(),
+        payload: Box::new(record.payload.clone()),
+    }
+}
+
+/// Continuation context from the latest valid checkpoint: the rendered
+/// `[GOAL CHECKPOINT]` block plus EXACTLY the transcript messages after its
+/// watermark — never a replay of what the checkpoint already represents.
+///
+/// `Ok(None)` = no usable checkpoint; the caller keeps the pre-checkpoint
+/// full-history path (backward compatibility, and the fail-closed answer to
+/// a corrupt/stale/future checkpoint — trust nothing, fall back).
+/// The transcript watermark of the checkpoint a resume would continue from,
+/// when there is one. A cheap indexed probe: it answers "how far back can the
+/// checkpoint path reach" without loading a message, which is what lets a
+/// bounded transcript load know it is safe.
+///
+/// `None` covers every case where the checkpoint path will not fire or its
+/// reach is unknown — no task, no goal, no checkpoint, no watermark — and the
+/// caller reads that as "impose no bound", never as "bound at zero".
+pub async fn checkpoint_transcript_ordinal(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+) -> Result<Option<u64>, EngineError> {
+    let Some(task) = stores.tasks.task_for_session(session_id).await? else {
+        return Ok(None);
+    };
+    let goals = stores.goals.for_task(&task).await?;
+    let goal = goals
+        .iter()
+        .find(|g| g.state == GoalState::Running)
+        .or_else(|| goals.first());
+    let Some(goal) = goal else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = stores.goal_checkpoints.latest_for_goal(&goal.id).await? else {
+        return Ok(None);
+    };
+    Ok(checkpoint.payload.transcript_ordinal)
+}
+
+pub async fn resume_prior_from_checkpoint(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+    transcript: &leveler_engine::RawTranscript,
+) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
+    let Some(task) = stores.tasks.task_for_session(session_id).await? else {
+        return Ok(None);
+    };
+    let goals = stores.goals.for_task(&task).await?;
+    // Resume continues the goal still owing work when there is one;
+    // otherwise the most recent goal is the one whose history this is.
+    let goal = goals
+        .iter()
+        .find(|g| g.state == GoalState::Running)
+        .or_else(|| goals.first());
+    let Some(goal) = goal else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = stores.goal_checkpoints.latest_for_goal(&goal.id).await? else {
+        return Ok(None);
+    };
+    // Cursor sanity: a checkpoint may only reference committed events. A
+    // cursor beyond the durable log is corruption — never trusted.
+    let latest = stores
+        .events
+        .latest_sequence(session_id)
+        .await?
+        .unwrap_or(0);
+    if checkpoint.event_cursor > latest {
+        tracing::warn!(
+            checkpoint = %checkpoint.id,
+            cursor = checkpoint.event_cursor,
+            latest,
+            "checkpoint cursor is beyond the durable event log; falling back to full history"
+        );
+        return Ok(None);
+    }
+    let Some(ordinal) = checkpoint.payload.transcript_ordinal else {
+        return Ok(None);
+    };
+    // The delta this checkpoint stands in front of. `None` means the loaded
+    // transcript cannot serve it — the watermark is past its end, or a bounded
+    // load began after it. Falling back to full history is the safe answer;
+    // splicing a shorter delta would silently drop work the checkpoint does
+    // not describe.
+    let Some(delta) = transcript.slice_from_ordinal(ordinal) else {
+        tracing::warn!(
+            checkpoint = %checkpoint.id,
+            ordinal,
+            transcript_offset = transcript.offset(),
+            transcript_len = transcript.stored_len(),
+            "checkpoint watermark is outside the loaded transcript; falling back"
+        );
+        return Ok(None);
+    };
+    let mut prior = Vec::with_capacity(1 + delta.len());
+    prior.push(leveler_model::Message {
+        role: leveler_model::Role::User,
+        content: vec![leveler_model::ContentPart::Text {
+            text: checkpoint.payload.context_block(),
+        }],
+    });
+    prior.extend_from_slice(delta);
+    Ok(Some(prior))
+}
+
+async fn last_ledger(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Option<EvidenceLedger>, EngineError> {
+    let Some(row) = events
+        .load_last_by_type(session_id, "evidence_ledger_updated", None)
+        .await?
+    else {
+        return Ok(None);
+    };
+    match EngineEvent::from_payload(&row.payload)? {
+        EngineEvent::EvidenceLedgerUpdated { ledger } => Ok(Some(ledger)),
+        _ => Err(EngineError::Corrupt(
+            "evidence_ledger_updated row carried a different event".into(),
+        )),
+    }
+}
+
+async fn last_plan(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Option<leveler_lifecycle::PlanState>, EngineError> {
+    let Some(row) = events
+        .load_last_by_type(session_id, "plan_updated", None)
+        .await?
+    else {
+        return Ok(None);
+    };
+    match EngineEvent::from_payload(&row.payload)? {
+        EngineEvent::PlanUpdated { steps } => Ok(Some(leveler_lifecycle::PlanState { steps })),
+        _ => Err(EngineError::Corrupt(
+            "plan_updated row carried a different event".into(),
+        )),
+    }
+}
+
+fn findings_from(ledger: &EvidenceLedger) -> CheckpointFindings {
+    CheckpointFindings::Known {
+        total: ledger.findings.len() as u32,
+        refs: ledger
+            .findings
+            .iter()
+            .take(MAX_REFS)
+            .map(|f| f.id.clone())
+            .collect(),
+    }
+}
+
+fn verification_from(ledger: &EvidenceLedger) -> CheckpointVerification {
+    if ledger.has_fresh_successful_verify() {
+        let evidence = ledger
+            .verifications
+            .iter()
+            .rev()
+            .find(|v| v.exit_code == 0)
+            .map(|v| v.command_fingerprint.clone())
+            .unwrap_or_else(|| "fresh successful verification".to_string());
+        return CheckpointVerification::Passed { evidence };
+    }
+    match ledger.verifications.last() {
+        Some(last) if last.exit_code != 0 => CheckpointVerification::Failed {
+            detail: format!("{} (exit {})", last.command_fingerprint, last.exit_code),
+        },
+        // A stale or baseline-green pass proves nothing about the current
+        // state; "not measured" is the truthful reading, not "passed".
+        _ => CheckpointVerification::Unmeasured,
+    }
+}
+
+async fn settled_children(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Vec<CheckpointChild>, EngineError> {
+    let rows = events
+        .load_by_types(session_id, &["sub_agent_finished"])
+        .await?;
+    let mut out = Vec::new();
+    for row in rows {
+        if let EngineEvent::SubAgentFinished {
+            id,
+            nickname,
+            ok,
+            contribution,
+            ..
+        } = EngineEvent::from_payload(&row.payload)?
+        {
+            out.push(CheckpointChild {
+                child_id: id,
+                nickname,
+                completed: ok,
+                contribution,
+            });
+        }
+    }
+    // Keep the most recent settlements when a long session had many.
+    if out.len() > MAX_REFS {
+        out.drain(..out.len() - MAX_REFS);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_core::{GoalId, TaskId};
+    use leveler_lifecycle::{FindingKind, FindingRecord};
+    use leveler_storage::{MemoryEventStore, MemoryMessageStore};
+
+    fn goal() -> GoalRecord {
+        GoalRecord {
+            id: GoalId::new("g1"),
+            task_id: TaskId::new("t1"),
+            objective: "port the parser".to_string(),
+            state: leveler_storage::GoalState::Running,
+            opened_at: leveler_core::now(),
+            settled_at: None,
+            windows_run: 0,
+        }
+    }
+
+    async fn append(events: &MemoryEventStore, session: &SessionId, event: EngineEvent) {
+        let (event_type, payload) = event.to_row().unwrap();
+        events
+            .append(session, None, &event_type, &payload, leveler_core::now())
+            .await
+            .unwrap();
+    }
+
+    fn finding(id: &str) -> FindingRecord {
+        FindingRecord {
+            id: id.to_string(),
+            source_child: "c1".to_string(),
+            role: "explorer".to_string(),
+            kind: FindingKind::Correctness,
+            summary: format!("finding {id}"),
+            file: None,
+            symbol: None,
+        }
+    }
+
+    /// Truth case B/C: with no ledger written, findings are UNKNOWN (not
+    /// zero) and verification is UNMEASURED (not passed).
+    #[tokio::test]
+    async fn no_ledger_projects_unknown_not_success() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        assert_eq!(projected.payload.findings, CheckpointFindings::Unknown);
+        assert_eq!(
+            projected.payload.verification,
+            CheckpointVerification::Unmeasured
+        );
+        assert_eq!(projected.event_cursor, 0, "no events → empty boundary");
+        assert_eq!(projected.payload.transcript_ordinal, Some(0));
+        assert_eq!(projected.payload.workspace.dirty, None, "no repo → unknown");
+    }
+
+    /// The cursor is the committed MAX(sequence) — never invented, never
+    /// beyond what the store holds.
+    #[tokio::test]
+    async fn cursor_is_the_committed_boundary() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        for _ in 0..3 {
+            append(
+                &events,
+                &session,
+                EngineEvent::GoalIntercepted {
+                    kind: "k".into(),
+                    detail: "d".into(),
+                },
+            )
+            .await;
+        }
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        assert_eq!(projected.event_cursor, 3);
+    }
+
+    /// Truth case D: every recorded finding is counted and referenced. There
+    /// is no "open" or "blocking" subset any more — a finding is information.
+    #[tokio::test]
+    async fn findings_truth_is_preserved() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        let ledger = EvidenceLedger {
+            findings: vec![finding("f-1"), finding("f-2"), finding("f-3")],
+            ..Default::default()
+        };
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger },
+        )
+        .await;
+
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        match projected.payload.findings {
+            CheckpointFindings::Known { total, refs } => {
+                assert_eq!(total, 3);
+                assert_eq!(
+                    refs,
+                    vec!["f-1".to_string(), "f-2".to_string(), "f-3".to_string()]
+                );
+            }
+            other => panic!("expected known findings, got {other:?}"),
+        }
+    }
+
+    /// Truth case A vs the stale-pass trap: a fresh successful verify is
+    /// PASSED; a verify that predates the last mutation is NOT.
+    #[tokio::test]
+    async fn verification_truth_requires_fresh_evidence() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+
+        let mut fresh = EvidenceLedger::default();
+        fresh.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
+        fresh.record_verify("v1", "cargo test", 0);
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger: fresh },
+        )
+        .await;
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            projected.payload.verification,
+            CheckpointVerification::Passed { .. }
+        ));
+
+        // Now a later mutation invalidates that pass.
+        let mut stale = EvidenceLedger::default();
+        stale.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
+        stale.record_verify("v1", "cargo test", 0);
+        stale.record_mutation("m2", "apply_patch", vec!["src/b.rs".into()]);
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger: stale },
+        )
+        .await;
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            projected.payload.verification,
+            CheckpointVerification::Unmeasured,
+            "a stale pass is not current-state evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_verification_projects_as_failed() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
+        ledger.record_verify("v1", "cargo test", 1);
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger },
+        )
+        .await;
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        match projected.payload.verification {
+            CheckpointVerification::Failed { detail } => {
+                assert!(detail.contains("cargo test"), "got: {detail}");
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    /// Truth cases E/F: an incomplete child and a completed-no-findings
+    /// child project distinctly, straight from the durable settlement facts.
+    #[tokio::test]
+    async fn child_truth_is_preserved() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        append(
+            &events,
+            &session,
+            EngineEvent::SubAgentFinished {
+                id: "c1".into(),
+                nickname: "Explorer".into(),
+                ok: true,
+                summary: "done".into(),
+                contribution: Some(leveler_lifecycle::ChildResultProjection {
+                    child_id: "c1".into(),
+                    role: "explorer".into(),
+                    ..Default::default()
+                }),
+                outcome: None,
+                stop: None,
+                limit: None,
+            },
+        )
+        .await;
+        append(
+            &events,
+            &session,
+            EngineEvent::SubAgentFinished {
+                id: "c2".into(),
+                nickname: "Reviewer".into(),
+                ok: false,
+                summary: "budget exhausted".into(),
+                contribution: None,
+                outcome: None,
+                stop: None,
+                limit: None,
+            },
+        )
+        .await;
+
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        let children = &projected.payload.children;
+        assert_eq!(children.len(), 2);
+        assert!(children[0].completed && children[0].contribution.is_some());
+        assert!(
+            !children[1].completed && children[1].contribution.is_none(),
+            "incomplete-no-result must not read as completed-no-findings"
+        );
+    }
+
+    /// Plan progress comes from the ledger's plan mirror.
+    #[tokio::test]
+    async fn plan_progress_is_projected() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        let ledger = EvidenceLedger {
+            plan: leveler_lifecycle::PlanState {
+                steps: vec![
+                    leveler_lifecycle::PlanStep {
+                        step: "audit".into(),
+                        status: "completed".into(),
+                        id: None,
+                        origin: Default::default(),
+                    },
+                    leveler_lifecycle::PlanStep {
+                        step: "implement".into(),
+                        status: "pending".into(),
+                        id: None,
+                        origin: Default::default(),
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger },
+        )
+        .await;
+        let projected = project_goal_checkpoint(&events, &messages, &goal(), &session, None)
+            .await
+            .unwrap();
+        let plan = projected.payload.plan.expect("plan projected");
+        assert_eq!((plan.completed, plan.total), (1, 2));
+        assert_eq!(plan.next_step.as_deref(), Some("implement"));
+    }
+}

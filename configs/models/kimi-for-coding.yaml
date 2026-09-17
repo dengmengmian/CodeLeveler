@@ -1,0 +1,34 @@
+# Kimi K2.8 Preview — the model behind the `kimi-for-coding` id.
+# Docs: https://www.kimi.com/code/docs/kimi-code/models (read 2026-09-17)
+# The id was upgraded in place: K2.8 Preview replaced K2.7 Code under the same
+# model id ("kimi-for-coding 直接升级、无需修改配置"), so the facts below are the
+# new model's, not the ones that id used to have.
+id: kimi-for-coding
+provider: kimi
+model_id: kimi-for-coding
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  # Officially 图片、视频. CodeLeveler models image input only, so `vision` says
+  # nothing about video: that input has no path into a request from here.
+  vision: true
+reasoning:
+  style: open_ai_effort
+  supported_efforts: [low, high, max]
+  # Official default is `max` (null → max; unknown → HTTP 400). CodeLeveler's own
+  # default is stated rather than inferred — here the two agree.
+  default_effort: max
+limits:
+  context_window: 1048576
+  reliable_context: 786432
+  max_output_tokens: 32768
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+  supports_temperature: false

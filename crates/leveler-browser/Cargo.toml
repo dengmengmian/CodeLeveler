@@ -1,0 +1,35 @@
+[package]
+name = "leveler-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Browser automation as a capability: product selection, refs and session ownership over CDP (Chrome/Edge/Chromium) and WebDriver (Safari)."
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+leveler-core = { workspace = true }
+
+# Signal the browser's whole process group, so no renderer outlives the daemon.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+# Job Object + kill-on-drop: the same descendant-cleanup mechanism
+# `leveler-execution` uses, so a browser tree cannot outlive the daemon.
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "8.2", default-features = false, features = [
+    "tokio1",
+    "job-object",
+    "kill-on-drop",
+] }
+
+[dev-dependencies]
+tokio-util = { workspace = true }

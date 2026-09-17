@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="CodeLeveler">
+  <rect width="64" height="64" rx="14" fill="#0B0F14"/>
+  <g fill="#FFFFFF" transform="translate(2 1) scale(0.94)">
+    <path d="
+      M 27 9
+      A 23 23 0 1 0 27 55
+      L 27 47
+      A 15 15 0 1 1 27 17
+      Z
+    "/>
+    <path d="
+      M 29 22 H 37 V 54 H 29 Z
+      M 29 46 H 51 V 54 H 29 Z
+      M 29 38 H 47 V 46 H 29 Z
+      M 29 30 H 43 V 38 H 29 Z
+    "/>
+  </g>
+</svg>

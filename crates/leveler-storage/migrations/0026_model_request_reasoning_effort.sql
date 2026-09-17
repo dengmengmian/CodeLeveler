@@ -1,0 +1,11 @@
+-- Record the reasoning effort each model call asked for.
+--
+-- A declarative agent can name its own `reasoning_effort`, and the runtime
+-- applies it to that child's requests. Until now nothing durable said which
+-- effort a call was actually sent with: the only evidence was the resolved
+-- configuration, which is what was intended, not what ran.
+--
+-- NULL means the request named no effort (the provider's default applied) or
+-- the row predates this migration. No backfill: an old row's effort was never
+-- recorded, and inventing one would assert a fact nobody measured.
+ALTER TABLE model_requests ADD COLUMN reasoning_effort TEXT;

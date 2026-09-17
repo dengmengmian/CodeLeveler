@@ -1,0 +1,4673 @@
+//! [`InProcessRuntimeClient`] — the first [`InteractiveRuntimeClient`], bridging
+//! the runtime's synchronous observer callbacks, cancellation tokens, and
+//! approver into the async, broadcast-shaped client protocol the TUI consumes
+//! .
+//!
+//! The runtime exposes progress as a synchronous `&mut (dyn FnMut(AgentEvent) + Send)`
+//! observer with no channel. This client wraps that callback in a closure that
+//! forwards each event into a `tokio::sync::broadcast`, and drives the turn on a
+//! blocking thread (the turn future is not `Send`). Embedded `send` returns
+//! after dispatch; the daemon composition waits for durable turn admission
+//! before its transport writes an ACK.
+//!
+//! Approvals round-trip over the protocol: [`ChannelApprover`] emits an
+//! `ApprovalRequested` event and awaits the matching `ApprovalDecision` command
+//! via a per-request oneshot . Model/mode switches update the fields
+//! used for subsequent turns and refresh the header via `SessionUpdated`.
+//!
+//! Assistant text arrives as whole-round `AgentEvent::AssistantText` (the
+//! executor uses the non-streaming path today), republished as
+//! `Started → TextDelta → Completed` so the protocol stays streaming-shaped for
+//! when token streaming lands later.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use leveler_core::{CheckpointId, CommandId, SessionId};
+use leveler_execution::{Approver, AutoApprove, PermissionProfile};
+use leveler_media::{MediaError, MediaStore};
+use leveler_model::{
+    ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
+    ToolChoice, resolve_reasoning_effort,
+};
+use leveler_storage::{MessageRepository, SessionRepository};
+
+use leveler_client_protocol::{
+    ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
+    AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiReasoningState, UiRole,
+    UiSessionSnapshot, UiSessionSummary,
+};
+
+/// Whether a turn auto-approves risky actions. True when the session opted in
+/// (`AutoApprove`), or the daemon was started with a global `--auto-approve`
+/// (backward-compatible fallback). Keeping the global as an OR means a plain
+/// daemon can host a per-session unattended goal AND interactive sessions at the
+/// same time, while `serve --auto-approve` still auto-approves everything.
+fn should_auto_approve(session_policy: Option<ApprovalPolicy>, global_auto_approve: bool) -> bool {
+    matches!(session_policy, Some(ApprovalPolicy::AutoApprove)) || global_auto_approve
+}
+
+/// New runtimes always project this block so the TUI can tell "no knob"
+/// (`effective: None`) from "old runtime, field absent".
+fn ui_reasoning_state(profile: Option<&ModelProfile>) -> Option<UiReasoningState> {
+    Some(UiReasoningState {
+        effective: profile.and_then(|p| {
+            resolve_reasoning_effort(None, &p.reasoning)
+                .effective
+                .map(|e| e.as_wire().to_string())
+        }),
+    })
+}
+
+fn unresolvable(command_id: &CommandId) -> ClientError {
+    ClientError::Unresolvable(format!(
+        "command {} was admitted, but the boot dispatching it ended before its outcome was \
+         recorded",
+        command_id.as_str()
+    ))
+}
+
+fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalDecision {
+    match value {
+        UiApprovalDecision::ApproveOnce => leveler_execution::ApprovalDecision::ApproveOnce,
+        UiApprovalDecision::ApproveSession => leveler_execution::ApprovalDecision::ApproveSession,
+        UiApprovalDecision::ApproveAlways => leveler_execution::ApprovalDecision::ApproveAlways,
+        UiApprovalDecision::Deny => leveler_execution::ApprovalDecision::Deny,
+    }
+}
+
+/// A command ACK means the engine has committed the turn's write-ahead input
+/// record. The model loop may still be running, but a process death after this
+/// point can reconstruct the transcript from durable state.
+async fn await_turn_acceptance(
+    accepted: oneshot::Receiver<Result<(), ClientError>>,
+) -> Result<(), ClientError> {
+    accepted.await.map_err(|_| {
+        ClientError::Runtime("turn worker stopped before durable admission".to_string())
+    })?
+}
+
+/// A refusal because another process owns the session, in the user's words.
+fn ownership_conflict(error: &crate::AppError) -> ClientError {
+    ClientError::OwnershipConflict(error.to_string())
+}
+
+/// Why a fresh turn was never durably admitted, as its caller hears it.
+fn turn_rejection<T>(result: &Result<T, crate::AppError>) -> ClientError {
+    match result {
+        Err(
+            error @ (crate::AppError::SessionRunningElsewhere
+            | crate::AppError::SessionOwnershipUnknown),
+        ) => ownership_conflict(error),
+        Err(error) => ClientError::Runtime(error.to_string()),
+        Ok(_) => ClientError::Runtime("turn ended before durable admission".to_string()),
+    }
+}
+
+/// Integration-test-only crash barrier. It is inert unless a daemon process
+/// was built with the non-default `test-crash-barrier` feature and receives a
+/// unique marker path directly under its isolated `LEVELER_HOME`. The test
+/// kills the process after the marker is created, so this thread deliberately
+/// never resumes.
+#[cfg(feature = "test-crash-barrier")]
+fn hit_after_turn_started_test_barrier() {
+    hit_test_crash_barrier(
+        "LEVELER_TEST_AFTER_TURN_STARTED_BARRIER",
+        b"after_turn_started\n",
+    );
+}
+
+/// Same contract, between a successful dispatch and its receipt being settled:
+/// the exact window that leaves a `dispatching` receipt behind a dead boot.
+#[cfg(feature = "test-crash-barrier")]
+fn hit_before_receipt_settled_test_barrier() {
+    hit_test_crash_barrier(
+        "LEVELER_TEST_BEFORE_RECEIPT_SETTLED_BARRIER",
+        b"before_receipt_settled\n",
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+fn hit_test_crash_barrier(variable: &str, marker: &[u8]) {
+    let Some(raw_path) = std::env::var_os(variable) else {
+        return;
+    };
+    let Some(raw_home) = std::env::var_os("LEVELER_HOME") else {
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+    let home = PathBuf::from(raw_home);
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".test-crash-barrier-"));
+    if path.parent() != Some(home.as_path()) || !valid_name {
+        tracing::warn!(path = %path.display(), "ignored invalid test crash barrier path");
+        return;
+    }
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, marker));
+    if let Err(error) = write_result {
+        tracing::warn!(%error, path = %path.display(), "could not announce test crash barrier");
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Production/default builds contain no environment-controlled crash path.
+#[cfg(not(feature = "test-crash-barrier"))]
+fn hit_after_turn_started_test_barrier() {}
+
+#[cfg(not(feature = "test-crash-barrier"))]
+fn hit_before_receipt_settled_test_barrier() {}
+
+/// Pending candidates as UI entries. Kept next to the listing handlers so the
+/// three places that emit `MemoryList` cannot drift on what "pending" means.
+/// Pending candidates with the body, kind and source the user needs in order
+/// to decide. A title alone is not informed consent.
+fn pending_entries(
+    store: &leveler_memory::MemoryStore,
+) -> Vec<leveler_client_protocol::UiMemoryCandidate> {
+    store
+        .list_pending()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| leveler_client_protocol::UiMemoryCandidate {
+            id: c.id,
+            title: c.title,
+            body: c.body,
+            kind: format!("{:?}", c.kind).to_lowercase(),
+            source: format!("{:?}", c.source).to_lowercase(),
+        })
+        .collect()
+}
+
+/// One active/archived row, carrying what a client must render differently:
+/// the kind, and whether it is withheld from the model as sensitive.
+fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::UiMemoryEntry {
+    use leveler_client_protocol::UiMemoryKind;
+    use leveler_memory::MemoryKind;
+    leveler_client_protocol::UiMemoryEntry {
+        id: entry.id.clone(),
+        title: entry.title.clone(),
+        kind: match MemoryKind::of(entry) {
+            MemoryKind::Preference => Some(UiMemoryKind::Preference),
+            MemoryKind::Decision => Some(UiMemoryKind::Decision),
+            MemoryKind::Note => Some(UiMemoryKind::Note),
+            // Legacy and derived entries have no product kind to claim.
+            MemoryKind::LegacyUnknown | MemoryKind::Derived => None,
+        },
+        sensitive: leveler_memory::is_sensitive(entry),
+    }
+}
+
+/// Push the current listing to this session's clients. One sender, so every
+/// memory command refreshes the same way.
+fn send_memory_list(
+    events: &tokio::sync::broadcast::Sender<RuntimeEvent>,
+    memory_dir: &std::path::Path,
+    include_archived: bool,
+) {
+    let Ok(store) = leveler_memory::MemoryStore::open(memory_dir) else {
+        return;
+    };
+    let active = store
+        .list_active()
+        .unwrap_or_default()
+        .iter()
+        .map(memory_row)
+        .collect();
+    let archived = if include_archived {
+        store
+            .list_archived()
+            .unwrap_or_default()
+            .iter()
+            .map(memory_row)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let _ = events.send(RuntimeEvent::MemoryList {
+        memory_dir: memory_dir.display().to_string(),
+        active,
+        archived,
+        pending: pending_entries(&store),
+    });
+}
+
+fn execution_mode(value: leveler_client_protocol::PermissionProfile) -> PermissionProfile {
+    match value {
+        leveler_client_protocol::PermissionProfile::RequestApproval => {
+            PermissionProfile::RequestApproval
+        }
+        leveler_client_protocol::PermissionProfile::Assisted => PermissionProfile::Assisted,
+        leveler_client_protocol::PermissionProfile::FullAccess => PermissionProfile::FullAccess,
+    }
+}
+
+fn protocol_mode(value: PermissionProfile) -> leveler_client_protocol::PermissionProfile {
+    match value {
+        PermissionProfile::RequestApproval => {
+            leveler_client_protocol::PermissionProfile::RequestApproval
+        }
+        PermissionProfile::Assisted => leveler_client_protocol::PermissionProfile::Assisted,
+        PermissionProfile::FullAccess => leveler_client_protocol::PermissionProfile::FullAccess,
+    }
+}
+
+use crate::event_bridge::{EventBridge, turn_runtime_event};
+use crate::prompt_bridge::{
+    ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
+    resolve_clarification, validate_pending_session,
+};
+use crate::workspace_view::{compute_diff, detect_branch_label};
+
+/// The instruction used to summarize a conversation for compaction (spec §53).
+const COMPACT_PROMPT: &str = "Summarize the conversation so far into a concise \
+    briefing that preserves the task, decisions made, key facts learned, and \
+    open questions, so work can continue without the full history. Reply with \
+    ONLY the summary.";
+
+/// Goal text interactive entry points create sessions with before any real
+/// message exists. Replaced by [`title_from_first_message`] on first submit.
+const PLACEHOLDER_GOAL: &str = "interactive session";
+
+/// Session title from the first message: the first sentence of the first
+/// non-empty line (CJK/latin sentence-final punctuation only — `.` would
+/// mangle paths and version numbers), capped at 40 chars.
+fn title_from_first_message(content: &str) -> Option<String> {
+    let line = content
+        .trim()
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .trim();
+    let sentence = line
+        .split(['。', '？', '！', '?', '!', '；', ';'])
+        .next()
+        .unwrap_or(line)
+        .trim();
+    let title: String = sentence.chars().take(40).collect();
+    (!title.is_empty()).then_some(title)
+}
+
+fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: &Path) {
+    let sources = leveler_context::load_rules(repo)
+        .into_iter()
+        .map(|rule| rule.source)
+        .collect::<Vec<_>>();
+    if !sources.is_empty() {
+        let _ = events.send(RuntimeEvent::ProjectRulesLoaded { sources });
+    }
+}
+
+/// Whether a plain Enter / SubmitMessage should use the Goal turn profile
+/// (`update_goal` / goal_mode) instead of Chat content turn.
+///
+/// Pure policy: single mapping table for TUI, remote clients, and tests.
+pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
+    collaboration.eq_ignore_ascii_case("goal")
+}
+
+use crate::Application;
+use crate::active_turns::ActiveTurns;
+
+/// An in-process runtime client backed by an [`Application`].
+pub struct InProcessRuntimeClient {
+    app: Arc<Application>,
+    /// Defaults for sessions created by this runtime service.
+    default_runtime: SessionRuntimeConfig,
+    /// Model/mode/path selected independently by each live or restored session.
+    session_runtime: Mutex<HashMap<SessionId, SessionRuntimeConfig>>,
+    /// When true, skip the approval overlay (AutoApprove) so unattended TUI
+    /// PTY drivers and CI dogfood can run interactive turns.
+    auto_approve: bool,
+    /// Root of the content-addressed image store (`<state_dir>/media`, under the
+    /// global home — not the project).
+    media_root: PathBuf,
+    /// Compatibility stream containing events from every session.
+    events: broadcast::Sender<RuntimeEvent>,
+    /// Session-scoped streams used by daemon/socket clients.
+    session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
+    pending: PendingApprovals,
+    pending_clarify: PendingClarifications,
+    /// User shell executions (`!command`): active + bounded history.
+    /// Arc so detached shell workers update it directly.
+    user_shells: Arc<crate::user_shell::UserShellStore>,
+    /// Conversation checkpoints, isolated by owning session (spec §68).
+    /// Arc so the async compact worker can drop them after a successful rewrite.
+    checkpoints: Arc<crate::checkpoints::CheckpointStore>,
+    /// Live client-facing state that is not part of the message transcript.
+    /// A reconnecting UI receives this through `snapshot()`.
+    live_views: Arc<crate::live_view::LiveViews>,
+    /// Per-session ownership and cancellation of active main turns.
+    active: Arc<ActiveTurns>,
+    /// Set when the runtime owner begins an explicit shutdown (Quit);
+    /// reported in health and never bypasses ownership fencing.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancelled to retire the process once work has drained. `None` for an
+    /// in-process runtime, which has no process of its own to retire.
+    process_shutdown: Option<CancellationToken>,
+    /// A daemon must not emit its wire ACK until a fresh turn's write-ahead
+    /// input is durable. Embedded callers keep the historical dispatch-only
+    /// return so current-thread runtimes never wait on their own worker.
+    durable_wire_ack: bool,
+    /// Commands this boot is handling. A command enters before its receipt is
+    /// written and leaves only once the receipt is settled — or once the path
+    /// handling it has ended without settling it — so a `dispatching` receipt
+    /// of this boot that is not in here will never be settled by this boot.
+    in_flight: InFlightCommands,
+    /// Text the user sent while a turn was already running, per session.
+    /// Drained by the agent loop at the top of each round.
+    steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    /// The cancellation handle of every child running in a session's turn,
+    /// by child id, so a user can stop one child without stopping the turn.
+    child_cancels: ChildCancels,
+    /// The cancellation handle of every tool call executing in a session's
+    /// turn, by call id, so a user can stop one command without the turn.
+    tool_call_cancels: ChildCancels,
+}
+
+type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
+/// Command id → number of deliveries of it this boot is handling.
+pub(crate) type InFlightCommands = Arc<Mutex<HashMap<String, usize>>>;
+
+/// One delivery's membership in [`InProcessRuntimeClient::in_flight`].
+struct InFlightDelivery {
+    registry: InFlightCommands,
+    command_id: String,
+}
+
+impl InFlightDelivery {
+    fn enter(registry: &InFlightCommands, command_id: &CommandId) -> Self {
+        *registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(command_id.as_str().to_string())
+            .or_default() += 1;
+        Self {
+            registry: registry.clone(),
+            command_id: command_id.as_str().to_string(),
+        }
+    }
+
+    /// Register, then write the receipt (`admit`). The order is the invariant:
+    /// a `dispatching` receipt of this boot is never observable while its
+    /// command is missing from the registry.
+    async fn admit<T>(
+        registry: &InFlightCommands,
+        command_id: &CommandId,
+        admit: impl std::future::Future<Output = T>,
+    ) -> (Self, T) {
+        let entry = Self::enter(registry, command_id);
+        (entry, admit.await)
+    }
+
+    /// The receipt could not be settled although the dispatch finished: stay
+    /// registered for the rest of this boot rather than let the receipt read
+    /// as abandoned by a path that did not abandon it. A later boot judges it.
+    fn keep_for_this_boot(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for InFlightDelivery {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = registry.get_mut(&self.command_id) {
+            *count -= 1;
+            if *count == 0 {
+                registry.remove(&self.command_id);
+            }
+        }
+    }
+}
+
+/// Drains one session's steering queue for the agent loop, and holds the
+/// session's running children's cancellation handles.
+struct SessionSteering {
+    session_id: SessionId,
+    queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    children: ChildCancels,
+    tool_calls: ChildCancels,
+}
+
+impl leveler_agent::SteeringSource for SessionSteering {
+    fn take_pending(&self) -> Vec<String> {
+        self.queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.session_id)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn child_started(&self, id: &str, cancel: CancellationToken) {
+        self.children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.session_id.clone())
+            .or_default()
+            .insert(id.to_string(), cancel);
+    }
+
+    fn child_ended(&self, id: &str) {
+        release_cancel(&self.children, &self.session_id, id);
+    }
+
+    fn tool_call_started(&self, id: &str, cancel: CancellationToken) {
+        self.tool_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.session_id.clone())
+            .or_default()
+            .insert(id.to_string(), cancel);
+    }
+
+    fn tool_call_ended(&self, id: &str) {
+        release_cancel(&self.tool_calls, &self.session_id, id);
+    }
+}
+
+/// Drop a settled child's or call's handle.
+fn release_cancel(handles: &ChildCancels, session_id: &SessionId, id: &str) {
+    if let Some(running) = handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(session_id)
+    {
+        running.remove(id);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeConfig {
+    model: ModelRef,
+    mode: PermissionProfile,
+    sandbox: bool,
+    work_profile: String,
+    collaboration: String,
+    /// Per-session approval policy. `AutoApprove` skips the approval overlay for
+    /// this session only; the daemon-wide `auto_approve` still applies as a
+    /// fallback (see `approver`). Not persisted: a restored session falls back to
+    /// `Interactive` (daemon-crash continuation is out of scope for this gate).
+    approval_policy: ApprovalPolicy,
+}
+
+impl InProcessRuntimeClient {
+    /// Build a client that runs turns with the given model, mode, and sandbox
+    /// setting.
+    pub fn new(
+        app: Arc<Application>,
+        model: ModelRef,
+        mode: PermissionProfile,
+        sandbox: bool,
+    ) -> Self {
+        Self::new_with_options(app, model, mode, sandbox, false)
+    }
+
+    /// Hand the runtime the token that retires its process, so
+    /// `ShutdownWhenIdle` can actually end the daemon once work drains. An
+    /// in-process runtime leaves this unset: it does not own a process.
+    pub fn with_process_shutdown(mut self, token: CancellationToken) -> Self {
+        self.process_shutdown = Some(token);
+        self
+    }
+
+    /// Enable the daemon transport's durable ACK boundary. Set only by the
+    /// `serve` composition root; this is not a user-selectable policy.
+    pub fn with_durable_wire_ack(mut self) -> Self {
+        self.durable_wire_ack = true;
+        self
+    }
+
+    /// Like [`Self::new`], with an explicit auto-approve switch for unattended
+    /// interactive TUI sessions.
+    pub fn new_with_options(
+        app: Arc<Application>,
+        model: ModelRef,
+        mode: PermissionProfile,
+        sandbox: bool,
+        auto_approve: bool,
+    ) -> Self {
+        let (events, _) = broadcast::channel(2048);
+        let media_root = app.layout.state_dir.join("media");
+        let in_flight = app.in_flight_commands();
+        // One flag, shared: the runtime reports it and admission enforces it.
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self {
+            app,
+            default_runtime: SessionRuntimeConfig {
+                model,
+                mode,
+                sandbox,
+                work_profile: "balanced".into(),
+                // Default: plain conversation (no update_goal gate).
+                collaboration: "chat".into(),
+                // Per-session default; the daemon-wide `auto_approve` still
+                // applies as the fallback in `approver`.
+                approval_policy: ApprovalPolicy::Interactive,
+            },
+            session_runtime: Mutex::new(HashMap::new()),
+            auto_approve,
+            media_root,
+            events,
+            session_events: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending_clarify: Arc::new(Mutex::new(HashMap::new())),
+            steering: Arc::new(Mutex::new(HashMap::new())),
+            child_cancels: Arc::new(Mutex::new(HashMap::new())),
+            tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
+            user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
+            checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
+            live_views: Arc::new(crate::live_view::LiveViews::default()),
+            active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
+            shutting_down: shutting_down.clone(),
+            process_shutdown: None,
+            durable_wire_ack: false,
+            in_flight,
+        }
+    }
+
+    /// Answer a delivery that found its command's receipt `dispatching`.
+    ///
+    /// Settled meanwhile → that answer. Admitted by an unknown boot (a row
+    /// from before boots were recorded) → no answer. Admitted by this boot →
+    /// still being handled while it is in flight, abandoned otherwise.
+    /// Admitted by another boot → still being handled while that boot holds
+    /// its lease, abandoned once the lease is free. Only an abandoned receipt
+    /// becomes unresolvable, durably, so later deliveries need no probe.
+    async fn answer_unsettled(
+        &self,
+        receipts: &leveler_storage::CommandReceiptRepository<'_>,
+        envelope: &CommandEnvelope,
+        fingerprint: &str,
+    ) -> Result<(), ClientError> {
+        let command_id = &envelope.command_id;
+        let unknown = || {
+            ClientError::OutcomeUnknown(format!(
+                "command {} is still being dispatched, or its outcome is not yet known",
+                command_id.as_str()
+            ))
+        };
+        let abandoned = match receipts
+            .dispatching_boot(command_id)
+            .await
+            .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            leveler_storage::DispatchingBoot::NotDispatching => false,
+            leveler_storage::DispatchingBoot::Unknown => return Err(unknown()),
+            leveler_storage::DispatchingBoot::Boot(boot)
+                if self.app.started_boot_id().as_ref() == Some(&boot) =>
+            {
+                !self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(command_id.as_str())
+            }
+            leveler_storage::DispatchingBoot::Boot(boot) => {
+                crate::runtime_boot::boot_liveness(&self.app.layout.state_dir, &boot)
+                    == leveler_core::BootLiveness::Dead
+            }
+        };
+        if abandoned
+            && receipts
+                .mark_unresolvable(command_id)
+                .await
+                .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            return Err(unresolvable(command_id));
+        }
+        // Not abandoned, or it settled between the read and the write: answer
+        // from whatever the receipt says now.
+        match receipts
+            .classify_terminal(command_id, &envelope.session_id, fingerprint)
+            .await
+            .map_err(|e| ClientError::OutcomeUnknown(e.to_string()))?
+        {
+            Some(leveler_storage::Admission::AlreadyCompleted) => Ok(()),
+            Some(leveler_storage::Admission::Unresolvable) => Err(unresolvable(command_id)),
+            _ => Err(unknown()),
+        }
+    }
+
+    /// The model a session runs on, or this runtime's default for a session it
+    /// has not opened.
+    fn session_model(&self, session_id: &SessionId) -> ModelRef {
+        self.session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|config| config.model.clone())
+            .unwrap_or_else(|| self.default_runtime.model.clone())
+    }
+
+    async fn save_agent(
+        &self,
+        session_id: SessionId,
+        scope: leveler_client_protocol::UiAgentScope,
+        draft: leveler_client_protocol::UiAgentDraft,
+        query_id: Option<leveler_core::CommandId>,
+        create: bool,
+    ) {
+        let model = self.session_model(&session_id);
+        let name = draft.name.trim().to_string();
+        let (ok, error, agent) = match self
+            .app
+            .save_agent(scope, &draft, create, Some(&model))
+            .await
+        {
+            Ok(entry) => (true, None, Some(entry)),
+            Err(error) => (false, Some(error), None),
+        };
+        let _ = self
+            .events_for(&session_id)
+            .send(RuntimeEvent::AgentMutated {
+                query_id,
+                name,
+                ok,
+                error,
+                agent,
+            });
+    }
+
+    fn events_for(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
+        let mut session_events = self.session_events.lock().unwrap();
+        if let Some(events) = session_events.get(session_id).cloned() {
+            return events;
+        }
+        let (events, mut forward) = broadcast::channel(2048);
+        session_events.insert(session_id.clone(), events.clone());
+        drop(session_events);
+        let all_events = self.events.clone();
+        let live_views = self.live_views.clone();
+        let owned_session_id = session_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match forward.recv().await {
+                    Ok(event) => {
+                        live_views.apply(&owned_session_id, &event);
+                        let _ = all_events.send(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "session event compatibility stream lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        events
+    }
+
+    /// Associate an externally created session with this client's defaults.
+    /// Legacy in-process entry points create the session through `Application`
+    /// before constructing the runtime client.
+    pub fn attach_session(&self, session_id: SessionId) {
+        self.session_runtime
+            .lock()
+            .unwrap()
+            .insert(session_id, self.default_runtime.clone());
+    }
+
+    /// The effective approval policy the daemon would use for `session_id` —
+    /// the live per-session config if present, else the DB-restored config
+    /// (which never carries a persisted policy, so it falls back to
+    /// `Interactive`). A read-only diagnostic: lets a caller (and a regression)
+    /// confirm a restored session is fail-closed and never silently auto-approves.
+    pub async fn effective_approval_policy(&self, session_id: &SessionId) -> ApprovalPolicy {
+        self.runtime_config(session_id)
+            .await
+            .map(|config| config.approval_policy)
+            .unwrap_or(ApprovalPolicy::Interactive)
+    }
+
+    async fn runtime_config(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionRuntimeConfig, ClientError> {
+        if let Some(config) = self
+            .session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+        {
+            return Ok(config);
+        }
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let record = SessionRepository::new(&db)
+            .get(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let model = ModelRef::parse(&record.model).ok_or_else(|| {
+            ClientError::Runtime(format!(
+                "session {} stores invalid model reference `{}`",
+                session_id.as_str(),
+                record.model
+            ))
+        })?;
+        let (mode, sandbox, kind, _) = SessionRepository::new(&db)
+            .execution(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let mode = crate::session::mode_from_str(&mode).ok_or_else(|| {
+            ClientError::Runtime(format!(
+                "session {} stores invalid execution mode `{mode}`",
+                session_id.as_str()
+            ))
+        })?;
+        // Interactive sessions always use the direct tool loop. Legacy rows
+        // stored as "orchestrate" are accepted but normalized to direct so a
+        // resume never re-enters the dual path.
+        match kind.as_str() {
+            "direct" | "orchestrate" | "orchestrated" => {}
+            other => {
+                return Err(ClientError::Runtime(format!(
+                    "session {} stores invalid execution kind `{other}`",
+                    session_id.as_str()
+                )));
+            }
+        }
+        let config = SessionRuntimeConfig {
+            model,
+            mode,
+            sandbox,
+            // Normalize on read: a legacy `delivery` row surfaces as `balanced`
+            // everywhere (snapshot, footer, next persist), not just in the engine.
+            work_profile: leveler_lifecycle::WorkProfile::from_persisted(&record.work_profile)
+                .as_str()
+                .to_string(),
+            collaboration: record.collaboration.clone(),
+            // Not persisted in the session record; a restored session prompts
+            // unless the daemon-wide `auto_approve` fallback applies. A client
+            // that resumed with --auto-approve must re-assert it via
+            // attach_session_policy (R006 R6-P2) — warn so the downgrade is
+            // never silent again.
+            approval_policy: {
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    "restored session hydrated with Interactive approval policy; \
+                     a resuming client must re-assert auto-approve explicitly"
+                );
+                ApprovalPolicy::Interactive
+            },
+        };
+        self.session_runtime
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.clone());
+        Ok(config)
+    }
+
+    async fn persist_runtime_config(
+        &self,
+        session_id: &SessionId,
+        config: SessionRuntimeConfig,
+    ) -> Result<(), ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let sessions = SessionRepository::new(&db);
+        sessions
+            .update_model(session_id, &config.model.to_string(), leveler_core::now())
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        sessions
+            .set_execution(
+                session_id,
+                config.mode.as_str(),
+                config.sandbox,
+                "direct",
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        sessions
+            .set_axes(
+                session_id,
+                &config.collaboration,
+                &config.work_profile,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        // One permission change, both projections: the row above is the
+        // durable record, this is the same value as RUNNING state. Without
+        // it a turn already executing keeps authorizing under the profile it
+        // started with while the UI and the row show the new one.
+        self.app
+            .set_live_permission_profile(session_id.as_str(), config.mode);
+        self.session_runtime
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config);
+        Ok(())
+    }
+
+    /// Record a checkpoint at the current transcript length, before a turn runs.
+    ///
+    /// When the transcript length cannot be determined the checkpoint is
+    /// skipped entirely — a fallback ordinal of 0 would restore to an empty
+    /// transcript, silently wiping the whole conversation.
+    async fn checkpoint_before_turn(&self, session_id: &SessionId, label: &str) {
+        let loaded = match self.app.open_database().await {
+            Ok(db) => MessageRepository::new(&db)
+                .count(session_id)
+                .await
+                .map(|n| n as usize)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let Some(ordinal) = checkpoint_ordinal(loaded) else {
+            tracing::warn!(
+                session_id = %session_id.as_str(),
+                "skipping checkpoint: transcript length unavailable (a 0-ordinal \
+                 fallback would restore to an empty conversation)"
+            );
+            return;
+        };
+        let label: String = label.chars().take(40).collect();
+        let checkpoint = UiCheckpoint {
+            id: CheckpointId::generate(),
+            label,
+            ordinal: ordinal as u32,
+        };
+        // Capture the workspace too (git repos only), so restoring the
+        // checkpoint rolls back the files the turn changed — including
+        // command-driven mutations (plan B9 on top of A8).
+        let snapshot =
+            match leveler_execution::WorkspaceSnapshot::capture(&self.app.layout.repo_root).await {
+                Ok(snapshot) => snapshot, // None: not a git repo (transcript-only)
+                Err(error) => {
+                    tracing::warn!("checkpoint workspace snapshot failed: {error}");
+                    None
+                }
+            };
+        self.checkpoints
+            .record(session_id, checkpoint.clone(), snapshot);
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::CheckpointCreated { checkpoint });
+    }
+
+    /// Run one explicit user shell command (`!command`). USER-ORIGINATED
+    /// DIRECT EXECUTION: no model, no agent loop, no tool registry. The
+    /// ActiveTurns slot enforces the Idle/AgentTurn/UserShell foreground
+    /// mutex; host safety (confinement, sandbox, env scrub, tree kill) rides
+    /// the same substrate as agent shell execution.
+    async fn handle_run_user_shell(
+        &self,
+        session_id: SessionId,
+        command: String,
+    ) -> Result<(), ClientError> {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            self.notify_error(&session_id, "在 ! 后输入要执行的命令".to_string());
+            return Ok(());
+        }
+        // The hang guard protects the user too (backgrounding via `&`,
+        // credential-file reads, comment-swallowed commands) — same rules as
+        // the agent's shell tool, stated to the user instead of the model.
+        if let Some(reason) = leveler_tools::tools::refuse_shell_script(trimmed) {
+            self.notify_error(&session_id, format!("命令被拒绝: {reason}"));
+            return Ok(());
+        }
+        let config = self.runtime_config(&session_id).await?;
+        let admission = match self.active.admit(&session_id) {
+            Ok(admission) => admission,
+            Err(crate::active_turns::TurnAdmissionError::Busy(_)) => {
+                self.notify_error(
+                    &session_id,
+                    "Agent 正在运行,请等待当前任务结束或先取消".to_string(),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                self.notify_error(&session_id, error.to_string());
+                return Ok(());
+            }
+        };
+        let cancel = admission.cancellation();
+        let (runner, request, cwd) =
+            match self
+                .app
+                .user_shell_execution(config.mode, config.sandbox, trimmed)
+            {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.active.finish(&admission);
+                    self.notify_error(&session_id, format!("无法构造执行环境: {error}"));
+                    return Ok(());
+                }
+            };
+        let id = leveler_core::UserShellId::new(format!("ush-{}", leveler_core::new_uuid_string()));
+        let cwd_display = cwd.display().to_string();
+        self.user_shells.begin(
+            &session_id,
+            id.clone(),
+            trimmed.to_string(),
+            cwd_display.clone(),
+            cancel.clone(),
+        );
+
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let store = self.user_shells.clone();
+        let active = self.active.clone();
+        let command_text = trimmed.to_string();
+        // spawn_blocking + block_on (the turn-spawn pattern): the worker's
+        // future borrows a `&mut dyn FnMut` observer across awaits, so it is
+        // !Send by construction; the blocking-thread bridge sidesteps that
+        // without loosening the EventLog observer contract.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                // Canonical facts go through the session EventLog with no turn
+                // attribution (persist-before-forward; transient output chunks
+                // skip the store automatically) and are projected by the SAME
+                // exhaustive EventBridge every other client fact uses.
+                let mut bridge = crate::event_bridge::EventBridge::new(events.clone());
+                let db = match app.open_database().await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        store.finish(&session_id, &id, None, "failed");
+                        active.finish(&admission);
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Error,
+                            message: format!("无法打开会话数据库: {error}"),
+                        });
+                        return;
+                    }
+                };
+                // A stale runtime must never stamp user shell facts into a
+                // session another runtime now owns — and if this runtime may
+                // not own the session, it must not run a shell there at all.
+                let fenced = async {
+                    let engine = app.task_engine(&db)?;
+                    engine
+                        .acquire_ownership(&session_id)
+                        .await
+                        .map_err(crate::session::app_error_from_engine)
+                }
+                .await;
+                let token = match fenced {
+                    Ok(token) => token,
+                    Err(error) => {
+                        store.finish(&session_id, &id, None, "failed");
+                        active.finish(&admission);
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Error,
+                            message: format!("无法获得会话执行所有权: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let log =
+                    leveler_engine::EventLog::new_owned(&db, session_id.clone(), token.clone());
+                let mut forward = |event: leveler_engine::EngineEvent| bridge.forward(event);
+                let _ = log
+                    .append(
+                        None,
+                        crate::user_shell::started_event(&id, &command_text, &cwd_display),
+                        &mut forward,
+                    )
+                    .await;
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let run = tokio::spawn({
+                    let cancel = cancel.clone();
+                    async move { runner.run_streaming(request, cancel, tx).await }
+                });
+                while let Some(chunk) = rx.recv().await {
+                    store.append_output(&session_id, &id, &chunk.text);
+                    let _ = log
+                        .append(
+                            None,
+                            leveler_engine::EngineEvent::UserShellOutput {
+                                execution_id: id.clone(),
+                                stream: crate::user_shell::stream_tag(chunk.stream).to_string(),
+                                chunk: chunk.text,
+                            },
+                            &mut forward,
+                        )
+                        .await;
+                }
+                let result = match run.await {
+                    Ok(result) => result,
+                    Err(join_error) => Err(leveler_execution::ProcessError::Io {
+                        program: "user-shell".into(),
+                        source: std::io::Error::other(join_error.to_string()),
+                    }),
+                };
+                let status = crate::user_shell::terminal_status(&result);
+                let exit_code = match &result {
+                    Ok(output) => output.exit_code,
+                    Err(_) => None,
+                };
+                if let Err(error) = &result
+                    && !matches!(
+                        error,
+                        leveler_execution::ProcessError::Cancelled
+                            | leveler_execution::ProcessError::CancelUnconfirmed
+                    )
+                {
+                    // Spawn/sandbox failures never produced output — put the host
+                    // error where the user will look for it.
+                    store.append_output(&session_id, &id, &format!("{error}\n"));
+                }
+                let duration_ms = store
+                    .finish(&session_id, &id, exit_code, status)
+                    .unwrap_or(0);
+                // Release the session BEFORE the terminal event is published.
+                // A client enables its composer on `UserShellExited`, so the
+                // next `SubmitMessage` can arrive within microseconds; holding
+                // the slot past the event leaves a window where the command is
+                // visibly finished and the session still answers "already has
+                // an active turn". Nothing below needs the slot: the process
+                // has exited, its output is drained, and `store.finish` has
+                // already made `CancelUserShell` a no-op. This matches the
+                // failure paths above, which release before they notify.
+                active.finish(&admission);
+                let _ = log
+                    .append(
+                        None,
+                        leveler_engine::EngineEvent::UserShellFinished {
+                            execution_id: id.clone(),
+                            exit_code,
+                            duration_ms,
+                            status: status.to_string(),
+                        },
+                        &mut forward,
+                    )
+                    .await;
+                // The shell has exited and its terminal fact is written: the
+                // session is nobody's until the next execution acquires it. A
+                // crash before this line leaves the task to a dead boot, which
+                // the next acquire takes over.
+                let released = async {
+                    app.task_engine(&db)?
+                        .release_ownership(&token)
+                        .await
+                        .map_err(crate::session::app_error_from_engine)
+                }
+                .await;
+                if let Err(error) = released {
+                    tracing::warn!(
+                        %error,
+                        session = session_id.as_str(),
+                        "user shell could not release the session"
+                    );
+                }
+            });
+        });
+        Ok(())
+    }
+
+    /// The shared turn-launch preamble: admit the session (one active main
+    /// turn), optionally name a placeholder session after its first message,
+    /// capture the pre-turn checkpoint, and emit the optimistic user-message
+    /// notification. Every path that starts a main turn goes through here so
+    /// the sequence cannot drift between commands. This client notification is
+    /// not a persistence witness; daemon ACKs wait on the turn record instead.
+    async fn stage_turn(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        retitle: bool,
+        images: usize,
+    ) -> Result<crate::active_turns::TurnLease, ClientError> {
+        let admission = self
+            .active
+            .admit(session_id)
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        if retitle {
+            self.retitle_placeholder_session(session_id, text).await;
+        }
+        self.checkpoint_before_turn(session_id, text).await;
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new(leveler_core::new_uuid_string()),
+                    role: UiRole::User,
+                    text: text.to_string(),
+                    ordinal: None,
+                    kind: None,
+                    images,
+                },
+            });
+        Ok(admission)
+    }
+
+    /// Steering for one session. Cloned into the executor, which drains it at
+    /// the top of every round.
+    /// Remove a session that was created but never handed to a client, so a
+    /// failure partway through setup does not leave an orphan row the user
+    /// sees in the session list and cannot explain.
+    async fn discard_session(&self, session_id: &SessionId) {
+        let removed: Result<(), anyhow::Error> = async {
+            let db = self.app.open_database().await?;
+            SessionRepository::new(&db).delete(session_id).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = removed {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "could not roll back a half-created session"
+            );
+        }
+    }
+
+    fn steering_for(&self, session_id: &SessionId) -> Arc<SessionSteering> {
+        Arc::new(SessionSteering {
+            session_id: session_id.clone(),
+            queues: self.steering.clone(),
+            children: self.child_cancels.clone(),
+            tool_calls: self.tool_call_cancels.clone(),
+        })
+    }
+
+    fn clarifier(
+        &self,
+        session_id: &SessionId,
+        cancel: CancellationToken,
+    ) -> Arc<ChannelClarifier> {
+        Arc::new(ChannelClarifier {
+            events: self.events_for(session_id),
+            pending: self.pending_clarify.clone(),
+            cancel,
+            session_id: session_id.clone(),
+        })
+    }
+
+    /// Best-effort reaper for zombie `running` turns left by kill / unclean exit.
+    ///
+    /// `Some(session)` reaps that session only (cancel / force-cancel).
+    /// `None` reaps every still-running turn in `scope` (process quit settles
+    /// only this boot's own). Returns the running turns it had to leave alone:
+    /// ones another live boot runs, or whose boot cannot be probed — this
+    /// process has no way to reach them.
+    async fn reap_running_turns(
+        &self,
+        session: Option<&SessionId>,
+        scope: leveler_engine::ReapScope,
+    ) -> Vec<leveler_engine::ReapConflict> {
+        let engine = match self
+            .app
+            .open_database()
+            .await
+            .and_then(|db| self.app.task_engine(&db))
+        {
+            Ok(engine) => engine,
+            Err(error) => {
+                tracing::warn!("cannot reap running turns: {error}");
+                return Vec::new();
+            }
+        };
+        match leveler_engine::reap_after_restart(&engine, session, scope).await {
+            Ok(outcome) => {
+                crate::session::checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
+                for conflict in &outcome.conflicts {
+                    tracing::warn!(
+                        session = conflict.session_id.as_str(),
+                        refusal = ?conflict.refusal,
+                        "not reaping running turns without proof their boot has ended"
+                    );
+                }
+                if !outcome.events.is_empty() {
+                    tracing::warn!(
+                        reaped = outcome.events.len(),
+                        session = session.map(|s| s.as_str()),
+                        "reaped zombie running turns"
+                    );
+                }
+                outcome.conflicts
+            }
+            Err(error) => {
+                tracing::warn!("failed to reap running turns: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Cancel a session with nothing of this boot running in it: settle what
+    /// this boot or a dead boot left behind. A turn another live boot runs is
+    /// out of this process's reach — the answer says so rather than claiming
+    /// a cancel that did not happen.
+    async fn cancel_orphaned(&self, session_id: &SessionId) -> Result<(), ClientError> {
+        let conflicts = self
+            .reap_running_turns(
+                Some(session_id),
+                leveler_engine::ReapScope::OwnAndEndedBoots,
+            )
+            .await;
+        if conflicts
+            .iter()
+            .any(|conflict| conflict.refusal == leveler_engine::ReapRefusal::LiveBoot)
+        {
+            return Err(ownership_conflict(
+                &crate::AppError::SessionRunningElsewhere,
+            ));
+        }
+        if !conflicts.is_empty() {
+            return Err(ownership_conflict(
+                &crate::AppError::SessionOwnershipUnknown,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the first user message's content parts from text and image
+    /// attachments, loading (and base64-encoding) each image from the store.
+    ///
+    /// An image that cannot be loaded fails the whole turn. Sending the text
+    /// without it would hand the model a question about a picture it was never
+    /// shown, and the answer would read exactly like a real one.
+    fn content_parts(
+        &self,
+        text: &str,
+        attachments: &[AttachmentRef],
+    ) -> Result<Vec<ContentPart>, String> {
+        let store = MediaStore::new(&self.media_root);
+        let mut parts = Vec::new();
+        if !text.trim().is_empty() {
+            parts.push(ContentPart::Text {
+                text: text.to_string(),
+            });
+        }
+        for att in attachments {
+            if att.kind != AttachmentKind::Image {
+                continue;
+            }
+            let (media_type, data) = store
+                .load_base64(&att.sha256)
+                .map_err(|e| format!("{}: {e}", att.name))?;
+            parts.push(ContentPart::Image {
+                source: ImageSource::Base64 { media_type, data },
+            });
+        }
+        Ok(parts)
+    }
+
+    /// Refuse a submit that carries an image the chosen model cannot read.
+    ///
+    /// Declared capability is the only thing that can be checked before the
+    /// request is built; the alternative is a provider 400 the user has to
+    /// decode, or worse, an answer about a picture that was dropped.
+    async fn refuse_unreadable_images(
+        &self,
+        model: &ModelRef,
+        attachments: &[AttachmentRef],
+    ) -> Result<(), ClientError> {
+        if !attachments.iter().any(|a| a.kind == AttachmentKind::Image) {
+            return Ok(());
+        }
+        let vision = self
+            .app
+            .registry
+            .profile(model)
+            .await
+            .map(|p| p.capabilities.vision)
+            .unwrap_or(false);
+        if vision {
+            return Ok(());
+        }
+        Err(ClientError::Runtime(format!(
+            "模型 {model} 不支持图片输入；请换一个支持视觉的模型，或移除图片后重发"
+        )))
+    }
+
+    fn cancel_active(&self, session_id: &SessionId) -> bool {
+        self.active.cancel(session_id)
+    }
+
+    /// Surface an error to the UI's status line.
+    fn notify_error(&self, session_id: &SessionId, message: String) {
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                message,
+            });
+    }
+
+    /// Truncate a session's stored messages after `ordinal`, propagating any
+    /// database failure to the caller (never swallowed).
+    async fn truncate_messages(
+        &self,
+        session_id: &SessionId,
+        ordinal: usize,
+    ) -> Result<(), anyhow::Error> {
+        let db = self.app.open_database().await?;
+        MessageRepository::new(&db)
+            .truncate_after(session_id, ordinal)
+            .await?;
+        Ok(())
+    }
+
+    /// After /clear, /compact, or checkpoint restore: cut Plan/Evidence/Progress
+    /// inheritance so the next turn is a fresh task epoch.
+    async fn reset_task_epoch(&self, session_id: &SessionId) -> Result<(), anyhow::Error> {
+        reset_session_task_epoch(self.app.as_ref(), session_id).await
+    }
+
+    /// Refuse context ops while a model turn (or another context op) owns the
+    /// session — concurrent clear/compact/restore would race the transcript.
+    fn admit_context_op(
+        &self,
+        session_id: &SessionId,
+        op: &str,
+    ) -> Result<crate::active_turns::TurnLease, ClientError> {
+        self.active.admit(session_id).map_err(|error| match error {
+            crate::active_turns::TurnAdmissionError::Busy(_) => {
+                ClientError::Runtime(format!("当前有进行中的回合，请先等待完成或取消后再{op}"))
+            }
+            other => ClientError::Runtime(other.to_string()),
+        })
+    }
+
+    /// Drop all UI checkpoints (and their workspace snapshots) for a session.
+    /// Used after /clear and /compact when the transcript is no longer aligned
+    /// with prior checkpoint ordinals.
+    fn drop_session_checkpoints(&self, session_id: &SessionId) {
+        self.checkpoints.drop_session(session_id);
+    }
+
+    /// After restore to `ordinal`, drop later checkpoints (and their snapshots)
+    /// so the UI cannot re-restore a point that no longer exists in the transcript.
+    fn prune_checkpoints_after_restore(&self, session_id: &SessionId, restored_ordinal: u32) {
+        self.checkpoints
+            .prune_after_restore(session_id, restored_ordinal);
+    }
+
+    /// Name a placeholder interactive session after its first real message:
+    /// the sidebars (web + TUI resume) show the `goal` column, and a wall of
+    /// "interactive session" rows is unreadable. Only the placeholder is ever
+    /// overwritten — user-named goals stay untouched.
+    async fn retitle_placeholder_session(&self, session_id: &SessionId, content: &str) {
+        let Some(title) = title_from_first_message(content) else {
+            return;
+        };
+        let Ok(db) = self.app.open_database().await else {
+            return;
+        };
+        let repo = SessionRepository::new(&db);
+        if let Ok(Some(record)) = repo.get(session_id).await
+            && (record.goal == PLACEHOLDER_GOAL || record.goal.trim().is_empty())
+        {
+            let _ = repo.update_goal(session_id, &title).await;
+        }
+    }
+
+    /// List stored sessions, most-recent first, as UI summaries. Sessions
+    /// whose goal is still the interactive placeholder display the first
+    /// sentence of their first user message instead — this also names the
+    /// history created before placeholder retitling existed.
+    async fn list_sessions(&self) -> Vec<UiSessionSummary> {
+        let Ok(db) = self.app.open_database().await else {
+            return Vec::new();
+        };
+        let first_texts = MessageRepository::new(&db)
+            .first_user_texts()
+            .await
+            .unwrap_or_default();
+        SessionRepository::new(&db)
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let goal = if r.goal == PLACEHOLDER_GOAL || r.goal.trim().is_empty() {
+                    first_texts
+                        .get(&r.id)
+                        .and_then(|text| title_from_first_message(text))
+                        .unwrap_or(r.goal)
+                } else {
+                    r.goal
+                };
+                UiSessionSummary {
+                    id: SessionId::new(r.id),
+                    goal,
+                    status: r.status.as_str().to_string(),
+                    model: r.model,
+                    updated_at: r.updated_at,
+                    repository: Some(self.app.layout.repo_root.display().to_string()),
+                }
+            })
+            .collect()
+    }
+
+    fn approver(&self, session_id: &SessionId, cancel: CancellationToken) -> Arc<dyn Approver> {
+        let session_policy = self
+            .session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|config| config.approval_policy);
+        if should_auto_approve(session_policy, self.auto_approve) {
+            Arc::new(AutoApprove)
+        } else {
+            Arc::new(ChannelApprover {
+                events: self.events_for(session_id),
+                pending: self.pending.clone(),
+                cancel,
+                session_id: session_id.clone(),
+            })
+        }
+    }
+
+    fn spawn_turn(
+        &self,
+        session_id: SessionId,
+        content: String,
+        attachments: Vec<AttachmentRef>,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        self.notify_memory_candidates(&session_id, &content);
+        let parts = match self.content_parts(&content, &attachments) {
+            Ok(parts) => parts,
+            Err(error) => {
+                let message = format!("附件读取失败，本轮未发送: {error}");
+                self.notify_error(&session_id, message.clone());
+                self.active.finish(&admission);
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(ClientError::Runtime(message)));
+                return rx;
+            }
+        };
+        self.spawn_content_turn(session_id, parts, admission, config)
+    }
+
+    fn spawn_goal_turn(
+        &self,
+        session_id: SessionId,
+        content: String,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        // Single interactive path: direct goal loop (update_goal + tools +
+        // spawn_agent). Orchestrate is not used for sessions.
+        self.notify_memory_candidates(&session_id, &content);
+        self.spawn_direct_goal_turn(session_id, content, admission, config)
+    }
+
+    fn spawn_direct_goal_turn(
+        &self,
+        session_id: SessionId,
+        content: String,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let active = self.active.clone();
+        let model = config.model;
+        let mode = config.mode;
+        let sandbox = config.sandbox;
+        let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
+        let approver = self.approver(&session_id, cancel.clone());
+        let clarifier = self.clarifier(&session_id, cancel.clone());
+        // Text the user sends while this turn runs lands here and is injected
+        // at the top of the next round.
+        let steering = self.steering_for(&session_id);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                emit_project_rules(&events, &repo);
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.run_in_session_with_clarifier(
+                        &session_id,
+                        &model,
+                        mode,
+                        &content,
+                        approver,
+                        clarifier,
+                        sandbox,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        &mut observer,
+                        cancel,
+                    )
+                    .await
+                };
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(Err(turn_rejection(&result)));
+                }
+                // TaskFinished is the normal path's one terminal authority and
+                // EventBridge projects it immediately. Only failures that never
+                // reached that commit need the wrapper fallback.
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
+                // Session-owned background reap moved to the engine's terminal
+                // settlement (finish_from_result) so chat-routed continuations
+                // are covered too — one reap site, not one per spawn function
+                // (R006 R6-P4).
+            });
+        });
+        accepted_rx
+    }
+
+    /// `/develop`: one goal through `Analyze → Coding → Verify → Review`.
+    ///
+    /// Identical plumbing to [`Self::spawn_direct_goal_turn`] — same admission,
+    /// same approver, clarifier and steering, same terminal publication — so
+    /// cancelling, approving and resuming behave exactly as they do for any
+    /// other turn. Only the harness entry point differs.
+    fn spawn_develop_turn(
+        &self,
+        session_id: SessionId,
+        content: String,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let active = self.active.clone();
+        let model = config.model;
+        let mode = config.mode;
+        let sandbox = config.sandbox;
+        let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
+        let approver = self.approver(&session_id, cancel.clone());
+        let clarifier = self.clarifier(&session_id, cancel.clone());
+        let steering = self.steering_for(&session_id);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                emit_project_rules(&events, &repo);
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.run_develop_in_session(
+                        &session_id,
+                        &model,
+                        mode,
+                        &content,
+                        approver,
+                        clarifier,
+                        sandbox,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        &mut observer,
+                        cancel,
+                    )
+                    .await
+                };
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(Err(turn_rejection(&result)));
+                }
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
+            });
+        });
+        accepted_rx
+    }
+
+    /// `/recap` (long-goal P3): cut a durable goal checkpoint and surface it
+    /// as a Recap history item.
+    ///
+    /// This is NOT a transcript summary: the checkpoint projects
+    /// authoritative facts through the engine's one canonical builder and is
+    /// persisted before anything is shown. The semantic wording is attempted
+    /// first with a hard timeout; any failure degrades to a structured-only
+    /// checkpoint with a deterministic display — never a lost checkpoint,
+    /// never "recap unavailable".
+    fn spawn_recap(&self, session_id: SessionId, config: SessionRuntimeConfig) {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let model = config.model;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let result: Result<Option<leveler_client_protocol::UiGoalRecap>, String> = async {
+                    let db = app.open_database().await.map_err(|e| e.to_string())?;
+                    let stores = leveler_storage::EngineStores::from_database(&db);
+                    let engine = app.task_engine(&db).map_err(|e| e.to_string())?;
+                    // A session without any goal has nothing to recap —
+                    // answer truthfully before spending a model call.
+                    let has_goal = match stores.tasks.task_for_session(&session_id).await {
+                        Ok(Some(task)) => !stores
+                            .goals
+                            .for_task(&task)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .is_empty(),
+                        _ => false,
+                    };
+                    if !has_goal {
+                        return Ok(None);
+                    }
+                    let semantic = Self::recap_semantic(&app, &session_id, model.clone()).await;
+                    let record = leveler_agent::coding::create_goal_checkpoint(
+                        &engine,
+                        &session_id,
+                        leveler_lifecycle::CheckpointReason::Manual,
+                        Some(&leveler_agent::coding::GitWorkspace::new(
+                            &app.layout.repo_root,
+                        )),
+                        semantic,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    Ok(record.as_ref().map(crate::goal_recap::project_goal_recap))
+                }
+                .await;
+                match result {
+                    Ok(Some(recap)) => {
+                        let _ = events.send(RuntimeEvent::GoalRecapCreated { recap });
+                    }
+                    Ok(None) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: "当前会话没有可回顾的 Goal".to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("阶段回顾失败：{error}"),
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    /// Bounded, optional semantic wording for a manual recap. Grounded in the
+    /// projected structured facts plus a short recent-transcript tail;
+    /// reasoning never reaches this input (it is dropped at the stream
+    /// boundary and never persisted). Every failure returns `None`.
+    async fn recap_semantic(
+        app: &Application,
+        session_id: &SessionId,
+        model: ModelRef,
+    ) -> Option<leveler_agent::coding::SemanticRecap> {
+        const RECAP_SEMANTIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let work = async {
+            let db = app.open_database().await.ok()?;
+            let raw = leveler_engine::RawTranscript::load_lossy(&db, session_id)
+                .await
+                .ok()?;
+            if raw.is_empty() {
+                return None;
+            }
+            let tail: String = raw
+                .messages
+                .iter()
+                .rev()
+                .filter_map(|m| {
+                    let text = m.text_content();
+                    (!text.is_empty()).then_some(text)
+                })
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            let tail: String = tail.chars().take(6_000).collect();
+            let prompt = format!(
+                "请基于下面的对话片段，用两行中文总结当前任务进展。\
+                 第一行：当前阶段与已完成的内容（一句话）。\
+                 第二行：以「下一步：」开头，说明接下来要做什么。\
+                 只依据给出的内容，不要编造未发生的事实。\n\n{tail}"
+            );
+            let mut request = ModelRequest::new(model, vec![Message::text(Role::User, prompt)]);
+            request.tool_choice = ToolChoice::None;
+            request.max_output_tokens = Some(256);
+            let resp = app
+                .registry
+                .generate(request, CancellationToken::new())
+                .await
+                .ok()?;
+            let text = resp.message.text_content();
+            let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+            let display = lines.next()?.trim().to_string();
+            let next_action = lines.next().map(|l| {
+                l.trim()
+                    .trim_start_matches("下一步：")
+                    .trim_start_matches("下一步:")
+                    .trim()
+                    .to_string()
+            });
+            Some(leveler_agent::coding::SemanticRecap {
+                goal_summary: Some(text.trim().to_string()),
+                display_summary: Some(display),
+                next_action: next_action.filter(|s| !s.is_empty()),
+            })
+        };
+        tokio::time::timeout(RECAP_SEMANTIC_TIMEOUT, work)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Side question: one generate call over a fork of the session transcript.
+    /// Does not take the main turn cancel token, so a running agent turn keeps
+    /// going; does not append to MessageRepository.
+    fn spawn_btw(&self, session_id: SessionId, question: String, config: SessionRuntimeConfig) {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let model = config.model;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let _ = events.send(RuntimeEvent::BtwStarted {
+                    question: question.clone(),
+                });
+
+                let result: Result<String, String> = async {
+                    let db = app.open_database().await.map_err(|e| e.to_string())?;
+                    // Same budgeted path as main turns — never dump unbounded
+                    // raw history. Advisory side-question: bare fold, no model
+                    // summary call, and no snapshot persisted.
+                    let raw = leveler_engine::RawTranscript::load_lossy(&db, &session_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let log = leveler_engine::EventLog::new(&db, session_id.clone());
+                    let context = raw
+                        .assemble(
+                            &log,
+                            None,
+                            Some(question.as_str()),
+                            u64::from(leveler_agent::coding::CHAT_CONTEXT_BUDGET),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mut messages = context.prior;
+                    messages.push(Message::text(
+                        Role::User,
+                        format!(
+                            "【旁问 / btw】请用当前对话上下文简短回答下面的问题。\
+                             不要调用任何工具，不要修改文件，不要继续主任务。\n\n{question}"
+                        ),
+                    ));
+                    let mut request = ModelRequest::new(model, messages);
+                    request.tool_choice = ToolChoice::None;
+                    let resp = app
+                        .registry
+                        .generate(request, CancellationToken::new())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(resp.message.text_content())
+                }
+                .await;
+
+                match result {
+                    Ok(text) => {
+                        if !text.is_empty() {
+                            let _ = events.send(RuntimeEvent::BtwTextDelta { delta: text });
+                        }
+                        let _ = events.send(RuntimeEvent::BtwCompleted);
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::BtwFailed { error });
+                    }
+                }
+            });
+        });
+    }
+
+    /// Save a message that is ONLY a memory command, and report it.
+    ///
+    /// Returns true when the message was consumed as a write, so no turn is
+    /// staged, no model request is made, and the running turn (if any) is not
+    /// steered. Anything ambiguous returns false and stays an ordinary
+    /// message: failing to save is recoverable, swallowing a real task is not.
+    fn handle_direct_memory_message(&self, session_id: &SessionId, content: &str) -> bool {
+        let Some(body) = leveler_memory::parse_direct_memory_command(content) else {
+            return false;
+        };
+        let memory_dir = self.app.layout.memory_dir();
+        let events = self.events_for(session_id);
+        let title = leveler_memory::title_from_body(&body);
+        // A commanded save defaults to a lasting preference: "remember this"
+        // almost always means "apply it from now on".
+        match leveler_memory::MemoryStore::open(&memory_dir).and_then(|store| {
+            store.activate(
+                &title,
+                &body,
+                leveler_memory::MemoryKind::Preference,
+                Vec::new(),
+            )
+        }) {
+            Ok(entry) => {
+                let busy = self.active.is_running(session_id);
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: if busy {
+                        // This turn's context was assembled already, so say
+                        // when it actually starts being recalled.
+                        format!(
+                            "已保存记忆 [{}]：{}。将从下一次用户回合开始参与自动召回。",
+                            entry.id, entry.title
+                        )
+                    } else {
+                        format!("已保存记忆 [{}]：{}", entry.id, entry.title)
+                    },
+                });
+                // Deliberately no list refresh here: the confirmation above
+                // IS the feedback, and a follow-up listing notification would
+                // overwrite it on a one-line status bar. Clients that show a
+                // panel re-list on their own after a write.
+                true
+            }
+            Err(error) => {
+                // Refused (a credential, say). Report it and do NOT fall
+                // through to the model, which would hand it the same text.
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message: format!("保存记忆失败：{error}"),
+                });
+                true
+            }
+        }
+    }
+
+    /// Tell the user when a turn's words produced a memory candidate.
+    ///
+    /// A candidate that only exists on disk is indistinguishable from nothing
+    /// happening: the user said "记住 X", the system stored a proposal, and
+    /// said not a word. `/memory accept <id>` could always adopt it — nothing
+    /// ever pointed there. Notifying is this layer's job because this is the
+    /// layer with a client attached.
+    fn notify_memory_candidates(&self, session_id: &SessionId, user_text: &str) {
+        let waiting = self.app.enqueue_memory_candidates(user_text);
+        if waiting.is_empty() {
+            return;
+        }
+        let titles: Vec<String> = waiting
+            .iter()
+            .map(|(id, title)| format!("[{id}] {title}"))
+            .collect();
+        let _ = self.events_for(session_id).send(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: format!(
+                "发现 {} 条可能值得记住的内容，等待确认：{}。用 /memory 查看，/memory accept <id> 采纳。",
+                waiting.len(),
+                titles.join("、")
+            ),
+        });
+    }
+
+    fn spawn_content_turn(
+        &self,
+        session_id: SessionId,
+        parts: Vec<ContentPart>,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let active = self.active.clone();
+        let model = config.model;
+        let mode = config.mode;
+        let sandbox = config.sandbox;
+        let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
+        let approver = self.approver(&session_id, cancel.clone());
+        let clarifier = self.clarifier(&session_id, cancel.clone());
+        // Steers and per-child cancels reach this chat turn through the same
+        // source the goal turn uses.
+        let steering = self.steering_for(&session_id);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        // The runtime's observer is `&mut dyn FnMut`, so the turn future is not
+        // `Send` and cannot be `tokio::spawn`ed. Drive it on a blocking thread
+        // with the current runtime handle — provider/DB clients stay on their
+        // home runtime.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                emit_project_rules(&events, &repo);
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.run_in_session_with_content(
+                        &session_id,
+                        &model,
+                        mode,
+                        parts,
+                        approver,
+                        clarifier,
+                        sandbox,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        &mut observer,
+                        cancel,
+                    )
+                    .await
+                };
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(Err(turn_rejection(&result)));
+                }
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
+            });
+        });
+        accepted_rx
+    }
+    /// Restore a checkpoint: roll back the transcript, task epoch, and (git)
+    /// workspace to the checkpoint, surfacing any partial-failure honestly.
+    async fn handle_restore_checkpoint(
+        &self,
+        session_id: SessionId,
+        checkpoint_id: CheckpointId,
+    ) -> Result<(), ClientError> {
+        let admission = self.admit_context_op(&session_id, "恢复检查点")?;
+        let ordinal = self.checkpoints.ordinal_of(&session_id, &checkpoint_id);
+        if let Some(ordinal) = ordinal {
+            // A failed truncate means the conversation did NOT roll
+            // back; the user must know rather than see a fake restore.
+            match self.truncate_messages(&session_id, ordinal as usize).await {
+                Ok(()) => {
+                    // Cut post-checkpoint Plan/Evidence/Progress so
+                    // resume does not inherit work after the restore point.
+                    if let Err(error) = self.reset_task_epoch(&session_id).await {
+                        self.notify_error(
+                            &session_id,
+                            format!("对话已回滚,但任务状态重置失败: {error}"),
+                        );
+                    }
+                    // Roll the workspace back to the checkpoint's
+                    // snapshot (git repos). A failure is surfaced —
+                    // the transcript rolled back but files did not.
+                    let snapshot = self.checkpoints.snapshot_of(&checkpoint_id);
+                    // What the user is told once it is done. Every failure
+                    // path already speaks; a COMPLETE restore said nothing at
+                    // all, so the screen simply went blank — no checkpoint
+                    // named, no word on whether the files had moved.
+                    let mut landed = Some(format!(
+                        "已回退到检查点 #{ordinal} · 对话与工作区已回到该处"
+                    ));
+                    match snapshot {
+                        Some(snapshot) => {
+                            if let Err(error) = leveler_execution::WorkspaceSnapshot::restore(
+                                &self.app.layout.repo_root,
+                                &snapshot,
+                            )
+                            .await
+                            {
+                                landed = None;
+                                self.notify_error(
+                                    &session_id,
+                                    format!("对话已回滚,但工作区文件回滚失败: {error}"),
+                                );
+                            } else {
+                                let diff = compute_diff(&self.app.layout.repo_root, true);
+                                let _ = self
+                                    .events_for(&session_id)
+                                    .send(RuntimeEvent::DiffUpdated { diff });
+                            }
+                        }
+                        None => {
+                            landed = Some(format!(
+                                "已回退到检查点 #{ordinal} · 对话已回退;工作区非 git 仓库,文件未回滚"
+                            ));
+                        }
+                    }
+                    // Discard checkpoints that pointed past the restore.
+                    self.prune_checkpoints_after_restore(&session_id, ordinal);
+                    if let Ok(session) = self.snapshot(&session_id).await {
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::SessionOpened { session });
+                    }
+                    // After the snapshot: it replaces the client's view, and a
+                    // notification sent before it would be cleared with the
+                    // rest of the old session state.
+                    if let Some(message) = landed {
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::Notification {
+                                level: NotificationLevel::Info,
+                                message,
+                            });
+                    }
+                }
+                Err(error) => self.notify_error(&session_id, format!("恢复检查点失败: {error}")),
+            }
+        } else {
+            self.notify_error(
+                &session_id,
+                "未找到该检查点（可能已被清空、压缩或更早的回滚移除）".to_string(),
+            );
+        }
+        self.active.finish(&admission);
+        Ok(())
+    }
+    /// Compact the session's context off the request path, owning the
+    /// session so Submit/clear/restore cannot race the transcript rewrite.
+    async fn handle_compact_context(&self, session_id: SessionId) -> Result<(), ClientError> {
+        // Own the session while compact runs so Submit/clear/restore
+        // cannot race the transcript rewrite.
+        let admission = self.admit_context_op(&session_id, "压缩上下文")?;
+        let cancel = admission.cancellation();
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let config = match self.runtime_config(&session_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.active.finish(&admission);
+                // Surface the same way as in-flight compact failures.
+                let _ = events.send(RuntimeEvent::TurnFailed {
+                    error: format!("压缩失败：{error}"),
+                    failure: None,
+                });
+                self.notify_error(&session_id, format!("压缩失败：{error}"));
+                return Ok(());
+            }
+        };
+        let model = config.model;
+        let mode = config.mode;
+        let active = self.active.clone();
+        let checkpoints = self.checkpoints.clone();
+        let live_views = self.live_views.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let rewrote = compact_conversation(
+                    &app,
+                    &events,
+                    &live_views,
+                    &model,
+                    mode,
+                    &session_id,
+                    cancel,
+                )
+                .await;
+                // Only wipe checkpoints when the transcript was actually
+                // replaced — a short/no-op compact must keep them.
+                if rewrote {
+                    checkpoints.drop_session(&session_id);
+                }
+                active.finish(&admission);
+            });
+        });
+        Ok(())
+    }
+    /// Clear the conversation: drop stored messages and reset task epoch,
+    /// surfacing a DB failure rather than showing a false-empty transcript.
+    async fn handle_clear_conversation(&self, session_id: SessionId) -> Result<(), ClientError> {
+        let admission = self.admit_context_op(&session_id, "清空会话")?;
+        // Drop all stored messages so the next turn starts fresh. A DB
+        // failure must be surfaced — silently keeping the history while
+        // the UI shows an empty conversation is a lie.
+        match self.truncate_messages(&session_id, 0).await {
+            Ok(()) => {
+                if let Err(error) = self.reset_task_epoch(&session_id).await {
+                    self.notify_error(
+                        &session_id,
+                        format!("会话已清空,但任务状态重置失败: {error}"),
+                    );
+                }
+                self.live_views.clear(&session_id);
+                self.drop_session_checkpoints(&session_id);
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionOpened { session });
+                }
+            }
+            Err(error) => self.notify_error(&session_id, format!("清空会话失败: {error}")),
+        }
+        self.active.finish(&admission);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl InteractiveRuntimeClient for InProcessRuntimeClient {
+    async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+        match command {
+            ClientCommand::SubmitMessage {
+                session_id,
+                content,
+                attachments,
+            } => {
+                // A message that is ONLY a memory command is the user's own
+                // write, not a task. Classified HERE, before `stage_turn`, so
+                // TUI, Web, mobile and remote all get the same answer — doing
+                // it in a client reducer would mean one client saving and
+                // another handing the same sentence to the model.
+                if attachments.is_empty()
+                    && self.handle_direct_memory_message(&session_id, &content)
+                {
+                    return Ok(());
+                }
+                let config = self.runtime_config(&session_id).await?;
+                // The TUI asks the user about this first, but the reducer is
+                // one client. Every other one — web, headless, a model changed
+                // between staging and sending — arrives here, and here the
+                // answer is the same: a model that cannot read an image is
+                // told so, never handed the text with the picture removed.
+                self.refuse_unreadable_images(&config.model, &attachments)
+                    .await?;
+                let cancel = self
+                    .stage_turn(&session_id, &content, true, image_count(&attachments))
+                    .await?;
+                // CollaborationMode is the single source of turn profile:
+                // goal → goal_mode / update_goal path; chat|plan → content turn.
+                // Plan read_only is applied inside engine from session.collaboration.
+                let accepted = if collaboration_routes_submit_to_goal(&config.collaboration) {
+                    if !attachments.is_empty() {
+                        // Goal path is text-first; attachments still need the
+                        // multimodal content turn (goal_mode stays false unless
+                        // the user used /goal). Prefer content when media present.
+                        self.spawn_turn(session_id, content, attachments, cancel, config)
+                    } else {
+                        self.spawn_goal_turn(session_id, content, cancel, config)
+                    }
+                } else {
+                    self.spawn_turn(session_id, content, attachments, cancel, config)
+                };
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
+            }
+            ClientCommand::RunGoal {
+                session_id,
+                content,
+            } => {
+                let config = self.runtime_config(&session_id).await?;
+                let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
+                let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
+            }
+            ClientCommand::RunDevelop {
+                session_id,
+                content,
+            } => {
+                let config = self.runtime_config(&session_id).await?;
+                let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
+                let accepted = self.spawn_develop_turn(session_id, content, cancel, config);
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
+            }
+            ClientCommand::AddAttachment {
+                session_id,
+                path,
+                name,
+            } => {
+                let media_root = self.media_root.clone();
+                let events = self.events_for(&session_id);
+                tokio::task::spawn_blocking(move || {
+                    let store = MediaStore::new(&media_root);
+                    let source = PathBuf::from(&path);
+                    let name = name.unwrap_or_else(|| {
+                        source
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone())
+                    });
+                    match store.import_path(&source) {
+                        Ok(stored) => {
+                            let _ = events.send(RuntimeEvent::AttachmentAdded {
+                                attachment: AttachmentRef {
+                                    id: AttachmentId::new(leveler_core::new_uuid_string()),
+                                    kind: AttachmentKind::Image,
+                                    name,
+                                    mime_type: stored.mime_type,
+                                    size_bytes: stored.size_bytes,
+                                    sha256: stored.sha256,
+                                    width: Some(stored.width),
+                                    height: Some(stored.height),
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
+                                error: e.to_string(),
+                            });
+                        }
+                    }
+                });
+                Ok(())
+            }
+            ClientCommand::AddAttachmentData {
+                session_id,
+                name,
+                data_base64,
+            } => {
+                let media_root = self.media_root.clone();
+                let events = self.events_for(&session_id);
+                tokio::task::spawn_blocking(move || {
+                    let store = MediaStore::new(&media_root);
+                    let result = match store.import_base64(&data_base64) {
+                        Ok(stored) => Ok(AttachmentRef {
+                            id: AttachmentId::new(leveler_core::new_uuid_string()),
+                            kind: AttachmentKind::Image,
+                            name,
+                            mime_type: stored.mime_type,
+                            size_bytes: stored.size_bytes,
+                            sha256: stored.sha256,
+                            width: Some(stored.width),
+                            height: Some(stored.height),
+                        }),
+                        Err(MediaError::Unsupported(_)) => {
+                            let mime = mime_from_name(&name);
+                            match store.put_base64(&data_base64, &mime) {
+                                Ok((sha256, size_bytes)) => Ok(AttachmentRef {
+                                    id: AttachmentId::new(leveler_core::new_uuid_string()),
+                                    kind: kind_from_mime(&mime),
+                                    name,
+                                    mime_type: mime,
+                                    size_bytes,
+                                    sha256,
+                                    width: None,
+                                    height: None,
+                                }),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    match result {
+                        Ok(attachment) => {
+                            let _ = events.send(RuntimeEvent::AttachmentAdded { attachment });
+                        }
+                        Err(error) => {
+                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed { error });
+                        }
+                    }
+                });
+                Ok(())
+            }
+            ClientCommand::AddClipboardImage { session_id } => {
+                let media_root = self.media_root.clone();
+                let events = self.events_for(&session_id);
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<AttachmentRef, String> {
+                        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+                        let image = clipboard.get_image().map_err(|e| e.to_string())?;
+                        let stored = MediaStore::new(&media_root)
+                            .import_rgba(image.width as u32, image.height as u32, &image.bytes)
+                            .map_err(|e| e.to_string())?;
+                        Ok(AttachmentRef {
+                            id: AttachmentId::new(leveler_core::new_uuid_string()),
+                            kind: AttachmentKind::Image,
+                            name: "clipboard.png".to_string(),
+                            mime_type: stored.mime_type,
+                            size_bytes: stored.size_bytes,
+                            sha256: stored.sha256,
+                            width: Some(stored.width),
+                            height: Some(stored.height),
+                        })
+                    })();
+                    match result {
+                        Ok(attachment) => {
+                            let _ = events.send(RuntimeEvent::AttachmentAdded { attachment });
+                        }
+                        Err(e) => {
+                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
+                                error: format!("剪贴板图片：{e}"),
+                            });
+                        }
+                    }
+                });
+                Ok(())
+            }
+            ClientCommand::ApprovalDecision {
+                request_id,
+                decision,
+            } => resolve_approval(&self.pending, &request_id, execution_decision(decision)),
+            ClientCommand::AnswerClarification { request_id, answer } => {
+                resolve_clarification(&self.pending_clarify, &request_id, answer)
+            }
+            ClientCommand::SelectModel { session_id, model } => {
+                if !self.app.model_refs().contains(&model) {
+                    return Err(ClientError::Runtime(format!(
+                        "model `{model}` is not configured"
+                    )));
+                }
+                let mut config = self.runtime_config(&session_id).await?;
+                config.model = model.clone();
+                self.persist_runtime_config(&session_id, config).await?;
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionUpdated { session });
+                }
+                Ok(())
+            }
+            ClientCommand::SetPermissionProfile { session_id, mode } => {
+                let mut config = self.runtime_config(&session_id).await?;
+                config.mode = execution_mode(mode);
+                self.persist_runtime_config(&session_id, config).await?;
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionUpdated { session });
+                }
+                Ok(())
+            }
+
+            ClientCommand::SetProductAxes {
+                session_id,
+                work_profile,
+                collaboration,
+            } => {
+                // Idle-only is enforced by the TUI; runtime still accepts while idle.
+                let mut config = self.runtime_config(&session_id).await?;
+                // A new write only ever stores a current value; legacy `delivery`
+                // (from an old client) normalizes to `balanced` rather than
+                // persisting a value the product no longer offers.
+                config.work_profile = leveler_lifecycle::WorkProfile::from_persisted(&work_profile)
+                    .as_str()
+                    .to_string();
+                config.collaboration = collaboration.clone();
+                // Collaboration::Plan forces Safe-only tools via ToolContext.read_only
+                // (orthogonal to the permission profile).
+                self.persist_runtime_config(&session_id, config).await?;
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionUpdated { session });
+                }
+                Ok(())
+            }
+            ClientCommand::ConfirmPlanToGoal {
+                session_id,
+                content,
+            } => {
+                let mut config = self.runtime_config(&session_id).await?;
+                config.collaboration = "goal".into();
+                self.persist_runtime_config(&session_id, config.clone())
+                    .await?;
+                let goal = if content.trim().is_empty() {
+                    "Execute the confirmed plan".to_string()
+                } else {
+                    content
+                };
+                let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
+                let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
+                if self.durable_wire_ack {
+                    await_turn_acceptance(accepted).await
+                } else {
+                    drop(accepted);
+                    Ok(())
+                }
+            }
+            ClientCommand::ListMemory {
+                session_id,
+                include_archived,
+            } => {
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                if let Err(err) = leveler_memory::MemoryStore::open(&memory_dir) {
+                    let _ = events.send(RuntimeEvent::Notification {
+                        level: leveler_client_protocol::NotificationLevel::Warning,
+                        message: format!("memory open failed: {err}"),
+                    });
+                    return Ok(());
+                }
+                send_memory_list(&events, &memory_dir, include_archived);
+                Ok(())
+            }
+            ClientCommand::SteerCurrentTurn {
+                session_id,
+                content,
+            } => {
+                if self.active.is_running(&session_id) {
+                    self.steering
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push(content);
+                    return Ok(());
+                }
+                // The turn ended between the client deciding to steer and this
+                // arriving — a real race, because the client's "busy" view lags
+                // the runtime by one event. Dropping the text here would lose
+                // what the user typed, so fall through to an ordinary
+                // submission and start a new turn with it.
+                return Box::pin(self.send(ClientCommand::SubmitMessage {
+                    session_id,
+                    content,
+                    attachments: Vec::new(),
+                }))
+                .await;
+            }
+            ClientCommand::AcceptMemory { session_id, id } => {
+                // User-authoritative promotion: this call IS the consent K36
+                // requires, which is why the model can never reach it.
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.accept(&id)) {
+                    Ok(entry) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: format!("已采纳记忆 [{}]: {}", entry.id, entry.title),
+                        });
+                        send_memory_list(&events, &memory_dir, false);
+                    }
+                    Err(err) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("accept failed: {err}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::RejectMemory { session_id, id } => {
+                // Declines a PENDING candidate and suppresses that signal, so
+                // the same proposal does not return on the next turn.
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.reject(&id)) {
+                    Ok(_) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: format!("已拒绝候选 [{id}]，不再重复提示"),
+                        });
+                        send_memory_list(&events, &memory_dir, false);
+                    }
+                    Err(err) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("reject failed: {err}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::RememberMemory {
+                session_id,
+                body,
+                kind,
+            } => {
+                // The user's own write: no model, no agent turn, no candidate.
+                // The command IS the authorization.
+                use leveler_client_protocol::UiMemoryKind;
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                let body = body.trim().to_string();
+                if body.is_empty() {
+                    let _ = events.send(RuntimeEvent::Notification {
+                        level: leveler_client_protocol::NotificationLevel::Warning,
+                        message: "记忆内容不能为空".to_string(),
+                    });
+                    return Ok(());
+                }
+                let domain_kind = match kind.unwrap_or(UiMemoryKind::Preference) {
+                    UiMemoryKind::Preference => leveler_memory::MemoryKind::Preference,
+                    UiMemoryKind::Decision => leveler_memory::MemoryKind::Decision,
+                    UiMemoryKind::Note => leveler_memory::MemoryKind::Note,
+                };
+                // The title is derived HERE, once, so TUI / Web / CLI cannot
+                // drift into three conventions. Never model-generated.
+                let title = leveler_memory::title_from_body(&body);
+                match leveler_memory::MemoryStore::open(&memory_dir)
+                    .and_then(|s| s.activate(&title, &body, domain_kind, Vec::new()))
+                {
+                    Ok(entry) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: format!("已保存记忆 [{}]：{}", entry.id, entry.title),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("保存记忆失败：{err}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::ForgetMemory { session_id, id } => {
+                // Archives an ACTIVE entry. A pending id used to land here and
+                // silently do nothing — the Web "忽略" button's bug — so a
+                // candidate id is refused with a pointer to the right action.
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                let is_pending = leveler_memory::MemoryStore::open(&memory_dir)
+                    .map(|s| s.read_pending(&id).is_ok())
+                    .unwrap_or(false);
+                if is_pending {
+                    let _ = events.send(RuntimeEvent::Notification {
+                        level: leveler_client_protocol::NotificationLevel::Warning,
+                        message: format!("[{id}] 是待确认候选，不是已保存记忆；请改用拒绝"),
+                    });
+                    return Ok(());
+                }
+                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.forget(&id)) {
+                    Ok(entry) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: format!("已归档记忆 [{}]: {}", entry.id, entry.title),
+                        });
+                        send_memory_list(&events, &memory_dir, true);
+                    }
+                    Err(err) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("forget failed: {err}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::RequestDiff { session_id } => {
+                let repo = self.app.layout.repo_root.clone();
+                let events = self.events_for(&session_id);
+                tokio::task::spawn_blocking(move || {
+                    let diff = compute_diff(&repo, true);
+                    let _ = events.send(RuntimeEvent::DiffUpdated { diff });
+                });
+                Ok(())
+            }
+            ClientCommand::CompactContext { session_id } => {
+                self.handle_compact_context(session_id).await
+            }
+            ClientCommand::ClearConversation { session_id } => {
+                self.handle_clear_conversation(session_id).await
+            }
+            ClientCommand::RestoreCheckpoint {
+                session_id,
+                checkpoint_id,
+            } => {
+                self.handle_restore_checkpoint(session_id, checkpoint_id)
+                    .await
+            }
+            ClientCommand::RequestSessionList => {
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::RequestSessionListFor {
+                requester_session_id,
+            } => {
+                let _ = self
+                    .events_for(&requester_session_id)
+                    .send(RuntimeEvent::SessionList {
+                        sessions: self.list_sessions().await,
+                    });
+                Ok(())
+            }
+            ClientCommand::OpenSession { session_id } => {
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self.events.send(RuntimeEvent::SessionOpened { session });
+                }
+                Ok(())
+            }
+            ClientCommand::NewSessionFor {
+                requester_session_id,
+            } => {
+                // Start fresh WITHOUT destroying anything: the caller's
+                // session keeps its transcript and checkpoints and stays in
+                // the session list, so `/clear` is a reversible move (reopen
+                // the old session) rather than an unrecoverable wipe.
+                let config = self.runtime_config(&requester_session_id).await?;
+                match self
+                    .app
+                    .create_daemon_session(&config.model, PLACEHOLDER_GOAL)
+                    .await
+                {
+                    Ok(session_id) => {
+                        // Persist the axes BEFORE attaching or announcing: a
+                        // session that is attached and then fails to persist
+                        // is an orphan the client has already switched to.
+                        // Carry the caller's runtime axes over so a fresh
+                        // conversation is not silently a different permission
+                        // profile or work mode.
+                        // Anything that fails from here on leaves a row the
+                        // client never switched to. Roll it back rather than
+                        // leaving an orphan in the session list.
+                        let prepared = async {
+                            self.persist_runtime_config(&session_id, config).await?;
+                            self.snapshot(&session_id).await
+                        }
+                        .await;
+                        let session = match prepared {
+                            Ok(session) => session,
+                            Err(error) => {
+                                self.discard_session(&session_id).await;
+                                self.notify_error(
+                                    &requester_session_id,
+                                    format!("新建会话失败: {error}"),
+                                );
+                                return Ok(());
+                            }
+                        };
+                        self.attach_session(session_id.clone());
+                        let _ = self
+                            .events_for(&requester_session_id)
+                            .send(RuntimeEvent::SessionOpened { session });
+                        let _ = self.events.send(RuntimeEvent::SessionList {
+                            sessions: self.list_sessions().await,
+                        });
+                    }
+                    Err(error) => {
+                        self.notify_error(&requester_session_id, format!("新建会话失败: {error}"));
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::OpenSessionFor {
+                requester_session_id,
+                session_id,
+            } => {
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&requester_session_id)
+                        .send(RuntimeEvent::SessionOpened { session });
+                }
+                Ok(())
+            }
+            ClientCommand::DeleteSession { session_id } => {
+                let deleted: Result<(), anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db).delete(&session_id).await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = deleted {
+                    let _ = self.events.send(RuntimeEvent::Notification {
+                        level: NotificationLevel::Error,
+                        message: format!("删除会话失败: {error}"),
+                    });
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::DeleteSessionFor {
+                requester_session_id,
+                session_id,
+            } => {
+                let deleted: Result<(), anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db).delete(&session_id).await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = deleted {
+                    self.notify_error(&requester_session_id, format!("删除会话失败: {error}"));
+                }
+                let _ = self
+                    .events_for(&requester_session_id)
+                    .send(RuntimeEvent::SessionList {
+                        sessions: self.list_sessions().await,
+                    });
+                Ok(())
+            }
+            ClientCommand::RenameSession { session_id, name } => {
+                let name = name.trim().to_string();
+                let renamed: Result<(), anyhow::Error> = async {
+                    if name.is_empty() {
+                        anyhow::bail!("名称不能为空");
+                    }
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db)
+                        .update_goal(&session_id, &name)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = renamed {
+                    self.notify_error(&session_id, format!("重命名会话失败: {error}"));
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::ArchiveSession { session_id } => {
+                let archived: Result<(), anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db)
+                        .set_archived(&session_id, Some(leveler_core::now()))
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = archived {
+                    self.notify_error(&session_id, format!("归档会话失败: {error}"));
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::ForkSession { session_id } => {
+                // Copy record + transcript into a fresh session; the original
+                // stays untouched so an alternative direction can be explored.
+                let forked: Result<SessionId, anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    let sessions = SessionRepository::new(&db);
+                    let record = sessions
+                        .get(&session_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("会话不存在"))?;
+                    let (mode, sandbox, kind, _) = sessions
+                        .execution(&session_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("会话执行配置不存在"))?;
+                    let title = if record.goal == PLACEHOLDER_GOAL {
+                        record.goal.clone()
+                    } else {
+                        format!("{} (分叉)", record.goal)
+                    };
+                    let engine = self.app.task_engine(&db)?;
+                    let fork_id = engine
+                        .create_task(&leveler_engine::NewSession {
+                            workspace: record.repository.clone(),
+                            goal: title,
+                            model: record.model.clone(),
+                            mode,
+                            sandbox,
+                            kind: leveler_engine::ExecutionKind::parse(&kind)?,
+                            axes: Some(leveler_engine::NewSessionAxes {
+                                collaboration: record.collaboration.clone(),
+                                work_profile: crate::canonical_work_profile(&record.work_profile),
+                            }),
+                        })
+                        .await?;
+                    let messages = MessageRepository::new(&db);
+                    let transcript = messages.load(&session_id).await?;
+                    messages
+                        .append(&fork_id, &transcript, leveler_core::now())
+                        .await?;
+                    Ok(fork_id)
+                }
+                .await;
+                match forked {
+                    Ok(fork_id) => {
+                        // To the session that was forked, not only to the
+                        // compatibility stream: a session-scoped client
+                        // subscribes to its own stream, so a fork that worked
+                        // was silent while one that failed was not.
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::Notification {
+                                level: NotificationLevel::Info,
+                                message: format!(
+                                    "已分叉会话: {fork_id}（原会话不变，/sessions 打开副本）"
+                                ),
+                            });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("分叉会话失败: {error}"));
+                    }
+                }
+                let sessions = self.list_sessions().await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::SessionList {
+                        sessions: sessions.clone(),
+                    });
+                let _ = self.events.send(RuntimeEvent::SessionList { sessions });
+                Ok(())
+            }
+            ClientCommand::Btw {
+                session_id,
+                question,
+            } => {
+                let config = self.runtime_config(&session_id).await?;
+                self.spawn_btw(session_id, question, config);
+                Ok(())
+            }
+            ClientCommand::CancelCurrentTurn { session_id } => {
+                if !self.cancel_active(&session_id) {
+                    // No owned live turn: recover a possible orphan left by an
+                    // earlier process. Never race the active executor's own
+                    // terminal transition with the reaper.
+                    self.cancel_orphaned(&session_id).await?;
+                }
+                Ok(())
+            }
+            ClientCommand::ForceCancelCurrentTurn { session_id } => {
+                if !self.cancel_active(&session_id) {
+                    self.cancel_orphaned(&session_id).await?;
+                }
+                Ok(())
+            }
+            ClientCommand::CancelChild {
+                session_id,
+                child_id,
+            } => {
+                match take_cancel(&self.child_cancels, &session_id, &child_id) {
+                    // The child observes its token, stops, and settles as
+                    // cancelled through the ordinary settlement path.
+                    Some(token) => token.cancel(),
+                    None => self.notify_error(
+                        &session_id,
+                        format!("子 Agent {child_id} 已结束或不存在,无需停止"),
+                    ),
+                }
+                Ok(())
+            }
+            ClientCommand::CancelToolCall {
+                session_id,
+                call_id,
+            } => match take_cancel(&self.tool_call_cancels, &session_id, call_id.as_str()) {
+                // The call observes its token, its process tree is killed,
+                // and it settles through its ordinary completion.
+                Some(token) => {
+                    token.cancel();
+                    Ok(())
+                }
+                // Refused, not notified: the client showing "stopping" must
+                // learn that nothing is being stopped.
+                None => Err(ClientError::Runtime(
+                    "该命令已结束或尚未开始执行,无需停止".to_string(),
+                )),
+            },
+            ClientCommand::RunUserShell {
+                session_id,
+                command,
+            } => self.handle_run_user_shell(session_id, command).await,
+            ClientCommand::CancelUserShell {
+                session_id,
+                execution_id,
+            } => {
+                match self.user_shells.cancel_token(&session_id, &execution_id) {
+                    Some(token) => token.cancel(),
+                    None => {
+                        self.notify_error(&session_id, "该命令已结束或不存在,无需停止".to_string())
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::QueryContext {
+                session_id,
+                query_id,
+            } => {
+                let accounting = self.live_views.view(&session_id).context_usage;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::ContextLoaded {
+                        query_id,
+                        accounting,
+                    });
+                Ok(())
+            }
+            ClientCommand::QueryObservability {
+                session_id,
+                query_id,
+                center_seq,
+                before,
+                after,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                match crate::observability::query_observability(
+                    &db,
+                    &session_id,
+                    center_seq,
+                    before,
+                    after,
+                )
+                .await
+                {
+                    Ok(observation) => {
+                        // Echo the caller's token. `None` is a 1.5 query:
+                        // still serve the read model; current clients will not
+                        // treat the response as owned.
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::ObservabilityLoaded {
+                                    query_id,
+                                    observation,
+                                });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("observability: {error}"));
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::QueryChildContribution {
+                session_id,
+                child_id,
+                query_id,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let stores = leveler_storage::EngineStores::from_database(&db);
+                let ledger =
+                    crate::contribution_query::last_ledger(stores.events.as_ref(), &session_id)
+                        .await;
+                // Role and profile are the child's own facts and are not in
+                // the ledger; recover them from the spawn event rather than
+                // guessing from the id shape.
+                let (role, profile_id, capabilities) = crate::contribution_query::child_identity(
+                    stores.events.as_ref(),
+                    &session_id,
+                    &child_id,
+                )
+                .await;
+                let detail = crate::contribution_query::project_child_contribution(
+                    ledger.as_ref(),
+                    &child_id,
+                    &role,
+                    profile_id,
+                    capabilities,
+                );
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::ChildContributionLoaded { query_id, detail });
+                Ok(())
+            }
+            ClientCommand::Recap { session_id } => {
+                let config = self.runtime_config(&session_id).await?;
+                self.spawn_recap(session_id, config);
+                Ok(())
+            }
+            ClientCommand::ListUnfinishedGoals {
+                session_id,
+                query_id,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let stores = leveler_storage::EngineStores::from_database(&db);
+                let runtime = self
+                    .app
+                    .runtime_id()
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let goals = crate::goal_discovery::list_unfinished_goals(&stores, &runtime)
+                    .await
+                    .map(|found| {
+                        found
+                            .into_iter()
+                            .map(|g| leveler_client_protocol::UiUnfinishedGoal {
+                                goal_id: g.goal.id.as_str().to_string(),
+                                objective: g.goal.objective.clone(),
+                                session_id: g.session_id.as_str().to_string(),
+                                opened_at: g.goal.opened_at.to_rfc3339(),
+                                windows_run: g.goal.windows_run,
+                                ours: g.ours,
+                                driving: g.driving,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::UnfinishedGoalsLoaded { query_id, goals });
+                Ok(())
+            }
+            ClientCommand::QuerySessionHistory {
+                session_id,
+                query_id,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                match crate::session_history::load_session_history(&db, &session_id).await {
+                    Ok((entries, omitted_turns)) => {
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::SessionHistoryLoaded {
+                                    query_id,
+                                    session_id: session_id.clone(),
+                                    entries,
+                                    omitted_turns,
+                                });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("session history: {error}"));
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::ListAgents {
+                session_id,
+                query_id,
+            } => {
+                let model = self.session_model(&session_id);
+                let (agents, problems) = self.app.list_agents(Some(&model)).await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentsLoaded {
+                        query_id,
+                        agents,
+                        problems,
+                    });
+                Ok(())
+            }
+            ClientCommand::GetAgent {
+                session_id,
+                name,
+                query_id,
+            } => {
+                let model = self.session_model(&session_id);
+                let (agent, error) = match self.app.get_agent(&name, Some(&model)).await {
+                    Ok(detail) => (Some(detail), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentLoaded {
+                        query_id,
+                        name,
+                        agent,
+                        error,
+                    });
+                Ok(())
+            }
+            ClientCommand::CreateAgent {
+                session_id,
+                scope,
+                draft,
+                query_id,
+            } => {
+                self.save_agent(session_id, scope, *draft, query_id, true)
+                    .await;
+                Ok(())
+            }
+            ClientCommand::UpdateAgent {
+                session_id,
+                scope,
+                draft,
+                query_id,
+            } => {
+                self.save_agent(session_id, scope, *draft, query_id, false)
+                    .await;
+                Ok(())
+            }
+            ClientCommand::DeleteAgent {
+                session_id,
+                scope,
+                name,
+                query_id,
+            } => {
+                let (ok, error) = match self.app.delete_agent(scope, &name) {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error)),
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::AgentMutated {
+                        query_id,
+                        name,
+                        ok,
+                        error,
+                        agent: None,
+                    });
+                Ok(())
+            }
+            ClientCommand::ShutdownWhenIdle { reason } => {
+                // Stop admitting new work FIRST: without this the runtime can
+                // be kept alive indefinitely by a stream of arriving turns and
+                // the replacement never happens.
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(?reason, "runtime retiring once work drains");
+                if let Some(token) = self.process_shutdown.clone() {
+                    let active = self.active.clone();
+                    let background = self.app.background_tasks().clone();
+                    tokio::spawn(async move {
+                        // Idle means nothing is still owed: no turn running and
+                        // no background task alive. A turn ending is not
+                        // enough — a background build outliving its turn is
+                        // exactly the work a replacement would destroy.
+                        loop {
+                            let (turns, _) = active.load();
+                            if turns == 0 && background.alive_count().await == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        tracing::info!("runtime idle; retiring");
+                        token.cancel();
+                    });
+                }
+                Ok(())
+            }
+            ClientCommand::Quit => {
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.active.cancel_all();
+                // Process is exiting: reaper is the safety net for turns that
+                // never got finish() because the OS killed the process mid-flight.
+                // Only this boot's own: a sibling process sharing the
+                // repository keeps running its turns.
+                self.reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
+                    .await;
+                // Runtime-owned OS resources must not outlive the runtime:
+                // background tasks (dev servers) and the browser tree are
+                // reaped explicitly — Drop never runs on exit paths that call
+                // `std::process::exit` or die to SIGTERM (R004 F7).
+                let killed = self.app.background_tasks().kill_all().await;
+                if killed > 0 {
+                    tracing::info!("shutdown reaped {killed} background task(s)");
+                }
+                self.app.browser().shutdown().await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn deliver(&self, envelope: CommandEnvelope) -> Result<(), ClientError> {
+        use sha2::{Digest, Sha256};
+        // Bind the envelope to its payload before anything keys off its session:
+        // version and receipt checks use `envelope.session_id`, so a command
+        // whose own target differs must be rejected up front — never check A but
+        // act on B (a future authorization boundary). Session-less commands
+        // (approval/clarification answers, global queries) carry no target here.
+        if let Some(target) = envelope.command.session_id()
+            && target != &envelope.session_id
+        {
+            return Err(ClientError::Runtime(format!(
+                "envelope/command session mismatch: envelope targets {}, command targets {}",
+                envelope.session_id.as_str(),
+                target.as_str()
+            )));
+        }
+
+        // Session-less commands (global queries like `RequestSessionList`,
+        // `Quit`) carry no session target, so they must not be receipted: the
+        // command_receipts.session_id foreign key requires a real session row,
+        // and clients (the WebUI) send these with an empty session id, which
+        // would violate that FK. They are idempotent global dispatches — run
+        // them directly, skipping the per-session dedup machinery.
+        if envelope.command.session_id().is_none() {
+            return self.send(envelope.command).await;
+        }
+
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+
+        let receipts = leveler_storage::CommandReceiptRepository::new(&db);
+        let command_bytes = serde_json::to_vec(&envelope.command)
+            .map_err(|e| ClientError::Runtime(format!("cannot fingerprint command: {e}")))?;
+        let command_fingerprint = format!("{:x}", Sha256::digest(command_bytes));
+        match receipts
+            .classify_terminal(
+                &envelope.command_id,
+                &envelope.session_id,
+                &command_fingerprint,
+            )
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?
+        {
+            Some(leveler_storage::Admission::AlreadyCompleted) => return Ok(()),
+            Some(leveler_storage::Admission::Unresolvable) => {
+                return Err(unresolvable(&envelope.command_id));
+            }
+            Some(leveler_storage::Admission::Uncertain) => {
+                return self
+                    .answer_unsettled(&receipts, &envelope, &command_fingerprint)
+                    .await;
+            }
+            Some(leveler_storage::Admission::Conflict) => {
+                return Err(ClientError::Runtime(format!(
+                    "command id {} is already bound to a different session or payload",
+                    envelope.command_id.as_str()
+                )));
+            }
+            _ => {}
+        }
+
+        // Request-id commands do not carry a session in their payload. Validate
+        // first deliveries/retryable failures against the live pending binding;
+        // a completed identical receipt above is already authoritative.
+        let pending_session = match &envelope.command {
+            ClientCommand::ApprovalDecision { request_id, .. } => self
+                .pending
+                .lock()
+                .unwrap()
+                .get(request_id)
+                .map(|pending| pending.binding.session_id.clone()),
+            ClientCommand::AnswerClarification { request_id, .. } => self
+                .pending_clarify
+                .lock()
+                .unwrap()
+                .get(request_id)
+                .map(|pending| pending.binding.session_id.clone()),
+            _ => None,
+        };
+        if matches!(
+            &envelope.command,
+            ClientCommand::ApprovalDecision { .. } | ClientCommand::AnswerClarification { .. }
+        ) {
+            validate_pending_session(&envelope.session_id, pending_session)?;
+        }
+
+        // Optimistic concurrency: reject a command issued against a stale view
+        // *before* consuming its id, so the client can resync and reissue with a
+        // fresh id rather than have this one silently swallowed as a duplicate.
+        if let Some(expected) = envelope.expected_version {
+            let latest = leveler_storage::EventRepository::new(&db)
+                .latest_sequence(&envelope.session_id)
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?
+                .unwrap_or(0);
+            if latest != expected {
+                return Err(ClientError::Runtime(format!(
+                    "version conflict: command expected the log at {expected}, but it is at \
+                     {latest}; resync required"
+                )));
+            }
+        }
+
+        // At-least-once dedup with a dispatch lifecycle: only a command whose
+        // prior dispatch actually completed is a true duplicate. One whose send
+        // failed is retryable; one that never resolved (crash mid-dispatch) is
+        // surfaced as uncertain, not silently swallowed as done.
+        let boot = self
+            .app
+            .boot_id()
+            .map_err(|e| ClientError::Runtime(format!("cannot start a runtime boot: {e}")))?;
+        let (in_flight, admission) = InFlightDelivery::admit(
+            &self.in_flight,
+            &envelope.command_id,
+            receipts.admit(
+                &envelope.command_id,
+                &envelope.session_id,
+                &command_fingerprint,
+                &envelope.issued_at,
+                &boot,
+                leveler_core::now(),
+            ),
+        )
+        .await;
+        match admission.map_err(|e| ClientError::Runtime(e.to_string()))? {
+            leveler_storage::Admission::AlreadyCompleted => return Ok(()),
+            leveler_storage::Admission::Unresolvable => {
+                return Err(unresolvable(&envelope.command_id));
+            }
+            leveler_storage::Admission::Uncertain => {
+                // This delivery dispatches nothing; only other registrations
+                // may speak for the receipt.
+                drop(in_flight);
+                return self
+                    .answer_unsettled(&receipts, &envelope, &command_fingerprint)
+                    .await;
+            }
+            leveler_storage::Admission::Conflict => {
+                return Err(ClientError::Runtime(format!(
+                    "command id {} is already bound to a different session or payload",
+                    envelope.command_id.as_str()
+                )));
+            }
+            leveler_storage::Admission::Dispatch => {}
+        }
+
+        let command_id = envelope.command_id.clone();
+        match self.send(envelope.command).await {
+            Ok(()) => {
+                hit_before_receipt_settled_test_barrier();
+                let settled = receipts.mark_completed(&command_id).await;
+                match settled {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        in_flight.keep_for_this_boot();
+                        Err(ClientError::Runtime(e.to_string()))
+                    }
+                }
+            }
+            Err(error) => {
+                // A returned error does not prove the command had no partial
+                // effect. Leave the durable receipt in `dispatching`, so a
+                // retry is never blindly executed again. This delivery's
+                // registration ends here: nothing will settle the receipt now,
+                // and a redelivery is answered unresolvable.
+                Err(error)
+            }
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.events.subscribe()
+    }
+
+    fn subscribe_session(&self, session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+        self.events_for(session_id).subscribe()
+    }
+
+    async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        let record = SessionRepository::new(&db)
+            .get(session_id)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?
+            .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+
+        let payloads = MessageRepository::new(&db)
+            .load(session_id)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        let messages = payloads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| ui_message_at(p, Some(i as u64)))
+            .collect();
+
+        let mut available_models = self.app.model_refs();
+        available_models.sort_by_key(|m| m.to_string());
+
+        let config = self.runtime_config(session_id).await?;
+        let model = config.model.clone();
+        let profile = self.app.registry.profile(&model).await.ok();
+        // Whether the current model accepts images (spec §42).
+        let vision = profile
+            .as_ref()
+            .map(|p| p.capabilities.vision)
+            .unwrap_or(false);
+        let reasoning = ui_reasoning_state(profile.as_ref());
+
+        let last_sequence = leveler_storage::EventRepository::new(&db)
+            .latest_sequence(session_id)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+
+        let mut pending_interactions = Vec::new();
+        pending_interactions.extend(
+            self.pending
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|pending| pending.binding.session_id == *session_id)
+                .map(|pending| {
+                    leveler_client_protocol::UiPendingInteraction::Approval(pending.request.clone())
+                }),
+        );
+        pending_interactions.extend(
+            self.pending_clarify
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|pending| pending.binding.session_id == *session_id)
+                .map(|pending| {
+                    leveler_client_protocol::UiPendingInteraction::Clarification(
+                        pending.request.clone(),
+                    )
+                }),
+        );
+        pending_interactions.sort_by_key(|item| match item {
+            leveler_client_protocol::UiPendingInteraction::Approval(request) => {
+                request.id.as_str().to_string()
+            }
+            leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
+                request.id.as_str().to_string()
+            }
+        });
+
+        let live = self.live_views.view(session_id);
+        let checkpoints = self.checkpoints.list(session_id);
+
+        // Long-goal P3: durable goal recaps survive the process, so a
+        // reopened client re-renders them from the persisted rows — same
+        // projection as the live event, oldest boundary first.
+        let mut recaps = Vec::new();
+        let stores = leveler_storage::EngineStores::from_database(&db);
+
+        // The live view only knows what THIS process forwarded. After a
+        // restart it is empty while the persisted plan — the one a resumed
+        // turn seeds from — still stands, so answer from that row instead of
+        // reporting no plan.
+        let plan = match live.plan {
+            Some(plan) => Some(plan),
+            None => match stores
+                .events
+                .load_last_by_type(session_id, "plan_updated", None)
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?
+            {
+                Some(row) => match leveler_engine::EngineEvent::from_payload(&row.payload)
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?
+                {
+                    leveler_engine::EngineEvent::PlanUpdated { steps } => {
+                        Some(crate::event_bridge::ui_plan(steps))
+                    }
+                    _ => {
+                        return Err(ClientError::Runtime(
+                            "plan_updated row carried a different event".into(),
+                        ));
+                    }
+                },
+                None => None,
+            },
+        };
+        if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await
+            && let Ok(goals) = stores.goals.for_task(&task).await
+        {
+            for goal in &goals {
+                if let Ok(rows) = stores.goal_checkpoints.for_goal(&goal.id).await {
+                    recaps.extend(rows.iter().map(crate::goal_recap::project_goal_recap));
+                }
+            }
+            recaps.sort_by(|a, b| {
+                a.transcript_ordinal
+                    .cmp(&b.transcript_ordinal)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+            });
+        }
+
+        // A durable `running` outlives the process that wrote it. Kill a TUI
+        // mid-turn and the column still says a turn is in flight, so reopening
+        // the session painted a live "waiting for the model" clock, elapsed
+        // time and all, over work that had ended with the process. The turns
+        // table is the finer truth and the startup reaper keeps it honest, so
+        // ask it: a session whose row says running while every one of its turns
+        // has settled is interrupted, and opens idle.
+        let runtime_active = self.active.is_running(session_id);
+        let status = if record.status == leveler_lifecycle::SessionStatus::Running
+            && !runtime_active
+            && leveler_storage::TurnRepository::new(&db)
+                .list(session_id)
+                .await
+                .map(|turns| turns.iter().all(|t| t.status != "running"))
+                .unwrap_or(false)
+        {
+            leveler_lifecycle::SessionStatus::Interrupted
+        } else {
+            record.status
+        };
+
+        // Unlike the best-effort fields above, a child row that cannot be
+        // decoded fails the snapshot: it is canonical history, and every other
+        // reader of it (restart reconciliation, observability) refuses corrupt
+        // rows rather than showing a partial truth as the whole one.
+        let children = crate::children::project_children(&db, session_id, runtime_active)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+
+        Ok(UiSessionSnapshot {
+            id: session_id.clone(),
+            repository: record.repository,
+            goal: record.goal,
+            model: Some(model),
+            mode: protocol_mode(config.mode),
+            branch: detect_branch_label(&self.app.layout.repo_root),
+            status: status.as_str().to_string(),
+            finalization_stage: runtime_active.then_some(live.finalization_stage).flatten(),
+            messages,
+            pending_interactions,
+            available_models,
+            vision,
+            last_sequence,
+            active_tools: live.active_tools,
+            plan,
+            verification: live.verification,
+            diff: live.diff,
+            checkpoints,
+            recaps,
+            user_shells: self.user_shells.snapshot(session_id),
+            completion_report: live.completion_report,
+            reasoning,
+            work_profile: Some(config.work_profile.clone()),
+            collaboration: Some(config.collaboration.clone()),
+            children,
+        })
+    }
+}
+
+#[async_trait]
+impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
+    /// Re-assert the effective approval policy for an existing session
+    /// (attach/resume). Memory-only and keyed by session id: it upgrades or
+    /// downgrades exactly ONE session's live policy without touching the DB
+    /// (the policy is deliberately not persisted, so restores stay fail-closed
+    /// Interactive) and without leaking across sessions (R006 R6-P2).
+    async fn attach_session_policy(
+        &self,
+        session_id: &SessionId,
+        policy: ApprovalPolicy,
+    ) -> Result<(), ClientError> {
+        // Hydrate first so an unknown session errs and a known-but-cold one
+        // gets its full runtime config before the policy write.
+        let _ = self.runtime_config(session_id).await?;
+        let mut map = self.session_runtime.lock().unwrap();
+        let entry = map.get_mut(session_id).ok_or_else(|| {
+            ClientError::Runtime(format!("session {} is not open", session_id.as_str()))
+        })?;
+        entry.approval_policy = policy;
+        Ok(())
+    }
+
+    async fn create_session(
+        &self,
+        request: leveler_local_transport::CreateSessionRequest,
+    ) -> Result<leveler_local_transport::SessionBootstrap, ClientError> {
+        let model = request
+            .model
+            .unwrap_or_else(|| self.default_runtime.model.clone());
+        if !self.app.model_refs().contains(&model) {
+            return Err(ClientError::Runtime(format!(
+                "model `{model}` is not configured"
+            )));
+        }
+        let session_id = self
+            .app
+            .create_daemon_session(&model, &request.goal)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        self.persist_runtime_config(
+            &session_id,
+            SessionRuntimeConfig {
+                model: model.clone(),
+                mode: execution_mode(request.mode),
+                sandbox: self.default_runtime.sandbox,
+                work_profile: self.default_runtime.work_profile.clone(),
+                collaboration: self.default_runtime.collaboration.clone(),
+                approval_policy: request.approval_policy,
+            },
+        )
+        .await?;
+        let session = self.snapshot(&session_id).await?;
+        let context_window = self
+            .app
+            .registry
+            .profile(&model)
+            .await
+            .map(|profile| profile.limits.context_window)
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        Ok(leveler_local_transport::SessionBootstrap {
+            session,
+            context_window,
+        })
+    }
+
+    async fn fetch_attachment(
+        &self,
+        sha256: &str,
+    ) -> Result<leveler_local_transport::AttachmentBytes, ClientError> {
+        let root = self.media_root.clone();
+        let sha = sha256.to_string();
+        tokio::task::spawn_blocking(move || MediaStore::new(&root).load_bytes(&sha))
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .map(|(mime_type, bytes)| leveler_local_transport::AttachmentBytes { mime_type, bytes })
+            .map_err(|_| ClientError::Runtime("attachment not found".to_string()))
+    }
+
+    async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+        let runtime_id = self
+            .app
+            .runtime_id()
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let (active, capacity) = self.active.load();
+        let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(leveler_client_protocol::RuntimeInfo {
+            runtime_id,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            // The daemon says which build it IS, not just which version it
+            // calls itself: that difference is the whole point of the field.
+            build: leveler_core::BuildIdentity::current(),
+            config_fingerprint: Some(self.app.config_fingerprint().to_string()),
+            pid: std::process::id(),
+            health: leveler_client_protocol::RuntimeHealth {
+                // Health is admission state, never authority: task writes
+                // still require a current OwnershipToken regardless.
+                accepting_work: !shutting_down && active < capacity,
+                active_turns: active as u32,
+                turn_capacity: Some(capacity as u32),
+                shutting_down,
+            },
+        })
+    }
+}
+
+fn mime_from_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".md") {
+        "text/markdown".to_string()
+    } else if lower.ends_with(".diff") || lower.ends_with(".patch") {
+        "text/x-diff".to_string()
+    } else if lower.ends_with(".txt") {
+        "text/plain".to_string()
+    } else if lower.ends_with(".json") {
+        "application/json".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn kind_from_mime(mime: &str) -> AttachmentKind {
+    if mime.starts_with("image/") {
+        AttachmentKind::Image
+    } else if mime.starts_with("text/") || mime == "application/json" {
+        AttachmentKind::TextFile
+    } else {
+        AttachmentKind::Document
+    }
+}
+
+/// Parse every stored message payload; any corrupt row is a hard error so
+/// compact cannot rewrite history after silently dropping rows.
+fn parse_history_messages_strict(payloads: &[String]) -> Result<Vec<Message>, String> {
+    let mut out = Vec::with_capacity(payloads.len());
+    for (i, payload) in payloads.iter().enumerate() {
+        match serde_json::from_str::<Message>(payload) {
+            Ok(msg) => out.push(msg),
+            Err(e) => {
+                return Err(format!("第 {} 条历史消息无法解析: {e}", i + 1));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Summarize a session's history via the model and replace it with the summary,
+/// then push a refreshed snapshot (spec §28, §53).
+///
+/// Failures are always surfaced (TurnFailed / Notification) — never silent.
+/// Returns `true` when the message store was rewritten (caller must drop
+/// checkpoints); `false` when history was left unchanged (short/no-op/error).
+async fn compact_conversation(
+    app: &Application,
+    events: &broadcast::Sender<RuntimeEvent>,
+    live_views: &crate::live_view::LiveViews,
+    model: &ModelRef,
+    mode: PermissionProfile,
+    session_id: &SessionId,
+    cancellation: CancellationToken,
+) -> bool {
+    let notify = |level: NotificationLevel, message: String| {
+        let _ = events.send(RuntimeEvent::Notification { level, message });
+    };
+    let fail = |message: String| {
+        let _ = events.send(RuntimeEvent::TurnFailed {
+            error: message.clone(),
+            failure: None,
+        });
+        notify(NotificationLevel::Error, message);
+    };
+    let db = match app.open_database().await {
+        Ok(db) => db,
+        Err(e) => {
+            fail(format!("压缩失败：无法打开数据库: {e}"));
+            return false;
+        }
+    };
+    let repo = MessageRepository::new(&db);
+    let payloads = match repo.load(session_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            fail(format!("压缩失败：无法读取对话历史: {e}"));
+            return false;
+        }
+    };
+    // Strict parse: any corrupt row aborts before replace_all can destroy
+    // history. Do not filter_map silently — a partial parse + rewrite is data loss.
+    let mut request_messages = match parse_history_messages_strict(&payloads) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            fail(format!("压缩失败：{e}（原对话未改动）"));
+            return false;
+        }
+    };
+    if request_messages.len() < 4 {
+        notify(NotificationLevel::Info, "对话较短，无需压缩".to_string());
+        return false;
+    }
+    // What the compaction replaces, for the durable `Compacted` fact below.
+    let compacted_from = request_messages.len();
+    request_messages.push(Message::text(Role::User, COMPACT_PROMPT));
+    let request = ModelRequest::new(model.clone(), request_messages);
+    // Show a spinner while the (blocking, non-streaming) summary is generated —
+    // otherwise the whole briefing "appears out of nowhere" with no feedback.
+    let _ = events.send(RuntimeEvent::AgentActivity {
+        label: "正在压缩上下文…".to_string(),
+    });
+    let summary = match app.registry.generate(request, cancellation).await {
+        Ok(resp) => resp.message.text_content(),
+        Err(e) => {
+            fail(format!("压缩失败：{e}"));
+            return false;
+        }
+    };
+
+    let summary_msg = Message::text(
+        Role::User,
+        format!(
+            "{}：\n{summary}",
+            leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
+        ),
+    );
+    if let Err(e) =
+        commit_compaction_epoch(&db, session_id, summary_msg.clone(), compacted_from).await
+    {
+        // Fail closed: the transaction rolled back, so the pre-compact
+        // state is intact and coherent — never a half-compacted session.
+        fail(format!("压缩失败：{e}（原历史与任务状态未改动）"));
+        return false;
+    }
+
+    if let Ok(Some(record)) = SessionRepository::new(&db).get(session_id).await {
+        let messages = repo
+            .load(session_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| ui_message(p))
+            .collect();
+        let mut available_models = app.model_refs();
+        available_models.sort_by_key(|m| m.to_string());
+        let profile = app.registry.profile(model).await.ok();
+        let vision = profile
+            .as_ref()
+            .map(|p| p.capabilities.vision)
+            .unwrap_or(false);
+        let reasoning = ui_reasoning_state(profile.as_ref());
+        let last_sequence = leveler_storage::EventRepository::new(&db)
+            .latest_sequence(session_id)
+            .await
+            .ok()
+            .flatten();
+        let live = live_views.view(session_id);
+        let _ = events.send(RuntimeEvent::SessionOpened {
+            session: UiSessionSnapshot {
+                id: session_id.clone(),
+                repository: record.repository,
+                goal: record.goal,
+                model: Some(model.clone()),
+                mode: protocol_mode(mode),
+                branch: detect_branch_label(&app.layout.repo_root),
+                status: record.status.as_str().to_string(),
+                finalization_stage: live.finalization_stage,
+                messages,
+                // Compact is admitted like a turn, so no turn is running and
+                // no interaction can be pending; checkpoints are about to be
+                // dropped by the caller. The LIVE view (plan/verification/
+                // diff/report) must ride along though — hardcoding it empty
+                // made this snapshot lie relative to `snapshot()`, and a
+                // reconnect would resurrect state this push had cleared.
+                pending_interactions: vec![],
+                available_models,
+                vision,
+                last_sequence,
+                active_tools: live.active_tools,
+                plan: live.plan,
+                verification: live.verification,
+                diff: live.diff,
+                checkpoints: Vec::new(),
+                recaps: Vec::new(),
+                user_shells: Vec::new(),
+                completion_report: live.completion_report,
+                reasoning,
+                work_profile: Some(crate::canonical_work_profile(&record.work_profile)),
+                collaboration: Some(record.collaboration.clone()),
+                children: Vec::new(),
+            },
+        });
+    }
+    // The same observation the automatic compaction publishes, and in this
+    // order for a reason: the snapshot above REPLACES the client's view, so an
+    // event sent before it would be thrown away. Live clients get it here;
+    // clients that rebuild from the durable log read it from the `Compacted`
+    // row the cut committed.
+    let _ = events.send(RuntimeEvent::ContextCompacted {
+        from: compacted_from as u32,
+        to: 1,
+    });
+    // Clear the spinner and confirm.
+    let _ = events.send(RuntimeEvent::TurnCompleted);
+    notify(NotificationLevel::Info, "✓ 已压缩历史为摘要".to_string());
+    true
+}
+
+/// Persist a terminal Progress + empty Plan + empty Evidence so the next turn
+/// does not inherit post-cut task state (after /clear, /compact, restore).
+///
+/// Also writes a **new** `ContextSnapshot` so `latest_context_snapshot` no longer
+/// returns a pre-cut transcript (empty for clear/restore; summary for compact).
+async fn reset_session_task_epoch(
+    app: &Application,
+    session_id: &SessionId,
+) -> Result<(), anyhow::Error> {
+    let db = app.open_database().await?;
+    reset_session_task_epoch_db(&db, session_id, Vec::new()).await
+}
+
+/// DB-level epoch cut (testable without a full Application).
+///
+/// `model_visible` becomes the sole model-visible snapshot after the cut
+/// (summary-only after compact; empty after clear/restore).
+/// The four epoch-cut events as `(type, payload)` rows, in the canonical
+/// order (snapshot first, so a partial legacy write cannot leave a fresh
+/// Progress with a stale ContextSnapshot still "latest").
+/// Commit a `/compact` as ONE transaction: the summary replaces the
+/// transcript, the epoch events land in order, and the destroyed epoch's
+/// derived goal checkpoints are invalidated (HCH-FIX-1 — the old shape could
+/// leave a rewritten transcript under old-epoch task state with nothing on
+/// restart able to notice).
+///
+/// The first of those events is `Compacted`, the same durable fact the
+/// automatic compaction writes from the agent loop. Without it a manual
+/// compaction left no trace anywhere but a notification that fades: the TUI
+/// rebuilds its conversation by replaying this log, so the one place the user
+/// could learn that history had been collapsed said nothing about it.
+async fn commit_compaction_epoch(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+    summary: Message,
+    compacted_from: usize,
+) -> Result<(), anyhow::Error> {
+    let payload =
+        serde_json::to_string(&summary).map_err(|e| anyhow::anyhow!("序列化摘要出错: {e}"))?;
+    let mut events = vec![
+        leveler_engine::EngineEvent::Compacted {
+            from: compacted_from,
+            to: 1, // the summary row
+        }
+        .to_row()
+        .map_err(|e| anyhow::anyhow!("序列化压缩事件出错: {e}"))?,
+    ];
+    events.extend(
+        epoch_event_rows(vec![summary], 1 /* the summary row */)
+            .map_err(|e| anyhow::anyhow!("序列化任务状态出错: {e}"))?,
+    );
+    db.cut_context_epoch(session_id, &[payload], &events, leveler_core::now())
+        .await?;
+    Ok(())
+}
+
+fn epoch_event_rows(
+    model_visible: Vec<Message>,
+    through_ordinal: u64,
+) -> Result<Vec<leveler_storage::EpochEventRow>, anyhow::Error> {
+    let events = [
+        leveler_engine::EngineEvent::ContextSnapshot {
+            messages: model_visible,
+            through_ordinal: Some(through_ordinal),
+        },
+        leveler_engine::EngineEvent::ProgressUpdated {
+            ledger: leveler_lifecycle::ProgressLedger::new_context_epoch(),
+        },
+        leveler_engine::EngineEvent::PlanUpdated { steps: vec![] },
+        leveler_engine::EngineEvent::EvidenceLedgerUpdated {
+            ledger: leveler_lifecycle::EvidenceLedger::default(),
+        },
+    ];
+    events.into_iter().map(|e| Ok(e.to_row()?)).collect()
+}
+
+async fn reset_session_task_epoch_db(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+    model_visible: Vec<Message>,
+) -> Result<(), anyhow::Error> {
+    let repo = leveler_storage::EventRepository::new(db);
+    let now = leveler_core::now();
+    // The epoch-cut snapshot supersedes the WHOLE post-cut transcript, so its
+    // watermark is the live message count (all callers mutate messages before
+    // resetting: clear/restore truncated them; /compact no longer comes
+    // through here — it uses the atomic `cut_context_epoch`).
+    let through_ordinal = MessageRepository::new(db).count(session_id).await?;
+    for (tag, payload) in epoch_event_rows(model_visible, through_ordinal)? {
+        repo.append(session_id, None, &tag, &payload, now).await?;
+    }
+    Ok(())
+}
+
+/// Deserialize a persisted `Message` payload into a `UiMessage`, or `None` for
+/// tool/empty messages that have nothing to render.
+fn ui_message(payload: &str) -> Option<UiMessage> {
+    ui_message_at(payload, None)
+}
+
+/// `ordinal` is the persisted append position of this payload in the message
+/// log — carried on snapshots so a client can interleave durable goal recaps
+/// at the transcript position their checkpoint represents (long-goal P3).
+/// How many images a set of attachments carries — the only kind a message can
+/// show, and what a client needs to name them.
+fn image_count(attachments: &[AttachmentRef]) -> usize {
+    attachments
+        .iter()
+        .filter(|a| a.kind == AttachmentKind::Image)
+        .count()
+}
+
+fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
+    let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
+    let role = match message.role {
+        Role::User => UiRole::User,
+        Role::Assistant => UiRole::Assistant,
+        Role::System => UiRole::System,
+        Role::Tool => UiRole::Tool,
+    };
+    let text = message.text_content();
+    let images = message
+        .content
+        .iter()
+        .filter(|p| matches!(p, ContentPart::Image { .. }))
+        .count();
+    // A message that was only a picture has no text, and dropping it here is
+    // how a reopened session lost the turn entirely.
+    if text.trim().is_empty() && images == 0 {
+        return None;
+    }
+    // Only the runtime's own notices: a user-role message whose first line is
+    // exactly one of the headers the runtime writes.
+    let kind = (role == UiRole::User
+        && text.lines().next().is_some_and(|first| {
+            leveler_agent::RUNTIME_NOTICE_HEADERS.contains(&first.trim_end())
+        }))
+    .then_some(leveler_client_protocol::UiMessageKind::RuntimeNotice);
+    Some(UiMessage {
+        id: MessageId::new(leveler_core::new_uuid_string()),
+        role,
+        text,
+        ordinal,
+        kind,
+        images,
+    })
+}
+
+/// The ordinal a new checkpoint records, or `None` to skip creating one.
+/// A load failure must NEVER fall back to 0: restoring a 0-ordinal checkpoint
+/// truncates the whole transcript.
+fn checkpoint_ordinal(loaded: Result<usize, String>) -> Option<usize> {
+    loaded.ok()
+}
+
+/// Take the cancellation handle of one running child or tool call, if it is
+/// still running.
+fn take_cancel(
+    children: &ChildCancels,
+    session_id: &SessionId,
+    child_id: &str,
+) -> Option<CancellationToken> {
+    children
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(session_id)
+        .and_then(|running| running.remove(child_id))
+}
+
+#[cfg(test)]
+mod runtime_notice_tests {
+    use super::*;
+
+    fn persisted(role: Role, text: &str) -> String {
+        serde_json::to_string(&leveler_model::Message::text(role, text)).unwrap()
+    }
+
+    /// A settlement notice is a user-role message in the transcript, but the
+    /// runtime wrote it. The snapshot says so; a user's own message stays
+    /// ordinary.
+    #[test]
+    fn a_runtime_notice_is_marked_and_a_user_message_is_not() {
+        let notice = ui_message(&persisted(
+            Role::User,
+            "## Background sub-agent settled\nEuclid (c1, role=explorer) has finished.",
+        ))
+        .unwrap();
+        assert_eq!(
+            notice.kind,
+            Some(leveler_client_protocol::UiMessageKind::RuntimeNotice)
+        );
+        let typed = ui_message(&persisted(
+            Role::User,
+            "## Background sub-agent settled? what is that",
+        ))
+        .unwrap();
+        let plain = ui_message(&persisted(Role::User, "please fix the parser")).unwrap();
+        assert_eq!(plain.kind, None);
+        assert_eq!(
+            typed.kind, None,
+            "a notice header is a whole first line, not a prefix a user can type into"
+        );
+    }
+}
+
+#[cfg(test)]
+mod child_cancel_tests {
+    use super::*;
+    use leveler_agent::SteeringSource;
+
+    /// A started child can be cancelled alone, exactly once; an ended child is
+    /// not running, and asking to cancel it finds nothing to stop.
+    #[test]
+    fn a_running_child_can_be_cancelled_and_an_ended_one_cannot() {
+        let children: ChildCancels = Arc::new(Mutex::new(HashMap::new()));
+        let session = SessionId::new("s1");
+        let steering = SessionSteering {
+            session_id: session.clone(),
+            queues: Arc::new(Mutex::new(HashMap::new())),
+            children: children.clone(),
+            tool_calls: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let running = CancellationToken::new();
+        steering.child_started("c1", running.clone());
+        steering.child_started("c2", CancellationToken::new());
+        steering.child_ended("c2");
+
+        take_cancel(&children, &session, "c1")
+            .expect("a running child has a handle")
+            .cancel();
+        assert!(running.is_cancelled());
+        assert!(
+            take_cancel(&children, &session, "c1").is_none(),
+            "a handle is used once"
+        );
+        assert!(
+            take_cancel(&children, &session, "c2").is_none(),
+            "an ended child is not running"
+        );
+        assert!(take_cancel(&children, &SessionId::new("other"), "c1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_ordinal_tests {
+    use super::checkpoint_ordinal;
+
+    #[test]
+    fn load_failure_skips_the_checkpoint_instead_of_recording_zero() {
+        assert_eq!(
+            checkpoint_ordinal(Err("db unavailable".to_string())),
+            None,
+            "a failed transcript load must skip the checkpoint — a 0-ordinal \
+             fallback wipes the conversation on restore"
+        );
+    }
+
+    #[test]
+    fn successful_load_records_the_transcript_length() {
+        assert_eq!(checkpoint_ordinal(Ok(7)), Some(7));
+        // An actually-empty transcript is a legitimate ordinal 0.
+        assert_eq!(checkpoint_ordinal(Ok(0)), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::title_from_first_message;
+
+    #[test]
+    fn first_sentence_of_first_line_wins() {
+        assert_eq!(
+            title_from_first_message("帮我修复登录超时的 bug。另外看下日志。").as_deref(),
+            Some("帮我修复登录超时的 bug")
+        );
+        assert_eq!(
+            title_from_first_message("\n\n  fix the login bug! then logs\n").as_deref(),
+            Some("fix the login bug")
+        );
+    }
+
+    #[test]
+    fn dots_in_paths_and_versions_do_not_split() {
+        assert_eq!(
+            title_from_first_message("升级 v1.2 后 src/main.rs 编译不过").as_deref(),
+            Some("升级 v1.2 后 src/main.rs 编译不过")
+        );
+    }
+
+    #[test]
+    fn long_titles_cap_at_40_chars_and_blank_is_none() {
+        let long = "这".repeat(80);
+        assert_eq!(title_from_first_message(&long).unwrap().chars().count(), 40);
+        assert_eq!(title_from_first_message("   \n  "), None);
+        assert_eq!(title_from_first_message("？？？"), None);
+    }
+}
+
+#[cfg(test)]
+mod approval_policy_tests {
+    use super::should_auto_approve;
+    use leveler_client_protocol::ApprovalPolicy;
+
+    #[test]
+    fn per_session_auto_approve_needs_no_global_flag() {
+        // §6.B — on a plain daemon (global off), an unattended goal session
+        // auto-approves while an interactive session on the SAME daemon prompts.
+        assert!(should_auto_approve(
+            Some(ApprovalPolicy::AutoApprove),
+            false
+        ));
+        assert!(!should_auto_approve(
+            Some(ApprovalPolicy::Interactive),
+            false
+        ));
+        // No stored config (e.g. a restored session) prompts unless the global
+        // fallback applies.
+        assert!(!should_auto_approve(None, false));
+    }
+
+    #[test]
+    fn global_auto_approve_stays_a_backward_compatible_fallback() {
+        // `serve --auto-approve` keeps auto-approving every session regardless of
+        // per-session policy.
+        assert!(should_auto_approve(Some(ApprovalPolicy::Interactive), true));
+        assert!(should_auto_approve(None, true));
+        assert!(should_auto_approve(Some(ApprovalPolicy::AutoApprove), true));
+    }
+}
+
+#[cfg(test)]
+mod collab_route_tests {
+    use super::collaboration_routes_submit_to_goal;
+
+    #[test]
+    fn goal_collaboration_routes_plain_submit_to_goal_profile() {
+        assert!(collaboration_routes_submit_to_goal("goal"));
+        assert!(collaboration_routes_submit_to_goal("Goal"));
+    }
+
+    #[test]
+    fn chat_and_plan_stay_on_content_turn() {
+        assert!(!collaboration_routes_submit_to_goal("chat"));
+        assert!(!collaboration_routes_submit_to_goal("plan"));
+        assert!(!collaboration_routes_submit_to_goal(""));
+    }
+}
+
+#[cfg(test)]
+mod context_ops_tests {
+    use super::*;
+    use leveler_lifecycle::{ProgressLedger, TurnPhase};
+    use leveler_model::{Message, Role};
+    use leveler_storage::{Database, EventRepository, SessionRecord, SessionRepository};
+
+    #[tokio::test]
+    async fn reset_task_epoch_makes_progress_terminal_for_inheritance() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+
+        // Simulate an open in-flight progress ledger.
+        let open = ProgressLedger {
+            cumulative_commands: 9,
+            phase: TurnPhase::Active,
+            ..Default::default()
+        };
+        let (tag, payload) = leveler_engine::EngineEvent::ProgressUpdated {
+            ledger: open.clone(),
+        }
+        .to_row()
+        .unwrap();
+        EventRepository::new(&db)
+            .append(&id, None, &tag, &payload, leveler_core::now())
+            .await
+            .unwrap();
+
+        // Pre-cut snapshot must not remain latest after epoch reset.
+        let (tag, payload) = leveler_engine::EngineEvent::ContextSnapshot {
+            messages: vec![Message::text(Role::User, "old bulky history line")],
+            through_ordinal: None,
+        }
+        .to_row()
+        .unwrap();
+        EventRepository::new(&db)
+            .append(&id, None, &tag, &payload, leveler_core::now())
+            .await
+            .unwrap();
+
+        reset_session_task_epoch_db(&db, &id, Vec::new())
+            .await
+            .unwrap();
+
+        // Last ProgressUpdated must be terminal (same gate engine uses for seed).
+        let rows = EventRepository::new(&db).load(&id).await.unwrap();
+        let mut last_progress = None;
+        let mut last_snapshot = None;
+        for row in rows {
+            match leveler_engine::EngineEvent::from_payload(&row.payload) {
+                Ok(leveler_engine::EngineEvent::ProgressUpdated { ledger }) => {
+                    last_progress = Some(ledger);
+                }
+                Ok(leveler_engine::EngineEvent::ContextSnapshot { messages, .. }) => {
+                    last_snapshot = Some(messages);
+                }
+                _ => {}
+            }
+        }
+        let last = last_progress.expect("progress event");
+        assert!(
+            last.is_terminal_for_inheritance(),
+            "clear/compact/restore epoch must not re-seed task state: {last:?}"
+        );
+        assert_eq!(last.cumulative_commands, 0);
+        let snap = last_snapshot.expect("context snapshot");
+        assert!(
+            snap.is_empty(),
+            "epoch cut must supersede pre-cut ContextSnapshot; got {snap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_epoch_reset_installs_summary_snapshot() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+        let (tag, payload) = leveler_engine::EngineEvent::ContextSnapshot {
+            messages: vec![Message::text(Role::User, "pre-compact long history")],
+            through_ordinal: None,
+        }
+        .to_row()
+        .unwrap();
+        EventRepository::new(&db)
+            .append(&id, None, &tag, &payload, leveler_core::now())
+            .await
+            .unwrap();
+        let summary = Message::text(Role::User, "COMPACTION SUMMARY: done");
+        reset_session_task_epoch_db(&db, &id, vec![summary.clone()])
+            .await
+            .unwrap();
+        let rows = EventRepository::new(&db).load(&id).await.unwrap();
+        let mut last_snapshot = None;
+        for row in rows {
+            if let Ok(leveler_engine::EngineEvent::ContextSnapshot { messages, .. }) =
+                leveler_engine::EngineEvent::from_payload(&row.payload)
+            {
+                last_snapshot = Some(messages);
+            }
+        }
+        let snap = last_snapshot.expect("snapshot");
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].text_content().contains("COMPACTION SUMMARY"),
+            "compact must pin summary as model-visible snapshot: {snap:?}"
+        );
+    }
+
+    /// `/compact` must record the SAME durable fact the automatic compaction
+    /// records. It wrote only the epoch-reset rows, so the one observation a
+    /// user got was a notification that fades — and the TUI's own replay of
+    /// the durable log (triggered by the snapshot /compact pushes) then
+    /// rebuilt the conversation with nothing in it saying history had been
+    /// collapsed.
+    #[tokio::test]
+    async fn manual_compact_persists_the_canonical_compaction_fact() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+        let summary = Message::text(Role::User, "对话摘要（已压缩历史）：done");
+
+        commit_compaction_epoch(&db, &id, summary, 12)
+            .await
+            .unwrap();
+
+        let compacted: Vec<(usize, usize)> = EventRepository::new(&db)
+            .load(&id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| {
+                match leveler_engine::EngineEvent::from_payload(&row.payload).ok()? {
+                    leveler_engine::EngineEvent::Compacted { from, to } => Some((from, to)),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            compacted,
+            vec![(12, 1)],
+            "one durable compaction fact, counting what it replaced"
+        );
+    }
+
+    /// The marker has to survive the path the TUI actually reads on a reopen
+    /// or a post-compact resync: the durable log projected back into runtime
+    /// events. Manual and automatic compaction must arrive as the same event.
+    #[tokio::test]
+    async fn manual_and_automatic_compaction_replay_the_same_observation() {
+        use leveler_client_protocol::RuntimeEvent;
+
+        async fn replayed_compactions(db: &Database, id: &SessionId) -> Vec<(u32, u32)> {
+            crate::session_history::load_session_history(db, id)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .filter_map(|entry| match entry.event {
+                    RuntimeEvent::ContextCompacted { from, to } => Some((from, to)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn session_with_a_turn(db: &Database) -> SessionId {
+            let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+            SessionRepository::new(db).create(&session).await.unwrap();
+            let id = SessionId::new(session.id.clone());
+            // The real shape a compaction lands in: a turn that has already
+            // settled. The replay bridge publishes one terminal and drops
+            // everything after it, which is exactly what buried the marker.
+            for event in [
+                leveler_engine::EngineEvent::TurnStarted {
+                    turn_id: leveler_core::TurnId::generate(),
+                    kind: leveler_engine::TurnKind::Chat,
+                },
+                leveler_engine::EngineEvent::TaskFinished {
+                    outcome: leveler_lifecycle::TaskOutcome::Completed,
+                    verification: leveler_lifecycle::VerificationStatus::NotRun,
+                    reason: None,
+                    failure: None,
+                    stop: Some(leveler_lifecycle::StopReason::Answered),
+                    warnings: Vec::new(),
+                },
+            ] {
+                let (tag, payload) = event.to_row().unwrap();
+                EventRepository::new(db)
+                    .append(&id, None, &tag, &payload, leveler_core::now())
+                    .await
+                    .unwrap();
+            }
+            id
+        }
+
+        // Manual: the /compact transaction.
+        let db = Database::connect_in_memory().await.unwrap();
+        let manual = session_with_a_turn(&db).await;
+        commit_compaction_epoch(
+            &db,
+            &manual,
+            Message::text(Role::User, "对话摘要（已压缩历史）：done"),
+            12,
+        )
+        .await
+        .unwrap();
+
+        // Automatic: what the agent loop appends on its own.
+        let auto = session_with_a_turn(&db).await;
+        let (tag, payload) = leveler_engine::EngineEvent::Compacted { from: 12, to: 1 }
+            .to_row()
+            .unwrap();
+        EventRepository::new(&db)
+            .append(&auto, None, &tag, &payload, leveler_core::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replayed_compactions(&db, &manual).await,
+            vec![(12, 1)],
+            "a manual compaction is observable after a replay"
+        );
+        assert_eq!(
+            replayed_compactions(&db, &manual).await,
+            replayed_compactions(&db, &auto).await,
+            "manual and automatic compaction converge on one observation"
+        );
+
+        // An automatic compaction happens INSIDE a running turn, before its
+        // terminal. Grouping an epoch cut separately must not split that turn
+        // or cost it its terminal.
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let mid_turn = SessionId::new(session.id.clone());
+        for event in [
+            leveler_engine::EngineEvent::TurnStarted {
+                turn_id: leveler_core::TurnId::generate(),
+                kind: leveler_engine::TurnKind::Chat,
+            },
+            leveler_engine::EngineEvent::Compacted { from: 30, to: 1 },
+            leveler_engine::EngineEvent::TaskFinished {
+                outcome: leveler_lifecycle::TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: None,
+                failure: None,
+                stop: Some(leveler_lifecycle::StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        ] {
+            let (tag, payload) = event.to_row().unwrap();
+            EventRepository::new(&db)
+                .append(&mid_turn, None, &tag, &payload, leveler_core::now())
+                .await
+                .unwrap();
+        }
+        let entries = crate::session_history::load_session_history(&db, &mid_turn)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(e.event, RuntimeEvent::ContextCompacted { .. }))
+                .count(),
+            1,
+            "the automatic compaction still replays"
+        );
+        assert_eq!(
+            entries.iter().filter(|e| e.turn_start).count(),
+            1,
+            "and it does not open a turn of its own: {entries:#?}"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(
+                    e.event,
+                    RuntimeEvent::TurnAnswered
+                        | RuntimeEvent::TurnCompleted
+                        | RuntimeEvent::TurnCompletedUnverified { .. }
+                        | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                        | RuntimeEvent::TurnCompletedChecksFailed { .. }
+                ))
+                .count(),
+            1,
+            "the turn keeps its terminal: {entries:#?}"
+        );
+    }
+
+    #[test]
+    fn btw_history_builder_uses_budgeted_path_not_raw_dump() {
+        // Same function /btw calls: oversized raw history is folded under threshold.
+        let mut raw = Vec::new();
+        for i in 0..80 {
+            raw.push(Message::text(
+                Role::User,
+                format!("history line {i} with enough padding to burn tokens xxxxxxxx"),
+            ));
+            raw.push(Message::text(
+                Role::Assistant,
+                format!("reply {i} also padded so estimate_tokens exceeds a tiny budget"),
+            ));
+        }
+        let before = raw.len();
+        let (budgeted, _) = leveler_engine::budget_prior_messages(
+            raw,
+            None,
+            None,
+            Some("side question"),
+            // Force compaction path with a tiny threshold.
+            500,
+        );
+        assert!(
+            budgeted.len() < before,
+            "btw must not send full raw transcript: before={before} after={}",
+            budgeted.len()
+        );
+        assert!(
+            leveler_agent::estimate_tokens(&budgeted) <= 2_000
+                || budgeted.len() <= leveler_agent::COMPACT_KEEP_RECENT + 4,
+            "budgeted btw history must be bounded"
+        );
+    }
+
+    #[test]
+    fn compact_parse_rejects_corrupt_row_without_dropping_siblings() {
+        let good = serde_json::to_string(&Message::text(Role::User, "ok")).unwrap();
+        let payloads = vec![
+            good.clone(),
+            good.clone(),
+            "{not-json".to_string(),
+            good.clone(),
+        ];
+        let err = parse_history_messages_strict(&payloads).unwrap_err();
+        assert!(
+            err.contains("第 3 条"),
+            "must name the corrupt ordinal: {err}"
+        );
+        // All-or-nothing: no partial Vec is returned on error.
+        assert!(parse_history_messages_strict(&[good.clone(), good]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    fn registered(registry: &InFlightCommands, command_id: &CommandId) -> bool {
+        registry.lock().unwrap().contains_key(command_id.as_str())
+    }
+
+    /// The local ambiguity window opens before the receipt exists: whenever the
+    /// receipt write runs, the command is already registered.
+    #[tokio::test]
+    async fn a_command_is_in_flight_before_its_receipt_is_written() {
+        let registry: InFlightCommands = Arc::default();
+        let command_id = CommandId::new("cmd-window");
+        let (entry, seen_during_write) = InFlightDelivery::admit(&registry, &command_id, async {
+            registered(&registry, &command_id)
+        })
+        .await;
+        assert!(
+            seen_during_write,
+            "registration must precede the receipt write"
+        );
+        assert!(registered(&registry, &command_id));
+        drop(entry);
+        assert!(!registered(&registry, &command_id));
+    }
+
+    /// One delivery leaving must not unregister another still handling the
+    /// same command; a kept registration outlives its delivery.
+    #[test]
+    fn registrations_are_counted_and_a_kept_one_stays() {
+        let registry: InFlightCommands = Arc::default();
+        let command_id = CommandId::new("cmd-twice");
+        let first = InFlightDelivery::enter(&registry, &command_id);
+        let second = InFlightDelivery::enter(&registry, &command_id);
+        drop(second);
+        assert!(registered(&registry, &command_id));
+        first.keep_for_this_boot();
+        assert!(registered(&registry, &command_id));
+    }
+}

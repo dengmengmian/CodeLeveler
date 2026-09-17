@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="CodeLeveler">
+  <!--
+    CodeLeveler CL monogram
+    C = open continuous ring (code flow / iteration)
+    L = ascending steps (levels / progression)
+    Shared spine at the C opening → one silhouette
+  -->
+  <g fill="currentColor">
+    <!-- Open C (annulus, gap on the right) -->
+    <path d="
+      M 27 9
+      A 23 23 0 1 0 27 55
+      L 27 47
+      A 15 15 0 1 1 27 17
+      Z
+    "/>
+    <!-- Rising L levels (spine + three ascending steps) -->
+    <path d="
+      M 29 22
+      H 37
+      V 54
+      H 29
+      Z
+      M 29 46
+      H 51
+      V 54
+      H 29
+      Z
+      M 29 38
+      H 47
+      V 46
+      H 29
+      Z
+      M 29 30
+      H 43
+      V 38
+      H 29
+      Z
+    "/>
+  </g>
+</svg>

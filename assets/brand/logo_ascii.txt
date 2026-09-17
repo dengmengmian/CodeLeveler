@@ -1,0 +1,20 @@
+# CodeLeveler Level Mark — TUI primary brand
+# Source of truth: crates/leveler-tui/src/brand.rs
+# Spec: assets/brand/README.md
+#
+# Master (13×5) — Candidate A "Cantilever"
+        ██
+      ████
+    ██████
+  ████  ██
+██      █████
+#
+# Compact (8×4)
+     ██
+   ████
+ ██  ██
+██  ████
+#
+# Micro (5×2)
+  ██
+█ ███

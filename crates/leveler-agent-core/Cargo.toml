@@ -1,0 +1,27 @@
+[package]
+name = "leveler-agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generic agent kernel: the one model↔tool loop over leveler-model types, embeddable without the CodeLeveler harness."
+
+[dependencies]
+leveler-model = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The example and the tests build `ToolCall` / `RequestId` values by hand.
+leveler-core = { workspace = true }
+tokio = { workspace = true }
+
+[[example]]
+name = "minimal"

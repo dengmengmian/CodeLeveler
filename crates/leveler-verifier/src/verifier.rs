@@ -1,0 +1,1386 @@
+//! The verifier: runs the plan's checks, captures evidence, and enforces scope.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+
+use leveler_execution::{CommandRunner, VerifyNetworkPolicy, process_request_for_verify_check};
+
+use std::collections::BTreeSet;
+
+use crate::failure::classify;
+use crate::plan::{CheckKind, ScopePolicy, VerificationCommand, VerificationPlan};
+use crate::report::{CheckOutcome, NotRunReason, VerificationReport};
+use crate::test_results::{parse_go_failures, parse_node_failures, parse_rust_failures};
+
+const MAX_EVIDENCE: usize = 4000;
+
+/// Runs verification plans against a workspace.
+pub struct Verifier {
+    runner: Arc<CommandRunner>,
+    environment: Arc<leveler_core::EnvSnapshot>,
+    workspace_root: PathBuf,
+}
+
+impl Verifier {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self::with_environment(
+            workspace_root,
+            Arc::new(leveler_core::environment().clone()),
+        )
+    }
+
+    pub fn with_environment(
+        workspace_root: impl Into<PathBuf>,
+        environment: Arc<leveler_core::EnvSnapshot>,
+    ) -> Self {
+        Self {
+            runner: Arc::new(CommandRunner::with_environment(environment.clone())),
+            environment,
+            workspace_root: workspace_root.into(),
+        }
+    }
+
+    /// Run every check in `plan`, verify scope, and return a report. `on_check`
+    /// is invoked as each check finishes so the caller can stream progress.
+    pub async fn verify(
+        &self,
+        plan: &VerificationPlan,
+        allowed_paths: &[String],
+        modified_files: &[String],
+        cancellation: &CancellationToken,
+        on_check: &mut dyn FnMut(&CheckOutcome),
+    ) -> VerificationReport {
+        let (scope_ok, scope_violations) = check_scope(allowed_paths, modified_files);
+
+        let mut checks = Vec::with_capacity(plan.commands.len());
+        for (index, command) in plan.commands.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                for pending in &plan.commands[index..] {
+                    let outcome = CheckOutcome::not_run(
+                        pending.name.clone(),
+                        pending.kind,
+                        pending.gating,
+                        NotRunReason::VerificationIncomplete,
+                        None,
+                        "verification cancelled before this check ran".to_string(),
+                        None,
+                    );
+                    on_check(&outcome);
+                    checks.push(outcome);
+                }
+                break;
+            }
+            let outcome = self.run_check(command, modified_files, cancellation).await;
+            on_check(&outcome);
+            checks.push(outcome);
+        }
+
+        VerificationReport {
+            checks,
+            scope_ok,
+            scope_violations,
+        }
+    }
+
+    /// A sentence naming the requirement, the toolchain that actually ran and
+    /// where the requirement was declared — or `None` when the environment
+    /// satisfies the repo (or the repo declares nothing).
+    ///
+    /// Only consulted on the failure path, so a green run never pays for it,
+    /// and only claims a mismatch it can prove: an unknown version leaves the
+    /// failure attributed to the code, where it belongs by default.
+    async fn unmet_declared_toolchain(
+        &self,
+        program: &str,
+        resolved: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let declared = crate::toolchain::declared_for(program, &self.workspace_root)?;
+        let args = crate::toolchain::version_args(program)?;
+        // Ask the installed toolchain, from OUTSIDE the module. Go reads
+        // `go.mod` even for `go version` and tries to switch to the declared
+        // toolchain first — inside the repo the probe fails for exactly the
+        // reason we are trying to measure, and proves nothing.
+        let mut request = process_request_for_verify_check(
+            resolved.display().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+            self.environment.temp_dir().to_path_buf(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        request.timeout = Duration::from_secs(30);
+        let output = self
+            .runner
+            .run(request, cancellation.child_token())
+            .await
+            .ok()?;
+        let actual = crate::toolchain::parse_actual(&combine(&output.stdout, &output.stderr))?;
+        crate::toolchain::is_below(&actual, &declared.version).then(|| {
+            format!(
+                "environment does not meet the toolchain this repository declares \
+                 (`{}` in {} requires {}, but `{}` is {})",
+                program,
+                declared.source,
+                declared.version,
+                resolved.display(),
+                actual
+            )
+        })
+    }
+
+    async fn run_check(
+        &self,
+        command: &VerificationCommand,
+        modified_files: &[String],
+        cancellation: &CancellationToken,
+    ) -> CheckOutcome {
+        let Some(resolved) = find_in_path(&command.program, &self.environment) else {
+            return CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::ToolMissing,
+                None,
+                format!("`{}` not found on PATH", command.program),
+                None,
+            );
+        };
+
+        #[cfg(unix)]
+        if let Some(interpreter) = unavailable_shebang_interpreter(&resolved, &self.environment) {
+            return CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::DependencyUnavailable,
+                None,
+                format!(
+                    "`{}` cannot start because shebang interpreter `{interpreter}` is unavailable",
+                    resolved.display()
+                ),
+                None,
+            );
+        }
+
+        let args = effective_args(command, modified_files, &self.workspace_root);
+        let executed_program = command.program.clone();
+        let executed_args = args.clone();
+        // Repo / builtin verify: write confinement on, network inherits session
+        // (not force-deny — K12 so cargo/go/npm cold caches still work).
+        let mut request = process_request_for_verify_check(
+            command.program.clone(),
+            args,
+            self.workspace_root.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        request.timeout = Duration::from_secs(command.timeout_seconds);
+
+        match self.runner.run(request, cancellation.child_token()).await {
+            Ok(output) => {
+                let execution = crate::report::CheckExecution {
+                    program: executed_program,
+                    args: executed_args,
+                    exit_code: output.exit_code,
+                    timed_out: output.timed_out,
+                };
+                let combined = combine(&output.stdout, &output.stderr);
+                if output.timed_out {
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::VerificationIncomplete,
+                        Some(execution),
+                        format!(
+                            "verification timed out after {}s: {}",
+                            command.timeout_seconds,
+                            truncate(&combined)
+                        ),
+                        None,
+                    )
+                } else if output.success() {
+                    CheckOutcome::passed(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        execution,
+                        truncate(&combined),
+                    )
+                } else if crate::failure::is_environment_mismatch(&combined) {
+                    // Toolchain/MSRV refusal: the ENVIRONMENT could not run the
+                    // check, the code was never judged (R005 F-P1). Report it
+                    // as environment — with provenance naming the binary that
+                    // actually ran — instead of gating as a code failure.
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::EnvironmentUnavailable,
+                        Some(execution),
+                        format!(
+                            "environment mismatch (ran `{}`): {}",
+                            resolved.display(),
+                            truncate(&combined)
+                        ),
+                        Some(classify(command.kind, &combined)),
+                    )
+                } else if let Some(mismatch) = self
+                    .unmet_declared_toolchain(&command.program, &resolved, cancellation)
+                    .await
+                {
+                    // R005-F-P2: the repo declares a toolchain this environment
+                    // does not provide, so the check failed before the code was
+                    // ever judged. F-P1 only caught the tools that say so
+                    // themselves; a stale toolchain usually fails in an
+                    // ordinary way (R005 in Rust, R009 in Go) and was gating as
+                    // a code failure.
+                    CheckOutcome::not_run(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        NotRunReason::EnvironmentUnavailable,
+                        Some(execution),
+                        format!("{mismatch}: {}", truncate(&combined)),
+                        Some(classify(command.kind, &combined)),
+                    )
+                } else {
+                    let failure = classify(command.kind, &combined);
+                    CheckOutcome::failed(
+                        command.name.clone(),
+                        command.kind,
+                        command.gating,
+                        Some(execution),
+                        truncate(&combined),
+                        failure,
+                        // Full (untruncated) output: the trailing `failures:`
+                        // block / `--- FAIL:` lines may lie past the evidence cap.
+                        parse_failed_tests(command, &combined),
+                    )
+                }
+            }
+            // Could not run the command at all — no test-level signal to parse.
+            Err(e) if cancellation.is_cancelled() => CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::VerificationIncomplete,
+                None,
+                format!("verification cancelled while check was running: {e}"),
+                None,
+            ),
+            Err(e) => CheckOutcome::not_run(
+                command.name.clone(),
+                command.kind,
+                command.gating,
+                NotRunReason::DependencyUnavailable,
+                None,
+                format!("failed to run: {e}"),
+                None,
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unavailable_shebang_interpreter(
+    program: &std::path::Path,
+    environment: &leveler_core::EnvSnapshot,
+) -> Option<String> {
+    let bytes = std::fs::read(program).ok()?;
+    let first_line = bytes.split(|byte| *byte == b'\n').next()?;
+    let shebang = first_line.strip_prefix(b"#!")?;
+    let text = std::str::from_utf8(shebang).ok()?.trim();
+    let mut words = text.split_whitespace();
+    let interpreter = words.next()?;
+    let path = std::path::Path::new(interpreter);
+    if path.is_absolute() && !path.exists() {
+        return Some(interpreter.to_string());
+    }
+
+    // `/usr/bin/env tool` successfully starts `env`, but the declared check
+    // itself never starts when `tool` is absent. Preserve that distinction as
+    // NotRun(DependencyUnavailable), just like a directly missing shebang
+    // interpreter. `-S` is the standard multi-argument shebang form.
+    if path.file_name().and_then(|name| name.to_str()) == Some("env") {
+        let first = words.next()?;
+        let target = if first == "-S" { words.next()? } else { first };
+        if !target.starts_with('-')
+            && !target.contains('=')
+            && find_in_path(target, environment).is_none()
+        {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
+/// Confirm that every modified file falls under an allowed path. An empty
+/// `allowed_paths` means no restriction (single-node/free-form runs).
+fn check_scope(allowed_paths: &[String], modified_files: &[String]) -> (bool, Vec<String>) {
+    if allowed_paths.is_empty() {
+        return (true, Vec::new());
+    }
+    let violations: Vec<String> = modified_files
+        .iter()
+        .filter(|m| !allowed_paths.iter().any(|a| path_allows(a, m)))
+        .cloned()
+        .collect();
+    (violations.is_empty(), violations)
+}
+
+fn path_allows(allowed: &str, modified: &str) -> bool {
+    let allowed = allowed.trim_end_matches('/');
+    modified == allowed || modified.starts_with(&format!("{allowed}/"))
+}
+
+/// The arguments a check actually runs with.
+///
+/// [`ScopePolicy::Exact`] commands run verbatim: the user declared a
+/// verification contract and the harness does not get to reinterpret it —
+/// neither by narrowing the target set nor by adding flags. Inferred commands
+/// are the harness's own construction, so they may be narrowed to the change
+/// under test and completed for baseline attribution.
+fn effective_args(
+    command: &VerificationCommand,
+    modified_files: &[String],
+    workspace_root: &Path,
+) -> Vec<String> {
+    if command.scope_policy == ScopePolicy::Exact {
+        return command.args.clone();
+    }
+    // Narrow whole-repo commands to the changed packages (spec §29.5).
+    let args = scope_args(&command.args, modified_files, workspace_root);
+    // Complete failure sets for baseline attribution (see with_no_fail_fast).
+    with_no_fail_fast(command, args)
+}
+
+/// Narrow a whole-repo package glob (`./...`) to just the packages containing the
+/// modified files (spec §29.5: prefer targeted → module → full). Falls back to
+/// the original args when it can't scope safely (a root-level change, or a
+/// target directory that no longer exists).
+fn scope_args(args: &[String], modified_files: &[String], workspace_root: &Path) -> Vec<String> {
+    if modified_files.is_empty() || !args.iter().any(|a| a == "./...") {
+        return args.to_vec();
+    }
+
+    let mut packages: Vec<String> = Vec::new();
+    for file in modified_files {
+        let dir = std::path::Path::new(file)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        // A root-level change can only be verified against the whole repo.
+        let glob = if dir.is_empty() {
+            "./...".to_string()
+        } else {
+            format!("./{dir}/...")
+        };
+        // `modified_files` is every path the run ever touched, so a directory
+        // here may be gone by now: a scratch tree the run created and removed,
+        // or a package it deleted outright. Narrowing to it would run a command
+        // that cannot resolve its own target ("no such file or directory") and
+        // fail the gate for a reason that has nothing to do with the code. A
+        // valid broader gate beats an invalid narrow one — and skipping
+        // verification is never the answer.
+        if !workspace_root.join(dir).is_dir() {
+            return args.to_vec();
+        }
+        if !packages.contains(&glob) {
+            packages.push(glob);
+        }
+    }
+
+    // If any change is at the repo root, we cannot narrow — run the full glob.
+    if packages.iter().any(|p| p == "./...") {
+        return args.to_vec();
+    }
+
+    let mut out = Vec::new();
+    for arg in args {
+        if arg == "./..." {
+            out.extend(packages.iter().cloned());
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
+/// `cargo test` stops at the first failing test binary by default, truncating
+/// the failed-test set that baseline attribution diffs (test_results.rs): a
+/// pre-existing failure hidden behind the truncation point can never be proven
+/// pre-existing, and the working run's truncation can hide a genuinely new
+/// failure behind an attributed one. Force the full suite for `cargo test`
+/// checks; the flag goes before a `--` harness-args separator so it stays a
+/// cargo flag. Other toolchains and non-Test checks are untouched.
+fn with_no_fail_fast(command: &VerificationCommand, mut args: Vec<String>) -> Vec<String> {
+    let is_cargo_test = command.kind == CheckKind::Test
+        && program_stem(&command.program) == "cargo"
+        && args.first().is_some_and(|a| a == "test");
+    if !is_cargo_test || args.iter().any(|a| a == "--no-fail-fast") {
+        return args;
+    }
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    args.insert(at, "--no-fail-fast".to_string());
+    args
+}
+
+/// Parse a failed check's output into test-level failure ids, dispatching on
+/// the toolchain. Only Test checks carry test granularity; build/fmt/lint and
+/// toolchains without a parser yield an empty set and cannot receive baseline
+/// attribution: an exit code alone does not prove that two failures match.
+///
+/// A Node test run arrives either directly (`node --test`) or through the
+/// package manager's script (`npm run test` → `node --test`), so all four
+/// programs are routed to the node parser. The parser keys on the reporter's
+/// own markers, so an `npm test` that runs some other runner matches nothing
+/// and therefore keeps the failure charged to the current change.
+fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<String> {
+    if command.kind != CheckKind::Test {
+        return BTreeSet::new();
+    }
+    let program = program_stem(&command.program);
+    match program {
+        "cargo" => parse_rust_failures(output),
+        "go" => parse_go_failures(output),
+        "node" | "npm" | "pnpm" | "yarn" => parse_node_failures(output),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// `program` may be a bare name or an absolute path; toolchain dispatch matches
+/// on the stem.
+fn program_stem(program: &str) -> &str {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+}
+
+fn combine(stdout: &str, stderr: &str) -> String {
+    let mut s = String::new();
+    if !stdout.trim().is_empty() {
+        s.push_str(stdout);
+    }
+    if !stderr.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(stderr);
+    }
+    s
+}
+
+fn truncate(s: &str) -> String {
+    // Keep the tail, where compiler/test errors usually are.
+    leveler_core::truncate_tail_bytes(s, MAX_EVIDENCE, "…[truncated]\n")
+}
+
+fn find_in_path(program: &str, environment: &leveler_core::EnvSnapshot) -> Option<PathBuf> {
+    // An explicit path is used directly.
+    if program.contains('/') || program.contains('\\') {
+        let p = PathBuf::from(program);
+        return p.is_file().then_some(p);
+    }
+    // Windows hosts expose the variable as `Path`; the snapshot keeps the
+    // original casing, so look it up case-insensitively there.
+    #[cfg(windows)]
+    let path = environment.var_os_case_insensitive("PATH")?;
+    #[cfg(not(windows))]
+    let path = environment.var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Windows executables carry a PATHEXT extension (`cargo` →
+        // `cargo.exe`); without this probe every gate reports ToolMissing.
+        #[cfg(windows)]
+        for ext in pathext_extensions(environment) {
+            let candidate = dir.join(format!("{program}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Executable extensions from PATHEXT, without the leading dot, matching how
+/// Windows resolves a bare program name. Falls back to the cmd default set.
+#[cfg(windows)]
+fn pathext_extensions(environment: &leveler_core::EnvSnapshot) -> Vec<String> {
+    let value = environment
+        .var_os_case_insensitive("PATHEXT")
+        .and_then(|v| v.into_string().ok())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    value
+        .split(';')
+        .filter_map(|ext| {
+            let ext = ext.trim().trim_start_matches('.').trim();
+            (!ext.is_empty()).then(|| ext.to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// C1.6 real-toolchain regression (macOS host configured with a global
+    /// `rustc-wrapper`): the production Verifier path over a real Rust repo
+    /// must pass. Opt-in because it compiles ripgrep's dependency tree.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "runs a full cargo check over the ripgrep fixture; opt in with --ignored"]
+    async fn probe_real_repo_gate_under_host_rustc_wrapper() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../evals/fixtures/repos/ripgrep");
+        if !repo.join("Cargo.toml").exists() {
+            eprintln!("skipping: evals/fixtures/repos/ripgrep not fetched");
+            return;
+        }
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                program: "cargo".into(),
+                args: vec!["check".into(), "--quiet".into(), "--offline".into()],
+                kind: CheckKind::Build,
+                gating: true,
+                timeout_seconds: 900,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(repo.canonicalize().unwrap(), environment)
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        assert_eq!(
+            check.observation,
+            crate::report::CheckObservation::Passed,
+            "a real repository gate must not fail on the host's compilation cache: {}",
+            &check.evidence[..check.evidence.len().min(600)]
+        );
+    }
+
+    use super::*;
+
+    fn cmd(name: &str, program: &str, args: &[&str], gating: bool) -> VerificationCommand {
+        VerificationCommand {
+            name: name.into(),
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            kind: CheckKind::Build,
+            gating,
+            timeout_seconds: 30,
+            scope_policy: ScopePolicy::Auto,
+        }
+    }
+
+    #[test]
+    fn scope_allows_files_under_allowed_dir() {
+        let (ok, v) = check_scope(&["src".into()], &["src/lib.rs".into()]);
+        assert!(ok);
+        assert!(v.is_empty());
+    }
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scope_narrows_go_glob_to_changed_packages() {
+        let root = root_with(&["errors"]);
+        let args = sv(&["test", "./..."]);
+        let scoped = scope_args(
+            &args,
+            &["errors/x.go".into(), "errors/y.go".into()],
+            root.path(),
+        );
+        assert_eq!(scoped, sv(&["test", "./errors/..."]));
+    }
+
+    #[test]
+    fn scope_handles_multiple_packages() {
+        let root = root_with(&["a", "b"]);
+        let scoped = scope_args(
+            &sv(&["test", "./..."]),
+            &["a/x.go".into(), "b/y.go".into()],
+            root.path(),
+        );
+        assert_eq!(scoped, sv(&["test", "./a/...", "./b/..."]));
+    }
+
+    /// F — a root-level change cannot be narrowed.
+    #[test]
+    fn scope_falls_back_to_full_on_root_change() {
+        let root = root_with(&[]);
+        let args = sv(&["test", "./..."]);
+        let scoped = scope_args(&args, &["main.go".into()], root.path());
+        assert_eq!(scoped, args);
+    }
+
+    #[test]
+    fn scope_leaves_non_glob_commands_untouched() {
+        let args = sv(&["check", "--workspace"]);
+        assert_eq!(
+            scope_args(&args, &["src/lib.rs".into()], Path::new(".")),
+            args
+        );
+    }
+
+    /// A workspace root with `dirs` materialized, for narrowing decisions that
+    /// must only ever name a directory that exists.
+    fn root_with(dirs: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        dir
+    }
+
+    /// A — the user declared `go test ./...`; that is the command that runs.
+    #[test]
+    fn explicit_args_are_never_rewritten() {
+        let root = root_with(&["app"]);
+        let mut command = test_check("go", &["test", "./..."]);
+        command.scope_policy = ScopePolicy::Exact;
+        assert_eq!(
+            effective_args(&command, &["app/foo.go".into()], root.path()),
+            sv(&["test", "./..."])
+        );
+    }
+
+    /// A (second rewrite path) — an explicit `cargo test` keeps its exact
+    /// arguments too; the harness does not slip `--no-fail-fast` in.
+    #[test]
+    fn explicit_cargo_test_keeps_its_exact_arguments() {
+        let root = root_with(&["crates/x/src"]);
+        let mut command = test_check("cargo", &["test", "--workspace"]);
+        command.scope_policy = ScopePolicy::Exact;
+        assert_eq!(
+            effective_args(&command, &["crates/x/src/lib.rs".into()], root.path()),
+            sv(&["test", "--workspace"])
+        );
+    }
+
+    /// B — the inferred plan keeps narrowing to the changed package.
+    #[test]
+    fn inferred_args_are_narrowed_to_the_changed_package() {
+        let root = root_with(&["app"]);
+        let command = test_check("go", &["test", "./..."]);
+        assert_eq!(
+            effective_args(&command, &["app/foo.go".into()], root.path()),
+            sv(&["test", "./app/..."])
+        );
+    }
+
+    /// E — the P1 reproduction: a transient directory the run created and
+    /// removed is still in `modified_files`, and narrowing to it would build a
+    /// target that cannot resolve (`lstat: no such file or directory`). Fall
+    /// back to the broader command instead of running a doomed one.
+    #[test]
+    fn a_vanished_target_falls_back_to_the_broader_command() {
+        let root = root_with(&["duration"]);
+        let command = test_check("go", &["test", "./..."]);
+        let scoped = effective_args(
+            &command,
+            &[
+                "duration/format.go".into(),
+                ".acceptance-work/duration/format.go".into(),
+            ],
+            root.path(),
+        );
+        assert_eq!(
+            scoped,
+            sv(&["test", "./..."]),
+            "a target that no longer exists must widen the gate, not break it"
+        );
+    }
+
+    /// G — deleting a source file inside a package that still exists narrows
+    /// normally; deleting the whole package widens instead of skipping.
+    #[test]
+    fn source_deletion_still_verifies() {
+        let root = root_with(&["app"]);
+        let command = test_check("go", &["test", "./..."]);
+        assert_eq!(
+            effective_args(&command, &["app/gone.go".into()], root.path()),
+            sv(&["test", "./app/..."]),
+            "the package survives the file deletion"
+        );
+        let widened = effective_args(&command, &["oldpkg/gone.go".into()], root.path());
+        assert_eq!(
+            widened,
+            sv(&["test", "./..."]),
+            "a removed package must still be verified, just more broadly"
+        );
+    }
+
+    fn test_check(program: &str, args: &[&str]) -> VerificationCommand {
+        VerificationCommand {
+            name: format!("{program} test"),
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            kind: CheckKind::Test,
+            gating: true,
+            timeout_seconds: 30,
+            scope_policy: ScopePolicy::Auto,
+        }
+    }
+
+    #[test]
+    fn cargo_test_gains_no_fail_fast() {
+        // Fail-fast truncates the failed-test set baseline attribution diffs;
+        // the executed command must always carry --no-fail-fast.
+        let c = test_check("cargo", &["test", "--workspace", "--quiet"]);
+        assert_eq!(
+            with_no_fail_fast(&c, c.args.clone()),
+            sv(&["test", "--workspace", "--quiet", "--no-fail-fast"])
+        );
+    }
+
+    #[test]
+    fn no_fail_fast_goes_before_the_harness_separator() {
+        // After `--` the args belong to the test harness, which rejects the
+        // flag — it must stay on cargo's side.
+        let c = test_check("cargo", &["test", "--", "--nocapture"]);
+        assert_eq!(
+            with_no_fail_fast(&c, c.args.clone()),
+            sv(&["test", "--no-fail-fast", "--", "--nocapture"])
+        );
+    }
+
+    #[test]
+    fn no_fail_fast_is_not_duplicated() {
+        let c = test_check("cargo", &["test", "--no-fail-fast"]);
+        assert_eq!(with_no_fail_fast(&c, c.args.clone()), c.args);
+    }
+
+    #[test]
+    fn other_toolchains_and_non_test_checks_are_untouched() {
+        let go = test_check("go", &["test", "./..."]);
+        assert_eq!(with_no_fail_fast(&go, go.args.clone()), go.args);
+
+        // `cargo check` is a Build check — no test flags.
+        let build = cmd("cargo check", "cargo", &["check", "--workspace"], true);
+        assert_eq!(with_no_fail_fast(&build, build.args.clone()), build.args);
+
+        // A cargo Test check whose subcommand is not `test` (e.g. nextest)
+        // takes different flags — leave it alone.
+        let nextest = test_check("cargo", &["nextest", "run"]);
+        assert_eq!(
+            with_no_fail_fast(&nextest, nextest.args.clone()),
+            nextest.args
+        );
+    }
+
+    #[test]
+    fn scope_flags_out_of_scope_file() {
+        let (ok, v) = check_scope(
+            &["src/lib.rs".into()],
+            &["src/lib.rs".into(), "src/other.rs".into()],
+        );
+        assert!(!ok);
+        assert_eq!(v, vec!["src/other.rs"]);
+    }
+
+    #[tokio::test]
+    async fn passing_command_is_passed() {
+        let v = Verifier::with_environment(
+            std::env::temp_dir(),
+            Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )),
+        );
+        // `true` does not exist on Windows runners; pass via cmd there.
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/c", "exit 0"])
+        } else {
+            ("true", &[])
+        };
+        let plan = VerificationPlan {
+            commands: vec![cmd("ok", program, args, true)],
+        };
+        let mut seen = 0;
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {
+                seen += 1
+            })
+            .await;
+        assert!(report.passed());
+        assert_eq!(seen, 1);
+        assert_eq!(
+            report.checks[0].execution,
+            Some(crate::report::CheckExecution {
+                program: program.into(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                exit_code: Some(0),
+                timed_out: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_materializes_every_remaining_plan_check_as_not_run() {
+        let verifier = Verifier::new(std::env::temp_dir());
+        let plan = VerificationPlan {
+            commands: vec![
+                cmd("build", "unused-build", &[], true),
+                cmd("test", "unused-test", &[], true),
+            ],
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut seen = 0;
+
+        let report = verifier
+            .verify(&plan, &[], &[], &cancellation, &mut |_| seen += 1)
+            .await;
+
+        assert_eq!(report.checks.len(), plan.commands.len());
+        assert_eq!(seen, plan.commands.len());
+        assert!(report.checks.iter().all(|check| {
+            check.observation
+                == crate::report::CheckObservation::NotRun(NotRunReason::VerificationIncomplete)
+        }));
+        assert!(report.checks.iter().all(|check| check.execution.is_none()));
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failing_gating_command_blocks() {
+        let v = Verifier::with_environment(
+            std::env::temp_dir(),
+            Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )),
+        );
+        // `false` does not exist on Windows runners; fail via cmd there.
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/c", "exit 1"])
+        } else {
+            ("false", &[])
+        };
+        let plan = VerificationPlan {
+            commands: vec![cmd("bad", program, args, true)],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        assert!(!report.passed());
+        assert_eq!(report.failed_gates().len(), 1);
+    }
+
+    #[test]
+    fn acceptance_process_request_is_force_deny_repo_verify_inherits() {
+        // Trust matrix unit check (shared helper): acceptance ForceDeny, repo Inherit.
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let accept = process_request_for_verify_check(
+            "sh",
+            vec!["-c".into(), "test -d .".into()],
+            root.clone(),
+            VerifyNetworkPolicy::ForceDeny,
+        );
+        assert!(accept.deny_network);
+        assert!(accept.write_scope.confines());
+
+        let repo = process_request_for_verify_check(
+            "cargo",
+            vec!["test".into()],
+            root,
+            VerifyNetworkPolicy::InheritSession,
+        );
+        assert!(!repo.deny_network);
+        assert!(repo.write_scope.confines());
+    }
+
+    /// The whole Node path, over real output: `node --test` on a fixture with
+    /// one failing test must yield a `Failed` check whose `failed_tests` names
+    /// that test. Without the Node arm in `parse_failed_tests` the set stayed
+    /// empty, so a pre-existing `node --test` failure could never be proven
+    /// pre-existing and always gated the run (reconciliation residual 11).
+    #[tokio::test]
+    async fn a_real_node_test_failure_yields_test_level_evidence() {
+        // This drives the real Verifier, which confines its check: inside a
+        // verification sandbox there is no way to observe confinement, so
+        // stand down with a reason instead of reporting the platform's
+        // nesting limit as a defect.
+        if leveler_test_support::already_confined() {
+            eprintln!("skipping: already inside a verification sandbox (sandboxes do not nest)");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.test.js"),
+            "const test = require('node:test');\n\
+             const assert = require('node:assert');\n\
+             test('addition works', () => { assert.strictEqual(1 + 1, 2); });\n\
+             test('subtraction is broken', () => { assert.strictEqual(2 - 1, 5); });\n",
+        )
+        .expect("write node fixture");
+
+        // `Verifier::new` reads the installed process capabilities, which are
+        // empty for a library-only caller — an explicit snapshot is what gives
+        // the check a PATH to find `node` on, exactly as the product does at
+        // startup.
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let v = Verifier::with_environment(dir.path().to_path_buf(), environment);
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "test".into(),
+                program: "node".into(),
+                args: vec!["--test".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 120,
+                scope_policy: ScopePolicy::Auto,
+            }],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        // A host without node cannot judge this: say so rather than assert on
+        // an environment that was never here.
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
+            eprintln!("skipping: node is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.observation,
+            crate::report::CheckObservation::Failed,
+            "evidence: {}",
+            check.evidence
+        );
+        assert!(
+            check.failed_tests.contains("subtraction is broken"),
+            "a real node failure was not parsed into test-level evidence: {:?}",
+            check.failed_tests
+        );
+        assert!(
+            !check.failed_tests.contains("addition works"),
+            "a passing test was collected as a failure: {:?}",
+            check.failed_tests
+        );
+        assert_eq!(
+            report.verdict(),
+            crate::report::Verdict::Failed,
+            "a real node failure must gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_program_is_tool_missing_and_unverified() {
+        let v = Verifier::new(std::env::temp_dir());
+        let plan = VerificationPlan {
+            commands: vec![cmd(
+                "missing",
+                "definitely-not-a-real-program-xyz",
+                &[],
+                true,
+            )],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        // A missing tool does not fail the gate, but the run is not verified.
+        assert!(report.passed());
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_that_cannot_start_is_not_reported_as_a_failed_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("broken-check");
+        std::fs::write(&program, "#!/definitely/missing/interpreter\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("PATH"),
+                dir.path().as_os_str().to_owned(),
+            )],
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![cmd("broken", "broken-check", &[], true)],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::DependencyUnavailable)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_env_shebang_target_is_not_reported_as_a_failed_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("broken-env-check");
+        std::fs::write(
+            &program,
+            "#!/usr/bin/env definitely-not-a-real-interpreter-xyz\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("PATH"),
+                dir.path().as_os_str().to_owned(),
+            )],
+            dir.path().to_path_buf(),
+            std::env::temp_dir(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![cmd("broken-env", "broken-env-check", &[], true)],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::DependencyUnavailable)
+        );
+        assert!(report.checks[0].execution.is_none());
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_check_is_incomplete_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let verifier = Verifier::with_environment(dir.path(), environment);
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "slow".into(),
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec /bin/sleep 5".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 1,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+
+        let report = verifier
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::VerificationIncomplete),
+            "{}",
+            report.checks[0].evidence
+        );
+        assert!(
+            report.checks[0]
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.timed_out)
+        );
+        assert!(matches!(
+            report.verdict(),
+            crate::report::Verdict::Unverified(_)
+        ));
+    }
+
+    /// R005 F-P1 accident: the gate ran bare `cargo` under the host's default
+    /// rustc 1.96 while the task's tree required 1.97, and the MSRV refusal
+    /// was reported as a CODE failure gating completion. The mismatch must be
+    /// classified as environment, not code: the gate stays open (not Failed)
+    /// and the verdict is honestly Unverified with an environment reason.
+    #[tokio::test]
+    async fn toolchain_mismatch_is_environment_unavailable_not_a_code_failure() {
+        let v = Verifier::with_environment(
+            std::env::temp_dir(),
+            Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )),
+        );
+        let msrv = "error: rustc 1.96.0 is not supported by the following packages: foo@0.1.0 requires rustc 1.97";
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), format!("echo {msrv}& exit 1")])
+        } else {
+            (
+                "sh",
+                vec!["-c".into(), format!("echo '{msrv}' >&2; exit 1")],
+            )
+        };
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                kind: CheckKind::Build,
+                program: program.into(),
+                args,
+                timeout_seconds: 30,
+                gating: true,
+                scope_policy: ScopePolicy::Auto,
+            }],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        assert_eq!(
+            report.checks[0].observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
+            "evidence: {}",
+            report.checks[0].evidence
+        );
+        assert!(report.checks[0].execution.is_some());
+        // Environment mismatch must not gate as a code failure…
+        assert!(report.passed());
+        assert!(report.failed_gates().is_empty());
+        // …but the run is NOT silently "verified" either.
+        match report.verdict() {
+            crate::report::Verdict::Unverified(reason) => {
+                assert!(
+                    reason.contains("environment mismatch"),
+                    "reason should name the environment: {reason}"
+                );
+            }
+            other => panic!("expected Unverified, got {other:?}"),
+        }
+        // Provenance: the evidence names the resolved binary that actually ran.
+        assert!(
+            report.checks[0].evidence.contains("ran `"),
+            "evidence should carry binary provenance: {}",
+            report.checks[0].evidence
+        );
+    }
+
+    /// Bare program names on Windows resolve via PATHEXT (`gate` → `gate.exe`),
+    /// and the path variable arrives as `Path` — not `PATH` — on real hosts.
+    #[cfg(windows)]
+    #[test]
+    fn find_in_path_probes_pathext_extensions() {
+        use std::ffi::OsString;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gate.exe"), b"").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let env = leveler_core::EnvSnapshot::new(
+            vec![
+                (OsString::from("Path"), path),
+                (OsString::from("PATHEXT"), OsString::from(".COM;.EXE")),
+            ],
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        );
+        assert!(find_in_path("gate", &env).is_some());
+        assert!(find_in_path("missing-gate", &env).is_none());
+    }
+}
+
+/// R005-F-P2: the repo declares a toolchain the environment does not provide.
+///
+/// F-P1 fixed the case where the tool *says so itself* ("package requires rustc
+/// 1.85"). A stale toolchain more often fails with an ordinary compile error,
+/// and that was gating as a code failure — the agent was told its code was
+/// wrong when the code had never been judged. R009 hit the same shape in Go.
+#[cfg(test)]
+mod toolchain_provenance_tests {
+    use super::*;
+
+    fn failing_cargo_check() -> VerificationPlan {
+        VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                program: "cargo".into(),
+                // Fails immediately, without the tool naming a version itself.
+                args: vec!["--this-flag-does-not-exist".into()],
+                kind: CheckKind::Build,
+                gating: true,
+                timeout_seconds: 60,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        }
+    }
+
+    async fn run_in(repo: &std::path::Path) -> CheckOutcome {
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(repo.to_path_buf(), environment)
+            .verify(
+                &failing_cargo_check(),
+                &[],
+                &[],
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        report.checks.into_iter().next().unwrap()
+    }
+
+    /// Unix only, and not because the rule is: it needs a host toolchain that
+    /// can actually read a version. The Windows runner's cargo cannot create
+    /// `%USERPROFILE%\\.rustup`, so it never reaches the `rust-version` it is
+    /// supposed to be refused by, and the assertion would be measuring the
+    /// runner rather than the classifier. The classifier's own rules are unit
+    /// tested on every platform in `failure.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unmet_rust_requirement_is_environment_not_code_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nrust-version = \"99.0\"\n",
+        )
+        .unwrap();
+        let check = run_in(dir.path()).await;
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
+            eprintln!("skipping: cargo is not on PATH");
+            return;
+        }
+        // A cargo that cannot start (no writable rustup home on this host, as
+        // on the Windows runner) never gets far enough to read the
+        // requirement. That is a fact about the machine, and asserting the
+        // attribution against it would be asserting nothing.
+        if !check.evidence.contains("99.0") && check.evidence.contains("home directory") {
+            eprintln!("skipping: cargo cannot start here: {}", check.evidence);
+            return;
+        }
+        assert_eq!(
+            check.observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
+            "a repo needing rust 99.0 was never judged on its code: {}",
+            check.evidence
+        );
+        assert!(
+            check.evidence.contains("99.0") && check.evidence.contains("Cargo.toml"),
+            "the evidence must name the requirement and where it was declared: {}",
+            check.evidence
+        );
+    }
+
+    /// Unix only, for the same reason as the cargo case above: it depends on the
+    /// host's `go` answering a version probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unmet_go_requirement_is_environment_not_code_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/x\n\ngo 1.99.0\n",
+        )
+        .unwrap();
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "test".into(),
+                program: "go".into(),
+                args: vec!["--this-flag-does-not-exist".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 60,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(dir.path().to_path_buf(), environment)
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
+            eprintln!("skipping: go is not on PATH");
+            return;
+        }
+        // Same as the cargo case: if the toolchain probe could not read a
+        // version on this host, the requirement was never compared and there
+        // is no attribution to assert.
+        if !check.evidence.contains("go.mod") && check.evidence.contains("Usage:") {
+            eprintln!("skipping: go could not report a version here");
+            return;
+        }
+        assert_eq!(
+            check.observation,
+            crate::report::CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable),
+            "a repo needing go 1.99.0 was never judged on its code: {}",
+            check.evidence
+        );
+        assert!(
+            check.evidence.contains("go.mod"),
+            "the evidence must name where the requirement was declared: {}",
+            check.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn a_met_requirement_still_reports_a_real_failure_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nrust-version = \"1.0\"\n",
+        )
+        .unwrap();
+        let check = run_in(dir.path()).await;
+        if check.observation == crate::report::CheckObservation::NotRun(NotRunReason::ToolMissing) {
+            eprintln!("skipping: cargo is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.observation,
+            crate::report::CheckObservation::Failed,
+            "a satisfied requirement must not excuse a genuine failure: {}",
+            check.evidence
+        );
+    }
+}

@@ -1,0 +1,2424 @@
+//! Run-style subcommands: run, parallel run,
+//! tui, and resume, plus their shared finish/ship helpers.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+
+use leveler_agent::StopReason;
+use leveler_app::{Application, InProcessRuntimeClient};
+use leveler_client_protocol::InteractiveRuntimeClient;
+use leveler_local_transport::{
+    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
+    TransportError,
+};
+use leveler_project::Layout;
+
+use crate::cli::{OutputFormat, RunMode};
+use crate::common::{build_approver, map_mode, resolve_model, spawn_interrupt_handler};
+use crate::output::Line;
+use crate::render::{emit_jsonl, render_event};
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cmd_run(
+    layout: Layout,
+    task: String,
+    model: Option<String>,
+    mode: RunMode,
+    auto_approve: bool,
+    output: OutputFormat,
+    ship: leveler_app::ShipOptions,
+    sandbox: bool,
+    work_profile: leveler_lifecycle::WorkProfile,
+    collaboration: leveler_lifecycle::CollaborationMode,
+    max_rounds: Option<u32>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let mut app = Application::assemble(layout)?
+        .with_work_profile(work_profile)
+        .with_collaboration(collaboration)
+        .with_task_round_budget(max_rounds);
+    if let Some(overrides) = parent_reasoning_override(std::env::var(PARENT_REASONING_ENV).ok())? {
+        app = app.with_execution_overrides(overrides);
+    }
+    let model_ref = resolve_model(&app, model)?;
+    let execution_mode = map_mode(mode);
+
+    let session_id = app.create_session(&model_ref, &task).await?;
+
+    if output == OutputFormat::Text {
+        println!(
+            "{}",
+            Line::heading(&format!("Running task with {model_ref}"))
+        );
+        println!("  session: {session_id}");
+        println!("  mode: {execution_mode:?}");
+        println!("  task: {task}\n");
+    } else {
+        emit_jsonl(serde_json::json!({
+            "type": "session_started",
+            "session_id": session_id.to_string(),
+            "model": model_ref.to_string(),
+        }));
+    }
+
+    let approver = build_approver(auto_approve);
+    let cancellation = CancellationToken::new();
+    spawn_interrupt_handler(cancellation.clone());
+
+    let result = app
+        .run_in_session(
+            &session_id,
+            &model_ref,
+            execution_mode,
+            &task,
+            approver,
+            sandbox,
+            &mut |e| render_event(e, output),
+            cancellation,
+        )
+        .await;
+
+    // Ship on success; direct runs with edits are verification-gated by the app.
+    if ship.any()
+        && output == OutputFormat::Text
+        && let Ok(outcome) = &result
+        && outcome.stop_reason == StopReason::Completed
+        && !outcome.modified_files.is_empty()
+    {
+        ship_changes_and_print(
+            &app,
+            &model_ref,
+            &task,
+            &outcome.modified_files,
+            true,
+            &ship,
+        )
+        .await;
+    }
+
+    finish(result, &session_id.to_string(), output)
+}
+pub(crate) async fn cmd_run_parallel(
+    layout: Layout,
+    task: String,
+    model: Option<String>,
+    mode: RunMode,
+    parallel: usize,
+) -> anyhow::Result<std::process::ExitCode> {
+    let app = Application::assemble(layout)?;
+    let model_ref = resolve_model(&app, model)?;
+    let execution_mode = map_mode(mode);
+
+    println!(
+        "{}",
+        Line::heading(&format!(
+            "Parallel edit: {parallel} agents with {model_ref}"
+        ))
+    );
+    println!("  mode: {execution_mode:?}");
+    println!("  task: {task}\n");
+    println!(
+        "{}",
+        Line::warn("Running agents concurrently in isolated worktrees…")
+    );
+
+    let cancellation = CancellationToken::new();
+    spawn_interrupt_handler(cancellation.clone());
+
+    let outcome = app
+        .parallel_edit(&model_ref, execution_mode, &task, parallel, cancellation)
+        .await?;
+
+    println!();
+    println!("{}", Line::heading("Parallel result"));
+    println!(
+        "  {} candidate(s), {} verified",
+        outcome.candidates, outcome.verified
+    );
+    println!("  session: {}", outcome.session);
+    if !outcome.integrated.is_empty() {
+        println!(
+            "  {} integrated: {}",
+            console::style("✓").green(),
+            outcome.integrated.join(", ")
+        );
+    }
+    if !outcome.conflicted.is_empty() {
+        println!(
+            "  {} skipped (conflicted with integrated edits): {}",
+            console::style("!").yellow(),
+            outcome.conflicted.join(", ")
+        );
+    }
+    if outcome.integrated.is_empty() {
+        println!(
+            "{}",
+            Line::warn("No candidate produced integrable changes.")
+        );
+        Ok(std::process::ExitCode::FAILURE)
+    } else {
+        println!("{}", Line::ok("Integrated into the current branch."));
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+}
+#[cfg(unix)]
+const DEFAULT_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketIntent {
+    Embedded,
+    ProbeDefault,
+    RequireExplicit,
+}
+
+fn socket_intent(
+    in_process: bool,
+    // R1: `--auto-approve` no longer forces an embedded runtime. It is carried as
+    // a per-session approval policy on the (trusted-local) CreateSessionRequest,
+    // so an unattended goal runs in the daemon and survives client disconnect.
+    _auto_approve: bool,
+    explicit_socket: bool,
+    config_overridden: bool,
+) -> SocketIntent {
+    if in_process {
+        SocketIntent::Embedded
+    } else if explicit_socket {
+        SocketIntent::RequireExplicit
+    } else if config_overridden {
+        // A running daemon cannot inherit this invocation-scoped config.
+        SocketIntent::Embedded
+    } else {
+        SocketIntent::ProbeDefault
+    }
+}
+
+#[cfg(unix)]
+async fn connect_default_runtime(
+    path: &Path,
+) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
+    match tokio::time::timeout(
+        DEFAULT_DAEMON_CONNECT_TIMEOUT,
+        tokio::net::UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Ok(_probe)) => LocalSocketRuntimeClient::connect(path).await.map(Some),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
+            Ok(None)
+        }
+        Err(_) => {
+            tracing::debug!(
+                socket = %path.display(),
+                timeout_ms = DEFAULT_DAEMON_CONNECT_TIMEOUT.as_millis(),
+                "timed out probing local runtime"
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn connect_default_runtime(
+    _path: &Path,
+) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
+    Ok(None)
+}
+
+/// How long an ensure-started daemon gets to report readiness before the TUI
+/// gives up. Model/config loading dominates; ten seconds is generous.
+#[cfg(unix)]
+const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The client-side daemon revival hook: when the daemon dies mid-session,
+/// the transport calls back here to run the SAME discover-or-start flow the
+/// TUI used at startup. The connected probe client is dropped immediately —
+/// revival only guarantees a runtime is serving again; the caller reconnects
+/// itself.
+#[cfg(unix)]
+struct DaemonReviver {
+    layout: Layout,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl leveler_local_transport::RuntimeReviver for DaemonReviver {
+    async fn revive(&self) -> Result<(), String> {
+        ensure_default_runtime(&self.layout)
+            .await
+            .map(|_probe_client| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Whether the connected runtime is the build this client expects.
+#[cfg(unix)]
+#[derive(Debug)]
+enum RuntimeConsistency {
+    Current,
+    Outdated {
+        runtime: leveler_core::BuildIdentity,
+        expected: leveler_core::BuildIdentity,
+    },
+    ConfigChanged,
+    /// The runtime did not report a usable identity — a build older than the
+    /// handshake, or an unreadable snapshot.
+    Unknown,
+}
+
+#[cfg(unix)]
+fn classify_runtime_generation(
+    reported: Option<&leveler_client_protocol::RuntimeInfo>,
+    expected_build: &leveler_core::BuildIdentity,
+    expected_config_fingerprint: &str,
+) -> RuntimeConsistency {
+    match classify_runtime(reported.map(|info| &info.build), expected_build) {
+        RuntimeConsistency::Current => match reported.and_then(|info| {
+            info.config_fingerprint
+                .as_deref()
+                .map(|fingerprint| fingerprint == expected_config_fingerprint)
+        }) {
+            Some(true) => RuntimeConsistency::Current,
+            Some(false) => RuntimeConsistency::ConfigChanged,
+            None => RuntimeConsistency::Unknown,
+        },
+        other => other,
+    }
+}
+
+/// Classify a runtime from what it reported. `None` — a daemon that predates
+/// the handshake, or a transport failure — is `Unknown`, never agreement:
+/// silence is not a claim to be the same build.
+#[cfg(unix)]
+fn classify_runtime(
+    reported: Option<&leveler_core::BuildIdentity>,
+    expected: &leveler_core::BuildIdentity,
+) -> RuntimeConsistency {
+    let Some(runtime) = reported else {
+        return RuntimeConsistency::Unknown;
+    };
+    if !runtime.is_known() || !expected.is_known() {
+        return RuntimeConsistency::Unknown;
+    }
+    if expected.matches(runtime) {
+        RuntimeConsistency::Current
+    } else {
+        RuntimeConsistency::Outdated {
+            runtime: runtime.clone(),
+            expected: expected.clone(),
+        }
+    }
+}
+
+/// Did the replacement actually become the build we expected?
+///
+/// Spawning successfully proves nothing: the process that came up has to say
+/// it is the build this client is, or the runtime was not replaced — it was
+/// merely restarted. Exactly one verdict, and no retry: a replacement that
+/// keeps coming back as the wrong build is something to report, not something
+/// to keep relaunching.
+#[cfg(unix)]
+fn verify_replacement(
+    reported: Option<&leveler_core::BuildIdentity>,
+    expected: &leveler_core::BuildIdentity,
+) -> anyhow::Result<()> {
+    // The replacement was spawned from `current_exe`, so reporting our exact
+    // identity — dirty flag included — is proof it is this build. `matches`
+    // answers a different question (is a daemon we did not spawn possibly
+    // stale code?), and its "two dirty trees may differ" rule applied here
+    // would reject the binary we just launched ourselves: on a modified tree
+    // the TUI would never start, and would say so by printing one build name
+    // twice.
+    if reported.is_some_and(|r| r.is_known() && r == expected) {
+        return Ok(());
+    }
+    match classify_runtime(reported, expected) {
+        RuntimeConsistency::Current => Ok(()),
+        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
+            "the local runtime started as {} but this CodeLeveler is {}; \
+             the runtime was not replaced correctly",
+            runtime.short(),
+            expected.short()
+        ),
+        RuntimeConsistency::ConfigChanged => {
+            anyhow::bail!("the replacement runtime loaded a different configuration generation")
+        }
+        RuntimeConsistency::Unknown => {
+            anyhow::bail!("the local runtime started but did not report a usable build identity")
+        }
+    }
+}
+
+/// Ask the runtime who it is, then classify the answer.
+#[cfg(unix)]
+async fn runtime_is_current(
+    client: &LocalSocketRuntimeClient,
+    layout: &Layout,
+) -> anyhow::Result<RuntimeConsistency> {
+    let expected = leveler_core::BuildIdentity::current();
+    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(client)
+        .await
+        .ok();
+    let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
+    Ok(classify_runtime_generation(
+        reported.as_ref(),
+        &expected,
+        &expected_config,
+    ))
+}
+
+/// Wait for the retiring runtime to release its socket. Bounded: a runtime
+/// that will not go must be reported, never waited on forever — and never
+/// escalated to a kill, which is the active work this whole path protects.
+#[cfg(unix)]
+async fn wait_for_runtime_exit(socket_path: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
+    loop {
+        if tokio::net::UnixStream::connect(socket_path).await.is_err() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the previous local runtime did not finish its work within {}s; \
+                 it is still running and was not interrupted — try again once it is idle",
+                DAEMON_ENSURE_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Discover the repository's local runtime, starting one if none is running.
+///
+/// The default TUI path: probe the per-repo socket; when nobody answers,
+/// spawn `leveler --repo <root> serve` as a *detached* process (its own
+/// process group, no kill-on-drop — the daemon must outlive this TUI), wait
+/// for its `--ready-json`, and connect. Two TUIs racing this function are
+/// safe: the socket bind's flock elects exactly one daemon, the loser child
+/// exits `AlreadyRunning`, and the losing TUI's retry loop connects to the
+/// winner. Returns the connected client; a startup failure is a hard error
+/// carrying the daemon's log tail — never a silent fall back to an
+/// in-process runtime.
+#[cfg(unix)]
+async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
+    let socket_path = layout.socket_path();
+    if let Some(client) = connect_default_runtime(&socket_path).await? {
+        match runtime_is_current(&client, layout).await? {
+            // Same build: reuse it, silently. This is the overwhelmingly
+            // common case and must stay free.
+            RuntimeConsistency::Current => return Ok(client),
+            // A runtime that cannot say what it is might be anything, and it
+            // might be busy. Leave it alone and say so — replacing a runtime
+            // we cannot reason about is how active work gets destroyed.
+            RuntimeConsistency::Unknown => {
+                anyhow::bail!(
+                    "the local runtime is from an unknown build and cannot be verified; \
+                     stop it and start CodeLeveler again"
+                );
+            }
+            RuntimeConsistency::Outdated { runtime, expected } => {
+                tracing::info!(
+                    runtime = %runtime.short(),
+                    expected = %expected.short(),
+                    "local runtime is a different build; asking it to retire"
+                );
+                // The runtime owns the drain. We do not kill it, and we do not
+                // poll it for idleness: it stops taking new work, finishes what
+                // it already owns, and exits. Replacing a binary on disk is not
+                // an update — this is.
+                client
+                    .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+                        reason: leveler_client_protocol::RestartReason::BuildMismatch,
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("could not ask the local runtime to retire: {e}")
+                    })?;
+                drop(client);
+                wait_for_runtime_exit(&socket_path).await?;
+            }
+            RuntimeConsistency::ConfigChanged => {
+                tracing::info!(
+                    "local runtime loaded a different configuration generation; asking it to retire"
+                );
+                client
+                    .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+                        reason: leveler_client_protocol::RestartReason::ConfigChanged,
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("could not ask the local runtime to retire: {e}")
+                    })?;
+                drop(client);
+                wait_for_runtime_exit(&socket_path).await?;
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&layout.state_dir)?;
+    let log_path = layout.state_dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path)?;
+    let ready_path = std::env::temp_dir().join(format!(
+        "leveler-tui-ready-{}-{}.json",
+        std::process::id(),
+        leveler_core::new_uuid_string()
+    ));
+    let _ = std::fs::remove_file(&ready_path);
+    let exe = std::env::current_exe()?;
+    let mut child = tokio::process::Command::new(&exe)
+        .arg("--repo")
+        .arg(&layout.repo_root)
+        .arg("serve")
+        .arg("--ready-json")
+        .arg(&ready_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log))
+        // Detached: the daemon owns task lifetime, so it must not share the
+        // TUI's process group (terminal signals) and is never kill-on-drop.
+        .process_group(0)
+        .spawn()?;
+    // NOTE on lifetime: the daemon also installs a SIGHUP handler (see the
+    // serve shutdown select) so a closing terminal cannot hard-kill it and
+    // wipe in-memory session policy (R006 R6-P2 enabling condition).
+
+    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
+    let client = loop {
+        // The child exiting is not necessarily failure: losing the daemon
+        // election (another TUI's child bound first) exits AlreadyRunning,
+        // and the winner is exactly who we want to connect to.
+        let child_done = child.try_wait()?.is_some();
+        if ready_path.is_file()
+            && let Ok(client) = LocalSocketRuntimeClient::connect(&socket_path).await
+        {
+            break client;
+        }
+        if child_done && let Some(client) = connect_default_runtime(&socket_path).await? {
+            break client;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.start_kill();
+            anyhow::bail!(
+                "the local runtime did not become ready within {}s; \
+                 inspect {} or run `leveler tui --in-process` as a fallback",
+                DAEMON_ENSURE_TIMEOUT.as_secs(),
+                log_path.display()
+            );
+        }
+        if child_done {
+            // Startup failed for real (bad config, corrupt identity, …):
+            // surface it now instead of burning the whole deadline.
+            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail = tail.lines().rev().take(8).collect::<Vec<_>>();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            anyhow::bail!(
+                "the local runtime failed to start (log: {}):\n{}\n\
+                 run `leveler tui --in-process` as a fallback",
+                log_path.display(),
+                tail.join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = std::fs::remove_file(&ready_path);
+    // Identity check is best-effort observability: log which runtime serves
+    // us; an old daemon that cannot answer still serves sessions fine.
+    match leveler_local_transport::LocalRuntimeService::runtime_info(&client).await {
+        Ok(info) => tracing::info!(
+            runtime_id = %info.runtime_id,
+            pid = info.pid,
+            "connected to local runtime"
+        ),
+        Err(error) => tracing::debug!(%error, "local runtime did not report an identity"),
+    }
+    // §20: a spawn that returned Ok proves nothing. The replacement has to
+    // say it is the build we expected, or the bootstrap failed — and it fails
+    // once, without a second attempt, because a restart loop over a build that
+    // keeps coming back wrong helps nobody.
+    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
+        .await
+        .ok();
+    verify_replacement(
+        reported.as_ref().map(|info| &info.build),
+        &leveler_core::BuildIdentity::current(),
+    )?;
+    let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
+    if reported
+        .as_ref()
+        .and_then(|info| info.config_fingerprint.as_deref())
+        != Some(expected_config.as_str())
+    {
+        anyhow::bail!("the replacement runtime did not load the current configuration generation");
+    }
+    Ok(client)
+}
+
+/// Bind the TUI-embedded Web UI against an existing local runtime service.
+///
+/// `/web` is a TUI capability, not an in-process-runtime capability: HTTP
+/// lives in this process and routes through whatever [`LocalRuntimeService`]
+/// the TUI already has. It does not own that runtime and does not open
+/// daemon TCP.
+async fn bind_tui_web_ui(
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+    repo_root: PathBuf,
+    shutdown: CancellationToken,
+) -> Result<String, String> {
+    let token = generate_daemon_token();
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let router = leveler_web::RouterService::new(service, repo_root);
+    let manager = leveler_web::ProjectManager::new(
+        router.clone(),
+        leveler_core::LevelerHome::resolve(leveler_core::environment()),
+        std::env::current_exe().ok(),
+    );
+    let background = manager.clone();
+    tokio::spawn(async move {
+        background.clone().load_registry().await;
+        background
+            .discover_historical_projects(&std::env::temp_dir())
+            .await;
+    });
+    let server = leveler_web::bind_multi(router, manager, addr, token.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let local = server.local_addr();
+    if !local.ip().is_loopback() {
+        return Err(format!("refusing to serve Web UI on non-loopback {local}"));
+    }
+    let url = format!("http://{local}/?token={token}");
+    tokio::spawn(async move {
+        let _ = server.serve(shutdown).await;
+    });
+    Ok(url)
+}
+
+/// Shared `/web` launcher for in-process and daemon-connected TUIs.
+fn make_web_launcher(
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+    repo_root: PathBuf,
+    shutdown: CancellationToken,
+) -> leveler_tui::WebLauncher {
+    Arc::new(move || {
+        let service = service.clone();
+        let repo_root = repo_root.clone();
+        let shutdown = shutdown.clone();
+        Box::pin(async move { bind_tui_web_ui(service, repo_root, shutdown).await })
+    })
+}
+
+fn make_url_opener() -> leveler_tui::UrlOpener {
+    Arc::new(move |url| {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || leveler_execution::open_url(&url))
+                .await
+                .map_err(|error| format!("URL 打开任务异常结束：{error}"))?
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
+/// Open the interactive terminal UI. Reuses a healthy per-repository daemon
+/// when possible and otherwise starts the runtime inside the TUI process.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cmd_tui(
+    layout: Layout,
+    model: Option<String>,
+    mode: RunMode,
+    auto_approve: bool,
+    in_process: bool,
+    socket: Option<PathBuf>,
+    session: Option<String>,
+    config_overridden: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    if in_process && socket.is_some() {
+        anyhow::bail!("--socket cannot be combined with --in-process");
+    }
+    let explicit_socket = socket.is_some();
+    let intent = socket_intent(in_process, auto_approve, explicit_socket, config_overridden);
+    if auto_approve && intent == SocketIntent::RequireExplicit {
+        anyhow::bail!(
+            "socket clients cannot elevate daemon permissions; start `leveler serve \
+             --auto-approve` instead"
+        );
+    }
+    let socket_path = socket.unwrap_or_else(|| layout.socket_path());
+    let socket_client = match intent {
+        SocketIntent::Embedded => None,
+        // The normal product path: discover the repository's runtime, start
+        // one when none is running, and connect. The TUI does not own task
+        // lifetime here — closing it leaves the daemon (and its tasks)
+        // running. Unix only: platforms without the socket transport keep
+        // the embedded runtime.
+        #[cfg(unix)]
+        SocketIntent::ProbeDefault => {
+            let client = ensure_default_runtime(&layout).await?;
+            // Supervisor semantics for a daemon that dies mid-session: the
+            // client's reconnect/request paths call back into the same
+            // ensure-daemon flow (idempotent; a concurrent revival race
+            // elects one winner), the restarted daemon keeps its durable
+            // RuntimeId, recovery reacquires a fresh OwnerEpoch inside the
+            // daemon, and session subscriptions resync from a fresh snapshot.
+            client.set_reviver(Arc::new(DaemonReviver {
+                layout: layout.clone(),
+            }));
+            Some(client)
+        }
+        #[cfg(not(unix))]
+        SocketIntent::ProbeDefault => connect_default_runtime(&socket_path).await.map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "the local runtime at {} answered the probe but rejected the client: {error}",
+                    socket_path.display()
+                )
+            },
+        )?,
+        SocketIntent::RequireExplicit => Some(
+            LocalSocketRuntimeClient::connect(&socket_path)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot connect to requested local runtime at {}: {error}; start \
+                         `leveler serve --socket {}` for this repository",
+                        socket_path.display(),
+                        socket_path.display()
+                    )
+                })?,
+        ),
+    };
+    if let Some(client) = socket_client {
+        let model = model
+            .as_deref()
+            .map(crate::common::parse_model_ref)
+            .transpose()?;
+        let model_key = model.as_ref().map(|m| m.to_string());
+        let client = Arc::new(client);
+        let (session_id, context_window) = if let Some(id) = session.as_deref() {
+            let session_id = leveler_core::SessionId::new(id);
+            let _snap = client.snapshot(&session_id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot open session {id}: {e}\n\
+                     list sessions: leveler resume"
+                )
+            })?;
+            // R006 R6-P2: --auto-approve was a silent no-op on `--session`
+            // resume — the policy lives only in the daemon's session map, and
+            // reconnecting never re-asserted it, so approvals fell back to a
+            // 5-minute human timeout → Deny → guard kill. Re-assert the
+            // session's effective policy through the same trust gate as
+            // creation. Without the flag nothing changes (no blanket upgrade).
+            if auto_approve {
+                use leveler_local_transport::LocalRuntimeService as _;
+                client
+                    .attach_session_policy(
+                        &session_id,
+                        leveler_client_protocol::ApprovalPolicy::AutoApprove,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("cannot re-assert auto-approve on session {id}: {e}")
+                    })?;
+            }
+            // The daemon path has no model registry of its own and the
+            // snapshot carries the model's name but not its limits, so the
+            // context gauge had nothing to divide by — and, contrary to the
+            // note that used to sit here, no later turn ever filled it in.
+            // The window the user configured for that model is right here.
+            let window = _snap
+                .model
+                .as_ref()
+                .and_then(|m| {
+                    leveler_app::GlobalConfig::load()
+                        .ok()
+                        .and_then(|g| g.context_window_for(&m.to_string()))
+                })
+                .unwrap_or(0);
+            (session_id, window)
+        } else {
+            // R006 R6-P5: bare `leveler tui` silently starts a NEW session, so
+            // an interrupted long-running goal is easy to abandon by accident —
+            // every resume in Batch #1 needed a session UUID the user has no
+            // way to know. Surface resumable work before creating another one.
+            if let Some(hint) = resumable_session_hint(&layout).await {
+                eprintln!("{hint}");
+            }
+            let bootstrap = client
+                .create_session(CreateSessionRequest {
+                    goal: "interactive session".to_string(),
+                    model,
+                    mode: match map_mode(mode) {
+                        leveler_execution::PermissionProfile::RequestApproval => {
+                            leveler_client_protocol::PermissionProfile::RequestApproval
+                        }
+                        leveler_execution::PermissionProfile::Assisted => {
+                            leveler_client_protocol::PermissionProfile::Assisted
+                        }
+                        leveler_execution::PermissionProfile::FullAccess => {
+                            leveler_client_protocol::PermissionProfile::FullAccess
+                        }
+                    },
+                    // `--auto-approve` becomes this session's policy; the daemon
+                    // runs the turn and it survives this client disconnecting.
+                    approval_policy: if auto_approve {
+                        leveler_client_protocol::ApprovalPolicy::AutoApprove
+                    } else {
+                        leveler_client_protocol::ApprovalPolicy::Interactive
+                    },
+                })
+                .await?;
+            (bootstrap.session.id, bootstrap.context_window)
+        };
+        let global = leveler_app::GlobalConfig::load()?;
+        let effort_key = model_key
+            .or_else(|| global.default_model.clone())
+            .unwrap_or_default();
+        let boot = leveler_tui::Boot {
+            session_id,
+            user: std::env::var("USER").unwrap_or_else(|_| "there".to_string()),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            // Workbench Header already shows project context; no welcome card.
+            show_welcome: false,
+            draft_path: Some(layout.state_dir.join("draft.txt")),
+            history_path: Some(layout.state_dir.join("input_history.json")),
+            context_window,
+            locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
+            untrusted_config: crate::trust_cmds::untrusted_config_display(&layout.repo_root),
+            reasoning_effort: global.reasoning_effort_for(&effort_key),
+        };
+        // A phone can be served over this connection.
+        //
+        // `/remote` used to refuse here on the grounds that the TUI does not own
+        // a runtime. It does not need to own one: the daemon on the other end of
+        // this socket *is* a `LocalRuntimeService`, and it is on this machine —
+        // the socket is a file in this repository's state directory. Refusing
+        // meant that opening a TUI in a repository where `leveler serve` was
+        // already running made the whole feature unreachable, with a message
+        // about a "remote daemon" that named the one case this is not.
+        let runtime_service: Arc<dyn leveler_local_transport::LocalRuntimeService> = client.clone();
+        let remote_launcher = crate::remote_invite::launcher(
+            runtime_service.clone(),
+            layout.repo_root.clone(),
+            leveler_remote_agent::RemoteHome::new(
+                leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
+            ),
+        );
+        let web_shutdown = CancellationToken::new();
+        let web_launcher = make_web_launcher(
+            runtime_service,
+            layout.repo_root.clone(),
+            web_shutdown.clone(),
+        );
+        let client: Arc<dyn InteractiveRuntimeClient> = client;
+        leveler_tui::run(
+            client,
+            Some(web_launcher),
+            Some(make_url_opener()),
+            Some(remote_launcher),
+            boot,
+        )
+        .await?;
+        // Stop the TUI-owned HTTP server; the local daemon keeps running.
+        web_shutdown.cancel();
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    let app = Arc::new(Application::assemble(layout)?);
+    let model_ref = resolve_model(app.as_ref(), model)?;
+    let mode = map_mode(mode);
+
+    let session_id = if let Some(id) = session.as_deref() {
+        let session_id = leveler_core::SessionId::new(id);
+        // Fail early with a clear message if the id is unknown for this repo.
+        let db = app.open_database().await?;
+        leveler_storage::SessionRepository::new(&db)
+            .get(&session_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session `{id}` not found in this repository.\n\
+                     list sessions: leveler resume"
+                )
+            })?;
+        // A starting process reaps the zombie turns its own runtime left
+        // behind. Creating a session did that; reopening one did not — so a
+        // session resumed after the previous process was killed opened with the
+        // killed turn still marked `running`, and the interface painted a live
+        // "waiting for the model" clock over work that had been dead since the
+        // kill. Scoped to this session: reopening one must not disturb another.
+        app.reap_zombie_turns(&db, Some(&session_id)).await?;
+        session_id
+    } else {
+        app.create_session(&model_ref, "interactive session")
+            .await?
+    };
+
+    let in_process_client = Arc::new(InProcessRuntimeClient::new_with_options(
+        app.clone(),
+        model_ref.clone(),
+        mode,
+        false,
+        auto_approve,
+    ));
+    // Do not overwrite persisted mode/model with process defaults when reopening.
+    if session.is_none() {
+        in_process_client.attach_session(session_id.clone());
+    }
+    // `/web` inside the TUI binds the browser Web UI over this same in-process
+    // runtime. The service is the `InProcessRuntimeClient` itself (it implements
+    // `LocalRuntimeService`); the launcher mints a fresh token and serves on an
+    // ephemeral loopback port, returning the token-carrying URL. Aggregation
+    // mode, same as `leveler web`: without it every `/api/projects` endpoint
+    // 404s ("打开项目失败: Not Found") and the sidebar can only ever show the
+    // current repository.
+    let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+        in_process_client.clone();
+    let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+        in_process_client.clone();
+    let quit_client = in_process_client.clone();
+    let remote_repo_root = app.layout.repo_root.clone();
+    let web_shutdown = CancellationToken::new();
+    let web_launcher = make_web_launcher(
+        web_service,
+        app.layout.repo_root.clone(),
+        web_shutdown.clone(),
+    );
+
+    let client: Arc<dyn InteractiveRuntimeClient> = in_process_client;
+
+    let draft_path = app.layout.state_dir.join("draft.txt");
+    let history_path = app.layout.state_dir.join("input_history.json");
+    // The active model's context window feeds the TUI context gauge.
+    let context_window = app
+        .config
+        .models
+        .iter()
+        .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
+        .map(|m| m.profile.limits.context_window)
+        .unwrap_or(0);
+    let boot = leveler_tui::Boot {
+        session_id,
+        user: std::env::var("USER").unwrap_or_else(|_| "there".to_string()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        // Workbench Header already shows project context; no welcome card.
+        show_welcome: false,
+        draft_path: Some(draft_path),
+        history_path: Some(history_path),
+        context_window,
+        // LEVELER_LANG → ~/.leveler/config.toml lang → system → zh.
+        locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
+        untrusted_config: crate::trust_cmds::untrusted_config_display(&app.layout.repo_root),
+        reasoning_effort: app
+            .config
+            .models
+            .iter()
+            .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
+            .and_then(|m| {
+                leveler_model::resolve_reasoning_effort(None, &m.profile.reasoning).effective
+            })
+            .map(|e| e.as_wire().to_string()),
+    };
+
+    // `/remote`: the agent serves paired phones over this same in-process
+    // runtime, so remote access lives exactly as long as this session.
+    let remote_launcher = crate::remote_invite::launcher(
+        remote_service,
+        remote_repo_root,
+        leveler_remote_agent::RemoteHome::new(
+            leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
+        ),
+    );
+
+    leveler_tui::run(
+        client,
+        Some(web_launcher),
+        Some(make_url_opener()),
+        Some(remote_launcher),
+        boot,
+    )
+    .await?;
+    web_shutdown.cancel();
+    // Drop-based reapers never run past `std::process::exit`; shut the
+    // runtime down explicitly (background tasks + browser tree, R004 F7).
+    let _ = quit_client
+        .send(leveler_client_protocol::ClientCommand::Quit)
+        .await;
+    // The TUI owns the only runtime, and an in-process `/web` server is spawned
+    // detached on a token it never cancels (it serves "until the process
+    // exits"). Falling through to a normal return would drop the runtime with
+    // that task still live, which hangs the process — the terminal is restored
+    // and the composer draft/history are already persisted inside `run`, but the
+    // shell never comes back. Exit the process directly so a running Web UI can
+    // never keep the CLI alive after the user quits the TUI.
+    std::process::exit(0);
+}
+
+/// The daemon's bound transports. In TCP mode the per-repo Unix socket is
+/// bound too — as the ownership lock that proves no other live daemon serves
+/// this repository (a fresh ephemeral TCP port proves nothing, and startup
+/// reaps `running` turns on that proof). The Unix socket is served as well,
+/// so same-machine clients can attach token-less.
+struct BoundServers {
+    unix: Option<LocalSocketServer>,
+    tcp: Option<(TcpRuntimeServer, String)>,
+}
+
+/// Bind the daemon transports: always the per-repo Unix socket (ownership
+/// lock + local clients), plus the loopback TCP listener when `tcp` is set.
+/// Binding the socket FIRST is what makes a second daemon on the same repo
+/// fail fast instead of reaping the first daemon's active turns.
+async fn bind_daemon_transports(
+    socket_path: &Path,
+    tcp: Option<SocketAddr>,
+    token: Option<String>,
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+) -> anyhow::Result<BoundServers> {
+    let unix = LocalSocketServer::bind(socket_path, service.clone()).await?;
+    let tcp = match tcp {
+        Some(addr) => {
+            let token = token.unwrap_or_else(generate_daemon_token);
+            let server = TcpRuntimeServer::bind(addr, token.clone(), service).await?;
+            Some((server, token))
+        }
+        None => None,
+    };
+    Ok(BoundServers {
+        unix: Some(unix),
+        tcp,
+    })
+}
+
+/// A 256-bit bearer token from the OS CSPRNG, hex-encoded. Never derived from
+/// time/pid — it is the daemon's only network auth secret, so it must be
+/// unpredictable.
+fn generate_daemon_token() -> String {
+    use std::fmt::Write;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+    let mut token = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(token, "{b:02x}");
+    }
+    token
+}
+
+/// Open `url` in the OS default browser, best-effort (any failure is ignored —
+/// the URL is still shown in the TUI notification as a fallback).
+/// Environment variable carrying the daemon bearer token. Secrets never go on
+/// argv (`ps` exposes it); the spawning WebUI passes the token this way.
+pub(crate) const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cmd_serve(
+    layout: Layout,
+    model: Option<String>,
+    mode: RunMode,
+    auto_approve: bool,
+    sandbox: bool,
+    socket: Option<PathBuf>,
+    tcp: Option<SocketAddr>,
+    ready_json: Option<PathBuf>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let socket_path = socket.unwrap_or_else(|| layout.socket_path());
+    let app = Arc::new(Application::assemble(layout)?);
+    let model_ref = resolve_model(app.as_ref(), model)?;
+
+    // Minted here so the runtime can retire this process itself once work
+    // drains (ShutdownWhenIdle); the signal handlers below cancel the same
+    // token, so there is one shutdown path rather than two.
+    let shutdown = CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new_with_options(
+            app.clone(),
+            model_ref.clone(),
+            map_mode(mode),
+            sandbox,
+            auto_approve,
+        )
+        .with_process_shutdown(shutdown.clone())
+        .with_durable_wire_ack(),
+    );
+    let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
+
+    // Token comes from the environment when a supervising process (the WebUI
+    // aggregator) supplied one; otherwise mint a fresh one. Never from argv.
+    let token = tcp.map(|_| {
+        std::env::var(DAEMON_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(generate_daemon_token)
+    });
+    // Bind first — a successful Unix socket bind proves no live daemon owns
+    // this repo, so afterwards startup may classify old `running` rows as
+    // crash leftovers. TCP mode binds the socket too (ownership lock + local
+    // token-less clients); an ephemeral TCP port alone proves nothing.
+    let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
+
+    let runtime_id = app.runtime_id()?;
+    // Recovery is an authoritative write, performed as this runtime's boot.
+    // The socket lock proves no other daemon is live — not that no TUI or
+    // `leveler run` is — so only turns of boots proven dead are reaped.
+    let db = app.open_database().await?;
+    let engine = app.task_engine(&db)?;
+    let reap =
+        leveler_engine::reap_after_restart(&engine, None, leveler_engine::ReapScope::EndedBoots)
+            .await?;
+    leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
+    for conflict in &reap.conflicts {
+        tracing::warn!(session = conflict.session_id.as_str(), refusal = ?conflict.refusal,
+            "not reaping running turns without proof their boot has ended");
+    }
+    if !reap.events.is_empty() {
+        tracing::warn!(
+            reaped = reap.events.len(),
+            "reaped zombie turns before daemon startup"
+        );
+    }
+
+    if let Some(path) = &ready_json {
+        // Machine-readable readiness for the supervising process (spawned by
+        // the WebUI aggregator or an ensure-daemon TUI): where to connect,
+        // how to authenticate, and which runtime identity is serving.
+        let ready = serde_json::json!({
+            "pid": std::process::id(),
+            "socket": socket_path,
+            "addr": bound.tcp.as_ref().map(|(s, _)| s.local_addr()).transpose()?.map(|a| a.to_string()),
+            "token": bound.tcp.as_ref().map(|(_, t)| t.clone()),
+            "runtime_id": runtime_id.as_str(),
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
+    }
+
+    println!("{}", Line::heading("Local runtime ready"));
+    if let Some(server) = &bound.unix {
+        println!("  socket: {}", server.path().display());
+    }
+    if let Some((server, token)) = &bound.tcp {
+        println!("  tcp: {}", server.local_addr()?);
+        // Printed once to the operator's own terminal: this is how a WebUI /
+        // external client authenticates. Not logged elsewhere.
+        println!("  token: {token}");
+    }
+    println!("  model: {model_ref}");
+    println!("  runtime: {runtime_id}");
+    println!("  press Ctrl+C to stop the daemon");
+
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
+        // must not orphan background tasks / the browser tree (R004 F7).
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            // SIGHUP: a closing spawn terminal must trigger the same graceful
+            // path, never a default hard kill that orphans background tasks
+            // and wipes session policy (R006 R6-P2).
+            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            signal_shutdown.cancel();
+        }
+        #[cfg(not(unix))]
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_shutdown.cancel();
+        }
+    });
+    let unix_serve = async {
+        match bound.unix {
+            Some(server) => server.serve(shutdown.clone()).await,
+            None => Ok(()),
+        }
+    };
+    let tcp_serve = async {
+        match bound.tcp {
+            Some((server, _)) => server.serve(shutdown.clone()).await,
+            None => Ok(()),
+        }
+    };
+    let result = tokio::try_join!(unix_serve, tcp_serve);
+    // Stopping the daemon is an explicit runtime shutdown, unlike closing a
+    // TUI client. Cancel and reap any remaining turns before process exit.
+    let _ = runtime
+        .send(leveler_client_protocol::ClientCommand::Quit)
+        .await;
+    result?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Start the browser WebUI server. Default: assemble an in-process runtime
+/// (like `serve`); with `--connect`, bridge an existing TCP daemon instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cmd_web(
+    layout: Layout,
+    addr: SocketAddr,
+    connect: Option<SocketAddr>,
+    token: Option<String>,
+    model: Option<String>,
+    mode: RunMode,
+    auto_approve: bool,
+    sandbox: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    // The owned runtime is kept only so an in-process server can shut it down
+    // explicitly on exit; a connected daemon belongs to another process. The
+    // in-process path runs in aggregation mode: the primary repository behind
+    // a RouterService, plus registered project daemons (probe-or-spawn).
+    let (server, runtime, token) = match connect {
+        Some(daemon_addr) => {
+            let token =
+                token.ok_or_else(|| anyhow::anyhow!("--token is required with --connect"))?;
+            let client = LocalSocketRuntimeClient::connect_tcp(daemon_addr, token.clone()).await?;
+            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+                Arc::new(DaemonService(client));
+            // Aggregation is available in --connect mode too, so the WebUI's
+            // "open project" flow works (POST /api/projects) instead of 404ing.
+            // The daemon is the primary behind the RouterService; added projects
+            // get their own probe-or-spawn daemons like the in-process path.
+            let router = leveler_web::RouterService::new(service, layout.repo_root.clone());
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                leveler_core::LevelerHome::resolve(leveler_core::environment()),
+                std::env::current_exe().ok(),
+            );
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
+            (server, None, token)
+        }
+        None => {
+            if token.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--token is only meaningful with --connect (without it, a token is generated)"
+                ));
+            }
+            let app = Arc::new(Application::assemble(layout)?);
+            let model_ref = resolve_model(app.as_ref(), model)?;
+            let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
+                app.clone(),
+                model_ref,
+                map_mode(mode),
+                sandbox,
+                auto_approve,
+            ));
+            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
+            let db = app.open_database().await?;
+            let engine = app.task_engine(&db)?;
+            let reap = leveler_engine::reap_after_restart(
+                &engine,
+                None,
+                leveler_engine::ReapScope::EndedBoots,
+            )
+            .await?;
+            leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
+            if !reap.events.is_empty() {
+                tracing::warn!(
+                    reaped = reap.events.len(),
+                    "reaped zombie turns before WebUI startup"
+                );
+            }
+            let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                leveler_core::LevelerHome::resolve(leveler_core::environment()),
+                std::env::current_exe().ok(),
+            );
+            // Bring persisted projects online in the background — the server
+            // must not wait on daemons that need spawning. Then register
+            // every repository that has Leveler state (TUI-only projects), so
+            // the sidebar lists all previously used projects.
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
+            let token = generate_daemon_token();
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
+            (server, Some(runtime), token)
+        }
+    };
+
+    println!("{}", Line::heading("Web UI ready"));
+    // Printed once to the operator's own terminal: the URL carries the bearer
+    // token the browser needs. Not logged elsewhere.
+    println!("  url: http://{}/?token={token}", server.local_addr());
+    println!("  press Ctrl+C to stop the server");
+
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
+        // must not orphan background tasks / the browser tree (R004 F7).
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            // SIGHUP: a closing spawn terminal must trigger the same graceful
+            // path, never a default hard kill that orphans background tasks
+            // and wipes session policy (R006 R6-P2).
+            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            signal_shutdown.cancel();
+        }
+        #[cfg(not(unix))]
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_shutdown.cancel();
+        }
+    });
+    let result = server.serve(shutdown).await;
+    if let Some(runtime) = runtime {
+        // Stopping an in-process server is an explicit runtime shutdown,
+        // unlike closing a browser tab. Cancel and reap remaining turns.
+        let _ = runtime
+            .send(leveler_client_protocol::ClientCommand::Quit)
+            .await;
+    }
+    result?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// A `LocalRuntimeService` facade over a TCP-connected daemon client: the
+/// transport client has the right methods but cannot implement the trait in
+/// its own crate without a dependency cycle, so the impl lives here.
+struct DaemonService(LocalSocketRuntimeClient);
+
+#[async_trait::async_trait]
+impl InteractiveRuntimeClient for DaemonService {
+    async fn send(
+        &self,
+        command: leveler_client_protocol::ClientCommand,
+    ) -> Result<(), leveler_client_protocol::ClientError> {
+        self.0.send(command).await
+    }
+
+    async fn deliver(
+        &self,
+        envelope: leveler_client_protocol::CommandEnvelope,
+    ) -> Result<(), leveler_client_protocol::ClientError> {
+        self.0.deliver(envelope).await
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
+        self.0.subscribe()
+    }
+
+    fn subscribe_session(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
+        self.0.subscribe_session(session_id)
+    }
+
+    async fn snapshot(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<leveler_client_protocol::UiSessionSnapshot, leveler_client_protocol::ClientError>
+    {
+        self.0.snapshot(session_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl leveler_local_transport::LocalRuntimeService for DaemonService {
+    async fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<leveler_local_transport::SessionBootstrap, leveler_client_protocol::ClientError>
+    {
+        self.0.create_session(request).await
+    }
+
+    async fn local_waiter_count(&self) -> Result<usize, leveler_client_protocol::ClientError> {
+        self.0.local_waiter_count().await
+    }
+
+    async fn runtime_info(
+        &self,
+    ) -> Result<leveler_client_protocol::RuntimeInfo, leveler_client_protocol::ClientError> {
+        leveler_local_transport::LocalRuntimeService::runtime_info(&self.0).await
+    }
+}
+
+/// Interactive resume: reopen a session in the TUI (the mainstream `resume`).
+/// With no id, list recent sessions so the user can pick one to reopen.
+pub(crate) async fn cmd_resume(
+    layout: Layout,
+    id: Option<String>,
+    config_overridden: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    let Some(id) = id else {
+        return list_sessions_for_resume(layout).await;
+    };
+    // Reopen reuses the TUI session path; persisted model/mode are restored.
+    cmd_tui(
+        layout,
+        None,
+        RunMode::Assisted,
+        false,
+        false,
+        None,
+        Some(id),
+        config_overridden,
+    )
+    .await
+}
+
+/// Print recent sessions with a copy-paste `leveler resume <id>` hint.
+async fn list_sessions_for_resume(layout: Layout) -> anyhow::Result<std::process::ExitCode> {
+    let app = Application::assemble(layout)?;
+    let db = app.open_database().await?;
+    let sessions = leveler_storage::SessionRepository::new(&db).list().await?;
+    if sessions.is_empty() {
+        println!(
+            "{}",
+            Line::warn("No sessions yet. Start one with `leveler`.")
+        );
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    println!(
+        "{}",
+        Line::heading("Recent sessions — reopen with `leveler resume <id>`")
+    );
+    for s in sessions.iter().take(20) {
+        println!("  {}  [{}]  {}", s.id, s.status.as_str(), s.goal);
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// A one-line notice when this repository has work that could be resumed.
+///
+/// R6-P5: the affordance gap is not that resume is missing — it is that
+/// starting fresh is the silent default, so an interrupted long-running goal
+/// is easy to abandon by accident. Returns `None` when there is nothing to
+/// resume, and never fails the launch: a hint that cannot be produced is not
+/// a reason to refuse to start.
+async fn resumable_session_hint(layout: &Layout) -> Option<String> {
+    let app = Application::assemble(layout.clone()).ok()?;
+    let db = app.open_database().await.ok()?;
+    let sessions = leveler_storage::SessionRepository::new(&db)
+        .list()
+        .await
+        .ok()?;
+    let rows: Vec<(String, String, String)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.status.as_str().to_string(), s.goal.clone()))
+        .collect();
+    format_resumable_hint(&rows).map(|body| Line::warn(&body).to_string())
+}
+
+/// Pure formatting half of [`resumable_session_hint`], split out so the rule
+/// (which statuses count, what the user is told) is testable without a daemon.
+fn format_resumable_hint(sessions: &[(String, String, String)]) -> Option<String> {
+    let resumable: Vec<_> = sessions
+        .iter()
+        .filter(|(_, status, _)| matches!(status.as_str(), "incomplete" | "blocked"))
+        .collect();
+    let (id, status, goal) = resumable.first()?;
+    let first_line = goal.lines().next().unwrap_or("").trim();
+    let goal = if first_line.chars().count() > 60 {
+        let cut: String = first_line.chars().take(60).collect();
+        format!("{cut}…")
+    } else {
+        first_line.to_string()
+    };
+    let more = match resumable.len() {
+        1 => String::new(),
+        n => format!(" (+{} more — `leveler resume`)", n - 1),
+    };
+    Some(format!(
+        "Starting a NEW session. Unfinished work here: {id} [{status}] {goal}{more}\n  \
+         resume it with: leveler --session {id}"
+    ))
+}
+
+/// Headless recovery of an interrupted non-interactive run (`run --resume`).
+pub(crate) async fn cmd_run_resume(
+    layout: Layout,
+    id: String,
+    auto_approve: bool,
+    confirm_recovery: bool,
+    output: OutputFormat,
+) -> anyhow::Result<std::process::ExitCode> {
+    // Axes SoT is the session row: resume_session reloads work_profile /
+    // collaboration from DB. assemble() defaults (balanced) must not stick.
+    let app = Application::assemble(layout)?;
+    let session_id = leveler_core::SessionId::new(id.clone());
+
+    // The explicit answer to a RecoveryConfirmationRequired stop: the user
+    // inspected the workspace, so close the interrupted call(s) first.
+    if confirm_recovery {
+        let closed = app.acknowledge_crash_window(&session_id).await?;
+        if output == OutputFormat::Text {
+            println!(
+                "{}",
+                Line::warn(&format!(
+                    "Acknowledged {closed} interrupted tool call(s); they were NOT replayed."
+                ))
+            );
+        }
+    }
+
+    if output == OutputFormat::Text {
+        println!("{}", Line::heading(&format!("Resuming session {id}")));
+        if let Ok((wp, collab)) = app.session_product_axes(&session_id).await {
+            println!("  work-mode: {} · collab: {}", wp.as_str(), collab.as_str());
+        }
+    }
+
+    let approver = build_approver(auto_approve);
+    let cancellation = CancellationToken::new();
+    spawn_interrupt_handler(cancellation.clone());
+
+    let result = app
+        .resume_session(
+            &session_id,
+            approver,
+            &mut |e| render_event(e, output),
+            cancellation,
+        )
+        .await;
+
+    finish(result, &id, output)
+}
+
+/// Run the git/GitHub workflow for the produced changes and print the result.
+async fn ship_changes_and_print(
+    app: &Application,
+    model: &leveler_model::ModelRef,
+    goal: &str,
+    modified: &[String],
+    verified: bool,
+    ship: &leveler_app::ShipOptions,
+) {
+    println!("{}", Line::heading("Shipping changes"));
+    match app
+        .ship_changes(
+            goal,
+            modified,
+            verified,
+            model,
+            ship,
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(out) => {
+            if out.committed {
+                let sha = out
+                    .commit_sha
+                    .as_deref()
+                    .map(|s| format!(" ({})", &s[..s.len().min(8)]))
+                    .unwrap_or_default();
+                println!("{}", Line::ok(&format!("committed to {}{sha}", out.branch)));
+            }
+            if out.pushed {
+                println!("{}", Line::ok(&format!("pushed {}", out.branch)));
+            }
+            if let Some(url) = &out.pr_url {
+                println!("{}", Line::ok(&format!("pull request: {url}")));
+            }
+            for note in &out.notes {
+                println!("{}", Line::warn(note));
+            }
+        }
+        Err(e) => println!("{}", Line::fail(&format!("ship failed: {e}"))),
+    }
+    println!();
+}
+
+/// Render the final summary and pick an exit code, handling cancellation
+/// gracefully (a cancelled run is resumable, not a hard error).
+fn finish(
+    result: Result<leveler_agent::AgentOutcome, leveler_app::AppError>,
+    session_id: &str,
+    output: OutputFormat,
+) -> anyhow::Result<std::process::ExitCode> {
+    match result {
+        Ok(outcome) => {
+            if output == OutputFormat::Text {
+                println!();
+                if !outcome.modified_files.is_empty() {
+                    println!("{}", Line::heading("Modified files"));
+                    for f in &outcome.modified_files {
+                        println!("  {f}");
+                    }
+                    println!();
+                }
+                match outcome.stop_reason {
+                    StopReason::Completed => println!(
+                        "{}",
+                        Line::ok(&format!("Completed in {} round(s).", outcome.rounds))
+                    ),
+                    StopReason::Answered => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Answer ended after {} round(s); task completion was not independently verified.",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::Incomplete => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Stopped after {} round(s): completeness could not be established.",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::BudgetExhausted => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Stopped after {} round(s): {} Resume with: leveler resume {session_id}",
+                            outcome.rounds, outcome.final_text
+                        ))
+                    ),
+                    StopReason::TurnLimitReached => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Hit absolute round ceiling after {} round(s). \
+                             The turn was force-stopped to guarantee termination; \
+                             check if the model was looping.",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::Blocked => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Stopped: the model reported the goal blocked after {} round(s).",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::Stalled => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Stopped: the model went quiet without resolving the goal \
+                             after {} round(s) (not verified).",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::CompletedUnverified => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Completed in {} round(s); the project's checks did not run.",
+                            outcome.rounds
+                        ))
+                    ),
+                    StopReason::CompletedChecksFailed => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Completed in {} round(s), but the project's checks failed: {}",
+                            outcome.rounds,
+                            outcome
+                                .stop_detail
+                                .as_deref()
+                                .unwrap_or("see verification output")
+                        ))
+                    ),
+                }
+            } else {
+                emit_jsonl(serde_json::json!({
+                    "type": "session_completed",
+                    "session_id": session_id,
+                    "stop_reason": format!("{:?}", outcome.stop_reason),
+                    "rounds": outcome.rounds,
+                    "modified_files": outcome.modified_files,
+                }));
+            }
+            let ok = outcome.stop_reason == StopReason::Completed;
+            Ok(if ok {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            })
+        }
+        Err(leveler_app::AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
+            if output == OutputFormat::Text {
+                println!(
+                    "\n{}",
+                    Line::warn(&format!(
+                        "Interrupted. Resume with: leveler resume {session_id}"
+                    ))
+                );
+            } else {
+                emit_jsonl(serde_json::json!({
+                    "type": "session_interrupted",
+                    "session_id": session_id,
+                }));
+            }
+            Ok(std::process::ExitCode::from(130))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tui_runtime_selection_tests {
+    use super::*;
+    use leveler_local_transport::LocalRuntimeService;
+
+    #[test]
+    fn daemon_token_is_256_bits_of_hex_and_not_constant() {
+        let a = generate_daemon_token();
+        let b = generate_daemon_token();
+        assert_eq!(a.len(), 64, "256-bit token → 64 hex chars: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b, "a CSPRNG token must not repeat");
+    }
+
+    #[test]
+    fn default_launch_probes_an_existing_daemon_without_requiring_it() {
+        assert_eq!(
+            socket_intent(
+                /*in_process*/ false, /*auto_approve*/ false,
+                /*explicit_socket*/ false, /*config_overridden*/ false,
+            ),
+            SocketIntent::ProbeDefault,
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_default_daemon_is_an_embedded_fallback_not_an_error() {
+        let socket = std::env::temp_dir().join(format!(
+            "leveler-missing-daemon-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        assert!(connect_default_runtime(&socket).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_socket_is_required_and_never_silently_downgraded() {
+        assert_eq!(
+            socket_intent(false, false, true, false),
+            SocketIntent::RequireExplicit,
+        );
+    }
+
+    #[test]
+    fn non_replayable_launch_options_force_the_embedded_runtime() {
+        // `config_overridden` still forces embedded this round (invocation-scoped
+        // config a running daemon cannot inherit), as does `--in-process`.
+        assert_eq!(
+            socket_intent(false, false, false, true),
+            SocketIntent::Embedded,
+        );
+        assert_eq!(
+            socket_intent(true, false, false, false),
+            SocketIntent::Embedded,
+        );
+    }
+
+    // R1: `--auto-approve` is no longer an invocation-scoped reason to embed the
+    // runtime in the TUI. It becomes a per-session approval policy carried on the
+    // CreateSessionRequest, so an unattended goal runs in the daemon and survives
+    // client disconnect. (§6.A)
+    #[test]
+    fn auto_approve_attaches_to_the_daemon_via_session_scoped_policy() {
+        assert_eq!(
+            socket_intent(
+                /*in_process*/ false, /*auto_approve*/ true,
+                /*explicit_socket*/ false, /*config_overridden*/ false,
+            ),
+            SocketIntent::ProbeDefault,
+        );
+    }
+
+    // §6.C — an explicit `--in-process` must still win over `--auto-approve`.
+    #[test]
+    fn in_process_wins_over_auto_approve() {
+        assert_eq!(
+            socket_intent(true, true, false, false),
+            SocketIntent::Embedded,
+        );
+    }
+
+    #[test]
+    fn explicit_socket_wins_over_implicit_reuse_restrictions() {
+        assert_eq!(
+            socket_intent(false, false, true, true),
+            SocketIntent::RequireExplicit,
+        );
+    }
+
+    #[test]
+    fn in_process_and_socket_clients_are_the_same_web_capability() {
+        fn check<T: LocalRuntimeService + InteractiveRuntimeClient + Send + Sync + 'static>() {}
+        check::<InProcessRuntimeClient>();
+        check::<LocalSocketRuntimeClient>();
+    }
+
+    #[test]
+    fn tui_web_does_not_shell_out_to_leveler_web() {
+        let src = include_str!("run_cmds.rs");
+        assert!(
+            !src.contains("arg(\"web\")"),
+            "/web must call leveler-web, not spawn `leveler web`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_launcher_tests {
+    use super::*;
+    use leveler_client_protocol::{
+        ClientCommand, ClientError, InteractiveRuntimeClient, RuntimeEvent, SessionId,
+        UiSessionSnapshot,
+    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    use tokio::sync::broadcast;
+
+    struct StubService {
+        events: broadcast::Sender<RuntimeEvent>,
+    }
+
+    impl StubService {
+        fn new() -> Self {
+            Self {
+                events: broadcast::channel(8).0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for StubService {
+        async fn send(&self, _command: ClientCommand) -> Result<(), ClientError> {
+            Ok(())
+        }
+        async fn deliver(
+            &self,
+            _envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+        fn subscribe_session(&self, _session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+        async fn snapshot(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<UiSessionSnapshot, ClientError> {
+            Err(ClientError::Runtime("not exercised".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRuntimeService for StubService {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            Err(ClientError::Runtime("not exercised".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn make_web_launcher_binds_loopback_with_a_bearer_token() {
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
+        let shutdown = CancellationToken::new();
+        let url = bind_tui_web_ui(
+            service,
+            PathBuf::from("/tmp/web-cap-repo"),
+            shutdown.clone(),
+        )
+        .await
+        .expect("bind Web UI");
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "must be loopback, got {url}"
+        );
+        assert!(!url.contains("0.0.0.0"), "{url}");
+        let token = url.split("token=").nth(1).expect("token-bearing URL");
+        assert_eq!(token.len(), 64, "{url}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{url}");
+        let status = get_projects_status(&url).await;
+        assert_eq!(
+            status, 200,
+            "/api/projects must stay on the multi-project surface, got {status}"
+        );
+        shutdown.cancel();
+    }
+
+    async fn get_projects_status(url: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("host");
+        let mut stream = tokio::net::TcpStream::connect(host)
+            .await
+            .expect("connect web");
+        let req = format!(
+            "GET /api/projects?token={token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+            token = url.split("token=").nth(1).unwrap_or("")
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        resp.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn make_web_launcher_returns_the_bound_url() {
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
+        let shutdown = CancellationToken::new();
+        let launcher = make_web_launcher(
+            service,
+            PathBuf::from("/tmp/web-cap-repo"),
+            shutdown.clone(),
+        );
+        let url = launcher().await.expect("bind Web UI");
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        shutdown.cancel();
+    }
+}
+
+// Unix sockets + the loopback TCP daemon are unix-only; on Windows the
+// transport returns Unavailable by design, so these binding tests are gated.
+#[cfg(all(test, unix))]
+mod daemon_bind_tests {
+    use super::*;
+    use leveler_client_protocol::{
+        ClientCommand, ClientError, NotificationLevel, RuntimeEvent, SessionId, UiSessionSnapshot,
+        mock::MockRuntimeClient,
+    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::broadcast;
+
+    /// Minimal LocalRuntimeService for bind tests: command surface is never
+    /// exercised, only the transports are bound.
+    struct TestService {
+        mock: MockRuntimeClient,
+        session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
+        raw_sends: AtomicUsize,
+        deliveries: AtomicUsize,
+    }
+
+    impl TestService {
+        fn session_sender(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
+            self.session_events
+                .lock()
+                .unwrap()
+                .entry(session_id.clone())
+                .or_insert_with(|| broadcast::channel(64).0)
+                .clone()
+        }
+
+        fn emit_for(&self, session_id: &SessionId, event: RuntimeEvent) {
+            let _ = self.session_sender(session_id).send(event);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for TestService {
+        async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            self.raw_sends.fetch_add(1, Ordering::SeqCst);
+            self.mock.send(command).await
+        }
+        async fn deliver(
+            &self,
+            envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), ClientError> {
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            self.mock.deliver(envelope).await
+        }
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.mock.subscribe()
+        }
+        fn subscribe_session(&self, session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+            self.session_sender(session_id).subscribe()
+        }
+        async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+            self.mock.snapshot(session_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRuntimeService for TestService {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            Err(ClientError::Runtime("not exercised".to_string()))
+        }
+    }
+
+    fn test_service() -> Arc<TestService> {
+        Arc::new(TestService {
+            mock: MockRuntimeClient::new(SessionId::new("s-test")),
+            session_events: Mutex::new(HashMap::new()),
+            raw_sends: AtomicUsize::new(0),
+            deliveries: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn connected_web_bridge_preserves_the_daemon_s_runtime_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let upstream = test_service();
+        let mut bound = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some("bridge-token".to_string()),
+            upstream.clone(),
+        )
+        .await
+        .expect("daemon transports bind");
+        let (server, token) = bound.tcp.take().expect("TCP transport");
+        let addr = server.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, token)
+            .await
+            .expect("web bridge connects to daemon");
+        let session_id = SessionId::new("s1");
+        client
+            .send(ClientCommand::OpenSession {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("opens the daemon's per-session subscription");
+        let bridge = DaemonService(client);
+        let mut events = bridge.subscribe_session(&session_id);
+
+        upstream.emit_for(
+            &session_id,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Info,
+                message: "session-only".to_string(),
+            },
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("the web bridge lost the daemon's per-session stream")
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Notification { message, .. } if message == "session-only"
+        ));
+
+        let sends_before = upstream.raw_sends.load(Ordering::SeqCst);
+        bridge
+            .issue(session_id, ClientCommand::RequestSessionList)
+            .await
+            .expect("the web bridge delivers an enveloped command");
+        assert_eq!(
+            upstream.deliveries.load(Ordering::SeqCst),
+            1,
+            "the web bridge must preserve the daemon's idempotent delivery boundary"
+        );
+        assert_eq!(
+            upstream.raw_sends.load(Ordering::SeqCst),
+            sends_before,
+            "an enveloped web command must not be downgraded to raw send"
+        );
+        assert_eq!(
+            bridge.local_waiter_count().await.unwrap(),
+            2,
+            "the daemon sees the bridge's global and per-session subscriptions; \
+             returning the facade default of one would hide both"
+        );
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_mode_binds_the_unix_ownership_socket_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let bound = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some("test-token".to_string()),
+            test_service(),
+        )
+        .await
+        .expect("binds");
+        assert!(bound.unix.is_some(), "TCP 模式也必须占住 Unix 锁 socket");
+        assert!(sock.exists(), "锁 socket 文件必须真的落盘");
+        let (tcp_server, token) = bound.tcp.as_ref().expect("tcp bound");
+        assert_eq!(
+            token, "test-token",
+            "env 提供的 token 必须被沿用而不是重新生成"
+        );
+        assert!(tcp_server.local_addr().unwrap().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn local_socket_client_feeds_the_shared_web_binder() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let mut bound = bind_daemon_transports(&sock, None, None, test_service())
+            .await
+            .expect("unix daemon");
+        let unix = bound.unix.take().expect("unix listener");
+        let daemon_shutdown = CancellationToken::new();
+        let daemon_task = tokio::spawn(unix.serve(daemon_shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&sock)
+            .await
+            .expect("tui-style socket client");
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(client);
+        let shutdown = CancellationToken::new();
+        let url = bind_tui_web_ui(service, dir.path().to_path_buf(), shutdown.clone())
+            .await
+            .expect("socket-backed /web");
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "loopback only, got {url}"
+        );
+        assert!(url.contains("?token="), "{url}");
+        shutdown.cancel();
+        daemon_shutdown.cancel();
+        let _ = daemon_task.await;
+    }
+
+    #[tokio::test]
+    async fn second_daemon_on_the_same_socket_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let _first = bind_daemon_transports(&sock, None, None, test_service())
+            .await
+            .expect("first daemon binds");
+        let second = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            None,
+            test_service(),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "同一仓库上的第二个 daemon 必须 bind 失败（否则会把第一个的活跃 turn 当僵尸 reap）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_hint_tests {
+    use super::format_resumable_hint;
+
+    fn row(id: &str, status: &str, goal: &str) -> (String, String, String) {
+        (id.to_string(), status.to_string(), goal.to_string())
+    }
+
+    /// R6-P5: an interrupted goal must be visible BEFORE another session is
+    /// silently created, and the notice must carry the id the user needs.
+    #[test]
+    fn unfinished_work_is_announced_with_the_command_to_resume() {
+        let hint = format_resumable_hint(&[row("sess-1", "incomplete", "fix inherited auth")])
+            .expect("an incomplete session must produce a hint");
+        assert!(hint.contains("sess-1"), "{hint}");
+        assert!(hint.contains("leveler --session sess-1"), "{hint}");
+        assert!(hint.contains("fix inherited auth"), "{hint}");
+    }
+
+    /// Finished work is not unfinished work — no nagging.
+    #[test]
+    fn completed_sessions_produce_no_hint() {
+        assert!(format_resumable_hint(&[row("s", "completed", "done")]).is_none());
+        assert!(format_resumable_hint(&[]).is_none());
+    }
+
+    /// A blocked session needs attention and is resumable, so it counts.
+    #[test]
+    fn blocked_sessions_count_as_resumable() {
+        assert!(format_resumable_hint(&[row("s", "blocked", "needs input")]).is_some());
+    }
+
+    /// Several resumable sessions: name the newest, point at the list for the
+    /// rest rather than printing a wall of ids at launch.
+    #[test]
+    fn extra_sessions_are_summarised_not_listed() {
+        let hint = format_resumable_hint(&[
+            row("newest", "incomplete", "goal a"),
+            row("older", "incomplete", "goal b"),
+            row("oldest", "blocked", "goal c"),
+        ])
+        .unwrap();
+        assert!(hint.contains("newest"), "{hint}");
+        assert!(hint.contains("+2 more"), "{hint}");
+        assert!(!hint.contains("oldest"), "must not list every id: {hint}");
+    }
+
+    /// A long multi-line goal must not flood the launch line.
+    #[test]
+    fn long_goals_are_truncated_to_one_line() {
+        let goal = "x".repeat(200) + "\nsecond line";
+        let hint = format_resumable_hint(&[row("s", "incomplete", &goal)]).unwrap();
+        assert!(hint.contains('…'), "{hint}");
+        assert!(!hint.contains("second line"), "{hint}");
+        assert!(hint.lines().count() <= 2, "{hint}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_consistency_tests {
+    use super::{RuntimeConsistency, classify_runtime, classify_runtime_generation};
+    use leveler_client_protocol::{RuntimeHealth, RuntimeInfo};
+    use leveler_core::{BuildIdentity, RuntimeId};
+
+    fn build(version: &str, revision: &str, dirty: bool) -> BuildIdentity {
+        BuildIdentity {
+            version: version.into(),
+            revision: revision.into(),
+            dirty,
+        }
+    }
+
+    fn clean(revision: &str) -> BuildIdentity {
+        build("0.2.0-beta.1", revision, false)
+    }
+
+    fn runtime(build: BuildIdentity, fingerprint: Option<&str>) -> RuntimeInfo {
+        RuntimeInfo {
+            runtime_id: RuntimeId::new("runtime"),
+            version: build.version.clone(),
+            build,
+            config_fingerprint: fingerprint.map(str::to_string),
+            pid: 1,
+            health: RuntimeHealth::default(),
+        }
+    }
+
+    #[test]
+    fn the_same_build_is_reused() {
+        let me = clean("abc123");
+        assert!(matches!(
+            classify_runtime(Some(&me.clone()), &me),
+            RuntimeConsistency::Current
+        ));
+    }
+
+    #[test]
+    fn the_same_build_with_a_different_config_is_replaced() {
+        let me = clean("abc123");
+        let reported = runtime(me.clone(), Some("sha256:old"));
+        assert!(matches!(
+            classify_runtime_generation(Some(&reported), &me, "sha256:new"),
+            RuntimeConsistency::ConfigChanged
+        ));
+    }
+
+    #[test]
+    fn a_runtime_without_a_config_generation_is_unknown() {
+        let me = clean("abc123");
+        let reported = runtime(me.clone(), None);
+        assert!(matches!(
+            classify_runtime_generation(Some(&reported), &me, "sha256:new"),
+            RuntimeConsistency::Unknown
+        ));
+    }
+
+    /// THE incident, as a decision: two builds calling themselves
+    /// `0.2.0-beta.1` are not thereby the same build, and the one that has
+    /// been running since yesterday is the one that must go.
+    #[test]
+    fn same_version_different_revision_is_outdated() {
+        let expected = clean("new111");
+        match classify_runtime(Some(&clean("old999")), &expected) {
+            RuntimeConsistency::Outdated { runtime, .. } => {
+                assert_eq!(runtime.revision, "old999");
+            }
+            other => panic!("a different build must be Outdated, got {other:?}"),
+        }
+    }
+
+    /// A daemon old enough to predate the handshake reports nothing. Nothing
+    /// is Unknown — and Unknown is never replaced on a guess, because a
+    /// runtime we cannot reason about may be holding live work.
+    #[test]
+    fn a_runtime_that_reports_nothing_is_unknown() {
+        assert!(matches!(
+            classify_runtime(None, &clean("abc123")),
+            RuntimeConsistency::Unknown
+        ));
+        assert!(matches!(
+            classify_runtime(Some(&BuildIdentity::default()), &clean("abc123")),
+            RuntimeConsistency::Unknown
+        ));
+        assert!(matches!(
+            classify_runtime(
+                Some(&build("0.2.0-beta.1", "unknown", false)),
+                &clean("abc")
+            ),
+            RuntimeConsistency::Unknown
+        ));
+    }
+
+    /// The dirty matrix. A modified tree is not identified by the commit it
+    /// was modified from, so it matches nothing — not a clean build of that
+    /// commit, and not another dirty build of it either.
+    #[test]
+    fn dirty_builds_are_outdated_in_every_direction() {
+        let dirty = build("0.2.0-beta.1", "abc123", true);
+        let clean_same = clean("abc123");
+        for (reported, expected) in [
+            (&dirty, &clean_same),
+            (&clean_same, &dirty),
+            (&dirty, &dirty),
+        ] {
+            assert!(
+                matches!(
+                    classify_runtime(Some(reported), expected),
+                    RuntimeConsistency::Outdated { .. }
+                ),
+                "a dirty build must never be reused: {reported:?} vs {expected:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod replacement_verification_tests {
+    use super::verify_replacement;
+    use leveler_core::BuildIdentity;
+
+    fn build(revision: &str, dirty: bool) -> BuildIdentity {
+        BuildIdentity {
+            version: "0.2.0-beta.1".into(),
+            revision: revision.into(),
+            dirty,
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_is_the_expected_build_is_accepted() {
+        let expected = build("newbuild", false);
+        assert!(verify_replacement(Some(&expected.clone()), &expected).is_ok());
+    }
+
+    /// Starting a process is not replacing a runtime. If what came up is some
+    /// third build, the bootstrap fails — and it fails once, since relaunching
+    /// a wrong build repeatedly only burns the machine.
+    #[test]
+    fn a_replacement_of_the_wrong_build_is_rejected_once() {
+        let err = verify_replacement(
+            Some(&build("someothersha", false)),
+            &build("expected", false),
+        )
+        .expect_err("a different build is not a replacement");
+        let message = err.to_string();
+        assert!(message.contains("not replaced correctly"), "{message}");
+        assert!(
+            message.contains("someothersha") && message.contains("expected"),
+            "the failure names both builds so it can be acted on: {message}"
+        );
+    }
+
+    /// A replacement that came up but says nothing about itself cannot be
+    /// verified, so it is not accepted either — silence is not proof.
+    #[test]
+    fn a_replacement_that_reports_no_identity_is_rejected() {
+        assert!(verify_replacement(None, &build("expected", false)).is_err());
+        assert!(
+            verify_replacement(Some(&BuildIdentity::default()), &build("expected", false)).is_err()
+        );
+    }
+
+    /// A dirty replacement is not the clean build that was expected.
+    #[test]
+    fn a_dirty_replacement_is_rejected() {
+        assert!(verify_replacement(Some(&build("same", true)), &build("same", false)).is_err());
+    }
+
+    /// A developer's build is dirty, and the replacement was spawned from this
+    /// process's own executable. Refusing it because "two dirty trees may
+    /// differ" refuses the binary we just launched ourselves: the TUI then
+    /// never starts on any modified tree, and says so with a message whose two
+    /// build names are the same string.
+    #[test]
+    fn a_dirty_replacement_of_this_very_build_is_accepted() {
+        let me = build("same", true);
+        assert!(
+            verify_replacement(Some(&me.clone()), &me).is_ok(),
+            "the runtime spawned from our own exe reports our own identity"
+        );
+    }
+}
+
+/// MA4-C ablation seam, EVAL ONLY: `LEVELER_EVAL_PARENT_REASONING_EFFORT`
+/// lowers the reasoning effort of the top-level `leveler run` seat while
+/// delegated children keep the model default. Unset leaves the run untouched;
+/// an unknown level is refused rather than silently ignored.
+const PARENT_REASONING_ENV: &str = "LEVELER_EVAL_PARENT_REASONING_EFFORT";
+
+fn parent_reasoning_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let effort = leveler_model::ReasoningEffort::parse(&raw).ok_or_else(|| {
+        anyhow::anyhow!("{PARENT_REASONING_ENV}: unknown reasoning effort {raw:?}")
+    })?;
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        main_reasoning_effort: Some(effort),
+        ..Default::default()
+    }))
+}
+
+#[cfg(test)]
+mod parent_reasoning_tests {
+    use super::parent_reasoning_override;
+    use leveler_model::ReasoningEffort;
+
+    #[test]
+    fn unset_leaves_the_run_without_overrides() {
+        assert!(parent_reasoning_override(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_level_sets_only_the_top_level_seat() {
+        let o = parent_reasoning_override(Some("high".into()))
+            .unwrap()
+            .expect("override");
+        assert_eq!(o.main_reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            o,
+            leveler_agent::coding::ExecutionOverrides {
+                main_reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused() {
+        assert!(parent_reasoning_override(Some("hihg".into())).is_err());
+    }
+}

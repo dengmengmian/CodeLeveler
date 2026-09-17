@@ -1,0 +1,1554 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ClientCommand",
+  "description": "A command from a UI client to the runtime.",
+  "oneOf": [
+    {
+      "description": "Submit a user message; the runtime drives a turn in the given session.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "attachments": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttachmentRef"
+          }
+        },
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "submit_message"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end.\n\nDistinct from queuing a follow-up (which `SubmitMessage` does while busy): a correction like \"actually use the other module\" is worthless once the work is finished. Ignored when no turn is running — the caller should submit normally in that case.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "steer_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_goal"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Run the Develop workflow on an explicit goal: `Analyze → Coding → Verify → Review`.\n\nDistinct from [`Self::RunGoal`] because it is a different product promise, not a different phrasing of the same one: the user is asking for the change to be investigated before it is written and read back after it is verified. An ordinary message never becomes one of these.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_develop"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import a file as an attachment; the runtime processes and stores it.\n\n`name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so.",
+      "type": "object",
+      "required": [
+        "path",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_attachment"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import an attachment from immutable base64-encoded bytes already read by a trusted client. This avoids reopening an ambient path after a security-sensitive upload or file-picker validation.",
+      "type": "object",
+      "required": [
+        "data_base64",
+        "name",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_attachment_data"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import an image from the system clipboard (spec §38.1).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_clipboard_image"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Retire this runtime once its current work has settled.\n\nOne mechanism covers both cases the caller cares about: an idle runtime drains instantly and exits, a busy one stops taking new work and exits when the work it already owns is done. The caller never polls for idleness and never kills anything — the runtime owns the drain, because only it knows what \"still working\" means.",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/definitions/RestartReason"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "shutdown_when_idle"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cooperatively cancel the running turn (graceful; resumable).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Escalate a cancel the user has already requested once.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "force_cancel_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cancel ONE running delegated child of the session's turn. The child settles as cancelled; its parent turn keeps running.",
+      "type": "object",
+      "required": [
+        "child_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "child_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_child"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Stop ONE running tool call of the session's turn (for a command, its whole process tree). The call settles with its own stop outcome; the turn keeps running. Rejected when no such call is executing.",
+      "type": "object",
+      "required": [
+        "call_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "call_id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_tool_call"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Resolve a pending permission request .",
+      "type": "object",
+      "required": [
+        "decision",
+        "request_id",
+        "type"
+      ],
+      "properties": {
+        "decision": {
+          "$ref": "#/definitions/ApprovalDecision"
+        },
+        "request_id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "approval_decision"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Answer a pending clarification (spec §35). An empty answer means \"skip\".",
+      "type": "object",
+      "required": [
+        "answer",
+        "request_id",
+        "type"
+      ],
+      "properties": {
+        "answer": {
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "answer_clarification"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Switch the model used for subsequent turns .",
+      "type": "object",
+      "required": [
+        "model",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "model": {
+          "$ref": "#/definitions/ModelRef"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "select_model"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Switch the execution mode used for subsequent turns .",
+      "type": "object",
+      "required": [
+        "mode",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/PermissionProfile"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "set_permission_profile"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced (legacy `delivery` reads as `balanced`); collaboration = chat|plan|goal.",
+      "type": "object",
+      "required": [
+        "collaboration",
+        "session_id",
+        "type",
+        "work_profile"
+      ],
+      "properties": {
+        "collaboration": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "set_product_axes"
+          ]
+        },
+        "work_profile": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Confirm a collaboration-plan proposal and auto-enter goal mode (K24).",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "description": "Optional plan body; empty uses the last assistant proposal text.",
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "confirm_plan_to_goal"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List project durable memory (active; optional archived) for TUI/CLI.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "include_archived": {
+          "description": "Include archived (forgotten) entries.",
+          "default": false,
+          "type": "boolean"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Archive (forget) one active memory id — user-authoritative (no model).",
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "forget_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable.",
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "accept_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web \"忽略\" button was doing.",
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "reject_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose.",
+      "type": "object",
+      "required": [
+        "body",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for \"apply this from now on\", which is what a preference is.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMemoryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "remember_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Recompute and push the working-tree diff.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_diff"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Summarize and compact the conversation history (spec §28, §53).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "compact_context"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Start a fresh conversation: drop the session's stored message history so the next turn carries no prior context (a real \"new chat\", not a screen clear).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "clear_conversation"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Ask for the list of stored sessions (spec §52).",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_session_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Ask for the session list and route the response only to the requesting session's event stream.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_session_list_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Start a FRESH session and switch the requester's view to it, leaving the current one intact in the session list.\n\nThis is what `/clear` does. Wiping the current session in place would be destructive and unrecoverable (it takes the checkpoints with it), which is why that shape needed a confirmation; starting a new session loses nothing, so it needs none.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "new_session_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Open a stored session, loading its transcript into the view.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "open_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Open a stored session on behalf of another currently displayed session. The switch event is delivered to the requester before the client moves its subscription to the target.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "open_session_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Delete a stored session.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "delete_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Delete a stored session and route the refreshed list to the requester.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "delete_session_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Rename a stored session (overwrite its goal/title text).",
+      "type": "object",
+      "required": [
+        "name",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "rename_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Archive a stored session: it keeps its transcript but leaves the default session list.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "archive_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fork a stored session: create a new session with a copy of the transcript, so an alternative direction can be explored without touching the original.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "fork_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Restore the conversation to a checkpoint (spec §68).",
+      "type": "object",
+      "required": [
+        "checkpoint_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "$ref": "#/definitions/CheckpointId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "restore_checkpoint"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side question (`/btw`): single-turn answer using current session context, without tools and without appending to the transcript store. Run an explicit user shell command (`!command`) in the session's repository. USER-ORIGINATED DIRECT EXECUTION: never reaches the model, the agent loop, or the tool registry. `command` is the raw shell string after the `!` prefix.",
+      "type": "object",
+      "required": [
+        "command",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_user_shell"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cancel exactly one user shell execution. Deliberately separate from `CancelCurrentTurn`: a user shell is not an agent turn, and the id match ensures a stale cancel can never kill a newer execution.",
+      "type": "object",
+      "required": [
+        "execution_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "execution_id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_user_shell"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "question",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "after": {
+          "description": "Events at/after the center (capped by the runtime).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "before": {
+          "description": "Events strictly before the center (capped by the runtime).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "center_seq": {
+          "description": "Sequence to center the event window on. `None` = latest durable seq.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`]. Distinct from envelope `command_id` (delivery idempotency): this names the query so a client can ignore another client's (or its own stale) observatory response. Absent on protocol 1.5 peers. Not a session identity.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_observability"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Read-only context-accounting query. Does not mutate the runtime or the conversation. Answers with [`crate::RuntimeEvent::ContextLoaded`].",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ContextLoaded`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_context"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Load one child's findings for the Contribution Inspector.\n\nA query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view.",
+      "type": "object",
+      "required": [
+        "child_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "child_id": {
+          "description": "Which child. Joins `FindingRecord::source_child`.",
+          "type": "string"
+        },
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ChildContributionLoaded`], so a client ignores another client's — or its own stale — response.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_child_contribution"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cut a durable goal checkpoint for the session's current goal and surface it as a Recap (long-goal P3, `/recap`).\n\nThis is NOT \"summarize the visible transcript\": the runtime projects authoritative facts (event log, evidence ledger, goal row) into a persisted GoalCheckpoint and answers with [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same event boundary — a transport retry returns the same checkpoint.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "recap"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List goals that still owe work (long-goal P2).\n\nRead-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::UnfinishedGoalsLoaded`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_unfinished_goals"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The session's past turns as clients saw them live: its durable event log projected through the same client projection, with the user's messages in place. Answered by [`crate::RuntimeEvent::SessionHistoryLoaded`].",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_session_history"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List the agent definitions the session's project resolves. Answered by [`crate::RuntimeEvent::AgentsLoaded`].",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_agents"
+          ]
+        }
+      }
+    },
+    {
+      "description": "One agent with its full definition. Answered by [`crate::RuntimeEvent::AgentLoaded`].",
+      "type": "object",
+      "required": [
+        "name",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "get_agent"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Write a new agent definition. The user's own command is the authorization; the runtime validates and writes atomically, and answers with [`crate::RuntimeEvent::AgentMutated`].",
+      "type": "object",
+      "required": [
+        "draft",
+        "scope",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "draft": {
+          "$ref": "#/definitions/UiAgentDraft"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiAgentScope"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "create_agent"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Replace an existing agent definition in `scope`.",
+      "type": "object",
+      "required": [
+        "draft",
+        "scope",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "draft": {
+          "$ref": "#/definitions/UiAgentDraft"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiAgentScope"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "update_agent"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Delete an agent definition from `scope`. Running children keep theirs.",
+      "type": "object",
+      "required": [
+        "name",
+        "scope",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiAgentScope"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "delete_agent"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "quit"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "approve_once",
+        "approve_session",
+        "approve_always",
+        "deny"
+      ]
+    },
+    "ApprovalId": {
+      "description": "Identifies a pending permission approval request.",
+      "type": "string"
+    },
+    "AttachmentId": {
+      "description": "Identifies a pending or sent attachment.",
+      "type": "string"
+    },
+    "AttachmentKind": {
+      "description": "The kind of attachment.",
+      "type": "string",
+      "enum": [
+        "image",
+        "text_file",
+        "document",
+        "unknown"
+      ]
+    },
+    "AttachmentRef": {
+      "description": "A reference to a processed, stored attachment (spec §39). Carries only metadata; the bytes are addressed by `sha256` in the media store.",
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "mime_type",
+        "name",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "id": {
+          "$ref": "#/definitions/AttachmentId"
+        },
+        "kind": {
+          "$ref": "#/definitions/AttachmentKind"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Content-address of the processed bytes in the media store.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CheckpointId": {
+      "description": "Identifies a conversation checkpoint (restore point).",
+      "type": "string"
+    },
+    "ClarificationId": {
+      "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "CommandId": {
+      "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "PermissionProfile": {
+      "type": "string",
+      "enum": [
+        "request_approval",
+        "assisted",
+        "full_access"
+      ]
+    },
+    "RestartReason": {
+      "description": "Why a runtime is being asked to retire.\n\nTyped rather than a string because the updater will reuse this exact lifecycle: install an artifact, ask the running runtime to retire, verify the replacement's identity. Only the reason differs.",
+      "oneOf": [
+        {
+          "description": "The connecting client is a different build than this runtime.",
+          "type": "string",
+          "enum": [
+            "build_mismatch"
+          ]
+        },
+        {
+          "description": "The connecting client sees a different effective configuration source generation than the running daemon loaded at boot.",
+          "type": "string",
+          "enum": [
+            "config_changed"
+          ]
+        },
+        {
+          "description": "A newer artifact is installed and waiting to take over. Reserved for the updater; nothing sends it yet.",
+          "type": "string",
+          "enum": [
+            "update_ready"
+          ]
+        }
+      ]
+    },
+    "SessionId": {
+      "description": "Identifies a single agent session (one user goal end to end).",
+      "type": "string"
+    },
+    "ToolCallId": {
+      "description": "Identifies a tool call. Must be stable across streaming reassembly.",
+      "type": "string"
+    },
+    "UiAgentCapability": {
+      "description": "The runtime capability class an agent runs under.",
+      "type": "string",
+      "enum": [
+        "read_only",
+        "writer",
+        "scoped_writer"
+      ]
+    },
+    "UiAgentDraft": {
+      "description": "A definition a client asks the runtime to write.",
+      "type": "object",
+      "required": [
+        "capability",
+        "description",
+        "instructions",
+        "name"
+      ],
+      "properties": {
+        "capability": {
+          "$ref": "#/definitions/UiAgentCapability"
+        },
+        "description": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "max_duration_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_rounds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "UiAgentScope": {
+      "description": "Where a client may write a definition.",
+      "type": "string",
+      "enum": [
+        "project",
+        "user"
+      ]
+    },
+    "UiMemoryKind": {
+      "description": "What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret.",
+      "oneOf": [
+        {
+          "description": "Injected into every turn while active.",
+          "type": "string",
+          "enum": [
+            "preference"
+          ]
+        },
+        {
+          "description": "Reachable by query recall and the catalog, never auto-injected.",
+          "type": "string",
+          "enum": [
+            "decision"
+          ]
+        },
+        {
+          "description": "Same reach as a decision.",
+          "type": "string",
+          "enum": [
+            "note"
+          ]
+        }
+      ]
+    },
+    "UserShellId": {
+      "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",
+      "type": "string"
+    }
+  }
+}

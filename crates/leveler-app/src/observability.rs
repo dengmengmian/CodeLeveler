@@ -1,0 +1,1897 @@
+//! Durable observatory query: read EventLog + model_requests, project DTOs.
+//! Not a second log. Fail-closed on corrupt canonical rows.
+
+use std::collections::HashMap;
+
+use leveler_client_protocol::{
+    OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,
+    UiEventRelation, UiLaneAccounting, UiObservabilityLoaded, UiObservationField, UiObservationRow,
+    UiRecoveryObservation, UiRequestObservation, UiSessionObservation, UiToolAggregate,
+    classify_tool,
+};
+use leveler_core::SessionId;
+use leveler_engine::EngineEvent;
+use leveler_lifecycle::VerificationStatus;
+use leveler_storage::{
+    Database, EventRecord, EventStore, ModelRequestStore, SessionRepository, TurnRepository,
+};
+
+use crate::AppError;
+
+const DEFAULT_BEFORE: u32 = 20;
+const DEFAULT_AFTER: u32 = 80;
+
+/// Query a session's durable observation. `center_seq = None` uses the latest
+/// sequence. Window sizes are capped at [`OBSERVABILITY_WINDOW_MAX`].
+pub async fn query_observability(
+    db: &Database,
+    session_id: &SessionId,
+    center_seq: Option<i64>,
+    before: u32,
+    after: u32,
+) -> Result<UiObservabilityLoaded, AppError> {
+    let session = SessionRepository::new(db)
+        .get(session_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound(format!("session {}", session_id.as_str())))?;
+
+    let latest = db
+        .latest_sequence(session_id)
+        .await
+        .map_err(AppError::from)?;
+    let latest_seq = latest.unwrap_or(0);
+    let after = if after == 0 {
+        DEFAULT_AFTER
+    } else {
+        after.min(OBSERVABILITY_WINDOW_MAX)
+    };
+    let (from_seq, to_seq) = if let Some(center) = center_seq {
+        let before = if before == 0 {
+            DEFAULT_BEFORE
+        } else {
+            before.min(OBSERVABILITY_WINDOW_MAX)
+        };
+        (
+            center.saturating_sub(i64::from(before)),
+            center.saturating_add(i64::from(after)),
+        )
+    } else {
+        // Tail: last `after` durable sequences, not a range past the tip.
+        let from = latest_seq.saturating_sub(i64::from(after.saturating_sub(1)));
+        (from.max(1), latest_seq.max(1))
+    };
+
+    let records = db
+        .load_window(session_id, from_seq, to_seq)
+        .await
+        .map_err(AppError::from)?;
+    let decoded = decode_records(&records)?;
+
+    let counts = db.count_by_type(session_id).await.map_err(AppError::from)?;
+    let count = |t: &str| -> u32 {
+        counts
+            .iter()
+            .find(|(k, _)| k == t)
+            .map(|(_, n)| *n as u32)
+            .unwrap_or(0)
+    };
+
+    // Whole-session `model_requests` (not the event window). The DISPLAY list
+    // is capped; the accounting is not — a session past the cap used to report
+    // the token total of its last 200 calls as if it were the whole session.
+    let requests = db
+        .load_for_session(session_id)
+        .await
+        .map_err(AppError::from)?;
+    let (avg_latency_ms, last_latency_ms, request_failures, request_retries, in_tok, out_tok) =
+        request_stats(&requests);
+    let request_count = requests.len() as u32;
+    let lanes = lanes_for(&requests);
+    let cached_input_tokens = lanes
+        .iter()
+        .find(|l| l.lane == "total")
+        .and_then(|l| l.cached_input_tokens);
+    let cost_usd_micros = lanes
+        .iter()
+        .find(|l| l.lane == "total")
+        .and_then(|l| l.cost_usd_micros);
+    let shown = if requests.len() > OBSERVABILITY_REQUESTS_MAX {
+        &requests[requests.len() - OBSERVABILITY_REQUESTS_MAX..]
+    } else {
+        &requests[..]
+    };
+    let request_views: Vec<UiRequestObservation> = shown.iter().map(request_view).collect();
+
+    let turns = TurnRepository::new(db)
+        .list(session_id)
+        .await
+        .map_err(AppError::from)?;
+    let interrupted_turns = turns
+        .iter()
+        .filter(|t| t.status == "interrupted" || (t.status == "running" && t.finished_at.is_none()))
+        .count() as u32;
+
+    // Session-wide: the verdict is the latest one recorded, which may sit
+    // outside the event window entirely.
+    let verdict_rows = db
+        .load_by_types(
+            session_id,
+            &["verification_started", "verification_finished"],
+        )
+        .await
+        .map_err(AppError::from)?;
+    let verdict_decoded = decode_records(&verdict_rows)?;
+    let session_duration_ms = parse_millis(&session.created_at)
+        .zip(parse_millis(&session.updated_at))
+        .and_then(|(a, b)| u64::try_from(b - a).ok());
+
+    let window = project_window(&decoded);
+    // Session-wide: tool lifecycle rows only. Never the event window, never
+    // the full log into the TUI.
+    let tool_rows = db
+        .load_by_types(session_id, &["tool_call_started", "tool_call_finished"])
+        .await
+        .map_err(AppError::from)?;
+    let tools = aggregate_tools(&decode_records(&tool_rows)?);
+    // Session-wide: sub-agent start/finish only. Same class of bug Tools had
+    // when `collect_agents` read the event window.
+    let agent_rows = db
+        .load_by_types(
+            session_id,
+            &[
+                "sub_agent_started",
+                "sub_agent_finished",
+                "sub_agent_interrupted",
+                "sub_agent_resumed",
+            ],
+        )
+        .await
+        .map_err(AppError::from)?;
+    let agents = collect_agents(&decode_records(&agent_rows)?);
+    let review_stages = collect_review_stages(&decoded);
+    let relations = if let Some(seq) = center_seq {
+        relations_for(&decoded, seq)
+    } else {
+        Vec::new()
+    };
+
+    Ok(UiObservabilityLoaded {
+        session: UiSessionObservation {
+            session_id: session_id.clone(),
+            goal: session.goal,
+            repository: session.repository,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            status: session.status.as_str().to_string(),
+            model: session.model,
+            work_profile: crate::canonical_work_profile(&session.work_profile),
+            collaboration: session.collaboration,
+            last_sequence: latest,
+            request_count,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            avg_latency_ms,
+            last_latency_ms,
+            request_failures,
+            request_retries,
+            tool_started: count("tool_call_started"),
+            tool_finished: count("tool_call_finished"),
+            verification_runs: count("verification_started"),
+            verification: verification_verdict(&verdict_decoded).to_string(),
+            compact_count: count("compacted"),
+            subagent_started: count("sub_agent_started"),
+            duration_ms: session_duration_ms,
+            cached_input_tokens,
+            cost_usd_micros,
+            lanes,
+        },
+        window,
+        window_from: from_seq,
+        window_to: to_seq,
+        requests: request_views,
+        tools,
+        agents,
+        recovery: UiRecoveryObservation {
+            interrupted_turns,
+            workspace_snapshots: count("workspace_snapshot_created"),
+            review_stages,
+        },
+        relations,
+    })
+}
+
+fn decode_records(records: &[EventRecord]) -> Result<Vec<(EventRecord, EngineEvent)>, AppError> {
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        let event = EngineEvent::from_payload(&rec.payload).map_err(|e| {
+            AppError::Engine(format!(
+                "corrupt authoritative event: session {} sequence {} type '{}': {e}",
+                rec.session_id, rec.sequence, rec.event_type
+            ))
+        })?;
+        out.push((rec.clone(), event));
+    }
+    Ok(out)
+}
+
+fn project_window(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiObservationRow> {
+    let mut open: HashMap<String, (usize, i64)> = HashMap::new();
+    let mut rows: Vec<UiObservationRow> = Vec::new();
+    for (rec, ev) in decoded {
+        if let Some(mut row) = project_event(rec, ev) {
+            if let EngineEvent::ToolCallStarted { call_id, .. } = ev {
+                open.insert(call_id.clone(), (rows.len(), rec.sequence));
+            }
+            if let EngineEvent::ToolCallFinished { call_id, .. } = ev
+                && let Some((idx, start_seq)) = open.remove(call_id)
+                && let (Some(start_ms), Some(end_ms)) = (
+                    parse_millis(&decoded[idx].0.created_at),
+                    parse_millis(&rec.created_at),
+                )
+            {
+                row.duration_ms = Some(end_ms.saturating_sub(start_ms) as u64);
+                row.fields.push(UiObservationField {
+                    key: "PairedStart".into(),
+                    value: start_seq.to_string(),
+                });
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow> {
+    let (class, title, target, status, fields) = match ev {
+        EngineEvent::ToolCallStarted {
+            call_id,
+            name,
+            arguments,
+            agent_id,
+            ..
+        } => (
+            classify_tool(name),
+            name.clone(),
+            safe_target(arguments),
+            "running".into(),
+            vec![
+                ("Call".into(), call_id.clone()),
+                ("Tool".into(), name.clone()),
+                (
+                    "Agent".into(),
+                    agent_id.clone().unwrap_or_else(|| "main".into()),
+                ),
+            ],
+        ),
+        EngineEvent::ToolCallFinished {
+            call_id,
+            name,
+            is_error,
+            agent_id,
+            ..
+        } => (
+            classify_tool(name),
+            name.clone(),
+            String::new(),
+            if *is_error { "fail" } else { "ok" }.into(),
+            vec![
+                ("Call".into(), call_id.clone()),
+                ("Tool".into(), name.clone()),
+                (
+                    "Agent".into(),
+                    agent_id.clone().unwrap_or_else(|| "main".into()),
+                ),
+            ],
+        ),
+        EngineEvent::TurnStarted { turn_id, kind } => (
+            ObservationClass::Terminal,
+            "turn started".into(),
+            kind.as_str().to_string(),
+            "info".into(),
+            vec![("Turn".into(), turn_id.as_str().to_string())],
+        ),
+        EngineEvent::FinalizationStarted { at } => (
+            ObservationClass::Terminal,
+            "finalization started".into(),
+            at.to_rfc3339(),
+            "running".into(),
+            vec![("At".into(), at.to_rfc3339())],
+        ),
+        EngineEvent::FinalizationPhaseStarted { phase, at } => (
+            ObservationClass::Terminal,
+            format!("finalization {phase}"),
+            at.to_rfc3339(),
+            "running".into(),
+            vec![
+                ("Phase".into(), phase.clone()),
+                ("At".into(), at.to_rfc3339()),
+            ],
+        ),
+        EngineEvent::FinalizationPhaseFinished {
+            phase,
+            at,
+            elapsed_ms,
+        } => (
+            ObservationClass::Terminal,
+            format!("finalization {phase}"),
+            format!("{elapsed_ms} ms"),
+            "ok".into(),
+            vec![
+                ("Phase".into(), phase.clone()),
+                ("At".into(), at.to_rfc3339()),
+                ("Elapsed".into(), format!("{elapsed_ms} ms")),
+            ],
+        ),
+        EngineEvent::TurnFinished {
+            turn_id,
+            outcome,
+            stop_reason,
+            rounds,
+            ..
+        } => (
+            ObservationClass::Terminal,
+            format!("turn {outcome:?}"),
+            stop_reason.clone(),
+            match outcome {
+                leveler_lifecycle::TurnOutcome::Failed => "fail",
+                _ => "ok",
+            }
+            .into(),
+            vec![
+                ("Turn".into(), turn_id.as_str().to_string()),
+                ("Rounds".into(), rounds.to_string()),
+                ("Outcome".into(), format!("{outcome:?}")),
+            ],
+        ),
+        EngineEvent::TaskFinished {
+            outcome, reason, ..
+        } => (
+            ObservationClass::Terminal,
+            format!("task {outcome:?}"),
+            reason.clone().unwrap_or_default(),
+            "info".into(),
+            vec![("Outcome".into(), format!("{outcome:?}"))],
+        ),
+        EngineEvent::VerificationStarted => (
+            ObservationClass::Verify,
+            "verify started".into(),
+            String::new(),
+            "running".into(),
+            vec![],
+        ),
+        EngineEvent::VerificationCheck {
+            name,
+            status,
+            observation,
+            disposition,
+            ..
+        } => (
+            ObservationClass::Verify,
+            name.clone(),
+            status.clone(),
+            if status == "failed" { "fail" } else { "info" }.into(),
+            {
+                let mut fields = vec![
+                    ("Check".into(), name.clone()),
+                    ("Status".into(), status.clone()),
+                ];
+                if let Some(observation) = observation {
+                    fields.push(("Observation".into(), format!("{observation:?}")));
+                }
+                if let Some(disposition) = disposition {
+                    fields.push(("Disposition".into(), format!("{disposition:?}")));
+                }
+                fields
+            },
+        ),
+        EngineEvent::VerificationFinished {
+            passed,
+            verification,
+        } => {
+            // The completion gate is not a result. A run that proved nothing
+            // is not "ok", and it has not "passed".
+            let recorded = row_verification(*verification, *passed);
+            (
+                ObservationClass::Verify,
+                "verify finished".into(),
+                String::new(),
+                match recorded {
+                    Some(VerificationStatus::Passed) => "ok",
+                    Some(VerificationStatus::Failed) => "fail",
+                    _ => "info",
+                }
+                .into(),
+                vec![(
+                    "Verification".into(),
+                    recorded
+                        .map(|status| status.as_str())
+                        .unwrap_or("unavailable")
+                        .to_string(),
+                )],
+            )
+        }
+        EngineEvent::SubAgentStarted {
+            id,
+            nickname,
+            role,
+            task,
+            profile_id,
+            read_only,
+            ..
+        } => (
+            ObservationClass::Agent,
+            format!("{nickname} started"),
+            role.clone(),
+            "running".into(),
+            {
+                let mut fields = vec![
+                    ("Id".into(), id.clone()),
+                    ("Task".into(), truncate(task, 64)),
+                ];
+                if let Some(pid) = profile_id {
+                    fields.push(("Profile".into(), pid.clone()));
+                }
+                fields.push((
+                    "Access".into(),
+                    if *read_only { "read-only" } else { "can write" }.into(),
+                ));
+                fields
+            },
+        ),
+        EngineEvent::SubAgentFinished {
+            id,
+            nickname,
+            ok,
+            summary,
+            contribution,
+            ..
+        } => (
+            ObservationClass::Agent,
+            format!("{nickname} done"),
+            String::new(),
+            if *ok { "ok" } else { "fail" }.into(),
+            {
+                let mut fields = vec![
+                    ("Id".into(), id.clone()),
+                    ("Summary".into(), truncate(summary, 64)),
+                ];
+                // What makes a child's contribution readable without joining
+                // the ledger by hand. Absent for children that never reported
+                // and for events written before contribution tracing.
+                if let Some(c) = contribution {
+                    if let Some(pid) = &c.profile_id {
+                        fields.push(("Profile".into(), pid.clone()));
+                    }
+                    fields.push((
+                        "Access".into(),
+                        if c.read_only {
+                            "read-only"
+                        } else {
+                            "can write"
+                        }
+                        .into(),
+                    ));
+                    fields.push(("Findings".into(), format!("{} reported", c.findings_total)));
+                }
+                fields
+            },
+        ),
+        EngineEvent::ReviewStage { action, detail, .. } => (
+            ObservationClass::Agent,
+            format!("review {action}"),
+            truncate(detail, 64),
+            "info".into(),
+            vec![("Action".into(), action.clone())],
+        ),
+        EngineEvent::WorkspaceSnapshotCreated { call_id, .. } => (
+            ObservationClass::Recovery,
+            "workspace snapshot".into(),
+            String::new(),
+            "info".into(),
+            vec![("Call".into(), call_id.clone())],
+        ),
+        EngineEvent::Compacted { from, to } => (
+            ObservationClass::System,
+            "compact".into(),
+            format!("{from} → {to}"),
+            "info".into(),
+            vec![],
+        ),
+        EngineEvent::UserShellStarted { command, .. } => (
+            ObservationClass::Shell,
+            "user shell".into(),
+            truncate(command, 64),
+            "running".into(),
+            vec![],
+        ),
+        EngineEvent::UserShellFinished {
+            status,
+            duration_ms,
+            ..
+        } => (
+            ObservationClass::Shell,
+            "user shell".into(),
+            status.clone(),
+            if status == "failed" { "fail" } else { "ok" }.into(),
+            vec![("Duration".into(), duration_ms.to_string())],
+        ),
+        EngineEvent::DelegationStage { action, .. } => (
+            ObservationClass::Agent,
+            format!("delegation {action}"),
+            String::new(),
+            "info".into(),
+            vec![],
+        ),
+        EngineEvent::GoalIntercepted { kind, detail } => (
+            ObservationClass::System,
+            format!("goal intercept {kind}"),
+            truncate(detail, 64),
+            "info".into(),
+            vec![],
+        ),
+        // Prompt-like or high-volume rows stay out of the default trace.
+        EngineEvent::ContextSnapshot { .. }
+        | EngineEvent::SubAgentTranscriptAppended { .. }
+        | EngineEvent::AssistantMessage { .. }
+        | EngineEvent::AssistantDelta { .. }
+        | EngineEvent::ReasoningDelta { .. }
+        | EngineEvent::EvidenceLedgerUpdated { .. }
+        | EngineEvent::ProgressUpdated { .. }
+        | EngineEvent::TokenUsage { .. } => return None,
+        _ => (
+            ObservationClass::System,
+            rec.event_type.clone(),
+            String::new(),
+            "info".into(),
+            vec![],
+        ),
+    };
+    Some(UiObservationRow {
+        sequence: rec.sequence,
+        created_at: rec.created_at.clone(),
+        turn_id: rec.turn_id.clone(),
+        class,
+        title,
+        target,
+        status,
+        duration_ms: None,
+        event_type: rec.event_type.clone(),
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| UiObservationField { key, value })
+            .collect(),
+    })
+}
+
+fn aggregate_tools(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiToolAggregate> {
+    #[derive(Default)]
+    struct Acc {
+        calls: u32,
+        succeeded: u32,
+        failed: u32,
+        unfinished: u32,
+        total_ms: u64,
+        timed: u32,
+    }
+    // Same identity EventLog uses for dangling calls: (call_id, agent_id).
+    let mut open: HashMap<(String, Option<String>), (String, Option<i64>)> = HashMap::new();
+    let mut by_name: HashMap<String, Acc> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (rec, ev) in decoded {
+        match ev {
+            EngineEvent::ToolCallStarted {
+                call_id,
+                name,
+                agent_id,
+                ..
+            } => {
+                open.insert(
+                    (call_id.clone(), agent_id.clone()),
+                    (name.clone(), parse_millis(&rec.created_at)),
+                );
+                let acc = by_name.entry(name.clone()).or_insert_with(|| {
+                    order.push(name.clone());
+                    Acc::default()
+                });
+                acc.calls += 1;
+            }
+            EngineEvent::ToolCallFinished {
+                call_id,
+                name,
+                is_error,
+                agent_id,
+                ..
+            } => {
+                let key = (call_id.clone(), agent_id.clone());
+                if let Some((start_name, start_ms)) = open.remove(&key) {
+                    let acc = by_name.entry(start_name.clone()).or_insert_with(|| {
+                        order.push(start_name.clone());
+                        Acc::default()
+                    });
+                    if *is_error {
+                        acc.failed += 1;
+                    } else {
+                        acc.succeeded += 1;
+                    }
+                    if let (Some(start), Some(end)) = (start_ms, parse_millis(&rec.created_at)) {
+                        acc.total_ms += end.saturating_sub(start) as u64;
+                        acc.timed += 1;
+                    }
+                } else {
+                    let acc = by_name.entry(name.clone()).or_insert_with(|| {
+                        order.push(name.clone());
+                        Acc::default()
+                    });
+                    acc.calls += 1;
+                    if *is_error {
+                        acc.failed += 1;
+                    } else {
+                        acc.succeeded += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, (name, _)) in open {
+        let acc = by_name.entry(name.clone()).or_insert_with(|| {
+            order.push(name.clone());
+            Acc::default()
+        });
+        acc.unfinished += 1;
+    }
+    order
+        .into_iter()
+        .map(|name| {
+            let acc = &by_name[&name];
+            let avg = if acc.timed > 0 {
+                Some(acc.total_ms / u64::from(acc.timed))
+            } else {
+                None
+            };
+            UiToolAggregate {
+                class: classify_tool(&name),
+                name,
+                calls: acc.calls,
+                succeeded: acc.succeeded,
+                failed: acc.failed,
+                unfinished: acc.unfinished,
+                total_ms: if acc.timed > 0 {
+                    Some(acc.total_ms)
+                } else {
+                    None
+                },
+                avg_ms: avg,
+            }
+        })
+        .collect()
+}
+
+fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservation> {
+    let mut by_id: HashMap<String, UiAgentObservation> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (_, ev) in decoded {
+        match ev {
+            EngineEvent::SubAgentStarted {
+                id,
+                nickname,
+                role,
+                task,
+                spec,
+                ..
+            } => {
+                if !by_id.contains_key(id) {
+                    order.push(id.clone());
+                }
+                by_id.insert(
+                    id.clone(),
+                    UiAgentObservation {
+                        id: id.clone(),
+                        nickname: nickname.clone(),
+                        role: role.clone(),
+                        status: "running".into(),
+                        summary: truncate(task, 64),
+                        agent: spec
+                            .as_ref()
+                            .and_then(|s| s.agent.as_ref())
+                            .map(|a| a.name.clone()),
+                    },
+                );
+            }
+            // Not folded into `UiAgentObservation`: that type lives in the
+            // client protocol, and widening it pulls in schema regeneration and
+            // generated TS — UX-phase work. Contribution is already readable
+            // through `leveler trace` (the Findings field above), which is what
+            // traceability required.
+            EngineEvent::SubAgentFinished {
+                id,
+                nickname,
+                ok,
+                summary,
+                ..
+            } => {
+                let row = by_id.entry(id.clone()).or_insert_with(|| {
+                    order.push(id.clone());
+                    UiAgentObservation {
+                        id: id.clone(),
+                        nickname: nickname.clone(),
+                        role: String::new(),
+                        status: String::new(),
+                        summary: String::new(),
+                        agent: None,
+                    }
+                });
+                row.nickname = nickname.clone();
+                row.status = if *ok { "ok" } else { "fail" }.into();
+                row.summary = truncate(summary, 64);
+            }
+            // Only a child still open changes state here: a terminal stands.
+            EngineEvent::SubAgentInterrupted { id } => {
+                if let Some(row) = by_id.get_mut(id)
+                    && row.status == "running"
+                {
+                    row.status = "interrupted".into();
+                }
+            }
+            EngineEvent::SubAgentResumed { id, .. } => {
+                if let Some(row) = by_id.get_mut(id)
+                    && row.status == "interrupted"
+                {
+                    row.status = "running".into();
+                }
+            }
+            _ => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
+fn collect_review_stages(decoded: &[(EventRecord, EngineEvent)]) -> Vec<String> {
+    decoded
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            EngineEvent::ReviewStage { action, .. } => Some(action.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn relations_for(decoded: &[(EventRecord, EngineEvent)], seq: i64) -> Vec<UiEventRelation> {
+    let Some((_, focus)) = decoded.iter().find(|(r, _)| r.sequence == seq) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match focus {
+        EngineEvent::ToolCallStarted { call_id, .. }
+        | EngineEvent::ToolCallFinished { call_id, .. } => {
+            for (rec, ev) in decoded {
+                match ev {
+                    EngineEvent::ToolCallStarted { call_id: id, .. }
+                        if id == call_id && rec.sequence != seq =>
+                    {
+                        out.push(rel(rec.sequence, "pair_start", "tool started"));
+                    }
+                    EngineEvent::ToolCallFinished { call_id: id, .. }
+                        if id == call_id && rec.sequence != seq =>
+                    {
+                        out.push(rel(rec.sequence, "pair_end", "tool finished"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        EngineEvent::SubAgentStarted { id, .. } | EngineEvent::SubAgentFinished { id, .. } => {
+            for (rec, ev) in decoded {
+                match ev {
+                    EngineEvent::SubAgentStarted { id: other, .. }
+                    | EngineEvent::SubAgentFinished { id: other, .. }
+                        if other == id && rec.sequence != seq =>
+                    {
+                        out.push(rel(rec.sequence, "same_agent", "same sub-agent"));
+                    }
+                    EngineEvent::ToolCallStarted {
+                        agent_id: Some(a), ..
+                    }
+                    | EngineEvent::ToolCallFinished {
+                        agent_id: Some(a), ..
+                    } if a == id => {
+                        out.push(rel(rec.sequence, "same_agent", "tool by this agent"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            if let Some(turn) = decoded
+                .iter()
+                .find(|(r, _)| r.sequence == seq)
+                .and_then(|(r, _)| r.turn_id.clone())
+            {
+                for (rec, _) in decoded {
+                    if rec.turn_id.as_deref() == Some(turn.as_str()) && rec.sequence != seq {
+                        out.push(rel(rec.sequence, "same_turn", "same turn"));
+                    }
+                }
+            }
+        }
+    }
+    out.truncate(24);
+    out
+}
+
+fn rel(sequence: i64, kind: &str, label: &str) -> UiEventRelation {
+    UiEventRelation {
+        sequence,
+        kind: kind.into(),
+        label: label.into(),
+    }
+}
+
+fn request_view(r: &leveler_storage::ModelRequestRecord) -> UiRequestObservation {
+    UiRequestObservation {
+        id: r.id.clone(),
+        provider: r.provider.clone(),
+        model: r.model.clone(),
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+        finish_reason: r.finish_reason.clone(),
+        error_kind: r.error_kind.clone(),
+        latency_ms: r.latency_ms,
+        retry_count: r.retry_count,
+        cached_input_tokens: r.cached_input_tokens,
+        cost_usd_micros: r.cost_usd_micros,
+        agent_id: r.agent_id.clone(),
+        created_at: r.created_at.to_rfc3339(),
+    }
+}
+
+/// Sum one lane's spend. `cached` and `cost` stay `None` unless at least one
+/// row carried the figure — an unmeasured column is not a zero.
+fn lane(name: &str, rows: &[&leveler_storage::ModelRequestRecord]) -> UiLaneAccounting {
+    let sum_opt = |pick: fn(&leveler_storage::ModelRequestRecord) -> Option<u64>| {
+        rows.iter()
+            .filter_map(|r| pick(r))
+            .fold(None, |acc: Option<u64>, v| Some(acc.unwrap_or(0) + v))
+    };
+    UiLaneAccounting {
+        lane: name.to_string(),
+        requests: rows.len() as u32,
+        input_tokens: rows.iter().map(|r| r.input_tokens).sum(),
+        output_tokens: rows.iter().map(|r| r.output_tokens).sum(),
+        cached_input_tokens: sum_opt(|r| r.cached_input_tokens),
+        cost_usd_micros: sum_opt(|r| r.cost_usd_micros),
+    }
+}
+
+/// Split spend by who did it. Empty when there is nothing to attribute.
+fn lanes_for(rows: &[leveler_storage::ModelRequestRecord]) -> Vec<UiLaneAccounting> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let main: Vec<&_> = rows.iter().filter(|r| r.agent_id.is_none()).collect();
+    let children: Vec<&_> = rows.iter().filter(|r| r.agent_id.is_some()).collect();
+    let all: Vec<&_> = rows.iter().collect();
+    vec![
+        lane("main", &main),
+        lane("children", &children),
+        lane("total", &all),
+    ]
+}
+
+/// What one `verification_finished` row says about verification.
+///
+/// `None` is "this row does not say", and it is returned for exactly one
+/// case: a row written before the gate and the truth were split, whose gate
+/// was open. `passed: true` cannot distinguish `Passed` from `NotRun`, so
+/// nothing is claimed. A closed gate that failed can only mean the checks
+/// failed, which is why that one case is derived.
+fn row_verification(
+    verification: Option<VerificationStatus>,
+    passed: bool,
+) -> Option<VerificationStatus> {
+    match verification {
+        Some(status) => Some(status),
+        None if passed => None,
+        None => Some(VerificationStatus::Failed),
+    }
+}
+
+/// The latest verdict the runtime recorded, never a count of attempts.
+/// `not_run` means nothing started; `unavailable` means something started and
+/// the log records no verdict for it.
+fn verification_verdict(decoded: &[(EventRecord, EngineEvent)]) -> &'static str {
+    let mut verdict: Option<VerificationStatus> = None;
+    let mut started = false;
+    for (_, ev) in decoded {
+        match ev {
+            EngineEvent::VerificationStarted => {
+                started = true;
+                verdict = None;
+            }
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => {
+                verdict = row_verification(*verification, *passed);
+            }
+            _ => {}
+        }
+    }
+    match (started, verdict) {
+        (_, Some(status)) => status.as_str(),
+        (true, None) => VerificationStatus::Unavailable.as_str(),
+        (false, None) => VerificationStatus::NotRun.as_str(),
+    }
+}
+
+fn request_stats(
+    rows: &[leveler_storage::ModelRequestRecord],
+) -> (Option<u64>, Option<u64>, u32, u32, u64, u64) {
+    let mut lat_sum = 0u64;
+    let mut lat_n = 0u32;
+    let mut last = None;
+    let mut failures = 0u32;
+    let mut retries = 0u32;
+    let mut input = 0u64;
+    let mut output = 0u64;
+    for r in rows {
+        input += r.input_tokens;
+        output += r.output_tokens;
+        retries += r.retry_count;
+        if r.error_kind.is_some() {
+            failures += 1;
+        }
+        if let Some(ms) = r.latency_ms {
+            lat_sum += ms;
+            lat_n += 1;
+            last = Some(ms);
+        }
+    }
+    let avg = if lat_n > 0 {
+        Some(lat_sum / u64::from(lat_n))
+    } else {
+        None
+    };
+    (avg, last, failures, retries, input, output)
+}
+
+fn safe_target(arguments: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    let Some(obj) = v.as_object() else {
+        return String::new();
+    };
+    for key in [
+        "path", "file", "pattern", "query", "program", "command", "cmd",
+    ] {
+        let lk = key.to_ascii_lowercase();
+        if lk.contains("token") || lk.contains("secret") || lk.contains("password") {
+            continue;
+        }
+        if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
+            return truncate(s, 64);
+        }
+    }
+    String::new()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn parse_millis(rfc3339: &str) -> Option<i64> {
+    rfc3339
+        .parse::<leveler_core::Timestamp>()
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_core::now;
+    use leveler_engine::EngineEvent;
+    use leveler_storage::{
+        EventStore, ModelRequestRecord, ModelRequestStore, SessionRecord, SessionRepository,
+    };
+
+    async fn persist(db: &Database, sid: &SessionId, ev: EngineEvent) {
+        let (ty, payload) = ev.to_row().unwrap();
+        db.append(sid, None, &ty, &payload, now()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconstructs_after_restart_from_durable_facts() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "fix auth", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        persist(
+            &db,
+            &sid,
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/lib.rs","token":"SECRET"}"#.into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+            },
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                is_error: false,
+                preview: "FILE BODY MUST NOT LEAK".into(),
+                agent_id: None,
+                applied_diff: None,
+            },
+        )
+        .await;
+        persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: Some(VerificationStatus::Failed),
+            },
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::SubAgentStarted {
+                id: "ag1".into(),
+                nickname: "Reviewer".into(),
+                role: "reviewer".into(),
+                task: "review patch".into(),
+                profile_id: Some("reviewer".into()),
+                profile_role: Some("reviewer".into()),
+                read_only: true,
+                spec: None,
+            },
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::SubAgentFinished {
+                id: "ag1".into(),
+                nickname: "Reviewer".into(),
+                ok: true,
+                summary: "ok".into(),
+                contribution: Some(leveler_lifecycle::ChildResultProjection {
+                    child_id: "ag1".into(),
+                    role: "reviewer".into(),
+                    findings_total: 3,
+                    ..Default::default()
+                }),
+                outcome: None,
+                stop: None,
+                limit: None,
+            },
+        )
+        .await;
+        db.insert(&ModelRequestRecord {
+            id: "req-1".into(),
+            provider_request_id: None,
+            session_id: sid.clone(),
+            provider: "glm".into(),
+            model: "glm-5.2".into(),
+            input_tokens: 1200,
+            output_tokens: 80,
+            finish_reason: Some("stop".into()),
+            error_kind: None,
+            latency_ms: Some(7100),
+            retry_count: 0,
+            kind: leveler_storage::ModelCallKind::Round,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
+            created_at: now(),
+            reasoning_effort: None,
+        })
+        .await
+        .unwrap();
+
+        // Simulate a new process: query the same durable stores with no TUI state.
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.session.goal, "fix auth");
+        assert_eq!(loaded.session.request_count, 1);
+        assert_eq!(loaded.session.input_tokens, 1200);
+        assert_eq!(loaded.session.last_latency_ms, Some(7100));
+        assert!(
+            loaded
+                .window
+                .iter()
+                .any(|r| r.class == ObservationClass::Read),
+            "read_file must classify as READ: {:?}",
+            loaded.window
+        );
+        // Contribution has to reach the trace, not merely compile. Without
+        // this, a child's findings stay joinable only by hand — which is the
+        // state MA-VALUE-A was measured in.
+        let findings_field = loaded
+            .window
+            .iter()
+            .filter(|r| r.class == ObservationClass::Agent)
+            .flat_map(|r| r.fields.iter())
+            .find(|f| f.key == "Findings")
+            .map(|f| f.value.clone());
+        assert_eq!(
+            findings_field.as_deref(),
+            Some("3 reported"),
+            "the child's contribution must be readable from the trace: {:?}",
+            loaded.window
+        );
+        assert!(
+            loaded
+                .window
+                .iter()
+                .any(|r| r.class == ObservationClass::Verify)
+        );
+        assert_eq!(loaded.agents.len(), 1);
+        assert_eq!(loaded.agents[0].nickname, "Reviewer");
+        assert!(
+            loaded.window.iter().all(|r| !r.target.contains("SECRET")
+                && !format!("{:?}", r.fields).contains("FILE BODY")),
+            "secrets and raw tool bodies must stay out"
+        );
+        let rel = query_observability(&db, &sid, Some(1), 10, 10)
+            .await
+            .unwrap()
+            .relations;
+        assert!(
+            rel.iter()
+                .any(|r| r.kind == "pair_end" || r.kind == "pair_start"),
+            "call_id pair must be identity-linked: {rel:?}"
+        );
+    }
+
+    fn tool_start(id: &str, name: &str) -> EngineEvent {
+        EngineEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+        }
+    }
+
+    fn tool_end(id: &str, name: &str, is_error: bool) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
+            call_id: id.into(),
+            name: name.into(),
+            is_error,
+            preview: String::new(),
+            agent_id: None,
+            applied_diff: None,
+        }
+    }
+
+    fn add_ms(t: leveler_core::Timestamp, ms: i64) -> leveler_core::Timestamp {
+        leveler_core::Timestamp::from_timestamp_millis(t.timestamp_millis() + ms)
+            .expect("timestamp in range")
+    }
+
+    fn by_name<'a>(tools: &'a [UiToolAggregate], name: &str) -> &'a UiToolAggregate {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name} in {tools:?}"))
+    }
+
+    #[tokio::test]
+    async fn tool_summary_is_session_wide_not_window() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "wide tools", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        // 40+20+10+8 pairs = 156 tool events; plus 10 verify markers → 166.
+        for i in 0..40 {
+            persist(&db, &sid, tool_start(&format!("r{i}"), "read_file")).await;
+            persist(&db, &sid, tool_end(&format!("r{i}"), "read_file", false)).await;
+        }
+        for i in 0..20 {
+            persist(&db, &sid, tool_start(&format!("s{i}"), "grep")).await;
+            persist(&db, &sid, tool_end(&format!("s{i}"), "grep", false)).await;
+        }
+        for i in 0..10 {
+            persist(&db, &sid, tool_start(&format!("e{i}"), "apply_patch")).await;
+            persist(&db, &sid, tool_end(&format!("e{i}"), "apply_patch", false)).await;
+        }
+        for i in 0..8 {
+            persist(&db, &sid, tool_start(&format!("h{i}"), "run_command")).await;
+            persist(&db, &sid, tool_end(&format!("h{i}"), "run_command", false)).await;
+        }
+        for _ in 0..10 {
+            persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        }
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert!(
+            loaded.window.len() <= 20,
+            "trace window must stay bounded: {}",
+            loaded.window.len()
+        );
+        assert_eq!(by_name(&loaded.tools, "read_file").calls, 40);
+        assert_eq!(by_name(&loaded.tools, "grep").calls, 20);
+        assert_eq!(by_name(&loaded.tools, "apply_patch").calls, 10);
+        assert_eq!(by_name(&loaded.tools, "run_command").calls, 8);
+        let window_reads = loaded
+            .window
+            .iter()
+            .filter(|r| r.title == "read_file")
+            .count();
+        assert!(
+            window_reads < 40,
+            "window must not contain every read: {window_reads}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_duration_pairs_by_call_id_only() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "dur", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let t0 = now();
+        let (ty, payload) = tool_start("a1", "read_file").to_row().unwrap();
+        db.append(&sid, None, &ty, &payload, t0).await.unwrap();
+        let (ty, payload) = tool_end("a1", "read_file", false).to_row().unwrap();
+        db.append(&sid, None, &ty, &payload, add_ms(t0, 50))
+            .await
+            .unwrap();
+        let (ty, payload) = tool_start("a2", "read_file").to_row().unwrap();
+        db.append(&sid, None, &ty, &payload, add_ms(t0, 100))
+            .await
+            .unwrap();
+        let (ty, payload) = tool_end("a2", "read_file", false).to_row().unwrap();
+        db.append(&sid, None, &ty, &payload, add_ms(t0, 200))
+            .await
+            .unwrap();
+
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let read = by_name(&loaded.tools, "read_file");
+        assert_eq!(read.calls, 2);
+        assert_eq!(read.total_ms, Some(150));
+        assert_eq!(read.avg_ms, Some(75));
+        assert_eq!(read.failed, 0);
+        assert_eq!(read.succeeded, 2);
+        assert_eq!(read.unfinished, 0);
+    }
+
+    #[tokio::test]
+    async fn tool_failures_count_finished_errors_only() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "fail", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        for i in 0..3 {
+            persist(&db, &sid, tool_start(&format!("ok{i}"), "run_command")).await;
+            persist(&db, &sid, tool_end(&format!("ok{i}"), "run_command", false)).await;
+        }
+        for i in 0..2 {
+            persist(&db, &sid, tool_start(&format!("bad{i}"), "run_command")).await;
+            persist(&db, &sid, tool_end(&format!("bad{i}"), "run_command", true)).await;
+        }
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let shell = by_name(&loaded.tools, "run_command");
+        assert_eq!(shell.calls, 5);
+        assert_eq!(shell.failed, 2);
+        assert_eq!(shell.succeeded, 3);
+        assert_eq!(shell.unfinished, 0);
+    }
+
+    #[tokio::test]
+    async fn unfinished_tool_is_not_success_and_has_no_duration() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "open", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        persist(&db, &sid, tool_start("open1", "read_file")).await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let read = by_name(&loaded.tools, "read_file");
+        assert_eq!(read.calls, 1);
+        assert_eq!(read.succeeded, 0);
+        assert_eq!(read.failed, 0);
+        assert_eq!(read.unfinished, 1);
+        assert_eq!(read.total_ms, None);
+        assert_eq!(read.avg_ms, None);
+    }
+
+    fn agent_start(id: &str, nickname: &str, role: &str, task: &str) -> EngineEvent {
+        EngineEvent::SubAgentStarted {
+            id: id.into(),
+            nickname: nickname.into(),
+            role: role.into(),
+            task: task.into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            spec: None,
+        }
+    }
+
+    fn agent_end(id: &str, nickname: &str, ok: bool, summary: &str) -> EngineEvent {
+        EngineEvent::SubAgentFinished {
+            id: id.into(),
+            nickname: nickname.into(),
+            ok,
+            summary: summary.into(),
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+        }
+    }
+
+    fn by_agent<'a>(agents: &'a [UiAgentObservation], id: &str) -> &'a UiAgentObservation {
+        agents
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap_or_else(|| panic!("missing agent {id} in {agents:?}"))
+    }
+
+    /// A child whose activation died is not running. The list reads the
+    /// durable lifecycle, so an interrupted child says so, and a resumed one
+    /// is running again.
+    #[tokio::test]
+    async fn an_interrupted_child_is_not_listed_as_running() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "interrupted agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        for id in ["agent-1", "agent-2"] {
+            persist(
+                &db,
+                &sid,
+                agent_start(id, "Explorer", "explorer", "Inspect"),
+            )
+            .await;
+            persist(
+                &db,
+                &sid,
+                EngineEvent::SubAgentInterrupted { id: id.into() },
+            )
+            .await;
+        }
+        persist(
+            &db,
+            &sid,
+            EngineEvent::SubAgentResumed {
+                id: "agent-2".into(),
+                attempt: 1,
+            },
+        )
+        .await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert_eq!(by_agent(&loaded.agents, "agent-1").status, "interrupted");
+        assert_eq!(by_agent(&loaded.agents, "agent-2").status, "running");
+    }
+
+    /// A child spawned from a declarative agent is listed under that agent's
+    /// name, not only its capability class — `explorer` does not tell the
+    /// user which of their agents ran.
+    #[tokio::test]
+    async fn a_declared_agent_child_is_listed_with_its_agent_name() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "declared agent", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let mut started = agent_start("agent-1", "Euclid", "explorer", "Review");
+        if let EngineEvent::SubAgentStarted { spec, .. } = &mut started {
+            *spec = Some(leveler_lifecycle::ChildSpawnSpec {
+                agent: Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                    name: "security-reviewer".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        persist(&db, &sid, started).await;
+        persist(
+            &db,
+            &sid,
+            agent_start("agent-2", "Kepler", "explorer", "Map"),
+        )
+        .await;
+        persist(&db, &sid, agent_end("agent-1", "Euclid", true, "done")).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        let declared = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(declared.agent.as_deref(), Some("security-reviewer"));
+        assert_eq!(declared.role, "explorer");
+        assert_eq!(by_agent(&loaded.agents, "agent-2").agent, None);
+    }
+
+    #[tokio::test]
+    async fn agent_list_is_session_wide_not_window() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "wide agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                "agent-1",
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_end("agent-1", "Explorer", true, "auth flow mapped"),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_start("agent-2", "Worker", "worker", "Add tests"),
+        )
+        .await;
+
+        for i in 0..40 {
+            persist(&db, &sid, tool_start(&format!("r{i}"), "read_file")).await;
+            persist(&db, &sid, tool_end(&format!("r{i}"), "read_file", false)).await;
+        }
+
+        persist(
+            &db,
+            &sid,
+            agent_end("agent-2", "Worker", false, "tests still failing"),
+        )
+        .await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert!(
+            loaded.window.len() <= 20,
+            "trace window must stay bounded: {}",
+            loaded.window.len()
+        );
+        let window_agent_rows = loaded
+            .window
+            .iter()
+            .filter(|r| r.class == ObservationClass::Agent)
+            .count();
+        assert!(
+            window_agent_rows < 4,
+            "window must not contain every agent lifecycle row: {window_agent_rows}"
+        );
+
+        assert_eq!(
+            loaded.agents.len(),
+            2,
+            "agents must be session-wide: {:?}",
+            loaded.agents
+        );
+        let explorer = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(explorer.nickname, "Explorer");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "ok");
+        assert_eq!(explorer.summary, "auth flow mapped");
+
+        let worker = by_agent(&loaded.agents, "agent-2");
+        assert_eq!(worker.nickname, "Worker");
+        assert_eq!(worker.role, "worker");
+        assert_eq!(worker.status, "fail");
+        assert_eq!(worker.summary, "tests still failing");
+    }
+
+    #[tokio::test]
+    async fn running_agent_outside_window_still_listed() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "open agent", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                "agent-1",
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        for _ in 0..30 {
+            persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        }
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert!(
+            loaded
+                .window
+                .iter()
+                .all(|r| r.class != ObservationClass::Agent),
+            "started agent must sit outside the event window: {:?}",
+            loaded.window
+        );
+        assert_eq!(loaded.agents.len(), 1);
+        let explorer = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "running");
+        assert_eq!(explorer.summary, "Inspect authentication flow");
+    }
+
+    #[tokio::test]
+    async fn first_spawn_of_each_turn_is_a_distinct_session_agent() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "cross-turn agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        let turn_a = leveler_core::AgentId::generate().into_inner();
+        let turn_b = leveler_core::AgentId::generate().into_inner();
+        assert_ne!(turn_a, turn_b);
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                &turn_a,
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_end(&turn_a, "Explorer", true, "auth flow mapped"),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_start(&turn_b, "Worker", "worker", "Add tests"),
+        )
+        .await;
+        persist(&db, &sid, agent_end(&turn_b, "Worker", true, "tests added")).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.agents.len(), 2, "{:?}", loaded.agents);
+        let explorer = by_agent(&loaded.agents, &turn_a);
+        let worker = by_agent(&loaded.agents, &turn_b);
+        assert_eq!(explorer.nickname, "Explorer");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "ok");
+        assert_eq!(explorer.summary, "auth flow mapped");
+        assert_eq!(worker.nickname, "Worker");
+        assert_eq!(worker.role, "worker");
+        assert_eq!(worker.status, "ok");
+        assert_eq!(worker.summary, "tests added");
+    }
+
+    fn tool_start_by(id: &str, name: &str, agent: &str) -> EngineEvent {
+        EngineEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: Some(agent.into()),
+        }
+    }
+
+    fn tool_end_by(id: &str, name: &str, agent: &str) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
+            call_id: id.into(),
+            name: name.into(),
+            is_error: false,
+            preview: String::new(),
+            agent_id: Some(agent.into()),
+            applied_diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn relations_do_not_cross_distinct_delegated_agents() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "rel", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        let explorer = leveler_core::AgentId::generate().into_inner();
+        let worker = leveler_core::AgentId::generate().into_inner();
+        persist(
+            &db,
+            &sid,
+            agent_start(&explorer, "Explorer", "explorer", "inspect"),
+        )
+        .await;
+        persist(&db, &sid, tool_start_by("e1", "read_file", &explorer)).await;
+        persist(&db, &sid, tool_end_by("e1", "read_file", &explorer)).await;
+        persist(&db, &sid, agent_end(&explorer, "Explorer", true, "mapped")).await;
+        persist(&db, &sid, tool_start("m1", "run_command")).await;
+        persist(&db, &sid, tool_end("m1", "run_command", false)).await;
+        persist(&db, &sid, agent_start(&worker, "Worker", "worker", "tests")).await;
+        persist(&db, &sid, tool_start_by("w1", "run_command", &worker)).await;
+        persist(&db, &sid, tool_end_by("w1", "run_command", &worker)).await;
+        persist(&db, &sid, agent_end(&worker, "Worker", true, "ok")).await;
+
+        let focused = query_observability(&db, &sid, Some(1), 20, 20)
+            .await
+            .unwrap();
+        assert!(
+            focused
+                .relations
+                .iter()
+                .any(|r| r.kind == "same_agent" && r.label == "same sub-agent"),
+            "{:?}",
+            focused.relations
+        );
+        assert!(
+            focused
+                .relations
+                .iter()
+                .any(|r| r.kind == "same_agent" && r.label == "tool by this agent"),
+            "{:?}",
+            focused.relations
+        );
+        let related: std::collections::HashSet<i64> =
+            focused.relations.iter().map(|r| r.sequence).collect();
+        // Worker start is sequence 7 (1 start, 2-3 tools, 4 finish, 5-6 main tools).
+        assert!(
+            !related.contains(&7),
+            "worker start must not relate to explorer: {:?}",
+            focused.relations
+        );
+        assert!(
+            !related.contains(&8) && !related.contains(&9),
+            "worker tools must not relate to explorer: {:?}",
+            focused.relations
+        );
+        assert!(
+            !related.contains(&5) && !related.contains(&6),
+            "main tools must not relate to explorer: {:?}",
+            focused.relations
+        );
+    }
+
+    #[tokio::test]
+    async fn session_wide_tool_aggregates_survive_file_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("obs.sqlite");
+        let sid = {
+            let db = Database::connect(&path).await.unwrap();
+            let rec = SessionRecord::new("/repo", "reopen", "glm/5", now());
+            let sid = SessionId::new(rec.id.clone());
+            SessionRepository::new(&db).create(&rec).await.unwrap();
+            for i in 0..6 {
+                persist(&db, &sid, tool_start(&format!("r{i}"), "read_file")).await;
+                persist(&db, &sid, tool_end(&format!("r{i}"), "read_file", false)).await;
+            }
+            persist(&db, &sid, tool_start("open", "grep")).await;
+            sid
+        };
+        let db = Database::connect(&path).await.unwrap();
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert_eq!(by_name(&loaded.tools, "read_file").calls, 6);
+        assert_eq!(by_name(&loaded.tools, "grep").unfinished, 1);
+        assert_eq!(by_name(&loaded.tools, "grep").succeeded, 0);
+        assert_eq!(by_name(&loaded.tools, "grep").total_ms, None);
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    //! Beta Product Closure, Phase D. The durable stores already carry cached
+    //! tokens, cost and the sub-agent that spent them; the session projection
+    //! did not report any of it, so a user could see a token total but never
+    //! what it cost or which lane spent it.
+    use super::*;
+    use leveler_core::now;
+    use leveler_engine::EngineEvent;
+    use leveler_storage::{
+        EventStore, ModelRequestRecord, ModelRequestStore, SessionRecord, SessionRepository,
+    };
+
+    async fn persist(db: &Database, sid: &SessionId, ev: EngineEvent) {
+        let (ty, payload) = ev.to_row().unwrap();
+        db.append(sid, None, &ty, &payload, now()).await.unwrap();
+    }
+
+    fn req(
+        id: &str,
+        agent: Option<&str>,
+        input: u64,
+        cached: Option<u64>,
+        output: u64,
+        cost: Option<u64>,
+        sid: &SessionId,
+    ) -> ModelRequestRecord {
+        ModelRequestRecord {
+            id: id.into(),
+            provider_request_id: None,
+            session_id: sid.clone(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            input_tokens: input,
+            output_tokens: output,
+            finish_reason: Some("stop".into()),
+            error_kind: None,
+            latency_ms: Some(4200),
+            retry_count: 0,
+            kind: leveler_storage::ModelCallKind::Round,
+            cached_input_tokens: cached,
+            cost_usd_micros: cost,
+            agent_id: agent.map(str::to_string),
+            created_at: now(),
+            reasoning_effort: None,
+        }
+    }
+
+    async fn seeded() -> (Database, SessionId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "count the docs", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        // Two root calls and one a reviewer child made.
+        for r in [
+            req("r1", None, 1000, Some(900), 50, Some(1200), &sid),
+            req("r2", None, 2000, Some(1800), 70, Some(2300), &sid),
+            req("c1", Some("ag1"), 500, Some(400), 30, Some(600), &sid),
+        ] {
+            db.insert(&r).await.unwrap();
+        }
+        (db, sid)
+    }
+
+    #[tokio::test]
+    async fn the_session_reports_cached_tokens_and_cost() {
+        let (db, sid) = seeded().await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let s = &loaded.session;
+        assert_eq!(s.input_tokens, 3500);
+        assert_eq!(s.cached_input_tokens, Some(3100));
+        assert_eq!(s.cost_usd_micros, Some(4100));
+        assert!(s.duration_ms.is_some(), "a session has a duration");
+    }
+
+    /// A row written before the cache column existed is an absence of
+    /// measurement. Summing it as zero would report a cache miss that was
+    /// never observed.
+    #[tokio::test]
+    async fn unmeasured_cache_and_cost_read_as_unavailable_not_zero() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "g", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        db.insert(&req("r1", None, 1000, None, 50, None, &sid))
+            .await
+            .unwrap();
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.session.cached_input_tokens, None);
+        assert_eq!(loaded.session.cost_usd_micros, None);
+    }
+
+    #[tokio::test]
+    async fn spend_is_split_between_the_root_session_and_its_children() {
+        let (db, sid) = seeded().await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let lanes = &loaded.session.lanes;
+        let main = lanes.iter().find(|l| l.lane == "main").expect("main lane");
+        let children = lanes
+            .iter()
+            .find(|l| l.lane == "children")
+            .expect("children lane");
+        assert_eq!(
+            (main.requests, main.input_tokens, main.output_tokens),
+            (2, 3000, 120)
+        );
+        assert_eq!(main.cost_usd_micros, Some(3500));
+        assert_eq!(
+            (
+                children.requests,
+                children.input_tokens,
+                children.output_tokens
+            ),
+            (1, 500, 30)
+        );
+        assert_eq!(children.cost_usd_micros, Some(600));
+    }
+
+    /// The display list is capped at 200 rows. The accounting must not be:
+    /// a long session used to report the token total of its last 200 calls as
+    /// if it were the whole session.
+    #[tokio::test]
+    async fn accounting_covers_every_request_even_past_the_display_cap() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "long", "deepseek/v4", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        let n = leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX + 50;
+        for i in 0..n {
+            db.insert(&req(&format!("r{i}"), None, 10, Some(4), 1, Some(2), &sid))
+                .await
+                .unwrap();
+        }
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.session.request_count, n as u32);
+        assert_eq!(loaded.session.input_tokens, (n as u64) * 10);
+        assert_eq!(loaded.session.cached_input_tokens, Some((n as u64) * 4));
+        assert_eq!(loaded.session.cost_usd_micros, Some((n as u64) * 2));
+        assert_eq!(
+            loaded.requests.len(),
+            leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX,
+            "the display list stays capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_reports_its_verdict_not_only_that_it_ran() {
+        let (db, sid) = seeded().await;
+        let before = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(before.session.verification, "not_run");
+
+        persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        let running = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(
+            running.session.verification, "unavailable",
+            "started and never finished is not a verdict"
+        );
+
+        persist(
+            &db,
+            &sid,
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: Some(VerificationStatus::Failed),
+            },
+        )
+        .await;
+        let failed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(failed.session.verification, "failed");
+
+        persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        persist(
+            &db,
+            &sid,
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: Some(VerificationStatus::Passed),
+            },
+        )
+        .await;
+        let passed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(
+            passed.session.verification, "passed",
+            "the latest verdict wins"
+        );
+    }
+}

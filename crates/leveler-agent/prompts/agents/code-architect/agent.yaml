@@ -1,0 +1,4 @@
+version: 1
+name: code-architect
+description: 依据现有代码惯例设计实现方案，给出组件划分、取舍和落地顺序
+capability: read_only

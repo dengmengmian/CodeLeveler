@@ -1,0 +1,62 @@
+//! Approval request projection for the UI.
+//!
+//! The runtime's `leveler_execution::ApprovalRequest` carries paths and a risk
+//! level; this is the render-ready view the approval overlay shows .
+//! The decision type ([`ApprovalDecision`]) and id ([`ApprovalId`]) are reused
+//! from the runtime unchanged.
+
+use serde::{Deserialize, Serialize};
+
+use leveler_core::{ApprovalId, ClarificationId};
+
+/// A pending permission request, projected for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiApprovalRequest {
+    pub id: ApprovalId,
+    /// The tool requesting permission (e.g. `run_command`).
+    pub tool: String,
+    /// A one-line summary of what will happen.
+    pub summary: String,
+    /// The concrete command, when the tool is `run_command`.
+    pub command: Option<String>,
+    /// Human-readable risk bullets (paths touched, network, etc.).
+    pub risks: Vec<String>,
+    /// The tool call this request is holding, when the runtime knows it.
+    ///
+    /// A UI needs it to tell "announced, waiting for you" apart from "running":
+    /// the call has an event on screen already, and without an id the only way
+    /// to find its row would be to guess at the latest running call. `None` for
+    /// a request that is not about one specific call (a standing
+    /// `request_permissions`), and for a session recorded before this field.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// Whether "always allow" would persist a standing permission rule for
+    /// this action. When `false` (consent tools such as `save_agent` or
+    /// `remember`, actions with no safe rule shape, or a request recorded
+    /// before this field) the runtime could only honour it for this turn,
+    /// so a client must not offer it.
+    #[serde(default)]
+    pub always_persists: bool,
+}
+
+/// A mid-task clarification the agent needs answered (spec §35).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiClarificationRequest {
+    pub id: ClarificationId,
+    pub question: String,
+    /// Candidate answers, when the model offered a choice.
+    pub options: Vec<String>,
+}
+
+/// A live control request included in a reconnect snapshot. Only requests with
+/// an in-process waiter are projected; interrupted turns never resurrect stale
+/// buttons after a process restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", content = "request", rename_all = "snake_case")]
+pub enum UiPendingInteraction {
+    Approval(UiApprovalRequest),
+    Clarification(UiClarificationRequest),
+}

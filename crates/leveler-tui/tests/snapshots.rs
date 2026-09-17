@@ -1,0 +1,1845 @@
+//! Render snapshot tests across terminal sizes (§69.5): the shell draws the
+//! welcome header, status line, and composer without panicking, and stays
+//! usable at tiny sizes.
+
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use unicode_width::UnicodeWidthStr;
+
+use leveler_client_protocol::{
+    ApprovalId, MessageId, PermissionProfile, RuntimeEvent, SessionId, ToolCallId,
+    UiApprovalRequest, UiMessage, UiRole, UiSessionSnapshot,
+};
+use leveler_tui::action::Action;
+use leveler_tui::reducer::reduce;
+use leveler_tui::render::render;
+use leveler_tui::state::{AppState, Boot};
+use leveler_tui::theme::Theme;
+
+fn opened_state() -> AppState {
+    let mut s = AppState::new(
+        Theme::no_color(),
+        Boot {
+            session_id: SessionId::new("s1"),
+            user: "麻凡".to_string(),
+            version: "0.1.0".to_string(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 200_000,
+            locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
+            reasoning_effort: None,
+        },
+    );
+    let snap = UiSessionSnapshot {
+        id: SessionId::new("s1"),
+        repository: "~/Develop/codeleveler".to_string(),
+        goal: "interactive session".to_string(),
+        model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
+        mode: PermissionProfile::Assisted,
+        branch: Some("main".to_string()),
+        status: "idle".to_string(),
+        finalization_stage: None,
+        messages: Vec::new(),
+        pending_interactions: Vec::new(),
+        available_models: Vec::new(),
+        vision: false,
+        last_sequence: None,
+        active_tools: Vec::new(),
+        plan: None,
+        verification: None,
+        diff: None,
+        checkpoints: Vec::new(),
+        recaps: Vec::new(),
+        user_shells: Vec::new(),
+        completion_report: None,
+        reasoning: None,
+        work_profile: None,
+        collaboration: None,
+        children: Vec::new(),
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    s
+}
+
+fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    let area = buf.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut x = 0;
+        while x < area.width {
+            let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+            out.push_str(sym);
+            // A double-width grapheme owns the next cell too; skip it so the
+            // scan does not inject a phantom space between wide characters.
+            x += (sym.width().max(1)) as u16;
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_at(width: u16, height: u16, state: &mut AppState) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, state)).unwrap();
+    buffer_text(&terminal)
+}
+
+/// Last `n` buffer lines — sticky footer/input chrome only (splash may use ↑/↓).
+/// The footer context chip's label, without its counts — the tests here assert
+/// placement and presence, never the wording, which the locale table owns.
+fn ctx_label() -> &'static str {
+    leveler_tui::Locale::Zh
+        .text()
+        .footer_context
+        .split(" {}")
+        .next()
+        .expect("the context chip has a label")
+}
+
+fn sticky_chrome(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+#[test]
+fn renders_welcome_header_and_composer_at_standard_sizes() {
+    let mut state = opened_state();
+    for (w, h) in [(80u16, 24u16), (120, 40), (160, 50)] {
+        let text = render_at(w, h, &mut state);
+        assert!(text.contains("CodeLeveler"), "header missing at {w}x{h}");
+        assert!(
+            !text.contains("欢迎回来"),
+            "welcome card must be gone at {w}x{h}"
+        );
+        // Input border: model · auto (English product terms).
+        assert!(
+            text.contains(" · auto") || text.contains("auto"),
+            "permission chip missing at {w}x{h}: {text}"
+        );
+        assert!(text.contains('›'), "composer prompt missing at {w}x{h}");
+        // The bottom strip stays a trust chip, not a shortcut bar — the full
+        // key list lives in /help · Ctrl+?. The one hint row under the composer
+        // is deliberate and transient (it vanishes as soon as you type; see
+        // `the_hints_get_out_of_the_way_once_you_type`), so the assertion is on
+        // the sticky strip rather than the whole frame.
+        // The last row is the trust strip; the hint row sits above it.
+        let bottom = sticky_chrome(&text, 1);
+        assert!(
+            !bottom.contains("Ctrl+C")
+                && !bottom.contains("Ctrl+M")
+                && !bottom.contains("Ctrl+Q")
+                && !bottom.contains("Ctrl+O")
+                && !bottom.contains("Ctrl+?"),
+            "shortcuts must not be sticky footer chrome at {w}x{h}: {bottom}"
+        );
+        // Fresh session: no token/context dump on sticky footer/input chrome.
+        // (Splash hint may mention ↑ history — only check the bottom strip.)
+        let chrome = sticky_chrome(&text, 6);
+        assert!(
+            !chrome.contains("↑") && !chrome.contains("↓"),
+            "idle token counts should be hidden at {w}x{h}: {chrome}"
+        );
+        assert!(
+            !chrome.contains(ctx_label()),
+            "fresh-session context line should be hidden at {w}x{h}: {chrome}"
+        );
+    }
+}
+
+#[test]
+fn context_chip_appears_on_footer_after_usage_update() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ContextUpdated {
+            estimated_tokens: 24_000,
+            candidate_files: Vec::new(),
+        }),
+    );
+
+    let text = render_at(100, 24, &mut state);
+    // Footer is context-only: Context 24k/200k (compact, not full commas).
+    assert!(
+        text.contains(&format!("{} 24k/", ctx_label())),
+        "footer context line missing: {text}"
+    );
+    let chrome = sticky_chrome(&text, 6);
+    assert!(
+        !chrome.contains("Ctrl+C") && !chrome.contains("↑") && !chrome.contains("替我审批"),
+        "keys/token/legacy perm must stay off sticky chrome: {chrome}"
+    );
+}
+
+#[test]
+fn footer_shows_cache_hit_rate_when_provider_reports_it() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cached_input_tokens: 700,
+        }),
+    );
+    // token_input drives used when context_tokens is still low.
+    state.context_window_tokens = 200_000;
+    state.context_tokens = 1000;
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains(ctx_label())
+            && text.contains(
+                &leveler_tui::Locale::Zh
+                    .text()
+                    .footer_cache
+                    .replace("{}", "70")
+            ),
+        "footer should show the context and cache chips: {text}"
+    );
+}
+
+#[test]
+fn empty_session_shows_splash_with_logo() {
+    let mut state = opened_state();
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("CodeLeveler") && text.contains('█'),
+        "empty session splash missing brand/logo: {text}"
+    );
+    assert!(
+        text.contains("让模型真正可靠地完成任务"),
+        "zh mission missing: {text}"
+    );
+    assert!(text.contains("/develop"), "{text}");
+    assert!(
+        !text.contains("feature-dev"),
+        "removed feature-dev entry leaked into splash: {text}"
+    );
+    assert!(!text.contains("/plan"), "plan must stay off splash: {text}");
+}
+
+#[test]
+fn splash_render_review_sizes() {
+    let mut zh = opened_state();
+    let mut en = opened_state();
+    en.locale = leveler_tui::Locale::En;
+    for (w, h) in [(120u16, 36u16), (80, 24), (60, 20)] {
+        let z = render_at(w, h, &mut zh);
+        let e = render_at(w, h, &mut en);
+        assert!(z.contains("CodeLeveler"), "zh {w}x{h}: {z}");
+        assert!(e.contains("CodeLeveler"), "en {w}x{h}: {e}");
+        assert!(
+            z.contains("让模型真正可靠地完成任务"),
+            "zh mission {w}x{h}: {z}"
+        );
+        assert!(
+            e.contains("Make models reliably complete tasks"),
+            "en mission {w}x{h}: {e}"
+        );
+        assert!(!z.contains("Make models reliably complete tasks"), "{z}");
+        assert!(!e.contains("让模型真正可靠地完成任务"), "{e}");
+        for cmd in ["/develop", "/model", "/help"] {
+            assert!(z.contains(cmd), "zh {w}x{h} {cmd}");
+            assert!(e.contains(cmd), "en {w}x{h} {cmd}");
+        }
+    }
+    // 48×16 leaves only a few conversation rows after header + composer.
+    // Brand + mission stay; commands may clip. Must not panic.
+    let tiny_z = render_at(48, 16, &mut zh);
+    let tiny_e = render_at(48, 16, &mut en);
+    assert!(tiny_z.contains("CodeLeveler"), "{tiny_z}");
+    assert!(tiny_e.contains("CodeLeveler"), "{tiny_e}");
+    assert!(tiny_z.contains("让模型真正可靠地完成任务"), "{tiny_z}");
+    assert!(
+        tiny_e.contains("Make models reliably complete tasks"),
+        "{tiny_e}"
+    );
+}
+
+/// End-to-end through the real render path: a repository shipping ignored
+/// `.leveler` config must be visible on screen, because the CLI's stderr notice
+/// is swallowed by the alternate screen. The splash carries the detail and the
+/// composer border carries a marker that outlives the splash.
+#[test]
+fn ignored_in_repo_config_is_visible_on_screen() {
+    let mut state = opened_state();
+    let clean = render_at(100, 24, &mut state);
+    assert!(!clean.contains('⚠'), "clean repo shows no warning: {clean}");
+
+    state.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("hooks.yaml"),
+        "splash must name the file: {text}"
+    );
+    assert!(
+        text.contains("leveler trust"),
+        "splash must name the fix: {text}"
+    );
+
+    // Once the conversation has content the splash is gone, but the composer
+    // border marker must remain — the condition still holds.
+    state.transcript.push_user("开始干活".into());
+    let after = render_at(100, 24, &mut state);
+    assert!(
+        after.contains('⚠'),
+        "the marker must outlive the splash: {after}"
+    );
+}
+
+#[test]
+fn token_usage_does_not_spam_input_or_footer() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TokenUsage {
+            input_tokens: 1200,
+            output_tokens: 300,
+            cached_input_tokens: 0,
+        }),
+    );
+
+    let text = render_at(120, 24, &mut state);
+    let chrome = sticky_chrome(&text, 6);
+    // ↑↓ call stats are not sticky chrome; model · auto stays on the input border.
+    assert!(
+        !chrome.contains('↑') && !chrome.contains('↓'),
+        "↑↓ token stats must not sticky-spam: {chrome}"
+    );
+    assert!(
+        text.contains("auto") || text.contains("deepseek"),
+        "model/permission chip missing: {text}"
+    );
+    assert!(
+        !chrome.contains("Ctrl+C") && !chrome.contains("Ctrl+M"),
+        "shortcuts must not reappear on footer: {chrome}"
+    );
+}
+
+#[test]
+fn shows_typed_and_streamed_text() {
+    let mut state = opened_state();
+    // Type into the composer.
+    for ch in "hello".chars() {
+        reduce(
+            &mut state,
+            Action::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::empty(),
+            )),
+        );
+    }
+    // Stream an assistant reply.
+    let id = leveler_client_protocol::MessageId::new("m1");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "答复内容".into(),
+        }),
+    );
+
+    let text = render_at(100, 20, &mut state);
+    assert!(text.contains("hello"), "composer text not rendered");
+    assert!(text.contains("答复内容"), "assistant stream not rendered");
+}
+
+#[test]
+fn conversation_messages_use_prompt_and_bullet_without_role_labels() {
+    let mut state = opened_state();
+    state.transcript.push_user("请检查项目".into());
+    let id = leveler_client_protocol::MessageId::new("message-style");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "开始检查".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
+
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("▌ 请检查项目"), "{text}");
+    assert!(text.contains("● 开始检查"), "{text}");
+    assert!(!text.lines().any(|line| line.trim() == "User"), "{text}");
+    assert!(
+        !text.lines().any(|line| line.trim() == "Agent Message"),
+        "{text}"
+    );
+}
+
+#[test]
+fn renders_approval_overlay_with_deny_visible() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: UiApprovalRequest {
+                id: ApprovalId::new("r1"),
+                tool: "run_command".into(),
+                summary: "run git push".into(),
+                command: Some("git push".into()),
+                risks: vec!["将访问网络".into()],
+                call_id: None,
+                always_persists: true,
+            },
+        }),
+    );
+    let text = render_at(100, 24, &mut state);
+    // The prompt leads with the action in the transcript's own words, not with
+    // a dialog title.
+    assert!(text.contains("允许"), "approval headline missing: {text}");
+    assert!(text.contains("git push"), "command missing");
+    assert!(text.contains("拒绝"), "deny option missing");
+    assert!(
+        text.contains("始终允许") || text.contains("项目规则"),
+        "always option missing: {text}"
+    );
+}
+
+#[test]
+fn renders_failed_tool_inline_and_tools_screen() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "run_command".into(),
+            arguments: "cargo test".into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("t1"),
+            ok: false,
+            preview: "exit: 101\n--- stderr ---\ncompiler error".into(),
+            duration_ms: 13000,
+            applied_diff: None,
+        }),
+    );
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
+    // A lone failed shell is its own evidence row: ✗, the command, the error.
+    let conv = render_at(100, 24, &mut state);
+    assert!(
+        conv.contains('✗') && conv.contains("cargo test"),
+        "the failure row must name the command that failed: {conv}"
+    );
+    assert!(
+        conv.contains("exit") && conv.contains("101"),
+        "collapsed failed tool should keep the first error line: {conv}"
+    );
+    assert!(
+        !conv.contains("compiler error"),
+        "collapsed stderr tail must not flood Conversation: {conv}"
+    );
+    assert!(
+        !conv.contains("工具调用"),
+        "group summary should not replace the activity stream: {conv}"
+    );
+
+    // Open the Tools screen.
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let tools = render_at(100, 24, &mut state);
+    assert!(tools.contains("工具"), "tools screen title missing");
+    assert!(
+        tools.contains("run_command · cargo test"),
+        "tools screen list should include the tool target"
+    );
+    assert!(tools.contains("Esc 返回"), "tools screen footer missing");
+
+    let narrow_tools = render_at(80, 24, &mut state);
+    assert!(
+        narrow_tools.contains("Esc 返回"),
+        "80-column tools footer should preserve the full return hint"
+    );
+}
+
+#[test]
+fn ok_tool_output_folds_then_expands_with_ctrl_o() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["test"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "line-one\nline-two\nline-three".into(),
+            duration_ms: 10,
+            applied_diff: None,
+        }),
+    );
+
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
+    // Folded by default: the call's own row, with its OUTPUT still hidden.
+    let folded = render_at(100, 24, &mut state);
+    assert!(
+        folded.contains("执行命令") && folded.contains("cargo"),
+        "the evidence row must name the command: {folded}"
+    );
+    assert!(!folded.contains("line-one"), "collapsed output leaked");
+    assert!(
+        !folded.contains("line-three"),
+        "later lines should be hidden"
+    );
+
+    // Ctrl+O expands the current (latest) tool group only.
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let expanded = render_at(100, 24, &mut state);
+    assert!(
+        expanded.contains("cargo"),
+        "expanded group still names the command: {expanded}"
+    );
+    assert!(
+        expanded.contains("line-three"),
+        "expanded output should show all lines: {expanded}"
+    );
+    if let Some(leveler_tui::transcript::TranscriptItem::ToolGroup(g)) =
+        state.transcript.items().last()
+    {
+        assert!(g.expanded, "latest group must be expanded");
+    }
+}
+
+#[test]
+fn command_result_renders_as_important_activity_not_file_list() {
+    let mut state = opened_state();
+    let message_id = leveler_client_protocol::MessageId::new("agent-1");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: message_id.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: message_id.clone(),
+            delta: "正在检查项目".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("command-1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("command-1"),
+            ok: true,
+            preview: "exit: 0\n--- stdout ---\nraw-shell-output\nsecond-line\n".into(),
+            duration_ms: 1250,
+            applied_diff: None,
+        }),
+    );
+
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
+    let collapsed = render_at(120, 30, &mut state);
+    assert!(
+        !collapsed.lines().any(|line| line.trim() == "Agent Message"),
+        "{collapsed}"
+    );
+    assert!(!collapsed.contains("工具输出"), "{collapsed}");
+    assert!(!collapsed.contains("摘要:"), "{collapsed}");
+    assert!(
+        collapsed.contains("执行命令") && collapsed.contains("cargo test"),
+        "the finished run keeps a row naming what it ran: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("raw-shell-output"),
+        "collapsed stdout must not enter the conversation text flow: {collapsed}"
+    );
+
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let expanded = render_at(120, 30, &mut state);
+    assert!(expanded.contains("raw-shell-output"), "{expanded}");
+    assert!(expanded.contains("second-line"), "{expanded}");
+}
+
+#[test]
+fn running_command_renders_as_progress_activity() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("command-running"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["check"]}"#.into(),
+            parallel: false,
+        }),
+    );
+
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains('◌') && text.contains("执行") && text.contains("cargo"),
+        "running important tool must show progress: {text}"
+    );
+    assert!(!text.contains("工具活动"), "{text}");
+    // Internal exploration noise must not appear as a path dump.
+    assert!(!text.contains("✓ ."), "{text}");
+}
+
+#[test]
+fn list_files_scan_stays_out_of_conversation() {
+    let mut state = opened_state();
+    for (id, path) in [
+        ("l1", "."),
+        ("l2", "cmd"),
+        ("l3", "internal/admin"),
+        ("l4", "Makefile"),
+    ] {
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "list_files".into(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+                parallel: false,
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id: ToolCallId::new(id),
+                ok: true,
+                preview: format!("{path}\nPROJECT_RULES.md\nMakefile"),
+                duration_ms: 3,
+                applied_diff: None,
+            }),
+        );
+    }
+    // A real edit should still surface.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("edit"),
+            name: "apply_patch".into(),
+            arguments: r#"{"patch":"*** Begin Patch\n*** Update File: internal/admin/web/web.go\n*** End Patch"}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("edit"),
+            ok: true,
+            preview: "ok".into(),
+            duration_ms: 8,
+            applied_diff: None,
+        }),
+    );
+
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        !text.contains("PROJECT_RULES.md"),
+        "file-list probe content must not enter Conversation: {text}"
+    );
+    assert!(
+        !text.contains("✓ .") && !text.contains("列目录"),
+        "silent list_files activity must stay hidden: {text}"
+    );
+    assert!(
+        text.contains("web.go") || text.contains("编辑"),
+        "important edit must remain visible: {text}"
+    );
+}
+
+/// F1 at the surface: the frame drawn right after a plan transition already
+/// shows it. The dock stuck on "step 1/8 in progress" while the agent worked
+/// on step 5 was a missing update, not a deferred repaint — but the repaint
+/// has to be immediate for the fix to be visible at all.
+#[test]
+fn a_plan_transition_repaints_on_the_same_frame() {
+    use leveler_client_protocol::{PlanStepStatus as P, UiPlan, UiPlanStep};
+    let mut state = opened_state();
+    let plan = |a, b, c| {
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "骨架".into(),
+                        status: a,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "首页".into(),
+                        status: b,
+                    },
+                    UiPlanStep {
+                        index: 2,
+                        description: "验证".into(),
+                        status: c,
+                    },
+                ],
+            },
+        })
+    };
+    // Plan updates arrive while a turn runs.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "run".into(),
+        }),
+    );
+    reduce(&mut state, plan(P::Running, P::Pending, P::Pending));
+    let before = render_at(100, 30, &mut state);
+    assert!(before.contains("已完成 0/3"), "{before}");
+
+    reduce(&mut state, plan(P::Done, P::Running, P::Pending));
+    let after = render_at(100, 30, &mut state);
+    assert!(
+        after.contains("已完成 1/3"),
+        "the header follows the transition: {after}"
+    );
+    assert!(after.contains("骨架") && after.contains("首页"), "{after}");
+}
+
+#[test]
+fn renders_plan_chrome_and_diff_screen() {
+    use leveler_client_protocol::{PlanStepStatus, UiDiff, UiDiffFile, UiPlan, UiPlanStep};
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![UiPlanStep {
+                    index: 0,
+                    description: "调整页面布局".into(),
+                    status: PlanStepStatus::Running,
+                }],
+            },
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            diff: UiDiff {
+                files: vec![UiDiffFile {
+                    path: "src/login.rs".into(),
+                    added: 12,
+                    removed: 4,
+                    patch: Some("+added line\n-removed line".into()),
+                }],
+            },
+        }),
+    );
+
+    // Plan has no dedicated slash/screen anymore — it lives in conversation chrome.
+    let conv = render_at(100, 24, &mut state);
+    assert!(
+        conv.contains("调整页面布局") || conv.contains("1/1") || conv.contains("计划"),
+        "plan chrome missing: {conv}"
+    );
+
+    let ctrl_key = |c: char| {
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::CONTROL,
+        ))
+    };
+    reduce(&mut state, ctrl_key('d')); // open diff
+    let diff = render_at(100, 24, &mut state);
+    assert!(diff.contains("src/login.rs"), "diff file missing");
+    assert!(diff.contains("+12"), "diff added count missing");
+}
+
+#[test]
+fn renders_completion_block() {
+    use leveler_client_protocol::UiCompletionReport;
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionCompleted {
+            report: UiCompletionReport {
+                files_changed: 3,
+                added: 86,
+                removed: 31,
+                checks_passed: 4,
+                checks_total: 4,
+                success: true,
+                verification: leveler_client_protocol::UiVerificationStatus::Passed,
+            },
+        }),
+    );
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("任务已完成"), "completion header missing");
+    assert!(text.contains("修改 3 个文件"), "completion summary missing");
+}
+
+#[test]
+fn second_render_reflects_new_content_not_a_stale_cache() {
+    let mut state = opened_state();
+
+    let m1 = leveler_client_protocol::MessageId::new("m1");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: m1.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: m1.clone(),
+            delta: "first answer".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: m1 }),
+    );
+    let first = render_at(100, 24, &mut state);
+    assert!(first.contains("first answer"), "first render: {first}");
+
+    // Add a second message and re-render the SAME state: the conversation-line
+    // cache must invalidate so the new content shows and the old one stays.
+    let m2 = leveler_client_protocol::MessageId::new("m2");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: m2.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: m2.clone(),
+            delta: "second answer".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: m2 }),
+    );
+    let second = render_at(100, 24, &mut state);
+    assert!(
+        second.contains("second answer"),
+        "cache must not hide new content: {second}"
+    );
+    assert!(
+        second.contains("first answer"),
+        "prior content must remain: {second}"
+    );
+}
+
+#[test]
+fn completed_turn_omits_recap_and_does_not_guess_input_suggestion() {
+    let mut state = opened_state();
+    let id = leveler_client_protocol::MessageId::new("handoff");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "权限检查已经完成。\n\n下一步：运行标签预置脚本。".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
+    reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCompleted));
+
+    assert!(
+        state.composer.is_empty(),
+        "freeform next-step prose must not prefill the composer"
+    );
+    assert_eq!(
+        state.prompt_suggestion, None,
+        "freeform prose must not become a next-step ghost either"
+    );
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        !text.contains("recap:"),
+        "freeform answer must not become a recap: {text}"
+    );
+    // Once the conversation has real turns, the empty-composer hint no longer
+    // repeats — it is a first-run cue only.
+    assert!(
+        !text.contains("输入消息") && !text.contains("Type a message"),
+        "hint should not repeat after a completed turn: {text}"
+    );
+}
+
+#[test]
+fn recap_does_not_render_raw_markdown_markers() {
+    let mut state = opened_state();
+    let id = ToolCallId::new("recap-md");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: id.clone(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({
+                "status": "complete",
+                "summary": "**构建和测试已经完成。**",
+                "next_step": "运行 `release` 发布流程"
+            })
+            .to_string(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id,
+            ok: true,
+            preview: "目标已完成".into(),
+            duration_ms: 10,
+            applied_diff: None,
+        }),
+    );
+    reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCompleted));
+
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("回顾:"), "localized recap missing: {text}");
+    assert!(!text.contains("**"), "raw markdown leaked: {text}");
+    assert!(text.contains("release"), "next step missing: {text}");
+}
+
+#[test]
+fn completed_markdown_message_is_rendered_not_raw() {
+    let mut state = opened_state();
+    let id = leveler_client_protocol::MessageId::new("m1");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "## 标题\n\n这是 **加粗** 文本。\n\n```rust\nfn a() {}\n```".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
+
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("加粗"), "bold text content present");
+    assert!(!text.contains("**加粗**"), "raw ** markers must be gone");
+    assert!(text.contains("标题"), "heading text present");
+    assert!(text.contains("fn a()"), "code block content present");
+}
+
+#[test]
+fn tiny_terminal_does_not_panic() {
+    let mut state = opened_state();
+    // Well below the 80x24 target: must degrade, not crash (§65).
+    let _ = render_at(20, 5, &mut state);
+    let _ = render_at(1, 1, &mut state);
+}
+
+/// An interrupt nobody can find is not an interrupt: while a turn runs, the key
+/// that stops it has to be on screen. These drive the real `render`, not the
+/// footer helper — a hint that only exists in a helper is a hint nobody sees.
+#[test]
+fn a_running_turn_shows_how_to_interrupt_it() {
+    let mut state = opened_state();
+    state.status = leveler_client_protocol::RuntimeStatus::Busy;
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("Esc"),
+        "no way to discover the interrupt:\n{text}"
+    );
+}
+
+#[test]
+fn an_untouched_composer_points_at_the_openers() {
+    let mut state = opened_state();
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("Shift+Tab"), "{text}");
+    assert!(text.contains('@'), "{text}");
+}
+
+#[test]
+fn the_hints_get_out_of_the_way_once_you_type() {
+    let mut state = opened_state();
+    state.composer.replace("修一下登录");
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        !text.contains("Shift+Tab"),
+        "hints must not nag while composing:\n{text}"
+    );
+}
+
+/// The layout must not jump when the hints appear and disappear: a row that
+/// steals height from the conversation on every keystroke would reflow the
+/// transcript under the user's eyes.
+#[test]
+fn showing_and_hiding_the_hints_keeps_the_conversation_the_same_height() {
+    let mut state = opened_state();
+    let empty = render_at(100, 24, &mut state);
+    state.composer.replace("修一下登录");
+    let typing = render_at(100, 24, &mut state);
+    assert_eq!(
+        empty.lines().count(),
+        typing.lines().count(),
+        "frame height changed with the hint row"
+    );
+}
+
+/// A short conversation must sit against the composer, the way terminal output
+/// does — not pin to the top of the viewport and leave a band of dead space
+/// between the last line and the input box.
+#[test]
+fn a_short_conversation_sits_against_the_composer() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "改个字".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let content = lines
+        .iter()
+        .position(|l| l.contains("改个字"))
+        .expect("the message must be on screen");
+    let composer = lines
+        .iter()
+        .position(|l| l.contains('›'))
+        .expect("composer must be on screen");
+
+    // The filler belongs ABOVE the content: several blank rows between the
+    // header rule and the first message, and none of consequence below it.
+    let blank_above = lines[..content]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim().is_empty())
+        .count();
+    let blank_below = lines[content + 1..composer]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blank_above >= 3,
+        "a short transcript must be pushed down by filler, got {blank_above} blank rows above\n{text}"
+    );
+    assert!(
+        blank_below <= 2,
+        "content must sit against the composer, got {blank_below} blank rows below\n{text}"
+    );
+}
+
+/// A tool group whose tools are all Silent (probe runs like `ls`) renders
+/// nothing — and must not leave the separator behind either. Otherwise the
+/// reader sees an unexplained hole between their prompt and the answer.
+#[test]
+fn a_silent_tool_group_leaves_no_hole() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "看看有多少文件".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    // A probe run: Silent by taxonomy, so it contributes no visible line.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"ls","args":["-la"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "924 entries".into(),
+            duration_ms: 120,
+            applied_diff: None,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("a1"),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: MessageId::new("a1"),
+            delta: "924 个文件".into(),
+        }),
+    );
+
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let prompt = lines
+        .iter()
+        .position(|l| l.contains("看看有多少文件"))
+        .expect("prompt on screen");
+    let answer = lines
+        .iter()
+        .position(|l| l.contains("924 个文件"))
+        .expect("answer on screen");
+    let blanks = lines[prompt + 1..answer]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blanks <= 1,
+        "a silent tool must not leave {blanks} blank rows between prompt and answer\n{text}"
+    );
+}
+
+/// Narrow terminals must stay *usable*, not merely survive. A split pane at 60
+/// columns is normal; if the answer or the composer is gone at that width the
+/// pane is useless even though nothing crashed.
+#[test]
+fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
+    for width in [60u16, 70, 80] {
+        let mut state = opened_state();
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new("u1"),
+                    role: UiRole::User,
+                    text: "问题".into(),
+                    ordinal: None,
+                    kind: None,
+                    images: 0,
+                },
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: MessageId::new("a1"),
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: MessageId::new("a1"),
+                delta: "这是答案".into(),
+            }),
+        );
+        let text = render_at(width, 24, &mut state);
+        assert!(
+            text.contains("这是答案"),
+            "answer lost at {width} cols:\n{text}"
+        );
+        assert!(text.contains('›'), "composer lost at {width} cols:\n{text}");
+    }
+}
+
+/// Nothing may print past the terminal edge: an over-wide line wraps in the
+/// user's terminal and shears the whole frame.
+#[test]
+fn no_rendered_line_exceeds_the_terminal_width() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                // No spaces: a naive wrapper has nowhere to break.
+                text: "验证一个非常长的不带空格的中文串".repeat(6),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    for (w, h) in [(60u16, 24u16), (100, 30), (120, 40)] {
+        let text = render_at(w, h, &mut state);
+        for (i, line) in text.lines().enumerate() {
+            let printed = UnicodeWidthStr::width(line.trim_end());
+            assert!(
+                printed <= w as usize,
+                "row {i} is {printed} cols wide at {w}x{h}:\n{line}"
+            );
+        }
+    }
+}
+
+/// The approval overlay replaces the composer, so it must not also leave the
+/// conversation stranded at the top with dead space — the decision should sit
+/// where the input box was, right under the work that prompted it.
+#[test]
+fn the_approval_overlay_sits_where_the_composer_was() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "推一下代码".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: UiApprovalRequest {
+                id: ApprovalId::new("r1"),
+                tool: "run_command".into(),
+                summary: "run git push".into(),
+                command: Some("git push".into()),
+                risks: vec!["将访问网络".into()],
+                call_id: None,
+                always_persists: true,
+            },
+        }),
+    );
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let prompt = lines
+        .iter()
+        .position(|l| l.contains("推一下代码"))
+        .expect("the prompt must stay visible while deciding");
+    let overlay = lines
+        .iter()
+        .position(|l| l.contains("允许 执行命令"))
+        .expect("the approval must be on screen");
+    assert!(
+        overlay > prompt,
+        "the decision belongs below the work — prompt at {prompt}, overlay at {overlay}:\n{text}"
+    );
+    let blanks = lines[prompt + 1..overlay]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blanks <= 3,
+        "{blanks} blank rows between the prompt and the approval:\n{text}"
+    );
+}
+
+#[test]
+fn the_splash_sits_in_the_middle_of_an_empty_session() {
+    // Bottom-aligning a transcript is right: output grows upward from the
+    // composer. An empty session has no transcript — it has a title card, and a
+    // title card shoved against the input box with a screenful of void above it
+    // reads as a layout bug, not a welcome.
+    let mut state = opened_state();
+    let text = render_at(120, 40, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+
+    // The composer box starts at column 0; the splash card is indented.
+    let composer = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with('╭'))
+        .expect("composer must be on screen");
+    // The conversation area begins under the header rule.
+    let rule = lines
+        .iter()
+        .position(|l| l.starts_with('─'))
+        .expect("header rule must be on screen");
+
+    let card_top = (rule + 1..composer)
+        .find(|&i| !lines[i].trim().is_empty())
+        .expect("splash card must be on screen");
+    let card_bottom = (rule + 1..composer)
+        .rev()
+        .find(|&i| !lines[i].trim().is_empty())
+        .unwrap();
+
+    let above = card_top - (rule + 1);
+    let below = composer - (card_bottom + 1);
+    assert!(
+        above.abs_diff(below) <= 2,
+        "splash is not centred: {above} rows above, {below} below\n{text}"
+    );
+}
+
+// ── Long-goal P3: goal recap rendering ───────────────────────────────────
+
+fn sample_recap(unknown_truth: bool) -> leveler_client_protocol::UiGoalRecap {
+    leveler_client_protocol::UiGoalRecap {
+        checkpoint_id: "cp-render".to_string(),
+        goal_id: "g1".to_string(),
+        reason: "manual".to_string(),
+        created_at: "2026-08-27T00:00:00Z".to_string(),
+        transcript_ordinal: Some(0),
+        display_summary: "架构与数据层审查已完成".to_string(),
+        phase: Some("Browser Capability Closure".to_string()),
+        next_action: Some("检查 API 与验证路径".to_string()),
+        plan_completed: Some(3),
+        plan_total: Some(5),
+        completed_milestones: vec!["ownership / cleanup".to_string()],
+        verification: if unknown_truth {
+            "unmeasured"
+        } else {
+            "passed"
+        }
+        .to_string(),
+        verification_detail: (!unknown_truth).then(|| "cargo test: 2707 passed".to_string()),
+        findings_total: if unknown_truth { None } else { Some(3) },
+        known_limitations: vec!["delayed popup 未覆盖".to_string()],
+        unresolved_work: Vec::new(),
+    }
+}
+
+/// §70/§41: the compact recap lives in conversation HISTORY as
+/// `✽ 阶段回顾 · …`, 1–2 lines, with the next step on the second line.
+#[test]
+fn compact_goal_recap_renders_in_history() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(false));
+    let text = render_at(100, 30, &mut state);
+    assert!(
+        text.contains("✽ 阶段回顾 · 架构与数据层审查已完成"),
+        "{text}"
+    );
+    assert!(text.contains("下一步：检查 API 与验证路径"), "{text}");
+    // Collapsed: the structured sections stay folded away.
+    assert!(!text.contains("已知限制"), "{text}");
+}
+
+/// §71/§72: expansion presents the persisted structured fields, and UNKNOWN
+/// truth stays explicit — unmeasured verification never renders as a pass,
+/// unknown findings never render as zero.
+#[test]
+fn expanded_goal_recap_presents_structured_truth() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(true));
+    let idx = state.transcript.items().len() - 1;
+    state.transcript.toggle_tool_group_at(idx);
+    let text = render_at(100, 40, &mut state);
+    assert!(text.contains("▾ 阶段回顾"), "{text}");
+    assert!(text.contains("当前阶段"), "{text}");
+    assert!(text.contains("Browser Capability Closure"), "{text}");
+    assert!(text.contains("3/5"), "{text}");
+    assert!(text.contains("未测量"), "{text}");
+    assert!(
+        !text.contains("✓ 已通过"),
+        "unmeasured verification must not show a pass: {text}"
+    );
+    assert!(text.contains("未知（账本不可读）"), "{text}");
+    assert!(
+        !text.contains("发现\n  0"),
+        "unknown findings must not read as zero: {text}"
+    );
+    assert!(text.contains("delayed popup 未覆盖"), "{text}");
+}
+
+/// §73 (layout half): a historical recap coexists with the lower runtime
+/// plan dock — the recap stays in history, the plan stays docked below.
+#[test]
+fn goal_recap_and_plan_dock_do_not_mix() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(false));
+    state.plan = Some(leveler_client_protocol::UiPlan {
+        steps: vec![
+            leveler_client_protocol::UiPlanStep {
+                index: 0,
+                description: "审查架构".to_string(),
+                status: leveler_client_protocol::PlanStepStatus::Done,
+            },
+            leveler_client_protocol::UiPlanStep {
+                index: 1,
+                description: "实现持久化".to_string(),
+                status: leveler_client_protocol::PlanStepStatus::Running,
+            },
+        ],
+    });
+    let text = render_at(100, 34, &mut state);
+    let recap_line = text
+        .lines()
+        .position(|l| l.contains("✽ 阶段回顾"))
+        .expect("recap in history");
+    let plan_line = text
+        .lines()
+        .position(|l| l.contains("审查架构"))
+        .expect("plan dock");
+    assert!(
+        recap_line < plan_line,
+        "recap belongs to the history above the docked plan: {text}"
+    );
+}
+
+// --- Live-surface i18n ------------------------------------------------------
+//
+// Every production-reachable screen must draw its natural language from the
+// locale table. Key notation (↑↓, Esc, Tab, Ctrl+D) is interaction shorthand,
+// not language: it stays identical in both locales. These tests assert both
+// halves — the words change, the keys do not.
+
+use leveler_tui::screen::Screen;
+
+fn zh_en(screen: Screen, w: u16, h: u16) -> (String, String) {
+    let mut zh = opened_state();
+    let mut en = opened_state();
+    en.locale = leveler_tui::Locale::En;
+    zh.active_screen = screen;
+    en.active_screen = screen;
+    let diff = leveler_client_protocol::UiDiff {
+        files: vec![leveler_client_protocol::UiDiffFile {
+            path: "crates/leveler-tui/src/render/screens.rs".to_string(),
+            added: 3,
+            removed: 1,
+            patch: None,
+        }],
+    };
+    zh.diff = Some(diff.clone());
+    en.diff = Some(diff);
+    (render_at(w, h, &mut zh), render_at(w, h, &mut en))
+}
+
+#[test]
+fn diff_screen_hint_follows_the_locale() {
+    let (zh, en) = zh_en(Screen::Diff, 100, 30);
+
+    assert!(zh.contains("选择文件"), "zh lost its own words:\n{zh}");
+    assert!(
+        !zh.contains("select file"),
+        "zh must not fall back to English:\n{zh}"
+    );
+
+    assert!(
+        !en.contains("选择文件") && !en.contains("返回") && !en.contains("滚动"),
+        "en still shows hardcoded Chinese:\n{en}"
+    );
+    assert!(
+        en.contains("select") && en.contains("back"),
+        "en lost the localized hint:\n{en}"
+    );
+
+    // Key notation is not language.
+    for keys in ["↑↓", "Esc"] {
+        assert!(zh.contains(keys), "zh dropped key notation {keys}:\n{zh}");
+        assert!(en.contains(keys), "en dropped key notation {keys}:\n{en}");
+    }
+}
+
+#[test]
+fn diff_screen_chrome_follows_the_locale() {
+    let (zh, en) = zh_en(Screen::Diff, 100, 30);
+    assert!(zh.contains("文件"), "zh file pane title:\n{zh}");
+    assert!(
+        en.contains("Files") || en.contains("files"),
+        "en file pane title is still Chinese:\n{en}"
+    );
+    // The patch is not loaded, so the detail pane shows its reload hint.
+    assert!(
+        !en.contains("刷新以加载补丁"),
+        "en reload hint is hardcoded Chinese:\n{en}"
+    );
+    assert!(
+        en.contains("Ctrl+D"),
+        "the key stays in both locales:\n{en}"
+    );
+}
+
+#[test]
+fn sessions_screen_follows_the_locale() {
+    let (zh, en) = zh_en(Screen::Sessions, 100, 30);
+    assert!(zh.contains("会话"), "zh title:\n{zh}");
+    assert!(en.contains("Sessions"), "en title is still Chinese:\n{en}");
+    assert!(
+        !en.contains("暂无会话") && !en.contains("选择") && !en.contains("返回"),
+        "en sessions screen still shows Chinese:\n{en}"
+    );
+}
+
+#[test]
+fn help_screen_key_descriptions_follow_the_locale() {
+    // Tall enough that the key table clears the command list above it.
+    let (zh, en) = zh_en(Screen::Help, 100, 90);
+    // "↑/↓ (Input)" / "↑/↓ (Conversation)" used to be English in both locales.
+    assert!(
+        !zh.contains("(Input)") && !zh.contains("(Conversation)"),
+        "zh help screen shows untranslated English labels:\n{zh}"
+    );
+    assert!(zh.contains("↑/↓"), "zh keeps the key notation:\n{zh}");
+    assert!(en.contains("↑/↓"), "en keeps the key notation:\n{en}");
+}
+
+#[test]
+fn tools_screen_filter_label_follows_the_locale() {
+    let (zh, en) = zh_en(Screen::Tools, 100, 30);
+    assert!(zh.contains("全部"), "zh filter label:\n{zh}");
+    assert!(
+        !en.contains("全部"),
+        "en Tools header still shows the hardcoded Chinese filter:\n{en}"
+    );
+    assert!(
+        en.contains("All") || en.contains("all"),
+        "en filter label missing:\n{en}"
+    );
+}
+
+// --- /trace: UI language follows the locale, protocol truth does not --------
+//
+// The Trace screen shows raw runtime facts (ids, model names, event types,
+// protocol field names) wrapped in UI chrome. The chrome is language; the
+// facts are not. These tests pin both halves: the chrome must follow the
+// locale, and the raw values must be byte-identical in either one.
+
+fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
+    use leveler_client_protocol::{
+        RuntimeEvent, UiObservabilityLoaded, UiRecoveryObservation, UiSessionObservation,
+    };
+    let mut s = opened_state();
+    s.locale = locale;
+    let loaded = UiObservabilityLoaded {
+        session: UiSessionObservation {
+            session_id: SessionId::new("obs-1"),
+            goal: "ship the parser".into(),
+            repository: "/repo".into(),
+            created_at: "t0".into(),
+            updated_at: "t1".into(),
+            status: "completed".into(),
+            model: "deepseek-v4-pro".into(),
+            work_profile: "balanced".into(),
+            collaboration: "goal".into(),
+            last_sequence: Some(42),
+            request_count: 3,
+            input_tokens: 1000,
+            output_tokens: 40,
+            avg_latency_ms: Some(2000),
+            last_latency_ms: Some(1800),
+            request_failures: 0,
+            request_retries: 0,
+            tool_started: 5,
+            tool_finished: 5,
+            verification_runs: 1,
+            compact_count: 0,
+            subagent_started: 0,
+            verification: "not_run".into(),
+            duration_ms: None,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            lanes: Vec::new(),
+        },
+        window: Vec::new(),
+        window_from: 0,
+        window_to: 42,
+        requests: vec![leveler_client_protocol::UiRequestObservation {
+            id: "req-1".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            input_tokens: 1000,
+            output_tokens: 40,
+            finish_reason: Some("stop".into()),
+            error_kind: None,
+            latency_ms: Some(1800),
+            retry_count: 0,
+            cached_input_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
+            created_at: "t1".into(),
+        }],
+        tools: Vec::new(),
+        agents: Vec::new(),
+        recovery: UiRecoveryObservation {
+            interrupted_turns: 0,
+            workspace_snapshots: 0,
+            review_stages: Vec::new(),
+        },
+        relations: Vec::new(),
+    };
+    // `/trace` is the production entry: it issues a query, and only the
+    // matching answer populates the screen. An uncorrelated payload is
+    // deliberately ignored, so the fixture has to go through the command.
+    for ch in "/trace".chars() {
+        reduce(&mut s, tab_key(ch));
+    }
+    let effects = reduce(
+        &mut s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    let query_id = effects.iter().find_map(|e| match e {
+        leveler_tui::action::Effect::Send(
+            leveler_client_protocol::ClientCommand::QueryObservability {
+                query_id: Some(id), ..
+            },
+        ) => Some(id.clone()),
+        _ => None,
+    });
+    assert!(query_id.is_some(), "/trace must query the runtime");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id,
+            observation: loaded,
+        }),
+    );
+    if tab != '1' {
+        reduce(&mut s, tab_key(tab));
+    }
+    render_at(110, 40, &mut s)
+}
+
+fn tab_key(c: char) -> Action {
+    Action::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(c),
+        crossterm::event::KeyModifiers::NONE,
+    ))
+}
+
+#[test]
+fn trace_chrome_follows_the_locale() {
+    let zh = trace_state(leveler_tui::Locale::Zh, '1');
+    let en = trace_state(leveler_tui::Locale::En, '1');
+
+    // The navigation hint used to read "1-6 tabs … Esc 返回" in BOTH locales.
+    assert!(
+        !zh.contains("tabs") && !zh.contains("inspect") && !zh.contains("filter"),
+        "zh trace still shows English UI verbs:\n{zh}"
+    );
+    assert!(
+        !en.contains("返回") && !en.contains("查询中") && !en.contains("标签"),
+        "en trace still shows Chinese UI copy:\n{en}"
+    );
+
+    // Key notation is interaction shorthand, not language.
+    for keys in ["1-6", "Tab", "↑↓", "Enter", "Esc"] {
+        assert!(zh.contains(keys), "zh dropped key notation {keys}:\n{zh}");
+        assert!(en.contains(keys), "en dropped key notation {keys}:\n{en}");
+    }
+}
+
+#[test]
+fn trace_raw_protocol_values_are_identical_in_both_locales() {
+    let zh = trace_state(leveler_tui::Locale::Zh, '1');
+    let en = trace_state(leveler_tui::Locale::En, '1');
+    // Ids, model names, status and profile values are runtime truth. A locale
+    // may not rewrite them.
+    for raw in [
+        "deepseek-v4-pro",
+        "completed",
+        "balanced",
+        "ship the parser",
+    ] {
+        assert!(zh.contains(raw), "zh lost raw value {raw}:\n{zh}");
+        assert!(en.contains(raw), "en lost raw value {raw}:\n{en}");
+    }
+}
+
+#[test]
+fn trace_empty_states_follow_the_locale() {
+    // Tab 4 = Tools; this fixture has no tool rows, so the empty state shows.
+    let zh = trace_state(leveler_tui::Locale::Zh, '4');
+    let en = trace_state(leveler_tui::Locale::En, '4');
+    assert!(zh.contains("此会话没有"), "zh tools empty state:\n{zh}");
+    assert!(
+        !en.contains("此会话没有") && !en.contains("全会话汇总"),
+        "en tools tab still shows Chinese:\n{en}"
+    );
+}
+
+#[test]
+fn trace_tab_and_filter_labels_follow_the_locale() {
+    let zh = trace_state(leveler_tui::Locale::Zh, '1');
+    let en = trace_state(leveler_tui::Locale::En, '1');
+    // Tab numbers are notation; the words beside them are UI vocabulary.
+    assert!(zh.contains('1') && en.contains("Overview"));
+    assert!(
+        !zh.contains("Overview") && !zh.contains("Recovery"),
+        "zh tab strip is still English:\n{zh}"
+    );
+}
+
+// --- Localization policy ---
+//
+// These lock the BOUNDARY, not the wording. The goal is not zero English in a
+// Chinese session — `模型 deepseek-v4-flash` is correct. The goal is that the
+// chrome follows the locale and the identifiers never do.
+
+#[test]
+fn chrome_follows_the_locale_while_the_model_id_does_not() {
+    let zh = trace_state(leveler_tui::Locale::Zh, '1');
+    let en = trace_state(leveler_tui::Locale::En, '1');
+
+    // Class A/B: the word for "model" is the product's, and it changes.
+    assert!(zh.contains("模型"), "zh chrome:\n{zh}");
+    assert!(
+        en.contains("MODEL") || en.contains("Model"),
+        "en chrome:\n{en}"
+    );
+    assert!(!zh.contains("MODEL"), "zh kept the English chrome:\n{zh}");
+
+    // Class C: the identifier beside it is the same bytes in both.
+    for id in ["deepseek-v4-pro", "not_run", "balanced"] {
+        assert!(zh.contains(id), "zh rewrote the identifier {id}:\n{zh}");
+        assert!(en.contains(id), "en rewrote the identifier {id}:\n{en}");
+    }
+}
+
+#[test]
+fn protocol_words_quoted_inside_prose_survive_translation() {
+    // §12.6: Class C terms quoted inside a Class A sentence stay put. Tab 5 is
+    // empty in this fixture, so its empty state renders: the sentence is
+    // Chinese, `durable` and `SubAgent` inside it are not.
+    let zh = trace_state(leveler_tui::Locale::Zh, '5');
+    let en = trace_state(leveler_tui::Locale::En, '5');
+    for word in ["durable", "SubAgent"] {
+        assert!(
+            zh.contains(word),
+            "zh translated the protocol identifier {word} out of the sentence:\n{zh}"
+        );
+        assert!(en.contains(word), "en lost {word}:\n{en}");
+    }
+    assert!(
+        zh.contains("此会话没有"),
+        "the prose around them is Chinese:\n{zh}"
+    );
+    assert!(
+        !en.contains("此会话没有"),
+        "the prose must follow the locale even when it quotes raw terms:\n{en}"
+    );
+}
+
+#[test]
+fn diagnostic_grid_headers_stay_english_in_both_locales() {
+    // §12.4: fixed-width column labels are compact technical identifiers, and
+    // the grid pads by character count — a CJK header breaks every row below.
+    let zh = trace_state(leveler_tui::Locale::Zh, '3');
+    let en = trace_state(leveler_tui::Locale::En, '3');
+    for header in ["MODEL", "IN", "OUT", "LAT", "RESULT"] {
+        assert!(zh.contains(header), "zh grid lost {header}:\n{zh}");
+        assert!(en.contains(header), "en grid lost {header}:\n{en}");
+    }
+}
+
+#[test]
+fn key_notation_is_identical_in_both_locales() {
+    // §12.3: keys name hardware. Only the verb after them is language.
+    let zh = trace_state(leveler_tui::Locale::Zh, '1');
+    let en = trace_state(leveler_tui::Locale::En, '1');
+    for key in ["1-6", "Tab", "↑↓", "Enter", "Esc"] {
+        assert!(zh.contains(key), "zh dropped {key}:\n{zh}");
+        assert!(en.contains(key), "en dropped {key}:\n{en}");
+    }
+    // The verbs, however, must differ.
+    assert!(zh.contains("查看") && en.contains("inspect"));
+}

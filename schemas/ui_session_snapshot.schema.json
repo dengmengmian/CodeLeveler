@@ -1,0 +1,1181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "UiSessionSnapshot",
+  "description": "Everything a client needs to render a session's header and transcript.",
+  "type": "object",
+  "required": [
+    "goal",
+    "id",
+    "messages",
+    "mode",
+    "repository",
+    "status"
+  ],
+  "properties": {
+    "active_tools": {
+      "description": "Live render state needed to reconnect while a long turn is still running. All fields are additive/defaulted for protocol compatibility.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiActiveToolCall"
+      }
+    },
+    "available_models": {
+      "description": "Models the user can switch to (for the model picker, ).",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ModelRef"
+      }
+    },
+    "branch": {
+      "description": "VCS branch, if the repository is a git repo.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "checkpoints": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiCheckpoint"
+      }
+    },
+    "children": {
+      "description": "Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiChildAgent"
+      }
+    },
+    "collaboration": {
+      "description": "Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "completion_report": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiCompletionReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diff": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiDiff"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "finalization_stage": {
+      "description": "Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FinalizationStage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "goal": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/definitions/SessionId"
+    },
+    "last_sequence": {
+      "description": "The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiMessage"
+      }
+    },
+    "mode": {
+      "$ref": "#/definitions/PermissionProfile"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pending_interactions": {
+      "description": "Live approval/clarification waiters for reconnect/resync.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiPendingInteraction"
+      }
+    },
+    "plan": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiPlan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reasoning": {
+      "description": "Runtime-projected reasoning state. Absent on old runtimes so a new client keeps its boot-time value. Present with `effective: None` means the model has no controllable effort knob (do not invent one).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiReasoningState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recaps": {
+      "description": "Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiGoalRecap"
+      }
+    },
+    "repository": {
+      "type": "string"
+    },
+    "status": {
+      "description": "Persisted status string (e.g. \"running\", \"completed\").",
+      "type": "string"
+    },
+    "user_shells": {
+      "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiUserShell"
+      }
+    },
+    "verification": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiVerification"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vision": {
+      "description": "Whether the current model accepts image input (spec §42).",
+      "default": false,
+      "type": "boolean"
+    },
+    "work_profile": {
+      "description": "Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "ApprovalId": {
+      "description": "Identifies a pending permission approval request.",
+      "type": "string"
+    },
+    "CheckState": {
+      "description": "The state of one verification check.\n\nThis is the check-level fact and not the task-level verdict, so the three ways a check can produce no verdict stay distinct. A check whose program is not installed is not a check that was deliberately skipped, and neither is a check the environment refused: each one is the reason a run ended unverified, and the reader is owed that reason rather than a shrug.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "running",
+            "passed",
+            "failed"
+          ]
+        },
+        {
+          "description": "Deliberately not run.",
+          "type": "string",
+          "enum": [
+            "skipped"
+          ]
+        },
+        {
+          "description": "No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency.",
+          "type": "string",
+          "enum": [
+            "not_run"
+          ]
+        },
+        {
+          "description": "The check's program is not on `PATH`, so it could not run at all.",
+          "type": "string",
+          "enum": [
+            "tool_missing"
+          ]
+        },
+        {
+          "description": "The check ran but the environment refused it (toolchain/MSRV mismatch).",
+          "type": "string",
+          "enum": [
+            "environment_unavailable"
+          ]
+        },
+        {
+          "description": "The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason.",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        }
+      ]
+    },
+    "CheckpointId": {
+      "description": "Identifies a conversation checkpoint (restore point).",
+      "type": "string"
+    },
+    "ChildOutcome": {
+      "description": "The four-way reading of a settled child's result. \"Finished with nothing to flag\" and \"stopped with nothing to show\" are opposite facts; a client renders them from this field, never from the summary text.",
+      "type": "string",
+      "enum": [
+        "completed_with_findings",
+        "completed_no_findings",
+        "incomplete_partial",
+        "incomplete_no_result"
+      ]
+    },
+    "ChildStop": {
+      "description": "How a settled child's activation ended.",
+      "type": "string",
+      "enum": [
+        "completed",
+        "incomplete",
+        "budget",
+        "cancelled",
+        "failed",
+        "lost"
+      ]
+    },
+    "ClarificationId": {
+      "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "FinalizationStage": {
+      "description": "The mechanical work still running after the assistant has produced its final response but before the runtime publishes the task terminal.\n\nThis is lifecycle chrome, not a second completion authority: the terminal event remains the only fact that ends the turn.",
+      "oneOf": [
+        {
+          "description": "Wait for work already admitted by the turn to settle.",
+          "type": "string",
+          "enum": [
+            "settling_dependencies"
+          ]
+        },
+        {
+          "description": "Run the configured checks over the final tree.",
+          "type": "string",
+          "enum": [
+            "verification"
+          ]
+        },
+        {
+          "description": "Persist verification and other completion evidence.",
+          "type": "string",
+          "enum": [
+            "evidence"
+          ]
+        },
+        {
+          "description": "Run a completion review explicitly required by the task contract.",
+          "type": "string",
+          "enum": [
+            "review"
+          ]
+        },
+        {
+          "description": "Resolve the task outcome from the collected facts.",
+          "type": "string",
+          "enum": [
+            "resolving_outcome"
+          ]
+        },
+        {
+          "description": "Commit and publish the canonical terminal fact.",
+          "type": "string",
+          "enum": [
+            "publishing_terminal"
+          ]
+        }
+      ]
+    },
+    "MessageId": {
+      "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "PermissionProfile": {
+      "type": "string",
+      "enum": [
+        "request_approval",
+        "assisted",
+        "full_access"
+      ]
+    },
+    "PlanStepStatus": {
+      "description": "The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).",
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "done",
+        "failed",
+        "skipped"
+      ]
+    },
+    "SessionId": {
+      "description": "Identifies a single agent session (one user goal end to end).",
+      "type": "string"
+    },
+    "ToolCallId": {
+      "description": "Identifies a tool call. Must be stable across streaming reassembly.",
+      "type": "string"
+    },
+    "UiActiveToolCall": {
+      "description": "A tool invocation that was still running when a client took its snapshot.",
+      "type": "object",
+      "required": [
+        "arguments",
+        "id",
+        "name"
+      ],
+      "properties": {
+        "arguments": {
+          "type": "string"
+        },
+        "elapsed_ms": {
+          "description": "How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "output_tail": {
+          "description": "The bounded end of the command's live output so far.",
+          "default": "",
+          "type": "string"
+        },
+        "output_truncated": {
+          "description": "True when `output_tail` dropped earlier output.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "UiApprovalRequest": {
+      "description": "A pending permission request, projected for display.",
+      "type": "object",
+      "required": [
+        "id",
+        "risks",
+        "summary",
+        "tool"
+      ],
+      "properties": {
+        "always_persists": {
+          "description": "Whether \"always allow\" would persist a standing permission rule for this action. When `false` (consent tools such as `save_agent` or `remember`, actions with no safe rule shape, or a request recorded before this field) the runtime could only honour it for this turn, so a client must not offer it.",
+          "default": false,
+          "type": "boolean"
+        },
+        "call_id": {
+          "description": "The tool call this request is holding, when the runtime knows it.\n\nA UI needs it to tell \"announced, waiting for you\" apart from \"running\": the call has an event on screen already, and without an id the only way to find its row would be to guess at the latest running call. `None` for a request that is not about one specific call (a standing `request_permissions`), and for a session recorded before this field.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "The concrete command, when the tool is `run_command`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "risks": {
+          "description": "Human-readable risk bullets (paths touched, network, etc.).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "description": "A one-line summary of what will happen.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool requesting permission (e.g. `run_command`).",
+          "type": "string"
+        }
+      }
+    },
+    "UiCheck": {
+      "description": "One verification check (spec §22).",
+      "type": "object",
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "evidence": {
+          "description": "Captured evidence (command output), for failures.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/CheckState"
+        }
+      }
+    },
+    "UiCheckpoint": {
+      "description": "A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git.",
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "ordinal"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/CheckpointId"
+        },
+        "label": {
+          "type": "string"
+        },
+        "ordinal": {
+          "description": "The persisted-message count to truncate back to.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiChildAgent": {
+      "description": "One delegated child, projected from the durable record — what a client that reconnects, or opens a session, renders without having seen a single live event.",
+      "type": "object",
+      "required": [
+        "id",
+        "nickname",
+        "purpose",
+        "role",
+        "state"
+      ],
+      "properties": {
+        "agent": {
+          "description": "The declarative agent it was spawned from, when it was. `None` for a built-in role spawn and for children recorded before agents existed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiChildAgentIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "background": {
+          "description": "Whether its parent continued while it ran.",
+          "default": false,
+          "type": "boolean"
+        },
+        "cost_usd_micros": {
+          "description": "`None` when no call carried a price — unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "description": "Model usage recorded under this child's id.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "ok": {
+          "description": "Whether it reached the end of its task, once settled. Carried beside `outcome` because rows settled before the outcome was typed have only this bit.",
+          "default": false,
+          "type": "boolean"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_tokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "description": "What it was asked to do.",
+          "type": "string"
+        },
+        "read_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "resumes": {
+          "description": "How many times it was continued after an interruption.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "role": {
+          "type": "string"
+        },
+        "scope": {
+          "description": "Exclusive write scope fixed at spawn (empty when late-bound or read-only).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "state": {
+          "$ref": "#/definitions/UiChildState"
+        },
+        "stop": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildStop"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "description": "The recorded settlement summary, once settled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiChildAgentIdentity": {
+      "description": "The definition a running or settled child was spawned from, as resolved at spawn. Deleting or editing the definition does not change it.",
+      "type": "object",
+      "required": [
+        "capability",
+        "fingerprint",
+        "name",
+        "source"
+      ],
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The agent's name, e.g. `security-reviewer`.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "description": "`project`, `user` or `builtin`.",
+          "type": "string"
+        }
+      }
+    },
+    "UiChildState": {
+      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\n`findings_total` is a count, not a score: it says how much this child reported, never whether any of it mattered. What the parent did about it is in the transcript, where the parent said it. Where a delegated child's lifecycle stands, as the runtime records it.",
+      "oneOf": [
+        {
+          "description": "An activation is live.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "Its activation died with a runtime window; the next turn of the session continues it or settles it as lost.",
+          "type": "string",
+          "enum": [
+            "interrupted"
+          ]
+        },
+        {
+          "description": "It has its one terminal.",
+          "type": "string",
+          "enum": [
+            "settled"
+          ]
+        }
+      ]
+    },
+    "UiClarificationRequest": {
+      "description": "A mid-task clarification the agent needs answered (spec §35).",
+      "type": "object",
+      "required": [
+        "id",
+        "options",
+        "question"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "options": {
+          "description": "Candidate answers, when the model offered a choice.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      }
+    },
+    "UiCompletionReport": {
+      "description": "The final completion report (spec §23).",
+      "type": "object",
+      "required": [
+        "added",
+        "checks_passed",
+        "checks_total",
+        "files_changed",
+        "removed",
+        "success"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "checks_passed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "checks_total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "files_changed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "success": {
+          "description": "Whether the run completed and every gating check passed. Kept for existing clients; `verification` carries the full status.",
+          "type": "boolean"
+        },
+        "verification": {
+          "description": "The project's own checks over the final tree. Absent on reports written before the status/verification split (reads as `not_run`).",
+          "default": "not_run",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiVerificationStatus"
+            }
+          ]
+        }
+      }
+    },
+    "UiDiff": {
+      "description": "A summary of working-tree changes.",
+      "type": "object",
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiDiffFile"
+          }
+        }
+      }
+    },
+    "UiDiffFile": {
+      "description": "One changed file (spec §21).",
+      "type": "object",
+      "required": [
+        "added",
+        "path",
+        "removed"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "patch": {
+          "description": "The unified diff hunk text, loaded on demand.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiGoalRecap": {
+      "description": "One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts.\n\nTruth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. `verification` is `\"unmeasured\"` when nothing was proven — never a pass.",
+      "type": "object",
+      "required": [
+        "checkpoint_id",
+        "created_at",
+        "display_summary",
+        "goal_id",
+        "reason",
+        "verification"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "description": "The persisted `GoalCheckpointId` this Recap presents.",
+          "type": "string"
+        },
+        "completed_milestones": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_at": {
+          "description": "RFC3339. When the checkpoint was cut.",
+          "type": "string"
+        },
+        "display_summary": {
+          "description": "The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback.",
+          "type": "string"
+        },
+        "findings_total": {
+          "description": "`None` = UNKNOWN (ledger unreadable) — never render as 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "known_limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_completed": {
+          "description": "Plan progress; both `None` when no plan was recorded (absent, not 0/0).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "plan_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "`manual` | `milestone` | `context_compaction` | `interrupted`.",
+          "type": "string"
+        },
+        "transcript_ordinal": {
+          "description": "Transcript position the checkpoint represents (messages `[0..n)`), so a reopened session can interleave the Recap where it happened. `None` = unknown; append after existing history.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unresolved_work": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "description": "`passed` | `failed` | `unmeasured`.",
+          "type": "string"
+        },
+        "verification_detail": {
+          "description": "Evidence for a pass, or the failure detail. Absent when unmeasured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiMessage": {
+      "description": "A rendered message in the transcript.",
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "images": {
+          "description": "How many images this message carried. A client renders them its own way — the text never holds a file path, and a message that was only a picture would otherwise read as an empty one. Additive: 0 on old runtimes and on every message that carried none.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "kind": {
+          "description": "What kind of message this is when its role alone would mislead. `None` is an ordinary message of its role.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMessageKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ordinal": {
+          "description": "Persisted transcript ordinal (append order in the message log), when known. Lets a client interleave durable goal recaps at the position their checkpoint represents. Additive: absent on live-stream messages and old runtimes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "role": {
+          "$ref": "#/definitions/UiRole"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "UiMessageKind": {
+      "description": "A message whose role does not say who wrote it.",
+      "oneOf": [
+        {
+          "description": "Written by the runtime into the model's context as a user-role turn — a child's settlement, a lost or resumed delegation — not typed by the user. Render it as a runtime notice, never as user input.",
+          "type": "string",
+          "enum": [
+            "runtime_notice"
+          ]
+        }
+      ]
+    },
+    "UiPendingInteraction": {
+      "description": "A live control request included in a reconnect snapshot. Only requests with an in-process waiter are projected; interrupted turns never resurrect stale buttons after a process restart.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiApprovalRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "approval"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiClarificationRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "clarification"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "UiPlan": {
+      "description": "The execution plan (spec §20).",
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiPlanStep"
+          }
+        }
+      }
+    },
+    "UiPlanStep": {
+      "description": "One step in the execution plan.",
+      "type": "object",
+      "required": [
+        "description",
+        "index",
+        "status"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/PlanStepStatus"
+        }
+      }
+    },
+    "UiReasoningState": {
+      "description": "Additive reasoning projection. The client must display `effective` and must not infer an effort from the model name or provider.",
+      "type": "object",
+      "properties": {
+        "effective": {
+          "description": "Wire value the runtime will send (`max`, `high`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiRole": {
+      "description": "Who authored a message.",
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "system",
+        "tool"
+      ]
+    },
+    "UiUserShell": {
+      "description": "One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log).",
+      "type": "object",
+      "required": [
+        "command",
+        "cwd",
+        "elapsed_secs",
+        "id",
+        "status"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "elapsed_secs": {
+          "description": "Seconds elapsed at snapshot time (running) or total runtime (done).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "exit_code": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "output_tail": {
+          "default": "",
+          "type": "string"
+        },
+        "output_truncated": {
+          "description": "True when `output_tail` dropped earlier output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "status": {
+          "description": "`running | success | failed | cancelled`.",
+          "type": "string"
+        }
+      }
+    },
+    "UiVerification": {
+      "description": "The verification result.\n\n`passed` is `None` while a check is still running, and it is also `None` when nothing was proven. It is never `Some(true)` for a run that was not verified — \"not verified\" and \"failed\" are different facts, and clients render them differently (`incomplete` versus `failed`).",
+      "type": "object",
+      "required": [
+        "checks"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiCheck"
+          }
+        },
+        "passed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiVerificationStatus": {
+      "description": "What the project's own checks reported over the final tree. Orthogonal to whether the run completed: `Passed` means the configured commands exited 0, never that the user's request was satisfied.",
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "not_run",
+        "unavailable"
+      ]
+    },
+    "UserShellId": {
+      "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",
+      "type": "string"
+    }
+  }
+}

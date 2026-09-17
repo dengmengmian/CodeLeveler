@@ -1,0 +1,1304 @@
+//! M5: command delivery goes through the idempotency/versioning envelope.
+//!
+//! `InProcessRuntimeClient::deliver` must dedup at-least-once delivery by
+//! `command_id` (a duplicate never re-dispatches its action) and reject a
+//! command issued against a stale `expected_version` (optimistic concurrency).
+
+use std::sync::Arc;
+
+use leveler_app::runtime_boot::RuntimeBootLease;
+use leveler_app::{Application, InProcessRuntimeClient};
+use leveler_client_protocol::{
+    ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
+    PermissionProfile as WirePermissionProfile, RuntimeEvent,
+};
+use leveler_core::{CommandId, SessionId};
+use leveler_execution::PermissionProfile;
+use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
+#[cfg(unix)]
+use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
+use leveler_model::ModelRef;
+use leveler_project::Layout;
+use leveler_storage::{TaskStore, TurnRepository};
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
+
+/// Point `LEVELER_HOME` at an empty dir so `GlobalConfig::load()` yields the
+/// default. Tests must not depend on the developer's `~/.leveler/config.toml`.
+fn isolate_global_config() {
+    use std::sync::OnceLock;
+    static EMPTY_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = EMPTY_HOME.get_or_init(|| tempfile::tempdir().unwrap());
+    unsafe {
+        std::env::set_var("LEVELER_HOME", dir.path());
+    }
+}
+
+fn write_config(root: &std::path::Path, base_url: &str) {
+    isolate_global_config();
+    std::fs::create_dir_all(root.join("configs/providers")).unwrap();
+    std::fs::create_dir_all(root.join("configs/models")).unwrap();
+    // The tests that use an unreachable `base_url` need the model call to
+    // FAIL, not to spend the production retry schedule doing it. Windows takes
+    // about two seconds to refuse a connection to a closed local port where
+    // Unix takes none, so four attempts plus backoff is the difference between
+    // a turn settling in a second and a turn outliving the test's patience.
+    std::fs::write(
+        root.join("configs/providers/mock.yaml"),
+        format!(
+            "id: mock\nprotocol: openai_chat\nbase_url: {base_url}\n\
+             timeouts:\n  connect_seconds: 5\n  request_seconds: 30\n  \
+             idle_stream_seconds: 30\nretry:\n  max_attempts: 1\n  \
+             initial_backoff_ms: 10\n  max_backoff_ms: 10\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("configs/models/m.yaml"),
+        r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: false
+  vision: false
+limits:
+  context_window: 8192
+  reliable_context: 4096
+  max_output_tokens: 1024
+  max_tool_schema_bytes: 8192
+  max_parallel_tool_calls: 1
+compatibility:
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+"#,
+    )
+    .unwrap();
+}
+
+async fn build_client() -> (
+    tempfile::TempDir,
+    Arc<Application>,
+    Arc<InProcessRuntimeClient>,
+    SessionId,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    // An unreachable base_url is fine: these tests observe the synchronous
+    // dispatch effect (a UserMessageAdded event), not the background turn.
+    write_config(tmp.path(), "http://127.0.0.1:9");
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let model = ModelRef::new("mock", "m");
+    let session_id = app.create_session(&model, "goal").await.unwrap();
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        model,
+        PermissionProfile::Assisted,
+        false,
+    ));
+    (tmp, app, client, session_id)
+}
+
+#[tokio::test]
+async fn duplicate_command_id_dispatches_once() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let mut rx = client.subscribe();
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("cmd-dup"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-07-12T00:00:00Z".to_string(),
+        command: ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "hi".to_string(),
+            attachments: vec![],
+        },
+    };
+    client.deliver(envelope.clone()).await.unwrap();
+    client.deliver(envelope).await.unwrap(); // same command_id, at-least-once retry
+
+    let mut user_messages = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, RuntimeEvent::UserMessageAdded { .. }) {
+            user_messages += 1;
+        }
+    }
+    assert_eq!(
+        user_messages, 1,
+        "a duplicate command_id must not dispatch the action twice"
+    );
+    settle_background_turns(&app, &client, &[&session_id]).await;
+}
+
+#[tokio::test]
+async fn stale_expected_version_is_rejected() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    // The fresh session's log is at 0; a command expecting version 999 was
+    // issued against a stale view and must be rejected (resync required).
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("cmd-ver"),
+        session_id: session_id.clone(),
+        expected_version: Some(999),
+        issued_at: "2026-07-12T00:00:00Z".to_string(),
+        command: ClientCommand::RequestDiff {
+            session_id: session_id.clone(),
+        },
+    };
+    let err = client.deliver(envelope).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Runtime(_)),
+        "stale version must be a runtime error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn envelope_command_session_mismatch_is_rejected() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    // The envelope targets the real session, but the command payload targets a
+    // different one — version/receipt checks would key off A while B is acted on.
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("cmd-mismatch"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-07-12T00:00:00Z".to_string(),
+        command: ClientCommand::RequestDiff {
+            session_id: SessionId::new("some-other-session"),
+        },
+    };
+    let err = client.deliver(envelope).await.unwrap_err();
+    assert!(
+        matches!(&err, ClientError::Runtime(message) if message.contains("mismatch")),
+        "a cross-session envelope must be rejected up front, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reused_command_id_with_different_payload_is_rejected() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    let first = CommandEnvelope {
+        command_id: CommandId::new("cmd-payload-conflict"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-07-12T00:00:00Z".to_string(),
+        command: ClientCommand::RequestDiff {
+            session_id: session_id.clone(),
+        },
+    };
+    client.deliver(first.clone()).await.unwrap();
+    let mut conflicting = first;
+    conflicting.command = ClientCommand::ClearConversation {
+        session_id: session_id.clone(),
+    };
+    let err = client.deliver(conflicting).await.unwrap_err();
+    assert!(
+        matches!(&err, ClientError::Runtime(message) if message.contains("different session or payload")),
+        "id reuse with another payload must be a clear conflict, got {err:?}"
+    );
+}
+
+fn submission(command_id: &str, session_id: &SessionId, content: &str) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id: CommandId::new(command_id),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-09-15T00:00:00Z".to_string(),
+        command: ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: content.to_string(),
+            attachments: vec![],
+        },
+    }
+}
+
+/// The client retries a submission whose ACK it never saw with the SAME
+/// envelope. After the runtime that admitted it is gone and a new one reads the
+/// same state, that retry must be answered from the durable receipt — delivered —
+/// and must not start a second turn.
+#[tokio::test]
+async fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn() {
+    let (tmp, app, client, session_id) = build_client().await;
+    let envelope = submission("cmd-restart", &session_id, "survive a restart");
+    client.deliver(envelope.clone()).await.unwrap();
+    settle_background_turns(&app, &client, &[&session_id]).await;
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(db);
+    drop(client);
+    drop(app);
+
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let restarted = Arc::new(Application::assemble(layout).unwrap());
+    let client = InProcessRuntimeClient::new_with_options(
+        restarted.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+        false,
+    )
+    .with_durable_wire_ack();
+    let mut events = client.subscribe_session(&session_id);
+
+    client
+        .deliver(envelope)
+        .await
+        .expect("an admitted command is answered as delivered after a restart");
+
+    let db = restarted.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&session_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the retry must not start a second turn"
+    );
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "the retry must not dispatch anything"
+    );
+}
+
+/// Write the `dispatching` receipt a boot leaves when it admits `envelope` and
+/// then never settles it.
+async fn leave_dispatching(
+    app: &Application,
+    envelope: &CommandEnvelope,
+    boot: &leveler_core::BootId,
+) {
+    use sha2::{Digest, Sha256};
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope.command).unwrap())
+    );
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        leveler_storage::CommandReceiptRepository::new(&db)
+            .admit(
+                &envelope.command_id,
+                &envelope.session_id,
+                &fingerprint,
+                &envelope.issued_at,
+                boot,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap(),
+        leveler_storage::Admission::Dispatch
+    );
+}
+
+async fn turns(app: &Application, session_id: &SessionId) -> usize {
+    let db = app.open_database().await.unwrap();
+    TurnRepository::new(&db)
+        .list(session_id)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Another boot admitted the command and still holds its lease: it may yet
+/// settle the receipt. A retry learns nothing new — no answer, and no rerun.
+#[tokio::test]
+async fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let other_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
+    let envelope = submission("cmd-live-elsewhere", &session_id, "still running there");
+    leave_dispatching(&app, &envelope, other_boot.id()).await;
+    let mut events = client.subscribe_session(&session_id);
+
+    let error = client.deliver(envelope.clone()).await.unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::OutcomeUnknown(_)),
+        "a live boot's dispatch is not orphaned: {error:?}"
+    );
+    assert_eq!(turns(&app, &session_id).await, 0);
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    drop(other_boot);
+}
+
+/// The boot that admitted the command is gone — its lease released, as the OS
+/// does for a killed process — and the receipt is still `dispatching`. Nothing
+/// can settle it any more: an authoritative unresolvable answer, the same on
+/// every later delivery, and the command never runs again.
+#[tokio::test]
+async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let crashed_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
+    let envelope = submission("cmd-orphaned", &session_id, "died mid-dispatch");
+    leave_dispatching(&app, &envelope, crashed_boot.id()).await;
+    drop(crashed_boot);
+    let mut events = client.subscribe_session(&session_id);
+
+    for attempt in 0..2 {
+        let error = client.deliver(envelope.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::Unresolvable(_)),
+            "attempt {attempt}: {error:?}"
+        );
+    }
+    assert_eq!(turns(&app, &session_id).await, 0, "never rerun");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+/// T12/T20: command delivery and task ownership are one boot. A receipt the
+/// application's boot admitted — the boot its turns are owned by — is judged
+/// as this boot's own: not in flight here means abandoned, with no probe that
+/// would find the application's own lease held and answer "still alive".
+#[tokio::test]
+async fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let envelope = submission("cmd-own-boot", &session_id, "admitted by this boot");
+    leave_dispatching(&app, &envelope, &app.boot_id().unwrap()).await;
+
+    let error = client.deliver(envelope).await.unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::Unresolvable(_)),
+        "delivery must recognise the application's boot as its own: {error:?}"
+    );
+    assert_eq!(turns(&app, &session_id).await, 0, "never rerun");
+}
+
+/// This boot admitted the command, and the path that was handling it has
+/// ended without settling the receipt (its dispatch returned an error, which
+/// cannot prove nothing happened). A later delivery of the same id — the
+/// client never saw that answer — is unresolvable, not a second dispatch.
+#[tokio::test]
+async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("cmd-ended-here"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: "2026-09-15T00:00:00Z".to_string(),
+        command: ClientCommand::SelectModel {
+            session_id: session_id.clone(),
+            model: ModelRef::new("mock", "not-configured"),
+        },
+    };
+
+    let first = client.deliver(envelope.clone()).await.unwrap_err();
+    assert!(matches!(first, ClientError::Runtime(_)), "{first:?}");
+
+    let again = client.deliver(envelope).await.unwrap_err();
+    assert!(matches!(again, ClientError::Unresolvable(_)), "{again:?}");
+}
+
+/// Model selection is a session action. A repository-local model may not exist
+/// anywhere else, so selecting it must never rewrite the user's global default
+/// and make another repository unable to start.
+#[tokio::test]
+async fn selecting_a_model_does_not_rewrite_the_global_default() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    let path = leveler_app::GlobalConfig::path().expect("isolated global config path");
+    let original = "default_model = \"global/keep\"\n";
+    std::fs::write(&path, original).unwrap();
+
+    client
+        .send(ClientCommand::SelectModel {
+            session_id,
+            model: ModelRef::new("mock", "m"),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn runtime_reports_the_config_generation_loaded_at_boot() {
+    let (tmp, app, client, _session_id) = build_client().await;
+    let before = client
+        .runtime_info()
+        .await
+        .unwrap()
+        .config_fingerprint
+        .expect("runtime config fingerprint");
+
+    let model_path = tmp.path().join("configs/models/m.yaml");
+    let mut model = std::fs::read_to_string(&model_path).unwrap();
+    model.push_str("\n# changed after boot\n");
+    std::fs::write(model_path, model).unwrap();
+
+    let current = leveler_app::runtime_config_fingerprint(&app.layout).unwrap();
+    let still_loaded = client
+        .runtime_info()
+        .await
+        .unwrap()
+        .config_fingerprint
+        .expect("runtime config fingerprint");
+    assert_ne!(before, current);
+    assert_eq!(still_loaded, before);
+}
+
+/// The hard gate on the local window: a duplicate that lands while this boot
+/// is still admitting or dispatching the command must never be judged
+/// orphaned. Delivered concurrently many times, the answers are only
+/// "delivered" or "no answer yet", and each command makes one turn.
+#[tokio::test]
+async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
+    let (_tmp, app, _client, _session) = build_client().await;
+    let client = Arc::new(
+        InProcessRuntimeClient::new_with_options(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+            false,
+        )
+        .with_durable_wire_ack(),
+    );
+    for round in 0..5 {
+        let session_id = app
+            .create_session(&ModelRef::new("mock", "m"), "race")
+            .await
+            .unwrap();
+        let envelope = submission(&format!("cmd-race-{round}"), &session_id, "race");
+        let (a, b, c) = tokio::join!(
+            client.deliver(envelope.clone()),
+            client.deliver(envelope.clone()),
+            client.deliver(envelope.clone()),
+        );
+        for answer in [&a, &b, &c] {
+            assert!(
+                matches!(answer, Ok(()) | Err(ClientError::OutcomeUnknown(_))),
+                "round {round}: {answer:?}"
+            );
+        }
+        assert!(
+            [&a, &b, &c].iter().any(|answer| answer.is_ok()),
+            "round {round}: one delivery dispatched"
+        );
+        settle_background_turns(&app, &client, &[&session_id]).await;
+        assert_eq!(turns(&app, &session_id).await, 1, "round {round}");
+        client
+            .deliver(envelope)
+            .await
+            .expect("a settled command is answered delivered");
+    }
+}
+
+/// M-3 — a trusted-local AutoApprove session keeps its policy per-session, and a
+/// session known only from the DB (a restore) is fail-closed to Interactive: an
+/// AutoApprove policy is never persisted and re-granted on restore.
+#[tokio::test]
+async fn auto_approve_is_per_session_and_restore_is_fail_closed() {
+    use leveler_client_protocol::ApprovalPolicy;
+    let (_tmp, _app, client, restored_session) = build_client().await;
+
+    // `restored_session` was created via the Application (a DB record) and is not
+    // in this client's live config map → it resolves through the DB-restore path.
+    assert_eq!(
+        client.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive,
+        "a restored session must never auto-approve — the policy is not persisted"
+    );
+
+    // A trusted-local create with AutoApprove is honored and stored per-session.
+    let approving = client
+        .create_session(CreateSessionRequest {
+            approval_policy: ApprovalPolicy::AutoApprove,
+            goal: "unattended".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .effective_approval_policy(&approving.session.id)
+            .await,
+        ApprovalPolicy::AutoApprove
+    );
+
+    // The other session is unaffected — policy is per-session, not global.
+    assert_eq!(
+        client.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive
+    );
+}
+
+#[tokio::test]
+async fn daemon_session_runtime_options_are_isolated_per_session() {
+    let (_tmp, app, client, _existing_session) = build_client().await;
+    let first = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "first".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let second = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "second".to_string(),
+            model: None,
+            mode: WirePermissionProfile::FullAccess,
+        })
+        .await
+        .unwrap();
+
+    let db = app.open_database().await.unwrap();
+    for session in [&first.session.id, &second.session.id] {
+        assert_eq!(
+            TaskStore::task_for_session(&db, session).await.unwrap(),
+            Some(leveler_core::TaskId::new(session.as_str())),
+            "daemon creation must return only after the engine has created its task"
+        );
+    }
+
+    let first_after_second = client.snapshot(&first.session.id).await.unwrap();
+    assert_eq!(
+        first_after_second.mode,
+        WirePermissionProfile::RequestApproval
+    );
+    assert_eq!(second.session.mode, WirePermissionProfile::FullAccess);
+
+    drop(client);
+    let restored = InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    assert_eq!(
+        restored.snapshot(&first.session.id).await.unwrap().mode,
+        WirePermissionProfile::RequestApproval,
+        "daemon restart must restore the session's persisted runtime options"
+    );
+}
+
+#[tokio::test]
+async fn creating_a_daemon_session_does_not_reap_another_live_turn() {
+    let (_tmp, app, client, live_session) = build_client().await;
+    let db = app.open_database().await.unwrap();
+    TurnRepository::new(&db)
+        .start(&live_session, "chat", None, leveler_core::now())
+        .await
+        .unwrap();
+
+    client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "another session".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    let turns = TurnRepository::new(&db).list(&live_session).await.unwrap();
+    assert_eq!(turns[0].status, "running");
+    assert!(
+        turns[0].finished_at.is_none(),
+        "a live daemon turn belongs to the daemon and must not be treated as a zombie"
+    );
+}
+
+#[tokio::test]
+async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
+    let (_tmp, app, client, _existing_session) = build_client().await;
+    let first = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "first".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let second = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "second".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: first.session.id.clone(),
+            content: "first checkpoint".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: second.session.id.clone(),
+            content: "second checkpoint".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let first_snapshot = client.snapshot(&first.session.id).await.unwrap();
+    let second_snapshot = client.snapshot(&second.session.id).await.unwrap();
+    assert_eq!(first_snapshot.checkpoints.len(), 1);
+    assert_eq!(first_snapshot.checkpoints[0].label, "first checkpoint");
+    assert_eq!(second_snapshot.checkpoints.len(), 1);
+    assert_eq!(second_snapshot.checkpoints[0].label, "second checkpoint");
+
+    settle_background_turns(&app, &client, &[&first.session.id, &second.session.id]).await;
+}
+
+#[tokio::test]
+async fn daemon_event_subscriptions_are_isolated_per_session() {
+    let (_tmp, _app, client, _existing_session) = build_client().await;
+    let first = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "first".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let second = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "second".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let mut first_events = client.subscribe_session(&first.session.id);
+    let mut second_events = client.subscribe_session(&second.session.id);
+
+    client
+        .send(ClientCommand::SetPermissionProfile {
+            session_id: first.session.id.clone(),
+            mode: WirePermissionProfile::FullAccess,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        first_events.recv().await.unwrap(),
+        RuntimeEvent::SessionUpdated { .. }
+    ));
+    assert!(matches!(
+        second_events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_clients_receive_only_their_session_events() {
+    let (tmp, _app, runtime, _existing_session) = build_client().await;
+    let path = tmp.path().join("runtime.sock");
+    let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+
+    let first = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "first over socket".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let second = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "second over socket".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let mut first_events = client.subscribe_session(&first.session.id);
+    let mut second_events = client.subscribe_session(&second.session.id);
+
+    client
+        .send(ClientCommand::SetPermissionProfile {
+            session_id: first.session.id,
+            mode: WirePermissionProfile::FullAccess,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        RuntimeEvent::SessionUpdated { .. }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), second_events.recv())
+            .await
+            .is_err(),
+        "a socket subscriber must not receive another session's event"
+    );
+
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Drive every background turn to a terminal state before the test returns.
+///
+/// `SubmitMessage` asserts on a synchronous dispatch effect, but it also spawns
+/// a real turn. Returning while one is still running drops the test runtime out
+/// from under it, and tokio's timer panics on the way down with "A Tokio 1.x
+/// context was found, but it is being shutdown". The test still reports
+/// success, so the panic reads as harmless noise instead of the leak it is —
+/// and a test that leaks a task is a test whose next failure is unexplainable.
+///
+/// Cancel is a request, not a completion, so this waits on the turn's terminal
+/// row rather than on the send returning.
+async fn settle_background_turns(
+    app: &Arc<Application>,
+    client: &Arc<InProcessRuntimeClient>,
+    submitted_to: &[&SessionId],
+) {
+    let db = app.open_database().await.unwrap();
+    let repo = TurnRepository::new(&db);
+    for session in submitted_to {
+        // The turn is spawned, so its row may not exist the instant dispatch
+        // returns. Waiting for it to appear is what makes the drain below mean
+        // something: polling "nothing is running" too early passes instantly
+        // and leaks exactly the task this helper exists to collect.
+        for _ in 0..400 {
+            if !repo.list(session).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        client
+            .send(ClientCommand::CancelCurrentTurn {
+                session_id: (*session).clone(),
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..400 {
+        if repo.list_running(None).await.unwrap().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let stuck = repo.list_running(None).await.unwrap();
+    let mut diag = String::new();
+    for turn in &stuck {
+        let session = SessionId::new(turn.session_id.clone());
+        let task = leveler_storage::TaskStore::task_for_session(&db, &session)
+            .await
+            .unwrap();
+        let owner = match &task {
+            Some(task) => leveler_storage::OwnershipStore::current(&db, task)
+                .await
+                .unwrap(),
+            None => None,
+        };
+        diag.push_str(&format!(
+            "\n  turn {} session {} status {} task {task:?} owner {owner:?}",
+            turn.id, turn.session_id, turn.status
+        ));
+    }
+    panic!("a background turn never reached a terminal state after cancellation:{diag}");
+}
+
+/// The first real message names a placeholder interactive session: the goal
+/// column (what the web/TUI sidebars show) becomes the message's first
+/// sentence. A session created with a real goal keeps it.
+///
+/// Retitling is a dispatch effect in `stage_turn`, before the model is
+/// called. Each session is submitted once: a follow-up `SubmitMessage` on
+/// the same session races the in-memory admit lease, which is released on
+/// a `spawn_blocking` thread after the durable turn row — Windows CI loses
+/// that race. The "do not overwrite a real goal" guard is the same branch
+/// as "do not overwrite an already-retitled placeholder", so a second
+/// session with a real goal covers it. Cancel the spawned wait-for-network
+/// loops at the end so the Tokio runtime is not torn down under them.
+#[tokio::test]
+async fn first_message_retitles_a_placeholder_session() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let bootstrap = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "interactive session".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session_id = bootstrap.session.id.clone();
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "帮我修复登录超时的 bug。另外顺便看下日志轮转。".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    {
+        let db = app.open_database().await.unwrap();
+        let record = leveler_storage::SessionRepository::new(&db)
+            .get(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.goal, "帮我修复登录超时的 bug",
+            "placeholder goal must become the first sentence of the first message"
+        );
+    }
+
+    let named = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "已有正式目标".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: named.session.id.clone(),
+            content: "随便聊聊。".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    {
+        let db = app.open_database().await.unwrap();
+        let record = leveler_storage::SessionRepository::new(&db)
+            .get(&named.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.goal, "已有正式目标");
+    }
+
+    settle_background_turns(&app, &client, &[&session_id, &named.session.id]).await;
+}
+
+/// The session-menu commands: rename overwrites the title, archive hides the
+/// session from the default list (transcript intact), fork clones record +
+/// transcript into a fresh session leaving the original untouched.
+#[tokio::test]
+async fn session_menu_rename_archive_fork_roundtrip() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let db = app.open_database().await.unwrap();
+    let sessions = leveler_storage::SessionRepository::new(&db);
+    let messages = leveler_storage::MessageRepository::new(&db);
+
+    // Seed a transcript so fork has something to copy.
+    messages
+        .append(
+            &session_id,
+            &[
+                r#"{"role":"user","content":[{"type":"text","text":"修复登录"}]}"#.into(),
+                r#"{"role":"assistant","content":[{"type":"text","text":"好的"}]}"#.into(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    // Rename.
+    client
+        .send(ClientCommand::RenameSession {
+            session_id: session_id.clone(),
+            name: "  登录修复方案  ".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions.get(&session_id).await.unwrap().unwrap().goal,
+        "登录修复方案",
+        "rename trims and overwrites the title"
+    );
+
+    // Fork: a new session appears with the transcript copied.
+    client
+        .send(ClientCommand::ForkSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let all = sessions.list().await.unwrap();
+    assert_eq!(all.len(), 2, "fork adds one session: {all:?}");
+    let fork = all
+        .iter()
+        .find(|r| r.id != session_id.as_str())
+        .expect("forked session listed");
+    assert_eq!(fork.goal, "登录修复方案 (分叉)");
+    let fork_id = SessionId::new(fork.id.clone());
+    assert!(
+        leveler_storage::TaskStore::task_for_session(&db, &fork_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "fork creates its task association atomically with the session"
+    );
+    assert_eq!(
+        messages.load(&fork_id).await.unwrap().len(),
+        2,
+        "fork copies the transcript"
+    );
+    assert_eq!(
+        messages.load(&session_id).await.unwrap().len(),
+        2,
+        "original transcript untouched"
+    );
+
+    // Archive: leaves the default list, transcript intact.
+    client
+        .send(ClientCommand::ArchiveSession {
+            session_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+    let listed = sessions.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "archived fork left the list");
+    assert!(
+        sessions.get(&fork_id).await.unwrap().is_some(),
+        "archive is not delete"
+    );
+}
+
+/// `/clear` must be a fresh start, not a wipe: the previous session keeps its
+/// transcript and stays listed, so the move is reversible by reopening it.
+#[tokio::test]
+async fn a_new_session_leaves_the_previous_one_intact() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "SURVIVES_THE_CLEAR".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let db = app.open_database().await.unwrap();
+    for _ in 0..100 {
+        let payloads = leveler_storage::MessageRepository::new(&db)
+            .load(&session_id)
+            .await
+            .unwrap();
+        if payloads.iter().any(|p| p.contains("SURVIVES_THE_CLEAR")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let mut events = client.subscribe_session(&session_id);
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    // The requester is switched to a different, empty session.
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = events.recv().await {
+                return session;
+            }
+        }
+    })
+    .await
+    .expect("the new session must be opened for the requester");
+    assert_ne!(
+        opened.id, session_id,
+        "/clear must switch to a NEW session, not reuse the old id"
+    );
+    assert!(
+        opened.messages.is_empty(),
+        "the new session starts empty: {:?}",
+        opened.messages
+    );
+
+    // …and the old one is untouched, so reopening it gets the work back.
+    let old = leveler_storage::MessageRepository::new(&db)
+        .load(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        old.iter().any(|p| p.contains("SURVIVES_THE_CLEAR")),
+        "the previous session's transcript must survive /clear"
+    );
+
+    settle_background_turns(&app, &client, &[&session_id]).await;
+}
+
+/// `/clear` opens a new session for the tab that asked, and only for that tab.
+///
+/// The web serves every tab from one process. Its client adopts "the next
+/// snapshot with a different id" while waiting for its own new session, so if
+/// another tab's `NewSessionFor` reached this tab's stream, the two would swap
+/// conversations mid-click. The routing that prevents it is the requester's
+/// own event channel — this pins that, since the client-side rule has no
+/// correlation of its own to fall back on.
+#[tokio::test]
+async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let onlooker = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "onlooker".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let requester = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "requester".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    let mut onlooker_events = client.subscribe_session(&onlooker.session.id);
+    let mut requester_events = client.subscribe_session(&requester.session.id);
+
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: requester.session.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = requester_events.recv().await {
+                return session;
+            }
+        }
+    })
+    .await
+    .expect("the requester must be handed its new session");
+    assert_ne!(opened.id, requester.session.id);
+
+    // The onlooker may see cross-session facts (a refreshed session list); what
+    // it must never see is somebody else's new session, because that is the one
+    // event its client would switch to.
+    while let Ok(event) = onlooker_events.try_recv() {
+        if let RuntimeEvent::SessionOpened { session } = event {
+            assert_ne!(
+                session.id, opened.id,
+                "another tab's /clear reached this session's stream; the two \
+                 tabs would swap conversations"
+            );
+        }
+    }
+
+    settle_background_turns(&app, &client, &[]).await;
+}
+
+/// R006 R6-P2 accident regression — resuming a session must be able to
+/// re-assert its effective auto-approve policy on a fresh runtime (the daemon
+/// that originally held it in memory died between windows), while:
+/// restore stays fail-closed, other sessions never leak the policy, and a
+/// resume WITHOUT the flag upgrades nothing.
+#[tokio::test]
+async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime() {
+    use leveler_client_protocol::ApprovalPolicy;
+    use leveler_local_transport::LocalRuntimeService as _;
+    let (_tmp, _app, client, resumed_session) = build_client().await;
+
+    // Fresh runtime hydrates the restored session fail-closed.
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::Interactive,
+        "restore alone must stay fail-closed"
+    );
+
+    // A second, untouched session for the leak check.
+    let other = client
+        .create_session(CreateSessionRequest {
+            approval_policy: ApprovalPolicy::Interactive,
+            goal: "bystander".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    // The resuming client re-asserts the policy it was launched with
+    // (`leveler tui --session <id> --auto-approve`).
+    client
+        .attach_session_policy(&resumed_session, ApprovalPolicy::AutoApprove)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::AutoApprove,
+        "the resumed session must run under its re-asserted policy"
+    );
+
+    // No cross-session leakage; no blanket upgrade of other sessions.
+    assert_eq!(
+        client.effective_approval_policy(&other.session.id).await,
+        ApprovalPolicy::Interactive,
+        "policy re-assert is strictly per-session"
+    );
+
+    // And a later downgrade back to Interactive also sticks (client without
+    // the flag re-attaching does not carry auto-approve forward implicitly —
+    // it simply asserts nothing; explicit downgrade is also honored).
+    client
+        .attach_session_policy(&resumed_session, ApprovalPolicy::Interactive)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::Interactive
+    );
+}
+
+/// Restoring a checkpoint rolls the conversation AND the workspace back, and
+/// then said nothing at all: the screen went blank, and every way the user
+/// could learn what happened — which checkpoint, whether files moved — was a
+/// notification that only existed on the failure paths.
+#[tokio::test]
+async fn a_restored_checkpoint_says_where_it_landed() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let opened = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "restore".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session_id = opened.session.id.clone();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "第一步".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    settle_background_turns(&app, &client, &[&session_id]).await;
+    let checkpoint = client
+        .snapshot(&session_id)
+        .await
+        .unwrap()
+        .checkpoints
+        .first()
+        .expect("a checkpoint for the submitted turn")
+        .id
+        .clone();
+
+    let mut events = client.subscribe_session(&session_id);
+    client
+        .send(ClientCommand::RestoreCheckpoint {
+            session_id: session_id.clone(),
+            checkpoint_id: checkpoint,
+        })
+        .await
+        .unwrap();
+
+    let mut said = Vec::new();
+    for _ in 0..24 {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+            Ok(Ok(leveler_client_protocol::RuntimeEvent::Notification { message, .. })) => {
+                said.push(message)
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        said.iter().any(|m| m.contains("已回退到检查点")),
+        "a completed restore names where it landed: {said:?}"
+    );
+}
+
+/// `/fork` copies the session and told nobody: the success notification went to
+/// the compatibility stream that carries every session, which no session-scoped
+/// client subscribes to. The failure path used the session's own stream, so a
+/// fork that worked was silent and only a fork that broke was visible.
+#[tokio::test]
+async fn a_forked_session_tells_the_session_it_was_forked_from() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let opened = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "fork me".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session_id = opened.session.id.clone();
+    let mut events = client.subscribe_session(&session_id);
+
+    client
+        .send(ClientCommand::ForkSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut said = Vec::new();
+    for _ in 0..24 {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+            Ok(Ok(leveler_client_protocol::RuntimeEvent::Notification { message, .. })) => {
+                said.push(message)
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        said.iter().any(|m| m.contains("分叉")),
+        "the session that was forked hears about it: {said:?}"
+    );
+
+    settle_background_turns(&app, &client, &[&session_id]).await;
+}

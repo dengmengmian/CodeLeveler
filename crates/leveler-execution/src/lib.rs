@@ -1,0 +1,79 @@
+//! `leveler-execution` — workspace safety, risk classification, and process
+//! execution (spec §8.12, §19, §20, §21).
+//!
+//! Provides a [`Workspace`] that resolves and validates every path so the
+//! file/patch tools cannot escape the repository, the [`RiskLevel`] /
+//! [`PermissionProfile`] vocabulary the tool layer tags itself with, a
+//! [`CommandRunner`] with process-tree termination, the permission
+//! [`ApprovalPolicy`]/[`Approver`], and a [`Checkpoint`] for rollback.
+// `deny` (not `forbid`) with two audited, scoped allows: the Linux
+// PR_SET_PDEATHSIG pre-exec hook in `command.rs`, which keeps
+// grandchildren from surviving a force-killed parent, and the Windows
+// ShellExecuteW call in `url_open.rs`, which delegates an HTTP URL to the
+// registered system handler. Any new unsafe block still fails the build unless
+// explicitly allowed and justified like those boundaries.
+#![deny(unsafe_code)]
+
+pub mod approval;
+pub mod artifact;
+pub mod background;
+pub mod checkpoint;
+mod clarify;
+pub mod command;
+pub mod hooks;
+pub mod permission_rules;
+pub mod policy;
+pub mod risk;
+mod shell_ast;
+pub use shell_ast::{literal_command_words, literal_program_names, proven_executed_commands};
+pub mod snapshot;
+pub mod trust;
+mod url_open;
+pub mod windows_acl;
+pub mod windows_confine;
+pub mod windows_sandbox;
+pub mod workspace;
+
+pub use approval::{
+    ApprovalDecision, ApprovalPolicy, ApprovalRequest, Approver, AutoApprove, AutoDeny,
+    AutoReviewer, CommandClass, CommandView, EvalApprove, NeedUserReviewer, Requirement,
+    ReviewVerdict, classify_command, command_is_destructive, command_needs_host_escape,
+    is_host_escape_program, is_memory_write_tool, is_remote_publish_command,
+    is_self_consent_command, is_shell_c_flag, is_shell_wrapper_program, shell_c_script,
+};
+pub use artifact::{ArtifactRef, ArtifactStore};
+pub use background::{
+    BackgroundCleanupTicket, BackgroundSettlement, BackgroundTaskRegistry, BackgroundTaskSnapshot,
+    BackgroundTaskStatus, MutationBaseline,
+};
+pub use checkpoint::Checkpoint;
+pub use clarify::{AutoClarify, ClarificationRequest, Clarifier, ClarifyOutcome};
+pub use command::{
+    CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, ProcessError,
+    ProcessIdentity, ProcessOutput, ProcessRequest, VerifyNetworkPolicy, credential_env_names,
+    is_credential_env_name, looks_like_absolute_path_arg, process_request_for_verify_check,
+    seal_read_denials, shell_invocation,
+};
+pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
+pub use permission_rules::{
+    MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
+    RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
+    clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
+};
+pub use policy::{
+    AuthorizationEvidence, PendingApproval, PolicyDenial, PolicyResolution, ResolvedExecutionPolicy,
+};
+pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile, WriteScope};
+pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
+pub use trust::{
+    TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
+    read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
+};
+pub use url_open::{UrlOpenError, open_url};
+pub use windows_confine::{WriteRootLease, lease_write_roots, recover_stale_write_roots};
+pub use windows_sandbox::{
+    FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
+    WindowsSandboxError, assert_intent_spawn_allowed, doctor_sandbox_line,
+    probe_sandbox_capabilities, process_tree_backend_available, validate_acl_root,
+};
+pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};

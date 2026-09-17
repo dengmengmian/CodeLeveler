@@ -1,0 +1,132 @@
+{
+  "algorithm": {
+    "canonical_string": "{v}|{sender}|{sender_id}|{recipient_id}|{stream_id}|{seq}|{ts}|{content_type}|{digest_hex}",
+    "digest": "lowercase hex SHA-256 of the raw payload bytes, not of payload_b64",
+    "id_charset": "^[A-Za-z0-9_.:-]{1,64}$",
+    "payload_b64": "standard base64 with padding",
+    "signature": "Ed25519 over the canonical string, UTF-8",
+    "timestamp": "YYYY-MM-DDTHH:MM:SSZ, verified within ±120s"
+  },
+  "cases": [
+    {
+      "canonical_string": "1|device|dev_golden|rt_golden|str_1|7|2026-07-25T12:00:00Z|session_upstream|a53c5a10dd43e1644e419559966fe0040a4626b24d3d6a36db958084a5627441",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_golden",
+        "sender": "device",
+        "sender_id": "dev_golden",
+        "seq": 7,
+        "sig_b64": "2Ukj5aR27fLyFTwG9xDlM84pRxaEqsQaUOu1Ej9mmUyVnuGKXsKpereb4CN4rleWb0yMivDhftbta9iiI3qdDA==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T12:00:00Z",
+        "v": 1
+      },
+      "expect": "accept",
+      "name": "valid_session_upstream",
+      "payload_utf8": "{\"type\":\"snapshot\",\"session_id\":\"s1\"}",
+      "why": "Baseline: correct key, correct audience, fresh timestamp."
+    },
+    {
+      "code": "signature_invalid",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_golden",
+        "sender": "device",
+        "sender_id": "dev_golden",
+        "seq": 7,
+        "sig_b64": "4RrqYxRjCjLkhVvPPMITAMSz/zMxSGzBCKGRnjeoe/+Sxcfy3rOicUwuHriTl0k1hI987gzvDgUWM5nnFDe1AA==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T12:00:00Z",
+        "v": 1
+      },
+      "expect": "reject",
+      "name": "forged_signature",
+      "why": "A compromised relay signs with a key of its own; it never holds the device's."
+    },
+    {
+      "code": "recipient_mismatch",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_other",
+        "sender": "device",
+        "sender_id": "dev_golden",
+        "seq": 7,
+        "sig_b64": "2Ukj5aR27fLyFTwG9xDlM84pRxaEqsQaUOu1Ej9mmUyVnuGKXsKpereb4CN4rleWb0yMivDhftbta9iiI3qdDA==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T12:00:00Z",
+        "v": 1
+      },
+      "expect": "reject",
+      "name": "wrong_recipient_unchanged",
+      "why": "Cross-runtime replay: a genuine frame this device signed for another host, forwarded here untouched. The signature is valid — only the audience is wrong — so a verifier that does not compare recipient_id against its own id will wrongly accept it."
+    },
+    {
+      "code": "signature_invalid",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_golden",
+        "sender": "device",
+        "sender_id": "dev_golden",
+        "seq": 7,
+        "sig_b64": "LXsiJ+tZEwLHv86UvYKYisKJtLdpvNPsjkzYVEy55nfIe/em2g3U1eK4JvOk0HeUlun1TKIT3XOWyHlQe5oHBg==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T12:00:00Z",
+        "v": 1
+      },
+      "expect": "reject",
+      "name": "recipient_rewritten_to_target",
+      "why": "The same replay after the relay edits recipient_id to name this host, to get past the audience check. It fails because recipient_id is inside the signed canonical string. An implementation that omits recipient_id from its signing input will wrongly accept this one."
+    },
+    {
+      "code": "invalid_frame",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_golden",
+        "sender": "device",
+        "sender_id": "dev|evil",
+        "seq": 7,
+        "sig_b64": "2Ukj5aR27fLyFTwG9xDlM84pRxaEqsQaUOu1Ej9mmUyVnuGKXsKpereb4CN4rleWb0yMivDhftbta9iiI3qdDA==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T12:00:00Z",
+        "v": 1
+      },
+      "expect": "reject",
+      "name": "illegal_id_character",
+      "why": "The separator inside an id could shift the canonical string's field boundaries; such an id must be refused before verification, not escaped."
+    },
+    {
+      "code": "replay",
+      "envelope": {
+        "content_type": "session_upstream",
+        "payload_b64": "eyJ0eXBlIjoic25hcHNob3QiLCJzZXNzaW9uX2lkIjoiczEifQ==",
+        "recipient_id": "rt_golden",
+        "sender": "device",
+        "sender_id": "dev_golden",
+        "seq": 7,
+        "sig_b64": "2Ukj5aR27fLyFTwG9xDlM84pRxaEqsQaUOu1Ej9mmUyVnuGKXsKpereb4CN4rleWb0yMivDhftbta9iiI3qdDA==",
+        "stream_id": "str_1",
+        "ts": "2026-07-25T11:00:00Z",
+        "v": 1
+      },
+      "expect": "reject",
+      "name": "stale_timestamp",
+      "why": "One hour old: outside the ±120s window even though the signature over the original timestamp is intact."
+    }
+  ],
+  "keys": {
+    "device_fingerprint": "fe812c12f3ab4ce6",
+    "device_fingerprint_display": "fe81 2c12 f3ab 4ce6",
+    "device_pubkey_b64url": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+    "device_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707"
+  },
+  "note": "Answer key for the CodeLeveler signed envelope. Seeds are test-only. A conforming implementation must accept every `accept` case and refuse every `reject` case with the stated code.",
+  "verifier": {
+    "now": "2026-07-25T12:00:00Z",
+    "recipient_id": "rt_golden"
+  }
+}

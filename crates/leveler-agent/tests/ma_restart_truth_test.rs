@@ -1,0 +1,1842 @@
+//! MA-RT — Multi-Agent Restart Truth Hardening gates.
+//!
+//! The durable record (`SubAgentStarted` without `SubAgentFinished`) is the
+//! truth about a child; process-local state is not. These tests seed the
+//! exact wreckage an unclean process exit leaves behind and prove the next
+//! window reconciles it truthfully: a ghost Worker becomes blocking debt that
+//! denies Verified, a durably finished child is never re-classified as lost,
+//! and a re-delivered settlement happens exactly once.
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
+use leveler_agent::AutoClarify;
+use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
+use leveler_core::{RequestId, SessionId, ToolCallId, TurnId};
+use leveler_engine::{EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome};
+use leveler_execution::{
+    ApprovalDecision, ApprovalRequest, Approver, PermissionProfile, Workspace,
+};
+use leveler_model::{
+    ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
+    ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
+};
+use leveler_storage::{Database, EventRepository};
+use leveler_tools::ToolContext;
+use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
+
+/// The surface a real coding turn gets: the tool crate's composition plus the
+/// harness controls THIS crate registers (`update_plan`). Production composes
+/// the same two halves in `leveler-app`.
+fn default_registry() -> leveler_tools::ToolRegistry {
+    let mut registry = leveler_tools::default_registry();
+    leveler_agent::register_harness_controls(&mut registry);
+    registry
+}
+
+// ── mock model ───────────────────────────────────────────────────────────────
+
+struct MockRuntime {
+    responses: Mutex<VecDeque<ModelResponse>>,
+}
+
+impl MockRuntime {
+    fn new(responses: Vec<ModelResponse>) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from(responses)),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelRuntime for MockRuntime {
+    async fn generate(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+        })
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "id": "m", "provider": "mock", "model_id": "m", "protocol": "openai_chat",
+            "capabilities": {
+                "streaming": true, "tool_calling": true, "parallel_tool_calls": true,
+                "structured_output": false, "reasoning": false, "vision": false
+            },
+            "limits": {
+                "context_window": 128000, "reliable_context": 64000,
+                "max_output_tokens": 4096, "max_tool_schema_bytes": 65536,
+                "max_parallel_tool_calls": 4
+            }
+        }))
+        .unwrap())
+    }
+}
+
+struct AutoApprove;
+
+#[async_trait]
+impl Approver for AutoApprove {
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::ApproveOnce
+    }
+}
+
+fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new(id),
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }],
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
+fn text(value: &str) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message::text(Role::Assistant, value),
+        finish_reason: FinishReason::Stop,
+        usage: TokenUsage::default(),
+    }
+}
+
+fn patch_call() -> ModelResponse {
+    tool_call(
+        "c1",
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+        }),
+    )
+}
+
+fn complete_call(id: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "added the function"}),
+    )
+}
+
+/// Understand JSON with a required AC that greps the patch fixture.
+fn understand_met_required_ac() -> ModelResponse {
+    let hint = if cfg!(windows) {
+        "findstr \\\"pub fn added\\\" src\\\\lib.rs".to_string()
+    } else {
+        "grep -q 'pub fn added' src/lib.rs".to_string()
+    };
+    text(&format!(
+        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
+        "acceptance_criteria":[{{"id":"AC-1","description":"added() exists",
+        "verification_hint":"{hint}","required":true}}],
+        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
+    ))
+}
+
+// ── harness ──────────────────────────────────────────────────────────────────
+
+fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> CodingRuntime {
+    let workspace = Workspace::new(dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
+        },
+        factory: ExecutorFactory {
+            runtime: Arc::new(MockRuntime::new(responses)),
+            registry: Arc::new(default_registry()),
+            tool_context,
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            memory_catalog: String::new(),
+            memory_expose: true,
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            steering: None,
+            allow_delegation: true,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
+            develop_model: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+    }
+}
+
+fn workspace_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    dir
+}
+
+fn gated_spec(dir: &Path) -> TaskSpec {
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/c".to_string(), "exit 0".to_string()],
+        )
+    } else {
+        ("true".to_string(), Vec::new())
+    };
+    TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "add a function".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: dir.to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: VerificationPlan {
+                commands: vec![VerificationCommand {
+                    name: "ok".into(),
+                    program,
+                    args,
+                    kind: CheckKind::Test,
+                    gating: true,
+                    timeout_seconds: 30,
+                    scope_policy: Default::default(),
+                }],
+            },
+            base_commit: None,
+        },
+    }
+}
+
+/// Seed the wreckage of a dead window: a turn that was running when the
+/// process died, with a durably started child that never finished.
+async fn seed_ghost_child(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    nickname: &str,
+    role: &str,
+) -> TurnId {
+    let turn = crashed_turn(db, session, "user").await;
+    let turn_id = TurnId::new(turn.id);
+    let log = EventLog::new(db, session.clone());
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentStarted {
+            id: id.to_string(),
+            nickname: nickname.to_string(),
+            role: role.to_string(),
+            task: "fix the parser module".to_string(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            spec: None,
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    turn_id
+}
+
+async fn event_rows(db: &Database, session: &SessionId) -> Vec<(Option<String>, EngineEvent)> {
+    EventRepository::new(db)
+        .load(session)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.turn_id.clone(),
+                EngineEvent::from_payload(&row.payload).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The last persisted evidence ledger, replayed from durable events only.
+fn last_ledger(
+    events: &[(Option<String>, EngineEvent)],
+) -> Option<leveler_lifecycle::EvidenceLedger> {
+    events.iter().rev().find_map(|(_, e)| match e {
+        EngineEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
+        _ => None,
+    })
+}
+
+// ── MA-RT-2: restart ghost completion truth ──────────────────────────────────
+
+/// A running turn left by a process that died: opened under the ownership of a
+/// boot of this runtime that has since ended.
+async fn crashed_turn(
+    db: &Database,
+    session: &SessionId,
+    kind: &str,
+) -> leveler_storage::TurnRecord {
+    let stores = leveler_storage::EngineStores::from_database(db);
+    let dead = TaskEngine {
+        stores: stores.clone(),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        boot: leveler_engine::EngineBoot {
+            id: leveler_core::BootId::generate(),
+            liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+        },
+    };
+    let token = dead.acquire_ownership(session).await.unwrap();
+    stores
+        .turns
+        .start_owned(&token, session, kind, None, leveler_core::now())
+        .await
+        .unwrap()
+}
+
+/// Control anchor: without a ghost this exact script legitimately reaches
+/// Verified. The treatment test below differs by ONE seeded fact.
+#[tokio::test]
+async fn control_the_same_script_reaches_verified_without_a_ghost() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        vec![
+            patch_call(),
+            complete_call("g1"),
+            understand_met_required_ac(),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let report = engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+}
+
+/// MA_RT_GHOST_WORKER_INCOMPLETE + MA_RT_GHOST_FINISH_TURN_ATTRIBUTION — a
+/// durably started Worker whose activation died must be reconciled into an
+/// incomplete terminal, attributed to the turn it started in.
+///
+/// It used to also leave an open BLOCKING finding that refused the parent's
+/// completion. Whether a lost child's work still matters is the model's
+/// reading of its own goal; the runtime states the fact and stops there.
+#[tokio::test]
+async fn a_ghost_worker_from_a_dead_window_settles_as_an_incomplete_terminal() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let mut script = vec![patch_call(), complete_call("g1")];
+    // After the refusal the drive keeps the round loop and closeout going;
+    // pad with honest stop replies — none of them can prove the AC, so any
+    // Verified here could only come from ignoring the debt.
+    for _ in 0..8 {
+        script.push(text(
+            "the completion was refused over the lost worker; stopping",
+        ));
+    }
+    let engine = engine_on(&db, dir.path(), script);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let origin_turn = seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
+
+    let report = engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Completed,
+        "the model declared the goal complete and nothing mechanical contradicts it"
+    );
+
+    let events = event_rows(&db, &session).await;
+    let ghost_finish = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .expect("the ghost must be settled with a durable terminal, not left running");
+    assert_eq!(
+        ghost_finish.0.as_deref(),
+        Some(origin_turn.as_str()),
+        "the synthetic terminal must be attributed to the turn the child started in"
+    );
+    let (
+        _,
+        EngineEvent::SubAgentFinished {
+            ok, outcome, stop, ..
+        },
+    ) = ghost_finish
+    else {
+        unreachable!()
+    };
+    assert!(!ok, "a child that never reported cannot be recorded as ok");
+    assert_eq!(*stop, Some(leveler_lifecycle::ChildStop::Lost));
+    assert_eq!(
+        *outcome,
+        Some(leveler_lifecycle::ChildStatus::IncompleteNoResult),
+        "the harness knows it adopted nothing from this child"
+    );
+
+    let refused_over_a_finding = events.iter().any(|(_, e)| {
+        matches!(
+            e,
+            EngineEvent::ToolCallFinished {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "update_goal" && preview.contains("blocking")
+        )
+    });
+    assert!(
+        !refused_over_a_finding,
+        "a lost child is a fact to report, never a gate on the model's own close"
+    );
+}
+
+async fn append_event(db: &Database, session: &SessionId, turn: Option<&TurnId>, e: EngineEvent) {
+    EventLog::new(db, session.clone())
+        .append(turn, e, &mut |_| {})
+        .await
+        .unwrap();
+}
+
+fn padded(mut script: Vec<ModelResponse>) -> Vec<ModelResponse> {
+    for _ in 0..14 {
+        script.push(text("stopping"));
+    }
+    script
+}
+
+fn transcript(payloads: &[String]) -> Vec<Message> {
+    payloads
+        .iter()
+        .map(|p| serde_json::from_str(p).unwrap())
+        .collect()
+}
+
+/// MA_RT_TERMINAL_FIRST_WINS + MA_RT_FINISHED_NOT_RECLASSIFIED_LOST +
+/// MA_RT_LOST_NOTE_TRUTH + MA_RT_C10 + MA_RT_C11 — a child whose terminal fact
+/// IS durable but whose settlement the dead window may not have consumed is
+/// re-delivered, exactly once, and never described as lost; restart must not
+/// downgrade a terminal fact.
+#[tokio::test]
+async fn a_durably_finished_child_is_redelivered_not_reclassified_as_lost() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![text(
+            "integrating the re-delivered explorer result; nothing further",
+        )]),
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+
+    // The wreckage: the child durably finished, but the crash landed between
+    // that terminal fact and the ProgressUpdated that would have cleared the
+    // outstanding record (C10's exact window).
+    let turn = crashed_turn(&db, &session, "user").await;
+    let t1 = TurnId::new(turn.id);
+    append_event(
+        &db,
+        &session,
+        Some(&t1),
+        EngineEvent::SubAgentStarted {
+            id: "agent-1".into(),
+            nickname: "finch".into(),
+            role: "explorer".into(),
+            task: "map the parser".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            spec: None,
+        },
+    )
+    .await;
+    append_event(
+        &db,
+        &session,
+        Some(&t1),
+        EngineEvent::SubAgentFinished {
+            id: "agent-1".into(),
+            nickname: "finch".into(),
+            ok: true,
+            contribution: None,
+            summary: "explored the parser: three modules, no defects".into(),
+            outcome: None,
+            stop: None,
+            limit: None,
+        },
+    )
+    .await;
+    let stale = leveler_lifecycle::ProgressLedger {
+        outstanding_children: vec!["agent-1|finch|explorer|".to_string()],
+        ..Default::default()
+    };
+    append_event(
+        &db,
+        &session,
+        Some(&t1),
+        EngineEvent::ProgressUpdated { ledger: stale },
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let finishes: Vec<_> = events
+        .iter()
+        .filter(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .collect();
+    assert_eq!(
+        finishes.len(),
+        1,
+        "first terminal fact wins: reconciliation must not write a second, contradictory \
+         terminal for a finished child"
+    );
+
+    let messages = transcript(
+        &leveler_storage::MessageRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap(),
+    );
+    let texts: Vec<String> = messages
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("Delegations lost")),
+        "a durably finished child must never be reported as lost"
+    );
+    let redelivered: Vec<_> = texts
+        .iter()
+        .filter(|t| t.contains("re-delivered after restart"))
+        .collect();
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "the recorded settlement must be re-delivered exactly once"
+    );
+    assert!(
+        redelivered[0].contains("finch") && redelivered[0].contains("no defects"),
+        "the re-delivery must carry the recorded outcome: {}",
+        redelivered[0]
+    );
+    let last_progress = events
+        .iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .expect("the pruned outstanding record must be persisted (the consumed mark)");
+    assert!(
+        last_progress.outstanding_children.is_empty(),
+        "consuming the re-delivery must durably clear the outstanding record"
+    );
+
+    // C11: a second window sees the consumed mark and re-delivers nothing.
+    let engine2 = engine_on(&db, dir.path(), padded(vec![text("nothing left")]));
+    engine2
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let texts2: Vec<String> = transcript(
+        &leveler_storage::MessageRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap(),
+    )
+    .iter()
+    .flat_map(|m| {
+        m.content.iter().filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+    })
+    .collect();
+    assert_eq!(
+        texts2
+            .iter()
+            .filter(|t| t.contains("re-delivered after restart"))
+            .count(),
+        1,
+        "re-delivery is once per settlement, not once per window"
+    );
+    let finishes2 = event_rows(&db, &session)
+        .await
+        .iter()
+        .filter(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .count();
+    assert_eq!(finishes2, 1, "still exactly one terminal fact");
+}
+
+/// MA_RT_C9 + MA_RT_FINDING_ADOPTION_IDEMPOTENT — a ghost whose findings were
+/// already durably adopted keeps them: the synthetic terminal carries a
+/// projection over them instead of contradicting them, the original finding is
+/// not duplicated, and reconciling twice changes nothing.
+#[tokio::test]
+async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(&db, dir.path(), padded(vec![text("noted; stopping")]));
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+
+    let origin = seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
+    let mut ledger = leveler_lifecycle::EvidenceLedger::default();
+    ledger.findings.push(leveler_lifecycle::FindingRecord {
+        id: "f-9".into(),
+        source_child: "agent-1".into(),
+        role: "worker".into(),
+        kind: leveler_lifecycle::FindingKind::Observation,
+        summary: "parser drops trailing comments".into(),
+        file: None,
+        symbol: None,
+    });
+    append_event(
+        &db,
+        &session,
+        Some(&origin),
+        EngineEvent::EvidenceLedgerUpdated { ledger },
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let (
+        _,
+        EngineEvent::SubAgentFinished {
+            contribution,
+            summary,
+            outcome,
+            stop,
+            ..
+        },
+    ) = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .expect("the ghost must be settled")
+    else {
+        unreachable!()
+    };
+    let projection = contribution
+        .as_ref()
+        .expect("durable findings must surface in the terminal projection, not vanish");
+    assert!(
+        projection.findings_total >= 1,
+        "the projection must count the preserved finding"
+    );
+    assert!(
+        summary.contains("remain adopted"),
+        "the terminal must say the earlier findings still stand: {summary}"
+    );
+    assert_eq!(*stop, Some(leveler_lifecycle::ChildStop::Lost));
+    assert_eq!(
+        *outcome,
+        Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+        "adopted findings make a lost child partial, not empty"
+    );
+
+    let ledger = last_ledger(&events).unwrap();
+    assert_eq!(
+        ledger
+            .findings
+            .iter()
+            .filter(|f| f.id == "f-9" || f.summary.contains("trailing comments"))
+            .count(),
+        1,
+        "the adopted finding must survive exactly once — neither erased nor duplicated"
+    );
+
+    // Reconcile again (second window): nothing changes.
+    let engine2 = engine_on(&db, dir.path(), padded(Vec::new()));
+    engine2
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = event_rows(&db, &session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1")
+            )
+            .count(),
+        1,
+        "reconciliation is idempotent: one terminal per child"
+    );
+    let ledger = last_ledger(&events).unwrap();
+    assert_eq!(
+        ledger
+            .findings
+            .iter()
+            .filter(|f| f.source_child == "agent-1")
+            .count(),
+        1,
+        "reconciliation is idempotent: the preserved finding is not re-adopted"
+    );
+}
+
+// ── MA-RT-2 across a real process boundary (file-backed, §46) ────────────────
+
+/// MA_RT_RESTART_OUTSTANDING_RECONCILIATION — the same ghost truth must hold
+/// when the second window is a genuinely fresh process image: new Database
+/// handle over the same file, nothing in memory carried over.
+///
+/// The truth a restart owes is mechanical and it is about the CHILD: a worker
+/// the log says started and never reported settles as `ok: false`, attributed
+/// to the turn that started it, saying what happened — the absence of a
+/// failure is not evidence of success, and a missing terminal fact is not a
+/// successful one. Nothing is invented on its behalf either: the settlement
+/// records the loss, it does not manufacture evidence the child never
+/// reported.
+///
+/// What it does NOT owe is a verdict on the parent. `TaskOutcome::Completed`
+/// records that the model declared its own goal complete, and
+/// `VerificationStatus` records what the project's checks said; whether a lost
+/// child's work still mattered is the model's reading of its own goal, which
+/// is why the in-memory sibling above pins that a ghost is a fact to report
+/// and never a gate on the close.
+#[tokio::test]
+async fn ghost_reconciliation_survives_a_real_database_reopen() {
+    let dir = workspace_dir();
+    let state = tempfile::tempdir().unwrap();
+    let db_path = state.path().join("leveler.db");
+    let spec = gated_spec(dir.path());
+
+    // Window one: the process that created the task and started the worker.
+    let (session, origin_turn) = {
+        let db = Database::connect(&db_path).await.unwrap();
+        let engine = engine_on(&db, dir.path(), Vec::new());
+        let session = engine.create_task(&spec).await.unwrap();
+        let origin_turn = seed_ghost_child(&db, &session, "agent-1", "wren", "worker").await;
+        (session, origin_turn)
+        // db dropped here — the "process" dies.
+    };
+
+    // Window two: a fresh connection, as after a daemon restart.
+    let db = Database::connect(&db_path).await.unwrap();
+    let mut script = vec![patch_call(), complete_call("g1")];
+    for _ in 0..8 {
+        script.push(text("refused over the lost worker; stopping"));
+    }
+    let engine = engine_on(&db, dir.path(), script);
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-1"))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "the reopened window must settle the ghost exactly once"
+    );
+    let (attributed_turn, EngineEvent::SubAgentFinished { ok, summary, .. }) = terminals[0] else {
+        unreachable!()
+    };
+    assert!(
+        !ok,
+        "a worker that never reported across the restart cannot be recorded as \
+         ok: the process disappearing is not the child succeeding"
+    );
+    assert!(
+        summary.contains("lost"),
+        "the terminal must say what actually happened to it: {summary}"
+    );
+    assert_eq!(
+        attributed_turn.as_deref(),
+        Some(origin_turn.as_str()),
+        "the settlement is attributed to the turn that started the child — a \
+         fact only the durable record can still supply after the reopen"
+    );
+    let ledger = last_ledger(&events).unwrap_or_default();
+    assert!(
+        !ledger.findings.iter().any(|f| f.source_child == "agent-1"),
+        "settling a lost child records the loss; it must not manufacture \
+         findings the child never reported"
+    );
+}
+
+// ── MA-RT-1: the durable total cap across a restart ──────────────────────────
+
+/// MA_RT_TOTAL_CAP_ACROSS_RESTART — a window that starts from a persisted
+/// ledger with the quota consumed refuses the next spawn; the durable count
+/// survives where the drive-local counter used to reset.
+#[tokio::test]
+async fn the_total_child_cap_survives_a_restart() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![
+            tool_call(
+                "s1",
+                "spawn_agent",
+                serde_json::json!({
+                    "task": "explore the parser",
+                    "role": "explorer",
+                    "run_in_background": false
+                }),
+            ),
+            text("the spawn was refused; doing the work directly"),
+        ]),
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+
+    let turn = crashed_turn(&db, &session, "user").await;
+    let t1 = TurnId::new(turn.id);
+    let consumed = leveler_lifecycle::ProgressLedger {
+        children_spawned_total: 6,
+        ..Default::default()
+    };
+    append_event(
+        &db,
+        &session,
+        Some(&t1),
+        EngineEvent::ProgressUpdated { ledger: consumed },
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::SubAgentStarted { .. })),
+        "the durable quota is spent: no seventh child may start"
+    );
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            EngineEvent::ToolCallFinished {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "spawn_agent" && preview.contains("limit reached")
+        )),
+        "the refusal must be explicit and durable, naming the limit"
+    );
+}
+
+// ── MA-RT-4: lifecycle turn attribution ──────────────────────────────────────
+
+/// MA_RT_NORMAL_CHILD_TURN_ATTRIBUTION — a child spawned and settled in the
+/// normal flow has both lifecycle events attributed to the turn that ran it.
+#[tokio::test]
+async fn a_normally_settled_child_is_attributed_to_its_turn() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![
+            tool_call(
+                "s1",
+                "spawn_agent",
+                serde_json::json!({
+                    "task": "explore the parser",
+                    "role": "explorer",
+                    "run_in_background": false
+                }),
+            ),
+            text("child report: parser has three modules"),
+            text("synthesis done; stopping"),
+        ]),
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let started = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentStarted { .. }))
+        .expect("the explorer must have started");
+    let finished = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { .. }))
+        .expect("the explorer must have settled");
+    assert!(
+        started.0.is_some(),
+        "a normally spawned child's start belongs to the turn that ran it"
+    );
+    assert_eq!(
+        started.0, finished.0,
+        "start and terminal must be attributed to the same turn"
+    );
+}
+
+/// MA_RT_REVIEWER_TURN_ATTRIBUTION — the harness-owned reviewer is not a turn
+/// (no turn row exists for it), so `turn_id = NULL` on both lifecycle events
+/// is the truthful attribution; the pair must agree, and the start must be
+/// durable (it is appended and awaited before the reviewer executes).
+///
+/// The review is asked for explicitly: `IndependentReviewPolicy` defaults to
+/// `Off`, so a harness that launches a reviewer nobody requested is itself the
+/// bug. This pins the attribution of the review a caller DID ask for.
+#[tokio::test]
+async fn reviewer_lifecycle_events_share_truthful_null_attribution() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let mut engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![
+            tool_call(
+                "c1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+                }),
+            ),
+            complete_call("g1"),
+            // Reviewer child rounds.
+            text("reviewed src/auth.rs: nothing to flag"),
+            text("reviewed src/auth.rs: nothing to flag"),
+        ]),
+    );
+    engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let reviewer_started = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"))
+        .expect("the closure review must have launched a reviewer");
+    let (_, EngineEvent::SubAgentStarted { id, .. }) = reviewer_started else {
+        unreachable!()
+    };
+    let reviewer_finished = events
+        .iter()
+        .find(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { id: fid, .. } if fid == id))
+        .expect("the reviewer must settle durably");
+    assert_eq!(
+        reviewer_started.0, None,
+        "the reviewer belongs to no turn; a fabricated turn id would be false provenance"
+    );
+    assert_eq!(
+        reviewer_finished.0, None,
+        "start and terminal must agree on the (null) attribution"
+    );
+}
+
+// ── MA1: durable child session ───────────────────────────────────────────────
+
+/// All messages a child appended to its own transcript, in durable order.
+fn child_transcript(events: &[(Option<String>, EngineEvent)], child: &str) -> Vec<Message> {
+    events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EngineEvent::SubAgentTranscriptAppended { id, messages } if id == child => {
+                Some(messages.clone())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// A child is a session, not only an activation: its start records what
+/// re-creates it and its own transcript is durable as it advances. Without
+/// both, a later window can only re-delegate — never continue the same child.
+#[tokio::test]
+async fn a_spawned_child_records_its_spec_and_its_own_transcript() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(
+        &db,
+        dir.path(),
+        padded(vec![
+            tool_call(
+                "s1",
+                "spawn_agent",
+                serde_json::json!({
+                    "task": "survey src/lib.rs",
+                    "role": "explorer",
+                    "run_in_background": false
+                }),
+            ),
+            // Child round 1: one read, so a tool round must be persisted.
+            tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+            text("src/lib.rs defines old()"),
+            text("synthesis done; stopping"),
+        ]),
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let (child_id, recorded) = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            EngineEvent::SubAgentStarted { id, spec, .. } => Some((id.clone(), spec.clone())),
+            _ => None,
+        })
+        .expect("the explorer must have started");
+    assert_eq!(
+        recorded,
+        Some(leveler_lifecycle::ChildSpawnSpec {
+            background: false,
+            ..Default::default()
+        }),
+        "the start must record what re-creates the activation"
+    );
+
+    let transcript = child_transcript(&events, &child_id);
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.role == Role::User && m.text_content().contains("survey src/lib.rs")),
+        "the child's own task opens its durable transcript: {transcript:?}"
+    );
+    assert!(
+        transcript.iter().any(|m| m.role == Role::Tool),
+        "a tool round is part of the child session: {transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.text_content().contains("defines old()")),
+        "the child's final answer is durable: {transcript:?}"
+    );
+}
+
+/// A model that answers the parent and a child from separate scripts, routed
+/// by whether the request carries the child's task. A resumed child runs in
+/// the background beside its parent, so one shared FIFO would hand each of
+/// them the other's replies in whatever order the scheduler picked.
+struct RoutedRuntime {
+    child_marker: String,
+    child: Mutex<VecDeque<ModelResponse>>,
+    parent: Mutex<VecDeque<ModelResponse>>,
+    child_requests: Mutex<Vec<Vec<Message>>>,
+    /// Tools and effort of each child request, in the same order.
+    child_surfaces: Mutex<Vec<(Vec<String>, Option<leveler_model::ReasoningEffort>)>>,
+}
+
+#[async_trait]
+impl ModelRuntime for RoutedRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let is_child = request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(&self.child_marker));
+        let queue = if is_child {
+            self.child_requests
+                .lock()
+                .unwrap()
+                .push(request.messages.clone());
+            self.child_surfaces.lock().unwrap().push((
+                request.tools.iter().map(|t| t.name.clone()).collect(),
+                request.reasoning_effort,
+            ));
+            &self.child
+        } else {
+            &self.parent
+        };
+        Ok(queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| text("stopping")))
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        if model.model == "missing" {
+            return Err(ModelError::new(
+                leveler_model::ModelErrorKind::InvalidRequest,
+                "model `mock/missing` is not configured",
+            ));
+        }
+        MockRuntime::new(Vec::new()).profile(model).await
+    }
+}
+
+const RESUMED_TASK: &str = "survey src/lib.rs for the resume gate";
+
+/// Seed the wreckage of a window that died while a durable child was mid-task:
+/// a running turn, the child's start WITH a spec, and one persisted round of
+/// its own transcript.
+async fn seed_interrupted_child_session(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+) -> TurnId {
+    seed_interrupted_child_session_scoped(db, session, id, role, Vec::new()).await
+}
+
+async fn seed_interrupted_child_session_scoped(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+    files: Vec<String>,
+) -> TurnId {
+    let turn_id = seed_ghost_child_with_scope(db, session, id, "wren", role, files).await;
+    let log = EventLog::new(db, session.clone());
+    let round = vec![
+        Message::text(Role::System, "you are a sub-agent"),
+        Message::text(Role::User, RESUMED_TASK),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new("r-before-crash"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            }],
+        },
+        Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: ToolCallId::new("r-before-crash"),
+                    content: "pub fn old() {}".into(),
+                    is_error: false,
+                },
+            }],
+        },
+    ];
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentTranscriptAppended {
+            id: id.to_string(),
+            messages: round,
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    turn_id
+}
+
+async fn seed_ghost_child_with_scope(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    nickname: &str,
+    role: &str,
+    files: Vec<String>,
+) -> TurnId {
+    seed_ghost_child_with_model(db, session, id, nickname, role, files, None).await
+}
+
+async fn seed_ghost_child_with_model(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    nickname: &str,
+    role: &str,
+    files: Vec<String>,
+    model: Option<String>,
+) -> TurnId {
+    let turn = crashed_turn(db, session, "user").await;
+    let turn_id = TurnId::new(turn.id);
+    EventLog::new(db, session.clone())
+        .append(
+            Some(&turn_id),
+            EngineEvent::SubAgentStarted {
+                id: id.to_string(),
+                nickname: nickname.to_string(),
+                role: role.to_string(),
+                task: RESUMED_TASK.to_string(),
+                profile_id: None,
+                profile_role: None,
+                read_only: role != "worker",
+                spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                    files,
+                    model,
+                    background: true,
+                    ..Default::default()
+                }),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    turn_id
+}
+
+fn routed_engine(
+    db: &Database,
+    dir: &Path,
+    child: Vec<ModelResponse>,
+) -> (CodingRuntime, Arc<RoutedRuntime>) {
+    let runtime = Arc::new(RoutedRuntime {
+        child_marker: RESUMED_TASK.to_string(),
+        child: Mutex::new(VecDeque::from(child)),
+        parent: Mutex::new(VecDeque::new()),
+        child_requests: Mutex::new(Vec::new()),
+        child_surfaces: Mutex::new(Vec::new()),
+    });
+    let mut engine = engine_on(db, dir, Vec::new());
+    engine.factory.runtime = runtime.clone();
+    (engine, runtime)
+}
+
+/// RUNNING_CHILD_RESTART_SAFE — the child a dead window left mid-task is
+/// continued, not replaced: same id, no second start, its own earlier round in
+/// context, told it was interrupted, and settled exactly once.
+#[tokio::test]
+async fn an_interrupted_child_is_resumed_with_the_same_identity_and_settles_once() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![text("src/lib.rs defines old(); resumed and done")],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+
+    let mut seen = Vec::new();
+    engine
+        .run(
+            &session,
+            &spec,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let count =
+        |pred: &dyn Fn(&EngineEvent) -> bool| events.iter().filter(|(_, e)| pred(e)).count();
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentStarted { id, .. } if id == "agent-r")),
+        1,
+        "a resumed child is the same child: it never starts twice"
+    );
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentInterrupted { id } if id == "agent-r")),
+        1,
+        "the dead activation is recorded as interrupted, once"
+    );
+    assert_eq!(
+        count(&|e| matches!(e, EngineEvent::SubAgentResumed { id, attempt: 1 } if id == "agent-r")),
+        1,
+        "the new activation is recorded as a resume"
+    );
+    let terminals: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EngineEvent::SubAgentFinished {
+                id,
+                ok,
+                stop,
+                summary,
+                ..
+            } if id == "agent-r" => Some((*ok, *stop, summary.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "settled exactly once: {terminals:?}");
+    assert!(
+        terminals[0].0,
+        "the resumed child finished its task: {terminals:?}"
+    );
+    assert_eq!(
+        terminals[0].1,
+        Some(leveler_lifecycle::ChildStop::Completed)
+    );
+
+    let first = runtime
+        .child_requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the resumed child asked the model");
+    assert!(
+        first.iter().any(|m| m.content.iter().any(|p| matches!(
+            p,
+            ContentPart::ToolCall { call } if call.id.as_str() == "r-before-crash"
+        ))),
+        "the child's own earlier round is restored into its context"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|m| m.text_content().contains("Resumed after an interruption")),
+        "the child is told it was interrupted"
+    );
+
+    let parent_told = transcript(
+        &leveler_storage::MessageRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap(),
+    )
+    .iter()
+    .any(|m| {
+        m.text_content()
+            .contains("Sub-agents resumed after restart")
+            && m.text_content().contains("wren")
+    });
+    assert!(parent_told, "the parent is told which child continues");
+}
+
+/// A child whose activation has already been continued the maximum number of
+/// times is not continued again: it settles as lost, truthfully.
+#[tokio::test]
+async fn a_child_interrupted_too_many_times_settles_as_lost() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let turn = seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+    let log = EventLog::new(&db, session.clone());
+    for attempt in 1..=leveler_engine::MAX_CHILD_RESUMES {
+        log.append(
+            Some(&turn),
+            EngineEvent::SubAgentInterrupted {
+                id: "agent-r".into(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn),
+            EngineEvent::SubAgentResumed {
+                id: "agent-r".into(),
+                attempt,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    }
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert!(
+        !events.iter().any(|(_, e)| matches!(
+            e,
+            EngineEvent::SubAgentResumed { attempt, .. } if *attempt > leveler_engine::MAX_CHILD_RESUMES
+        )),
+        "no activation beyond the bound"
+    );
+    let stop = events.iter().find_map(|(_, e)| match e {
+        EngineEvent::SubAgentFinished { id, stop, .. } if id == "agent-r" => Some(*stop),
+        _ => None,
+    });
+    assert_eq!(stop, Some(Some(leveler_lifecycle::ChildStop::Lost)));
+}
+
+/// The reviewer is harness-launched and bounded; it is rerun fresh, never
+/// continued from a dead activation.
+#[tokio::test]
+async fn an_interrupted_reviewer_is_not_resumed() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "reviewer").await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::SubAgentResumed { .. }))
+    );
+    assert!(events.iter().any(|(_, e)| matches!(
+        e,
+        EngineEvent::SubAgentFinished { id, stop: Some(leveler_lifecycle::ChildStop::Lost), .. } if id == "agent-r"
+    )));
+}
+
+/// NO_OPEN_ORPHAN_AFTER_RESTART — the daemon-restart reaper does not leave a
+/// child reading as running until someone happens to resume its session.
+#[tokio::test]
+async fn the_restart_reaper_marks_an_open_child_interrupted() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = engine_on(&db, dir.path(), Vec::new());
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session(&db, &session, "agent-r", "explorer").await;
+
+    leveler_engine::reap_after_restart(
+        &engine.engine,
+        Some(&session),
+        leveler_engine::ReapScope::EndedBoots,
+    )
+    .await
+    .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentInterrupted { id } if id == "agent-r")
+            )
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::SubAgentFinished { .. })),
+        "interrupted is not settled: the session may still continue it"
+    );
+}
+
+/// A resumed Worker holds its scope again — it can write inside it — and the
+/// recovery note it was given is part of its durable session, so a second
+/// interruption restores that too.
+#[tokio::test]
+async fn a_resumed_worker_writes_inside_its_reclaimed_scope() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, _runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "w1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn resumed() {}\n*** End Patch"
+                }),
+            ),
+            text("added resumed() in src/lib.rs"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_child_session_scoped(
+        &db,
+        &session,
+        "agent-w",
+        "worker",
+        vec!["src/lib.rs".to_string()],
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        lib.contains("pub fn resumed()"),
+        "the resumed worker's write inside its re-claimed scope must land: {lib}"
+    );
+    let events = event_rows(&db, &session).await;
+    let transcript = child_transcript(&events, "agent-w");
+    assert!(
+        transcript
+            .iter()
+            .any(|m| m.text_content().contains("re-claimed for this activation")),
+        "the recovery note is persisted into the child's own session"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-w")
+            )
+            .count(),
+        1
+    );
+}
+
+/// A child whose pinned model the runtime no longer resolves cannot continue:
+/// it settles as failed, saying why, instead of starting and failing blind.
+#[tokio::test]
+async fn a_resumed_child_whose_model_is_gone_settles_as_failed() {
+    let dir = workspace_dir();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(&db, dir.path(), vec![text("never asked")]);
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    let turn = seed_ghost_child_with_model(
+        &db,
+        &session,
+        "agent-m",
+        "wren",
+        "explorer",
+        Vec::new(),
+        Some("mock/missing".to_string()),
+    )
+    .await;
+    EventLog::new(&db, session.clone())
+        .append(
+            Some(&turn),
+            EngineEvent::SubAgentTranscriptAppended {
+                id: "agent-m".into(),
+                messages: vec![Message::text(Role::User, RESUMED_TASK)],
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = event_rows(&db, &session).await;
+    let terminal = events.iter().find_map(|(_, e)| match e {
+        EngineEvent::SubAgentFinished {
+            id, stop, summary, ..
+        } if id == "agent-m" => Some((*stop, summary.clone())),
+        _ => None,
+    });
+    let (stop, summary) = terminal.expect("the child is settled");
+    assert_eq!(stop, Some(leveler_lifecycle::ChildStop::Failed));
+    assert!(summary.contains("not available"), "{summary}");
+    assert!(
+        runtime.child_requests.lock().unwrap().is_empty(),
+        "the child never asked a model"
+    );
+}
+
+/// Seed a dead window's declarative-agent child: its durable start carries the
+/// spawn-time snapshot, and its own first round carries the brief it was
+/// admitted with.
+async fn seed_interrupted_agent_child(
+    db: &Database,
+    session: &SessionId,
+    id: &str,
+    role: &str,
+    snapshot: leveler_lifecycle::ChildAgentSnapshot,
+    brief: &str,
+) {
+    let turn = crashed_turn(db, session, "user").await;
+    let turn_id = TurnId::new(turn.id);
+    let log = EventLog::new(db, session.clone());
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentStarted {
+            id: id.to_string(),
+            nickname: "wren".to_string(),
+            role: role.to_string(),
+            task: RESUMED_TASK.to_string(),
+            profile_id: Some(snapshot.name.clone()),
+            profile_role: Some(role.to_string()),
+            read_only: role == "explorer",
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                background: true,
+                agent: Some(Box::new(snapshot)),
+                ..Default::default()
+            }),
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    log.append(
+        Some(&turn_id),
+        EngineEvent::SubAgentTranscriptAppended {
+            id: id.to_string(),
+            messages: vec![
+                Message::text(Role::System, format!("you are a sub-agent\n\n{brief}")),
+                Message::text(Role::User, RESUMED_TASK),
+            ],
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+}
+
+fn write_agent_dir(root: &Path, name: &str, yaml_body: &str, instructions: &str) {
+    let dir = root.join(".leveler/agents").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.yaml"),
+        format!("version: 1\nname: {name}\ndescription: d\n{yaml_body}"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("instructions.md"), instructions).unwrap();
+}
+
+/// RESTART_USES_SPAWN_TIME_PROFILE — a child spawned read-only from
+/// `security-reviewer` v1 continues after a restart as v1, even though the
+/// definition on disk now says `writer` with new instructions and effort: its
+/// brief comes from its own transcript and its bounds from its durable
+/// snapshot, never from the edited files.
+#[tokio::test]
+async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
+    let dir = workspace_dir();
+    write_agent_dir(
+        dir.path(),
+        "security-reviewer",
+        "capability: writer\nreasoning_effort: low\n",
+        "V2_INSTRUCTIONS_AFTER_EDIT",
+    );
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content": "pwned"}),
+            ),
+            text("reviewed"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_interrupted_agent_child(
+        &db,
+        &session,
+        "agent-sr",
+        "explorer",
+        leveler_lifecycle::ChildAgentSnapshot {
+            name: "security-reviewer".into(),
+            source: "project".into(),
+            fingerprint: "sha256:v1".into(),
+            capability: "read_only".into(),
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        },
+        "## Agent profile: security-reviewer\nV1_INSTRUCTIONS_AT_SPAWN",
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = runtime.child_requests.lock().unwrap().clone();
+    assert!(!requests.is_empty(), "the child resumed");
+    for messages in &requests {
+        let blob: String = messages.iter().map(|m| m.text_content()).collect();
+        assert!(
+            blob.contains("V1_INSTRUCTIONS_AT_SPAWN"),
+            "spawn-time brief kept"
+        );
+        assert!(
+            !blob.contains("V2_INSTRUCTIONS_AFTER_EDIT"),
+            "edited file never read"
+        );
+    }
+    for (tools, effort) in runtime.child_surfaces.lock().unwrap().iter() {
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t == "write_file" || t == "apply_patch"),
+            "still read-only: {tools:?}"
+        );
+        assert_eq!(*effort, Some(leveler_model::ReasoningEffort::High));
+    }
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert_eq!(lib, "pub fn old() {}\n");
+
+    // The durable model-request log, not the configuration, is the evidence of
+    // which effort the child actually ran with.
+    let rows = leveler_storage::ModelRequestRepository::new(&db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    let child_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_id.as_deref() == Some("agent-sr"))
+        .collect();
+    assert!(
+        !child_rows.is_empty(),
+        "the resumed child's calls are recorded"
+    );
+    assert!(
+        child_rows
+            .iter()
+            .all(|row| row.reasoning_effort.as_deref() == Some("high")),
+        "{child_rows:?}"
+    );
+}
+
+/// A deleted definition does not stop a running child: it continues under its
+/// snapshot, and the snapshot's write roots still bound what it may claim.
+#[tokio::test]
+async fn a_restarted_agent_child_survives_deletion_and_keeps_its_write_roots() {
+    let dir = workspace_dir();
+    std::fs::create_dir_all(dir.path().join("web")).unwrap();
+    let db = Database::connect_in_memory().await.unwrap();
+    let (engine, runtime) = routed_engine(
+        &db,
+        dir.path(),
+        vec![
+            tool_call(
+                "c1",
+                "claim_write_scope",
+                serde_json::json!({"paths": ["src/lib.rs"]}),
+            ),
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content": "pwned"}),
+            ),
+            tool_call(
+                "c2",
+                "claim_write_scope",
+                serde_json::json!({"paths": ["web/page.ts"]}),
+            ),
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "web/page.ts", "content": "ok"}),
+            ),
+            text("done"),
+        ],
+    );
+    let spec = gated_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    // No definition on disk at all: it was deleted after the spawn.
+    seed_interrupted_agent_child(
+        &db,
+        &session,
+        "agent-fw",
+        "default",
+        leveler_lifecycle::ChildAgentSnapshot {
+            name: "frontend-writer".into(),
+            source: "project".into(),
+            fingerprint: "sha256:v1".into(),
+            capability: "writer".into(),
+            write_roots: vec!["web".into()],
+            ..Default::default()
+        },
+        "## Agent profile: frontend-writer\nFRONTEND_BRIEF",
+    )
+    .await;
+
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !runtime.child_requests.lock().unwrap().is_empty(),
+        "resumed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\n",
+        "outside the snapshot's write roots"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("web/page.ts"))
+            .ok()
+            .as_deref(),
+        Some("ok"),
+        "inside the snapshot's write roots"
+    );
+    let events = event_rows(&db, &session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, EngineEvent::SubAgentFinished { id, .. } if id == "agent-fw")
+            )
+            .count(),
+        1
+    );
+}

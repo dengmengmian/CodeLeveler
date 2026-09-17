@@ -1,0 +1,2960 @@
+use std::collections::HashMap;
+use std::time::Instant;
+
+use tokio::sync::broadcast;
+
+use leveler_agent::{AdvisoryKind, AgentError, AgentOutcome, StopReason};
+use leveler_core::ToolCallId;
+use leveler_engine::EngineEvent;
+use leveler_lifecycle::VerificationStatus;
+use leveler_verifier::CheckStatus;
+
+use leveler_client_protocol::{
+    CheckState, ChildContribution, FailureCategory, FailureDelivery, FailureRetryability,
+    FailureSource, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
+    UiCheck, UiFailure, UiPlan, UiPlanStep, UiVerification,
+};
+
+use crate::AppError;
+
+/// The client projection of a persisted plan table. One mapping for the live
+/// event and the reconnect snapshot, so the two cannot disagree on a status.
+pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
+    UiPlan {
+        steps: steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, s)| UiPlanStep {
+                index,
+                description: s.step,
+                status: match s.status.as_str() {
+                    "in_progress" => PlanStepStatus::Running,
+                    "completed" => PlanStepStatus::Done,
+                    _ => PlanStepStatus::Pending,
+                },
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> RuntimeEvent {
+    match result {
+        Ok(outcome) => turn_end_event(outcome.stop_reason, outcome.stop_detail),
+        Err(AppError::Agent(AgentError::Cancelled)) => RuntimeEvent::TurnCancelled,
+        Err(AppError::Agent(AgentError::Model(error)))
+            if error.kind == leveler_model::ModelErrorKind::Truncated =>
+        {
+            RuntimeEvent::TurnTruncated {
+                error: error.to_string(),
+            }
+        }
+        Err(AppError::UnclosedTerminalBoundary(error)) => RuntimeEvent::Notification {
+            level: NotificationLevel::Error,
+            message: format!("任务终态尚未发布：收尾证据无法持久化，需要恢复后重新结算（{error}）"),
+        },
+        Err(AppError::TerminalCommitFailed(error)) => RuntimeEvent::Notification {
+            level: NotificationLevel::Error,
+            message: format!("任务终态尚未发布：权威终态提交失败，需要恢复后重新结算（{error}）"),
+        },
+        Err(error) => RuntimeEvent::TurnFailed {
+            error: error.to_string(),
+            failure: match &error {
+                AppError::Model(model) => Some(ui_failure_from_model(model)),
+                _ => None,
+            },
+        },
+    }
+}
+
+/// Project a typed provider failure onto the product failure contract.
+///
+/// The ONLY place a `ModelError` becomes a `UiFailure`. Everything above reads
+/// the structured fields; the vendor's raw text travels only as `detail`.
+pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
+    use leveler_model::{DeliveryState, ModelErrorKind, Retryability};
+    let category = match error.kind {
+        ModelErrorKind::Auth => FailureCategory::Authentication,
+        ModelErrorKind::InvalidRequest | ModelErrorKind::Decode | ModelErrorKind::Truncated => {
+            FailureCategory::InvalidRequest
+        }
+        ModelErrorKind::RateLimit => FailureCategory::RateLimit,
+        ModelErrorKind::ProviderUnavailable | ModelErrorKind::ContentFiltered => {
+            FailureCategory::Provider
+        }
+        ModelErrorKind::Transport | ModelErrorKind::StreamInterrupted => FailureCategory::Network,
+        ModelErrorKind::Timeout => FailureCategory::Timeout,
+        ModelErrorKind::Cancelled => FailureCategory::Cancelled,
+        ModelErrorKind::Other => FailureCategory::Internal,
+    };
+    let retryability = match error.retryability() {
+        Retryability::Safe => FailureRetryability::Safe,
+        Retryability::Caution => FailureRetryability::Caution,
+        Retryability::Unknown => FailureRetryability::Unknown,
+        Retryability::Never => FailureRetryability::Never,
+    };
+    let delivery = match error.delivery_state {
+        DeliveryState::NotSent => FailureDelivery::NotSent,
+        DeliveryState::SentNoResponse => FailureDelivery::SentNoResponse,
+        DeliveryState::Responded => FailureDelivery::Responded,
+        DeliveryState::StreamInterrupted { progress } => FailureDelivery::StreamInterrupted {
+            text: progress.text,
+            tool_args: progress.tool_args,
+        },
+        DeliveryState::Unknown => FailureDelivery::Unknown,
+    };
+    // Provider-agnostic product copy. Deliberately generic: the runtime has no
+    // evidence for a more specific cause, and inventing one from the raw text
+    // would be a guess. The raw text stays in `detail`.
+    let summary = match category {
+        FailureCategory::Authentication => "模型服务拒绝了当前凭据。",
+        FailureCategory::InvalidRequest => "模型服务拒绝了当前请求。",
+        FailureCategory::RateLimit => "模型服务繁忙，请稍后重试。",
+        FailureCategory::Provider => "模型服务暂时不可用。",
+        FailureCategory::Network => "无法连接模型服务。",
+        FailureCategory::Timeout => "模型服务未及时响应。",
+        FailureCategory::Cancelled => "请求已取消。",
+        _ => "请求失败。",
+    }
+    .to_string();
+    UiFailure {
+        category,
+        source: FailureSource::Provider,
+        provider: error.provider.clone(),
+        provider_code: None,
+        status: error.status,
+        retryability,
+        delivery,
+        summary,
+        detail: error.message.clone(),
+    }
+}
+
+/// The turn-end event for a typed stop reason — the terminal marker a person
+/// reads at the bottom of a finished turn.
+///
+/// Split out of [`turn_runtime_event`] so a consumer that holds only the
+/// durable `TaskFinished { stop, reason }` — a replay of a recorded session, an
+/// audit of one — reaches the same terminal state the live client reached,
+/// through this code rather than a second copy of the mapping. Terminal state
+/// is where "blocked" is told apart from "done", so a replay that cannot reach
+/// it cannot check the one thing that matters most.
+pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeEvent {
+    let detail = stop_detail.filter(|s| !s.trim().is_empty());
+    match stop {
+        StopReason::Completed => RuntimeEvent::TurnCompleted,
+        StopReason::Answered => RuntimeEvent::TurnAnswered,
+        StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
+        },
+        // The work so far is real and still on disk. A bare "budget
+        // exhausted" reads as a dead end, so name the way forward:
+        // /goal is the profile that grants further work-windows instead
+        // of stopping at one round budget.
+        StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
+        },
+        // A pinned round ceiling fired: bounded work reached its edge.
+        // The runtime's own `stop_detail` here is a machine token
+        // ("round ceiling reached") that must never reach the screen,
+        // so this outcome always speaks in product wording. Not a
+        // liftable budget, so do not point at /goal as if more
+        // work-window helps.
+        StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
+            reason: "达到执行回合上限 · 已停止,请检查是否陷入循环".into(),
+        },
+        StopReason::Blocked => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
+        },
+        StopReason::Stalled => RuntimeEvent::TurnIncomplete {
+            reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
+        },
+        StopReason::CompletedUnverified => RuntimeEvent::TurnCompletedUnverified {
+            reason: detail.unwrap_or_else(|| {
+                leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+            }),
+        },
+        StopReason::CompletedChecksFailed => RuntimeEvent::TurnCompletedChecksFailed {
+            reason: detail.unwrap_or_else(|| "验证未通过".to_string()),
+        },
+    }
+}
+
+/// A write-ownership decision in the words the rest of the UI uses.
+///
+/// `action` is an audit key and `detail` is "<agent id>: <paths>". Pasted
+/// together they filled the status line with
+/// "delegation ownership_granted: 5500f56e-0773-…: src/load.js" — an internal
+/// name and a UUID where the user looks to see what is happening. The agent
+/// that owns the paths is already a row in the roster; the paths are the part
+/// worth reading.
+fn delegation_stage_label(action: &str, detail: &str) -> String {
+    let paths = detail.split_once(": ").map_or(detail, |(_, rest)| rest);
+    match action {
+        "ownership_granted" => format!("写入权限已分配 · {paths}"),
+        "ownership_denied" => format!("写入权限被拒 · {paths}"),
+        _ => paths.to_string(),
+    }
+}
+
+/// A required stage in the words the rest of the UI uses.
+///
+/// `action` is an audit key (`review_launching`, `analyze_finished_ok`, or a
+/// bare `launching` for the closure reviewer) and `detail` is its
+/// machine-readable reason. Pasted together they printed
+/// "review review_launching: review" at the user — three machine words and no
+/// sentence.
+fn review_stage_label(action: &str, detail: &str) -> String {
+    let (stage, verb) = match action.split_once('_') {
+        Some((stage, verb)) => (stage, verb),
+        None => ("reviewer", action),
+    };
+    let stage = match stage {
+        "analyze" => "分析",
+        "review" | "reviewer" => "评审",
+        other => other,
+    };
+    match verb {
+        "launching" => format!("{stage} · 启动"),
+        "finished_ok" => format!("{stage} · 完成"),
+        "finished_incomplete" => format!("{stage} · 未完成"),
+        // The only detail worth carrying: why it could not start.
+        "launch_failed" => format!("{stage} · 启动失败：{detail}"),
+        _ => stage.to_string(),
+    }
+}
+
+fn task_finished_event(
+    outcome: leveler_lifecycle::TaskOutcome,
+    verification: VerificationStatus,
+    reason: Option<String>,
+    failure: Option<leveler_model::ModelError>,
+    stop: Option<StopReason>,
+    warnings: Vec<String>,
+) -> RuntimeEvent {
+    let detail_with_warnings = || {
+        let mut parts = Vec::new();
+        for part in reason.iter().chain(warnings.iter()) {
+            if !part.trim().is_empty() && !parts.contains(part) {
+                parts.push(part.clone());
+            }
+        }
+        parts.join("; ")
+    };
+    if outcome == leveler_lifecycle::TaskOutcome::Completed
+        && verification == VerificationStatus::Failed
+    {
+        return RuntimeEvent::TurnCompletedChecksFailed {
+            reason: if reason.is_some() || !warnings.is_empty() {
+                detail_with_warnings()
+            } else {
+                "验证未通过".to_string()
+            },
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && !warnings.is_empty() {
+        return RuntimeEvent::TurnCompletedWithWarnings {
+            reason: detail_with_warnings(),
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop == Some(StopReason::Completed) {
+        return match verification {
+            VerificationStatus::Passed if !warnings.is_empty() || reason.is_some() => {
+                RuntimeEvent::TurnCompletedWithWarnings {
+                    reason: detail_with_warnings(),
+                }
+            }
+            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
+            VerificationStatus::Failed => unreachable!("failed verification handled above"),
+            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
+                RuntimeEvent::TurnCompletedUnverified {
+                    reason: reason.unwrap_or_else(|| {
+                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+                    }),
+                }
+            }
+        };
+    }
+    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop.is_none() {
+        return match verification {
+            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
+            VerificationStatus::Failed => unreachable!("failed verification handled above"),
+            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
+                RuntimeEvent::TurnCompletedUnverified {
+                    reason: reason.unwrap_or_else(|| {
+                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
+                    }),
+                }
+            }
+        };
+    }
+    if let Some(stop) = stop {
+        return turn_end_event(stop, reason);
+    }
+    match outcome {
+        leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnCancelled,
+        leveler_lifecycle::TaskOutcome::Failed => RuntimeEvent::TurnFailed {
+            error: reason.unwrap_or_else(|| "任务执行失败".to_string()),
+            failure: failure.as_ref().map(ui_failure_from_model),
+        },
+        leveler_lifecycle::TaskOutcome::BudgetLimited => RuntimeEvent::TurnIncomplete {
+            reason: reason.unwrap_or_else(|| "执行预算已用尽".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::Blocked => RuntimeEvent::TurnIncomplete {
+            reason: reason.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::Completed => RuntimeEvent::TurnAnswered,
+    }
+}
+
+fn finalization_stage(phase: &str) -> Option<FinalizationStage> {
+    Some(match phase {
+        "settling_dependencies" => FinalizationStage::SettlingDependencies,
+        "settling_turn" => FinalizationStage::SettlingDependencies,
+        "verification" => FinalizationStage::Verification,
+        "evidence" => FinalizationStage::Evidence,
+        "review" => FinalizationStage::Review,
+        "continuation_checkpoint" => FinalizationStage::ResolvingOutcome,
+        "resolving_outcome" => FinalizationStage::ResolvingOutcome,
+        "publishing_terminal" => FinalizationStage::PublishingTerminal,
+        _ => return None,
+    })
+}
+
+fn project_verification_check(
+    legacy: &str,
+    observation: Option<&leveler_engine::VerificationObservation>,
+    disposition: Option<&leveler_engine::VerificationDisposition>,
+    evidence: Option<String>,
+) -> (CheckState, Option<String>) {
+    use leveler_engine::{VerificationDisposition as D, VerificationObservation as O};
+    match (observation, disposition) {
+        (Some(O::Passed), Some(D::Required)) => (CheckState::Passed, evidence),
+        (Some(O::Failed), Some(D::Required)) => (CheckState::Failed, evidence),
+        (
+            Some(O::Failed),
+            Some(D::Skipped {
+                reason,
+                revision,
+                source,
+                failed_tests,
+            }),
+        ) => {
+            let mut grounded = format!("skipped: {reason}");
+            if let Some(revision) = revision {
+                grounded.push_str(&format!("; revision={revision}"));
+            }
+            if let Some(source) = source {
+                grounded.push_str(&format!("; source={source}"));
+            }
+            if !failed_tests.is_empty() {
+                grounded.push_str(&format!("; failed_tests={}", failed_tests.join(",")));
+            }
+            if let Some(evidence) = evidence
+                && !evidence.is_empty()
+            {
+                grounded.push_str(&format!("\n{evidence}"));
+            }
+            (CheckState::Skipped, Some(grounded))
+        }
+        (Some(O::NotRun { reason }), _) => {
+            let state = match reason.as_str() {
+                "tool_missing" => CheckState::ToolMissing,
+                "environment_unavailable" => CheckState::EnvironmentUnavailable,
+                _ => CheckState::NotRun,
+            };
+            (
+                state,
+                evidence.or_else(|| Some(format!("not run: {reason}"))),
+            )
+        }
+        (_, Some(D::Skipped { reason, .. })) => (
+            CheckState::Skipped,
+            evidence.or_else(|| Some(format!("skipped: {reason}"))),
+        ),
+        _ => (map_check_status(legacy), evidence),
+    }
+}
+
+/// Translates the runtime's synchronous `AgentEvent`s into protocol events. Tool
+/// calls carry a stable id, so a `ToolResult` pairs with its `ToolCall` by id
+/// (NOT arrival order — read-only tools run in parallel, so results can arrive
+/// out of order or after an interleaved serial tool). `tool_starts` records each
+/// call's start time by id for the client-side duration.
+pub struct EventBridge {
+    events: broadcast::Sender<RuntimeEvent>,
+    tool_starts: HashMap<String, Instant>,
+    /// The in-flight assistant message id, open while deltas stream (spec §16).
+    open_assistant: Option<MessageId>,
+    verification_checks: Vec<UiCheck>,
+    /// Recently completed assistant texts this turn, for the near-duplicate
+    /// fold (a nudged model repeating its "task complete" summary). Display
+    /// layer only — the persisted transcript keeps every message.
+    recent_assistant_texts: std::collections::VecDeque<String>,
+    /// Role per in-flight child, so the terminal event can carry the role the
+    /// spawn announced instead of an empty string.
+    child_roles: HashMap<String, String>,
+    /// A TaskFinished event is the one terminal authority. Once projected,
+    /// post-terminal timing/cleanup events can never move the client back to a
+    /// busy state, and the interactive wrapper knows not to emit a duplicate.
+    terminal_published: bool,
+    /// Releases host admission ownership at the same boundary that publishes
+    /// the durable terminal. This runs after the client event is enqueued, so
+    /// no newly admitted turn can overtake the preceding terminal projection.
+    on_terminal: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// The wire spelling of the runtime's four-way child reading.
+pub(crate) fn project_child_outcome(
+    outcome: leveler_lifecycle::ChildStatus,
+) -> leveler_client_protocol::ChildOutcome {
+    use leveler_client_protocol::ChildOutcome as Wire;
+    use leveler_lifecycle::ChildStatus;
+    match outcome {
+        ChildStatus::CompletedWithFindings => Wire::CompletedWithFindings,
+        ChildStatus::CompletedNoFindings => Wire::CompletedNoFindings,
+        ChildStatus::IncompletePartial => Wire::IncompletePartial,
+        ChildStatus::IncompleteNoResult => Wire::IncompleteNoResult,
+    }
+}
+
+/// The wire spelling of how a child's activation ended.
+pub(crate) fn project_child_stop(
+    stop: leveler_lifecycle::ChildStop,
+) -> leveler_client_protocol::ChildStop {
+    use leveler_client_protocol::ChildStop as Wire;
+    use leveler_lifecycle::ChildStop;
+    match stop {
+        ChildStop::Completed => Wire::Completed,
+        ChildStop::Incomplete => Wire::Incomplete,
+        ChildStop::Budget => Wire::Budget,
+        ChildStop::Cancelled => Wire::Cancelled,
+        ChildStop::Failed => Wire::Failed,
+        ChildStop::Lost => Wire::Lost,
+    }
+}
+
+/// Map the runtime's projection onto the wire type.
+///
+/// Deliberately total: every field crosses. Dropping one here is invisible at
+/// the call site and unrecoverable downstream — which is exactly how
+/// `contribution` was lost before.
+fn project_contribution(c: &leveler_lifecycle::ChildResultProjection) -> ChildContribution {
+    ChildContribution {
+        role: c.role.clone(),
+        profile_id: c.profile_id.clone(),
+        profile_role: c.profile_role.clone(),
+        read_only: c.read_only,
+        findings_total: c.findings_total,
+    }
+}
+
+/// How many completed texts the fold compares against. Nudge rounds can carry
+/// a short tool-status text between two copies of the summary, so comparing
+/// only the immediately previous message would miss the repeat.
+const FOLD_LOOKBACK: usize = 4;
+
+/// Minimum normalized length before the fold may apply: short acknowledgements
+/// repeat legitimately and must stay visible.
+const FOLD_MIN_CHARS: usize = 24;
+
+/// Fraction of the new text's trigrams that must already exist in an earlier
+/// text for the new one to count as "nothing new". A re-stated summary with a
+/// trivial suffix lands ≈0.87; an answer with a genuinely new paragraph drops
+/// below ≈0.7 — 0.85 separates the two with margin on the keep side.
+const FOLD_CONTAINMENT: f64 = 0.85;
+
+/// True when `new` adds (nearly) nothing over `prev`: compare character
+/// trigrams of the normalized texts and require [`FOLD_CONTAINMENT`] of the
+/// new text's trigrams to be already present. Containment (not symmetric
+/// similarity) so a shorter re-statement of a long summary still folds.
+fn is_near_duplicate(prev: &str, new: &str) -> bool {
+    fn normalized(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    fn trigrams(chars: &[char]) -> std::collections::HashSet<[char; 3]> {
+        chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    }
+    let p = normalized(prev);
+    let n = normalized(new);
+    if p.len() < FOLD_MIN_CHARS || n.len() < FOLD_MIN_CHARS {
+        return false;
+    }
+    let new_grams = trigrams(&n);
+    if new_grams.is_empty() {
+        return false;
+    }
+    let prev_grams = trigrams(&p);
+    let overlap = new_grams.iter().filter(|g| prev_grams.contains(*g)).count();
+    overlap as f64 / new_grams.len() as f64 >= FOLD_CONTAINMENT
+}
+
+impl EventBridge {
+    pub fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
+        Self {
+            events,
+            tool_starts: HashMap::new(),
+            open_assistant: None,
+            verification_checks: Vec::new(),
+            recent_assistant_texts: std::collections::VecDeque::new(),
+            child_roles: HashMap::new(),
+            terminal_published: false,
+            on_terminal: None,
+        }
+    }
+
+    pub fn with_terminal_callback(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
+        self.on_terminal = Some(Box::new(callback));
+        self
+    }
+
+    pub fn terminal_published(&self) -> bool {
+        self.terminal_published
+    }
+
+    pub fn forward(&mut self, event: EngineEvent) {
+        // TaskFinished is the closed event boundary. No event from the old
+        // epoch may project after it and race a newly admitted turn.
+        if self.terminal_published {
+            return;
+        }
+        match event {
+            EngineEvent::FinalizationStarted { .. } => {
+                if !self.terminal_published {
+                    let _ = self.events.send(RuntimeEvent::TurnFinalizing {
+                        stage: FinalizationStage::SettlingDependencies,
+                    });
+                }
+            }
+            EngineEvent::FinalizationPhaseStarted { phase, .. } => {
+                if !self.terminal_published
+                    && let Some(stage) = finalization_stage(&phase)
+                {
+                    let _ = self.events.send(RuntimeEvent::TurnFinalizing { stage });
+                }
+            }
+            EngineEvent::FinalizationPhaseFinished { .. } => {}
+            EngineEvent::StreamAttemptStarted => {
+                let message_id = self.open_assistant.take();
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::AssistantAttemptReset { message_id });
+            }
+            EngineEvent::AssistantDelta { text: delta } => {
+                if self.open_assistant.is_none() {
+                    let id = MessageId::new(leveler_core::new_uuid_string());
+                    let _ = self.events.send(RuntimeEvent::AssistantMessageStarted {
+                        message_id: id.clone(),
+                    });
+                    self.open_assistant = Some(id);
+                }
+                if let Some(id) = &self.open_assistant {
+                    let _ = self.events.send(RuntimeEvent::AssistantTextDelta {
+                        message_id: id.clone(),
+                        delta,
+                    });
+                }
+            }
+            EngineEvent::ReasoningDelta { text: delta } => {
+                let _ = self.events.send(RuntimeEvent::ReasoningDelta { delta });
+            }
+            EngineEvent::AssistantMessage { text } => {
+                // Near-duplicate fold: a nudged model that re-states an earlier
+                // summary is collapsed into one notice instead of rendering the
+                // repeat. Display only — the transcript sink keeps the message.
+                let duplicate = self
+                    .recent_assistant_texts
+                    .iter()
+                    .any(|prev| is_near_duplicate(prev, &text));
+                if duplicate {
+                    if let Some(id) = self.open_assistant.take() {
+                        // Streamed path: the deltas are already on screen —
+                        // retract the unfinished block by id.
+                        let _ = self.events.send(RuntimeEvent::AssistantAttemptReset {
+                            message_id: Some(id),
+                        });
+                    }
+                    let _ = self.events.send(RuntimeEvent::Notification {
+                        level: NotificationLevel::Info,
+                        message: "重复的总结已折叠(内容与先前一致)".to_string(),
+                    });
+                    return;
+                }
+                if !text.trim().is_empty() {
+                    self.recent_assistant_texts.push_back(text.clone());
+                    if self.recent_assistant_texts.len() > FOLD_LOOKBACK {
+                        self.recent_assistant_texts.pop_front();
+                    }
+                }
+                // Streamed path: close the open message. Non-streamed fallback:
+                // synthesize the whole message as one delta.
+                if let Some(id) = self.open_assistant.take() {
+                    let _ = self
+                        .events
+                        .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
+                } else if !text.trim().is_empty() {
+                    let id = MessageId::new(leveler_core::new_uuid_string());
+                    let _ = self.events.send(RuntimeEvent::AssistantMessageStarted {
+                        message_id: id.clone(),
+                    });
+                    let _ = self.events.send(RuntimeEvent::AssistantTextDelta {
+                        message_id: id.clone(),
+                        delta: text,
+                    });
+                    let _ = self
+                        .events
+                        .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
+                }
+            }
+            // A delegated agent's canonical tool events are durable recovery
+            // facts, not a second UI stream: the parent already surfaces child
+            // work as attributed SubAgentActivity. Projecting them here would
+            // render every child call twice.
+            EngineEvent::ToolCallStarted {
+                agent_id: Some(_), ..
+            }
+            | EngineEvent::ToolCallFinished {
+                agent_id: Some(_), ..
+            } => {}
+            EngineEvent::ToolCallStarted {
+                call_id: id,
+                name,
+                arguments,
+                parallel,
+                risk: _,
+                agent_id: None,
+            } => {
+                // A tool call ends the current assistant thought. Close any open
+                // streamed message so the next round's text opens a fresh block
+                // instead of being concatenated onto this one.
+                if let Some(open) = self.open_assistant.take() {
+                    let _ = self
+                        .events
+                        .send(RuntimeEvent::AssistantMessageCompleted { message_id: open });
+                }
+                self.tool_starts.insert(id.clone(), Instant::now());
+                let _ = self.events.send(RuntimeEvent::ToolCallStarted {
+                    id: ToolCallId::new(id),
+                    name,
+                    arguments,
+                    parallel,
+                });
+            }
+            EngineEvent::ToolCallFinished {
+                call_id: id,
+                name,
+                is_error,
+                preview,
+                agent_id: None,
+                applied_diff,
+                exit_code,
+                stop,
+            } => {
+                // Pair with the ToolCall by id, whatever order results arrive in.
+                // A denial/guard result has no prior ToolCall — synthesize a
+                // started block first so it still renders and isn't dropped.
+                let start = match self.tool_starts.remove(&id) {
+                    Some(start) => start,
+                    None => {
+                        let _ = self.events.send(RuntimeEvent::ToolCallStarted {
+                            id: ToolCallId::new(id.clone()),
+                            name,
+                            arguments: String::new(),
+                            parallel: false,
+                        });
+                        Instant::now()
+                    }
+                };
+                let _ = self.events.send(RuntimeEvent::ToolCallCompleted {
+                    id: ToolCallId::new(id),
+                    ok: !is_error,
+                    preview,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    applied_diff,
+                    exit_code,
+                    stop: stop.map(|stop| match stop {
+                        leveler_execution::CommandStop::Confirmed => {
+                            leveler_client_protocol::UiCommandStop::Confirmed
+                        }
+                        leveler_execution::CommandStop::Unconfirmed => {
+                            leveler_client_protocol::UiCommandStop::Unconfirmed
+                        }
+                    }),
+                });
+            }
+            EngineEvent::ToolCallOutput {
+                call_id,
+                stream,
+                chunk,
+            } => {
+                let _ = self.events.send(RuntimeEvent::ToolCallOutput {
+                    id: ToolCallId::new(call_id),
+                    stream,
+                    chunk,
+                });
+            }
+            EngineEvent::WorkspaceSnapshotCreated { .. } => {
+                // Durability metadata is persisted by the engine; it has no
+                // standalone transcript cell in the TUI.
+            }
+            EngineEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => {
+                let _ = self.events.send(RuntimeEvent::TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                });
+            }
+            EngineEvent::ContextUsage { accounting } => {
+                let _ = self.events.send(RuntimeEvent::ContextUsage { accounting });
+            }
+            EngineEvent::Compacted { from, to } => {
+                // Structured fact — clients own the wording and locale.
+                let _ = self.events.send(RuntimeEvent::ContextCompacted {
+                    from: from as u32,
+                    to: to as u32,
+                });
+            }
+            // Reachable again under the canonical projection: the legacy
+            // shim dropped this durable fact before the arm could run.
+            EngineEvent::ContextExpanded {
+                from, to, reason, ..
+            } => {
+                let _ = self.events.send(RuntimeEvent::ContextExpanded {
+                    from_tokens: from,
+                    to_tokens: to,
+                    reason,
+                });
+            }
+            EngineEvent::ContextSnapshot { .. } => {
+                // Engine durability metadata; no standalone UI cell.
+            }
+            EngineEvent::PlanUpdated { steps } => {
+                let plan = ui_plan(steps);
+                let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
+            }
+            EngineEvent::GoalIntercepted { kind, detail } => {
+                // Surface as activity label; full tool error remains the model path.
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: format!("gate refused {kind}: {detail}"),
+                });
+            }
+            EngineEvent::DelegationStage { action, detail } => {
+                // Durable ownership-provenance fact; surfaced as a light
+                // activity label so a grant/denial is visible live.
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: delegation_stage_label(&action, &detail),
+                });
+            }
+            EngineEvent::ReviewStage {
+                required,
+                action,
+                detail,
+            } => {
+                // A required review's fate is user-relevant; the rest is audit
+                // trail only (durable, not surfaced).
+                if required {
+                    let _ = self.events.send(RuntimeEvent::AgentActivity {
+                        label: review_stage_label(&action, &detail),
+                    });
+                }
+            }
+            EngineEvent::EvidenceLedgerUpdated { .. } => {
+                // Persisted by engine; no dedicated UI cell in v1.
+            }
+            EngineEvent::GoalCheckpointCreated {
+                checkpoint_id,
+                goal_id,
+                reason,
+                created_at,
+                payload,
+            } => {
+                let _ = self.events.send(RuntimeEvent::GoalRecapCreated {
+                    recap: crate::goal_recap::project_goal_recap_parts(
+                        &checkpoint_id,
+                        &goal_id,
+                        &reason,
+                        &created_at,
+                        &payload,
+                    ),
+                });
+            }
+            EngineEvent::UserShellStarted {
+                execution_id,
+                command,
+                cwd,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellStarted {
+                    execution_id,
+                    command,
+                    cwd,
+                });
+            }
+            EngineEvent::UserShellOutput {
+                execution_id,
+                stream,
+                chunk,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellOutput {
+                    execution_id,
+                    stream,
+                    chunk,
+                });
+            }
+            EngineEvent::UserShellFinished {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellExited {
+                    execution_id,
+                    exit_code,
+                    duration_ms,
+                    status,
+                });
+            }
+            EngineEvent::AdvisoryStarted { kind } => {
+                // Closeout round trips that happen after the visible answer.
+                // Label them so the status line does not read "等待模型" with no
+                // hint of why the wait continues. Unknown keys (older/newer
+                // logs) degrade to the audit label.
+                use leveler_agent::closeout::CloseoutReason;
+                let kind = AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::ContextCompaction);
+                let label = match kind {
+                    AdvisoryKind::ContextCompaction => "压缩上下文中…",
+                    AdvisoryKind::CloseoutNudge(reason) => match reason {
+                        CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
+                        CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
+                    },
+                };
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: label.to_string(),
+                });
+            }
+            EngineEvent::CommandProgress { label, elapsed_ms } => {
+                // Structured event; the TUI reducer turns it into the status-line
+                // label ("运行 cargo test · 02:31"). Single source, so Web/logs get
+                // the same structured data instead of a pre-formatted string.
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::CommandProgress { label, elapsed_ms });
+            }
+            EngineEvent::ModelRetrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+            } => {
+                // Connectivity is ephemeral: a status-line hint, never a
+                // transcript item. Structured so every client renders it in its
+                // own vocabulary.
+                let _ = self.events.send(RuntimeEvent::ModelRetrying {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                });
+            }
+            EngineEvent::ModelWaitingForNetwork { elapsed_ms } => {
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::ModelWaitingForNetwork { elapsed_ms });
+            }
+            // Supervisor control state. Durable for recovery, not for display:
+            // the window count and the guards behind it are how the runtime
+            // decides, and the user already sees the decision.
+            EngineEvent::WindowStateUpdated { .. } => {}
+            EngineEvent::ProgressUpdated { ledger } => {
+                let phase = match ledger.phase {
+                    leveler_lifecycle::TurnPhase::Active => "active",
+                    leveler_lifecycle::TurnPhase::AwaitingModel => "awaiting_model",
+                    leveler_lifecycle::TurnPhase::ToolBatch => "tool_batch",
+                    leveler_lifecycle::TurnPhase::Closing => "closing",
+                    leveler_lifecycle::TurnPhase::AwaitingUser => "awaiting_user",
+                    leveler_lifecycle::TurnPhase::Closed => "closed",
+                };
+                let _ = self.events.send(RuntimeEvent::TurnProgress {
+                    phase: phase.to_string(),
+                    closing: ledger.closing,
+                    no_progress_streak: ledger.no_progress_streak,
+                });
+                if ledger.closing {
+                    let _ = self.events.send(RuntimeEvent::AgentActivity {
+                        label: "计划已完成 · 收口中".into(),
+                    });
+                } else if ledger.no_progress_streak > 0 {
+                    let _ = self.events.send(RuntimeEvent::AgentActivity {
+                        label: format!("无进展 streak {}", ledger.no_progress_streak),
+                    });
+                }
+            }
+            EngineEvent::VerificationStarted => {
+                self.verification_checks.clear();
+                self.emit_verification(None);
+            }
+            EngineEvent::VerificationCheck {
+                name,
+                status,
+                evidence,
+                observation,
+                disposition,
+                execution: _,
+            } => {
+                let (status, evidence) = project_verification_check(
+                    &status,
+                    observation.as_ref(),
+                    disposition.as_ref(),
+                    evidence,
+                );
+                self.verification_checks.push(UiCheck {
+                    name,
+                    status,
+                    evidence,
+                });
+                self.emit_verification(None);
+            }
+            // A client is told the verification truth, not the completion
+            // gate: `UiVerification::passed` answers "did verification pass",
+            // and a run that was not verified has not passed.
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => self.emit_verification(verification_outcome(verification, passed)),
+            EngineEvent::SubAgentStarted {
+                id,
+                nickname,
+                role,
+                task,
+                profile_id,
+                profile_role,
+                read_only,
+                spec,
+            } => {
+                // The capability contract travels with the child so the UI can
+                // state what it was allowed to do rather than implying it.
+                self.child_roles.insert(id.clone(), role.clone());
+                let spec = spec.unwrap_or_default();
+                let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
+                    id,
+                    nickname,
+                    role,
+                    done: false,
+                    ok: false,
+                    detail: task,
+                    profile_id,
+                    profile_role,
+                    read_only,
+                    agent: crate::agents::child_agent_identity(&spec),
+                    contribution: None,
+                    outcome: None,
+                    stop: None,
+                    background: Some(spec.background),
+                    scope: spec.files,
+                });
+            }
+            EngineEvent::SubAgentProgress {
+                id,
+                active,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentProgress {
+                    id,
+                    active,
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                });
+            }
+            EngineEvent::SubAgentFinished {
+                id,
+                nickname,
+                ok,
+                summary,
+                contribution,
+                outcome,
+                stop,
+                ..
+            } => {
+                let projected = contribution.as_ref().map(project_contribution);
+                // Prefer the role recorded at spawn; a projection carries it
+                // too, but a child that was never announced has neither and an
+                // empty string is honest about that.
+                let role = self
+                    .child_roles
+                    .remove(&id)
+                    .or_else(|| {
+                        projected
+                            .as_ref()
+                            .map(|c: &ChildContribution| c.role.clone())
+                    })
+                    .unwrap_or_default();
+                let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
+                    id,
+                    nickname,
+                    role,
+                    done: true,
+                    ok,
+                    detail: summary,
+                    profile_id: projected.as_ref().and_then(|c| c.profile_id.clone()),
+                    profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
+                    read_only: projected.as_ref().is_some_and(|c| c.read_only),
+                    agent: None,
+                    contribution: projected,
+                    outcome: outcome.map(project_child_outcome),
+                    stop: stop.map(project_child_stop),
+                    background: None,
+                    scope: Vec::new(),
+                });
+            }
+            // A child's own transcript is its durable session, not a live
+            // client fact: clients see the child through its lifecycle and
+            // activity events, never its raw context.
+            EngineEvent::SubAgentTranscriptAppended { .. } => {}
+            // Written at a window boundary (the reaper, a turn start). A client
+            // already holding the child moves it; one that just connected
+            // reads the same state from the snapshot's children.
+            EngineEvent::SubAgentInterrupted { id } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentStateChanged {
+                    id,
+                    state: leveler_client_protocol::UiChildState::Interrupted,
+                });
+            }
+            EngineEvent::SubAgentResumed { id, .. } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentStateChanged {
+                    id,
+                    state: leveler_client_protocol::UiChildState::Running,
+                });
+            }
+            EngineEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                preview,
+                is_error,
+            } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentActivity {
+                    id,
+                    phase,
+                    tool,
+                    preview,
+                    is_error,
+                });
+            }
+            EngineEvent::RunFinished { .. } => {
+                // Close a still-open streamed message at turn end. Without this, a
+                // round that streamed only whitespace (no closing AssistantText,
+                // which the executor sends only for non-empty text) would leave
+                // the message "streaming" forever and misdirect the next round's
+                // deltas to a stale id.
+                if let Some(id) = self.open_assistant.take() {
+                    let _ = self
+                        .events
+                        .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
+                }
+            }
+            // Engine-only facts: persisted in the event log and surfaced by
+            // engine-aware consumers (snapshot, approval channel, eval, the
+            // parallel strategy). Deliberately NOT on the client event stream.
+            // This list is exhaustive on purpose — a new EngineEvent variant
+            // must make an explicit projection decision here to compile.
+            EngineEvent::TaskFinished {
+                outcome,
+                verification,
+                reason,
+                failure,
+                stop,
+                warnings,
+            } => {
+                if !self.terminal_published {
+                    self.terminal_published = true;
+                    let _ = self.events.send(task_finished_event(
+                        outcome,
+                        verification,
+                        reason,
+                        failure,
+                        stop,
+                        warnings,
+                    ));
+                    if let Some(callback) = self.on_terminal.take() {
+                        callback();
+                    }
+                }
+            }
+            // A tool call's clock starts when the model asks for it, which for
+            // an approved command counts the user reading the overlay as time
+            // the command ran. The moment the call is allowed is when it can
+            // begin, so that is when its clock starts.
+            EngineEvent::ApprovalResolved {
+                call_id: Some(call_id),
+                ..
+            } => {
+                if let std::collections::hash_map::Entry::Occupied(mut slot) =
+                    self.tool_starts.entry(call_id)
+                {
+                    slot.insert(Instant::now());
+                }
+            }
+            EngineEvent::TaskStarted { .. }
+            | EngineEvent::TurnStarted { .. }
+            | EngineEvent::TurnFinished { .. }
+            | EngineEvent::ApprovalRequested { .. }
+            | EngineEvent::ApprovalResolved { .. }
+            | EngineEvent::ClarificationRequested { .. }
+            | EngineEvent::ClarificationAnswered { .. }
+            | EngineEvent::AcceptanceEvidence { .. }
+            | EngineEvent::PhaseChanged { .. }
+            | EngineEvent::RequirementReady { .. }
+            | EngineEvent::ContextReady { .. }
+            | EngineEvent::PlanReady { .. }
+            | EngineEvent::NodeStarted { .. }
+            | EngineEvent::NodeFinished { .. }
+            | EngineEvent::RepairStarted { .. }
+            | EngineEvent::CandidateStarted { .. }
+            | EngineEvent::CandidateFinished { .. }
+            | EngineEvent::ReviewStarted { .. }
+            | EngineEvent::ReviewFinding { .. }
+            | EngineEvent::ReviewFailed { .. }
+            | EngineEvent::ReviewFinished { .. } => {}
+        }
+    }
+
+    fn emit_verification(&self, passed: Option<bool>) {
+        let _ = self.events.send(RuntimeEvent::VerificationUpdated {
+            verification: UiVerification {
+                checks: self.verification_checks.clone(),
+                passed,
+            },
+        });
+    }
+}
+
+/// Wire status key → UI state, through the vocabulary's own parser.
+///
+/// A check that could not run is not a check that was skipped: collapsing
+/// `tool_missing` and `environment_unavailable` into `Skipped` threw away the
+/// reason the run was unverified, which is the one thing the reader needs.
+fn map_check_status(status: &str) -> CheckState {
+    match CheckStatus::from_wire(status) {
+        Some(CheckStatus::Passed) => CheckState::Passed,
+        Some(CheckStatus::Failed) => CheckState::Failed,
+        Some(CheckStatus::Skipped) => CheckState::Skipped,
+        Some(CheckStatus::ToolMissing) => CheckState::ToolMissing,
+        Some(CheckStatus::EnvironmentUnavailable) => CheckState::EnvironmentUnavailable,
+        // A spelling this vocabulary has never had. Not a pass, and not an
+        // invented reason either.
+        None if status == "not_run" => CheckState::NotRun,
+        None => CheckState::Unknown,
+    }
+}
+
+/// What `UiVerification::passed` may say, given the verdict and the gate.
+///
+/// `None` is "nothing was proven". It is deliberately not `Some(false)`
+/// either: "not verified" and "failed" are different facts, and clients
+/// render them differently (`incomplete` versus `failed`).
+fn verification_outcome(verification: Option<VerificationStatus>, passed: bool) -> Option<bool> {
+    match verification {
+        Some(VerificationStatus::Passed) => Some(true),
+        Some(VerificationStatus::Failed) => Some(false),
+        Some(VerificationStatus::NotRun | VerificationStatus::Unavailable) => None,
+        // A row written before the split. A closed gate that failed can only
+        // mean the checks failed; a closed gate that passed cannot say whether
+        // anything was proven, so it says nothing.
+        None if !passed => Some(false),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    /// Legacy-vocabulary test helper: these tests predate the canonical
+    /// projection and speak AgentEvent; the total `From<AgentEvent> for
+    /// EngineEvent` conversion keeps them meaningful unchanged.
+    fn forward_agent(bridge: &mut EventBridge, event: leveler_agent::AgentEvent) {
+        bridge.forward(event.into());
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// The provider raw body becomes `detail`, never the primary summary; the
+    /// category and delivery are carried structurally so no client parses the
+    /// message.
+    #[test]
+    fn a_model_error_projects_to_a_structured_failure() {
+        use leveler_model::{ModelError, ModelErrorKind};
+        let error = ModelError::from_status(400, r#"{"error":{"message":"bad schema"}}"#)
+            .with_provider("moonshot");
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::InvalidRequest);
+        assert_eq!(failure.source, FailureSource::Provider);
+        assert_eq!(failure.provider.as_deref(), Some("moonshot"));
+        assert_eq!(failure.status, Some(400));
+        assert_eq!(failure.retryability, FailureRetryability::Never);
+        assert_eq!(failure.delivery, FailureDelivery::Responded);
+        assert!(failure.detail.contains("bad schema"));
+        assert!(
+            !failure.summary.contains("bad schema"),
+            "the summary is product copy, not the raw body: {}",
+            failure.summary
+        );
+    }
+
+    /// A failed turn's structured failure survives the durable `TaskFinished`
+    /// projection, so live and replay reach the same presentation.
+    #[test]
+    fn a_failed_task_carries_the_structured_failure_to_the_client() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+        let model = leveler_model::ModelError::from_status(400, "bad").with_provider("moonshot");
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Failed,
+            verification: VerificationStatus::NotRun,
+            reason: Some("execution error: model error [InvalidRequest]: bad".into()),
+            failure: Some(model),
+            stop: None,
+            warnings: Vec::new(),
+        });
+        match rx.try_recv() {
+            Ok(RuntimeEvent::TurnFailed { failure, .. }) => {
+                let failure = failure.expect("structured failure must be projected");
+                assert_eq!(failure.category, FailureCategory::InvalidRequest);
+                assert_eq!(failure.provider.as_deref(), Some("moonshot"));
+            }
+            other => panic!("expected a structured TurnFailed, got {other:?}"),
+        }
+    }
+
+    /// Closeout advisory calls (completeness audit / compaction) must surface as
+    /// a labeled AgentActivity so the status line names the wait instead of a
+    /// bare "waiting for model".
+    #[test]
+    fn advisory_started_becomes_a_labeled_activity() {
+        for (kind, needle) in [
+            (leveler_agent::AdvisoryKind::ContextCompaction, "压缩"),
+            (
+                leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::GoalUnresolved,
+                ),
+                "update_goal",
+            ),
+        ] {
+            let (tx, mut rx) = broadcast::channel(16);
+            let mut bridge = EventBridge::new(tx);
+            forward_agent(
+                &mut bridge,
+                leveler_agent::AgentEvent::AdvisoryStarted { kind },
+            );
+            let labels: Vec<String> = drain(&mut rx)
+                .into_iter()
+                .filter_map(|e| match e {
+                    RuntimeEvent::AgentActivity { label } => Some(label),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                labels.iter().any(|l| l.contains(needle)),
+                "advisory {kind:?} did not surface a '{needle}' activity label: {labels:?}"
+            );
+        }
+    }
+
+    /// The same rule for a delegation stage: the status line showed
+    /// "delegation ownership_granted: 5500f56e-0773-…: src/load.js" — an
+    /// internal action name and an agent UUID in the place the user looks to
+    /// see what is happening.
+    #[test]
+    fn a_delegation_stage_reads_as_a_sentence() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(leveler_engine::EngineEvent::DelegationStage {
+            action: "ownership_granted".into(),
+            detail: "5500f56e-0773-4b38-8fe4-4e365c1e37db: src/load.js, test/load.test.js".into(),
+        });
+        let labels: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::AgentActivity { label } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(
+            !labels[0].contains("5500f56e") && !labels[0].contains("ownership_granted"),
+            "no identifiers: {labels:?}"
+        );
+        assert!(labels[0].contains("src/load.js"), "the files: {labels:?}");
+    }
+
+    /// Stage rows are an audit trail keyed by internal identifiers. Pasting
+    /// them into the status line printed "review review_launching: review" at
+    /// the user — three machine words and no sentence. A required stage says
+    /// what it is doing, in the words the rest of the UI uses.
+    #[test]
+    fn a_required_review_stage_reads_as_a_sentence() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(leveler_engine::EngineEvent::ReviewStage {
+            required: true,
+            action: "review_launching".into(),
+            detail: "review".into(),
+        });
+        let labels: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::AgentActivity { label } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(
+            !labels[0].contains("review_launching") && !labels[0].contains("review review"),
+            "no internal identifiers reach the user: {labels:?}"
+        );
+    }
+
+    /// The direct path's structured plan must reach the client as PlanUpdated,
+    /// with update_plan wire statuses mapped onto the UI step states.
+    #[test]
+    fn plan_updated_maps_statuses_onto_ui_plan() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::PlanUpdated {
+                steps: vec![
+                    leveler_agent::PlanStep {
+                        step: "locate the bug".into(),
+                        status: "completed".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                    leveler_agent::PlanStep {
+                        step: "fix it".into(),
+                        status: "in_progress".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                    leveler_agent::PlanStep {
+                        step: "run tests".into(),
+                        status: "pending".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                ],
+            },
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let plan = events
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::PlanUpdated { plan } => Some(plan.clone()),
+                _ => None,
+            })
+            .expect("PlanUpdated must be forwarded");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
+        assert_eq!(plan.steps[1].description, "fix it");
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Pending);
+        assert_eq!(plan.steps[2].index, 2);
+    }
+
+    /// The id of the Completed event that carries `preview`.
+    fn completed_id_for_preview(events: &[RuntimeEvent], preview: &str) -> String {
+        events
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::ToolCallCompleted { id, preview: p, .. } if p == preview => {
+                    Some(id.as_str().to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The id of the Started event for tool `name`.
+    fn started_id_for_name(events: &[RuntimeEvent], name: &str) -> String {
+        events
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::ToolCallStarted { id, name: n, .. } if n == name => {
+                    Some(id.as_str().to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// A command's live output and how it ended both reach clients: output
+    /// as `ToolCallOutput` for that call, exit code and stop outcome on its
+    /// completion.
+    #[test]
+    fn command_output_and_stop_outcome_reach_clients() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "shell_command".into(),
+                arguments: r#"{"cmd":"cargo test"}"#.into(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolOutput {
+                id: "c1".into(),
+                stream: leveler_execution::OutputStream::Stderr,
+                text: "Compiling leveler-core\n".into(),
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                id: "c1".into(),
+                name: "shell_command".into(),
+                is_error: true,
+                preview: "tool error: command was cancelled".into(),
+                applied_diff: None,
+                exit_code: None,
+                stop: Some(leveler_execution::CommandStop::Unconfirmed),
+            },
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::ToolCallOutput { id, stream, chunk }
+                    if id.as_str() == "c1" && stream == "stderr" && chunk == "Compiling leveler-core\n"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::ToolCallCompleted {
+                    id,
+                    exit_code: None,
+                    stop: Some(leveler_client_protocol::UiCommandStop::Unconfirmed),
+                    ..
+                } if id.as_str() == "c1"
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn tool_result_pairs_by_id_even_when_out_of_order() {
+        // Mimics a round mixing a parallel read (grep) with a serial edit
+        // (apply_patch): the edit's result is emitted before the parallel read's.
+        // A FIFO pairing would swap the two previews; id pairing keeps them right.
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "g".into(),
+                name: "grep".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "p".into(),
+                name: "apply_patch".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
+                id: "p".into(),
+                name: "apply_patch".into(),
+                is_error: false,
+                preview: "AP".into(),
+                applied_diff: None,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
+                id: "g".into(),
+                name: "grep".into(),
+                is_error: false,
+                preview: "GR".into(),
+                applied_diff: None,
+            },
+        );
+
+        let events = drain(&mut rx);
+        // apply_patch's block must complete with apply_patch's preview, grep's with grep's.
+        assert_eq!(
+            started_id_for_name(&events, "apply_patch"),
+            completed_id_for_preview(&events, "AP"),
+            "apply_patch result paired to the wrong tool block"
+        );
+        assert_eq!(
+            started_id_for_name(&events, "grep"),
+            completed_id_for_preview(&events, "GR"),
+            "grep result paired to the wrong tool block"
+        );
+    }
+
+    #[test]
+    fn finished_closes_a_dangling_open_assistant() {
+        // A round that opened a streamed message but never sent a closing
+        // AssistantText (e.g. whitespace-only output) must still be completed.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(" ".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::Finished(String::new()),
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. })),
+            "Finished must close the open streamed message"
+        );
+    }
+
+    #[test]
+    fn retry_attempt_resets_the_open_transient_message() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::StreamAttemptStarted);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("wrong".into()),
+        );
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::StreamAttemptStarted);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("right".into()),
+        );
+        let events = drain(&mut rx);
+
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::AssistantAttemptReset { message_id: None }
+        ));
+        let stale_id = match &events[1] {
+            RuntimeEvent::AssistantMessageStarted { message_id } => message_id.clone(),
+            other => panic!("expected message start, got {other:?}"),
+        };
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AssistantAttemptReset { message_id: Some(id) } if id == &stale_id
+        )));
+    }
+
+    /// Display-layer fold: a later assistant message that near-duplicates an
+    /// earlier one this turn (the repeated "task complete" summary after a
+    /// closeout nudge) is retracted and replaced by ONE folded notice. The
+    /// persisted transcript is untouched — this only stops the live UI spam.
+    #[test]
+    fn near_duplicate_final_summary_is_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "任务已完成:统一 closeout 决策点,合并三个 nudge 机制,四种催办原因都有 \
+                       UI 事件与 transcript 持久化,工作区测试全部通过。";
+
+        // Streamed round one passes through untouched.
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(summary.into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        // Nudged round two repeats the same summary with a trivial suffix.
+        let repeat = format!("{summary}(以上为最终结论)");
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(repeat.clone()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(repeat),
+        );
+
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed, 1,
+            "the duplicate must not complete as a second message: {events:?}"
+        );
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::AssistantMessageStarted { message_id } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "both rounds stream a block: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantAttemptReset { message_id: Some(id) } if id == &started[1]
+            )),
+            "the duplicate's streamed block must be retracted by id: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "the fold must leave one visible notice: {events:?}"
+        );
+    }
+
+    /// A genuinely different second answer must never be folded.
+    #[test]
+    fn different_second_answer_is_not_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(
+                "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
+            ),
+        );
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::AssistantText(
+            "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
+                .into(),
+        ));
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed, 2,
+            "distinct answers must both render: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Notification { message, .. } if message.contains("折叠"))),
+            "no fold notice for distinct answers: {events:?}"
+        );
+    }
+
+    /// Short acknowledgements repeat legitimately ("好的" twice) — the length
+    /// guard keeps them out of the fold.
+    #[test]
+    fn short_repeats_are_not_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+        );
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "short repeats stay visible: {events:?}");
+    }
+
+    /// The non-streamed fallback (no deltas) must fold BEFORE synthesizing the
+    /// message, so the duplicate never reaches the client at all.
+    #[test]
+    fn non_streamed_duplicate_is_folded_without_synthesis() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "验证完成:所有工作区测试通过,改动范围与方案一致,没有引入新的配置开关,\
+                       持久化层保持不变。";
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        let events = drain(&mut rx);
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageStarted { .. }))
+            .count();
+        assert_eq!(
+            started, 1,
+            "the duplicate must not even start a second message: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "the fold must leave one visible notice: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_closes_the_open_assistant_so_later_text_is_a_new_block() {
+        // A round streams text, then calls a tool; the next round streams more
+        // text. Without closing the assistant message at the tool call, the
+        // second round's deltas reuse the first message id and the reducer
+        // concatenates them into one block ("…presets fileThe test expects…").
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("round one text".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("round two text".into()),
+        );
+        let events = drain(&mut rx);
+
+        let started: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::AssistantMessageStarted { message_id } => {
+                    Some(message_id.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started.len(),
+            2,
+            "the tool call must close the first message so the second text opens a new one"
+        );
+        assert_ne!(
+            started[0], started[1],
+            "the two rounds' texts must have distinct message ids"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. })),
+            "the first assistant message must be completed at the tool call"
+        );
+    }
+
+    #[test]
+    fn denial_result_without_a_toolcall_still_renders() {
+        // A guard/denial emits a ToolResult with no prior ToolCall; the bridge
+        // must synthesize a Started so the block isn't dropped.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                exit_code: None,
+                stop: None,
+                id: "x".into(),
+                name: "grep".into(),
+                is_error: true,
+                preview: "search budget reached".into(),
+                applied_diff: None,
+            },
+        );
+        let events = drain(&mut rx);
+        let started = events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { name, .. } if name == "grep"));
+        let completed = events.iter().any(|e| {
+            matches!(e, RuntimeEvent::ToolCallCompleted { ok, preview, .. }
+                if !ok && preview == "search budget reached")
+        });
+        assert!(started, "a synthesized Started must be emitted");
+        assert!(completed, "the denial result must complete the block");
+    }
+
+    fn outcome(stop_reason: StopReason) -> AgentOutcome {
+        AgentOutcome {
+            final_text: String::new(),
+            rounds: 1,
+            modified_files: Vec::new(),
+            stop_reason,
+            stop_detail: None,
+            budget_exhaustion: None,
+            progress: Default::default(),
+            objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
+        }
+    }
+
+    #[test]
+    fn answer_end_does_not_emit_task_completed() {
+        assert_eq!(
+            turn_runtime_event(Ok(outcome(StopReason::Answered))),
+            RuntimeEvent::TurnAnswered
+        );
+        assert_eq!(
+            turn_runtime_event(Ok(outcome(StopReason::Completed))),
+            RuntimeEvent::TurnCompleted
+        );
+    }
+
+    #[test]
+    fn output_limit_error_has_a_distinct_runtime_event() {
+        let error =
+            leveler_model::ModelError::new(leveler_model::ModelErrorKind::Truncated, "token limit");
+        assert!(matches!(
+            turn_runtime_event(Err(AppError::Agent(AgentError::Model(error)))),
+            RuntimeEvent::TurnTruncated { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unclosed_evidence_boundary_is_a_recovery_fault_not_a_terminal() {
+        let projected = turn_runtime_event(Err(AppError::UnclosedTerminalBoundary(
+            "review terminal write failed".to_string(),
+        )));
+        assert!(matches!(
+            &projected,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                ..
+            }
+        ));
+        assert!(!matches!(
+            &projected,
+            RuntimeEvent::TurnCompleted
+                | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                | RuntimeEvent::TurnCompletedUnverified { .. }
+                | RuntimeEvent::TurnCompletedChecksFailed { .. }
+                | RuntimeEvent::TurnFailed { .. }
+                | RuntimeEvent::TurnCancelled
+        ));
+    }
+
+    #[test]
+    fn a_failed_terminal_commit_is_a_recovery_fault_not_a_terminal() {
+        let projected = turn_runtime_event(Err(AppError::TerminalCommitFailed(
+            "injected terminal failure".to_string(),
+        )));
+        assert!(matches!(
+            projected,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_budget_cutoff_tells_the_user_how_to_carry_on() {
+        // Short product copy: next action (continue / /goal), not a long essay.
+        let RuntimeEvent::TurnIncomplete { reason } =
+            turn_runtime_event(Ok(outcome(StopReason::BudgetExhausted)))
+        else {
+            panic!("a budget cutoff is an incomplete turn");
+        };
+        assert!(
+            reason.contains("/goal") && reason.contains("继续"),
+            "point at how to resume: {reason}"
+        );
+    }
+}
+
+/// Projection equivalence characterization (core hardening §23). The TABLE
+/// (EngineEvent inputs → client-visible shapes) is the contract: it captures
+/// the behavior of the pre-hardening path and must stay green, unchanged,
+/// when the projection implementation is swapped. Message/call ids are
+/// normalized because the bridge mints fresh UUIDs.
+#[cfg(test)]
+mod projection_equivalence {
+    use super::*;
+    use leveler_engine::EngineEvent;
+
+    /// Run a canonical event sequence through the application projection and
+    /// return normalized shapes of every client-visible event.
+    fn project(events: Vec<EngineEvent>) -> Vec<String> {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        for event in events {
+            bridge.forward(event);
+        }
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(shape(&ev));
+        }
+        out
+    }
+
+    /// Stable, id-free shape of a RuntimeEvent for table comparison.
+    fn shape(ev: &RuntimeEvent) -> String {
+        match ev {
+            RuntimeEvent::AssistantAttemptReset { message_id } => {
+                format!("reset(open={})", message_id.is_some())
+            }
+            RuntimeEvent::AssistantMessageStarted { .. } => "msg_start".into(),
+            RuntimeEvent::AssistantTextDelta { delta, .. } => format!("delta:{delta}"),
+            RuntimeEvent::AssistantMessageCompleted { .. } => "msg_done".into(),
+            RuntimeEvent::ReasoningDelta { delta } => format!("reasoning:{delta}"),
+            RuntimeEvent::ToolCallStarted {
+                id, name, parallel, ..
+            } => {
+                format!("tool_start:{id}:{name}:par={parallel}")
+            }
+            RuntimeEvent::ToolCallCompleted { id, ok, .. } => format!("tool_done:{id}:ok={ok}"),
+            RuntimeEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => format!("usage:{input_tokens}/{output_tokens}/{cached_input_tokens}"),
+            RuntimeEvent::Notification { level, message } => {
+                format!("note[{level:?}]:{message}")
+            }
+            RuntimeEvent::ContextCompacted { from, to } => format!("compacted:{from}->{to}"),
+            RuntimeEvent::UserShellStarted {
+                execution_id,
+                command,
+                cwd,
+            } => format!("ush_start:{}:{command}:{cwd}", execution_id.as_str()),
+            RuntimeEvent::UserShellOutput {
+                execution_id,
+                stream,
+                chunk,
+            } => format!("ush_out:{}:{stream}:{chunk}", execution_id.as_str()),
+            RuntimeEvent::UserShellExited {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+            } => format!(
+                "ush_exit:{}:{exit_code:?}:{duration_ms}:{status}",
+                execution_id.as_str()
+            ),
+            RuntimeEvent::ContextExpanded {
+                from_tokens,
+                to_tokens,
+                reason,
+            } => format!("expanded:{from_tokens}->{to_tokens}:{reason}"),
+            RuntimeEvent::AgentActivity { label } => format!("activity:{label}"),
+            RuntimeEvent::CommandProgress { label, elapsed_ms } => {
+                format!("cmd:{label}@{elapsed_ms}")
+            }
+            RuntimeEvent::PlanUpdated { plan } => {
+                let steps: Vec<String> = plan
+                    .steps
+                    .iter()
+                    .map(|s| format!("{}={:?}", s.index, s.status))
+                    .collect();
+                format!("plan:[{}]", steps.join(","))
+            }
+            RuntimeEvent::VerificationUpdated { verification } => format!(
+                "verify:passed={:?}:checks={}",
+                verification.passed,
+                verification.checks.len()
+            ),
+            RuntimeEvent::SubAgentUpdated { id, done, ok, .. } => {
+                format!("sub:{id}:done={done}:ok={ok}")
+            }
+            RuntimeEvent::SubAgentProgress { id, active, .. } => {
+                format!("sub_progress:{id}:active={active}")
+            }
+            RuntimeEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                is_error,
+                ..
+            } => {
+                format!("sub_activity:{id}:{phase}:{tool}:err={is_error}")
+            }
+            RuntimeEvent::TurnProgress {
+                phase,
+                closing,
+                no_progress_streak,
+            } => format!("progress:{phase}:closing={closing}:streak={no_progress_streak}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn tool_started(id: &str, name: &str, agent: Option<&str>) -> EngineEvent {
+        EngineEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: agent.map(str::to_string),
+        }
+    }
+
+    fn tool_finished(id: &str, name: &str, is_error: bool, agent: Option<&str>) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
+            call_id: id.into(),
+            name: name.into(),
+            is_error,
+            preview: "out".into(),
+            agent_id: agent.map(str::to_string),
+            applied_diff: None,
+        }
+    }
+
+    /// A tool row's duration is how long the command ran, not how long the
+    /// user took to allow it. The clock started when the MODEL asked, so a
+    /// live turn reported `✓ 执行命令 · 已完成 · 3m 40s` for a script that ran
+    /// for seconds and spent the rest sitting in an approval overlay — which
+    /// makes every duration beside an approved command unreadable.
+    #[test]
+    fn an_approved_command_is_not_timed_from_before_it_was_allowed() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(tool_started("c1", "run_command", None));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        bridge.forward(EngineEvent::ApprovalResolved {
+            id: leveler_core::ApprovalId::new("a1"),
+            call_id: Some("c1".into()),
+            agent_id: None,
+            decision: "approve".into(),
+        });
+        bridge.forward(tool_finished("c1", "run_command", false, None));
+        let mut seen = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let RuntimeEvent::ToolCallCompleted { duration_ms, .. } = ev {
+                seen = Some(duration_ms);
+            }
+        }
+        let duration = seen.expect("the completed tool call reports a duration");
+        assert!(
+            duration < 150,
+            "the 200ms spent waiting for approval was billed to the command: {duration}ms"
+        );
+    }
+
+    #[test]
+    fn streamed_answer_projects_start_deltas_done() {
+        let shapes = project(vec![
+            EngineEvent::StreamAttemptStarted,
+            EngineEvent::AssistantDelta { text: "he".into() },
+            EngineEvent::AssistantDelta { text: "llo".into() },
+            EngineEvent::AssistantMessage {
+                text: "hello".into(),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "reset(open=false)",
+                "msg_start",
+                "delta:he",
+                "delta:llo",
+                "msg_done"
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_resets_the_open_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta { text: "a".into() },
+            EngineEvent::StreamAttemptStarted,
+            EngineEvent::AssistantDelta { text: "b".into() },
+            EngineEvent::AssistantMessage { text: "b".into() },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "msg_start",
+                "delta:a",
+                "reset(open=true)",
+                "msg_start",
+                "delta:b",
+                "msg_done"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_streamed_text_synthesizes_a_whole_message() {
+        assert_eq!(
+            project(vec![EngineEvent::AssistantMessage { text: "hi".into() }]),
+            ["msg_start", "delta:hi", "msg_done"]
+        );
+        assert!(project(vec![EngineEvent::AssistantMessage { text: "".into() }]).is_empty());
+    }
+
+    #[test]
+    fn near_duplicate_summary_folds_to_a_notification() {
+        let text = "这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string();
+        let shapes = project(vec![
+            EngineEvent::AssistantMessage { text: text.clone() },
+            EngineEvent::AssistantMessage { text },
+        ]);
+        assert_eq!(
+            shapes[..3],
+            [
+                "msg_start".to_string(),
+                "delta:这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string(),
+                "msg_done".to_string()
+            ]
+        );
+        assert!(shapes[3].starts_with("note[Info]"), "{shapes:?}");
+        assert_eq!(shapes.len(), 4);
+    }
+
+    #[test]
+    fn parent_tool_calls_project_with_duration_pairing() {
+        let shapes = project(vec![
+            tool_started("t1", "grep", None),
+            tool_finished("t1", "grep", false, None),
+        ]);
+        assert_eq!(
+            shapes,
+            ["tool_start:t1:grep:par=false", "tool_done:t1:ok=true"]
+        );
+    }
+
+    #[test]
+    fn unpaired_tool_result_synthesizes_its_start() {
+        let shapes = project(vec![tool_finished("t9", "apply_patch", true, None)]);
+        assert_eq!(
+            shapes,
+            [
+                "tool_start:t9:apply_patch:par=false",
+                "tool_done:t9:ok=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_closes_an_open_assistant_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta {
+                text: "think".into(),
+            },
+            tool_started("t1", "read_file", None),
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "msg_start",
+                "delta:think",
+                "msg_done",
+                "tool_start:t1:read_file:par=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn delegated_agent_tool_facts_do_not_render_twice() {
+        // A child's canonical tool events are durable recovery facts; the UI
+        // stream already carries them as attributed SubAgentActivity.
+        assert!(
+            project(vec![
+                tool_started("c1", "grep", Some("agent-1")),
+                tool_finished("c1", "grep", false, Some("agent-1")),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn usage_and_compaction_project() {
+        let shapes = project(vec![
+            EngineEvent::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 8,
+            },
+            EngineEvent::Compacted { from: 100, to: 40 },
+        ]);
+        assert_eq!(shapes[0], "usage:10/5/8");
+        // Phase-5 structured-event migration: the compaction fact is typed;
+        // clients localize ("上下文已压缩 100 → 40 条" moves to the TUI).
+        assert_eq!(shapes[1], "compacted:100->40");
+    }
+
+    #[test]
+    fn verification_sequence_accumulates_checks() {
+        let shapes = project(vec![
+            EngineEvent::VerificationStarted,
+            EngineEvent::VerificationCheck {
+                name: "cargo test".into(),
+                status: "passed".into(),
+                observation: None,
+                disposition: None,
+                execution: None,
+                evidence: None,
+            },
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: Some(VerificationStatus::Passed),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "verify:passed=None:checks=0",
+                "verify:passed=None:checks=1",
+                "verify:passed=Some(true):checks=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn finalization_stages_precede_the_authoritative_terminal_event() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::AssistantDelta {
+            text: "done".into(),
+        });
+        bridge.forward(EngineEvent::RunFinished {
+            text: "done".into(),
+        });
+        bridge.forward(EngineEvent::FinalizationStarted {
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::FinalizationPhaseStarted {
+            phase: "verification".into(),
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::AssistantMessageStarted { .. },
+                RuntimeEvent::AssistantTextDelta { .. },
+                RuntimeEvent::AssistantMessageCompleted { .. },
+                RuntimeEvent::TurnFinalizing {
+                    stage: FinalizationStage::SettlingDependencies
+                },
+                RuntimeEvent::TurnFinalizing {
+                    stage: FinalizationStage::Verification
+                },
+                RuntimeEvent::TurnCompletedChecksFailed { reason }
+            ] if reason == "failed gate(s): cargo test"
+        ));
+        assert!(bridge.terminal_published());
+    }
+
+    #[test]
+    fn terminal_is_enqueued_before_admission_is_released() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, _rx) = broadcast::channel(4);
+        let mut callback_rx = tx.subscribe();
+        let terminal_was_visible = Arc::new(AtomicBool::new(false));
+        let observed = terminal_was_visible.clone();
+        let mut bridge = EventBridge::new(tx).with_terminal_callback(move || {
+            observed.store(
+                matches!(callback_rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)),
+                Ordering::SeqCst,
+            );
+        });
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+
+        assert!(terminal_was_visible.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn completion_warning_does_not_rewrite_passed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: Some("required independent review did not complete".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["required independent review did not complete".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
+                if reason == "required independent review did not complete"
+        ));
+    }
+
+    #[test]
+    fn completion_warning_cannot_mask_failed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["required independent review reported 1 finding(s)".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
+                if reason.contains("failed gate(s): cargo test")
+                    && reason.contains("review reported 1 finding")
+        ));
+    }
+
+    #[test]
+    fn answered_stop_cannot_mask_failed_verification() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Failed,
+            reason: Some("failed gate(s): cargo test".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: Vec::new(),
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
+                if reason == "failed gate(s): cargo test"
+        ));
+    }
+
+    #[test]
+    fn legacy_completed_task_without_typed_stop_stays_completed() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            failure: None,
+            stop: None,
+            warnings: Vec::new(),
+        });
+
+        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
+    }
+
+    #[test]
+    fn grounded_baseline_warning_projects_completed_with_warnings() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Unavailable,
+            reason: Some("required checks were not rerun".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: vec!["mechanically confirmed baseline failure: cargo test".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
+                if reason.contains("required checks were not rerun")
+                    && reason.contains("mechanically confirmed baseline failure")
+        ));
+    }
+
+    #[test]
+    fn terminal_latch_drops_every_post_terminal_event() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            verification: VerificationStatus::Passed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
+
+        bridge.forward(EngineEvent::FinalizationPhaseStarted {
+            phase: "cleanup".into(),
+            at: leveler_core::now(),
+        });
+        bridge.forward(EngineEvent::AssistantMessage {
+            text: "post-terminal review".into(),
+        });
+        bridge.forward(EngineEvent::VerificationStarted);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Failed,
+            verification: VerificationStatus::Failed,
+            reason: Some("duplicate".into()),
+            failure: None,
+            stop: None,
+            warnings: Vec::new(),
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may make a terminal UI busy or publish a second terminal"
+        );
+
+        bridge.forward(EngineEvent::GoalCheckpointCreated {
+            checkpoint_id: "checkpoint-1".into(),
+            goal_id: "goal-1".into(),
+            reason: "milestone".into(),
+            created_at: "2026-09-14T00:00:00Z".into(),
+            payload: Box::new(leveler_lifecycle::GoalCheckpoint {
+                objective: "continue the goal".into(),
+                ..Default::default()
+            }),
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// §13 C/D: a check that could not run is not a check that was deliberately
+    /// skipped. Both spellings a durable row may carry land on the same state,
+    /// and none of them lands on `Skipped`.
+    #[test]
+    fn a_check_that_could_not_run_is_not_projected_as_a_skip() {
+        for (durable, expected) in [
+            ("passed", CheckState::Passed),
+            ("failed", CheckState::Failed),
+            ("skipped", CheckState::Skipped),
+            ("not_run", CheckState::NotRun),
+            ("tool_missing", CheckState::ToolMissing),
+            ("toolmissing", CheckState::ToolMissing),
+            (
+                "environment_unavailable",
+                CheckState::EnvironmentUnavailable,
+            ),
+            ("environmentunavailable", CheckState::EnvironmentUnavailable),
+        ] {
+            assert_eq!(map_check_status(durable), expected, "{durable}");
+        }
+        assert_ne!(map_check_status("tool_missing"), CheckState::Skipped);
+        assert_ne!(
+            map_check_status("environment_unavailable"),
+            CheckState::Skipped
+        );
+        // A status this build cannot read is neither a pass nor an invented
+        // reason.
+        assert_eq!(map_check_status("something-else"), CheckState::Unknown);
+    }
+
+    #[test]
+    fn typed_incomplete_check_projects_as_not_run_with_its_reason() {
+        let (status, evidence) = project_verification_check(
+            "skipped",
+            Some(&leveler_engine::VerificationObservation::NotRun {
+                reason: "verification_incomplete".into(),
+            }),
+            Some(&leveler_engine::VerificationDisposition::Required),
+            None,
+        );
+        assert_eq!(status, CheckState::NotRun);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("not run: verification_incomplete")
+        );
+    }
+
+    /// The defect this split exists for. A run that owed no check has an open
+    /// completion gate — it must still complete — and the projection must not
+    /// turn that into a pass for a client to render.
+    #[test]
+    fn a_run_that_was_not_verified_never_projects_as_passed() {
+        for verification in [VerificationStatus::NotRun, VerificationStatus::Unavailable] {
+            let shapes = project(vec![
+                EngineEvent::VerificationStarted,
+                EngineEvent::VerificationFinished {
+                    passed: true,
+                    verification: Some(verification),
+                },
+            ]);
+            assert_eq!(
+                shapes,
+                ["verify:passed=None:checks=0", "verify:passed=None:checks=0"],
+                "{verification:?} is not a pass"
+            );
+        }
+    }
+
+    /// A row written before the gate and the truth were split carries only the
+    /// gate. `passed: true` cannot say whether anything was proven, so it says
+    /// nothing; `passed: false` can only have come from checks that failed, and
+    /// pretending not to know would hide a real failure.
+    #[test]
+    fn a_legacy_row_reports_what_it_can_and_nothing_more() {
+        let shapes = project(vec![
+            EngineEvent::VerificationFinished {
+                passed: false,
+                verification: None,
+            },
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: None,
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "verify:passed=Some(false):checks=0",
+                "verify:passed=None:checks=0"
+            ]
+        );
+    }
+
+    /// The projection is what every client renders. Facts the runtime already
+    /// computed must survive the hop: a contribution dropped here cannot be
+    /// recovered downstream, and the UI would have to invent it or omit it.
+    #[test]
+    fn a_child_contribution_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: true,
+            summary: "done".into(),
+            contribution: Some(
+                leveler_lifecycle::ChildResultProjection::from_findings("a1", "explorer", &[])
+                    .with_profile("explorer", "explorer", true),
+            ),
+            outcome: None,
+            stop: None,
+            limit: None,
+        });
+        let ev = rx.try_recv().expect("one event");
+        match ev {
+            RuntimeEvent::SubAgentUpdated {
+                role, contribution, ..
+            } => {
+                assert_eq!(role, "explorer", "role must not be blanked on finish");
+                let c = contribution.expect("the projection must reach the client");
+                assert_eq!(c.role, "explorer");
+                assert_eq!(c.profile_id.as_deref(), Some("explorer"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The typed terminal crosses the bridge as typed fields. A client that
+    /// has to recover "partial" or "lost" from the summary text is deriving
+    /// runtime truth, which is exactly what it must not do.
+    #[test]
+    fn a_child_typed_terminal_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: Some(leveler_lifecycle::ChildStatus::IncompletePartial),
+            stop: Some(leveler_lifecycle::ChildStop::Budget),
+            limit: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { outcome, stop, .. } => {
+                assert_eq!(
+                    outcome,
+                    Some(leveler_client_protocol::ChildOutcome::IncompletePartial)
+                );
+                assert_eq!(stop, Some(leveler_client_protocol::ChildStop::Budget));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// A child spawned from a declarative agent carries the agent it was
+    /// resolved from — name, source, fingerprint, model, effort, skills — so a
+    /// client can say "Curie · security-reviewer", not just "explorer".
+    #[test]
+    fn a_child_start_carries_its_agent_identity() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "a1".into(),
+            nickname: "Curie".into(),
+            role: "explorer".into(),
+            task: "review".into(),
+            profile_id: Some("security-reviewer".into()),
+            profile_role: Some("explorer".into()),
+            read_only: true,
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                model: Some("deepseek/deepseek-v4-pro".into()),
+                agent: Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                    name: "security-reviewer".into(),
+                    source: "project".into(),
+                    fingerprint: "sha256:abc".into(),
+                    capability: "read_only".into(),
+                    reasoning_effort: Some("high".into()),
+                    skills: vec!["sec-audit".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        });
+        match rx.try_recv().expect("start") {
+            RuntimeEvent::SubAgentUpdated { agent, .. } => {
+                let agent = agent.expect("identity carried");
+                assert_eq!(agent.name, "security-reviewer");
+                assert_eq!(agent.source, "project");
+                assert_eq!(agent.fingerprint, "sha256:abc");
+                assert_eq!(agent.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+                assert_eq!(agent.reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(agent.skills, vec!["sec-audit".to_string()]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// A child's background flag and scope reach the client at start, and an
+    /// interruption or resume reaches it as a state change — a client must not
+    /// keep drawing a dead activation as running.
+    #[test]
+    fn a_child_start_and_its_lifecycle_moves_reach_the_client() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            role: "worker".into(),
+            task: "write".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: false,
+            spec: Some(leveler_lifecycle::ChildSpawnSpec {
+                files: vec!["src/a.rs".into()],
+                background: true,
+                ..Default::default()
+            }),
+        });
+        match rx.try_recv().expect("start") {
+            RuntimeEvent::SubAgentUpdated {
+                background, scope, ..
+            } => {
+                assert_eq!(background, Some(true));
+                assert_eq!(scope, vec!["src/a.rs".to_string()]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        bridge.forward(EngineEvent::SubAgentInterrupted { id: "a1".into() });
+        bridge.forward(EngineEvent::SubAgentResumed {
+            id: "a1".into(),
+            attempt: 1,
+        });
+        let states: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                RuntimeEvent::SubAgentStateChanged { id, state } => (id, state),
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "a1".to_string(),
+                    leveler_client_protocol::UiChildState::Interrupted
+                ),
+                (
+                    "a1".to_string(),
+                    leveler_client_protocol::UiChildState::Running
+                ),
+            ]
+        );
+    }
+
+    /// A terminal says nothing about whether the child ran in the background;
+    /// it must not claim `false`.
+    #[test]
+    fn a_child_terminal_does_not_claim_a_background_flag() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: true,
+            summary: "done".into(),
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { background, .. } => assert_eq!(background, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// `None` means the runtime did not measure this child. It must stay
+    /// distinguishable from a measured zero all the way to the renderer.
+    #[test]
+    fn an_unmeasured_contribution_stays_none() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: false,
+            summary: "did not report".into(),
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { contribution, .. } => {
+                assert!(contribution.is_none(), "unmeasured must not become a zero");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The capability contract is what lets the UI say "read-only" instead of
+    /// implying it.
+    #[test]
+    fn a_child_profile_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "r1".into(),
+            nickname: "reviewer".into(),
+            role: "reviewer".into(),
+            task: "review the diff".into(),
+            profile_id: Some("reviewer".into()),
+            profile_role: Some("reviewer".into()),
+            read_only: true,
+            spec: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated {
+                profile_id,
+                read_only,
+                ..
+            } => {
+                assert_eq!(profile_id.as_deref(), Some("reviewer"));
+                assert!(read_only, "a reviewer's write bound must cross the wire");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_lifecycle_projects() {
+        let shapes = project(vec![
+            EngineEvent::SubAgentStarted {
+                id: "a1".into(),
+                nickname: "Newton".into(),
+                role: "explorer".into(),
+                task: "look".into(),
+                profile_id: None,
+                profile_role: None,
+                read_only: false,
+                spec: None,
+            },
+            EngineEvent::SubAgentProgress {
+                id: "a1".into(),
+                active: true,
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_input_tokens: 0,
+            },
+            EngineEvent::SubAgentActivity {
+                id: "a1".into(),
+                phase: "tool_started".into(),
+                tool: "grep".into(),
+                preview: String::new(),
+                is_error: false,
+            },
+            EngineEvent::SubAgentFinished {
+                id: "a1".into(),
+                nickname: "Newton".into(),
+                ok: true,
+                summary: "done".into(),
+                contribution: None,
+                outcome: None,
+                stop: None,
+                limit: None,
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "sub:a1:done=false:ok=false",
+                "sub_progress:a1:active=true",
+                "sub_activity:a1:tool_started:grep:err=false",
+                "sub:a1:done=true:ok=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn advisory_and_command_progress_project() {
+        let shapes = project(vec![
+            EngineEvent::AdvisoryStarted {
+                kind: "context_compaction".into(),
+            },
+            EngineEvent::CommandProgress {
+                label: "cargo test".into(),
+                elapsed_ms: 1500,
+            },
+        ]);
+        assert!(shapes[0].starts_with("activity:"), "{shapes:?}");
+        assert_eq!(shapes[1], "cmd:cargo test@1500");
+    }
+
+    #[test]
+    fn goal_interception_surfaces_as_activity() {
+        let shapes = project(vec![EngineEvent::GoalIntercepted {
+            kind: "complete".into(),
+            detail: "checks failing".into(),
+        }]);
+        assert_eq!(shapes, ["activity:gate refused complete: checks failing"]);
+    }
+
+    #[test]
+    fn finished_closes_a_dangling_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta {
+                text: "tail".into(),
+            },
+            EngineEvent::RunFinished {
+                text: "tail".into(),
+            },
+        ]);
+        assert_eq!(shapes, ["msg_start", "delta:tail", "msg_done"]);
+    }
+
+    #[test]
+    fn engine_only_facts_do_not_reach_the_client_stream() {
+        // Lifecycle, approvals, and strategy events are surfaced by
+        // engine-aware consumers (snapshot, approval channel, eval) — the
+        // client event stream must not see them.
+        let shapes = project(vec![
+            EngineEvent::TurnStarted {
+                turn_id: leveler_core::TurnId::new("turn-1"),
+                kind: leveler_engine::TurnKind::Chat,
+            },
+            EngineEvent::ContextSnapshot {
+                messages: Vec::new(),
+                through_ordinal: None,
+            },
+            EngineEvent::PhaseChanged {
+                from: leveler_lifecycle::AgentState::Plan,
+                to: leveler_lifecycle::AgentState::Execute,
+            },
+        ]);
+        assert!(shapes.is_empty(), "{shapes:?}");
+    }
+
+    #[test]
+    fn user_shell_lifecycle_projects_one_to_one() {
+        let id = leveler_core::UserShellId::new("ush-1");
+        let shapes = project(vec![
+            EngineEvent::UserShellStarted {
+                execution_id: id.clone(),
+                command: "cargo test".into(),
+                cwd: "/repo".into(),
+            },
+            EngineEvent::UserShellOutput {
+                execution_id: id.clone(),
+                stream: "stdout".into(),
+                chunk: "running".into(),
+            },
+            EngineEvent::UserShellFinished {
+                execution_id: id,
+                exit_code: Some(0),
+                duration_ms: 4200,
+                status: "success".into(),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "ush_start:ush-1:cargo test:/repo",
+                "ush_out:ush-1:stdout:running",
+                "ush_exit:ush-1:Some(0):4200:success"
+            ]
+        );
+    }
+
+    #[test]
+    fn context_expansion_now_reaches_the_client() {
+        // DELIBERATE behavior change, the one exception in this table: the
+        // legacy shim dropped this durable fact before the bridge's
+        // notification arm could run (dead code confirmed in the audit). The
+        // canonical projection restores the intended notification. Production
+        // default keeps adaptive context disabled, so nothing fires today.
+        let shapes = project(vec![EngineEvent::ContextExpanded {
+            from: 256_000,
+            to: 512_000,
+            reason: "reread_pressure".into(),
+            crossed_reliable: false,
+        }]);
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert_eq!(shapes[0], "expanded:256000->512000:reread_pressure");
+    }
+}

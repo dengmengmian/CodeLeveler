@@ -1,0 +1,377 @@
+//! Deterministic execution-policy resolution — the ONE place that decides how
+//! hard to drive a model for a given turn.
+//!
+//! Replaces the retired weak/medium/strong `ModelPolicy` tiers. Inputs are
+//! model facts (`ModelProfile`), the executor's seat (`ExecutionRole`), the
+//! turn's own limits (`TurnProfile`), and always-on safety rails. Resolution
+//! is pure and deterministic: min-composition for concurrency, a precedence
+//! chain for reasoning effort, and no runtime auto-tuning in v1.
+
+use leveler_model::{ModelProfile, ReasoningEffort};
+
+use crate::coding::factory::TurnProfile;
+
+/// Local read-only tool batch width for main/explorer seats. This is a *local
+/// executor* resource guard over calls the model already emitted — the model's
+/// wire-level parallel-tool-call capability does not cap it (see plan doc §3:
+/// profile `max_parallel_tool_calls` is a conservative placeholder today, and
+/// folding it in would silently drop 4 → 1).
+const DEFAULT_PARALLEL_TOOLS: usize = 4;
+/// Per-step distinct-modified-files budget. `0` is unlimited, and that is the
+/// default: a patch touching many files is a wide refactor, not evidence that
+/// the model needs supervising. Only an explicit caller budget bounds it.
+const DEFAULT_FILES_PER_STEP: usize = 0;
+
+/// Which seat the executor occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionRole {
+    /// Top-level turn (Goal/Chat/Node).
+    Main,
+    /// Delegated agent without a narrower explorer/worker specialization.
+    Default,
+    /// Read-only investigation sub-agent.
+    Explorer,
+    /// Writing sub-agent pinned to owned files.
+    Worker,
+    /// Independent read-only reviewer of work the main agent already did.
+    ///
+    /// R007b N7: `REQUIRED_REVIEWER` existed only as a supervisor label — the
+    /// harness had never heard of it, so R008 and R009 were both designated
+    /// and both ignored it. A reviewer has to be a seat the product knows
+    /// about before any of it can be measured.
+    Reviewer,
+}
+
+/// Whether the harness launches an independent reviewer at closure.
+///
+/// Explicit only: the user, the eval, or the caller says so. The runtime
+/// never infers from file names or diff size that a change "needs" a second
+/// model — that is a judgement about the work, not a mechanical fact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndependentReviewPolicy {
+    #[default]
+    Off,
+    /// Launch a read-only reviewer child over every product mutation.
+    Required,
+}
+
+/// eval-only injection seam for single-variable ablation. Production assembly
+/// never constructs one; every `None` inherits the resolved default. The
+/// executor's progress-guard rail (`repeated_read_guard`, kept under that name
+/// because existing experiment configs use it) can ONLY be switched off
+/// through here — that is deliberate: measuring a rail's value is an
+/// experiment, not a configuration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExecutionOverrides {
+    pub max_parallel_tools: Option<usize>,
+    pub max_files_per_step: Option<usize>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning effort for the top-level seat only; delegated seats keep
+    /// `reasoning_effort` / the model default. MA4-C parent-budget ablation.
+    pub main_reasoning_effort: Option<ReasoningEffort>,
+    pub max_tool_output_bytes: Option<usize>,
+    /// Measurement knob: persist the model context after every round
+    /// (`ContextSnapshot`), not only when it diverges from the transcript.
+    /// Context-cost attribution reads those rows; production never sets it.
+    pub context_trace: Option<bool>,
+}
+
+/// The interactive-chat fold threshold. Chat holds a conservative window;
+/// a task folds at the model's own declared reliable context. Resolved
+/// through this one seam so the two cannot drift apart unnoticed (C2.1
+/// recorded them diverging: 24k vs the task budget).
+pub const CHAT_CONTEXT_BUDGET: u32 = crate::PRE_REQUEST_COMPACT_THRESHOLD as u32;
+
+/// The fully resolved execution configuration for one executor. For the
+/// numeric budget fields `0` means unlimited, matching executor semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExecutionPolicy {
+    pub max_output_tokens: u32,
+    /// The model's declared context window (exact fact). Used for accounting
+    /// (`/context`), never to refuse a request.
+    pub context_window: u32,
+    /// Fold threshold in estimated tokens; `0` disables folding. Governs when
+    /// held context is compacted — never how much may be read.
+    pub context_budget: u32,
+    pub max_parallel_tools: usize,
+    pub max_files_per_step: usize,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Byte budget for a single tool result (the central output cap).
+    pub max_tool_output_bytes: usize,
+    /// Persist the model context every round (eval measurement seam).
+    pub context_trace: bool,
+}
+
+/// min over concurrency caps where `0` means "no opinion / unlimited".
+fn min_nonzero(caps: &[usize]) -> usize {
+    caps.iter().copied().filter(|&c| c > 0).min().unwrap_or(0)
+}
+
+/// The tool-context slice of resolution: the per-step modified-files budget.
+/// Split out because the tool context is built once per engine (before any
+/// turn exists), while the executor is resolved per turn — both must read the
+/// SAME defaults or the seam drifts.
+pub fn resolve_tool_limits(overrides: Option<&ExecutionOverrides>) -> usize {
+    overrides
+        .and_then(|o| o.max_files_per_step)
+        .unwrap_or(DEFAULT_FILES_PER_STEP)
+}
+
+/// Resolve the execution configuration for one executor seat. Pure function;
+/// `overrides` is the eval-only ablation seam.
+pub fn resolve_execution_policy(
+    profile: &ModelProfile,
+    role: ExecutionRole,
+    turn: &TurnProfile,
+    overrides: Option<&ExecutionOverrides>,
+) -> ResolvedExecutionPolicy {
+    // The turn's own StepLimits are enforced by the executor. Structured-plan
+    // support stays enabled for every seat; the executor applies its task-based
+    // complexity check so simple one-step work is not forced through a plan.
+    let _ = turn;
+    let o = overrides.cloned().unwrap_or_default();
+
+    let role_parallel = match role {
+        // A reviewer reads the same way an explorer does — it just reads work
+        // that already exists rather than code it is about to change.
+        ExecutionRole::Main
+        | ExecutionRole::Default
+        | ExecutionRole::Explorer
+        | ExecutionRole::Reviewer => DEFAULT_PARALLEL_TOOLS,
+        // Write path stays serial: parallel writes conflict and amplify errors.
+        ExecutionRole::Worker => 1,
+    };
+    let max_parallel_tools = min_nonzero(&[role_parallel, o.max_parallel_tools.unwrap_or(0)]);
+
+    ResolvedExecutionPolicy {
+        max_output_tokens: profile.limits.max_output_tokens,
+        context_window: profile.limits.context_window,
+        // `reliable_context` is a model QUALITY declaration (recall degrades
+        // past it), not a hard cap: the policy chooses to fold there.
+        context_budget: profile.limits.reliable_context,
+        max_parallel_tools,
+        max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
+        // Safety rail: only the eval seam may lower it.
+        reasoning_effort: leveler_model::resolve_reasoning_effort(
+            match role {
+                ExecutionRole::Main => o.main_reasoning_effort.or(o.reasoning_effort),
+                _ => o.reasoning_effort,
+            },
+            &profile.reasoning,
+        )
+        .effective,
+        // Explicit configuration only (no auto-tuning in v1): eval seam, then
+        // the model profile, then the global default cap.
+        max_tool_output_bytes: o
+            .max_tool_output_bytes
+            .or(profile.limits.max_tool_output_bytes)
+            .unwrap_or(leveler_tools::registry::MAX_TOOL_OUTPUT)
+            .clamp(
+                leveler_tools::registry::MIN_TOOL_OUTPUT,
+                leveler_tools::registry::MAX_TOOL_OUTPUT,
+            ),
+        context_trace: o.context_trace.unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::factory::TurnProfile;
+    use crate::{ContinuationPolicy, StepLimits};
+    use leveler_model::{ModelProfile, ReasoningEffort};
+
+    fn profile() -> ModelProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": "deepseek-v4-flash",
+            "provider": "deepseek",
+            "model_id": "deepseek-v4-flash",
+            "protocol": "openai_chat",
+            "capabilities": {
+                "streaming": true, "tool_calling": true,
+                "parallel_tool_calls": false, "structured_output": false,
+                "reasoning": false, "vision": false
+            },
+            "limits": {
+                "context_window": 131072, "reliable_context": 65536,
+                "max_output_tokens": 8192, "max_tool_schema_bytes": 32768,
+                "max_parallel_tool_calls": 1
+            },
+            "reasoning": { "style": "none" }
+        }))
+        .expect("valid test profile")
+    }
+
+    fn goal_turn() -> TurnProfile {
+        TurnProfile::Goal {
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+            continues_active_goal: false,
+        }
+    }
+
+    /// Migration contract: for a main seat with no overrides, resolution must
+    /// equal what the retired `default_policy()` produced through the old
+    #[test]
+    fn context_trace_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert!(
+            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None).context_trace,
+            "production never persists the context every round"
+        );
+        let o = ExecutionOverrides {
+            context_trace: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        assert!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o)).context_trace
+        );
+    }
+
+    #[test]
+    fn tool_output_budget_prefers_override_then_profile_then_default() {
+        let mut p = profile();
+        p.limits.max_tool_output_bytes = Some(16 * 1024);
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(r.max_tool_output_bytes, 16 * 1024, "profile value wins");
+
+        let o = ExecutionOverrides {
+            max_tool_output_bytes: Some(8 * 1024),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
+        assert_eq!(
+            r.max_tool_output_bytes,
+            8 * 1024,
+            "eval seam wins over profile"
+        );
+    }
+
+    #[test]
+    fn tool_output_budget_is_clamped_to_safe_global_bounds() {
+        let p = profile();
+        let huge = ExecutionOverrides {
+            max_tool_output_bytes: Some(leveler_tools::registry::MAX_TOOL_OUTPUT * 10),
+            ..ExecutionOverrides::default()
+        };
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&huge))
+                .max_tool_output_bytes,
+            leveler_tools::registry::MAX_TOOL_OUTPUT
+        );
+
+        let zero = ExecutionOverrides {
+            max_tool_output_bytes: Some(0),
+            ..ExecutionOverrides::default()
+        };
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&zero))
+                .max_tool_output_bytes,
+            leveler_tools::registry::MIN_TOOL_OUTPUT
+        );
+    }
+
+    #[test]
+    fn tool_limits_resolve_to_the_task_file_budget() {
+        // De-engineering Wave 2 made the per-step file budget unlimited by
+        // default: a patch touching nine files is a wide refactor, not a
+        // mistake, and only an explicit caller budget bounds it.
+        assert_eq!(resolve_tool_limits(None), DEFAULT_FILES_PER_STEP);
+        assert_eq!(DEFAULT_FILES_PER_STEP, 0, "0 means unlimited");
+        let o = ExecutionOverrides {
+            max_files_per_step: Some(2),
+            ..ExecutionOverrides::default()
+        };
+        assert_eq!(resolve_tool_limits(Some(&o)), 2);
+    }
+
+    #[test]
+    fn worker_seat_serializes_writes_and_explorer_keeps_wide_read_parallelism() {
+        let p = profile();
+        let worker = resolve_execution_policy(&p, ExecutionRole::Worker, &goal_turn(), None);
+        assert_eq!(worker.max_parallel_tools, 1, "write path stays serial");
+
+        let explorer = resolve_execution_policy(&p, ExecutionRole::Explorer, &goal_turn(), None);
+        assert_eq!(
+            explorer.max_parallel_tools, 4,
+            "read-only investigation keeps the wide local batch"
+        );
+    }
+
+    #[test]
+    fn min_composition_ignores_zero_and_override_wins_when_tighter() {
+        assert_eq!(min_nonzero(&[0, 4, 0]), 4);
+        assert_eq!(min_nonzero(&[3, 4]), 3);
+        assert_eq!(min_nonzero(&[0, 0]), 0, "all-unlimited stays unlimited");
+
+        let p = profile();
+        let tighter = ExecutionOverrides {
+            max_parallel_tools: Some(2),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&tighter));
+        assert_eq!(r.max_parallel_tools, 2);
+    }
+
+    #[test]
+    fn reasoning_effort_prefers_override_then_profile_recommendation() {
+        let mut p = profile();
+        p.reasoning.default_effort = Some(ReasoningEffort::Low);
+        p.reasoning.supported_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Low));
+
+        let task = ExecutionOverrides {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn reasoning_effort_upgrades_unsupported_override() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.default_effort = Some(ReasoningEffort::Max);
+        p.reasoning.supported_efforts = vec![ReasoningEffort::High, ReasoningEffort::Max];
+        let task = ExecutionOverrides {
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn main_reasoning_effort_lowers_only_the_top_level_seat() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.default_effort = Some(ReasoningEffort::Max);
+        p.reasoning.supported_efforts = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ];
+        let parent_only = ExecutionOverrides {
+            main_reasoning_effort: Some(ReasoningEffort::High),
+            ..ExecutionOverrides::default()
+        };
+        let main =
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&parent_only));
+        assert_eq!(main.reasoning_effort, Some(ReasoningEffort::High));
+        for role in [
+            ExecutionRole::Default,
+            ExecutionRole::Explorer,
+            ExecutionRole::Worker,
+            ExecutionRole::Reviewer,
+        ] {
+            let child = resolve_execution_policy(&p, role, &goal_turn(), Some(&parent_only));
+            assert_eq!(
+                child.reasoning_effort,
+                Some(ReasoningEffort::Max),
+                "{role:?} keeps the model default"
+            );
+        }
+    }
+}

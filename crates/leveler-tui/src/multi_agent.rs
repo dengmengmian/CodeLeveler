@@ -1,0 +1,1696 @@
+//! Multi-agent view model.
+//!
+//! One typed projection between runtime facts and the renderer. The renderer
+//! reads this; it never derives a fact from prose.
+//!
+//! The product question this answers is not "how many agents ran" but "why was
+//! the parallel work worth waiting for": what each child was for, what the
+//! parent did with what it produced, and what it cost.
+
+use leveler_client_protocol::ChildContribution;
+
+/// Where a child is. Distinct from the outcome of what it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// Launched, not yet doing visible work.
+    Waiting,
+    /// Actively spending model calls.
+    Running,
+    /// Its activation died with a runtime window; the runtime continues it or
+    /// settles it as lost. Not running, not finished.
+    Interrupted,
+    /// Its turn ended and no terminal reached this view. The UI holds no fact
+    /// about how it ended; a later terminal or snapshot says.
+    Unreported,
+    Completed,
+    Failed,
+}
+
+/// What the parent did with what one child produced.
+///
+/// Three outcomes, deliberately separate. Collapsing `NothingToFlag` and
+/// `NotMeasured` into "0 findings" is the defect that made an eval report
+/// claim five reviewers found nothing when all five had reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Contribution {
+    /// The child has not finished.
+    Pending,
+    /// It finished and the runtime produced no projection. Unknown, not zero.
+    NotMeasured,
+    /// It finished and reported nothing. A real answer.
+    NothingToFlag,
+    /// It did NOT finish. Whatever it reported is a partial measurement, and
+    /// zero findings from a child that was cut off certifies nothing — it only
+    /// says the review never got there.
+    Incomplete { reported: u32 },
+    /// It reported this many findings. What the parent made of them is in
+    /// the transcript, in the parent's own words — the runtime no longer
+    /// tracks a per-finding verdict, so neither does this.
+    Reported { total: u32 },
+}
+
+/// One child, as the user should understand it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildAgentView {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    /// Built-in capability contract. `None` means the runtime recorded none.
+    pub profile_id: Option<String>,
+    /// The declarative agent it was spawned from (`security-reviewer`), when
+    /// it was. `None` for a built-in role spawn and for older records.
+    pub agent_name: Option<String>,
+    /// Whether this child holds a physically read-only toolset.
+    pub read_only: bool,
+    /// What it was asked to do. Leads the running line: a user watching a
+    /// spinner needs the reason, not the state.
+    pub purpose: String,
+    pub status: ChildStatus,
+    pub contribution: Contribution,
+    /// Latest tool step, when the runtime reported one.
+    pub recent_step: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// How the activation ended, once it has. `None` while running and for
+    /// terminals recorded before it was typed.
+    pub stop: Option<leveler_client_protocol::ChildStop>,
+    pub started_elapsed_secs: u64,
+    /// Elapsed when this child settled, once it has. A finished row shows the
+    /// time it took; without the stamp it followed the turn clock, so a
+    /// hundred-second child read "7m 10s" ten minutes later, beside its own ✓.
+    pub settled_elapsed_secs: Option<u64>,
+    /// Findings loaded on demand by the Contribution Inspector.
+    ///
+    /// `None` means nobody has asked yet — not that there are none. The
+    /// inspector queries when the user opens a detail view, because findings
+    /// are ledger facts and streaming them would duplicate the record.
+    pub detail: Option<leveler_client_protocol::UiChildContribution>,
+    /// Bounded projection of [`SubAgentActivity`] steps, newest last.
+    pub steps: Vec<String>,
+}
+
+impl ChildAgentView {
+    /// True when this child can only be described by its bounds, not by what
+    /// it produced — the honest state for a failed or unmeasured child.
+    pub fn contribution_unknown(&self) -> bool {
+        matches!(self.contribution, Contribution::NotMeasured)
+    }
+
+    /// Read-only children can be stated as such rather than implied.
+    ///
+    /// This used to scan a list of semantic capability labels for
+    /// "write"/"edit"/"apply_patch" — none of which a label ever was, so every
+    /// profiled child, Workers included, read as read-only. The runtime now
+    /// sends the bound it enforces.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+/// One `SubAgentUpdated`, as the view model consumes it.
+///
+/// A struct rather than ten positional parameters: the call site passes three
+/// `Option<String>`-shaped things and two bools, and a transposed pair there
+/// would compile and be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildUpdate {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    /// false while running; true once the child finished.
+    pub done: bool,
+    /// Whether it finished successfully. Only meaningful when `done`, and
+    /// load-bearing: zero findings from `ok == false` certifies nothing.
+    pub ok: bool,
+    /// The task while running; a short result summary once done.
+    pub detail: String,
+    pub profile_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub read_only: bool,
+    /// `None` means the runtime produced no projection — not measured.
+    pub contribution: Option<ChildContribution>,
+    /// How the activation ended, when it did. Read, never inferred.
+    pub stop: Option<leveler_client_protocol::ChildStop>,
+    pub started_elapsed_secs: u64,
+}
+
+/// The team working on one task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskTeamView {
+    pub children: Vec<ChildAgentView>,
+    /// Turn-elapsed seconds at the moment the LAST active child settled.
+    /// Presentation-only, and deliberately not persisted anywhere: it exists
+    /// so the runtime surface can show a brief terminal summary and then get
+    /// out of the way. Cleared whenever a child becomes active again.
+    pub settled_at_elapsed: Option<u64>,
+}
+
+/// How long the terminal collaboration summary stays on screen after the last
+/// child settles, before the surface disappears entirely.
+pub const COLLABORATION_TERMINAL_SECS: u64 = 6;
+
+impl TaskTeamView {
+    /// Children still working.
+    pub fn active(&self) -> impl Iterator<Item = &ChildAgentView> {
+        self.children
+            .iter()
+            .filter(|c| matches!(c.status, ChildStatus::Running | ChildStatus::Waiting))
+    }
+
+    /// Apply one `SubAgentUpdated`. Upserts by id so a child transitions in
+    /// place rather than appearing twice.
+    /// Re-derive the terminal stamp after any child-state change.
+    ///
+    /// Active again → the surface is live, so clear the stamp. Just went
+    /// fully settled → stamp it so the terminal summary can age out. Already
+    /// stamped → leave it, or the summary would restart on every event.
+    fn restamp_settlement(&mut self, now_elapsed: u64) {
+        if self.children.is_empty() {
+            self.settled_at_elapsed = None;
+            return;
+        }
+        if self.active().next().is_some() {
+            self.settled_at_elapsed = None;
+        } else if self.settled_at_elapsed.is_none() {
+            self.settled_at_elapsed = Some(now_elapsed);
+        }
+    }
+
+    /// Whether the runtime surface should be on screen at all.
+    ///
+    /// This is an ACTIVITY question, not a composition one: a team that
+    /// merely exists is history, and history belongs to Task Detail. The
+    /// surface is live while anyone is working or blocking, stays briefly
+    /// after the last child settles, and then goes away.
+    pub fn surface_visible(&self, now_elapsed: u64) -> bool {
+        if self.children.is_empty() {
+            return false;
+        }
+        if self.active().next().is_some() {
+            return true;
+        }
+        match self.settled_at_elapsed {
+            None => true,
+            // A clock that went BACKWARDS (the turn clock resets when the
+            // session goes idle) means the turn that stamped this has ended:
+            // the linger is over, not restarted.
+            Some(at) => now_elapsed >= at && now_elapsed - at < COLLABORATION_TERMINAL_SECS,
+        }
+    }
+
+    /// Whether the surface is showing its brief post-settlement summary.
+    pub fn surface_is_terminal(&self, now_elapsed: u64) -> bool {
+        self.surface_visible(now_elapsed) && self.active().next().is_none()
+    }
+
+    pub fn apply_update(&mut self, update: ChildUpdate) {
+        let ChildUpdate {
+            id,
+            nickname,
+            role,
+            done,
+            ok,
+            detail,
+            profile_id,
+            agent_name,
+            read_only,
+            contribution,
+            stop,
+            started_elapsed_secs,
+        } = update;
+        let contribution = if !done {
+            Contribution::Pending
+        } else {
+            project(contribution.as_ref(), ok)
+        };
+        let status = match (done, ok) {
+            (false, _) => ChildStatus::Waiting,
+            (true, true) => ChildStatus::Completed,
+            (true, false) => ChildStatus::Failed,
+        };
+        if let Some(existing) = self.children.iter_mut().find(|c| c.id == id) {
+            // A finish event carries no purpose; keep the one from the spawn.
+            if !done {
+                existing.purpose = detail;
+            }
+            existing.status = status;
+            // The first settlement owns the clock: a repeated finish event
+            // must not re-stamp it later.
+            if done {
+                existing
+                    .settled_elapsed_secs
+                    .get_or_insert(started_elapsed_secs);
+            }
+            existing.contribution = contribution;
+            existing.stop = stop;
+            if !role.is_empty() {
+                existing.role = role;
+            }
+            if profile_id.is_some() {
+                existing.profile_id = profile_id;
+            }
+            if agent_name.is_some() {
+                existing.agent_name = agent_name;
+            }
+            existing.read_only = read_only;
+            self.restamp_settlement(started_elapsed_secs);
+            return;
+        }
+        self.children.push(ChildAgentView {
+            id,
+            nickname,
+            role,
+            profile_id,
+            agent_name,
+            read_only,
+            purpose: detail,
+            status,
+            contribution,
+            recent_step: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop,
+            started_elapsed_secs,
+            settled_elapsed_secs: done.then_some(started_elapsed_secs),
+            detail: None,
+            steps: Vec::new(),
+        });
+        self.restamp_settlement(started_elapsed_secs);
+    }
+
+    /// Take the children the runtime recorded (a snapshot on open or
+    /// reconnect). Each is upserted by id: a child this view already follows
+    /// keeps its live-only detail (steps, loaded findings) and takes the
+    /// recorded state; one it never saw is added as recorded.
+    pub fn restore(
+        &mut self,
+        children: &[leveler_client_protocol::UiChildAgent],
+        now_elapsed: u64,
+    ) {
+        use leveler_client_protocol::{ChildOutcome, UiChildState};
+        for recorded in children {
+            let status = match recorded.state {
+                UiChildState::Running => ChildStatus::Waiting,
+                UiChildState::Interrupted => ChildStatus::Interrupted,
+                UiChildState::Settled => match recorded.outcome {
+                    Some(
+                        ChildOutcome::CompletedWithFindings | ChildOutcome::CompletedNoFindings,
+                    ) => ChildStatus::Completed,
+                    Some(_) => ChildStatus::Failed,
+                    // Settled before the outcome was typed: only the ok bit.
+                    None if recorded.ok => ChildStatus::Completed,
+                    None => ChildStatus::Failed,
+                },
+            };
+            let input = u32::try_from(recorded.input_tokens).unwrap_or(u32::MAX);
+            let output = u32::try_from(recorded.output_tokens).unwrap_or(u32::MAX);
+            if let Some(existing) = self.children.iter_mut().find(|c| c.id == recorded.id) {
+                // A terminal already applied is final: a snapshot taken before
+                // it still says running and must not reopen the child. And a
+                // live Running is finer than the record's Running.
+                let settled_here = matches!(
+                    existing.status,
+                    ChildStatus::Completed | ChildStatus::Failed
+                );
+                let finer_live =
+                    status == ChildStatus::Waiting && existing.status == ChildStatus::Running;
+                if !settled_here && !finer_live {
+                    existing.status = status;
+                    existing.stop = recorded.stop;
+                }
+                existing.input_tokens = existing.input_tokens.max(input);
+                existing.output_tokens = existing.output_tokens.max(output);
+                continue;
+            }
+            // Settled history belongs to the transcript, not the live team:
+            // only children the runtime still has open join it.
+            if recorded.state == UiChildState::Settled {
+                continue;
+            }
+            self.children.push(ChildAgentView {
+                id: recorded.id.clone(),
+                nickname: recorded.nickname.clone(),
+                role: recorded.role.clone(),
+                profile_id: recorded.profile_id.clone(),
+                agent_name: recorded.agent.as_ref().map(|a| a.name.clone()),
+                read_only: recorded.read_only,
+                purpose: recorded.purpose.clone(),
+                status,
+                contribution: Contribution::Pending,
+                recent_step: None,
+                input_tokens: input,
+                output_tokens: output,
+                stop: None,
+                started_elapsed_secs: now_elapsed,
+                // Restored children are still open by the branch above; a
+                // settled one never joins the live team.
+                settled_elapsed_secs: None,
+                detail: None,
+                steps: Vec::new(),
+            });
+        }
+        self.restamp_settlement(now_elapsed);
+    }
+
+    /// The runtime moved a child without a start or terminal: its activation
+    /// died (interrupted) or a new one began (running). A settled child stays
+    /// settled — a terminal is final.
+    pub fn apply_state(
+        &mut self,
+        id: &str,
+        state: leveler_client_protocol::UiChildState,
+        now_elapsed: u64,
+    ) {
+        use leveler_client_protocol::UiChildState;
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
+            match (state, c.status) {
+                (
+                    UiChildState::Interrupted,
+                    ChildStatus::Waiting | ChildStatus::Running | ChildStatus::Unreported,
+                ) => {
+                    c.status = ChildStatus::Interrupted;
+                }
+                (UiChildState::Running, ChildStatus::Interrupted | ChildStatus::Unreported) => {
+                    c.status = ChildStatus::Waiting;
+                }
+                _ => return,
+            }
+        }
+        self.restamp_settlement(now_elapsed);
+    }
+
+    /// A turn ended: a child this view still shows as working got no terminal
+    /// here. Say exactly that — not failed, not interrupted.
+    pub fn mark_unreported_at_turn_end(&mut self, now_elapsed: u64) {
+        let mut changed = false;
+        for c in &mut self.children {
+            if matches!(c.status, ChildStatus::Running | ChildStatus::Waiting) {
+                c.status = ChildStatus::Unreported;
+                changed = true;
+            }
+        }
+        if changed {
+            self.restamp_settlement(now_elapsed);
+        }
+    }
+
+    /// Live execution state. `active` separates "spending model calls" from
+    /// "launched and queued", which is what makes waiting explicable.
+    pub fn apply_progress(&mut self, id: &str, active: bool, input: u32, output: u32) {
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
+            c.input_tokens = input;
+            c.output_tokens = output;
+            if matches!(c.status, ChildStatus::Waiting | ChildStatus::Running) {
+                c.status = if active {
+                    ChildStatus::Running
+                } else {
+                    ChildStatus::Waiting
+                };
+            }
+        }
+    }
+
+    /// Store a loaded contribution detail. Late or duplicate responses are
+    /// harmless: the ledger snapshot is the truth and overwriting is idempotent.
+    pub fn apply_detail(&mut self, detail: leveler_client_protocol::UiChildContribution) {
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == detail.child_id) {
+            c.detail = Some(detail);
+        }
+    }
+
+    pub fn apply_activity(&mut self, id: &str, tool: &str) {
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
+            c.recent_step = Some(tool.to_string());
+            if c.steps.last().map(String::as_str) != Some(tool) {
+                c.steps.push(tool.to_string());
+                if c.steps.len() > 16 {
+                    c.steps.remove(0);
+                }
+            }
+        }
+    }
+}
+
+/// The words for a non-completed stop the runtime typed. `None` for a stop
+/// that has no more specific word than "incomplete".
+pub fn stop_label(
+    stop: Option<leveler_client_protocol::ChildStop>,
+    t: &crate::i18n::UiText,
+) -> Option<&'static str> {
+    use leveler_client_protocol::ChildStop;
+    match stop? {
+        ChildStop::Cancelled => Some(t.sub_agent_cancelled),
+        ChildStop::Lost => Some(t.sub_agent_lost),
+        ChildStop::Budget => Some(t.sub_agent_budget),
+        ChildStop::Completed | ChildStop::Incomplete | ChildStop::Failed => None,
+    }
+}
+
+/// `None` is the runtime saying "not measured". It is not a zero, and the
+/// difference is the whole reason this function exists.
+fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
+    let Some(c) = c else {
+        return Contribution::NotMeasured;
+    };
+    if !ok {
+        // A child that was stopped reports whatever it had. That is a partial
+        // measurement, never a clean bill of health.
+        return Contribution::Incomplete {
+            reported: c.findings_total,
+        };
+    }
+    if c.findings_total == 0 {
+        return Contribution::NothingToFlag;
+    }
+    Contribution::Reported {
+        total: c.findings_total,
+    }
+}
+
+/// How a child is named on screen: its nickname, and the declared agent it
+/// runs as when it has one (`Euclid · rust-reviewer`).
+pub(crate) fn child_label(nickname: &str, agent_name: Option<&str>) -> String {
+    match agent_name.filter(|a| !a.trim().is_empty()) {
+        Some(agent) => format!("{nickname} · {agent}"),
+        None => nickname.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three children spawned into one turn printed "子 Agent" three times in
+    /// the roster — the same generic role — while the activity lane above named
+    /// every one of them. A row nobody can identify cannot say whose command
+    /// just failed.
+    #[test]
+    fn the_roster_names_each_child_the_way_the_lane_does() {
+        let mut team = TaskTeamView::default();
+        for (id, nickname) in [("c1", "Euclid"), ("c2", "Newton"), ("c3", "Curie")] {
+            team.apply_update(ChildUpdate {
+                id: id.into(),
+                nickname: nickname.into(),
+                role: "default".into(),
+                done: false,
+                ok: false,
+                detail: "任务".into(),
+                profile_id: None,
+                agent_name: None,
+                read_only: false,
+                contribution: None,
+                stop: None,
+                started_elapsed_secs: 0,
+            });
+        }
+        let t = crate::i18n::Locale::Zh.text();
+        let labels: Vec<String> = roster_rows(&team, None, 10, t)
+            .into_iter()
+            .skip(1)
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["子 Agent · Euclid", "子 Agent · Newton", "子 Agent · Curie"],
+            "{labels:?}"
+        );
+
+        // One child of a role needs no disambiguation.
+        let mut single = TaskTeamView::default();
+        single.apply_update(ChildUpdate {
+            id: "only".into(),
+            nickname: "Euclid".into(),
+            role: "reviewer".into(),
+            done: false,
+            ok: false,
+            detail: "复核".into(),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            started_elapsed_secs: 0,
+        });
+        let labels: Vec<String> = roster_rows(&single, None, 10, t)
+            .into_iter()
+            .skip(1)
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(labels, vec![display_role("reviewer", t)], "{labels:?}");
+    }
+
+    /// A settled team that lost a child must not wear the success mark.
+    /// The corpus replay caught eight real frames saying `✓ … 1 项未完成`.
+    #[test]
+    fn a_team_that_lost_a_child_does_not_wear_the_success_mark() {
+        let lost = team_with(&[ChildStatus::Completed, ChildStatus::Failed]);
+        assert_eq!(
+            collaboration_glyph(&lost, true),
+            "\u{26a0}",
+            "settled with a loss"
+        );
+        let clean = team_with(&[ChildStatus::Completed, ChildStatus::Completed]);
+        assert_eq!(
+            collaboration_glyph(&clean, true),
+            "\u{2713}",
+            "settled, nothing lost"
+        );
+        let working = team_with(&[ChildStatus::Running, ChildStatus::Failed]);
+        assert_eq!(
+            collaboration_glyph(&working, false),
+            "\u{25c9}",
+            "still working"
+        );
+    }
+
+    fn recorded(
+        id: &str,
+        state: leveler_client_protocol::UiChildState,
+        ok: bool,
+    ) -> leveler_client_protocol::UiChildAgent {
+        leveler_client_protocol::UiChildAgent {
+            id: id.into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            profile_id: None,
+            read_only: true,
+            purpose: "look".into(),
+            agent: None,
+            state,
+            ok,
+            background: true,
+            scope: Vec::new(),
+            resumes: 0,
+            outcome: None,
+            stop: None,
+            summary: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd_micros: None,
+        }
+    }
+
+    /// MA3 review M1: a terminal already applied is final; a snapshot taken
+    /// before it (which still says running) must not reopen the child.
+    #[test]
+    fn a_stale_snapshot_does_not_reopen_a_settled_child() {
+        let mut team = team_with(&[ChildStatus::Completed]);
+        let id = team.children[0].id.clone();
+        team.restore(
+            &[recorded(
+                &id,
+                leveler_client_protocol::UiChildState::Running,
+                false,
+            )],
+            5,
+        );
+        assert_eq!(team.children[0].status, ChildStatus::Completed);
+    }
+
+    /// MA3 review L1 + L4: a settled record restores nothing into the live
+    /// team (history is the transcript's), and an old settled row without an
+    /// outcome is read by its ok bit when it updates a child this view holds.
+    #[test]
+    fn restore_brings_back_open_children_only_and_reads_ok_for_old_rows() {
+        use leveler_client_protocol::UiChildState;
+        let mut team = TaskTeamView::default();
+        team.restore(
+            &[
+                recorded("old", UiChildState::Settled, true),
+                recorded("open", UiChildState::Interrupted, false),
+            ],
+            0,
+        );
+        assert_eq!(team.children.len(), 1, "settled history is not live team");
+        assert_eq!(team.children[0].id, "open");
+
+        let mut live = team_with(&[ChildStatus::Running]);
+        let id = live.children[0].id.clone();
+        live.restore(&[recorded(&id, UiChildState::Settled, true)], 5);
+        assert_eq!(
+            live.children[0].status,
+            ChildStatus::Completed,
+            "ok=true without outcome is completed"
+        );
+    }
+
+    /// U2: the turn clock resets to 0 when the session goes idle. A settled
+    /// team stamped at 10s must not read "0 - 10 saturates to 0, still under
+    /// the linger" and stay on screen for the whole idle period.
+    #[test]
+    fn a_settled_team_leaves_the_surface_when_the_turn_clock_resets() {
+        let mut team = team_with(&[ChildStatus::Completed]);
+        team.settled_at_elapsed = Some(10);
+        assert!(team.surface_visible(12), "inside the linger");
+        assert!(
+            !team.surface_visible(10 + COLLABORATION_TERMINAL_SECS),
+            "aged out"
+        );
+        assert!(
+            !team.surface_visible(0),
+            "the clock reset: the linger is over"
+        );
+    }
+
+    fn team_with(statuses: &[ChildStatus]) -> TaskTeamView {
+        let mut team = TaskTeamView::default();
+        for (i, st) in statuses.iter().enumerate() {
+            team.children.push(ChildAgentView {
+                id: format!("c{i}"),
+                nickname: String::new(),
+                role: if i == 0 {
+                    "探索 Agent".into()
+                } else {
+                    "审查 Agent".into()
+                },
+                profile_id: None,
+                agent_name: None,
+                read_only: false,
+                purpose: "look around".into(),
+                status: *st,
+                contribution: Contribution::Pending,
+                recent_step: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_elapsed_secs: 0,
+                settled_elapsed_secs: None,
+                detail: None,
+                steps: Vec::new(),
+                stop: None,
+            });
+        }
+        team
+    }
+
+    /// The runtime surface answers "who is working NOW". A team that merely
+    /// exists is history: visible while active, visible briefly as a terminal
+    /// summary after the last child settles, gone afterwards — and back the
+    /// moment a child becomes active again.
+    #[test]
+    fn collaboration_surface_follows_activity_not_existence() {
+        let mut team = team_with(&[ChildStatus::Running, ChildStatus::Waiting]);
+        assert!(team.surface_visible(100), "active children → visible");
+        assert!(!team.surface_is_terminal(100));
+
+        team.children[0].status = ChildStatus::Completed;
+        team.children[1].status = ChildStatus::Completed;
+        team.restamp_settlement(120);
+        assert!(
+            team.surface_visible(121),
+            "terminal summary lingers briefly"
+        );
+        assert!(team.surface_is_terminal(121));
+        assert!(
+            !team.surface_visible(120 + COLLABORATION_TERMINAL_SECS),
+            "then the surface leaves — history belongs to Task Detail"
+        );
+
+        // A new child re-activates the surface and clears the stamp.
+        team.children[0].status = ChildStatus::Running;
+        team.restamp_settlement(130);
+        assert_eq!(team.settled_at_elapsed, None);
+        assert!(team.surface_visible(500));
+
+        assert!(
+            !TaskTeamView::default().surface_visible(0),
+            "no children, no surface"
+        );
+    }
+
+    /// The compact row never words a lost child as success.
+    #[test]
+    fn compact_line_is_truthful_about_failure() {
+        let t = crate::i18n::Locale::Zh.text();
+        let mut team = team_with(&[ChildStatus::Running, ChildStatus::Waiting]);
+        let row = collaboration_compact_line(&team, t);
+        assert!(row.contains("2 个 Agent"), "{row}");
+        assert!(row.contains("探索 Agent"), "{row}");
+
+        team.children[0].status = ChildStatus::Completed;
+        team.children[1].status = ChildStatus::Completed;
+        let row = collaboration_compact_line(&team, t);
+        assert!(row.contains("已完成"), "{row}");
+
+        team.children[1].status = ChildStatus::Failed;
+        let row = collaboration_compact_line(&team, t);
+        assert!(
+            !row.contains("已完成"),
+            "a failed child is not 已完成: {row}"
+        );
+        assert!(row.contains("未完成"), "{row}");
+    }
+
+    fn contribution(total: u32) -> ChildContribution {
+        ChildContribution {
+            role: "reviewer".into(),
+            profile_id: Some("reviewer".into()),
+            profile_role: Some("reviewer".into()),
+            read_only: true,
+            findings_total: total,
+        }
+    }
+
+    fn started(team: &mut TaskTeamView, id: &str, role: &str, purpose: &str) {
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: id.into(),
+            nickname: "Newton".into(),
+            role: role.into(),
+            done: false,
+            ok: false,
+            detail: purpose.into(),
+            profile_id: Some(role.into()),
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            started_elapsed_secs: 0,
+            stop: None,
+        });
+    }
+
+    fn finished(team: &mut TaskTeamView, id: &str, ok: bool, c: Option<ChildContribution>) {
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: id.into(),
+            nickname: "Newton".into(),
+            role: "reviewer".into(),
+            done: true,
+            ok,
+            detail: "summary".into(),
+            profile_id: None,
+            agent_name: None,
+            read_only: false,
+            contribution: c,
+            started_elapsed_secs: 0,
+            stop: None,
+        });
+    }
+
+    #[test]
+    fn a_running_child_leads_with_its_purpose_not_its_state() {
+        let mut team = TaskTeamView::default();
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
+        let c = &team.children[0];
+        assert_eq!(c.purpose, "analyzing repository structure");
+        assert_eq!(c.status, ChildStatus::Waiting);
+        assert_eq!(c.contribution, Contribution::Pending);
+    }
+
+    #[test]
+    fn progress_separates_running_from_queued() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        team.apply_progress("a1", true, 100, 20);
+        assert_eq!(team.children[0].status, ChildStatus::Running);
+        team.apply_progress("a1", false, 100, 20);
+        assert_eq!(team.children[0].status, ChildStatus::Waiting);
+    }
+
+    #[test]
+    fn a_child_transitions_in_place_rather_than_appearing_twice() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        finished(&mut team, "a1", true, Some(contribution(2)));
+        assert_eq!(team.children.len(), 1);
+        assert_eq!(team.children[0].status, ChildStatus::Completed);
+    }
+
+    #[test]
+    fn a_finish_event_does_not_erase_the_purpose() {
+        let mut team = TaskTeamView::default();
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
+        finished(&mut team, "a1", true, Some(contribution(1)));
+        assert_eq!(
+            team.children[0].purpose, "analyzing repository structure",
+            "the finish summary is not the purpose"
+        );
+    }
+
+    #[test]
+    fn a_reporting_child_carries_its_finding_count() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        finished(&mut team, "a1", true, Some(contribution(7)));
+        assert_eq!(
+            team.children[0].contribution,
+            Contribution::Reported { total: 7 }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_found_nothing_is_a_result_not_an_empty_state() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        finished(&mut team, "r1", true, Some(contribution(0)));
+        assert_eq!(team.children[0].contribution, Contribution::NothingToFlag);
+        assert!(!team.children[0].contribution_unknown());
+    }
+
+    #[test]
+    fn an_unmeasured_contribution_is_not_a_zero() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        finished(&mut team, "r1", true, None);
+        assert_eq!(team.children[0].contribution, Contribution::NotMeasured);
+        assert!(team.children[0].contribution_unknown());
+        assert_ne!(
+            team.children[0].contribution,
+            Contribution::NothingToFlag,
+            "not measured and nothing to flag are different facts"
+        );
+    }
+
+    #[test]
+    fn a_failed_child_is_failed_even_with_a_projection() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "w1", "worker", "implement");
+        finished(&mut team, "w1", false, Some(contribution(0)));
+        assert_eq!(team.children[0].status, ChildStatus::Failed);
+    }
+
+    #[test]
+    fn read_only_is_stated_from_the_capability_contract() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        assert!(team.children[0].is_read_only());
+
+        let mut team2 = TaskTeamView::default();
+        team2.apply_update(crate::multi_agent::ChildUpdate {
+            id: "w1".into(),
+            nickname: "Worker".into(),
+            role: "worker".into(),
+            done: false,
+            ok: false,
+            detail: "implement".into(),
+            profile_id: Some("worker".into()),
+            agent_name: None,
+            read_only: false,
+            contribution: None,
+            started_elapsed_secs: 0,
+            stop: None,
+        });
+        assert!(!team2.children[0].is_read_only());
+    }
+
+    #[test]
+    fn the_role_from_spawn_survives_a_finish_without_one() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            role: String::new(),
+            done: true,
+            ok: true,
+            detail: "done".into(),
+            profile_id: None,
+            agent_name: None,
+            read_only: false,
+            contribution: None,
+            started_elapsed_secs: 0,
+            stop: None,
+        });
+        assert_eq!(team.children[0].role, "explorer");
+    }
+
+    #[test]
+    fn a_clean_review_reads_as_a_result_not_a_blank() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        finished(&mut team, "r1", true, Some(contribution(0)));
+        let line = contribution_line(&team.children[0], t).expect("a result line");
+        assert!(line.contains("nothing to flag"), "{line}");
+        assert!(!line.contains('0'), "zero must not be the headline: {line}");
+    }
+
+    #[test]
+    fn an_unmeasured_child_says_so_rather_than_showing_zero() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        finished(&mut team, "r1", true, None);
+        let line = contribution_line(&team.children[0], t).expect("a result line");
+        assert!(line.contains("not measured"), "{line}");
+        assert!(!line.contains('0'), "{line}");
+    }
+
+    /// The third reading a contribution can have, beside "nothing to flag"
+    /// and "not measured" above: a measured, non-empty result states its own
+    /// count. The three must stay distinguishable — a child that found seven
+    /// things, a child that found none, and a child nobody measured are three
+    /// different facts, and only the first is a tally.
+    #[test]
+    fn a_measured_contribution_states_the_count_it_measured() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        finished(&mut team, "a1", true, Some(contribution(7)));
+        let line = contribution_line(&team.children[0], t).expect("a result line");
+        assert!(line.contains('7'), "{line}");
+        assert!(!line.contains("nothing to flag"), "{line}");
+        assert!(!line.contains("not measured"), "{line}");
+    }
+
+    #[test]
+    fn a_running_child_has_no_contribution_line_yet() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        assert!(contribution_line(&team.children[0], t).is_none());
+    }
+
+    #[test]
+    fn waiting_explains_itself_with_the_purpose() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
+        let line = running_line(&team.children[0], t);
+        assert_eq!(line, "analyzing repository structure");
+        assert_ne!(line, "waiting", "a bare status word explains nothing");
+    }
+
+    #[test]
+    fn a_purposeless_child_falls_back_to_the_status_word() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "   ");
+        assert_eq!(running_line(&team.children[0], t), "waiting");
+        team.apply_progress("a1", true, 1, 1);
+        assert_eq!(running_line(&team.children[0], t), "running");
+    }
+
+    use leveler_client_protocol::{UiChildContribution, UiFinding};
+
+    fn finding(id: &str) -> UiFinding {
+        UiFinding {
+            id: id.into(),
+            kind: "correctness".into(),
+            summary: format!("summary {id}"),
+            file: Some("src/auth.rs".into()),
+            symbol: None,
+        }
+    }
+
+    fn detail(measured: bool, findings: Vec<UiFinding>) -> UiChildContribution {
+        UiChildContribution {
+            child_id: "r1".into(),
+            role: "reviewer".into(),
+            profile_id: Some("reviewer".into()),
+            read_only: true,
+            findings,
+            measured,
+        }
+    }
+
+    #[test]
+    fn the_inspector_shows_nothing_until_something_is_loaded() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        assert!(
+            inspector_rows(&team.children[0], t).is_none(),
+            "an empty list is a claim; not-asked-yet is not"
+        );
+    }
+
+    #[test]
+    fn an_explorer_with_findings_shows_file_state_and_summary() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "explorer", "repository analysis");
+        team.apply_detail(detail(true, vec![finding("f-1"), finding("f-2")]));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("src/auth.rs"), "{joined}");
+        assert!(joined.contains("[correctness]"), "{joined}");
+        assert!(joined.contains("2 findings"), "{joined}");
+    }
+
+    #[test]
+    fn a_reviewer_with_no_findings_reads_as_a_clean_review() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        team.apply_detail(detail(true, Vec::new()));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("nothing to flag"), "{joined}");
+        assert!(
+            !joined.contains('0'),
+            "a clean review is a sentence, not a tally that happens to be zero: \
+             {joined}"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_detail_says_so_rather_than_listing_nothing() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        team.apply_detail(detail(false, Vec::new()));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("not measured"), "{joined}");
+        assert!(!joined.contains("nothing to flag"), "{joined}");
+    }
+
+    #[test]
+    fn the_inspector_states_read_only_from_the_contract() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        team.apply_detail(detail(true, Vec::new()));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("read-only"), "{joined}");
+    }
+
+    #[test]
+    fn a_late_response_for_an_unknown_child_is_ignored() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        let mut d = detail(true, Vec::new());
+        d.child_id = "someone-else".into();
+        team.apply_detail(d);
+        assert!(team.children[0].detail.is_none());
+    }
+
+    #[test]
+    fn one_child_is_not_a_team() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        assert!(
+            !team_panel_should_show(&team),
+            "a panel that says \"1 agent\" costs a line to say nothing"
+        );
+    }
+
+    #[test]
+    fn a_lone_reviewer_still_earns_the_panel() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        assert!(
+            team_panel_should_show(&team),
+            "an independent review is the thing the user most needs told about"
+        );
+    }
+
+    #[test]
+    fn a_working_child_shows_its_purpose_not_a_status_word() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
+        started(&mut team, "w1", "worker", "implementing the change");
+        let lines = team_lines(&team, t);
+        assert_eq!(lines[0].glyph, "○");
+        assert_eq!(lines[0].detail, "analyzing repository structure");
+        assert_ne!(lines[0].detail, "waiting");
+    }
+
+    #[test]
+    fn a_finished_child_shows_what_it_contributed() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        started(&mut team, "w1", "worker", "implement");
+        finished(&mut team, "a1", true, Some(contribution(7)));
+        let lines = team_lines(&team, t);
+        assert_eq!(lines[0].glyph, "✓");
+        assert!(lines[0].detail.contains("7 findings"), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn a_clean_reviewer_reads_as_a_result_in_the_panel() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "w1", "worker", "implement");
+        started(&mut team, "r1", "reviewer", "review");
+        finished(&mut team, "r1", true, Some(contribution(0)));
+        let lines = team_lines(&team, t);
+        let reviewer = lines
+            .iter()
+            .find(|l| l.status == ChildStatus::Completed)
+            .unwrap();
+        assert!(reviewer.detail.contains("nothing to flag"), "{reviewer:?}");
+    }
+
+    #[test]
+    fn a_failed_child_is_marked_and_not_dressed_up() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "w1", "worker", "implement");
+        started(&mut team, "a1", "explorer", "look");
+        finished(&mut team, "w1", false, None);
+        let lines = team_lines(&team, t);
+        let failed = lines
+            .iter()
+            .find(|l| l.status == ChildStatus::Failed)
+            .unwrap();
+        assert_eq!(failed.glyph, "✗");
+        assert!(!failed.detail.contains("not measured"), "{failed:?}");
+    }
+
+    #[test]
+    fn the_title_never_leads_with_a_head_count() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        for (i, role) in ["explorer", "worker", "reviewer"].iter().enumerate() {
+            started(&mut team, &format!("c{i}"), role, "work");
+        }
+        let title = team_panel_title(&team, t);
+        assert!(!title.contains('3'), "count is not the headline: {title}");
+    }
+
+    /// Dogfood, taskC: the panel said "AI team · done" above a child marked
+    /// failed. Nothing was done; something broke.
+    #[test]
+    fn a_failed_child_is_not_a_finished_team() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "w1", "worker", "implement");
+        started(&mut team, "r1", "reviewer", "review");
+        finished(&mut team, "w1", true, Some(contribution(0)));
+        finished(&mut team, "r1", false, Some(contribution(0)));
+        let title = team_panel_title(&team, t);
+        assert!(
+            !title.contains("done"),
+            "a team with a failed child has not finished: {title}"
+        );
+    }
+
+    /// Dogfood, taskC: a reviewer stopped mid-review reported zero findings and
+    /// rendered as "reviewed, nothing to flag". It had not reviewed anything —
+    /// it was cut off. Zero findings from an interrupted child is not a clean
+    /// bill of health, it is an unfinished measurement.
+    #[test]
+    fn zero_findings_from_a_failed_child_is_not_a_clean_review() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        finished(&mut team, "r1", false, Some(contribution(0)));
+        assert_ne!(
+            team.children[0].contribution,
+            Contribution::NothingToFlag,
+            "an interrupted reviewer did not certify anything"
+        );
+        let line = contribution_line(&team.children[0], t).unwrap_or_default();
+        assert!(
+            !line.contains("nothing to flag"),
+            "a stopped reviewer must not read as a clean review: {line}"
+        );
+    }
+
+    #[test]
+    fn a_successful_child_with_zero_findings_still_reads_as_clean() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review");
+        finished(&mut team, "r1", true, Some(contribution(0)));
+        let line = contribution_line(&team.children[0], t).unwrap_or_default();
+        assert!(line.contains("nothing to flag"), "{line}");
+    }
+
+    #[test]
+    fn active_lists_only_children_still_working() {
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        started(&mut team, "w1", "worker", "implement");
+        finished(&mut team, "a1", true, Some(contribution(1)));
+        let active: Vec<_> = team.active().map(|c| c.id.clone()).collect();
+        assert_eq!(active, vec!["w1"]);
+    }
+}
+
+/// One line describing what a child contributed, for the renderer.
+///
+/// Deliberately here and not in the renderer: "reviewed, nothing to flag" and
+/// "not measured" are product statements, and putting them next to the type
+/// that distinguishes them keeps them from drifting apart.
+pub fn contribution_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<String> {
+    match &view.contribution {
+        Contribution::Pending => None,
+        Contribution::NotMeasured => Some(t.child_contribution_unmeasured.to_string()),
+        Contribution::NothingToFlag => Some(t.child_contribution_clean.to_string()),
+        Contribution::Incomplete { reported } => Some(
+            t.child_contribution_incomplete
+                .replace("{n}", &reported.to_string()),
+        ),
+        Contribution::Reported { total } => Some(
+            t.child_contribution_reported
+                .replace("{n}", &total.to_string()),
+        ),
+    }
+}
+
+/// Why this child is running, for the line the user watches. Falls back to the
+/// status word only when the runtime gave no purpose.
+pub fn running_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
+    if view.purpose.trim().is_empty() {
+        return match view.status {
+            ChildStatus::Running => t.sub_agent_running.to_string(),
+            _ => t.sub_agent_waiting.to_string(),
+        };
+    }
+    view.purpose.trim().to_string()
+}
+
+/// Contribution line for a transcript block.
+///
+/// The block carries the projection directly, so this is the same statement as
+/// [`contribution_line`] without needing the whole team view.
+pub fn contribution_line_for_block(
+    block: &crate::transcript::SubAgentBlock,
+    t: &crate::i18n::UiText,
+) -> Option<String> {
+    match &block.contribution {
+        Contribution::Pending => None,
+        Contribution::NotMeasured => Some(t.child_contribution_unmeasured.to_string()),
+        Contribution::NothingToFlag => Some(t.child_contribution_clean.to_string()),
+        Contribution::Incomplete { reported } => Some(
+            t.child_contribution_incomplete
+                .replace("{n}", &reported.to_string()),
+        ),
+        Contribution::Reported { total } => Some(
+            t.child_contribution_reported
+                .replace("{n}", &total.to_string()),
+        ),
+    }
+}
+
+/// One rendered row of the Contribution Inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectorRow {
+    pub text: String,
+}
+
+/// Inspector body for one child.
+///
+/// Returns `None` when nothing has been loaded yet — the caller shows a
+/// loading state rather than an empty list, because an empty list is a claim
+/// and "not asked yet" is not one.
+pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<Vec<InspectorRow>> {
+    let detail = view.detail.as_ref()?;
+    let mut rows = Vec::new();
+
+    rows.push(InspectorRow {
+        text: format!("{}: {}", t.inspector_purpose, running_line(view, t)),
+    });
+    if let Some(profile) = view.agent_name.as_deref().or(detail.profile_id.as_deref()) {
+        let access = if view.is_read_only() {
+            t.inspector_read_only
+        } else {
+            t.inspector_can_write
+        };
+        rows.push(InspectorRow {
+            text: format!("{}: {profile} · {access}", t.inspector_profile),
+        });
+    }
+
+    if !detail.measured {
+        // The question could not be answered. Saying so beats an empty list,
+        // which would read as "found nothing".
+        rows.push(InspectorRow {
+            text: t.child_contribution_unmeasured.to_string(),
+        });
+        return Some(rows);
+    }
+
+    if detail.findings.is_empty() {
+        // A clean review is a result. It gets a sentence, not blank space.
+        rows.push(InspectorRow {
+            text: t.child_contribution_clean.to_string(),
+        });
+        return Some(rows);
+    }
+
+    for f in &detail.findings {
+        let mut text = String::new();
+        if let Some(file) = f.file.as_deref() {
+            text.push_str(file);
+            if let Some(sym) = f.symbol.as_deref() {
+                text.push_str("::");
+                text.push_str(sym);
+            }
+            text.push_str(" — ");
+        }
+        text.push_str(&f.summary);
+        text.push_str(&format!(" [{}]", f.kind));
+        rows.push(InspectorRow { text });
+    }
+
+    rows.push(InspectorRow {
+        text: t
+            .inspector_summary
+            .replace("{n}", &detail.findings.len().to_string()),
+    });
+    Some(rows)
+}
+
+/// Visual tone of one agent-roster row; the renderer maps it to theme
+/// colors. Presentation-only — never persisted, never a lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterTone {
+    /// The coordinator/root row.
+    Main,
+    /// A child actively working (or queued to work).
+    Active,
+    /// A child that settled successfully.
+    Done,
+    /// A child that ended without completing. Never rendered as success.
+    Failed,
+}
+
+/// One row of the active agent runtime roster: who, doing what, for how
+/// long, at what accumulated usage. A pure render projection over existing
+/// TUI state — structurally ready for future activation states (a child
+/// that EXISTS is not assumed ACTIVE; tone follows current status), but no
+/// new state is added before the runtime supports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRosterRow {
+    pub glyph: &'static str,
+    /// Localized identity: 主 Agent / 探索 Agent / …
+    pub label: String,
+    /// Current human-readable activity — structured runtime facts only
+    /// (tool/background labels, task text), never reasoning.
+    pub activity: String,
+    /// Right-aligned metadata: "4m09s · 168k", "4m09s", or absent.
+    pub meta: Option<String>,
+    pub tone: RosterTone,
+}
+
+/// The same text with the workspace's absolute path written as its name.
+///
+/// A spawn brief opens with "你在仓库 <absolute path>（工作区根目录）中…", so
+/// three children in one repository painted three rows of the same hundred
+/// characters and the reason never reached the screen. The path is the one
+/// thing the reader already knows; its name is what identifies it.
+pub fn name_the_workspace(text: &str, repository: &str) -> String {
+    let repo = repository.trim_end_matches('/');
+    let name = repo.rsplit('/').next().unwrap_or("");
+    if repo.is_empty() || name.is_empty() || !text.contains(repo) {
+        return text.to_string();
+    }
+    text.replace(repo, name)
+}
+
+/// Compact token figure for the roster meta column: `168k`, `9.4k`, `312`.
+/// No fake precision — one decimal only below 10k.
+pub fn fmt_tokens_compact(n: u32) -> String {
+    if n >= 10_000 {
+        format!("{}k", n / 1000)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn child_meta(view: &ChildAgentView, now_elapsed: u64) -> Option<String> {
+    let elapsed = crate::status_line::fmt_elapsed(
+        view.settled_elapsed_secs
+            .unwrap_or(now_elapsed)
+            .saturating_sub(view.started_elapsed_secs),
+    );
+    let usage = view.input_tokens.saturating_add(view.output_tokens);
+    Some(if usage > 0 {
+        format!("{elapsed} · {}", fmt_tokens_compact(usage))
+    } else {
+        elapsed
+    })
+}
+
+/// The child's current activity, by structured-source priority: the latest
+/// runtime tool/step label, then the task text, then a role-state fallback.
+/// Raw reasoning is not a source and never becomes one.
+fn child_activity(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
+    if matches!(view.status, ChildStatus::Running | ChildStatus::Waiting)
+        && let Some(step) = view.recent_step.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        return step.trim().to_string();
+    }
+    running_line(view, t)
+}
+
+/// Build the active agent runtime roster: Main first (the coordinator row —
+/// not a spawned child), then every child in spawn order; the renderer owns
+/// the cap. `main_activity` is the existing structured activity label;
+/// absence means the truthful fallback "正在工作", never invented detail.
+pub fn roster_rows(
+    team: &TaskTeamView,
+    main_activity: Option<&str>,
+    now_elapsed: u64,
+    t: &crate::i18n::UiText,
+) -> Vec<AgentRosterRow> {
+    let mut rows = Vec::with_capacity(team.children.len() + 1);
+    rows.push(AgentRosterRow {
+        glyph: "●",
+        label: t.main_agent.to_string(),
+        activity: main_activity
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(t.main_agent_working)
+            .to_string(),
+        meta: None,
+        tone: RosterTone::Main,
+    });
+    for child in &team.children {
+        let (glyph, tone, activity) = match child.status {
+            ChildStatus::Waiting | ChildStatus::Running => {
+                ("○", RosterTone::Active, child_activity(child, t))
+            }
+            ChildStatus::Completed => (
+                "✓",
+                RosterTone::Done,
+                contribution_line(child, t).unwrap_or_else(|| t.sub_agent_completed.to_string()),
+            ),
+            // Truth over comfort: an incomplete child never renders as ✓.
+            ChildStatus::Failed => (
+                "!",
+                RosterTone::Failed,
+                stop_label(child.stop, t)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| t.sub_agent_ended_incomplete.to_string()),
+            ),
+            ChildStatus::Interrupted => {
+                ("⏸", RosterTone::Failed, t.sub_agent_interrupted.to_string())
+            }
+            ChildStatus::Unreported => {
+                ("?", RosterTone::Failed, t.sub_agent_unreported.to_string())
+            }
+        };
+        rows.push(AgentRosterRow {
+            glyph,
+            // A declarative agent is named for what it is; a built-in role
+            // spawn keeps its role's name.
+            label: child
+                .agent_name
+                .clone()
+                .unwrap_or_else(|| display_role(&child.role, t)),
+            activity,
+            meta: child_meta(child, now_elapsed),
+            tone,
+        });
+    }
+    name_apart_rows_that_share_a_label(&mut rows, &team.children);
+    rows
+}
+
+/// Add each child's own name to rows a role label alone cannot tell apart.
+///
+/// The roster names agents by role, which reads well until a turn spawns three
+/// children of one role: it printed "子 Agent" three times, one of them with a
+/// failed command, and nothing said whose. Only the ambiguous rows are
+/// extended, so the common shape is unchanged.
+fn name_apart_rows_that_share_a_label(rows: &mut [AgentRosterRow], children: &[ChildAgentView]) {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for row in rows.iter().skip(1) {
+        *seen.entry(row.label.as_str()).or_default() += 1;
+    }
+    let repeated: std::collections::HashSet<String> = seen
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(label, _)| label.to_string())
+        .collect();
+    if repeated.is_empty() {
+        return;
+    }
+    for (row, child) in rows.iter_mut().skip(1).zip(children) {
+        if repeated.contains(&row.label) && !child.nickname.trim().is_empty() {
+            row.label = format!("{} · {}", row.label, child.nickname.trim());
+        }
+    }
+}
+
+/// One line of the Task Team header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamLine {
+    pub glyph: &'static str,
+    pub role: String,
+    /// Purpose while working, contribution once finished. Never a bare status
+    /// word — the whole point of the panel is that waiting is explicable.
+    pub detail: String,
+    pub status: ChildStatus,
+}
+
+/// Should the Task Team panel appear at all?
+///
+/// One child is not a team, and a panel that says "1 agent" costs a line of a
+/// terminal to tell the user something the transcript already shows.
+pub fn team_panel_should_show(team: &TaskTeamView) -> bool {
+    team.children.len() >= 2 || team.children.iter().any(|c| c.role == "reviewer")
+}
+
+/// The one-line runtime row: who is working right now.
+///
+/// Truth over brevity: a settled team says what it ended as, and a team that
+/// lost a child never says "completed".
+pub fn collaboration_compact_line(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
+    let n = team.children.len();
+    let bad = team
+        .children
+        .iter()
+        .filter(|c| c.status == ChildStatus::Failed)
+        .count();
+    if team.active().next().is_none() {
+        return if bad > 0 {
+            t.collaboration_ended_incomplete
+                .replace("{n}", &n.to_string())
+                .replace("{bad}", &bad.to_string())
+        } else {
+            t.collaboration_done.replace("{n}", &n.to_string())
+        };
+    }
+    let mut row = t.collaboration_compact.replace("{n}", &n.to_string());
+    for c in team.active() {
+        let state = match c.status {
+            ChildStatus::Running => t.agent_status_running,
+            _ => t.sub_agent_waiting,
+        };
+        row.push_str(&format!(" · {} {}", c.role, state));
+    }
+    row
+}
+
+/// The glyph on the compact collaboration row.
+///
+/// Found by replaying real sessions: a settled team that lost a child rendered
+/// `✓ 2 个 Agent 已结束 · 1 项未完成` — the success mark on the line that
+/// announces work which did not finish. The colour already went red; the glyph
+/// did not, and the glyph is what a reader takes as the verdict. Same rule the
+/// blocked goal row follows (`status_glyph`): a call that ran is not an outcome
+/// that succeeded.
+///
+/// `terminal` is the caller's own settled test, so WHEN the glyph appears does
+/// not change — only what it says when the team lost someone.
+pub fn collaboration_glyph(team: &TaskTeamView, terminal: bool) -> &'static str {
+    if !terminal {
+        return "\u{25c9}";
+    }
+    let lost_one = team
+        .children
+        .iter()
+        .any(|c| c.status == ChildStatus::Failed);
+    if lost_one { "\u{26a0}" } else { "\u{2713}" }
+}
+
+/// Compact team summary for the header.
+///
+/// Deliberately not a dashboard: role, state and *why*. No token counts, no
+/// event stream, no agent graph. The task is the primary object; this is a
+/// caption on it.
+pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine> {
+    team.children
+        .iter()
+        .map(|c| {
+            let glyph = match c.status {
+                ChildStatus::Waiting => "○",
+                ChildStatus::Running => "⟳",
+                ChildStatus::Completed => "✓",
+                ChildStatus::Failed => "✗",
+                ChildStatus::Interrupted => "⏸",
+                ChildStatus::Unreported => "?",
+            };
+            let detail = match c.status {
+                ChildStatus::Waiting | ChildStatus::Running => running_line(c, t),
+                ChildStatus::Interrupted => t.sub_agent_interrupted.to_string(),
+                ChildStatus::Unreported => t.sub_agent_unreported.to_string(),
+                ChildStatus::Failed => stop_label(c.stop, t)
+                    .unwrap_or(t.sub_agent_incomplete)
+                    .to_string(),
+                ChildStatus::Completed => {
+                    contribution_line(c, t).unwrap_or_else(|| t.sub_agent_completed.to_string())
+                }
+            };
+            TeamLine {
+                glyph,
+                role: display_role(&c.role, t),
+                detail,
+                status: c.status,
+            }
+        })
+        .collect()
+}
+
+/// Title for the team panel. Names what the team is doing, not how many of
+/// them there are — "3 agents" is the count the product deliberately does not
+/// lead with.
+pub fn team_panel_title(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
+    if team.active().next().is_some() {
+        return t.team_panel_working.to_string();
+    }
+    // A team with a failed child has not finished. Saying "done" over a ✗ is
+    // the panel contradicting the line directly beneath it.
+    if team
+        .children
+        .iter()
+        .any(|c| c.status == ChildStatus::Failed)
+    {
+        return t.team_panel_incomplete.to_string();
+    }
+    t.team_panel_done.to_string()
+}
+
+fn display_role(role: &str, t: &crate::i18n::UiText) -> String {
+    match role {
+        "explorer" => t.sub_agent_explorer,
+        "worker" => t.sub_agent_worker,
+        "reviewer" => t.sub_agent_reviewer,
+        _ => t.sub_agent_default,
+    }
+    .to_string()
+}

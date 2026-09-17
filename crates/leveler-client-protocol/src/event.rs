@@ -1,0 +1,1324 @@
+//! [`RuntimeEvent`] — facts the runtime emits for clients to render.
+//!
+//! Events cover opened sessions, user messages, assistant text,
+//! streaming, coarse agent activity, and turn lifecycle. Streaming is modeled
+//! as `Started` → `TextDelta*` → `Completed` so that when true token-level
+//! streaming lands in the executor later, clients need no change .
+
+use serde::{Deserialize, Serialize};
+
+use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
+
+use super::approval::{UiApprovalRequest, UiClarificationRequest};
+use super::media::AttachmentRef;
+use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan, UiVerification};
+use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
+
+/// Stable `TurnCompletedUnverified.reason` when the turn AUTHORED no source
+/// edits — so clients can show a calm "ended · no source edits" marker
+/// (analysis/Q&A closeout, and repository operations like `pull`/`switch` that
+/// move HEAD without writing anything) instead of an "unverified" delivery
+/// warning. It says what this run wrote, never that the repository stands
+/// where it did.
+pub const REASON_NO_CODE_CHANGES: &str = "no_code_changes";
+/// Stable UI token: work changed files, but the project supplied no applicable
+/// automatic verification command. Clients localize the explanatory detail.
+pub const REASON_NO_AUTOMATIC_VERIFICATION: &str = "no_automatic_verification";
+
+/// Severity for a transient notification .
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationLevel {
+    Info,
+    Warning,
+    Error,
+}
+/// The four-way reading of a settled child's result. "Finished with nothing
+/// to flag" and "stopped with nothing to show" are opposite facts; a client
+/// renders them from this field, never from the summary text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ChildOutcome {
+    CompletedWithFindings,
+    CompletedNoFindings,
+    IncompletePartial,
+    IncompleteNoResult,
+}
+
+/// How a settled child's activation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ChildStop {
+    Completed,
+    Incomplete,
+    Budget,
+    Cancelled,
+    Failed,
+    Lost,
+}
+
+/// What one child contributed, as counts plus its capability contract.
+///
+/// A flat mirror of the runtime's projection rather than the runtime type
+/// itself: this crate is the stable wire, so an internal refactor of the
+/// ledger must not change what clients parse.
+///
+/// `findings_total` is a count, not a score: it says how much this child
+/// reported, never whether any of it mattered. What the parent did about it
+/// is in the transcript, where the parent said it.
+/// Where a delegated child's lifecycle stands, as the runtime records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiChildState {
+    /// An activation is live.
+    Running,
+    /// Its activation died with a runtime window; the next turn of the session
+    /// continues it or settles it as lost.
+    Interrupted,
+    /// It has its one terminal.
+    Settled,
+}
+
+/// One delegated child, projected from the durable record — what a client
+/// that reconnects, or opens a session, renders without having seen a single
+/// live event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiChildAgent {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    /// The declarative agent it was spawned from, when it was. `None` for a
+    /// built-in role spawn and for children recorded before agents existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::UiChildAgentIdentity>,
+    /// What it was asked to do.
+    pub purpose: String,
+    pub state: UiChildState,
+    /// Whether it reached the end of its task, once settled. Carried beside
+    /// `outcome` because rows settled before the outcome was typed have only
+    /// this bit.
+    #[serde(default)]
+    pub ok: bool,
+    /// Whether its parent continued while it ran.
+    #[serde(default)]
+    pub background: bool,
+    /// Exclusive write scope fixed at spawn (empty when late-bound or read-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+    /// How many times it was continued after an interruption.
+    #[serde(default)]
+    pub resumes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ChildOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<ChildStop>,
+    /// The recorded settlement summary, once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Model usage recorded under this child's id.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// `None` when no call carried a price — unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+}
+
+/// One fact of a past turn, as the live stream carried it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiHistoryEntry {
+    /// Milliseconds from the start of the turn this entry belongs to, taken
+    /// from the durable record times — a replay has no live clock.
+    pub turn_elapsed_ms: u64,
+    /// The first entry of a turn.
+    #[serde(default)]
+    pub turn_start: bool,
+    pub event: RuntimeEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChildContribution {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_role: Option<String>,
+    /// Whether this child held a physically read-only toolset. It used to be
+    /// a list of semantic capability labels; what a client needs is the
+    /// structural bound.
+    #[serde(default)]
+    pub read_only: bool,
+    pub findings_total: u32,
+}
+
+impl ChildContribution {
+    /// The child ran and reported nothing. A real answer, not an empty state.
+    pub fn reported_nothing(&self) -> bool {
+        self.findings_total == 0
+    }
+}
+
+/// How a stopped command call ended, as the runtime established it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiCommandStop {
+    /// The whole process tree was confirmed gone.
+    Confirmed,
+    /// The tree was signalled, but its termination could not be confirmed.
+    Unconfirmed,
+}
+
+/// An event flowing from the runtime to clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeEvent {
+    /// The runtime finished booting and is ready for commands.
+    RuntimeReady,
+    /// A session was opened / its snapshot refreshed.
+    SessionOpened { session: UiSessionSnapshot },
+    /// Session metadata changed (model/mode/branch) without touching the
+    /// transcript — refresh the header only.
+    SessionUpdated { session: UiSessionSnapshot },
+    /// The runtime needs the user to approve a risky action .
+    ApprovalRequested { request: UiApprovalRequest },
+    /// A pending approval was resolved (by any connected client, or by a
+    /// timeout/cancel). Clients dismiss the matching prompt so a second client
+    /// never answers an approval that no longer exists.
+    ApprovalResolved { id: ApprovalId },
+    /// The agent is asking the user a clarifying question (spec §35).
+    ClarificationRequested { request: UiClarificationRequest },
+    /// A pending clarification was resolved (by any client, timeout, or cancel).
+    ClarificationResolved { id: ClarificationId },
+    /// An imported attachment was processed and stored (spec §39).
+    AttachmentAdded { attachment: AttachmentRef },
+    /// Importing an attachment failed.
+    AttachmentProcessingFailed { error: String },
+    /// A user message was appended to the transcript.
+    UserMessageAdded { message: UiMessage },
+    /// A new assistant message began; deltas will target this id.
+    AssistantMessageStarted { message_id: MessageId },
+    /// A retry attempt began. Remove the prior transient message, if present,
+    /// and clear its reasoning before applying new deltas.
+    AssistantAttemptReset { message_id: Option<MessageId> },
+    /// A chunk of assistant text for an in-flight message.
+    AssistantTextDelta {
+        message_id: MessageId,
+        delta: String,
+    },
+    /// A chunk of model reasoning/summary, rendered separately from the answer.
+    ReasoningDelta { delta: String },
+    /// The assistant message is complete.
+    AssistantMessageCompleted { message_id: MessageId },
+    /// The assistant has produced its final response, while the runtime is
+    /// still settling the task before its one authoritative terminal event.
+    TurnFinalizing { stage: FinalizationStage },
+    /// Coarse progress label from the runtime, shown in the status line.
+    AgentActivity { label: String },
+    /// Heartbeat while a long command tool runs (runtime observability). Lets a
+    /// client show "运行 cargo test" with a live elapsed instead of a bare
+    /// "等待模型". Structured so TUI/Web/logs can consume it uniformly.
+    CommandProgress { label: String, elapsed_ms: u64 },
+    /// A model round is about to retry the same request (transient). Belongs in
+    /// ephemeral status, NOT the transcript: a brief network blip must not
+    /// spam the conversation. `attempt` is 1-based (the retry about to happen)
+    /// and `max_attempts` the lane's bound.
+    ModelRetrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+    },
+    /// The retry budget is spent on a `Safe` failure and the runtime is waiting
+    /// for the network rather than failing the task (transient). Ephemeral
+    /// status only. `elapsed_ms` is how long the wait has lasted.
+    ModelWaitingForNetwork { elapsed_ms: u64 },
+    /// Project behavior constraints loaded for this turn. Sources are
+    /// workspace-relative paths; instruction contents never enter UI chrome.
+    ProjectRulesLoaded { sources: Vec<String> },
+    /// A tool call started .
+    ToolCallStarted {
+        id: ToolCallId,
+        name: String,
+        /// Compacted JSON arguments.
+        arguments: String,
+        /// True when this call ran in the concurrent read-only batch; a UI can
+        /// group such calls as one parallel burst.
+        #[serde(default)]
+        parallel: bool,
+    },
+    /// A tool call finished. `preview` is the runtime's truncated output;
+    /// `duration_ms` is measured client-side.
+    ToolCallCompleted {
+        id: ToolCallId,
+        ok: bool,
+        preview: String,
+        duration_ms: u64,
+        /// Canonical unified diff of what an edit ACTUALLY changed, with the
+        /// line numbers it landed on, produced by the tool that made it.
+        ///
+        /// A UI renders an edit from THIS, not from the call's arguments: an
+        /// `apply_patch` hunk is located by content and `replace` matches a
+        /// substring, so the request never says where the change went. `None`
+        /// for every non-edit call, and for an edit whose location could not
+        /// be established — the UI must then show no line numbers rather than
+        /// invent one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_diff: Option<String>,
+        /// Exit code of the process a command call ran, when it exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Present only when the call was stopped: whether the runtime
+        /// confirmed its whole process tree gone. A client shows "stopped"
+        /// for `confirmed` alone; `unconfirmed` is an unknown outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<UiCommandStop>,
+    },
+    /// Live output from a running command tool call. `stream` is `stdout` or
+    /// `stderr`; `chunk` is one or more whole, sanitized lines. Transient:
+    /// clients keep a bounded buffer and the completed preview is the record.
+    ToolCallOutput {
+        id: ToolCallId,
+        stream: String,
+        chunk: String,
+    },
+    /// The execution plan was created or a step's status changed (spec §20).
+    PlanUpdated { plan: UiPlan },
+    /// Verification progress: a check finished or the run concluded (spec §22).
+    VerificationUpdated { verification: UiVerification },
+    /// The working-tree diff was (re)computed (spec §21).
+    DiffUpdated { diff: UiDiff },
+    /// A conversation checkpoint was created (spec §68).
+    CheckpointCreated { checkpoint: UiCheckpoint },
+    /// The list of stored sessions (spec §52).
+    SessionList { sessions: Vec<UiSessionSummary> },
+    /// Context package info from an orchestrated run (spec §53).
+    ContextUpdated {
+        candidate_files: Vec<String>,
+        estimated_tokens: u32,
+    },
+    /// The runtime folded conversation history: `from` transcript messages
+    /// became `to`. A stable product fact — clients own the wording and the
+    /// locale; the runtime does not send prose for this.
+    ContextCompacted { from: u32, to: u32 },
+    /// Replay-only. The adaptive-context ladder that climbed the fold
+    /// threshold was deleted; the variant survives so an old event log still
+    /// decodes, and nothing emits one. Token budgets, not message counts.
+    ContextExpanded {
+        from_tokens: u32,
+        to_tokens: u32,
+        reason: String,
+    },
+    /// A user shell execution (`!command`) started. User-originated direct
+    /// host execution — not an agent tool call; clients render it as its own
+    /// block and never feed it to the model conversation.
+    UserShellStarted {
+        execution_id: leveler_core::UserShellId,
+        command: String,
+        cwd: String,
+    },
+    /// Live output from a running user shell. `stream` is `stdout` or
+    /// `stderr`. Transient: clients keep a bounded buffer; the runtime does
+    /// not persist chunks.
+    UserShellOutput {
+        execution_id: leveler_core::UserShellId,
+        stream: String,
+        chunk: String,
+    },
+    /// A user shell execution ended. `status` is `success | failed |
+    /// cancelled`; `exit_code` is `None` when the process was killed or
+    /// never spawned.
+    UserShellExited {
+        execution_id: leveler_core::UserShellId,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        status: String,
+    },
+    /// Real token usage reported by the model for the latest request. The
+    /// context gauge tracks how full the window is; `input_tokens` already
+    /// includes the whole prompt (system + history + tools), so the window in
+    /// use is `input_tokens + output_tokens`.
+    TokenUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+        /// Subset of `input_tokens` the provider served from its prefix cache.
+        /// Zero when the provider reports no cache stats.
+        cached_input_tokens: u32,
+    },
+    /// The accounting of the exact next model request, computed by the kernel
+    /// before the request is sent. Transient: nothing persists it, and a
+    /// reconnecting client gets the latest through its live view.
+    ContextUsage {
+        accounting: leveler_model::ContextAccounting,
+    },
+    /// An orchestrated run completed; carries the summary report (spec §23).
+    SessionCompleted { report: UiCompletionReport },
+    /// The current turn finished successfully.
+    TurnCompleted,
+    /// The work completed and project verification retains its own result,
+    /// but a separate required completion contract produced warnings.
+    TurnCompletedWithWarnings { reason: String },
+    /// The assistant naturally finished its answer, without claiming that an
+    /// external task was independently verified as complete.
+    TurnAnswered,
+    /// The turn stopped at an output limit even after bounded continuation.
+    TurnTruncated { error: String },
+    /// The executor stopped cleanly but did not reach a successful terminal
+    /// state (for example, budget exhaustion or an unresolved goal).
+    TurnIncomplete { reason: String },
+    /// The turn finished its work, but the project's checks did not run or
+    /// could not produce a verdict. Done, not verified — distinct from
+    /// `TurnIncomplete` (which means the work did not finish).
+    TurnCompletedUnverified { reason: String },
+    /// The turn finished its work and the project's own checks then FAILED
+    /// over the final tree. Done, checks failed — both facts stand; `reason`
+    /// names the failing checks.
+    TurnCompletedChecksFailed { reason: String },
+    /// The current turn failed.
+    ///
+    /// `error` is the legacy display string, kept for compatibility with older
+    /// clients (CLI, Web). New presentations must prefer `failure` and must
+    /// never parse `error` to decide a category, a retry, or a delivery truth.
+    TurnFailed {
+        error: String,
+        /// Structured product failure. `None` on legacy events and on failures
+        /// the runtime could not type; readers fall back to `error`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<crate::failure::UiFailure>,
+    },
+    /// The current turn was cancelled (resumable).
+    TurnCancelled,
+    /// A spawned sub-agent started or finished (multi-agent delegation). One
+    /// block per agent id, updated in place from running → done.
+    SubAgentUpdated {
+        id: String,
+        nickname: String,
+        role: String,
+        /// false while running; true once the agent finished.
+        done: bool,
+        /// Whether it finished successfully (only meaningful when `done`).
+        ok: bool,
+        /// The task while running; a short result summary once done.
+        detail: String,
+        /// Built-in capability contract this child was launched under.
+        /// `None` means the runtime did not record one, not "no profile".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_role: Option<String>,
+        /// Whether this child holds a physically read-only toolset.
+        #[serde(default)]
+        read_only: bool,
+        /// The declarative agent it was spawned from, carried on the start.
+        /// `None` for built-in role spawns, on terminals, and on events
+        /// recorded before agents existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiChildAgentIdentity>,
+        /// What the parent did with what this child found, once it finished.
+        ///
+        /// `None` means NOT MEASURED — the runtime produced no projection —
+        /// and must never be rendered as a zero. A child that reported
+        /// nothing arrives as `Some` with zero counts, which is a different
+        /// fact and reads differently to the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contribution: Option<ChildContribution>,
+        /// The four-way reading, once done. `None` while running and for
+        /// children settled before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<ChildOutcome>,
+        /// How the activation ended, once done.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<ChildStop>,
+        /// Whether the parent continues while this child runs. Carried on the
+        /// start; `None` on a terminal, which says nothing about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<bool>,
+        /// Exclusive write scope fixed at spawn (empty when late-bound or
+        /// read-only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scope: Vec<String>,
+    },
+    /// A child's lifecycle moved without a start or a terminal: its activation
+    /// died with a runtime window (`interrupted`) or a new one began under the
+    /// same id (`running`). Clients update the child they already hold.
+    SubAgentStateChanged { id: String, state: UiChildState },
+    /// Live execution state and cumulative model usage for one spawned agent.
+    SubAgentProgress {
+        id: String,
+        active: bool,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+    },
+    /// Live tool/step for one spawned sub-agent (attributed by `id`). Transient;
+    /// older clients ignore unknown types via [`parse_runtime_event`].
+    SubAgentActivity {
+        id: String,
+        /// `tool_started` or `tool_finished`.
+        phase: String,
+        tool: String,
+        preview: String,
+        is_error: bool,
+    },
+    /// Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only:
+    /// a snapshot of the ledger, never a mutation.
+    ChildContributionLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        detail: crate::UiChildContribution,
+    },
+    /// A durable goal checkpoint was cut; render it as a Recap history item
+    /// (long-goal P3). Emitted for `/recap`, milestones, context compaction,
+    /// and on surfacing an interruption checkpoint — the recap carries its
+    /// `checkpoint_id`, so an expanded view presents the same persisted facts.
+    GoalRecapCreated { recap: crate::UiGoalRecap },
+    /// Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only.
+    UnfinishedGoalsLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        goals: Vec<crate::UiUnfinishedGoal>,
+    },
+    /// Result of [`crate::ClientCommand::ListAgents`].
+    AgentsLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        agents: Vec<crate::UiAgentEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<crate::UiAgentProblem>,
+    },
+    /// Result of [`crate::ClientCommand::GetAgent`]. `agent` is `None` and
+    /// `error` says why when the name does not resolve.
+    AgentLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiAgentDetail>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure
+    /// nothing was written and `error` is the reason.
+    AgentMutated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        name: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// The entry as the registry now resolves it (after a create/update).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::UiAgentEntry>,
+    },
+    /// A transient notification for the status line.
+    Notification {
+        level: NotificationLevel,
+        message: String,
+    },
+    /// A background process task was started (`run_command` background=true).
+    BackgroundTaskStarted {
+        task_id: String,
+        program: String,
+        args: Vec<String>,
+    },
+    /// A background task finished (exit or kill).
+    BackgroundTaskExited {
+        task_id: String,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        ok: bool,
+    },
+    /// Project memory listing (response to [`crate::ClientCommand::ListMemory`]).
+    MemoryList {
+        memory_dir: String,
+        active: Vec<UiMemoryEntry>,
+        archived: Vec<UiMemoryEntry>,
+        /// Candidates awaiting the user's consent (K36). Without these in the
+        /// listing the TUI cannot show that anything is waiting, and the only
+        /// way to adopt a memory is the CLI — the last mile of the feature.
+        #[serde(default)]
+        pending: Vec<UiMemoryCandidate>,
+    },
+    /// Side-question (`/btw`) started; not persisted to session history.
+    BtwStarted { question: String },
+    /// Side-question answer chunk (often one full answer in MVP).
+    BtwTextDelta { delta: String },
+    /// Side-question finished successfully.
+    BtwCompleted,
+    /// Side-question failed.
+    BtwFailed { error: String },
+    /// Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).
+    ///
+    /// No free-form paths or tool output — safe to surface in TUI chrome and
+    /// optional remote summaries. Unknown older clients that reject new
+    /// variants should skip events via [`crate::event::parse_runtime_event`].
+    TurnProgress {
+        /// Active | Closing | Terminal (and similar host phase labels).
+        phase: String,
+        closing: bool,
+        no_progress_streak: u32,
+    },
+    /// Result of [`crate::ClientCommand::QueryContext`]. `accounting` is
+    /// `None` when no model request has been assembled yet for the session
+    /// (a fresh session before its first turn).
+    ContextLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<leveler_model::ContextAccounting>,
+    },
+    /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
+    /// projection of durable facts for the current or a historical session.
+    /// Echoes the command's `query_id` when the peer sent one. Absent on
+    /// protocol 1.5 peers — a current client must not treat that as ownership.
+    ObservabilityLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        observation: crate::UiObservabilityLoaded,
+    },
+    /// Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest
+    /// turns in order. `omitted_turns` older turns were left out to bound the
+    /// response; they are still in the session.
+    SessionHistoryLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        session_id: leveler_core::SessionId,
+        entries: Vec<UiHistoryEntry>,
+        #[serde(default)]
+        omitted_turns: u32,
+    },
+}
+
+/// Deserialize a runtime event, treating **unknown** `type` tags as
+/// `Ok(None)` so a newer runtime can emit additive variants without crashing
+/// an older client that still speaks the same major protocol version.
+pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    match serde_json::from_value::<RuntimeEvent>(value.clone()) {
+        Ok(event) => Ok(Some(event)),
+        Err(err) => {
+            // Unknown variant typically surfaces as "unknown variant `…`".
+            let msg = err.to_string();
+            if msg.contains("unknown variant") {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Compact durable-memory row for TUI list surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryEntry {
+    pub id: String,
+    pub title: String,
+    /// What this memory is, which decides how it reaches the model. Additive:
+    /// absent on older runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<UiMemoryKind>,
+    /// Held back from every automatic path because it looks like a credential.
+    /// Kept in the listing so the user can find and archive it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
+}
+
+/// What a durable memory IS. Strongly typed so no client invents its own
+/// strings for a field the domain has to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiMemoryKind {
+    /// Injected into every turn while active.
+    Preference,
+    /// Reachable by query recall and the catalog, never auto-injected.
+    Decision,
+    /// Same reach as a decision.
+    Note,
+}
+
+/// A candidate awaiting consent, with enough to decide on.
+///
+/// Deliberately NOT [`UiMemoryEntry`]: approving something shown only as a
+/// title is not informed consent, so the body, kind and source ride along.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryCandidate {
+    pub id: String,
+    pub title: String,
+    /// The text that would be stored. Already length-bounded by the domain.
+    pub body: String,
+    /// Free-form label as stored (`preference`, `package_manager`, …).
+    pub kind: String,
+    /// Who proposed it (`user_explicit`, `system_propose`, …).
+    pub source: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::{PlanStepStatus, UiCheck, UiDiff, UiDiffFile, UiPlan, UiPlanStep};
+    use crate::snapshot::{
+        MessageId, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot, UiSessionSummary,
+    };
+    use crate::{
+        ApprovalId, AttachmentId, AttachmentKind, ClarificationId, CommandId, ModelRef, SessionId,
+        ToolCallId,
+    };
+    use crate::{UiApprovalRequest, UiClarificationRequest};
+
+    fn session_snapshot() -> UiSessionSnapshot {
+        UiSessionSnapshot {
+            id: SessionId::new("sess-1"),
+            repository: "repo".to_string(),
+            goal: "goal".to_string(),
+            model: Some(ModelRef::new("openai", "gpt-4o")),
+            mode: crate::PermissionProfile::Assisted,
+            branch: Some("main".to_string()),
+            status: "busy".to_string(),
+            finalization_stage: None,
+            messages: vec![UiMessage {
+                id: MessageId::new("m1"),
+                role: UiRole::User,
+                text: "hi".to_string(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            }],
+            pending_interactions: vec![],
+            available_models: vec![ModelRef::new("openai", "gpt-4o-mini")],
+            vision: false,
+            last_sequence: Some(7),
+            active_tools: Vec::new(),
+            plan: None,
+            verification: None,
+            diff: None,
+            checkpoints: Vec::new(),
+            recaps: Vec::new(),
+            user_shells: Vec::new(),
+            completion_report: None,
+            reasoning: None,
+            work_profile: None,
+            collaboration: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn turn_progress_roundtrips() {
+        roundtrip(
+            RuntimeEvent::TurnProgress {
+                phase: "closing".into(),
+                closing: true,
+                no_progress_streak: 2,
+            },
+            "turn_progress",
+        );
+    }
+
+    #[test]
+    fn parse_runtime_event_skips_unknown_variant() {
+        let json = r#"{"type":"future_only_signal","payload":{"x":1}}"#;
+        // Untagged missing content form used by some peers:
+        let json2 = r#"{"type":"totally_unknown_event_v99"}"#;
+        assert!(parse_runtime_event(json2).ok().flatten().is_none());
+        // Malformed still errors:
+        assert!(parse_runtime_event("{").is_err());
+        let _ = json; // keep for doc; unknown with extra fields also skipped
+        assert!(
+            parse_runtime_event(r#"{"type":"not_a_real_runtime_event","foo":1}"#)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn observation_fixture() -> crate::UiObservabilityLoaded {
+        crate::UiObservabilityLoaded {
+            session: crate::UiSessionObservation {
+                session_id: SessionId::new("s1"),
+                goal: "g".into(),
+                repository: "/repo".into(),
+                created_at: "t".into(),
+                updated_at: "t".into(),
+                status: "idle".into(),
+                model: "m".into(),
+                work_profile: "balanced".into(),
+                collaboration: "chat".into(),
+                last_sequence: Some(100),
+                request_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                avg_latency_ms: None,
+                last_latency_ms: None,
+                request_failures: 0,
+                request_retries: 0,
+                tool_started: 0,
+                tool_finished: 0,
+                verification_runs: 0,
+                compact_count: 0,
+                subagent_started: 0,
+                verification: "not_run".into(),
+                duration_ms: None,
+                cached_input_tokens: None,
+                cost_usd_micros: None,
+                lanes: Vec::new(),
+            },
+            window: Vec::new(),
+            window_from: 1,
+            window_to: 1,
+            requests: Vec::new(),
+            tools: Vec::new(),
+            agents: Vec::new(),
+            recovery: crate::UiRecoveryObservation {
+                interrupted_turns: 0,
+                workspace_snapshots: 0,
+                review_stages: Vec::new(),
+            },
+            relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn observability_loaded_decodes_protocol_1_5_without_query_id() {
+        let json = serde_json::json!({
+            "type": "observability_loaded",
+            "observation": observation_fixture(),
+        });
+        let ev: RuntimeEvent = serde_json::from_value(json).expect("1.5 observability_loaded");
+        match ev {
+            RuntimeEvent::ObservabilityLoaded { query_id, .. } => assert_eq!(query_id, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observability_loaded_echoes_a_1_6_query_id() {
+        let ev = RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(CommandId::new("q1")),
+            observation: observation_fixture(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["query_id"], "q1");
+        let back: RuntimeEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RuntimeEvent::ObservabilityLoaded { query_id, .. } => {
+                assert_eq!(query_id, Some(CommandId::new("q1")));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    fn roundtrip(event: RuntimeEvent, expected_type: &str) {
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(&format!("\"type\":\"{expected_type}\"")),
+            "json did not contain expected type: {json}"
+        );
+        let back: RuntimeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn runtime_ready_roundtrips() {
+        roundtrip(RuntimeEvent::RuntimeReady, "runtime_ready");
+    }
+
+    #[test]
+    fn session_opened_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SessionOpened {
+                session: session_snapshot(),
+            },
+            "session_opened",
+        );
+    }
+
+    #[test]
+    fn session_updated_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SessionUpdated {
+                session: session_snapshot(),
+            },
+            "session_updated",
+        );
+    }
+
+    #[test]
+    fn approval_requested_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ApprovalRequested {
+                request: UiApprovalRequest {
+                    id: ApprovalId::new("a1"),
+                    tool: "run_command".to_string(),
+                    summary: "run ls".to_string(),
+                    command: Some("ls".to_string()),
+                    risks: vec!["network".to_string()],
+                    call_id: None,
+                    always_persists: true,
+                },
+            },
+            "approval_requested",
+        );
+    }
+
+    #[test]
+    fn clarification_requested_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ClarificationRequested {
+                request: UiClarificationRequest {
+                    id: ClarificationId::new("c1"),
+                    question: "which file?".to_string(),
+                    options: vec!["a.rs".to_string()],
+                },
+            },
+            "clarification_requested",
+        );
+    }
+
+    #[test]
+    fn attachment_added_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AttachmentAdded {
+                attachment: AttachmentRef {
+                    id: AttachmentId::new("att-1"),
+                    kind: AttachmentKind::Image,
+                    name: "img.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    size_bytes: 1024,
+                    sha256: "deadbeef".to_string(),
+                    width: Some(100),
+                    height: None,
+                },
+            },
+            "attachment_added",
+        );
+    }
+
+    #[test]
+    fn attachment_processing_failed_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AttachmentProcessingFailed {
+                error: "bad mime".to_string(),
+            },
+            "attachment_processing_failed",
+        );
+    }
+
+    #[test]
+    fn user_message_added_roundtrips() {
+        roundtrip(
+            RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new("m1"),
+                    role: UiRole::User,
+                    text: "hello".to_string(),
+                    ordinal: None,
+                    kind: None,
+                    images: 0,
+                },
+            },
+            "user_message_added",
+        );
+    }
+
+    #[test]
+    fn assistant_message_started_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AssistantMessageStarted {
+                message_id: MessageId::new("m1"),
+            },
+            "assistant_message_started",
+        );
+    }
+
+    #[test]
+    fn assistant_text_delta_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AssistantTextDelta {
+                message_id: MessageId::new("m1"),
+                delta: "world".to_string(),
+            },
+            "assistant_text_delta",
+        );
+    }
+
+    #[test]
+    fn assistant_message_completed_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AssistantMessageCompleted {
+                message_id: MessageId::new("m1"),
+            },
+            "assistant_message_completed",
+        );
+    }
+
+    #[test]
+    fn turn_finalizing_roundtrips_with_a_typed_stage() {
+        roundtrip(
+            RuntimeEvent::TurnFinalizing {
+                stage: FinalizationStage::ResolvingOutcome,
+            },
+            "turn_finalizing",
+        );
+    }
+
+    #[test]
+    fn agent_activity_roundtrips() {
+        roundtrip(
+            RuntimeEvent::AgentActivity {
+                label: "thinking".to_string(),
+            },
+            "agent_activity",
+        );
+    }
+
+    #[test]
+    fn tool_call_started_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new("tc1"),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+                parallel: false,
+            },
+            "tool_call_started",
+        );
+    }
+
+    #[test]
+    fn tool_call_completed_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id: ToolCallId::new("tc1"),
+                ok: true,
+                preview: "ok".to_string(),
+                duration_ms: 42,
+                applied_diff: None,
+            },
+            "tool_call_completed",
+        );
+    }
+
+    #[test]
+    fn plan_updated_roundtrips() {
+        roundtrip(
+            RuntimeEvent::PlanUpdated {
+                plan: UiPlan {
+                    steps: vec![UiPlanStep {
+                        index: 0,
+                        description: "step".to_string(),
+                        status: PlanStepStatus::Running,
+                    }],
+                },
+            },
+            "plan_updated",
+        );
+    }
+
+    #[test]
+    fn verification_updated_roundtrips() {
+        roundtrip(
+            RuntimeEvent::VerificationUpdated {
+                verification: crate::progress::UiVerification {
+                    checks: vec![UiCheck {
+                        name: "fmt".to_string(),
+                        status: crate::progress::CheckState::Passed,
+                        evidence: None,
+                    }],
+                    passed: Some(true),
+                },
+            },
+            "verification_updated",
+        );
+    }
+
+    #[test]
+    fn diff_updated_roundtrips() {
+        roundtrip(
+            RuntimeEvent::DiffUpdated {
+                diff: UiDiff {
+                    files: vec![UiDiffFile {
+                        path: "a.rs".to_string(),
+                        added: 1,
+                        removed: 0,
+                        patch: None,
+                    }],
+                },
+            },
+            "diff_updated",
+        );
+    }
+
+    #[test]
+    fn checkpoint_created_roundtrips() {
+        roundtrip(
+            RuntimeEvent::CheckpointCreated {
+                checkpoint: UiCheckpoint {
+                    id: leveler_core::CheckpointId::new("chk1"),
+                    label: "start".to_string(),
+                    ordinal: 0,
+                },
+            },
+            "checkpoint_created",
+        );
+    }
+
+    #[test]
+    fn session_list_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SessionList {
+                sessions: vec![UiSessionSummary {
+                    id: SessionId::new("s1"),
+                    goal: "g".to_string(),
+                    status: "done".to_string(),
+                    model: "openai/gpt-4o".to_string(),
+                    updated_at: "now".to_string(),
+                    repository: None,
+                }],
+            },
+            "session_list",
+        );
+    }
+
+    #[test]
+    fn context_updated_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ContextUpdated {
+                candidate_files: vec!["a.rs".to_string()],
+                estimated_tokens: 1234,
+            },
+            "context_updated",
+        );
+    }
+
+    #[test]
+    fn user_shell_lifecycle_roundtrips() {
+        roundtrip(
+            RuntimeEvent::UserShellStarted {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                command: "cargo test".into(),
+                cwd: "/repo".into(),
+            },
+            "user_shell_started",
+        );
+        roundtrip(
+            RuntimeEvent::UserShellOutput {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                stream: "stdout".into(),
+                chunk: "running 312 tests\n".into(),
+            },
+            "user_shell_output",
+        );
+        roundtrip(
+            RuntimeEvent::UserShellExited {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                exit_code: Some(0),
+                duration_ms: 4200,
+                status: "success".into(),
+            },
+            "user_shell_exited",
+        );
+    }
+
+    #[test]
+    fn context_compacted_roundtrip() {
+        roundtrip(
+            RuntimeEvent::ContextCompacted { from: 100, to: 40 },
+            "context_compacted",
+        );
+    }
+
+    #[test]
+    fn context_expanded_roundtrip() {
+        roundtrip(
+            RuntimeEvent::ContextExpanded {
+                from_tokens: 256_000,
+                to_tokens: 512_000,
+                reason: "reread_pressure".into(),
+            },
+            "context_expanded",
+        );
+    }
+
+    #[test]
+    fn token_usage_roundtrips() {
+        roundtrip(
+            RuntimeEvent::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 40,
+            },
+            "token_usage",
+        );
+    }
+
+    #[test]
+    fn session_completed_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SessionCompleted {
+                report: crate::progress::UiCompletionReport {
+                    files_changed: 1,
+                    added: 2,
+                    removed: 3,
+                    checks_passed: 4,
+                    verification: crate::progress::UiVerificationStatus::Passed,
+                    checks_total: 5,
+                    success: true,
+                },
+            },
+            "session_completed",
+        );
+    }
+
+    #[test]
+    fn turn_completed_roundtrips() {
+        roundtrip(RuntimeEvent::TurnCompleted, "turn_completed");
+    }
+
+    #[test]
+    fn distinct_non_completion_end_states_roundtrip() {
+        roundtrip(RuntimeEvent::TurnAnswered, "turn_answered");
+        roundtrip(
+            RuntimeEvent::TurnTruncated {
+                error: "token limit".to_string(),
+            },
+            "turn_truncated",
+        );
+        roundtrip(
+            RuntimeEvent::TurnIncomplete {
+                reason: "round budget".to_string(),
+            },
+            "turn_incomplete",
+        );
+        roundtrip(
+            RuntimeEvent::TurnCompletedUnverified {
+                reason: "no verification gate".to_string(),
+            },
+            "turn_completed_unverified",
+        );
+        roundtrip(
+            RuntimeEvent::TurnCompletedChecksFailed {
+                reason: "test: 2 failed".to_string(),
+            },
+            "turn_completed_checks_failed",
+        );
+    }
+
+    #[test]
+    fn turn_failed_roundtrips() {
+        roundtrip(
+            RuntimeEvent::TurnFailed {
+                error: "oops".to_string(),
+                failure: None,
+            },
+            "turn_failed",
+        );
+    }
+
+    #[test]
+    fn turn_failed_with_structured_failure_roundtrips() {
+        roundtrip(
+            RuntimeEvent::TurnFailed {
+                error: "legacy".to_string(),
+                failure: Some(crate::failure::UiFailure {
+                    category: crate::failure::FailureCategory::InvalidRequest,
+                    source: crate::failure::FailureSource::Provider,
+                    provider: Some("moonshot".into()),
+                    provider_code: None,
+                    status: Some(400),
+                    retryability: crate::failure::FailureRetryability::Never,
+                    delivery: crate::failure::FailureDelivery::Responded,
+                    summary: "模型服务拒绝了当前请求。".into(),
+                    detail: "At path 'properties.plan.items' …".into(),
+                }),
+            },
+            "turn_failed",
+        );
+    }
+
+    #[test]
+    fn turn_cancelled_roundtrips() {
+        roundtrip(RuntimeEvent::TurnCancelled, "turn_cancelled");
+        roundtrip(
+            RuntimeEvent::BackgroundTaskStarted {
+                task_id: "bg-1".into(),
+                program: "sleep".into(),
+                args: vec!["1".into()],
+            },
+            "background_task_started",
+        );
+        roundtrip(
+            RuntimeEvent::BackgroundTaskExited {
+                task_id: "bg-1".into(),
+                exit_code: Some(0),
+                duration_ms: 12,
+                ok: true,
+            },
+            "background_task_exited",
+        );
+    }
+
+    #[test]
+    fn sub_agent_progress_is_a_distinct_runtime_event() {
+        let json = serde_json::json!({
+            "type": "sub_agent_progress",
+            "id": "agent-2",
+            "active": true,
+            "input_tokens": 2400,
+            "output_tokens": 180,
+            "cached_input_tokens": 1200
+        });
+        let event = serde_json::from_value::<RuntimeEvent>(json);
+        assert!(
+            event.is_ok(),
+            "sub-agent usage must not reuse global TokenUsage"
+        );
+    }
+
+    #[test]
+    fn sub_agent_activity_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SubAgentActivity {
+                id: "agent-1".into(),
+                phase: "tool_started".into(),
+                tool: "list_files".into(),
+                preview: r#"{"path":"."}"#.into(),
+                is_error: false,
+            },
+            "sub_agent_activity",
+        );
+    }
+
+    #[test]
+    fn notification_roundtrips() {
+        for level in [
+            NotificationLevel::Info,
+            NotificationLevel::Warning,
+            NotificationLevel::Error,
+        ] {
+            roundtrip(
+                RuntimeEvent::Notification {
+                    level,
+                    message: "hello".to_string(),
+                },
+                "notification",
+            );
+        }
+    }
+}

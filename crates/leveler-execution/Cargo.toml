@@ -1,0 +1,60 @@
+[package]
+name = "leveler-execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Workspace path safety, risk levels, and process execution."
+
+[dependencies]
+sha2 = { workspace = true }
+leveler-core = { workspace = true }
+# The audited `unsafe` boundary for Windows write confinement. Depended on
+# unconditionally so `windows_confine`'s bookkeeping compiles and is tested on
+# every host; off Windows the crate is honest stubs.
+leveler-win-confine = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+url = "2.5"
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tempfile = "3"
+fs2 = { workspace = true }
+cap-std = { workspace = true }
+# Shell-script danger classification parses bash with a real grammar instead of
+# string splitting. Pinned exactly: grammar and runtime ABI must stay in sync.
+tree-sitter = "=0.25.10"
+tree-sitter-bash = "=0.25.1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process", "user"] }
+rustix = { workspace = true }
+
+# Job Object and Low-integrity launch via audited safe wrappers (no in-crate
+# unsafe): `process-wrap` owns the process tree, `leveler-win-confine` owns the
+# token and the write-root labels.
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "8.2", default-features = false, features = [
+    "tokio1",
+    "job-object",
+    "kill-on-drop",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+leveler-test-support = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

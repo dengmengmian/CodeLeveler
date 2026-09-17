@@ -1,0 +1,204 @@
+//! Plan, diff, verification, and completion projections (spec §20–§23).
+//!
+//! These are render-ready views built by the runtime client from the
+//! orchestrator's events and git — the UI never inspects the task graph or runs
+//! git itself.
+
+use serde::{Deserialize, Serialize};
+
+/// The mechanical work still running after the assistant has produced its
+/// final response but before the runtime publishes the task terminal.
+///
+/// This is lifecycle chrome, not a second completion authority: the terminal
+/// event remains the only fact that ends the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizationStage {
+    /// Wait for work already admitted by the turn to settle.
+    SettlingDependencies,
+    /// Run the configured checks over the final tree.
+    Verification,
+    /// Persist verification and other completion evidence.
+    Evidence,
+    /// Run a completion review explicitly required by the task contract.
+    Review,
+    /// Resolve the task outcome from the collected facts.
+    ResolvingOutcome,
+    /// Commit and publish the canonical terminal fact.
+    PublishingTerminal,
+}
+
+/// The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+/// One step in the execution plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiPlanStep {
+    pub index: usize,
+    pub description: String,
+    pub status: PlanStepStatus,
+}
+
+/// The execution plan (spec §20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiPlan {
+    pub steps: Vec<UiPlanStep>,
+}
+
+/// The state of one verification check.
+///
+/// This is the check-level fact and not the task-level verdict, so the three
+/// ways a check can produce no verdict stay distinct. A check whose program is
+/// not installed is not a check that was deliberately skipped, and neither is
+/// a check the environment refused: each one is the reason a run ended
+/// unverified, and the reader is owed that reason rather than a shrug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Running,
+    Passed,
+    Failed,
+    /// Deliberately not run.
+    Skipped,
+    /// No pass/fail observation was produced. `UiCheck::evidence` carries the
+    /// reason projected by the runtime, such as cancellation or an unavailable
+    /// dependency.
+    NotRun,
+    /// The check's program is not on `PATH`, so it could not run at all.
+    ToolMissing,
+    /// The check ran but the environment refused it (toolchain/MSRV mismatch).
+    EnvironmentUnavailable,
+    /// The row carried a status this build does not know. It is not a pass,
+    /// and it is not a skip either — naming it one would invent a reason.
+    Unknown,
+}
+
+/// One verification check (spec §22).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiCheck {
+    pub name: String,
+    pub status: CheckState,
+    /// Captured evidence (command output), for failures.
+    pub evidence: Option<String>,
+}
+
+/// The verification result.
+///
+/// `passed` is `None` while a check is still running, and it is also `None`
+/// when nothing was proven. It is never `Some(true)` for a run that was not
+/// verified — "not verified" and "failed" are different facts, and clients
+/// render them differently (`incomplete` versus `failed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiVerification {
+    pub checks: Vec<UiCheck>,
+    pub passed: Option<bool>,
+}
+
+/// One changed file (spec §21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiDiffFile {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+    /// The unified diff hunk text, loaded on demand.
+    pub patch: Option<String>,
+}
+
+/// A summary of working-tree changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiDiff {
+    pub files: Vec<UiDiffFile>,
+}
+
+impl UiDiff {
+    pub fn total_added(&self) -> u32 {
+        self.files.iter().map(|f| f.added).sum()
+    }
+
+    pub fn total_removed(&self) -> u32 {
+        self.files.iter().map(|f| f.removed).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn totals_are_zero_for_empty_diff() {
+        let diff = UiDiff { files: vec![] };
+        assert_eq!(diff.total_added(), 0);
+        assert_eq!(diff.total_removed(), 0);
+    }
+
+    #[test]
+    fn totals_sum_across_files() {
+        let diff = UiDiff {
+            files: vec![
+                UiDiffFile {
+                    path: "a.rs".to_string(),
+                    added: 10,
+                    removed: 2,
+                    patch: None,
+                },
+                UiDiffFile {
+                    path: "b.rs".to_string(),
+                    added: 5,
+                    removed: 7,
+                    patch: None,
+                },
+            ],
+        };
+        assert_eq!(diff.total_added(), 15);
+        assert_eq!(diff.total_removed(), 9);
+    }
+}
+
+/// What the project's own checks reported over the final tree. Orthogonal
+/// to whether the run completed: `Passed` means the configured commands
+/// exited 0, never that the user's request was satisfied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiVerificationStatus {
+    Passed,
+    Failed,
+    #[default]
+    NotRun,
+    Unavailable,
+}
+
+/// The final completion report (spec §23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiCompletionReport {
+    pub files_changed: usize,
+    pub added: u32,
+    pub removed: u32,
+    pub checks_passed: usize,
+    pub checks_total: usize,
+    /// Whether the run completed and every gating check passed. Kept for
+    /// existing clients; `verification` carries the full status.
+    pub success: bool,
+    /// The project's own checks over the final tree. Absent on reports
+    /// written before the status/verification split (reads as `not_run`).
+    #[serde(default)]
+    pub verification: UiVerificationStatus,
+}

@@ -1,0 +1,1233 @@
+//! Global, single-file user config (`~/.leveler/config.toml`).
+//!
+//! A machine-global resident config so `leveler` works in any directory without a
+//! per-repo `configs/` bundle. It defines the default model plus one or more
+//! providers/models in one compact TOML. API keys may be set via
+//! `api_key_env` (environment variable name) and/or plaintext `api_key`
+//! (local convenience; preferred when non-empty). It is loaded first and then
+//! the repo's `configs/` bundle (if any) is merged over it, so a project can
+//! still override or add models.
+//!
+//! Example `~/.leveler/config.toml`:
+//! ```toml
+//! default_model = "deepseek/deepseek-v4-pro"
+//! lang = "zh"                 # optional UI language: zh | en (LEVELER_LANG overrides)
+//!
+//! [ui]
+//! theme = "auto"               # optional TUI theme: auto | dark | light | high-contrast
+//!
+//! [browser]
+//! default = "chrome"           # optional: safari | chrome | edge | chromium.
+//!                              # Unset prefers installed CDP browsers.
+//!
+//! [vcs]
+//! co_author = true             # optional; append the CodeLeveler/model commit trailer
+//!
+//! [providers.deepseek]
+//! base_url = "https://api.deepseek.com"
+//! api_key_env = "DEEPSEEK_API_KEY"
+//! # api_key = "sk-..."        # optional plaintext; preferred over api_key_env
+//!
+//! [models."deepseek-v4-pro"]
+//! provider = "deepseek"
+//! context_window = 131072
+//! max_output_tokens = 16384   # optional; default 8192
+//! # parallel_tool_calls = false # optional: force this model serial
+//! # max_parallel_tool_calls = 1 # optional known hard limit
+//! # max_tool_output_bytes = 16384 # optional per-tool-result cap; default 48 KiB
+//!
+//! [[mcp_servers]]             # optional; external MCP tool servers
+//! name = "fs"
+//! command = "npx"
+//! args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+//! # env values are *names* of environment variables to forward (never secrets):
+//! # env = { GITHUB_TOKEN = "GITHUB_TOKEN" }
+//! ```
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+use toml_edit::{DocumentMut, value};
+
+use leveler_model::{
+    CompatibilityConfig, ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind,
+    ReasoningConfig, ReasoningEffort, ReasoningStyle,
+};
+use leveler_provider::{ModelConfigFile, ProviderConfig};
+use leveler_tools::mcp::McpServerConfig;
+
+/// The parsed global config.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalConfig {
+    /// Default model reference (`provider/model`) when none is given.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// TUI language: `zh` or `en`. Overridden by `LEVELER_LANG` when set.
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// UI preferences (theme, …).
+    #[serde(default)]
+    ui: GlobalUi,
+    /// Which browser the browser capability drives.
+    #[serde(default)]
+    browser: GlobalBrowser,
+    /// Git commit attribution. Enabled unless explicitly disabled.
+    #[serde(default)]
+    vcs: GlobalVcs,
+    #[serde(default)]
+    providers: BTreeMap<String, GlobalProvider>,
+    #[serde(default)]
+    models: BTreeMap<String, GlobalModel>,
+    /// External MCP (Model Context Protocol) servers whose tools are exposed to
+    /// the model (spawned over stdio).
+    #[serde(default)]
+    mcp_servers: Vec<GlobalMcpServer>,
+    /// Multi-agent product settings.
+    #[serde(default)]
+    agents: GlobalAgents,
+    /// The `/develop` workflow's settings.
+    #[serde(default)]
+    develop: GlobalDevelop,
+}
+
+/// `[develop]`. One key: which model reads the code.
+///
+/// Analyze and Review deliberately share it. Two keys would let a user
+/// configure a workflow whose investigation and whose acceptance disagree
+/// about what the code is, and there is no question that setup answers.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalDevelop {
+    /// `provider/model` for Analyze and Review. Unset = the session's model,
+    /// which is what makes `/develop` a workflow rather than a second-model
+    /// requirement.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalAgents {
+    /// Advertise `spawn_agent` (default true).
+    #[serde(default = "default_true")]
+    delegation: bool,
+    /// When the harness launches an independent reviewer. Default `auto`.
+    #[serde(default)]
+    independent_review: leveler_project::IndependentReview,
+    /// Cross-model completion judge: `provider/model` used by the Completion
+    /// Reconciliation Gate. Unset = the executor's own model.
+    #[serde(default)]
+    completion_judge_model: Option<String>,
+    /// Legacy: the completion-reconciliation gate this bounded was deleted.
+    /// Still accepted so an existing config file loads, and ignored.
+    #[serde(default)]
+    completion_judge_timeout_seconds: Option<u64>,
+}
+
+impl Default for GlobalAgents {
+    fn default() -> Self {
+        Self {
+            delegation: true,
+            independent_review: leveler_project::IndependentReview::default(),
+            completion_judge_model: None,
+            completion_judge_timeout_seconds: None,
+        }
+    }
+}
+
+/// `[browser]`. One key: which browser to drive.
+///
+/// Unset lets the host choose the first installed browser with the CDP
+/// observation surface, in the stable Chrome, Edge, Chromium order. Safari is
+/// opt-in because its WebDriver session cannot expose console, page-error, or
+/// network inspection.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalBrowser {
+    /// `safari` | `chrome` | `edge` | `chromium`.
+    #[serde(default)]
+    default: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalUi {
+    /// TUI theme id: `auto` | `dark` | `light` | `high-contrast`.
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalVcs {
+    #[serde(default = "default_true")]
+    co_author: bool,
+}
+
+impl Default for GlobalVcs {
+    fn default() -> Self {
+        Self { co_author: true }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalMcpServer {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalProvider {
+    #[serde(default = "default_protocol")]
+    protocol: String,
+    base_url: String,
+    /// Name of an environment variable holding the API key.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    /// Optional plaintext API key (local convenience). Preferred over
+    /// `api_key_env` when non-empty.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Extra HTTP headers sent with every request to *this* provider only
+    /// (e.g. a `user-agent` an endpoint gates on). Empty → nothing extra.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// Request/stream timeouts. Compact-config users previously could NOT
+    /// raise these off the tight defaults (60 s idle-read doubles as the
+    /// time-to-first-header budget for huge continuation transcripts — a
+    /// contributor to R006's window-boundary timeout, R6-P3).
+    #[serde(default)]
+    timeouts: Option<leveler_provider::Timeouts>,
+    /// Provider-level retry budget/backoff.
+    #[serde(default)]
+    retry: Option<leveler_provider::RetryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalModel {
+    provider: String,
+    /// Provider-side model id; defaults to the table key.
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+    /// Factual model capabilities. Defaults preserve the pre-existing compact
+    /// global-config behavior; set them explicitly when the endpoint differs.
+    #[serde(default = "default_true")]
+    streaming: bool,
+    #[serde(default = "default_true")]
+    tool_calling: bool,
+    /// Default true means "leave the provider's native behavior alone": the
+    /// OpenAI-compatible adapter then omits the wire flag. Set false only for a
+    /// model that must be forced to emit tool calls serially.
+    #[serde(default = "default_true")]
+    parallel_tool_calls: bool,
+    #[serde(default = "default_true")]
+    structured_output: bool,
+    #[serde(default)]
+    vision: bool,
+    #[serde(default)]
+    reasoning: bool,
+    /// How to ask this model to reason: `none` (default), `openai_effort`, or
+    /// `thinking_flag` (DeepSeek/GLM). Unset means we send no reasoning field.
+    #[serde(default)]
+    reasoning_style: ReasoningStyle,
+    /// Native efforts this model accepts. Omitted → inferred as `[reasoning_effort]`
+    /// when that field is set.
+    #[serde(default)]
+    supported_efforts: Vec<ReasoningEffort>,
+    /// CodeLeveler default: `minimal` | `low` | `medium` | `high` | `xhigh` | `max`.
+    /// This is **not** the provider default. A knob-style model must set it.
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Usable context before compaction. Defaults to half the hard window.
+    #[serde(default)]
+    reliable_context: Option<u32>,
+    /// Optional gateway pricing (USD per million tokens) for eval cost
+    /// accounting: `pricing: { input_usd_per_mtok: 0.27, output_usd_per_mtok: 1.10 }`.
+    /// Omit and no cost is ever computed.
+    #[serde(default)]
+    pricing: Option<leveler_model::ModelPricing>,
+    /// Max output tokens per request. Large tool-call payloads (e.g. apply_patch)
+    /// truncate mid-JSON if this is too small. Defaults to 8192.
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    max_tool_schema_bytes: Option<usize>,
+    /// Known provider/model limit. Zero means unspecified when parallel tool
+    /// calls are supported; non-parallel models default to one.
+    #[serde(default)]
+    max_parallel_tool_calls: Option<usize>,
+    /// Per-tool-result byte budget fed to the executor's central output cap.
+    /// Omitted → 48 KiB. Lower it for a model with a small reliable context.
+    #[serde(default)]
+    max_tool_output_bytes: Option<usize>,
+    /// Whether the provider accepts a caller-chosen `temperature`. Kimi For
+    /// Coding rejects every value but its own default (HTTP 400), so set this
+    /// false there. Defaults to true.
+    #[serde(default = "default_true")]
+    supports_temperature: bool,
+    /// Whether the provider accepts a forced `tool_choice` (`required` /
+    /// named function) while thinking mode is active. DeepSeek rejects that
+    /// combination (HTTP 400 "Thinking mode does not support this
+    /// tool_choice") — set false there so the adapter explicitly disables
+    /// thinking on exactly those requests. Defaults to true.
+    #[serde(default = "default_true")]
+    thinking_supports_forced_tool_choice: bool,
+    /// Whether assistant tool-call messages must echo `reasoning_content`
+    /// back (DeepSeek thinking-mode contract: an unrecognized tool-call id is
+    /// rejected unless the key is present). Defaults to false.
+    #[serde(default)]
+    passback_reasoning_content: bool,
+}
+
+impl GlobalModel {
+    fn reasoning_config(&self) -> ReasoningConfig {
+        let mut supported = self.supported_efforts.clone();
+        if supported.is_empty()
+            && let Some(default) = self.reasoning_effort
+        {
+            supported = vec![default];
+        }
+        ReasoningConfig {
+            style: self.reasoning_style,
+            supported_efforts: supported,
+            default_effort: self.reasoning_effort,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_protocol() -> String {
+    "openai_chat".to_string()
+}
+
+/// The bundle a [`GlobalConfig`] expands into.
+pub struct GlobalBundle {
+    pub providers: Vec<ProviderConfig>,
+    pub models: Vec<ModelConfigFile>,
+    pub default_model: Option<String>,
+    pub lang: Option<String>,
+    /// TUI theme id from `[ui].theme`, if set.
+    pub theme: Option<String>,
+    pub vcs_co_author: bool,
+    /// `[develop].model`, exactly as written. Carried as a raw string because
+    /// `/develop` owns the refusal: a model reference the runtime cannot
+    /// resolve must not stop an ordinary turn that never asked for it.
+    pub develop_model: Option<String>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Multi-agent: advertise `spawn_agent` when true (default).
+    pub agents_delegation: bool,
+    /// Whether the harness launches an independent reviewer (default Off).
+    pub agents_independent_review: leveler_project::IndependentReview,
+    /// `[browser].default`, parsed after validation rejects unrecognised values.
+    pub browser_default: Option<leveler_browser::BrowserProduct>,
+}
+
+/// A typed error from loading the global config, so callers and tests can tell
+/// MCP secret rejections apart from ordinary parse failures.
+#[derive(Debug, thiserror::Error)]
+pub enum GlobalConfigError {
+    #[error("{0}")]
+    Parse(String),
+    #[error(
+        "global config MCP server `{server}` env `{key}` stores a plaintext secret; replace the value with an environment variable name reference (e.g. `{key} = \"{key}\"`)"
+    )]
+    McpSecretInConfig { server: String, key: String },
+    #[error(
+        "global config MCP server `{server}` env `{key}` must be a string UPPER_SNAKE environment variable name reference (e.g. `{key} = \"{key}\"`)"
+    )]
+    McpEnvNotString { server: String, key: String },
+}
+impl GlobalConfig {
+    /// The config path: `<leveler-home>/config.toml`, or `None` when no home is
+    /// known. Home resolution (incl. the Windows `USERPROFILE` fallback) is
+    /// shared via [`leveler_core::leveler_home_dir_from`].
+    pub fn path() -> Option<PathBuf> {
+        leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+            .map(|root| leveler_core::LevelerHome::from_root(root).config_file())
+    }
+
+    /// Load the global config, or an empty one if the file is absent. A present
+    /// but malformed file is a hard error (never silently ignored).
+    pub fn load() -> Result<Self, GlobalConfigError> {
+        let Some(path) = Self::path() else {
+            return Ok(Self::default());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_toml_str(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(GlobalConfigError::Parse(format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// Parse global config from TOML text. Provider `api_key` may be set as
+    /// plaintext (local convenience) and/or via `api_key_env`. MCP `env`
+    /// values must still be env-name references (never raw secrets).
+    fn from_toml_str(text: &str) -> Result<Self, GlobalConfigError> {
+        let value: toml::Value =
+            toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        reject_mcp_env_secrets(&value)?;
+        let cfg: Self =
+            toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        cfg.validate_browser()?;
+        cfg.validate_reasoning()?;
+        Ok(cfg)
+    }
+
+    fn validate_browser(&self) -> Result<(), GlobalConfigError> {
+        if let Some(value) = self.browser.default.as_deref()
+            && leveler_browser::BrowserProduct::parse(value).is_none()
+        {
+            return Err(GlobalConfigError::Parse(format!(
+                "[browser].default must be safari, chrome, edge or chromium; got `{value}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_reasoning(&self) -> Result<(), GlobalConfigError> {
+        for (id, model) in &self.models {
+            let config = model.reasoning_config();
+            if let Err(reason) = leveler_model::validate_reasoning_config(model.reasoning, &config)
+            {
+                return Err(GlobalConfigError::Parse(format!(
+                    "model `{id}` has invalid reasoning config: {reason}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Effective CodeLeveler default for `[models.<id>]` (`provider/model` or
+    /// a bare model id). `None` when the model has no controllable knob.
+    pub fn reasoning_effort_for(&self, model: &str) -> Option<String> {
+        let id = model
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(model);
+        let m = self.models.get(id)?;
+        let config = m.reasoning_config();
+        leveler_model::resolve_reasoning_effort(None, &config)
+            .effective
+            .map(|e| e.as_wire().to_string())
+    }
+
+    /// The configured context window for `[models.<id>]` (`provider/model` or
+    /// a bare model id), if the user set one.
+    ///
+    /// A client that reopens a session through the daemon has no model
+    /// registry of its own, and the snapshot carries the model's name but not
+    /// its limits — so the context gauge had nothing to divide by and stayed
+    /// blank for the rest of the session.
+    pub fn context_window_for(&self, model: &str) -> Option<u32> {
+        let id = model
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(model);
+        self.models.get(id)?.context_window
+    }
+}
+
+/// Render the starter config `leveler init` writes. Lives next to the parser
+/// so the generated document can never drift from the accepted schema (the
+/// round-trip is unit-tested in this module).
+pub fn render_init_config(
+    provider_id: &str,
+    base_url: &str,
+    api_key_env: &str,
+    model_id: &str,
+    context_window: u64,
+) -> String {
+    // Built with toml_edit so user-supplied values are always escaped
+    // correctly; the round-trip through the strict parser is unit-tested.
+    // Explicit `[providers.x]` tables (not inline) — humans edit this file.
+    let mut doc = DocumentMut::new();
+    doc["default_model"] = value(format!("{provider_id}/{model_id}"));
+    let mut provider = toml_edit::Table::new();
+    provider["base_url"] = value(base_url);
+    provider["api_key_env"] = value(api_key_env);
+    let mut providers = toml_edit::Table::new();
+    providers.set_implicit(true);
+    providers[provider_id] = toml_edit::Item::Table(provider);
+    doc["providers"] = toml_edit::Item::Table(providers);
+    let mut model = toml_edit::Table::new();
+    model["provider"] = value(provider_id);
+    model["context_window"] = value(context_window as i64);
+    let mut models = toml_edit::Table::new();
+    models.set_implicit(true);
+    models[model_id] = toml_edit::Item::Table(model);
+    doc["models"] = toml_edit::Item::Table(models);
+    format!(
+        "# CodeLeveler global config — created by `leveler init`.\n\
+         # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
+         {doc}"
+    )
+}
+
+impl GlobalConfig {
+    /// Expand into provider/model/policy configs with sensible defaults filled.
+    pub fn into_bundle(self) -> GlobalBundle {
+        if self.agents.completion_judge_model.is_some()
+            || self.agents.completion_judge_timeout_seconds.is_some()
+        {
+            tracing::warn!(
+                "agents.completion_judge_model / completion_judge_timeout_seconds are legacy \
+                 keys: the completion judge no longer exists and the values are ignored"
+            );
+        }
+        let providers = self
+            .providers
+            .into_iter()
+            .map(|(id, p)| ProviderConfig {
+                id,
+                protocol: parse_protocol(&p.protocol),
+                base_url: p.base_url,
+                api_key_env: p.api_key_env.unwrap_or_default(),
+                api_key: p
+                    .api_key
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                headers: p.headers,
+                timeouts: p.timeouts.unwrap_or_default(),
+                retry: p.retry.unwrap_or_default(),
+            })
+            .collect();
+
+        let models = self
+            .models
+            .into_iter()
+            .map(|(id, m)| {
+                let context = m.context_window.unwrap_or(131_072);
+                let reasoning = m.reasoning_config();
+                ModelConfigFile {
+                    profile: ModelProfile {
+                        model_id: m.model_id.unwrap_or_else(|| id.clone()),
+                        id,
+                        provider: m.provider,
+                        protocol: m
+                            .protocol
+                            .as_deref()
+                            .map(parse_protocol)
+                            .unwrap_or(ProtocolKind::OpenAiChat),
+                        capabilities: ModelCapabilities {
+                            streaming: m.streaming,
+                            tool_calling: m.tool_calling,
+                            parallel_tool_calls: m.parallel_tool_calls,
+                            structured_output: m.structured_output,
+                            reasoning: m.reasoning,
+                            vision: m.vision,
+                        },
+                        limits: ModelLimits {
+                            context_window: context,
+                            reliable_context: m.reliable_context.unwrap_or(context / 2),
+                            max_output_tokens: m.max_output_tokens.unwrap_or(8192),
+                            max_tool_schema_bytes: m.max_tool_schema_bytes.unwrap_or(32768),
+                            max_parallel_tool_calls: m
+                                .max_parallel_tool_calls
+                                .unwrap_or(usize::from(!m.parallel_tool_calls)),
+                            max_tool_output_bytes: m.max_tool_output_bytes,
+                        },
+                        context_quality: None,
+                        reasoning,
+                        compatibility: CompatibilityConfig {
+                            supports_temperature: m.supports_temperature,
+                            thinking_supports_forced_tool_choice: m
+                                .thinking_supports_forced_tool_choice,
+                            passback_reasoning_content: m.passback_reasoning_content,
+                            ..CompatibilityConfig::default()
+                        },
+                        // Global models use the default prompt; a per-model prompt
+                        // is a repo-config concern (configs/models/*.yaml).
+                        instructions: None,
+                        pricing: m.pricing,
+                    },
+                    policy: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mcp_servers = self
+            .mcp_servers
+            .into_iter()
+            .map(|s| {
+                let env = resolve_mcp_env_refs(&s.name, s.env);
+                McpServerConfig {
+                    name: s.name,
+                    command: s.command,
+                    args: s.args,
+                    // Config stores env-name *references*; resolve to real values
+                    // from the process environment (secrets never live in the file).
+                    env,
+                }
+            })
+            .collect();
+
+        GlobalBundle {
+            providers,
+            models,
+            default_model: self.default_model,
+            lang: self.lang,
+            theme: self.ui.theme,
+            vcs_co_author: self.vcs.co_author,
+            develop_model: self.develop.model,
+            mcp_servers,
+            agents_delegation: self.agents.delegation,
+            agents_independent_review: self.agents.independent_review,
+            browser_default: self
+                .browser
+                .default
+                .as_deref()
+                .and_then(leveler_browser::BrowserProduct::parse),
+        }
+    }
+}
+
+/// Reject MCP `env` map values that are not UPPER_SNAKE name references.
+/// Never echoes secret values.
+fn reject_mcp_env_secrets(value: &toml::Value) -> Result<(), GlobalConfigError> {
+    let Some(servers) = value.get("mcp_servers").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for server in servers {
+        let name = server
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        let Some(env) = server.get("env").and_then(|v| v.as_table()) else {
+            continue;
+        };
+        for (key, val) in env {
+            let Some(raw) = val.as_str() else {
+                return Err(GlobalConfigError::McpEnvNotString {
+                    server: name.to_string(),
+                    key: key.clone(),
+                });
+            };
+            // Same rules as `mcp add --env`: UPPER_SNAKE refs only; no tokens,
+            // no lowercase literals like `password`.
+            if crate::mcp_config::looks_like_secret_token(raw)
+                || !crate::mcp_config::is_env_name_ref(raw)
+            {
+                return Err(GlobalConfigError::McpSecretInConfig {
+                    server: name.to_string(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve MCP env map (`dest → source_env_name`) from the process environment.
+/// Unset sources are omitted (doctor reports the gap; a warn log names key only).
+fn resolve_mcp_env_refs(server: &str, env: BTreeMap<String, String>) -> Vec<(String, String)> {
+    resolve_mcp_env_refs_with(server, env, |source| std::env::var(source).ok())
+}
+
+/// Testable resolver: looks up each source name via `lookup`.
+fn resolve_mcp_env_refs_with(
+    server: &str,
+    env: BTreeMap<String, String>,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    env.into_iter()
+        .filter_map(|(dest, source)| {
+            if !crate::mcp_config::is_env_name_ref(&source) {
+                tracing::warn!(
+                    server,
+                    key = %dest,
+                    "MCP env value is not a valid UPPER_SNAKE name reference; skipped"
+                );
+                return None;
+            }
+            match lookup(&source) {
+                Some(v) => Some((dest, v)),
+                None => {
+                    tracing::warn!(
+                        server,
+                        key = %dest,
+                        source = %source,
+                        "MCP env source is unset; variable will not be forwarded"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_protocol(s: &str) -> ProtocolKind {
+    match s {
+        "openai_responses" => ProtocolKind::OpenAiResponses,
+        "anthropic_messages" => ProtocolKind::AnthropicMessages,
+        "gemini_generate_content" => ProtocolKind::GeminiGenerateContent,
+        _ => ProtocolKind::OpenAiChat,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reopening a session through the daemon leaves the client without a
+    /// model registry, and the snapshot names the model but not its limits —
+    /// so the footer had nothing to divide by and the context gauge stayed
+    /// blank for the rest of the session. The window the user configured is
+    /// readable by model ref or bare id.
+    #[test]
+    fn the_configured_context_window_is_readable_by_model_ref() {
+        let text = render_init_config(
+            "deepseek",
+            "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY",
+            "deepseek-chat",
+            131_072,
+        );
+        let parsed = GlobalConfig::from_toml_str(&text).expect("parses");
+        assert_eq!(
+            parsed.context_window_for("deepseek/deepseek-chat"),
+            Some(131_072)
+        );
+        assert_eq!(parsed.context_window_for("deepseek-chat"), Some(131_072));
+        assert_eq!(parsed.context_window_for("kimi/k3"), None);
+    }
+
+    #[test]
+    fn init_rendering_round_trips_through_the_parser() {
+        let text = render_init_config(
+            "deepseek",
+            "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY",
+            "deepseek-chat",
+            131_072,
+        );
+        let parsed = GlobalConfig::from_toml_str(&text)
+            .expect("init output must parse with the strict (deny_unknown_fields) parser");
+        assert_eq!(
+            parsed.default_model.as_deref(),
+            Some("deepseek/deepseek-chat")
+        );
+        let bundle = parsed.into_bundle();
+        assert_eq!(bundle.providers.len(), 1, "one provider: {text}");
+        assert_eq!(bundle.providers[0].id, "deepseek");
+        assert_eq!(bundle.providers[0].base_url, "https://api.deepseek.com");
+        assert_eq!(bundle.providers[0].api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(bundle.models.len(), 1, "one model: {text}");
+        assert_eq!(bundle.models[0].profile.id, "deepseek-chat");
+        assert_eq!(bundle.models[0].profile.limits.context_window, 131_072);
+    }
+
+    #[test]
+    fn init_rendering_escapes_awkward_values() {
+        // Values are user input; a quote or backslash must not corrupt the TOML.
+        let text = render_init_config(
+            "my-provider",
+            "https://例子.example/v1?a=\"b\"",
+            "MY_KEY",
+            "model.v1",
+            8192,
+        );
+        GlobalConfig::from_toml_str(&text).expect("escaped values must still parse");
+    }
+
+    /// The completion judge is gone. Its keys are still accepted so an
+    /// existing config file keeps parsing under `deny_unknown_fields`, and
+    /// they reach nothing.
+    #[test]
+    fn legacy_completion_judge_keys_still_parse_and_are_ignored() {
+        let legacy = GlobalConfig::from_toml_str(
+            "[agents]
+completion_judge_model = \"deepseek/deepseek-v4-pro\"
+completion_judge_timeout_seconds = 180
+",
+        )
+        .expect("legacy judge keys must still parse");
+        let _ = legacy.into_bundle();
+    }
+
+    #[test]
+    fn expands_a_compact_toml_into_a_full_bundle() {
+        let toml = r#"
+            default_model = "deepseek/deepseek-v4-pro"
+
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+            api_key_env = "DEEPSEEK_API_KEY"
+
+            [models."deepseek-v4-pro"]
+            provider = "deepseek"
+            context_window = 131072
+            vision = true
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        let bundle = cfg.into_bundle();
+
+        assert_eq!(
+            bundle.default_model.as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+        assert_eq!(bundle.providers.len(), 1);
+        assert_eq!(bundle.providers[0].id, "deepseek");
+        assert_eq!(bundle.providers[0].protocol, ProtocolKind::OpenAiChat);
+
+        assert_eq!(bundle.models.len(), 1);
+        let m = &bundle.models[0];
+        assert_eq!(m.profile.id, "deepseek-v4-pro");
+        assert_eq!(m.profile.model_id, "deepseek-v4-pro");
+        assert_eq!(m.profile.provider, "deepseek");
+        assert!(m.profile.capabilities.vision);
+        assert!(m.profile.capabilities.streaming);
+        assert!(m.profile.capabilities.tool_calling);
+        assert!(m.profile.capabilities.parallel_tool_calls);
+        assert!(m.profile.capabilities.structured_output);
+        assert_eq!(m.profile.limits.context_window, 131072);
+        assert_eq!(m.profile.limits.reliable_context, 65536);
+        assert_eq!(m.profile.limits.max_tool_schema_bytes, 32768);
+        assert_eq!(m.profile.limits.max_parallel_tool_calls, 0);
+        // Not set in the TOML above → defaults to 8192.
+        assert_eq!(m.profile.limits.max_output_tokens, 8192);
+        // Tier bindings are retired: global models never carry a policy ref.
+        assert_eq!(m.policy, None);
+    }
+
+    #[test]
+    fn reasoning_style_and_effort_reach_the_profile() {
+        let toml = r#"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+
+            [models."deepseek-v4-pro"]
+            provider = "deepseek"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            reasoning_effort = "high"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        let bundle = cfg.into_bundle();
+        let r = &bundle.models[0].profile.reasoning;
+        assert_eq!(r.style, ReasoningStyle::ThinkingFlag);
+        assert_eq!(r.default_effort, Some(ReasoningEffort::High));
+        assert_eq!(r.supported_efforts, vec![ReasoningEffort::High]);
+    }
+
+    #[test]
+    fn invalid_custom_reasoning_is_a_load_error() {
+        let toml = r#"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+
+            [models.broken]
+            provider = "deepseek"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            reasoning_effort = "medium"
+            supported_efforts = ["high", "max"]
+        "#;
+        let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("not in supported_efforts"), "{err}");
+    }
+
+    #[test]
+    fn reasoning_defaults_to_sending_nothing() {
+        let toml = r#"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+
+            [models."deepseek-chat"]
+            provider = "deepseek"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        let bundle = cfg.into_bundle();
+        let r = &bundle.models[0].profile.reasoning;
+        assert_eq!(r.style, ReasoningStyle::None);
+        assert_eq!(r.default_effort, None);
+    }
+
+    #[test]
+    fn global_model_accepts_complete_capability_and_limit_facts() {
+        let toml = r#"
+            [providers.openai]
+            base_url = "https://api.openai.com"
+
+            [models."capable"]
+            provider = "openai"
+            streaming = false
+            tool_calling = false
+            parallel_tool_calls = true
+            structured_output = false
+            context_window = 200000
+            reliable_context = 180000
+            max_output_tokens = 32000
+            max_tool_schema_bytes = 65536
+            max_parallel_tool_calls = 8
+        "#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let profile = &bundle.models[0].profile;
+        assert!(!profile.capabilities.streaming);
+        assert!(!profile.capabilities.tool_calling);
+        assert!(profile.capabilities.parallel_tool_calls);
+        assert!(!profile.capabilities.structured_output);
+        assert_eq!(profile.limits.reliable_context, 180000);
+        assert_eq!(profile.limits.max_tool_schema_bytes, 65536);
+        assert_eq!(profile.limits.max_parallel_tool_calls, 8);
+    }
+
+    #[test]
+    fn mcp_servers_parse_env_as_name_references() {
+        let toml = r#"
+            [[mcp_servers]]
+            name = "fs"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+            env = { FOO = "LEVELER_TEST_MCP_FOO", MISSING = "LEVELER_TEST_MCP_MISSING_XYZ" }
+        "#;
+        let cfg = GlobalConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        let s = &cfg.mcp_servers[0];
+        assert_eq!(s.name, "fs");
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args.len(), 3);
+        assert_eq!(
+            s.env.get("FOO").map(String::as_str),
+            Some("LEVELER_TEST_MCP_FOO")
+        );
+        assert_eq!(
+            s.env.get("MISSING").map(String::as_str),
+            Some("LEVELER_TEST_MCP_MISSING_XYZ")
+        );
+        // into_bundle resolves from process env; without those vars set, env is empty.
+        // Pure resolve logic is covered by `resolve_mcp_env_refs_with_lookup`.
+        let bundle = GlobalConfig::from_toml_str(toml).unwrap().into_bundle();
+        assert_eq!(bundle.mcp_servers[0].name, "fs");
+    }
+
+    #[test]
+    fn resolve_mcp_env_refs_with_lookup() {
+        let mut refs = BTreeMap::new();
+        refs.insert("FOO".into(), "SRC_FOO".into());
+        refs.insert("BAR".into(), "SRC_BAR".into());
+        let resolved = resolve_mcp_env_refs_with("svc", refs, |source| match source {
+            "SRC_FOO" => Some("resolved-value".into()),
+            _ => None,
+        });
+        assert_eq!(
+            resolved,
+            vec![("FOO".to_string(), "resolved-value".to_string())]
+        );
+    }
+
+    #[test]
+    fn mcp_env_plaintext_secret_is_rejected_without_echoing() {
+        let secret = "sk-supersecret-mcp-value";
+        let toml = format!(
+            r#"
+            [[mcp_servers]]
+            name = "gh"
+            command = "gh-mcp"
+            env = {{ GITHUB_TOKEN = "{secret}" }}
+        "#
+        );
+        let err = GlobalConfig::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GlobalConfigError::McpSecretInConfig { server, key }
+                    if server == "gh" && key == "GITHUB_TOKEN"
+            ),
+            "expected McpSecretInConfig, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "must never echo the secret value"
+        );
+    }
+
+    #[test]
+    fn mcp_env_identifier_shaped_plaintext_is_rejected_without_echoing() {
+        // Avoid substrings of the error template itself (e.g. the word "secret").
+        for literal in ["password", "hunter2", "s3cr3tvalue"] {
+            let toml = format!(
+                r#"
+                [[mcp_servers]]
+                name = "svc"
+                command = "echo"
+                env = {{ API_KEY = "{literal}" }}
+            "#
+            );
+            let err = GlobalConfig::from_toml_str(&toml).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    GlobalConfigError::McpSecretInConfig { server, key }
+                        if server == "svc" && key == "API_KEY"
+                ),
+                "literal {literal:?} must be rejected, got {err:?}"
+            );
+            assert!(
+                !err.to_string().contains(literal),
+                "must never echo the literal in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_env_non_string_value_is_rejected_as_not_string() {
+        let toml = r#"
+            [[mcp_servers]]
+            name = "svc"
+            command = "echo"
+            env = { API_KEY = 123 }
+        "#;
+        let err = GlobalConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GlobalConfigError::McpEnvNotString { server, key }
+                    if server == "svc" && key == "API_KEY"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn max_output_tokens_is_read_from_config() {
+        let toml = r#"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+
+            [models."m"]
+            provider = "deepseek"
+            max_output_tokens = 16384
+        "#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        assert_eq!(bundle.models[0].profile.limits.max_output_tokens, 16384);
+    }
+
+    #[test]
+    fn empty_config_yields_empty_bundle() {
+        let bundle = GlobalConfig::default().into_bundle();
+        assert!(bundle.providers.is_empty());
+        assert!(bundle.models.is_empty());
+        assert!(bundle.default_model.is_none());
+        assert!(bundle.lang.is_none());
+    }
+
+    #[test]
+    fn lang_is_read_from_config() {
+        let toml = r#"
+            default_model = "deepseek/m"
+            lang = "zh"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+            [models.m]
+            provider = "deepseek"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.lang.as_deref(), Some("zh"));
+        assert_eq!(cfg.into_bundle().lang.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn ui_theme_is_read_from_config() {
+        let toml = r#"
+            [ui]
+            theme = "night"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.into_bundle().theme.as_deref(), Some("night"));
+    }
+
+    #[test]
+    fn vcs_co_author_can_be_disabled() {
+        let config = GlobalConfig::from_toml_str("[vcs]\nco_author = false\n")
+            .expect("vcs.co_author must be a valid setting");
+        assert!(!config.into_bundle().vcs_co_author);
+        assert!(GlobalConfig::default().into_bundle().vcs_co_author);
+    }
+
+    #[test]
+    fn develop_model_is_read_from_config() {
+        let config = GlobalConfig::from_toml_str("[develop]\nmodel = \"openai/gpt-5.6\"\n")
+            .expect("develop.model must be a valid setting");
+        assert_eq!(
+            config.into_bundle().develop_model.as_deref(),
+            Some("openai/gpt-5.6")
+        );
+    }
+
+    #[test]
+    fn develop_model_is_optional() {
+        // `/develop` is a workflow, not a demand for a second model. A config
+        // that never mentions it must still be able to run one.
+        assert_eq!(GlobalConfig::default().into_bundle().develop_model, None);
+        let config = GlobalConfig::from_toml_str("default_model = \"deepseek/deepseek-v4-pro\"\n")
+            .expect("a config without a develop section is valid");
+        assert_eq!(config.into_bundle().develop_model, None);
+    }
+
+    #[test]
+    fn develop_config_is_carried_verbatim_not_validated_at_load() {
+        // Load must not reject it: a broken develop.model may not break every
+        // ordinary turn. `/develop` itself refuses it, where the user can see
+        // which command the refusal belongs to.
+        let config = GlobalConfig::from_toml_str("[develop]\nmodel = \"gpt-5.6\"\n")
+            .expect("an invalid develop.model must not fail the whole config");
+        assert_eq!(
+            config.into_bundle().develop_model.as_deref(),
+            Some("gpt-5.6")
+        );
+    }
+
+    #[test]
+    fn a_typo_in_the_develop_section_is_rejected() {
+        assert!(GlobalConfig::from_toml_str("[develop]\nmdoel = \"a/b\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        // deny_unknown_fields catches typos rather than silently ignoring them.
+        assert!(toml::from_str::<GlobalConfig>("bogus_key = 1").is_err());
+    }
+
+    #[test]
+    fn unknown_browser_is_rejected_instead_of_selecting_another_product() {
+        let err = GlobalConfig::from_toml_str("[browser]\ndefault = \"chorome\"\n")
+            .expect_err("a browser typo must be an error");
+        assert!(err.to_string().contains("[browser].default"), "{err}");
+        assert!(err.to_string().contains("chorome"), "{err}");
+    }
+
+    #[test]
+    fn provider_headers_reach_the_provider_config() {
+        // Some endpoints gate on User-Agent; the global TOML must be able to set it.
+        let toml = r#"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+headers = { user-agent = "custom-client/0.1.0" }
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let provider = &bundle.providers[0];
+        assert_eq!(
+            provider.headers.get("user-agent").map(String::as_str),
+            Some("custom-client/0.1.0")
+        );
+    }
+
+    #[test]
+    fn plaintext_provider_api_key_is_accepted() {
+        let toml = "[providers.kimi]\nbase_url = \"https://e\"\napi_key = \"sk-supersecret\"\napi_key_env = \"KIMI_API_KEY\"\n";
+        let bundle = GlobalConfig::from_toml_str(toml).unwrap().into_bundle();
+        let p = &bundle.providers[0];
+        assert_eq!(p.id, "kimi");
+        assert_eq!(p.api_key.as_deref(), Some("sk-supersecret"));
+        assert_eq!(p.api_key_env, "KIMI_API_KEY");
+    }
+
+    #[test]
+    fn supports_temperature_defaults_true_and_can_be_disabled() {
+        let toml = r#"
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+
+[models."kimi-for-coding"]
+provider = "kimi"
+supports_temperature = false
+
+[models."normal"]
+provider = "kimi"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .supports_temperature
+        };
+        assert!(!find("kimi-for-coding"), "explicit false must be honored");
+        assert!(find("normal"), "omitted must default to true");
+    }
+
+    #[test]
+    fn thinking_forced_tool_choice_defaults_true_and_can_be_disabled() {
+        let toml = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+
+[models."thinking-forced-incompatible"]
+provider = "deepseek"
+thinking_supports_forced_tool_choice = false
+
+[models."legacy"]
+provider = "deepseek"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .thinking_supports_forced_tool_choice
+        };
+        assert!(
+            !find("thinking-forced-incompatible"),
+            "explicit false must reach the profile"
+        );
+        assert!(
+            find("legacy"),
+            "legacy profiles keep the compatible default"
+        );
+    }
+
+    #[test]
+    fn passback_reasoning_content_defaults_false_and_can_be_enabled() {
+        let toml = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+
+[models."needs-passback"]
+provider = "deepseek"
+passback_reasoning_content = true
+
+[models."legacy"]
+provider = "deepseek"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .passback_reasoning_content
+        };
+        assert!(
+            find("needs-passback"),
+            "explicit true must reach the profile"
+        );
+        assert!(!find("legacy"), "legacy profiles never send the key");
+    }
+}

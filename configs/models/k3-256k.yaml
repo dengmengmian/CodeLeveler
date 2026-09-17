@@ -1,0 +1,36 @@
+# Kimi K3 (256K) — the same K3 model with a 256K context window (model id: k3-256k).
+# Docs: https://www.kimi.com/code/docs/kimi-code/models (read 2026-09-17)
+# Cheaper than the 1M id: k3 (1M) consumes about twice as much.
+# Moderato and above may call it; 1M context is what needs Allegretto, and this
+# id does not ask for it.
+id: k3-256k
+provider: kimi
+model_id: k3-256k
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  # Images only: this id does not take video, so a session carrying video input
+  # has to be compacted before switching to it.
+  vision: true
+reasoning:
+  style: open_ai_effort
+  supported_efforts: [low, high, max]
+  # Official default is `high` (null → high; unknown → HTTP 400); CodeLeveler's
+  # own default is `max`, matching the 1M `k3` id. Not a vendor default.
+  default_effort: max
+limits:
+  context_window: 262144
+  reliable_context: 196608
+  # Mirrors `k3`: the same model behind a smaller window.
+  max_output_tokens: 65536
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+  # Kimi Coding endpoints reject caller-chosen temperature (only default allowed).
+  supports_temperature: false

@@ -1,0 +1,635 @@
+//! The `Tool` trait and its supporting types (spec §18.1).
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
+use leveler_context::FileStateTracker;
+use leveler_execution::{
+    Checkpoint, CommandRunner, PermissionProfile, ProcessError, ResolvedExecutionPolicy, RiskLevel,
+    SharedPermissionProfile, Workspace, WorkspaceError, WriteScope,
+};
+
+/// Shared, cheaply-cloneable context handed to every tool invocation:
+///
+/// - [`ExecutionResources`] — the execution substrate this call is anchored
+///   to: the workspace whose root the write scope is resolved against, the
+///   process runner, the rollback checkpoint, the read fingerprints, the
+///   workspace-wide command gate. Process-wide `Arc`s, one instance for the
+///   whole run including sub-agents.
+/// - [`ToolPolicy`] — the per-call authority: gates and budgets, and the
+///   frozen policy the ToolHost minted at admission. The only
+///   security-loosening switches live here behind named grant methods.
+/// - `session_scope` — which session this call belongs to.
+///
+/// It carries NO capability handles. There used to be a third facet,
+/// `ToolServices`, holding the language-server pool, the browser runtime, the
+/// memory root, the artifact store and the background task registry — so
+/// `read_file` was handed the browser and `grep` could start a language
+/// server. Every tool is now CONSTRUCTED with the handles it uses
+/// ([`crate::Capabilities`]), and a tool that has no business with a
+/// capability has no way to reach it.
+///
+/// ANTI-GROWTH RULE: a new top-level field is not allowed, and a new
+/// capability is not a candidate for one — it goes to the tools that use it at
+/// construction. What may live here is per-call authority or per-call
+/// identity, and it must name its owner in review.
+#[derive(Clone)]
+pub struct ToolContext {
+    pub execution: ExecutionResources,
+    pub policy: ToolPolicy,
+    /// Stable identity of the session this context serves, used to isolate
+    /// per-session capability state (e.g. browser pages/refs — §18). `None` for
+    /// non-session contexts (eval, one-shot CLI); those share a default scope.
+    pub session_scope: Option<Arc<str>>,
+    /// Where a command call sends its live output while it runs. Set per call
+    /// by the host that shows it; `None` runs the command without streaming.
+    pub output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
+}
+
+/// Process-wide execution and write-safety infrastructure. Every handle is an
+/// `Arc` shared across turns and sub-agents: mutating interior state (the
+/// checkpoint, file fingerprints, the command gate) is globally visible by
+/// design.
+#[derive(Clone)]
+pub struct ExecutionResources {
+    pub workspace: Arc<Workspace>,
+    pub runner: Arc<CommandRunner>,
+    pub environment: Arc<leveler_core::EnvSnapshot>,
+    /// Captures original file content before the first write, for rollback.
+    pub checkpoint: Arc<Checkpoint>,
+    /// Fingerprints files as they were last read, so `apply_patch` can refuse
+    /// to overwrite a file something else changed in the meantime.
+    pub file_state: Arc<FileStateTracker>,
+    /// Serializes workspace-wide commands across concurrent sub-agents.
+    ///
+    /// Parallel workers own disjoint *files*, but they share one working tree
+    /// and one build directory. Without this, agent A's `cargo test` can run
+    /// against source that agent B is halfway through rewriting, and the
+    /// result looks authoritative while being meaningless. `ToolContext` is
+    /// cloned into every child, so the `Arc` makes one gate for the whole run.
+    pub command_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Gates and budgets — the scope-varying part of the context. Per-engine
+/// (`mode`, `read_only`), per-turn (`tool_output_budget`, network grant), and
+/// per-invocation (write constraints, fs grant) knobs live together because
+/// they share one change reason: what is this execution allowed to do.
+#[derive(Clone)]
+pub struct ToolPolicy {
+    /// The task's permission profile, held by REFERENCE, not by value.
+    ///
+    /// A turn used to freeze this at startup, so switching to 完全访问 while a
+    /// turn was running left that turn — and every agent it had already
+    /// delegated to — authorizing under the old profile while the UI and the
+    /// session row both said otherwise. Private so nothing can read a stale
+    /// copy: [`Self::mode`] is the only way in, and it always reads the cell.
+    permission_profile: SharedPermissionProfile,
+    /// Collaboration-plan / `leveler plan` read-only overlay: only Safe tools.
+    /// Orthogonal to the three-tier [`PermissionProfile`].
+    pub read_only: bool,
+    /// An explicit run-level network denial (`--deny-network`), on top of the
+    /// profile's own default. PRIVATE: set only through
+    /// [`ToolContext::with_sandbox`].
+    deny_network: bool,
+    /// A user-approved network grant (`request_permissions`, a turn approval,
+    /// or one call's `escalate`). PRIVATE: set only through
+    /// [`Self::grant_network`], so the elevation surface stays auditable in
+    /// one place.
+    network_granted: bool,
+    /// Turn-scoped grant from `request_permissions`: drop write
+    /// confinement for `run_command` / `shell_command`. PRIVATE: granted only
+    /// through [`Self::grant_unrestricted_fs`].
+    turn_unrestricted_fs: bool,
+    /// The policy an ADMITTED call executes under (PR 5). Set once by the
+    /// ToolHost at admission; while present, [`Self::write_scope`] and
+    /// [`Self::network_denied`] answer from it and never from the live
+    /// profile or the turn flags above — those are inputs to resolution,
+    /// not something a running tool may re-read.
+    resolved: Option<ResolvedExecutionPolicy>,
+    /// Extra env var names scrubbed from `run_command` children (the
+    /// configured providers' `api_key_env` names).
+    pub deny_env: Arc<Vec<String>>,
+    /// Max files a single `apply_patch` may touch (0 = unlimited).
+    pub max_files_per_step: usize,
+    /// Paths a command may modify. `None` means unrestricted.
+    pub command_write_allowlist: Option<Arc<Vec<String>>>,
+    /// How many additional files a command may modify. `None` means unlimited.
+    pub command_modified_files_remaining: Option<usize>,
+    /// Files already counted against the run budget before this command.
+    pub command_previously_modified: Arc<Vec<String>>,
+    /// Paths exclusively owned by ANOTHER agent while this call runs.
+    ///
+    /// A command's workspace changes are attributed by diffing the whole
+    /// workspace around it, which in a shared tree with concurrent children
+    /// also catches a sibling's writes. This call cannot have made those — the
+    /// ownership fence and the write allowlist both refuse them — so they are
+    /// excluded from attribution. Without it, a sibling's authorized write is
+    /// charged here as a violation and rolled back with the rest.
+    pub command_foreign_paths: Arc<Vec<String>>,
+    /// Per-model byte budget for a single tool result (the central cap applied
+    /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
+    /// a model with a smaller reliable context may configure less.
+    pub tool_output_budget: usize,
+}
+
+impl ToolPolicy {
+    /// The permission profile in force RIGHT NOW. Every authorization
+    /// decision goes through here, so a change the user makes mid-turn is
+    /// seen by the next decision — in the main agent and in children that
+    /// were delegated before the change.
+    pub fn mode(&self) -> PermissionProfile {
+        self.permission_profile.get()
+    }
+
+    /// The live cell itself, for a host that owns the session's profile.
+    pub fn permission_profile(&self) -> &SharedPermissionProfile {
+        &self.permission_profile
+    }
+
+    /// Whether this execution runs with network access denied: the frozen
+    /// policy of an admitted call, else no grant and either an explicit
+    /// denial or a profile that does not reach the network by default. Reads
+    /// the live profile, so a switch lands on the next call.
+    pub fn network_denied(&self) -> bool {
+        if let Some(resolved) = &self.resolved {
+            return !resolved.network_allowed;
+        }
+        !self.network_granted && (self.deny_network || !self.mode().network_by_default())
+    }
+
+    /// Whether the run itself denies the network (`--deny-network`), as
+    /// opposed to the profile's default. A process CodeLeveler cannot confine
+    /// (an MCP server) is refused under an explicit denial; under the profile
+    /// default it goes to the user like any other network use.
+    pub fn network_explicitly_denied(&self) -> bool {
+        self.deny_network && !self.network_granted
+    }
+
+    /// The frozen per-call policy, when this context belongs to an admitted
+    /// call.
+    pub fn resolved_policy(&self) -> Option<&ResolvedExecutionPolicy> {
+        self.resolved.as_ref()
+    }
+
+    /// Whether this scope holds an unrestricted-filesystem grant.
+    pub fn unrestricted_fs(&self) -> bool {
+        self.turn_unrestricted_fs
+    }
+
+    /// The write boundary this execution runs under, read once.
+    ///
+    /// Replaces the predicate `mode().confines_workspace() &&
+    /// !unrestricted_fs()` that `run_command` spelled out at every site, plus
+    /// the separate `has_zero_write_authority()` reading; the answer is the
+    /// same, it is just one answer now. Reads the live profile cell, so a
+    /// mid-turn switch lands on the next call.
+    pub fn write_scope(&self, workspace_root: &std::path::Path) -> WriteScope {
+        if let Some(resolved) = &self.resolved {
+            return resolved.write.clone();
+        }
+        if self.turn_unrestricted_fs {
+            return WriteScope::Unrestricted;
+        }
+        match self.mode().write_scope(workspace_root) {
+            WriteScope::Workspace { .. } if self.has_zero_write_authority() => WriteScope::None,
+            scope => scope,
+        }
+    }
+
+    /// User-approved network grant (from `request_permissions`). The ONLY way
+    /// to clear the network denial after construction.
+    pub fn grant_network(&mut self) {
+        self.network_granted = true;
+    }
+
+    /// User-approved filesystem elevation (from `request_permissions` or a
+    /// post-approval host escape). The ONLY way to set the grant.
+    pub fn grant_unrestricted_fs(&mut self) {
+        self.turn_unrestricted_fs = true;
+    }
+
+    /// Whether `path` (workspace-relative) is outside the live write allowlist.
+    /// `None` allowlist = unrestricted. An empty allowlist is zero authority:
+    /// every path is denied (late-bound child before `claim_write_scope`).
+    pub fn write_path_denied(&self, path: &str) -> Option<String> {
+        let allow = self.command_write_allowlist.as_deref()?;
+        let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+        if allow.iter().any(|a| {
+            let a = a.trim_end_matches('/');
+            !a.is_empty() && (path == a || path.starts_with(&format!("{a}/")))
+        }) {
+            return None;
+        }
+        Some(if allow.is_empty() {
+            format!(
+                "Edit rejected: no write scope is currently owned. Read the relevant \
+                 code, then use claim_write_scope(paths) before modifying files \
+                 (denied: {path})."
+            )
+        } else {
+            format!(
+                "Edit rejected: {path} is outside your claimed scope ({}). Claim it \
+                 with claim_write_scope first, or stay within your scope.",
+                allow.join(", ")
+            )
+        })
+    }
+
+    /// Zero claimed paths and not a structurally read-only overlay: a command
+    /// that can mutate the workspace must not run (git-after-the-fact cannot
+    /// see empty-directory removals).
+    pub fn has_zero_write_authority(&self) -> bool {
+        self.command_write_allowlist
+            .as_deref()
+            .is_some_and(|allow| allow.is_empty())
+            && !self.read_only
+    }
+}
+
+impl ToolContext {
+    pub fn new(workspace: Workspace, mode: PermissionProfile) -> Self {
+        let env = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ));
+        Self::with_environment(workspace, mode, env.clone())
+    }
+
+    pub fn with_environment(
+        workspace: Workspace,
+        mode: PermissionProfile,
+        environment: Arc<leveler_core::EnvSnapshot>,
+    ) -> Self {
+        Self {
+            execution: ExecutionResources {
+                workspace: Arc::new(workspace),
+                runner: Arc::new(CommandRunner::with_environment(environment.clone())),
+                environment,
+                checkpoint: Arc::new(Checkpoint::new()),
+                file_state: Arc::new(FileStateTracker::default()),
+                command_gate: Arc::new(tokio::sync::Mutex::new(())),
+            },
+            policy: ToolPolicy {
+                permission_profile: SharedPermissionProfile::new(mode),
+                read_only: false,
+                deny_network: false,
+                network_granted: false,
+                turn_unrestricted_fs: false,
+                resolved: None,
+                deny_env: Arc::new(Vec::new()),
+                max_files_per_step: 0,
+                command_write_allowlist: None,
+                command_modified_files_remaining: None,
+                command_previously_modified: Arc::new(Vec::new()),
+                command_foreign_paths: Arc::new(Vec::new()),
+                tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
+            },
+            session_scope: None,
+            output: None,
+        }
+    }
+
+    /// Point this context at a permission profile the SESSION owns, instead
+    /// of the private cell the constructor made.
+    ///
+    /// This is what makes a permission change reach a turn that is already
+    /// running: the host holds the cell, the turn holds a reference, and
+    /// `ToolContext` is cloned into every child — so one write is seen by the
+    /// whole agent tree at its next authorization decision, with nothing to
+    /// broadcast and nothing to restart.
+    pub fn with_permission_profile(mut self, profile: SharedPermissionProfile) -> Self {
+        self.policy.permission_profile = profile;
+        self
+    }
+
+    /// Freeze this context to one admitted call's policy (PR 5). The ToolHost
+    /// is the only caller; a tool never widens its own policy.
+    pub fn with_resolved_policy(mut self, resolved: ResolvedExecutionPolicy) -> Self {
+        self.policy.resolved = Some(resolved);
+        self
+    }
+
+    /// Bind this context to a session identity (browser page/ref isolation).
+    pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
+        self.session_scope = Some(scope.into());
+        self
+    }
+
+    /// The session scope for capability isolation, defaulting to a shared scope
+    /// when this context has no session identity.
+    pub fn session_scope(&self) -> &str {
+        self.session_scope.as_deref().unwrap_or("default")
+    }
+
+    /// Force Safe-only tools (collaboration plan / read-only planning).
+    pub fn with_read_only(mut self, on: bool) -> Self {
+        self.policy.read_only = on;
+        self
+    }
+
+    /// Enable network sandboxing for `run_command` processes.
+    pub fn with_sandbox(mut self, deny_network: bool) -> Self {
+        self.policy.deny_network = deny_network;
+        self
+    }
+
+    /// Env var names to scrub from `run_command` children, on top of the
+    /// built-in denylist and secret-suffix patterns.
+    pub fn with_deny_env(mut self, names: Vec<String>) -> Self {
+        self.policy.deny_env = Arc::new(names);
+        self
+    }
+
+    /// Constrain command-driven workspace mutations. Violations are rolled
+    /// back to the pre-command snapshot by `run_command`.
+    /// [`ToolPolicy::write_scope`] anchored on this context's workspace.
+    pub fn write_scope(&self) -> WriteScope {
+        self.policy.write_scope(self.execution.workspace.root())
+    }
+
+    pub fn with_command_write_constraints(
+        mut self,
+        allowlist: Option<Vec<String>>,
+        modified_files_remaining: Option<usize>,
+        previously_modified: Vec<String>,
+    ) -> Self {
+        self.policy.command_write_allowlist = allowlist.map(Arc::new);
+        self.policy.command_modified_files_remaining = modified_files_remaining;
+        self.policy.command_previously_modified = Arc::new(previously_modified);
+        self
+    }
+
+    /// Paths another agent exclusively owns for the duration of this call.
+    pub fn with_foreign_owned_paths(mut self, paths: Vec<String>) -> Self {
+        self.policy.command_foreign_paths = Arc::new(paths);
+        self
+    }
+
+    /// Apply the model-policy per-step file cap (spec §17).
+    pub fn with_policy_limits(mut self, max_files_per_step: usize) -> Self {
+        self.policy.max_files_per_step = max_files_per_step;
+        self
+    }
+}
+
+/// The result of a tool invocation. `is_error` tells the agent loop to present
+/// this to the model as a failure it should react to (vs. infrastructure errors,
+/// which surface as [`ToolError`]).
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
+    pub metadata: serde_json::Value,
+}
+
+impl ToolOutput {
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Infrastructure-level tool errors (as opposed to model-visible failures, which
+/// are returned as [`ToolOutput`] with `is_error = true`).
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    #[error("unknown tool `{0}`")]
+    NotFound(String),
+    #[error("invalid arguments for `{tool}`: {message}")]
+    InvalidArguments { tool: String, message: String },
+    #[error("tool `{tool}` is not permitted in {mode:?} mode (risk {risk:?})")]
+    NotPermitted {
+        tool: String,
+        mode: PermissionProfile,
+        risk: RiskLevel,
+    },
+    #[error("workspace error: {0}")]
+    Workspace(#[from] WorkspaceError),
+    #[error("process error: {0}")]
+    Process(#[from] ProcessError),
+    #[error("io error: {0}")]
+    Io(String),
+}
+
+/// A tool the model can call. Implementations must be stateless (or internally
+/// synchronized) since one instance is shared across the process.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// The stable tool name exposed to the model. Borrowed from the tool
+    /// instance so runtime-discovered tools (MCP, future extensions) can own
+    /// their metadata; built-ins keep returning `&'static str` literals.
+    fn name(&self) -> &str;
+
+    /// A concise description for the model. Same ownership contract as
+    /// [`Self::name`].
+    fn description(&self) -> &str;
+
+    /// The JSON Schema for this tool's arguments.
+    fn input_schema(&self) -> serde_json::Value;
+
+    /// Repair a narrow, known-compatible argument shape before schema
+    /// validation. The normalized value is still validated against
+    /// [`Self::input_schema`]; implementations must not use this to weaken the
+    /// tool's argument contract.
+    fn normalize_input(&self, input: serde_json::Value) -> serde_json::Value {
+        input
+    }
+
+    /// Phrase the refusal for a structurally invalid call, in this tool's
+    /// own vocabulary. Consulted by the registry ONLY after schema validation
+    /// has already rejected the input — returning `Some` replaces the bare
+    /// schema error with actionable guidance; `None` (the default) lets the
+    /// schema error surface as-is.
+    ///
+    /// Implementations must never execute anything and never repair the
+    /// input: the call is refused either way, this only decides the wording.
+    fn invalid_input_guidance(&self, _input: &serde_json::Value) -> Option<String> {
+        None
+    }
+
+    /// The risk class of this tool.
+    fn risk(&self) -> RiskLevel;
+
+    /// Whether this tool is a pure, read-only lookup that is safe to run
+    /// concurrently with other parallel-safe tools requested in the same round.
+    /// Defaults to `false` (serialized). Any tool with side effects — edits,
+    /// commands, plan updates, checkpoints — MUST leave this `false` so the
+    /// executor keeps running it in order.
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool edits workspace files through its own arguments (a
+    /// patch, a replacement), as opposed to a command that happens to write.
+    ///
+    /// The agent loop reads this instead of matching on tool names, so it
+    /// charges the per-step file budget, records a mutation on the evidence
+    /// ledger, and re-fingerprints touched files for any such tool — including
+    /// ones registered outside this crate.
+    fn mutates_files(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool executes a shell command.
+    ///
+    /// The agent loop reads this instead of matching on tool names, so command
+    /// budgets, verification detection, and the failing-command stagnation
+    /// signal apply to any command-executing tool.
+    fn runs_command(&self) -> bool {
+        false
+    }
+
+    /// Whether re-running this call after a crash, with the same arguments, is
+    /// guaranteed to have no external effect beyond what the first (possibly
+    /// completed) attempt already had.
+    ///
+    /// **Defaults to `false`, and that default is the safe one.** Crash
+    /// recovery may auto-replay a tool ONLY when this is `true`; everything
+    /// else stops for human reconciliation.
+    ///
+    /// This is deliberately NOT derived from [`Self::risk`]. `RiskLevel::Safe`
+    /// answers "does this need approval", and it admits side effects:
+    /// `create_checkpoint` resets the rollback baseline and `wait_task` can
+    /// restore a workspace snapshot, yet both are Safe. Replaying either after
+    /// a crash would silently undo work. Only a tool that reads and returns —
+    /// with no write, no process, no external call — may set this.
+    fn replay_is_side_effect_free(&self) -> bool {
+        false
+    }
+
+    /// Execute the tool with already-schema-validated arguments.
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError>;
+}
+
+#[cfg(test)]
+mod write_scope_tests {
+    use super::*;
+    use leveler_execution::WriteScope;
+
+    fn ctx(mode: PermissionProfile) -> (ToolContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        (ToolContext::new(ws, mode), dir)
+    }
+
+    /// PR 1. `ToolPolicy::write_scope` is the single reading of what today is
+    /// spelled three times in `run_command` as
+    /// `mode().confines_workspace() && !unrestricted_fs()` plus a separate
+    /// `has_zero_write_authority()`. Every row here pins a behavior that
+    /// already exists.
+    #[test]
+    fn assisted_confines_writes_to_the_workspace() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let root = c.execution.workspace.root().to_path_buf();
+        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+    }
+
+    #[test]
+    fn full_access_is_unrestricted() {
+        let (c, _d) = ctx(PermissionProfile::FullAccess);
+        assert_eq!(c.write_scope(), WriteScope::Unrestricted);
+    }
+
+    /// The network half of the profile: request-approval runs commands with
+    /// the network denied until a grant; the others allow; an explicit
+    /// `--deny-network` denies under every profile.
+    #[test]
+    fn the_effective_network_follows_the_live_profile_and_grants() {
+        let (c, _d) = ctx(PermissionProfile::RequestApproval);
+        assert!(c.policy.network_denied());
+        assert!(!c.policy.network_explicitly_denied());
+
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        assert!(!c.policy.network_denied());
+        c.policy
+            .permission_profile()
+            .set(PermissionProfile::RequestApproval);
+        assert!(
+            c.policy.network_denied(),
+            "a switch to request-approval denies the next call"
+        );
+
+        let (mut c, _d) = ctx(PermissionProfile::RequestApproval);
+        c.policy.grant_network();
+        assert!(
+            !c.policy.network_denied(),
+            "a grant lifts the profile default"
+        );
+
+        let (c, _d) = ctx(PermissionProfile::FullAccess);
+        let c = c.with_sandbox(true);
+        assert!(c.policy.network_denied());
+        assert!(c.policy.network_explicitly_denied());
+        let mut c = c;
+        c.policy.grant_network();
+        assert!(
+            !c.policy.network_denied(),
+            "a grant lifts an explicit denial too"
+        );
+    }
+
+    #[test]
+    fn a_turn_grant_lifts_confinement() {
+        let (mut c, _d) = ctx(PermissionProfile::Assisted);
+        c.policy.grant_unrestricted_fs();
+        assert_eq!(c.write_scope(), WriteScope::Unrestricted);
+    }
+
+    /// A late-bound child before `claim_write_scope`: empty allowlist, no
+    /// read-only overlay → nothing may be written.
+    #[test]
+    fn zero_write_authority_is_none() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let c = c.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        assert_eq!(c.write_scope(), WriteScope::None);
+    }
+
+    /// The read-only OVERLAY (`leveler plan`) is orthogonal: it filters tools
+    /// by risk rather than by write scope, so `has_zero_write_authority` is
+    /// false under it and the scope stays the workspace. Pinned so the adapter
+    /// does not quietly merge two mechanisms.
+    #[test]
+    fn read_only_overlay_does_not_collapse_into_none() {
+        let (mut c, _d) = ctx(PermissionProfile::Assisted);
+        c.policy.read_only = true;
+        let root = c.execution.workspace.root().to_path_buf();
+        let c = c.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+    }
+
+    /// Mirrors the predicate it replaces, for the live profile cell too: a
+    /// switch to 完全访问 mid-turn is seen by the next reading.
+    #[test]
+    fn write_scope_follows_the_live_profile() {
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        assert!(c.write_scope().confines());
+        c.policy
+            .permission_profile()
+            .set(PermissionProfile::FullAccess);
+        assert!(!c.write_scope().confines());
+    }
+}

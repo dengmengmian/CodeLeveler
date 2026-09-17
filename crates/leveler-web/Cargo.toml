@@ -1,0 +1,39 @@
+[package]
+name = "leveler-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Browser WebUI server for CodeLeveler: REST + WebSocket on top of the local runtime service."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-client-protocol = { workspace = true }
+leveler-local-transport = { workspace = true }
+leveler-project = { workspace = true }
+leveler-storage = { workspace = true }
+axum = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+ignore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = "4.0.2"
+base64 = { workspace = true }
+
+[dev-dependencies]
+leveler-client-protocol = { workspace = true, features = ["testing"] }
+leveler-test-support = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+tempfile = "3"
+tokio-tungstenite = "0.26"

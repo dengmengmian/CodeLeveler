@@ -1,0 +1,236 @@
+//! The reducer's input ([`Action`]) and output ([`Effect`]).
+//!
+//! Terminal input and runtime events are both funneled into `Action`; the
+//! reducer folds them into [`AppState`] and returns `Effect`s the event loop
+//! performs at the edge (send a command, quit). This keeps the reducer pure and
+//! testable without a terminal or a live client .
+
+use crossterm::event::{KeyEvent, MouseEvent};
+
+use leveler_client_protocol::{ClientCommand, CommandId, RuntimeEvent, UiSessionSnapshot};
+
+use crate::state::PendingInteraction;
+
+/// Result produced by an asynchronous edge effect and folded back through the
+/// reducer. Keeping completions as actions prevents network and filesystem
+/// latency from blocking terminal input or runtime events.
+#[derive(Debug, Clone)]
+pub enum EffectCompletion {
+    CommandDelivered,
+    /// The runtime answered with an error: it is reachable, and it did not
+    /// accept the command.
+    CommandRejected {
+        /// The command that was refused, so a control waiting on it (a stop
+        /// request) can settle.
+        command: ClientCommand,
+        message: String,
+        /// Best-effort authoritative state used to roll back optimistic UI.
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// No answer: the command may or may not have run.
+    CommandUncertain {
+        command: ClientCommand,
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime admitted this turn input (now, or on an earlier attempt).
+    SubmissionDelivered {
+        command_id: CommandId,
+        /// Present when the answer came after a reconnect, so the view resyncs
+        /// with whatever the runtime did meanwhile.
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime answered that it did not run this turn input.
+    SubmissionRejected {
+        command_id: CommandId,
+        message: String,
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The runtime proved this turn input's outcome unrecoverable: admitted,
+    /// but the boot dispatching it ended before recording what happened. Final:
+    /// never re-delivered, and not a failure, a completion, or "not delivered".
+    SubmissionUnresolvable {
+        command_id: CommandId,
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+    /// The first attempt got no answer; the same envelope is being re-delivered
+    /// until the runtime gives one.
+    SubmissionUnconfirmed {
+        command_id: CommandId,
+    },
+    InteractionDelivered {
+        key: String,
+    },
+    InteractionUncertain {
+        key: String,
+        restore: PendingInteraction,
+        /// Boxed so the enum stays small (snapshot is a large reconnect payload).
+        snapshot: Option<Box<UiSessionSnapshot>>,
+    },
+}
+
+/// Something that happened and needs to be folded into state.
+///
+/// `Runtime` is the largest variant, but an `Action` is short-lived — one is
+/// created per event and consumed by `reduce` immediately, never stored in
+/// bulk — so boxing it would only add noise at every construction site.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum Action {
+    /// `/remote` finished, one way or another.
+    Remote(RemoteOutcome),
+    /// An event from the runtime.
+    Runtime(RuntimeEvent),
+    /// A key press.
+    Key(KeyEvent),
+    /// Mouse wheel / drag / click (Conversation viewport).
+    Mouse(MouseEvent),
+    /// Drive edge auto-scroll while a text selection drag is active.
+    SelectionTick,
+    /// A burst of plain text typed into the composer.
+    TextInput(String),
+    /// A bracketed-paste payload.
+    Paste(String),
+    /// The terminal was resized to (cols, rows).
+    Resize(u16, u16),
+    /// Project file paths loaded at the terminal edge for `@file` completion.
+    FileCandidatesLoaded(Vec<String>),
+    /// An asynchronous edge effect completed.
+    EffectCompleted(EffectCompletion),
+    /// The embedded Web UI server finished starting: `Ok(url)` with the
+    /// token-carrying URL, or `Err(message)` if it could not start.
+    WebLaunched(Result<String, String>),
+    /// The host finished handing a URL to the user's default browser.
+    UrlOpened {
+        url: String,
+        result: Result<(), String>,
+    },
+    /// `$EDITOR` exited: `Ok(text)` is whatever was left in the buffer (empty
+    /// means the user deleted everything and meant it), `Err(message)` is why
+    /// it could not run.
+    EditorFinished(Result<String, String>),
+}
+
+/// A side effect for the event loop to carry out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Send a command to the runtime.
+    Send(ClientCommand),
+    /// Deliver a turn input under the id the reducer minted for it and keeps
+    /// in [`crate::state::AppState::pending_submissions`]. Retries reuse the id.
+    Submit {
+        command: ClientCommand,
+        command_id: CommandId,
+    },
+    /// Send an approval/clarification answer with a stable [`CommandId`] for
+    /// at-least-once retries. On transport failure the event loop confirms
+    /// delivery via snapshot before restoring `restore`.
+    SendInteraction {
+        command: ClientCommand,
+        restore: crate::state::PendingInteraction,
+        /// Idempotency key — reused across retries of the same decision.
+        command_id: CommandId,
+    },
+    /// Load repository files without blocking the pure reducer.
+    LoadFileCandidates { repository: String },
+    /// Start the embedded browser Web UI server (`/web`). The event loop runs
+    /// the injected [`WebLauncher`] and folds its result back as
+    /// [`Action::WebLaunched`].
+    StartWeb,
+    /// Open a URL in the default browser (conversation link click, or `/web`
+    /// re-invocation when the server is already up).
+    OpenWebUrl(String),
+    /// Make this machine reachable from a paired phone and produce an invite
+    /// (`/remote`). `local` binds the relay to this machine's LAN address
+    /// instead of expecting one on the internet — a phone on the same Wi-Fi can
+    /// reach that, and it needs no server anywhere.
+    StartRemote { local: bool },
+    /// Accept or reject the device waiting to pair, from the invite screen.
+    AnswerPairing { accept: bool },
+    /// Suspend the TUI, open `$VISUAL`/`$EDITOR` on the current draft, and fold
+    /// the result back as [`Action::EditorFinished`]. The composer is a poor
+    /// place to write a long prompt; this is the standard way out of it.
+    OpenExternalEditor { text: String },
+    /// Tear down the UI and exit.
+    Quit,
+}
+
+/// What `/remote` produced: everything the invite screen shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInvite {
+    /// The QR, already rendered as terminal rows. The TUI does not encode it
+    /// itself — that would put a QR library in a crate whose job is drawing.
+    pub qr: Vec<String>,
+    /// The payload the QR encodes, for a phone that cannot scan.
+    pub payload: String,
+    /// This machine's key fingerprint, for the user to compare on the phone.
+    pub host_fingerprint: String,
+    /// Where the phone will connect, shown so a user can see it is their own
+    /// network rather than someone else's server.
+    pub relay_url: String,
+}
+
+/// A device waiting for this machine to accept it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub device_name: String,
+    pub platform: String,
+    /// What the user compares with the phone's screen. The whole security of
+    /// pairing is this one comparison.
+    pub fingerprint: String,
+}
+
+/// Injected at startup by the CLI: makes this machine reachable and answers the
+/// pairing it produces. Opaque so `leveler-tui` needs neither the relay nor the
+/// agent — the same reason [`WebLauncher`] is a closure.
+pub type RemoteLauncher = std::sync::Arc<
+    dyn Fn(
+            RemoteRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RemoteOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What the TUI is asking the host side to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRequest {
+    /// Start (if needed) and produce an invite.
+    Invite {
+        local: bool,
+    },
+    /// Is anybody waiting to be accepted?
+    Pending,
+    Accept,
+    Reject,
+}
+
+/// What came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOutcome {
+    Invited(RemoteInvite),
+    Waiting(Option<PairingRequest>),
+    Paired { device_name: String },
+    Rejected,
+    Failed(String),
+}
+
+/// Injected at startup by the CLI: binds and serves the browser Web UI over
+/// the current local runtime service (in-process client or local Unix-socket
+/// daemon), returning the token-carrying URL (or an error). Opaque so
+/// `leveler-tui` need not depend on the web server. `None` only when the
+/// host could not provide any local runtime service.
+pub type WebLauncher = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Injected by the host: opens an HTTP URL in the user's default browser and
+/// reports whether the operating system accepted the request.
+pub type UrlOpener = std::sync::Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;

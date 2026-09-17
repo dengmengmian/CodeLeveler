@@ -1,0 +1,1198 @@
+//! Definitions of the executor-injected tools (request_user_input / ask_user,
+//! update_goal, request_permissions, spawn_agent) advertised to the model.
+
+use leveler_model::{ToolCall, ToolDefinition};
+
+/// Primary name for mid-turn clarification.
+pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
+
+/// Legacy alias kept for older prompts / transcripts; same Clarifier path.
+pub(crate) const ASK_USER_TOOL: &str = "ask_user";
+
+/// Shared schema for `request_user_input` and `ask_user`.
+fn user_input_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "question": { "type": "string", "description": "The question to ask." },
+            "options": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Optional candidate answers."
+            }
+        },
+        "required": ["question"]
+    })
+}
+
+fn user_input_description(primary_name: &str, alias: Option<&str>) -> String {
+    let alias_note = match alias {
+        Some(a) => format!(" (legacy alias: `{a}`)"),
+        None => String::new(),
+    };
+    format!(
+        "Ask the user a clarifying question and wait for their answer \
+         (`{primary_name}`{alias_note}). Use it at a genuine decision point that is the \
+         user's to make: an ambiguous requirement, a choice between viable approaches, \
+         overwriting existing work, or a destructive/irreversible action. Prefer asking \
+         over guessing at these forks. Do NOT ask about trivial choices you can \
+         reasonably make yourself. For approach/scope choice forks, always pass \
+         `options` with 2–4 mutually exclusive answers (short label + consequence); \
+         put the recommended option first when you have a preference. Do not rely on \
+         open-ended chat prose alone (\"想问一下\", \"waiting for confirmation\") — that \
+         is a fake pause. Omit `options` only for free-form answers (credentials, \
+         names, paths the user must type). Keep `question` to one short sentence."
+    )
+}
+
+/// Whether `name` is a clarification tool (primary or legacy).
+pub(crate) fn is_user_input_tool(name: &str) -> bool {
+    name == REQUEST_USER_INPUT_TOOL || name == ASK_USER_TOOL
+}
+
+/// Primary clarification tool definition.
+pub(crate) fn request_user_input_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REQUEST_USER_INPUT_TOOL.to_string(),
+        description: user_input_description(REQUEST_USER_INPUT_TOOL, Some(ASK_USER_TOOL)),
+        input_schema: user_input_input_schema(),
+    }
+}
+
+/// Legacy `ask_user` definition (compat; same Clarifier path).
+pub(crate) fn ask_user_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ASK_USER_TOOL.to_string(),
+        description: user_input_description(ASK_USER_TOOL, Some(REQUEST_USER_INPUT_TOOL)),
+        input_schema: user_input_input_schema(),
+    }
+}
+
+/// The name of the injected goal-resolution tool (goal mode only). The run does
+/// not end when the model goes quiet — it ends only when the model calls this to
+/// mark the objective `complete` (proven, audited) or `blocked` (truly stuck).
+pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
+
+pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_GOAL_TOOL.to_string(),
+        description: "Resolve the current objective. Call this ONLY to end the \
+            task: `complete` when you have PROVEN, against the current workspace \
+            state, that every requirement is done (build/tests run and passed \
+            since your last edit); `blocked` when you are genuinely and \
+            repeatedly stuck and cannot make progress. Going silent does NOT end \
+            the task — you must call this. Do not mark complete on unproven or \
+            indirect evidence, and do not redefine success down to what already \
+            exists. `complete` means the objective AS THE USER STATED IT. If the \
+            stated objective cannot be satisfied — it conflicts with something \
+            you must not change (an existing test that pins the opposite \
+            behavior, a frozen interface, an explicit prohibition) — do NOT \
+            reinterpret or narrow its terms into a weaker task and complete \
+            that instead: that is a false completion. Report `blocked`, name \
+            the exact conflict (which requirement collides with which \
+            constraint), and first revert edits that served only the abandoned \
+            attempt so the workspace is left clean. Partial conflicts are the \
+            same rule: when only PART of the stated objective is satisfiable, \
+            delivering that part while quietly exempting the rest — with or \
+            without a rationalization — is still a false completion. Blocked, \
+            naming which part cannot be satisfied and why."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["complete", "blocked"],
+                    "description": "complete = proven done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Internal audit note only (not shown as a chat row on success). Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
+                },
+                "next_step": {
+                    "type": "string",
+                    "description": "Optional concrete follow-up for the user. Omit this field when no genuine next step remains; never copy or paraphrase the conversation merely to fill it."
+                }
+            },
+            "required": ["status", "summary"]
+        }),
+    }
+}
+
+/// The name of the injected request-permissions tool.
+pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
+
+/// The name of the injected sub-agent spawn tool.
+pub(crate) const SPAWN_AGENT_TOOL: &str = "spawn_agent";
+
+/// The tool the model calls to run a focused sub-agent on a self-contained
+/// subtask, getting back only its final result. Emitting several calls in one
+/// turn runs the sub-agents CONCURRENTLY.
+pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SPAWN_AGENT_TOOL.to_string(),
+        description: "Delegate a self-contained subtask to a focused sub-agent so it \
+            does not consume this conversation's context. The child shares your model \
+            and workspace but starts a FRESH conversation — put everything it needs \
+            in `task`; that is the only required argument. This tool runs the child \
+            IN THE BACKGROUND BY DEFAULT: the call returns immediately with the \
+            child's id, you continue working, and the runtime tells you when it \
+            settles (its truthful result, partial work included). Start independent \
+            delegations together in one assistant message; they run concurrently. \
+            The child starts read-capable and claims a bounded write scope itself \
+            (claim_write_scope) after inspecting the code; the runtime enforces \
+            exclusive ownership and denies conflicts, so you do not pre-plan file \
+            ownership. Keep the work yourself when it is small, tightly coupled, or \
+            needs your in-flight context. Do NOT spawn the whole task as one blob. \
+            agent='<name>' runs a declarative agent from the available-agents list \
+            (project `.leveler/agents/<name>/`, user-level, or built-in): its definition \
+            fixes its capability, tools, write bounds, model and instructions, so do not \
+            also pass a different `role` or `profile`. Optional `profile` selects a \
+            built-in capability contract; omit it for the default child."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string", "description": "The complete, self-contained instruction for the sub-agent." },
+                "profile": {
+                    "type": "string",
+                    "enum": ["default", "explorer", "worker"],
+                    "description": "Optional capability contract: explorer = read-only investigation; worker = scoped writer (requires `files`); default = claims its own write scope. Omit for the default child. Reviewer is harness-launched and cannot be requested here. Alias of `role` when both agree; conflicting values are refused."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["default", "explorer", "worker"],
+                    "description": "Optional. Historical alias of `profile`. explorer = read-only investigation; worker = legacy pre-scoped writer (requires `files`); default = normal child that claims its own write scope."
+                },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Legacy, for role='worker' only: pre-claimed exclusive paths. Normal children omit this and claim their own scope after reading the code."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Name of an available agent (project `.leveler/agents/<name>/`, user-level, or built-in). Its definition sets the capability; an unknown or invalid name is refused."
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Defaults to true — the call returns immediately with the child's id and you continue useful work; the runtime tells you when it settles. Set false only when your next action depends on this child's result."
+                }
+            },
+            "required": ["task"]
+        }),
+    }
+}
+
+/// The tool a CHILD calls to acquire exclusive write authority over the paths
+/// it actually needs, after reading enough code to know them (late-bound
+/// ownership: SPAWN != WRITE AUTHORITY).
+pub(crate) const CLAIM_WRITE_SCOPE_TOOL: &str = "claim_write_scope";
+
+pub(crate) fn claim_write_scope_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+        description: "Claim exclusive write authority over the files or directories \
+            you are about to modify. Use it AFTER reading enough code to know what \
+            this task actually needs to change; before your first claim every \
+            mutation is refused. The grant is exclusive and atomic (all paths or \
+            none); overlapping claims by others are denied while you hold it, and \
+            it is released automatically when you finish. A denial is a coordination \
+            result, not a failure: narrow the scope, work on something else, or \
+            retry after the owner settles. You may claim additional paths later as \
+            you discover them. Re-read a claimed file before your first write to it \
+            if time has passed since you read it."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Relative files or directories to own exclusively (a directory covers its whole subtree, e.g. 'src/output/'). Claim the smallest scope that covers your work — never the repository root."
+                }
+            },
+            "required": ["paths"]
+        }),
+    }
+}
+
+/// Runtime default resolution for `run_in_background`: an omitted parameter
+/// means background. The model relies on the advertised default; it does not
+/// have to reproduce it on every call.
+pub(crate) fn resolve_run_in_background(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// The tool a CHILD calls to report one typed finding as it is confirmed.
+pub(crate) const REPORT_FINDING_TOOL: &str = "report_finding";
+
+pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_FINDING_TOOL.to_string(),
+        description: "Report ONE concrete finding the moment you confirm it \
+            (do not batch them into your final prose). Each finding is recorded \
+            durably and handed to the agent that spawned you even if your run is \
+            cut short. Use one call per finding; keep `summary` specific and \
+            evidence-backed, naming the file/symbol where it applies."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "relevant_file", "relevant_symbol", "dependency",
+                        "callsite", "risk", "test", "config", "observation",
+                        "correctness"
+                    ],
+                    "description": "What kind of thing this finding is."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One specific, evidence-backed sentence."
+                },
+                "file": { "type": "string", "description": "The file it concerns, if any." },
+                "symbol": { "type": "string", "description": "The symbol it concerns, if any." }
+            },
+            "required": ["kind", "summary"]
+        }),
+    }
+}
+
+/// Turn-scoped elevations from an approved `request_permissions` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TurnPermissionGrants {
+    pub network: bool,
+    /// Drop OS write confinement for run_command/shell_command this turn.
+    pub unrestricted_fs: bool,
+}
+
+impl TurnPermissionGrants {
+    pub fn is_empty(self) -> bool {
+        !self.network && !self.unrestricted_fs
+    }
+
+    /// Whether everything `requested` asks for is already granted.
+    pub fn covers(self, requested: Self) -> bool {
+        (self.network || !requested.network) && (self.unrestricted_fs || !requested.unrestricted_fs)
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            network: self.network || other.network,
+            unrestricted_fs: self.unrestricted_fs || other.unrestricted_fs,
+        }
+    }
+}
+
+/// Parse model arguments for `request_permissions` (current fields plus legacy aliases).
+///
+/// - `network` (bool): request network for the rest of the turn
+/// - `filesystem`: `"unrestricted"` | `"workspace"` (default) — unrestricted
+///   clears write confinement (approximate full-access for commands)
+/// - `full_access` (bool): shorthand for network + unrestricted filesystem
+/// - If none of the above are set, defaults to **network only** (legacy behavior)
+pub(crate) fn parse_permission_request(
+    args: &serde_json::Value,
+) -> (String, String, TurnPermissionGrants) {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(未说明)")
+        .to_string();
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (mut grants, named) = parse_grant_axes(args);
+    if !named {
+        // Legacy: only action/reason → network elevation.
+        grants.network = true;
+    }
+    (action, reason, grants)
+}
+
+/// The command tools whose calls may carry an `escalate` retry.
+const ESCALATABLE_TOOLS: [&str; 2] = ["shell_command", "run_command"];
+
+/// Read the grant axes (`network` / `filesystem` / `full_access`) shared by
+/// `request_permissions` and a command's `escalate`. Returns the grants plus
+/// whether any axis was actually named — the two callers disagree on what an
+/// unnamed axis means, so that judgement stays with them.
+fn parse_grant_axes(args: &serde_json::Value) -> (TurnPermissionGrants, bool) {
+    let full_access = args
+        .get("full_access")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let network = args.get("network").and_then(|v| v.as_bool());
+    let filesystem = args
+        .get("filesystem")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if full_access {
+        return (
+            TurnPermissionGrants {
+                network: true,
+                unrestricted_fs: true,
+            },
+            true,
+        );
+    }
+    let named = network.is_some() || !filesystem.is_empty();
+    (
+        TurnPermissionGrants {
+            network: network.unwrap_or(false),
+            unrestricted_fs: matches!(
+                filesystem,
+                "unrestricted" | "full" | "full_access" | "danger-full-access"
+            ),
+        },
+        named,
+    )
+}
+
+/// Whether a tool's calls may carry `escalate`.
+pub(crate) fn is_escalatable_tool(name: &str) -> bool {
+    ESCALATABLE_TOOLS.contains(&name)
+}
+
+/// Parse a command call's `escalate` retry into its reason and grants.
+///
+/// `None` means the call is an ordinary one. Unlike `request_permissions`,
+/// an `escalate` naming no axis yields EMPTY grants rather than the legacy
+/// network default: this argument exists to answer a denial the model just
+/// saw, so it must name the axis that denial was about. The caller turns
+/// empty grants into a refusal.
+pub(crate) fn parse_escalation(args: &serde_json::Value) -> Option<(String, TurnPermissionGrants)> {
+    let escalate = args.get("escalate")?;
+    if !escalate.is_object() {
+        return None;
+    }
+    let reason = escalate
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (grants, _) = parse_grant_axes(escalate);
+    Some((reason, grants))
+}
+
+/// The command line an `escalate` prompt shows the user. The command IS the
+/// action here — unlike `request_permissions`, the model does not restate it.
+pub(crate) fn escalation_action(call: &ToolCall) -> String {
+    if let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) {
+        return cmd.to_string();
+    }
+    let program = call
+        .arguments
+        .get("program")
+        .and_then(|v| v.as_str())
+        .unwrap_or(call.name.as_str());
+    let args: Vec<&str> = call
+        .arguments
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|args| args.iter().filter_map(|arg| arg.as_str()).collect())
+        .unwrap_or_default();
+    format!("{program} {}", args.join(" ")).trim().to_string()
+}
+
+/// An `escalate` that names no axis. Refused without a prompt: there is
+/// nothing concrete to ask the user to approve.
+pub(crate) fn escalation_missing_axis_message() -> String {
+    "escalate named no permission: set `network: true`, `filesystem: \"unrestricted\"`, \
+     or `full_access: true` on it, matching the access the sandbox actually denied. \
+     The command was NOT run."
+        .to_string()
+}
+
+/// The `escalate` property added to each command tool's published schema.
+fn escalation_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Retry this EXACT command with elevated permission after the \
+            sandbox denied it. The approval prompt this raises is how the user consents \
+            — do not ask in prose first, and do not call request_permissions for it. \
+            Ground it in a denial you just saw: never escalate speculatively. Ask only for \
+            what that denial showed: a network failure needs `network`, not `filesystem`. \
+            The user chooses whether the grant covers this call or the rest of the turn. \
+            If the user denies, that answer is final.",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "One sentence for the user: why this exact command needs the wider access."
+            },
+            "network": {
+                "type": "boolean",
+                "description": "This call needs network access."
+            },
+            "filesystem": {
+                "type": "string",
+                "enum": ["workspace", "unrestricted"],
+                "description": "unrestricted = drop the workspace write confinement (and the `.git` write protection). Only after a write outside the workspace was denied; dependency caches are already writable once the network is granted."
+            },
+            "full_access": {
+                "type": "boolean",
+                "description": "Shorthand for network=true and filesystem=unrestricted."
+            }
+        },
+        "required": ["reason"]
+    })
+}
+
+/// Publish `escalate` on the command tools.
+///
+/// Mounted only while the profile actually confines something — under
+/// 完全访问 there is nothing to escalate to, so the argument would only invite
+/// a pointless prompt (same reason `request_permissions` is withheld there).
+pub(crate) fn advertise_escalation(tools: &mut [ToolDefinition]) {
+    for tool in tools
+        .iter_mut()
+        .filter(|tool| is_escalatable_tool(&tool.name))
+    {
+        if let Some(properties) = tool
+            .input_schema
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            properties.insert("escalate".to_string(), escalation_property());
+        }
+    }
+}
+
+/// How long an approved elevation lasts. `request_permissions` holds for the
+/// rest of the turn, and its prompt says so. A command's `escalate` lasts as
+/// long as the option the user picks — this call ("仅允许本次") or the turn
+/// ("本轮对话内允许") — so its description claims neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantScope {
+    Turn,
+    SingleCall,
+}
+
+impl GrantScope {
+    fn fs_note(self) -> &'static str {
+        match self {
+            Self::Turn => "本轮写不受工作区沙箱限制",
+            Self::SingleCall => "写不受工作区沙箱限制",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Turn => "本轮需要",
+            Self::SingleCall => "需要",
+        }
+    }
+}
+
+/// What the user reads at the moment they decide.
+///
+/// It used to glue three machine fields with colons and nest them in
+/// parentheses — "命令请求网络:curl -sS …(原因:用户要求…)" — inside the
+/// parentheses the client adds of its own. One sentence, one separator.
+pub(crate) fn permission_request_description(
+    action: &str,
+    reason: &str,
+    grants: TurnPermissionGrants,
+    scope: GrantScope,
+) -> String {
+    let mut parts = Vec::new();
+    if grants.network {
+        parts.push("网络");
+    }
+    if grants.unrestricted_fs {
+        parts.push(scope.fs_note());
+    }
+    let what = if parts.is_empty() {
+        "权限".to_string()
+    } else {
+        parts.join(" + ")
+    };
+    let prefix = scope.prefix();
+    let mut text = format!("{prefix}{what}");
+    if !action.trim().is_empty() {
+        text.push_str(" · ");
+        text.push_str(action.trim());
+    }
+    if !reason.trim().is_empty() {
+        text.push_str(" · 原因：");
+        text.push_str(reason.trim());
+    }
+    text
+}
+
+pub(crate) fn permission_grant_message(granted: bool, grants: TurnPermissionGrants) -> String {
+    if granted {
+        permission_granted_message(grants)
+    } else {
+        permission_denied_by_user_message()
+    }
+}
+
+fn permission_granted_message(grants: TurnPermissionGrants) -> String {
+    let mut parts = Vec::new();
+    if grants.network {
+        parts.push("网络访问");
+    }
+    if grants.unrestricted_fs {
+        parts.push("本轮无限制写(命令不再套工作区写沙箱)");
+    }
+    if parts.is_empty() {
+        "已获授权。".to_string()
+    } else {
+        format!("已获授权:本轮允许{}。", parts.join("、"))
+    }
+}
+
+/// Model-facing result when a person clicked Deny. English is protocol
+/// guidance for the model, not TUI copy.
+pub(crate) fn permission_denied_by_user_message() -> String {
+    "The user explicitly denied this permission request. \
+     Continue only with capabilities already available. \
+     Do not request the same or broader permission again for this task \
+     unless the user explicitly changes their decision. \
+     If you now need the user to perform an action or provide information, \
+     use request_user_input. \
+     If the task cannot proceed without the denied capability, \
+     report the task as blocked rather than repeatedly retrying."
+        .to_string()
+}
+
+pub(crate) fn permission_already_denied_message() -> String {
+    "The user already denied this permission for the current task. \
+     Do not request it again. Continue only with capabilities already available, \
+     or use request_user_input if you need the user to act."
+        .to_string()
+}
+
+pub(crate) fn permission_denied_unattended_message() -> String {
+    "Permission was not granted (no human was available to approve). \
+     Continue only with capabilities already available. \
+     Do not treat this as a user refusal."
+        .to_string()
+}
+
+/// Outcome of `request_permissions`. Human Deny is not the same fact as
+/// a headless auto-deny.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionRequestOutcome {
+    Granted {
+        grants: TurnPermissionGrants,
+        /// The user chose to allow it for the rest of this turn, not just
+        /// what was asked. Only a single-call escalation reads it; a
+        /// `request_permissions` grant already lasts the turn.
+        for_turn: bool,
+        message: String,
+    },
+    DeniedByUser {
+        requested: TurnPermissionGrants,
+        message: String,
+    },
+    DeniedUnattended {
+        requested: TurnPermissionGrants,
+        message: String,
+    },
+    Invalid {
+        message: String,
+    },
+}
+
+impl PermissionRequestOutcome {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Granted { message, .. }
+            | Self::DeniedByUser { message, .. }
+            | Self::DeniedUnattended { message, .. }
+            | Self::Invalid { message } => message,
+        }
+    }
+
+    pub(crate) fn is_error(&self) -> bool {
+        !matches!(self, Self::Granted { .. })
+    }
+}
+
+/// Apply turn grants onto a tool context (network + optional unrestricted FS).
+pub(crate) fn apply_turn_grants(
+    mut ctx: leveler_tools::ToolContext,
+    grants: TurnPermissionGrants,
+) -> leveler_tools::ToolContext {
+    if grants.network {
+        ctx.policy.grant_network();
+    }
+    if grants.unrestricted_fs {
+        ctx.policy.grant_unrestricted_fs();
+    }
+    ctx
+}
+
+/// The tool the model calls to ask for elevated permission (network / filesystem).
+pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REQUEST_PERMISSIONS_TOOL.to_string(),
+        description: "Ask the user to grant elevated permission for this turn. \
+            Use BEFORE an action that needs network and/or writes outside the \
+            workspace sandbox. Fields: `network` (bool), `filesystem` \
+            (\"workspace\"|\"unrestricted\"), or `full_access` (bool) for both. \
+            Legacy calls with only `action` still mean network-only. On approval, \
+            grants last for the rest of this turn. If the user denies, keep \
+            working with already-available capabilities; do not re-request the \
+            same or a broader permission. If you need the user to run a command \
+            or paste output, call request_user_input instead of asking in prose."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "description": "What you want to do that needs permission." },
+                "reason": { "type": "string", "description": "Why it is necessary." },
+                "network": { "type": "boolean", "description": "Request network access for this turn." },
+                "filesystem": {
+                    "type": "string",
+                    "enum": ["workspace", "unrestricted"],
+                    "description": "workspace = keep write sandbox (default); unrestricted = no write confinement for commands this turn."
+                },
+                "full_access": {
+                    "type": "boolean",
+                    "description": "Shorthand for network=true and filesystem=unrestricted."
+                }
+            },
+            "required": ["action"]
+        }),
+    }
+}
+
+/// Agent plan synchronization contract. The plan is the user's live view of
+/// the work and the seed a resumed turn reads, so keeping it current is the
+/// model's job — stated where the model reads it, never enforced by the
+/// runtime (the plan is not a completion gate).
+#[cfg(test)]
+mod plan_sync_contract_tests {
+    const BASE_PROMPT: &str = include_str!("../prompts/base.md");
+
+    fn plan_section() -> &'static str {
+        let start = BASE_PROMPT
+            .find("## Plan")
+            .expect("base prompt must carry a plan section");
+        let rest = &BASE_PROMPT[start + 2..];
+        &BASE_PROMPT[start..start + 2 + rest.find("\n## ").unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn base_prompt_says_the_plan_moves_with_the_work() {
+        let section = plan_section();
+        for needle in ["update_plan", "in_progress"] {
+            assert!(
+                section.contains(needle),
+                "plan section lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    /// Plan truth contract. COMPLETE / FAILURE / REVISE are the semantics the
+    /// transition experiment showed remove plan-ahead errors (a failed or
+    /// abandoned step marked completed); pinned so a rewording cannot drop them.
+    #[test]
+    fn completed_means_the_outcome_is_true() {
+        let section = plan_section();
+        for needle in ["`completed` only", "outcome is true", "already read"] {
+            assert!(
+                section.contains(needle),
+                "COMPLETE lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_action_completes_nothing() {
+        let section = plan_section();
+        assert!(
+            section.contains("failed, denied or timed-out action never completes a step"),
+            "FAILURE lost:\n{section}"
+        );
+        assert!(
+            section.contains("same outcome another way") && section.contains("stays `in_progress`"),
+            "same-objective retry must keep the step in progress:\n{section}"
+        );
+    }
+
+    #[test]
+    fn a_changed_objective_is_revised_not_completed() {
+        let section = plan_section();
+        for needle in [
+            "rewrite that step",
+            "never mark an abandoned or replaced step `completed`",
+        ] {
+            assert!(
+                section.contains(needle),
+                "REVISE lost `{needle}`:\n{section}"
+            );
+        }
+    }
+
+    /// The plan tracks steps, not tool calls: a short trail is accepted, a
+    /// plan left describing a stage the work has already left is not. The
+    /// same-response START rule had no measurable effect and must not return.
+    #[test]
+    fn short_lag_is_accepted_but_the_plan_converges() {
+        let section = plan_section();
+        assert!(
+            section.contains("may trail"),
+            "LAG acceptance lost:\n{section}"
+        );
+        assert!(
+            section.contains("already left behind"),
+            "convergence lost:\n{section}"
+        );
+        assert!(
+            !section.contains("same response as the first tool call"),
+            "the same-response START rule was measured ineffective:\n{section}"
+        );
+    }
+
+    /// No terminal reconciliation instruction. Asking for the plan to be
+    /// brought up to date right before `update_goal` is not needed for
+    /// correctness, and in an A/B run (10 runs per arm) removing it took final
+    /// multi-step catch-up updates from 9/10 to 5/10 with no loss in task
+    /// success or final plan completeness. It is kept out unless new evidence
+    /// says otherwise. No causal link to false completions is claimed.
+    #[test]
+    fn there_is_no_final_plan_reconciliation_instruction() {
+        let section = plan_section();
+        assert!(
+            !section.contains("Before `update_goal`"),
+            "final reconciliation is back in the plan section:\n{section}"
+        );
+        let def = super::update_goal_tool_definition();
+        assert!(
+            !def.description.contains("update_plan"),
+            "final reconciliation is back in update_goal: {}",
+            def.description
+        );
+    }
+
+    /// The plan is the agent's declared progress. The runtime records, persists
+    /// and shows it; it does not observe whether the work is really at the
+    /// declared step, so neither text may present the plan as the live state
+    /// of the work.
+    #[test]
+    fn the_plan_is_described_as_declared_progress() {
+        let def = crate::update_plan::UpdatePlanTool;
+        let description = leveler_tools::Tool::description(&def);
+        for text in [plan_section(), description] {
+            assert!(
+                text.contains("declare"),
+                "plan must be framed as declared progress:\n{text}"
+            );
+            assert!(
+                !text.contains("state of the work"),
+                "plan must not be framed as the live state of the work:\n{text}"
+            );
+        }
+        assert!(
+            plan_section().contains("nothing updates it for you"),
+            "the runtime does not advance the plan:\n{}",
+            plan_section()
+        );
+    }
+
+    /// Plan order is the intended order: completing a later step first is a
+    /// legitimate declaration.
+    #[test]
+    fn plan_order_is_intended_not_mandatory() {
+        let def = crate::update_plan::UpdatePlanTool;
+        let description = leveler_tools::Tool::description(&def);
+        assert!(
+            description.contains("intended order"),
+            "update_plan must say order is intent, not a rule:\n{description}"
+        );
+    }
+
+    #[test]
+    fn plan_sync_is_not_described_as_enforced() {
+        let def = super::update_goal_tool_definition();
+        for text in [plan_section(), def.description.as_str()] {
+            let lower = text.to_ascii_lowercase();
+            for claim in ["refuse", "reject", "gate"] {
+                assert!(
+                    !lower.contains(claim),
+                    "plan sync must not be described as enforced (`{claim}`):\n{text}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_fidelity_tests {
+    /// ICG-6R: the completion contract must keep saying, in so many words,
+    /// that an unsatisfiable objective is `blocked` — never reinterpreted into
+    /// a weaker task and completed. A wording regression here re-opens the
+    /// scope-substitution false-completion path.
+    #[test]
+    fn update_goal_contract_forbids_scope_substitution() {
+        let def = super::update_goal_tool_definition();
+        for needle in [
+            "AS THE USER STATED IT",
+            "Partial conflicts",
+            "do NOT",
+            "false completion",
+            "revert edits",
+        ] {
+            assert!(
+                def.description.contains(needle),
+                "completion contract lost `{needle}`"
+            );
+        }
+    }
+
+    /// Last-edit truth survives the verification-sufficiency wording: an edit
+    /// still invalidates prior verification, so a completion claim stays
+    /// grounded in build/tests run since the last change. VIF changes what the
+    /// model does with sufficient evidence, not this contract.
+    #[test]
+    fn update_goal_keeps_the_last_edit_truth() {
+        let def = super::update_goal_tool_definition();
+        assert!(
+            def.description.contains("since your last edit"),
+            "completion contract lost the last-edit truth"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_scope_advertises_directory_grants() {
+        // Ergonomics (MA-WA1): at decision time Main often knows the module,
+        // not every file. Directory scope has always been enforced (allowlist
+        // + overlap both use directory-prefix semantics) — the schema must say
+        // so, or the model believes it needs perfect file knowledge to spawn.
+        let def = spawn_agent_tool_definition();
+        let files_desc = def.input_schema["properties"]["files"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            files_desc.contains("Legacy") && files_desc.contains("claim"),
+            "files must read as the legacy path, pointing at claim_write_scope: {files_desc}"
+        );
+        // Late-bound ownership: the claim tool advertises directory grants.
+        let claim = claim_write_scope_tool_definition();
+        let claim_desc = claim.input_schema["properties"]["paths"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            claim_desc.contains("director"),
+            "claim paths must advertise directory grants: {claim_desc}"
+        );
+    }
+
+    /// V2 four-point background contract, tool-description + parameter points:
+    /// the advertised default is background, the call returns immediately with
+    /// the child's id, settlement is promised, and the foreground escape is
+    /// scoped to "next action depends on it". Runtime point is
+    /// `resolve_run_in_background`; prompt point is the steer hint (tested in
+    /// sub_agent.rs).
+    #[test]
+    fn spawn_agent_advertises_the_background_first_contract() {
+        let def = spawn_agent_tool_definition();
+        let d = def.description.to_ascii_lowercase();
+        assert!(d.contains("background by default"), "{}", def.description);
+        assert!(d.contains("returns immediately"), "{}", def.description);
+        assert!(d.contains("settle"), "{}", def.description);
+        assert!(
+            d.contains("claim") && d.contains("write"),
+            "the late-bound claim protocol must be model-visible: {}",
+            def.description
+        );
+        assert!(
+            d.contains("keep the work yourself when"),
+            "KEEP guidance must stay: {}",
+            def.description
+        );
+        assert!(
+            !d.contains("when the user asks for parallel/multi-agent work"),
+            "{}",
+            def.description
+        );
+        assert!(!d.contains("always spawn"), "{}", def.description);
+
+        let param = def.input_schema["properties"]["run_in_background"]["description"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(param.contains("defaults to true"), "{param}");
+        assert!(param.contains("next action depends"), "{param}");
+    }
+
+    #[test]
+    fn run_in_background_default_is_runtime_resolved_not_model_remembered() {
+        assert!(resolve_run_in_background(&serde_json::json!({"task": "x"})));
+        assert!(resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": true})
+        ));
+        assert!(!resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": false})
+        ));
+        // Malformed value degrades to the advertised default, never to a
+        // silent foreground surprise.
+        assert!(resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": "yes"})
+        ));
+    }
+
+    #[test]
+    fn legacy_action_only_requests_network() {
+        let (_, _, g) = parse_permission_request(&serde_json::json!({"action": "curl"}));
+        assert_eq!(
+            g,
+            TurnPermissionGrants {
+                network: true,
+                unrestricted_fs: false
+            }
+        );
+    }
+
+    #[test]
+    fn full_access_shorthand_sets_both() {
+        let (_, _, g) =
+            parse_permission_request(&serde_json::json!({"action": "x", "full_access": true}));
+        assert!(g.network && g.unrestricted_fs);
+    }
+
+    #[test]
+    fn filesystem_unrestricted_without_network() {
+        let (_, _, g) = parse_permission_request(&serde_json::json!({
+            "action": "write outside",
+            "network": false,
+            "filesystem": "unrestricted"
+        }));
+        assert!(!g.network && g.unrestricted_fs);
+    }
+
+    #[test]
+    fn apply_turn_grants_sets_network_and_fs_flags() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-grant-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx =
+            leveler_tools::ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+                .with_sandbox(true);
+        assert!(ctx.policy.network_denied());
+        assert!(!ctx.policy.unrestricted_fs());
+        let elevated = apply_turn_grants(
+            ctx,
+            TurnPermissionGrants {
+                network: true,
+                unrestricted_fs: true,
+            },
+        );
+        assert!(!elevated.policy.network_denied());
+        assert!(elevated.policy.unrestricted_fs());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn human_denial_message_is_not_a_bare_false() {
+        let msg = permission_denied_by_user_message();
+        assert!(msg.contains("explicitly denied"));
+        assert!(msg.contains("request_user_input"));
+        assert!(!msg.contains("用户未批准"));
+        let unattended = permission_denied_unattended_message();
+        assert!(!unattended.contains("explicitly denied"));
+        assert!(unattended.contains("no human"));
+    }
+
+    #[test]
+    fn request_permissions_schema_advertises_filesystem_fields() {
+        let tool = request_permissions_tool_definition();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("network"));
+        assert!(props.contains_key("filesystem"));
+        assert!(props.contains_key("full_access"));
+    }
+
+    #[test]
+    fn update_goal_exposes_optional_structured_next_step() {
+        let tool = update_goal_tool_definition();
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("next_step"));
+        assert!(
+            !properties.contains_key("override_incomplete_todos"),
+            "the plan is not a completion gate, so there is nothing to override"
+        );
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|field| field == "next_step"),
+            "next_step must be omitted when there is no genuine follow-up"
+        );
+    }
+
+    #[test]
+    fn request_user_input_is_primary_with_ask_user_alias() {
+        assert!(is_user_input_tool(REQUEST_USER_INPUT_TOOL));
+        assert!(is_user_input_tool(ASK_USER_TOOL));
+        assert!(!is_user_input_tool("request_permissions"));
+
+        let primary = request_user_input_tool_definition();
+        assert_eq!(primary.name, "request_user_input");
+        assert!(primary.description.contains("ask_user"));
+        assert!(primary.input_schema["properties"].get("question").is_some());
+        assert!(
+            primary.description.contains("mutually exclusive")
+                || primary.description.contains("2–4")
+                || primary.description.contains("2-4"),
+            "tool description must require structured choice options: {}",
+            primary.description
+        );
+        assert!(
+            primary.description.contains("fake pause")
+                || primary.description.contains("waiting for confirmation"),
+            "tool description must ban prose-only waiting: {}",
+            primary.description
+        );
+
+        let legacy = ask_user_tool_definition();
+        assert_eq!(legacy.name, "ask_user");
+        assert!(legacy.description.contains("request_user_input"));
+        assert_eq!(
+            primary.input_schema["required"],
+            legacy.input_schema["required"]
+        );
+    }
+
+    /// The prompt is the user's only view of what they are approving, and it
+    /// is read at the moment a security decision is made. It used to be three
+    /// machine fields glued with colons and nested parentheses:
+    /// "命令请求网络:curl -sS …(原因:用户要求确认…)" — and the client wraps it
+    /// in parentheses of its own.
+    #[test]
+    fn an_escalation_prompt_reads_as_a_sentence() {
+        let grants = TurnPermissionGrants {
+            network: true,
+            unrestricted_fs: false,
+        };
+        let text = permission_request_description(
+            "curl -sS https://registry.npmjs.org/-/ping",
+            "确认能否连到 npm registry",
+            grants,
+            GrantScope::SingleCall,
+        );
+        assert!(!text.contains('('), "no machine parentheses: {text}");
+        assert!(
+            !text.contains("网络:") && !text.contains("原因:"),
+            "no colon-glued fields: {text}"
+        );
+        assert!(text.contains("网络"), "{text}");
+        assert!(text.contains("curl -sS"), "{text}");
+        assert!(text.contains("确认能否连到 npm registry"), "{text}");
+    }
+
+    /// The prompt is the user's only view of what they are approving. A
+    /// one-call escalation must not be described as lasting the whole turn.
+    #[test]
+    fn a_single_call_escalation_prompt_does_not_claim_the_turn() {
+        let grants = TurnPermissionGrants {
+            network: false,
+            unrestricted_fs: true,
+        };
+        let turn = permission_request_description("git pull", "", grants, GrantScope::Turn);
+        assert!(turn.contains("本轮"), "{turn}");
+
+        // A command's escalation lasts as long as the option the user picks
+        // ("仅允许本次" / "本轮对话内允许"); the description claims neither.
+        let once = permission_request_description("git pull", "", grants, GrantScope::SingleCall);
+        assert!(!once.contains("本轮"), "{once}");
+        assert!(!once.contains("仅此一次"), "{once}");
+        assert!(once.contains("写不受工作区沙箱限制"), "{once}");
+    }
+
+    #[test]
+    fn escalation_is_absent_when_the_call_carries_no_escalate_field() {
+        assert!(parse_escalation(&serde_json::json!({"cmd": "git pull"})).is_none());
+    }
+
+    #[test]
+    fn escalation_parses_the_same_axes_as_request_permissions() {
+        let (reason, grants) = parse_escalation(&serde_json::json!({
+            "cmd": "git pull --rebase",
+            "escalate": { "reason": "remote git needs the network and .git writes", "full_access": true }
+        }))
+        .expect("escalate must parse");
+        assert!(reason.contains("remote git"));
+        assert!(grants.network && grants.unrestricted_fs);
+
+        let (_, fs_only) = parse_escalation(&serde_json::json!({
+            "escalate": { "reason": "write outside the workspace", "filesystem": "unrestricted" }
+        }))
+        .unwrap();
+        assert!(fs_only.unrestricted_fs && !fs_only.network);
+    }
+
+    /// Unlike `request_permissions`, a bare `escalate` must NOT silently mean
+    /// network: the model has to name the axis its command was denied on.
+    #[test]
+    fn an_escalation_naming_no_axis_is_empty_not_a_network_grant() {
+        let (_, grants) = parse_escalation(&serde_json::json!({
+            "escalate": { "reason": "please" }
+        }))
+        .unwrap();
+        assert!(grants.is_empty(), "a bare escalate must not grant network");
+    }
+
+    #[test]
+    fn escalation_is_advertised_on_command_tools_only() {
+        let mut tools = vec![
+            ToolDefinition {
+                name: "shell_command".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "run_command".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"program":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            },
+        ];
+        advertise_escalation(&mut tools);
+
+        for tool in tools.iter().filter(|t| t.name != "read_file") {
+            let escalate = tool.input_schema["properties"]
+                .get("escalate")
+                .unwrap_or_else(|| panic!("{} must advertise escalate", tool.name));
+            let props = escalate["properties"].as_object().unwrap();
+            for axis in ["reason", "network", "filesystem", "full_access"] {
+                assert!(props.contains_key(axis), "{} missing {axis}", tool.name);
+            }
+            assert_eq!(escalate["required"], serde_json::json!(["reason"]));
+        }
+        assert!(
+            tools[2].input_schema["properties"]
+                .get("escalate")
+                .is_none(),
+            "a read-only tool has nothing to escalate"
+        );
+        assert!(
+            tools[0].input_schema["properties"].get("cmd").is_some(),
+            "augmenting the schema must not drop the tool's own fields"
+        );
+    }
+}

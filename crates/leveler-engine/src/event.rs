@@ -1,0 +1,1491 @@
+//! The engine's unified event taxonomy (plan B2).
+//!
+//! One enum covers kernel events (lifecycle, model/tool, approvals,
+//! verification) and strategy events (plan/orchestrate). Events are
+//! adjacently tagged (`{"type": …, "payload": …}`) so the persisted `type`
+//! column is queryable without parsing payloads. Replaying an unknown type is
+//! a hard error — never silently skipped.
+//!
+//! ## Projection contract (M2)
+//!
+//! [`EngineEvent`] is the *canonical* domain fact: persisted (unless
+//! [`EngineEvent::is_transient`]) and replayable. Client-facing `RuntimeEvent`
+//! (in `leveler-client-protocol`) is a *projection* of it, built by the app
+//! layer; UI types never flow back down here (the engine has no dependency on
+//! any client crate). Three properties hold:
+//!
+//! - **persist-before-forward**: a non-transient event is written to the log
+//!   before any observer sees it, so a crash never exposes an un-persisted
+//!   fact (see `EventLog::append`).
+//! - **transient loss is recoverable**: deltas/usage/run-finished markers carry
+//!   no replay value; a client that misses them rebuilds authoritative state
+//!   from a snapshot.
+//! - **data classification** ([`EngineEvent::data_class`]): every event is
+//!   either `Projectable` (safe for a future sanitized cloud projection) or
+//!   `LocalOnly` (embeds source, model output, tool output, or full context).
+
+use serde::{Deserialize, Serialize};
+
+use leveler_core::{ApprovalId, ClarificationId, TurnId};
+use leveler_lifecycle::{AgentState, TaskOutcome, TurnOutcome};
+
+use crate::EngineError;
+
+/// How a session executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionKind {
+    Direct,
+    Parallel,
+}
+
+impl ExecutionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionKind::Direct => "direct",
+            ExecutionKind::Parallel => "parallel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, EngineError> {
+        match s {
+            // Legacy "orchestrate"/"orchestrated" sessions run as direct.
+            "direct" | "orchestrate" | "orchestrated" => Ok(ExecutionKind::Direct),
+            "parallel" => Ok(ExecutionKind::Parallel),
+            other => Err(EngineError::Corrupt(format!(
+                "unknown execution kind `{other}`"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_kind_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_orchestrate_kind_parses_as_direct() {
+        assert_eq!(
+            ExecutionKind::parse("orchestrated").unwrap(),
+            ExecutionKind::Direct
+        );
+        assert_eq!(
+            ExecutionKind::parse("orchestrate").unwrap(),
+            ExecutionKind::Direct
+        );
+        assert_eq!(ExecutionKind::Direct.as_str(), "direct");
+    }
+}
+
+/// Legacy plan-node status (kept as a plain enum for event replay only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+/// Domain-neutral wire fact for what a verification command observed. The
+/// harness owns the reason vocabulary; the engine persists it without
+/// interpreting coding semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerificationObservation {
+    Passed,
+    Failed,
+    NotRun { reason: String },
+}
+
+/// Domain-neutral wire fact for whether an observation participates in the
+/// completion gate. Optional provenance remains typed rather than being hidden
+/// in arbitrary metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerificationDisposition {
+    Required,
+    Skipped {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed_tests: Vec<String>,
+    },
+}
+
+/// Mechanical identity and result of the exact command invocation. Optional
+/// on legacy rows and when no process was started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationExecution {
+    pub program: String,
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+/// What a turn is, matching `turns.kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnKind {
+    /// The top-level user goal (goal-mode executor).
+    User,
+    /// A conversational turn (multimodal content, goal mode off).
+    Chat,
+    /// Legacy plan-graph node turn (no longer produced).
+    Node { node_id: String },
+    /// Legacy verification-repair turn (no longer produced; kept so rows
+    /// written by the deleted auto-repair loop still replay).
+    Repair { attempt: u32 },
+}
+
+impl TurnKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TurnKind::User => "user",
+            TurnKind::Chat => "chat",
+            TurnKind::Node { .. } => "node",
+            TurnKind::Repair { .. } => "repair",
+        }
+    }
+}
+
+/// Every event the engine can emit. Kernel events first, then strategy
+/// events. Transient events (deltas, usage) are forwarded to observers but
+/// never persisted — see [`EngineEvent::is_transient`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum EngineEvent {
+    // ── kernel: lifecycle ────────────────────────────────────────────────
+    TaskStarted {
+        goal: String,
+        model: String,
+        /// request_approval | assisted | full_access
+        mode: String,
+        sandbox: bool,
+        kind: ExecutionKind,
+        /// The durable task identity behind this run. Additive: legacy events
+        /// omit it and deserialize as `None` (their task id equals the
+        /// session id by the migration-0016 backfill rule).
+        #[serde(default)]
+        task_id: Option<leveler_core::TaskId>,
+    },
+    TurnStarted {
+        turn_id: TurnId,
+        kind: TurnKind,
+    },
+    /// The harness has emitted its final assistant response and entered the
+    /// generic runtime finalization boundary. The task is still non-terminal:
+    /// dependent work and authority resolution may follow.
+    FinalizationStarted {
+        at: leveler_core::Timestamp,
+    },
+    /// One named finalization phase began. `phase` is an opaque, stable key
+    /// selected by the harness; the engine records lifecycle timing without
+    /// learning domain-specific verification semantics.
+    FinalizationPhaseStarted {
+        phase: String,
+        at: leveler_core::Timestamp,
+    },
+    /// One finalization phase settled. The paired start/finish records make
+    /// post-run latency attributable without putting telemetry on the terminal
+    /// critical path.
+    FinalizationPhaseFinished {
+        phase: String,
+        at: leveler_core::Timestamp,
+        elapsed_ms: u64,
+    },
+    TurnFinished {
+        turn_id: TurnId,
+        /// Explicit terminal status. Legacy events omitted it and deserialize
+        /// as `Completed`; new failed/interrupted paths must persist it.
+        #[serde(default)]
+        outcome: TurnOutcome,
+        /// Human-oriented stop text (historically the Debug repr of
+        /// [`leveler_lifecycle::StopReason`], or an error message). Kept for
+        /// display compatibility; machine consumers use `stop`.
+        stop_reason: String,
+        /// Typed executor stop reason. `None` on legacy rows and on turns
+        /// that ended in an error instead of an executor outcome.
+        #[serde(default)]
+        stop: Option<leveler_lifecycle::StopReason>,
+        rounds: u32,
+        modified_files: Vec<String>,
+    },
+    TaskFinished {
+        outcome: TaskOutcome,
+        /// What the project's own checks said over the final tree. Absent on
+        /// rows written before the status/verification split (reads as
+        /// `NotRun`).
+        #[serde(default)]
+        verification: leveler_lifecycle::VerificationStatus,
+        reason: Option<String>,
+        /// Typed executor stop reason for the whole task (raw, not the
+        /// product reinterpretation). `None` on legacy rows and on tasks that
+        /// ended in cancellation or an engine error.
+        #[serde(default)]
+        stop: Option<leveler_lifecycle::StopReason>,
+        /// The structured provider failure behind a `Failed` outcome, when
+        /// there was one. Carried so a client can render a category, a
+        /// retryability and a delivery truth without parsing `reason` — the
+        /// projection strips it from the public (remote) view like `reason`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<leveler_model::ModelError>,
+        /// Completion-contract warnings orthogonal to project verification.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+
+    // ── kernel: model / tools (1:1 from AgentEvent) ──────────────────────
+    /// TRANSIENT: discard in-flight deltas before a fresh stream attempt.
+    StreamAttemptStarted,
+    /// TRANSIENT: streamed assistant text.
+    AssistantDelta {
+        text: String,
+    },
+    /// TRANSIENT: streamed reasoning text.
+    ReasoningDelta {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+        arguments: String,
+        /// True when the call ran in the concurrent read-only batch. Legacy
+        /// events omit it (defaults to false → shown as a normal call).
+        #[serde(default)]
+        parallel: bool,
+        /// Risk recorded at execution time. Legacy events omit it; recovery
+        /// treats `None` conservatively rather than consulting today's registry.
+        #[serde(default)]
+        risk: Option<leveler_execution::RiskLevel>,
+        /// The delegated agent that made this call, when it was not the
+        /// top-level one. Legacy events omit it (parent call).
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    ToolCallFinished {
+        call_id: String,
+        name: String,
+        is_error: bool,
+        preview: String,
+        /// The delegated agent that made this call (see `ToolCallStarted`).
+        #[serde(default)]
+        agent_id: Option<String>,
+        /// Canonical unified diff of what an edit ACTUALLY changed, produced
+        /// by the tool that made it. Absent for every other call, and for an
+        /// edit whose location could not be established.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_diff: Option<String>,
+        /// Exit code of the process a command call ran, when it exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Set when the call's process was cancelled: whether its tree was
+        /// confirmed gone. Absent for every call that was not stopped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<leveler_execution::CommandStop>,
+    },
+    /// TRANSIENT: live output chunk from a running command tool call.
+    /// `stream` is `stdout` or `stderr`. Never persisted — the call's
+    /// finished preview is the durable record.
+    ToolCallOutput {
+        call_id: String,
+        stream: String,
+        chunk: String,
+    },
+    WorkspaceSnapshotCreated {
+        call_id: String,
+        snapshot: String,
+    },
+    /// TRANSIENT: token usage for the context gauge.
+    TokenUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+    },
+    /// TRANSIENT: the accounting of the exact next model request, computed by
+    /// the kernel before it is sent. Aggregate token estimates and category
+    /// names only — no prompt content. Never persisted; a reconnecting client
+    /// gets the latest through its live view, not the event log.
+    ContextUsage {
+        accounting: leveler_model::ContextAccounting,
+    },
+    Compacted {
+        from: usize,
+        to: usize,
+    },
+    /// Replay-only: the deleted adaptive-context ladder recorded a climb of
+    /// the fold threshold here. Old logs carry these rows; nothing writes one
+    /// any more, and the fold threshold no longer moves during a task.
+    ContextExpanded {
+        from: u32,
+        to: u32,
+        reason: String,
+        crossed_reliable: bool,
+    },
+    /// A user-originated shell execution (`!command`) started in this
+    /// session. Direct host execution: no turn, no model, no tool call.
+    /// Persisted so the session's audit trail names every explicit user
+    /// side effect.
+    UserShellStarted {
+        execution_id: leveler_core::UserShellId,
+        command: String,
+        cwd: String,
+    },
+    /// TRANSIENT: live output chunk from a running user shell. `stream` is
+    /// `stdout` or `stderr`. Never persisted — clients keep a bounded buffer.
+    UserShellOutput {
+        execution_id: leveler_core::UserShellId,
+        stream: String,
+        chunk: String,
+    },
+    /// A user shell execution ended (`status`: success | failed | cancelled |
+    /// unknown — a stop whose process tree could not be confirmed gone).
+    /// Persisted alongside its start for audit/recovery.
+    UserShellFinished {
+        execution_id: leveler_core::UserShellId,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        status: String,
+    },
+    /// The harness started an advisory (tool-free) model call during closeout —
+    /// a completeness audit or a compaction summary. Transient UI hint only, so a
+    /// status line can name the wait instead of a bare "waiting for model". `kind`
+    /// is a stable key (`completeness_audit` / `context_compaction`).
+    AdvisoryStarted {
+        kind: String,
+    },
+    /// Heartbeat while a long command tool runs (runtime observability). Carries
+    /// the command line, so it is a LocalOnly UI hint — never projected remotely
+    /// or persisted. Lets a status line show "运行 cargo test" with a live elapsed.
+    CommandProgress {
+        label: String,
+        elapsed_ms: u64,
+    },
+    /// TRANSIENT: a model round is about to retry the same request. A live
+    /// connectivity hint for a status line — never persisted, never a
+    /// transcript item, never an outcome. Emitted by the kernel's retry
+    /// controller; presentation only consumes it and must never drive a retry
+    /// from it.
+    ModelRetrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+    },
+    /// TRANSIENT: the retry budget is spent on a `Safe` failure and the round
+    /// is waiting, low-frequency, for the network. A live status hint only —
+    /// never persisted, never a transcript item, never an outcome.
+    ModelWaitingForNetwork {
+        elapsed_ms: u64,
+    },
+    /// The model replaced its structured plan (update_plan tool). Full list,
+    /// not a delta; step text derives from the task/model output.
+    PlanUpdated {
+        steps: Vec<leveler_lifecycle::PlanStep>,
+    },
+    /// Host refused update_goal(complete) (process gate). Persisted for UI/resume.
+    GoalIntercepted {
+        kind: String,
+        detail: String,
+    },
+    /// Ownership provenance for a child's write scope (`ownership_granted` /
+    /// `ownership_denied`). Persisted so an offline audit can tell an
+    /// authorized write from a bypass. `detail` carries paths → LocalOnly.
+    DelegationStage {
+        action: String,
+        detail: String,
+    },
+    /// The closure-boundary review decision (R013-F1): why a required review
+    /// ran, was skipped, or could not be launched. Persisted so "no reviewer"
+    /// is always explainable from durable history — the silent-swallow failure
+    /// mode this replaces left a downgraded task with zero trace.
+    ///
+    /// `action`: `not_required` | `already_reviewed` | `launching` |
+    /// `launch_failed` | `finished_ok` | `finished_incomplete` |
+    /// `blocking_finding_open`.
+    /// `detail` carries the policy reason or the launch error — never file
+    /// contents or secrets.
+    ReviewStage {
+        required: bool,
+        action: String,
+        detail: String,
+    },
+    /// A durable goal checkpoint was cut (long-goal P3). Carries the bounded
+    /// payload so clients can render the Recap without a second read — the
+    /// `goal_checkpoints` row stays the durable authority (same precedent as
+    /// `EvidenceLedgerUpdated` carrying the ledger). Emitted AFTER the row is
+    /// persisted, so this event always names a checkpoint that exists.
+    GoalCheckpointCreated {
+        checkpoint_id: String,
+        goal_id: String,
+        /// `manual` | `milestone` | `context_compaction` | `interrupted`.
+        reason: String,
+        /// RFC3339 creation time of the persisted row.
+        created_at: String,
+        /// Boxed: the full checkpoint snapshot dwarfs every other variant,
+        /// and events are moved through channels by value.
+        payload: Box<leveler_lifecycle::GoalCheckpoint>,
+    },
+    /// Delivery process-evidence ledger snapshot (SoT for resume seed).
+    EvidenceLedgerUpdated {
+        ledger: leveler_lifecycle::EvidenceLedger,
+    },
+    /// Cross-round progress / closeout ledger (engine continue reads last).
+    ProgressUpdated {
+        ledger: leveler_lifecycle::ProgressLedger,
+    },
+    /// Replay-only: the deleted supervisor's window-control state. Old logs
+    /// carry these rows; nothing writes or reads them anymore.
+    WindowStateUpdated {
+        state: crate::window::WindowState,
+    },
+    /// Exact messages the next request will use. Unlike the raw transcript,
+    /// this includes compaction and transient continuation nudges.
+    ContextSnapshot {
+        messages: Vec<leveler_model::Message>,
+        /// Transcript watermark: how many leading transcript messages this
+        /// snapshot supersedes. Restore appends exactly the messages after it
+        /// — no suffix-overlap inference. `None` marks a legacy snapshot or
+        /// an executor in-loop snapshot (no durable ordinal in scope); those
+        /// merge via the legacy overlap heuristic. Equal to the DB message
+        /// ordinal whenever the transcript has no unparsable rows (guaranteed
+        /// on the strict resume/continuation paths).
+        #[serde(default)]
+        through_ordinal: Option<u64>,
+    },
+    SubAgentStarted {
+        id: String,
+        nickname: String,
+        role: String,
+        task: String,
+        /// Built-in capability contract. `serde(default)` so events written
+        /// before Child Profile existed still replay. `None` / empty means
+        /// "not recorded", not "no profile".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_role: Option<String>,
+        /// Whether this child holds a physically read-only toolset. Absent on
+        /// events written before the write bound replaced the capability
+        /// taxonomy; `false` is then the floor, never a claim.
+        #[serde(default)]
+        read_only: bool,
+        /// What re-creates this child's activation. `None` on rows written
+        /// before children were resumable — such a child cannot be continued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec: Option<leveler_lifecycle::ChildSpawnSpec>,
+    },
+    /// A child's activation died with its runtime window. The child itself —
+    /// its identity, spec and transcript — remains, and a later turn of the
+    /// same session either continues it or settles it as lost.
+    SubAgentInterrupted {
+        id: String,
+    },
+    /// A new activation of an interrupted child, under the same identity.
+    /// `attempt` counts the activations after the first (1 = first resume).
+    SubAgentResumed {
+        id: String,
+        attempt: u32,
+    },
+    /// Messages a delegated child appended to its own transcript, in order.
+    /// With the start's spec this is the child session: what a later window
+    /// restores to continue the same child.
+    SubAgentTranscriptAppended {
+        id: String,
+        messages: Vec<leveler_model::Message>,
+    },
+    /// TRANSIENT: live execution state and cumulative usage for one sub-agent.
+    SubAgentProgress {
+        id: String,
+        active: bool,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+    },
+    SubAgentFinished {
+        id: String,
+        nickname: String,
+        ok: bool,
+        summary: String,
+        /// What this child contributed, as counts joined on `source_child`.
+        /// A reference, never the finding records — the ledger stays the
+        /// authority. `serde(default)` so events written before contribution
+        /// tracing existed still replay.
+        #[serde(default)]
+        contribution: Option<leveler_lifecycle::ChildResultProjection>,
+        /// The harness's four-way reading of the child's result. `None` on
+        /// rows written before it was typed, or when no harness spoke for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<leveler_lifecycle::ChildStatus>,
+        /// How the child's activation ended. `None` on rows written before it
+        /// was typed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<leveler_lifecycle::ChildStop>,
+        /// Which bound fired when `stop` is `budget`. `None` for every other
+        /// stop and on rows written before it was typed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<leveler_lifecycle::ChildLimit>,
+    },
+    /// TRANSIENT: live tool/step for one sub-agent (attributed by `id`).
+    SubAgentActivity {
+        id: String,
+        phase: String,
+        tool: String,
+        preview: String,
+        is_error: bool,
+    },
+    /// TRANSIENT: the executor's final-text marker; the turn runner replaces
+    /// it with [`EngineEvent::TurnFinished`].
+    RunFinished {
+        text: String,
+    },
+
+    // ── kernel: approvals / clarifications ──────────────────────────────
+    ApprovalRequested {
+        id: ApprovalId,
+        /// The call this approval gates, and the agent that made it. Recovery
+        /// pairs on both: call ids are local to their agent, so two concurrent
+        /// delegated agents can raise the same one. `None` on rows written
+        /// before the attribution existed — recovery falls back to the most
+        /// recent open call there rather than dropping the marker.
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        tool: String,
+        summary: String,
+        command: Option<String>,
+        risk: String,
+    },
+    ApprovalResolved {
+        id: ApprovalId,
+        /// See [`EngineEvent::ApprovalRequested`].
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        /// approve | approve_session | deny
+        decision: String,
+    },
+    ClarificationRequested {
+        id: ClarificationId,
+        question: String,
+        options: Vec<String>,
+    },
+    ClarificationAnswered {
+        id: ClarificationId,
+        answer: String,
+        /// answered | skipped | unattended | timed_out | cancelled — how the
+        /// request actually resolved. Only `answered` carries a user reply;
+        /// the other variants must never be read as the user speaking.
+        #[serde(default)]
+        outcome: String,
+    },
+
+    // ── kernel: verification ─────────────────────────────────────────────
+    VerificationStarted,
+    VerificationCheck {
+        name: String,
+        /// The verifier's own durable spelling, carried verbatim:
+        /// `passed | failed | skipped | tool_missing | environment_unavailable`.
+        ///
+        /// A `String` on purpose: the engine persists this fact and does not
+        /// interpret it, and must not start depending on the crate that owns
+        /// the statuses in order to do so. Rows written before the vocabulary
+        /// was made explicit also carry `toolmissing` and
+        /// `environmentunavailable`; readers accept both spellings, and
+        /// nothing rewrites a row.
+        status: String,
+        /// Structured observation. `None` on legacy one-dimensional rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observation: Option<VerificationObservation>,
+        /// Structured gate disposition, including grounded baseline
+        /// provenance. `None` on legacy one-dimensional rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<VerificationDisposition>,
+        /// Effective invocation after verifier argument resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<VerificationExecution>,
+        evidence: Option<String>,
+    },
+    VerificationFinished {
+        /// The completion gate: whether the report blocked completion. It is
+        /// `true` for a run that was not verified, because a run that owed no
+        /// check must still complete. A reader answering "did this pass" must
+        /// read `verification`, not this.
+        passed: bool,
+        /// What the project's own checks actually said.
+        ///
+        /// `None` on rows written before the gate and the truth were split:
+        /// those rows carry `passed` alone, and `passed: true` cannot say
+        /// whether the run was `Passed` or `NotRun`. Absent is the honest
+        /// answer, and it is deliberately an `Option` — a default would
+        /// manufacture a verdict nobody recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationStatus>,
+    },
+    /// One acceptance criterion's command-backed evidence.
+    /// `status`: met | unmet | unverifiable.
+    /// `reject_reason`: optional machine-readable refuse code
+    /// (`no_command` / `trivial` / `dangerous` / `cancelled`).
+    AcceptanceEvidence {
+        id: String,
+        description: String,
+        required: bool,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reject_reason: Option<String>,
+    },
+
+    // ── strategy: plan / orchestrate ─────────────────────────────────────
+    PhaseChanged {
+        from: AgentState,
+        to: AgentState,
+    },
+    /// Legacy orchestrate event (payload simplified for wire compatibility).
+    RequirementReady {
+        goal: String,
+    },
+    ContextReady {
+        candidate_files: Vec<String>,
+        estimated_tokens: u32,
+    },
+    /// Legacy orchestrate event.
+    PlanReady {
+        step_count: u32,
+    },
+    NodeStarted {
+        node_id: String,
+        description: String,
+    },
+    NodeFinished {
+        node_id: String,
+        status: NodeStatus,
+    },
+    /// Legacy: emitted by the deleted verification-repair loop. Kept only so
+    /// persisted rows still replay; never produced.
+    RepairStarted {
+        attempt: u32,
+    },
+
+    // ── strategy: parallel worktree candidates ───────────────────────────
+    CandidateStarted {
+        branch: String,
+    },
+    CandidateFinished {
+        branch: String,
+        /// The child engine session that produced this candidate.
+        session_id: String,
+        verified: bool,
+    },
+    ReviewStarted {
+        lenses: usize,
+    },
+    ReviewFinding {
+        summary: String,
+    },
+    ReviewFailed {
+        lens: String,
+        error: String,
+    },
+    ReviewFinished {
+        findings: usize,
+        failures: usize,
+        blocking: bool,
+    },
+}
+
+impl EngineEvent {
+    /// Transient events are forwarded to observers but never persisted (they
+    /// are the overwhelming write volume and carry no replay value).
+    /// Which agent emitted this event, for diagnostics.
+    ///
+    /// `"main"` for the top-level agent; a child's id when the event carries
+    /// one. Only tool events are attributed today, which is enough for the
+    /// question this exists to answer — under an event-buffer overload the
+    /// flood is tool traffic, and "which of the four agents" is the first thing
+    /// worth knowing.
+    pub fn producer(&self) -> &str {
+        match self {
+            EngineEvent::ToolCallStarted { agent_id, .. }
+            | EngineEvent::ToolCallFinished { agent_id, .. } => {
+                agent_id.as_deref().unwrap_or("main")
+            }
+            _ => "main",
+        }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            EngineEvent::StreamAttemptStarted
+                | EngineEvent::UserShellOutput { .. }
+                | EngineEvent::ToolCallOutput { .. }
+                | EngineEvent::AssistantDelta { .. }
+                | EngineEvent::ReasoningDelta { .. }
+                | EngineEvent::TokenUsage { .. }
+                | EngineEvent::ContextUsage { .. }
+                | EngineEvent::SubAgentProgress { .. }
+                | EngineEvent::SubAgentActivity { .. }
+                | EngineEvent::RunFinished { .. }
+                | EngineEvent::ModelRetrying { .. }
+                | EngineEvent::ModelWaitingForNetwork { .. }
+        )
+    }
+
+    /// The persisted row: (`type` tag, full tagged JSON payload). The tag is
+    /// extracted from the serialization itself so it can never drift from the
+    /// serde attribute.
+    pub fn to_row(&self) -> Result<(String, String), EngineError> {
+        let value = serde_json::to_value(self)?;
+        let tag = value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| EngineError::Corrupt("event serialized without a type tag".into()))?
+            .to_string();
+        Ok((tag, value.to_string()))
+    }
+
+    /// Replay a persisted payload. An unknown or malformed event is a hard
+    /// error — a resume must never silently drop history.
+    pub fn from_payload(payload: &str) -> Result<Self, EngineError> {
+        serde_json::from_str(payload)
+            .map_err(|e| EngineError::Corrupt(format!("unreplayable event payload: {e}")))
+    }
+
+    /// How far this event may travel beyond the local machine. Local execution
+    /// keeps everything; a future cloud control-plane projection (M6/M7) may
+    /// carry only [`DataClass::Projectable`] events — lifecycle, status, phase,
+    /// verifier verdicts, and the approval/clarification control surface a phone
+    /// needs. [`DataClass::LocalOnly`] events embed source code, model output,
+    /// tool output, or full conversation context and must never enter a syncable
+    /// projection.
+    ///
+    /// The match is exhaustive on purpose: adding an event forces a deliberate
+    /// classification rather than defaulting to "shareable".
+    pub fn data_class(&self) -> DataClass {
+        use DataClass::{LocalOnly, Projectable};
+        match self {
+            // Lifecycle, status, counts, ids, verdicts, and the remote-control
+            // surface — safe for a sanitized projection.
+            EngineEvent::TaskStarted { .. }
+            | EngineEvent::TurnStarted { .. }
+            | EngineEvent::FinalizationStarted { .. }
+            | EngineEvent::FinalizationPhaseStarted { .. }
+            | EngineEvent::FinalizationPhaseFinished { .. }
+            | EngineEvent::TurnFinished { .. }
+            | EngineEvent::TaskFinished { .. }
+            | EngineEvent::TokenUsage { .. }
+            | EngineEvent::Compacted { .. }
+            | EngineEvent::ContextExpanded { .. }
+            | EngineEvent::ApprovalRequested { .. }
+            | EngineEvent::ApprovalResolved { .. }
+            | EngineEvent::ClarificationRequested { .. }
+            | EngineEvent::ClarificationAnswered { .. }
+            | EngineEvent::VerificationStarted
+            | EngineEvent::VerificationFinished { .. }
+            | EngineEvent::AcceptanceEvidence { .. }
+            | EngineEvent::PhaseChanged { .. }
+            | EngineEvent::ProgressUpdated { .. }
+            | EngineEvent::WindowStateUpdated { .. }
+            | EngineEvent::ContextReady { .. }
+            | EngineEvent::NodeStarted { .. }
+            | EngineEvent::NodeFinished { .. }
+            | EngineEvent::RepairStarted { .. }
+            | EngineEvent::CandidateStarted { .. }
+            | EngineEvent::CandidateFinished { .. }
+            | EngineEvent::ReviewStarted { .. }
+            | EngineEvent::ReviewFinished { .. } => Projectable,
+
+            // Embeds model output, tool arguments/output, source-bearing
+            // evidence, or the full conversation — local machine only.
+            EngineEvent::StreamAttemptStarted
+            | EngineEvent::ContextUsage { .. }
+            | EngineEvent::AssistantDelta { .. }
+            | EngineEvent::ReasoningDelta { .. }
+            | EngineEvent::AssistantMessage { .. }
+            | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallFinished { .. }
+            | EngineEvent::WorkspaceSnapshotCreated { .. }
+            | EngineEvent::ContextSnapshot { .. }
+            | EngineEvent::SubAgentStarted { .. }
+            | EngineEvent::SubAgentTranscriptAppended { .. }
+            | EngineEvent::SubAgentInterrupted { .. }
+            | EngineEvent::SubAgentResumed { .. }
+            | EngineEvent::SubAgentProgress { .. }
+            | EngineEvent::SubAgentActivity { .. }
+            | EngineEvent::SubAgentFinished { .. }
+            | EngineEvent::RunFinished { .. }
+            | EngineEvent::PlanUpdated { .. }
+            | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::DelegationStage { .. }
+            | EngineEvent::ReviewStage { .. }
+            | EngineEvent::EvidenceLedgerUpdated { .. }
+            // Carries the checkpoint payload (paths, plan wording) — local.
+            | EngineEvent::GoalCheckpointCreated { .. }
+            | EngineEvent::VerificationCheck { .. }
+            | EngineEvent::RequirementReady { .. }
+            | EngineEvent::PlanReady { .. }
+            | EngineEvent::ReviewFinding { .. }
+            | EngineEvent::ReviewFailed { .. }
+            // Transient local UI hints (may carry command text), never projected.
+            | EngineEvent::AdvisoryStarted { .. }
+            | EngineEvent::CommandProgress { .. }
+            | EngineEvent::ModelRetrying { .. }
+            | EngineEvent::ModelWaitingForNetwork { .. }
+            // User shell facts carry the raw command line and its output —
+            // local-sensitive by construction.
+            | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellOutput { .. }
+            | EngineEvent::UserShellFinished { .. }
+            // Raw command output — local-sensitive like the user shell's.
+            | EngineEvent::ToolCallOutput { .. } => LocalOnly,
+        }
+    }
+
+    /// Build the only event representation allowed to cross a remote/public
+    /// boundary. This is an explicit reconstruction, never serialization of
+    /// the domain event, so sensitive fields cannot be accidentally retained.
+    /// Returning `None` is the deny-by-default path.
+    pub fn public_projection(&self) -> Option<PublicEvent> {
+        Some(match self {
+            EngineEvent::TaskStarted { sandbox, kind, .. } => PublicEvent::TaskStarted {
+                sandbox: *sandbox,
+                kind: *kind,
+            },
+            EngineEvent::TurnStarted { turn_id, kind } => PublicEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: PublicTurnKind::from(kind),
+            },
+            EngineEvent::FinalizationStarted { at } => PublicEvent::FinalizationStarted { at: *at },
+            EngineEvent::FinalizationPhaseStarted { phase, at } => {
+                PublicEvent::FinalizationPhaseStarted {
+                    phase: phase.clone(),
+                    at: *at,
+                }
+            }
+            EngineEvent::FinalizationPhaseFinished {
+                phase,
+                at,
+                elapsed_ms,
+            } => PublicEvent::FinalizationPhaseFinished {
+                phase: phase.clone(),
+                at: *at,
+                elapsed_ms: *elapsed_ms,
+            },
+            EngineEvent::TurnFinished {
+                turn_id,
+                outcome,
+                rounds,
+                modified_files,
+                ..
+            } => PublicEvent::TurnFinished {
+                turn_id: turn_id.clone(),
+                outcome: *outcome,
+                rounds: *rounds,
+                modified_file_count: modified_files.len(),
+            },
+            EngineEvent::TaskFinished {
+                outcome,
+                verification,
+                ..
+            } => PublicEvent::TaskFinished {
+                outcome: *outcome,
+                verification: *verification,
+            },
+            EngineEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => PublicEvent::TokenUsage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cached_input_tokens: *cached_input_tokens,
+            },
+            EngineEvent::Compacted { from, to } => PublicEvent::Compacted {
+                from: *from,
+                to: *to,
+            },
+            EngineEvent::ApprovalRequested { id, .. } => {
+                PublicEvent::ApprovalRequested { id: id.clone() }
+            }
+            EngineEvent::ApprovalResolved { id, .. } => {
+                PublicEvent::ApprovalResolved { id: id.clone() }
+            }
+            EngineEvent::ClarificationRequested { id, options, .. } => {
+                PublicEvent::ClarificationRequested {
+                    id: id.clone(),
+                    option_count: options.len(),
+                }
+            }
+            EngineEvent::ClarificationAnswered { id, .. } => {
+                PublicEvent::ClarificationAnswered { id: id.clone() }
+            }
+            EngineEvent::VerificationStarted => PublicEvent::VerificationStarted,
+            EngineEvent::VerificationFinished {
+                passed,
+                verification,
+            } => PublicEvent::VerificationFinished {
+                passed: *passed,
+                verification: *verification,
+            },
+            EngineEvent::AcceptanceEvidence {
+                required, status, ..
+            } => PublicEvent::AcceptanceEvidence {
+                required: *required,
+                status: PublicAcceptanceStatus::parse(status)?,
+            },
+            EngineEvent::PhaseChanged { from, to } => PublicEvent::PhaseChanged {
+                from: *from,
+                to: *to,
+            },
+            EngineEvent::ProgressUpdated { ledger } => PublicEvent::TurnProgress {
+                closing: ledger.closing,
+                no_progress_streak: ledger.no_progress_streak,
+            },
+            EngineEvent::ContextReady {
+                candidate_files,
+                estimated_tokens,
+            } => PublicEvent::ContextReady {
+                candidate_file_count: candidate_files.len(),
+                estimated_tokens: *estimated_tokens,
+            },
+            EngineEvent::NodeStarted { .. } => PublicEvent::NodeStarted,
+            EngineEvent::NodeFinished { status, .. } => {
+                PublicEvent::NodeFinished { status: *status }
+            }
+            EngineEvent::RepairStarted { attempt } => {
+                PublicEvent::RepairStarted { attempt: *attempt }
+            }
+            EngineEvent::CandidateStarted { .. } => PublicEvent::CandidateStarted,
+            EngineEvent::CandidateFinished { verified, .. } => PublicEvent::CandidateFinished {
+                verified: *verified,
+            },
+            EngineEvent::ReviewStarted { lenses } => PublicEvent::ReviewStarted { lenses: *lenses },
+            EngineEvent::ReviewFinished {
+                findings,
+                failures,
+                blocking,
+            } => PublicEvent::ReviewFinished {
+                findings: *findings,
+                failures: *failures,
+                blocking: *blocking,
+            },
+
+            EngineEvent::StreamAttemptStarted
+            | EngineEvent::AssistantDelta { .. }
+            | EngineEvent::ReasoningDelta { .. }
+            | EngineEvent::AssistantMessage { .. }
+            | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallFinished { .. }
+            | EngineEvent::WorkspaceSnapshotCreated { .. }
+            | EngineEvent::ContextSnapshot { .. }
+            | EngineEvent::SubAgentStarted { .. }
+            | EngineEvent::SubAgentTranscriptAppended { .. }
+            | EngineEvent::SubAgentInterrupted { .. }
+            | EngineEvent::SubAgentResumed { .. }
+            | EngineEvent::SubAgentProgress { .. }
+            | EngineEvent::SubAgentActivity { .. }
+            | EngineEvent::SubAgentFinished { .. }
+            | EngineEvent::RunFinished { .. }
+            | EngineEvent::PlanUpdated { .. }
+            | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::DelegationStage { .. }
+            | EngineEvent::ReviewStage { .. }
+            | EngineEvent::EvidenceLedgerUpdated { .. }
+            // Local control state. It says nothing a remote peer needs and
+            // deny-by-default is the right answer for it.
+            | EngineEvent::WindowStateUpdated { .. }
+            | EngineEvent::GoalCheckpointCreated { .. }
+            | EngineEvent::VerificationCheck { .. }
+            | EngineEvent::RequirementReady { .. }
+            | EngineEvent::PlanReady { .. }
+            | EngineEvent::ReviewFinding { .. }
+            | EngineEvent::ReviewFailed { .. }
+            | EngineEvent::AdvisoryStarted { .. }
+            | EngineEvent::ContextExpanded { .. }
+            | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellOutput { .. }
+            | EngineEvent::UserShellFinished { .. }
+            | EngineEvent::ToolCallOutput { .. }
+            | EngineEvent::ModelRetrying { .. }
+            | EngineEvent::ModelWaitingForNetwork { .. }
+            | EngineEvent::CommandProgress { .. }
+            | EngineEvent::ContextUsage { .. } => return None,
+        })
+    }
+}
+
+/// Sanitized lifecycle facts allowed to leave the local runtime. It contains
+/// no free-form text, paths, commands, prompts, model output, or tool data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum PublicEvent {
+    TaskStarted {
+        sandbox: bool,
+        kind: ExecutionKind,
+    },
+    TurnStarted {
+        turn_id: TurnId,
+        kind: PublicTurnKind,
+    },
+    FinalizationStarted {
+        at: leveler_core::Timestamp,
+    },
+    FinalizationPhaseStarted {
+        phase: String,
+        at: leveler_core::Timestamp,
+    },
+    FinalizationPhaseFinished {
+        phase: String,
+        at: leveler_core::Timestamp,
+        elapsed_ms: u64,
+    },
+    TurnFinished {
+        turn_id: TurnId,
+        outcome: TurnOutcome,
+        rounds: u32,
+        modified_file_count: usize,
+    },
+    TaskFinished {
+        outcome: TaskOutcome,
+        #[serde(default)]
+        verification: leveler_lifecycle::VerificationStatus,
+    },
+    TokenUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+    },
+    Compacted {
+        from: usize,
+        to: usize,
+    },
+    ApprovalRequested {
+        id: ApprovalId,
+    },
+    ApprovalResolved {
+        id: ApprovalId,
+    },
+    ClarificationRequested {
+        id: ClarificationId,
+        option_count: usize,
+    },
+    ClarificationAnswered {
+        id: ClarificationId,
+    },
+    VerificationStarted,
+    VerificationFinished {
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationStatus>,
+    },
+    AcceptanceEvidence {
+        required: bool,
+        status: PublicAcceptanceStatus,
+    },
+    PhaseChanged {
+        from: AgentState,
+        to: AgentState,
+    },
+    /// Coarse progress counters only (no paths/tool text).
+    TurnProgress {
+        closing: bool,
+        no_progress_streak: u32,
+    },
+    ContextReady {
+        candidate_file_count: usize,
+        estimated_tokens: u32,
+    },
+    NodeStarted,
+    NodeFinished {
+        status: NodeStatus,
+    },
+    RepairStarted {
+        attempt: u32,
+    },
+    CandidateStarted,
+    CandidateFinished {
+        verified: bool,
+    },
+    ReviewStarted {
+        lenses: usize,
+    },
+    ReviewFinished {
+        findings: usize,
+        failures: usize,
+        blocking: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTurnKind {
+    User,
+    Chat,
+    Node,
+    Repair,
+}
+
+impl From<&TurnKind> for PublicTurnKind {
+    fn from(value: &TurnKind) -> Self {
+        match value {
+            TurnKind::User => Self::User,
+            TurnKind::Chat => Self::Chat,
+            TurnKind::Node { .. } => Self::Node,
+            TurnKind::Repair { .. } => Self::Repair,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicAcceptanceStatus {
+    Met,
+    Unmet,
+    Unverifiable,
+}
+
+impl PublicAcceptanceStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "met" => Some(Self::Met),
+            "unmet" => Some(Self::Unmet),
+            "unverifiable" => Some(Self::Unverifiable),
+            _ => None,
+        }
+    }
+}
+
+/// How far an [`EngineEvent`] may travel beyond the local machine — see
+/// [`EngineEvent::data_class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataClass {
+    /// Safe for a sanitized cloud/control-plane projection.
+    Projectable,
+    /// Contains source, model content, tool output, or full context — never
+    /// leaves the local machine.
+    LocalOnly,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_turn_finished_without_outcome_defaults_to_completed() {
+        let payload = serde_json::json!({
+            "type": "turn_finished",
+            "payload": {
+                "turn_id": "turn-1",
+                "stop_reason": "Completed",
+                "rounds": 2,
+                "modified_files": []
+            }
+        });
+        let event = EngineEvent::from_payload(&payload.to_string()).unwrap();
+        assert!(matches!(
+            event,
+            EngineEvent::TurnFinished {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    /// The bound that stopped a child survives the durable row, and rows
+    /// written before it was typed still replay.
+    #[test]
+    fn a_child_budget_limit_is_durable_and_optional() {
+        let event = EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Euclid".into(),
+            ok: false,
+            summary: "stopped".into(),
+            contribution: None,
+            outcome: None,
+            stop: Some(leveler_lifecycle::ChildStop::Budget),
+            limit: Some(leveler_lifecycle::ChildLimit::Duration),
+        };
+        let (_, payload) = event.to_row().unwrap();
+        assert!(payload.contains(r#""limit":"duration""#), "{payload}");
+        assert!(matches!(
+            EngineEvent::from_payload(&payload).unwrap(),
+            EngineEvent::SubAgentFinished {
+                limit: Some(leveler_lifecycle::ChildLimit::Duration),
+                ..
+            }
+        ));
+
+        let legacy = serde_json::json!({
+            "type": "sub_agent_finished",
+            "payload": {"id": "a1", "nickname": "Euclid", "ok": false, "summary": "s", "stop": "budget"}
+        });
+        assert!(matches!(
+            EngineEvent::from_payload(&legacy.to_string()).unwrap(),
+            EngineEvent::SubAgentFinished { limit: None, .. }
+        ));
+    }
+
+    #[test]
+    fn full_context_and_model_content_are_local_only() {
+        // The full conversation, model output, and tool output must never enter
+        // a syncable projection.
+        assert_eq!(
+            EngineEvent::ContextSnapshot {
+                messages: vec![],
+                through_ordinal: None,
+            }
+            .data_class(),
+            DataClass::LocalOnly
+        );
+        assert_eq!(
+            EngineEvent::AssistantMessage { text: "x".into() }.data_class(),
+            DataClass::LocalOnly
+        );
+        assert_eq!(
+            EngineEvent::ToolCallFinished {
+                exit_code: None,
+                stop: None,
+                call_id: "c".into(),
+                name: "read_file".into(),
+                is_error: false,
+                preview: "source".into(),
+                agent_id: None,
+                applied_diff: None,
+            }
+            .data_class(),
+            DataClass::LocalOnly
+        );
+        assert_eq!(
+            EngineEvent::VerificationCheck {
+                name: "test".into(),
+                status: "failed".into(),
+                observation: Some(VerificationObservation::Failed),
+                disposition: Some(VerificationDisposition::Required),
+                execution: None,
+                evidence: Some("stack trace".into()),
+            }
+            .data_class(),
+            DataClass::LocalOnly
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_control_surface_are_projectable() {
+        assert_eq!(
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: None,
+                failure: None,
+                stop: None,
+                warnings: Vec::new(),
+            }
+            .data_class(),
+            DataClass::Projectable
+        );
+        assert_eq!(
+            EngineEvent::PhaseChanged {
+                from: AgentState::Plan,
+                to: AgentState::Execute,
+            }
+            .data_class(),
+            DataClass::Projectable
+        );
+        assert_eq!(
+            EngineEvent::ApprovalRequested {
+                id: leveler_core::ApprovalId::generate(),
+                call_id: Some("call-1".into()),
+                agent_id: None,
+                tool: "run_command".into(),
+                summary: "run tests".into(),
+                command: Some("cargo test".into()),
+                risk: "assisted".into(),
+            }
+            .data_class(),
+            DataClass::Projectable
+        );
+        assert_eq!(
+            EngineEvent::VerificationFinished {
+                passed: true,
+                verification: None,
+            }
+            .data_class(),
+            DataClass::Projectable
+        );
+    }
+
+    #[test]
+    fn public_projection_does_not_serialize_sensitive_event_fields() {
+        let secret = "LVTEST_PUBLIC_SECRET_DO_NOT_LEAK";
+        let events = [
+            EngineEvent::TaskStarted {
+                goal: secret.into(),
+                model: secret.into(),
+                mode: secret.into(),
+                sandbox: true,
+                kind: ExecutionKind::Direct,
+                task_id: Some(leveler_core::TaskId::new(secret)),
+            },
+            EngineEvent::TurnFinished {
+                turn_id: TurnId::new("turn-safe"),
+                outcome: TurnOutcome::Failed,
+                stop_reason: secret.into(),
+                rounds: 2,
+                modified_files: vec![secret.into()],
+                stop: None,
+            },
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: Some(secret.into()),
+                failure: None,
+                stop: None,
+                warnings: Vec::new(),
+            },
+            EngineEvent::ApprovalRequested {
+                id: ApprovalId::new("approval-safe"),
+                call_id: Some(secret.into()),
+                agent_id: Some(secret.into()),
+                tool: secret.into(),
+                summary: secret.into(),
+                command: Some(secret.into()),
+                risk: "destructive".into(),
+            },
+            EngineEvent::ClarificationRequested {
+                id: ClarificationId::new("clarification-safe"),
+                question: secret.into(),
+                options: vec![secret.into()],
+            },
+            EngineEvent::CandidateStarted {
+                branch: secret.into(),
+            },
+        ];
+
+        for event in events {
+            let projected = event
+                .public_projection()
+                .expect("safe event shape should remain projectable");
+            let json = serde_json::to_string(&projected).unwrap();
+            assert!(!json.contains(secret), "public projection leaked: {json}");
+        }
+    }
+
+    #[test]
+    fn source_and_model_content_have_no_public_projection() {
+        for event in [
+            EngineEvent::AssistantMessage {
+                text: "source".into(),
+            },
+            EngineEvent::ToolCallStarted {
+                call_id: "call".into(),
+                name: "run_command".into(),
+                arguments: "{\"token\":\"secret\"}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+            },
+            EngineEvent::ContextSnapshot {
+                messages: vec![],
+                through_ordinal: None,
+            },
+        ] {
+            assert!(event.public_projection().is_none());
+        }
+    }
+
+    #[test]
+    fn transient_events_are_never_persisted_and_carry_no_replay_value() {
+        // Losing a transient event must not lose authoritative state — the
+        // client rebuilds from a snapshot, and the log never stored it.
+        for e in [
+            EngineEvent::AssistantDelta { text: "d".into() },
+            EngineEvent::ReasoningDelta { text: "r".into() },
+            EngineEvent::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_input_tokens: 0,
+            },
+            EngineEvent::RunFinished { text: "f".into() },
+        ] {
+            assert!(e.is_transient(), "{e:?} must be transient");
+        }
+        // Canonical lifecycle events are persisted.
+        assert!(
+            !EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Failed,
+                verification: leveler_lifecycle::VerificationStatus::NotRun,
+                reason: None,
+                failure: None,
+                stop: None,
+                warnings: Vec::new(),
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn sub_agent_progress_has_a_transient_engine_event_shape() {
+        let payload = serde_json::json!({
+            "type": "sub_agent_progress",
+            "payload": {
+                "id": "agent-2",
+                "active": true,
+                "input_tokens": 2400,
+                "output_tokens": 180,
+                "cached_input_tokens": 1200
+            }
+        })
+        .to_string();
+        let event = EngineEvent::from_payload(&payload);
+        assert!(
+            event.is_ok(),
+            "progress event must have a stable wire shape"
+        );
+        assert!(event.unwrap().is_transient());
+    }
+
+    #[test]
+    fn persisted_events_round_trip_through_to_row_and_from_payload() {
+        let event = EngineEvent::PhaseChanged {
+            from: AgentState::Understand,
+            to: AgentState::Localize,
+        };
+        let (tag, payload) = event.to_row().unwrap();
+        assert_eq!(tag, "phase_changed");
+        assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
+    }
+
+    /// DelegationStage is a persisted ownership fact whose `detail` carries
+    /// file paths — it must replay exactly, never travel beyond the local
+    /// machine, and never be dropped as transient.
+    #[test]
+    fn delegation_stage_is_persisted_local_only_and_round_trips() {
+        let event = EngineEvent::DelegationStage {
+            action: "ownership_granted".to_string(),
+            detail: "agent-1: src/output, src/cmd/dedup.rs".to_string(),
+        };
+        assert!(!event.is_transient());
+        assert_eq!(event.data_class(), DataClass::LocalOnly);
+        assert!(event.public_projection().is_none());
+        let (tag, payload) = event.to_row().unwrap();
+        assert_eq!(tag, "delegation_stage");
+        assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
+    }
+
+    #[test]
+    fn legacy_tool_started_without_risk_remains_readable_and_unknown() {
+        let payload = r#"{"type":"tool_call_started","payload":{"call_id":"c1","name":"read_file","arguments":"{}"}}"#;
+        assert!(matches!(
+            EngineEvent::from_payload(payload).unwrap(),
+            EngineEvent::ToolCallStarted { risk: None, .. }
+        ));
+    }
+}

@@ -1,0 +1,653 @@
+//! Tool-call authorization helpers: command/path extraction, write
+//! allowlists, approval signatures, tool classification.
+
+use leveler_execution::{is_shell_wrapper_program, shell_c_script};
+use leveler_model::ToolCall;
+use sha2::{Digest, Sha256};
+
+/// Whether a program is a verification-class runner (build / test /
+/// typecheck). Heuristic by program basename over the command that ACTUALLY
+/// ran, whatever tool wrapper carried it: the real gate is the verifier — this
+/// decides what counts as a green check and whether the executor nudges the
+/// model to verify before accepting a completion.
+pub(crate) fn is_verification_program(program: &str) -> bool {
+    const VERIFICATION_PROGRAMS: &[&str] = &[
+        "cargo", "rustc", "go", "npm", "pnpm", "yarn", "npx", "bun", "deno", "node", "tsc", "jest",
+        "vitest", "mocha", "pytest", "python", "python3", "tox", "mypy", "ruff", "make", "just",
+        "gradle", "gradlew", "mvn", "mvnw", "dotnet", "ctest", "cmake", "swift", "zig",
+    ];
+    // Parse both separator styles so Windows tool calls are classified the
+    // same way even when replayed or tested on a Unix host.
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let base = base.to_ascii_lowercase();
+    let base = [".exe", ".cmd", ".bat", ".com"]
+        .into_iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(&base);
+    VERIFICATION_PROGRAMS.contains(&base)
+}
+
+pub(crate) fn collect_scoped_paths_from_call(call: &ToolCall, out: &mut Vec<String>) {
+    if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
+        push_unique_path(out, path);
+    }
+    if call.name == "run_command"
+        && let Some(cwd) = call.arguments.get("cwd").and_then(|v| v.as_str())
+    {
+        push_unique_path(out, cwd);
+    }
+    if call.name == "apply_patch"
+        && let Some(patch) = call.arguments.get("patch").and_then(|v| v.as_str())
+    {
+        for path in patch_paths(patch) {
+            push_unique_path(out, &path);
+        }
+    }
+    // Shell targets are visible to path rules and approval prompts (R004 F3):
+    // absolute-looking literal words of the command are scoped paths too.
+    if call.name == "run_command"
+        && let Some(args) = call.arguments.get("args").and_then(|v| v.as_array())
+    {
+        for arg in args.iter().filter_map(|a| a.as_str()) {
+            if leveler_execution::looks_like_absolute_path_arg(arg) {
+                push_unique_path(out, arg);
+            }
+        }
+    }
+    if call.name == "shell_command"
+        && let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str())
+    {
+        for word in leveler_execution::literal_command_words(cmd).unwrap_or_default() {
+            if leveler_execution::looks_like_absolute_path_arg(&word) {
+                push_unique_path(out, &word);
+            }
+        }
+    }
+}
+
+pub(crate) fn patch_paths(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        for prefix in [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ] {
+            if let Some(path) = line.strip_prefix(prefix) {
+                paths.push(path.trim().to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// The patch's target files that fall outside `allowlist` (worker ownership).
+/// A target is allowed if it equals an entry or sits under an allowed directory
+/// prefix. Paths are normalized (`./` stripped) before comparison.
+/// The paths a write tool (`apply_patch`/`replace`) would touch that fall
+/// outside the allowlist (files or directory prefixes).
+pub(crate) fn write_targets_outside_allowlist(
+    call: &ToolCall,
+    allowlist: &[String],
+) -> Vec<String> {
+    let allow: Vec<String> = allowlist
+        .iter()
+        .map(|p| norm_scope_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    write_targets(call)
+        .into_iter()
+        .map(|p| norm_scope_path(&p))
+        .filter(|target| !allow.iter().any(|a| scope_covers(a, target)))
+        .collect()
+}
+
+/// The paths a direct write tool would touch, normalized — for callers that
+/// need the target set itself (ownership fences) rather than a containment
+/// verdict against a fixed list.
+pub(crate) fn mutation_targets(call: &ToolCall) -> Vec<String> {
+    write_targets(call)
+        .into_iter()
+        .map(|p| norm_scope_path(&p))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The paths a direct write tool would touch, unnormalized.
+fn write_targets(call: &ToolCall) -> Vec<String> {
+    match call.name.as_str() {
+        "apply_patch" => {
+            let patch = call
+                .arguments
+                .get("patch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            patch_paths(patch)
+        }
+        "replace" | "write_file" => call
+            .arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Normalize a scope/target path: `./` prefix and trailing slashes stripped so
+/// a directory grant written either way (`src/output` / `src/output/`, the
+/// spawn_agent schema shows the latter) covers its subtree. A bare "/"
+/// normalizes to "" and matches nothing.
+pub(crate) fn norm_scope_path(p: &str) -> String {
+    p.trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Whether normalized scope entry `a` covers normalized `target` (equal path
+/// or directory prefix).
+fn scope_covers(a: &str, target: &str) -> bool {
+    !a.is_empty() && (target == a || target.starts_with(&format!("{a}/")))
+}
+
+/// Whether a normalized write target cannot be proven in-workspace by string
+/// comparison (absolute, or containing `..`). The ownership fence DENIES on a
+/// match, so such a spelling must fail CLOSED — it is treated as inside every
+/// claimed scope rather than silently escaping one.
+pub(crate) fn target_is_unresolvable(target: &str) -> bool {
+    target.starts_with('/') || target.split('/').any(|segment| segment == "..")
+}
+
+pub(crate) fn push_unique_path(out: &mut Vec<String>, path: &str) {
+    let normalized = path.trim().trim_start_matches("./");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized
+            .split('/')
+            .any(|segment| segment == ".." || segment.is_empty())
+    {
+        return;
+    }
+    if !out.iter().any(|existing| existing == normalized) {
+        out.push(normalized.to_string());
+    }
+}
+
+/// Whether this call is a host opener (`open` / `xdg-open` / …) that must run
+/// outside the workspace seatbelt after the user approves.
+pub(crate) fn call_needs_host_escape(call: &ToolCall) -> bool {
+    let (program, args) = extract_command(call);
+    let Some(program) = program.as_deref() else {
+        return false;
+    };
+    leveler_execution::command_needs_host_escape(&leveler_execution::CommandView {
+        program,
+        args: &args,
+    })
+}
+
+/// Pull `(program, args)` out of a command tool call for classification.
+///
+/// - `run_command` → structured `(program, args)`
+/// - `shell_command` → platform shell wrapper `(sh|cmd, ["-c"|/C, raw_cmd])`
+///   so [`leveler_execution::classify_command`] can inspect the script body.
+///   The original script is preserved as the final arg for grant identity.
+pub(crate) fn extract_command(call: &ToolCall) -> (Option<String>, Vec<String>) {
+    match call.name.as_str() {
+        "run_command" => {
+            let program = call
+                .arguments
+                .get("program")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let mut args = call
+                .arguments
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(program) = &program {
+                drop_duplicate_program_arg(program, &mut args);
+            }
+            (program, args)
+        }
+        "shell_command" => {
+            let cmd = call
+                .arguments
+                .get("cmd")
+                .or_else(|| call.arguments.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (program, args) = shell_invocation_for_classification(cmd);
+            (Some(program), args)
+        }
+        _ => (None, Vec::new()),
+    }
+}
+
+/// Platform shell wrapper used for classification — the SAME single copy the
+/// tool executes with, so the classified shape can never drift from the
+/// executed shape.
+fn shell_invocation_for_classification(cmd: &str) -> (String, Vec<String>) {
+    leveler_execution::shell_invocation(cmd)
+}
+
+pub(crate) fn drop_duplicate_program_arg(program: &str, args: &mut Vec<String>) {
+    let Some(first) = args.first() else {
+        return;
+    };
+    let program_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|p| p.to_str())
+        .unwrap_or(program);
+    if first == program || first == program_name {
+        args.remove(0);
+    }
+}
+
+/// Command line for permission-rule matching and approval UI.
+///
+/// `shell_command` uses the raw `cmd` string (not `sh -c …`) so rules can match
+/// prefixes like `cargo test` against the script body.
+pub(crate) fn command_line_for_match(
+    call: &ToolCall,
+    program: Option<&str>,
+    args: &[String],
+) -> Option<String> {
+    if call.name == "shell_command" {
+        return call
+            .arguments
+            .get("cmd")
+            .or_else(|| call.arguments.get("command"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+    program.map(|p| format!("{} {}", p, args.join(" ")).trim().to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+/// A stable signature for "approve for the session".
+///
+/// Ordinary `run_command` uses `tool:program:first_arg` so approving `git push`
+/// covers later `git push`s. Shell wrappers **must not** collapse to
+/// `…:sh:-c` / `shell_command:sh:-c` — that would grant every subsequent shell
+/// script. For `shell_command` and `run_command` of `sh -c` / `cmd /C <script>`,
+/// identity is the SHA-256 of the trimmed script body.
+///
+/// Shell detection and `-c`/`/C` extraction are shared with
+/// [`leveler_execution::classify_command`] via
+/// [`leveler_execution::is_shell_wrapper_program`] /
+/// [`leveler_execution::shell_c_script`].
+pub(crate) fn approval_signature(tool: &str, program: Option<&str>, args: &[String]) -> String {
+    if tool == "shell_command" {
+        let script = shell_c_script(args).unwrap_or("").trim();
+        return format!("shell_command:{}", sha256_hex(script.as_bytes()));
+    }
+    if tool == "run_command"
+        && let Some(p) = program
+        && is_shell_wrapper_program(p)
+        && let Some(script) = shell_c_script(args)
+    {
+        return format!("run_command:{}", sha256_hex(script.trim().as_bytes()));
+    }
+    match program {
+        Some(p) => format!(
+            "{tool}:{p}:{}",
+            args.first().map(String::as_str).unwrap_or("")
+        ),
+        None => tool.to_string(),
+    }
+}
+
+/// Stable, non-reversible identity of one exact proposed action. Used to bind
+/// a pending user decision without retaining another copy of raw arguments.
+pub(crate) fn action_fingerprint(call: &ToolCall) -> String {
+    let mut digest = Sha256::new();
+    digest.update(call.name.as_bytes());
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&call.arguments).unwrap_or_default());
+    format!("{:x}", digest.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_core::ToolCallId;
+
+    fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("t"),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    /// The spawn_agent schema's directory example uses a trailing slash
+    /// (`src/output/`). The allowlist must accept that spelling: without
+    /// trailing-slash normalization every write of a worker scoped per the
+    /// schema's own example is refused (fail-closed, but a dead worker).
+    #[test]
+    fn a_trailing_slash_directory_allowlist_entry_admits_the_subtree() {
+        let call = tool_call(
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/output/mod.rs\n-a\n+b\n*** End Patch"
+            }),
+        );
+        assert!(
+            write_targets_outside_allowlist(&call, &["src/output/".to_string()]).is_empty(),
+            "trailing-slash directory grant must cover its subtree"
+        );
+        assert_eq!(
+            write_targets_outside_allowlist(&call, &["src/other/".to_string()]),
+            vec!["src/output/mod.rs".to_string()],
+            "normalization must not turn a trailing slash into allow-everything"
+        );
+    }
+
+    /// The ownership fence and the per-worker write allowlist read a write
+    /// tool's targets from here. A write tool this function does not know
+    /// reports no target at all, so a sibling agent's file could be
+    /// overwritten without the fence ever seeing it.
+    #[test]
+    fn every_direct_write_tool_declares_its_target() {
+        let call = tool_call(
+            "write_file",
+            serde_json::json!({"path": "src/other/mod.rs", "content": "x\n"}),
+        );
+        assert_eq!(
+            mutation_targets(&call),
+            vec!["src/other/mod.rs".to_string()],
+            "write_file must declare the file it writes"
+        );
+        assert_eq!(
+            write_targets_outside_allowlist(&call, &["src/output/".to_string()]),
+            vec!["src/other/mod.rs".to_string()],
+            "a write_file outside the claimed scope must be caught"
+        );
+        assert!(
+            write_targets_outside_allowlist(&call, &["src/other/".to_string()]).is_empty(),
+            "a write_file inside the claimed scope must be allowed"
+        );
+    }
+
+    #[test]
+    fn extract_command_shell_uses_platform_wrapper() {
+        let call = tool_call("shell_command", serde_json::json!({"cmd": "rm -rf x"}));
+        let (program, args) = extract_command(&call);
+        #[cfg(windows)]
+        {
+            assert_eq!(program.as_deref(), Some("cmd"));
+            assert_eq!(args, vec!["/C".to_string(), "rm -rf x".to_string()]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program.as_deref(), Some("sh"));
+            assert_eq!(args, vec!["-c".to_string(), "rm -rf x".to_string()]);
+        }
+    }
+
+    #[test]
+    fn open_index_html_needs_host_escape() {
+        let run = tool_call(
+            "run_command",
+            serde_json::json!({"program": "open", "args": ["index.html"]}),
+        );
+        assert!(call_needs_host_escape(&run));
+        let shell = tool_call(
+            "shell_command",
+            serde_json::json!({"cmd": "open index.html"}),
+        );
+        assert!(call_needs_host_escape(&shell));
+        let safe = tool_call(
+            "run_command",
+            serde_json::json!({"program": "ls", "args": ["."]}),
+        );
+        assert!(!call_needs_host_escape(&safe));
+    }
+
+    #[test]
+    fn shell_command_grant_is_script_hash_not_sh_c() {
+        let call = tool_call("shell_command", serde_json::json!({"cmd": "echo hi"}));
+        let (program, args) = extract_command(&call);
+        let sig = approval_signature("shell_command", program.as_deref(), &args);
+        assert!(
+            !sig.contains(":-c") && !sig.ends_with(":/C") && !sig.contains(":sh:"),
+            "must not collapse to shell wrapper flags: {sig}"
+        );
+        assert!(
+            sig.starts_with("shell_command:"),
+            "expected shell_command:{{hash}}, got {sig}"
+        );
+        let expected = format!("shell_command:{}", sha256_hex("echo hi".as_bytes()));
+        assert_eq!(sig, expected);
+    }
+
+    #[test]
+    fn session_grant_echo_does_not_cover_rm() {
+        let echo = tool_call("shell_command", serde_json::json!({"cmd": "echo hi"}));
+        let rm = tool_call("shell_command", serde_json::json!({"cmd": "rm -rf x"}));
+        let (p1, a1) = extract_command(&echo);
+        let (p2, a2) = extract_command(&rm);
+        let sig_echo = approval_signature("shell_command", p1.as_deref(), &a1);
+        let sig_rm = approval_signature("shell_command", p2.as_deref(), &a2);
+        assert_ne!(
+            sig_echo, sig_rm,
+            "ApproveSession for echo must not auto-allow rm"
+        );
+        // Same script again shares the grant. Hash uses trim(script); raw cmd
+        // padding must not change grant identity.
+        let echo2 = tool_call("shell_command", serde_json::json!({"cmd": "  echo hi  "}));
+        let (p3, a3) = extract_command(&echo2);
+        let sig_echo_padded = approval_signature("shell_command", p3.as_deref(), &a3);
+        assert_eq!(sig_echo, sig_echo_padded);
+
+        // Mimic authorize(): ApproveSession inserts signature into session set;
+        // a later call is auto-allowed only when its signature is present.
+        let mut session_approved = std::collections::HashSet::new();
+        session_approved.insert(sig_echo.clone());
+        assert!(
+            session_approved.contains(&sig_echo),
+            "echo grant covers a second echo"
+        );
+        assert!(
+            !session_approved.contains(&sig_rm),
+            "echo grant must not cover rm (authorize would still NeedApproval)"
+        );
+    }
+
+    #[test]
+    fn run_command_shell_wrapper_uses_script_hash() {
+        let args = vec!["-c".to_string(), "echo hi".to_string()];
+        let sig = approval_signature("run_command", Some("sh"), &args);
+        assert_eq!(
+            sig,
+            format!("run_command:{}", sha256_hex("echo hi".as_bytes()))
+        );
+        let sig_rm = approval_signature(
+            "run_command",
+            Some("bash"),
+            &["-c".to_string(), "rm -rf x".to_string()],
+        );
+        assert_ne!(sig, sig_rm);
+        // Windows cmd /C also hashes the script body (shared shell_c_script).
+        let sig_cmd = approval_signature(
+            "run_command",
+            Some("cmd"),
+            &["/C".to_string(), "echo hi".to_string()],
+        );
+        assert_eq!(
+            sig_cmd,
+            format!("run_command:{}", sha256_hex("echo hi".as_bytes()))
+        );
+        // Non-shell run_command keeps program:first_arg form.
+        let git = approval_signature(
+            "run_command",
+            Some("git"),
+            &["push".to_string(), "origin".to_string()],
+        );
+        assert_eq!(git, "run_command:git:push");
+    }
+
+    #[test]
+    fn verification_class_is_decided_by_the_program_that_ran() {
+        // HC-002 F1: this used to be double-gated on the TOOL NAME, so the
+        // same runner counted through `run_command` and vanished through
+        // `shell_command`. The class is a property of the program; which
+        // command actually ran is the execution layer's report, not a guess
+        // from arguments (a spoofed `program` field on a shell call never
+        // reaches this).
+        assert!(is_verification_program("cargo"));
+        assert!(is_verification_program("go"));
+        assert!(!is_verification_program("git"));
+        assert!(!is_verification_program("echo"));
+        assert!(is_verification_program(r"C:\Rust\bin\cargo.exe"));
+        assert!(is_verification_program(r"C:\Node\npm.CMD"));
+    }
+
+    #[test]
+    fn permission_match_line_uses_raw_shell_cmd() {
+        let call = tool_call(
+            "shell_command",
+            serde_json::json!({"cmd": "cargo test --workspace"}),
+        );
+        let (program, args) = extract_command(&call);
+        let line = command_line_for_match(&call, program.as_deref(), &args);
+        assert_eq!(line.as_deref(), Some("cargo test --workspace"));
+        // Must not be the wrapper form used for classification.
+        assert!(!line.unwrap().starts_with("sh "));
+    }
+}
+
+/// The execution layer records a verification-class run as completion
+/// evidence only when the command's own exit status is the program's
+/// (HC-002): `jest … 2>&1 | tail -6` exits with `tail`'s status, and
+/// `TEST_ENV=web jest …` ran in an environment the fingerprint does not
+/// name. Those runs are real to the model — it just watched the tests pass —
+/// and invisible to the ledger. Left unsaid, the next completion claim is
+/// refused for "no green check since the last edit" against a check the
+/// model remembers running, and the run ends in a guard fight over evidence
+/// that was never recorded. This names the gap at the moment it opens.
+pub(crate) fn unproven_verification_note(
+    call_name: &str,
+    arguments: &serde_json::Value,
+    executed_commands: &[Vec<String>],
+    is_error: bool,
+) -> Option<String> {
+    if is_error || !executed_commands.is_empty() {
+        return None;
+    }
+    let script = match call_name {
+        "shell_command" => arguments.get("cmd")?.as_str()?.to_string(),
+        "run_command" => {
+            let program = arguments.get("program")?.as_str()?;
+            let args: Vec<&str> = arguments
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+            match (base, args.as_slice()) {
+                ("sh" | "bash" | "zsh" | "dash", [flag, body, ..]) if *flag == "-c" => {
+                    (*body).to_string()
+                }
+                // A plain program is proven by construction; if nothing was
+                // recorded the tool itself said so and there is no shape to explain.
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let programs = leveler_execution::literal_program_names(&script)?;
+    let program = programs.iter().find(|w| is_verification_program(w))?;
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    Some(format!(
+        "[runtime] This run is not recorded as verification evidence: the command's \
+         exit status is not `{base}`'s own (a pipe, redirect, `;`/`||`, environment \
+         prefix or subshell stands between them), so a completion claim cannot cite \
+         it. Run `{base} …` as one plain command for it to count."
+    ))
+}
+
+#[cfg(test)]
+mod unproven_verification_note_tests {
+    use super::*;
+
+    fn shell(cmd: &str) -> serde_json::Value {
+        serde_json::json!({ "cmd": cmd })
+    }
+
+    #[test]
+    fn a_piped_test_run_is_named_as_unrecorded_evidence() {
+        let note = unproven_verification_note(
+            "shell_command",
+            &shell("TEST_ENV=web node_modules/.bin/jest --ci nested 2>&1 | tail -6"),
+            &[],
+            false,
+        )
+        .expect("a verification program ran in a shape that proves nothing");
+        assert!(note.contains("jest"), "names the program: {note}");
+        assert!(
+            note.contains("not recorded"),
+            "says the run did not count: {note}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_run_and_a_non_verification_pipeline_get_no_note() {
+        // Proven and recorded: nothing to say.
+        assert!(
+            unproven_verification_note(
+                "shell_command",
+                &shell("node_modules/.bin/jest --ci nested"),
+                &[vec![
+                    "node_modules/.bin/jest".into(),
+                    "--ci".into(),
+                    "nested".into()
+                ]],
+                false,
+            )
+            .is_none()
+        );
+        // No verification program anywhere in the pipeline: not evidence either way.
+        assert!(
+            unproven_verification_note("shell_command", &shell("ls -la | head -5"), &[], false)
+                .is_none()
+        );
+        // A failed run is not silently-lost evidence; the failure is visible.
+        assert!(
+            unproven_verification_note("shell_command", &shell("jest 2>&1 | tail -6"), &[], true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_command_with_a_shell_wrapper_is_covered_too() {
+        let args = serde_json::json!({ "program": "sh", "args": ["-c", "pytest -q; echo done"] });
+        let note = unproven_verification_note("run_command", &args, &[], false)
+            .expect("pytest behind `;` proves nothing");
+        assert!(note.contains("pytest"));
+        // A plain run_command of the program itself is proven by construction.
+        let plain = serde_json::json!({ "program": "pytest", "args": ["-q"] });
+        assert!(
+            unproven_verification_note(
+                "run_command",
+                &plain,
+                &[vec!["pytest".into(), "-q".into()]],
+                false
+            )
+            .is_none()
+        );
+    }
+}

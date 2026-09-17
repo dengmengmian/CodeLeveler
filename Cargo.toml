@@ -1,0 +1,198 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/leveler-core",
+    "crates/leveler-lifecycle",
+    "crates/leveler-memory",
+    "crates/leveler-model",
+    "crates/leveler-protocol",
+    "crates/leveler-provider",
+    "crates/leveler-storage",
+    "crates/leveler-project",
+    "crates/leveler-execution",
+    "crates/leveler-win-confine",
+    "crates/leveler-tools",
+    "crates/leveler-agent-core",
+    "crates/leveler-agent",
+    "crates/leveler-verifier",
+    "crates/leveler-context",
+    "crates/leveler-vcs",
+    "crates/leveler-lsp",
+    "crates/leveler-skills",
+    "crates/leveler-eval",
+    "crates/leveler-engine",
+    "crates/leveler-app",
+    "crates/leveler-client-protocol",
+    "crates/leveler-remote-protocol",
+    "crates/leveler-remote-agent",
+    "crates/leveler-local-transport",
+    "crates/leveler-media",
+    "crates/leveler-browser",
+    "crates/leveler-tui",
+    "crates/leveler-web",
+    "crates/leveler-cli",
+    "crates/leveler-test-support",
+    "services/leveler-relay",
+]
+
+[workspace.package]
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+authors = ["CodeLeveler contributors"]
+repository = "https://github.com/dengmengmian/CodeLeveler"
+
+[workspace.dependencies]
+# Internal crates
+leveler-core = { version = "0.1.0-beta.1", path = "crates/leveler-core" }
+leveler-lifecycle = { version = "0.1.0-beta.1", path = "crates/leveler-lifecycle" }
+leveler-memory = { version = "0.1.0-beta.1", path = "crates/leveler-memory" }
+leveler-model = { version = "0.1.0-beta.1", path = "crates/leveler-model" }
+leveler-protocol = { version = "0.1.0-beta.1", path = "crates/leveler-protocol" }
+leveler-provider = { version = "0.1.0-beta.1", path = "crates/leveler-provider" }
+leveler-storage = { version = "0.1.0-beta.1", path = "crates/leveler-storage" }
+leveler-project = { version = "0.1.0-beta.1", path = "crates/leveler-project" }
+leveler-execution = { version = "0.1.0-beta.1", path = "crates/leveler-execution" }
+leveler-win-confine = { version = "0.1.0-beta.1", path = "crates/leveler-win-confine" }
+leveler-tools = { version = "0.1.0-beta.1", path = "crates/leveler-tools" }
+leveler-agent-core = { version = "0.1.0-beta.1", path = "crates/leveler-agent-core" }
+leveler-agent = { version = "0.1.0-beta.1", path = "crates/leveler-agent" }
+leveler-verifier = { version = "0.1.0-beta.1", path = "crates/leveler-verifier" }
+leveler-context = { version = "0.1.0-beta.1", path = "crates/leveler-context" }
+leveler-vcs = { version = "0.1.0-beta.1", path = "crates/leveler-vcs" }
+leveler-lsp = { version = "0.1.0-beta.1", path = "crates/leveler-lsp" }
+leveler-skills = { version = "0.1.0-beta.1", path = "crates/leveler-skills" }
+leveler-eval = { version = "0.1.0-beta.1", path = "crates/leveler-eval" }
+leveler-engine = { version = "0.1.0-beta.1", path = "crates/leveler-engine" }
+leveler-app = { version = "0.1.0-beta.1", path = "crates/leveler-app" }
+leveler-client-protocol = { version = "0.1.0-beta.1", path = "crates/leveler-client-protocol" }
+leveler-remote-protocol = { version = "0.1.0-beta.1", path = "crates/leveler-remote-protocol" }
+leveler-remote-agent = { version = "0.1.0-beta.1", path = "crates/leveler-remote-agent" }
+leveler-relay = { version = "0.1.0-beta.1", path = "services/leveler-relay" }
+leveler-local-transport = { version = "0.1.0-beta.1", path = "crates/leveler-local-transport" }
+leveler-media = { version = "0.1.0-beta.1", path = "crates/leveler-media" }
+leveler-browser = { version = "0.1.0-beta.1", path = "crates/leveler-browser" }
+leveler-tui = { version = "0.1.0-beta.1", path = "crates/leveler-tui" }
+leveler-web = { version = "0.1.0-beta.1", path = "crates/leveler-web" }
+leveler-test-support = { version = "0.1.0-beta.1", path = "crates/leveler-test-support" }
+
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# HTTP (rustls, no system OpenSSL)
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+    "json",
+    "gzip",
+] }
+bytes = "1"
+
+# CDP transport: one plain ws:// socket to the browser's DevTools endpoint.
+# No TLS features — the endpoint is always 127.0.0.1.
+tokio-tungstenite = "0.26"
+
+# Web UI server (browser client)
+axum = { version = "0.8", features = ["ws", "json", "multipart"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+ignore = "0.4"
+
+# Deterministic workspace search (the `read`/`ls`/`find`/`grep` primitives)
+globset = "0.4"
+regex = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# serde_yaml is archived; serde_yaml_ng is the maintained API-compatible fork.
+# The package rename keeps call sites as `serde_yaml::…`.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+toml = "0.8"
+toml_edit = "0.22"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = { version = "4.5" }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Terminal
+console = "0.15"
+indicatif = "0.17"
+
+# Terminal UI (TUI product layer)
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+textwrap = "0.16"
+pulldown-cmark = { version = "0.12", default-features = false }
+syntect = { version = "5", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
+
+# JSON Schema
+schemars = "0.8"
+jsonschema = "0.26"
+
+# Cryptography (Ed25519 signing, SHA-256). Already linked via rustls; kept
+# central so the remote agent and relay cannot drift to another version.
+ring = "0.17"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Media (image attachments)
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+] }
+infer = "0.16"
+sha2 = "0.10"
+libc = "0.2"
+base64 = "0.22"
+fs2 = "0.4"
+rustix = { version = "1.1", features = ["fs"] }
+cap-std = "4.0.2"
+cap-tempfile = "4.0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Line tables, not full debuginfo. The workspace links 68 separate integration
+# test binaries against a 503-package graph, so debug info is paid 68 times over
+# and it dominates both link time and `target/debug`, which reached 170 GB /
+# 1.7M files in 48 days. `line-tables-only` keeps what the tests actually need —
+# file and line in every panic and backtrace — and drops the variable-level
+# information only an attached debugger reads.
+debug = "line-tables-only"

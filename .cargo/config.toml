@@ -1,0 +1,37 @@
+# Local / team build helpers. Do not put rustc-wrapper here (breaks CI if sccache
+# is missing). Incremental compilation stays at the dev-profile default.
+# Cargo applies it only to workspace members; registry crates are unaffected.
+# Prefer the narrow aliases while developing; use the full workspace for DoD.
+
+# Narrow-scope aliases — prefer these while developing; use full workspace only for DoD.
+[alias]
+# Core security / permissions surface
+t-exec = "test -p leveler-execution --lib --test classify_adversarial"
+# Agent authorize + executor
+t-agent = "test -p leveler-agent --lib"
+# CLI is bin-only: integration tests under tests/ (not --lib)
+t-cli = "test -p leveler-cli --test permissions"
+t-tui = "test -p leveler-tui --lib"
+# Permission-path checks across execution, agent, TUI, and CLI
+t-perm = "test -p leveler-execution -p leveler-agent -p leveler-tui --lib"
+# Fast typecheck of the permission chain
+c-perm = "check -p leveler-execution -p leveler-agent -p leveler-cli -p leveler-tui"
+# Definition of done (slow — run once before push)
+dod-test = "test --workspace"
+dod-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+
+# Cap the artifact directory instead of letting it grow to six figures of
+# files. Run after a workspace test round; needs `cargo install cargo-sweep`.
+sweep-target = "sweep --maxsize 20000"
+
+# Windows gives the main thread a 1 MB stack where Unix gives 8 MB, and that
+# difference is not academic: `leveler completions bash` overflowed it in CI
+# (`thread 'main' has overflowed its stack`) generating the script from clap's
+# command tree. Reserve the Unix figure so a recursive walk over the CLI
+# definition behaves the same on every platform. Applies to the binaries this
+# workspace builds, including the release artifacts.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

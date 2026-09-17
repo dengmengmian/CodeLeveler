@@ -1,0 +1,35 @@
+[package]
+name = "leveler-remote-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Remote control plane DTOs for CodeLeveler: device pairing, routing tokens, agent tunnel frames, and the end-to-end signed envelope."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+# Ed25519 + SHA-256. `ring` is already linked through rustls/reqwest, so the
+# signing layer adds no new crate to the supply chain.
+ring = { workspace = true }
+leveler-client-protocol = { workspace = true, optional = true }
+
+[features]
+# The remote capability gate. Pulls in the client protocol because the policy is
+# a decision *about* `ClientCommand`. Off by default so a relay — which must
+# never enforce policy, only route — gets the framing types alone.
+policy = ["dep:leveler-client-protocol"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+base64 = { workspace = true }
+# Dev only, and only for `frame_fuzz`: the inner session message is the one
+# relay-facing parser this crate does not own, and leaving it out of the
+# mutation pass would leave a hole exactly where the payload is attacker-chosen.
+# The dependency stays out of the built library, so the rule that this crate
+# does not carry session framing is unchanged.

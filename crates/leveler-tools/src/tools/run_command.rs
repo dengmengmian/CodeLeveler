@@ -1,0 +1,1945 @@
+//! `run_command` — run a program with explicit arguments (no shell) (spec §18.3).
+//!
+//! The tool decodes argv, refuses the shapes that are a different tool's
+//! intent, and hands the call to [`CommandExecution`]. It owns no process
+//! launch of its own.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+use leveler_execution::RiskLevel;
+
+use super::command_execution::CommandExecution;
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct Input {
+    /// Required. The executable only, e.g. "cargo" or "go" — never a whole
+    /// command line. Everything after it goes in `args`.
+    //
+    // Deliberately `Option` in the type despite being required in the
+    // contract, so a missing value reaches `execute` and gets guidance
+    // naming what is wrong instead of a bare schema rejection. That rationale
+    // stays OUT of the doc comment: schemars publishes doc comments as the
+    // model-facing description, and a field documented as "kept
+    // schema-optional" reads as permission to omit it — which a real session
+    // did, twice, sending `{"args":["test","./..."]}` with no program at all.
+    //
+    // `schemars(required)` keeps the MACHINE contract honest: the published
+    // schema lists `program` in `required`, which is the only signal a
+    // strict-function-calling provider actually enforces. Prose in a
+    // description is not a contract. The `Option` remains so a provider that
+    // does not enforce `required` — or a model that sends an empty string —
+    // still reaches `execute` and gets a message naming what is missing.
+    //
+    // No `#[serde(default)]`: schemars 0.8 treats a serde default as a veto
+    // over `required` (`_private::insert_object_property` checks
+    // `!has_default && …`), so the two cannot be combined — the attribute
+    // would be silently ignored and the published contract would keep lying.
+    // `Option<T>` alone already deserializes a missing key to `None`, which
+    // is the fallback this needs.
+    #[schemars(required)]
+    program: Option<String>,
+    /// Arguments passed as an array (never a shell string).
+    #[serde(default)]
+    args: Vec<String>,
+    /// Working directory relative to the workspace root. Defaults to ".".
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Timeout in seconds. Defaults to 120. Do not raise this to "wait forever"
+    /// for dev servers — use `background=true` instead.
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    /// When true, start the process in the background and return a task_id
+    /// immediately. Use get_task / wait_task / kill_task to manage it.
+    /// Required for long-lived processes (HTTP servers, watchers): foreground
+    /// runs block the agent until exit or timeout.
+    #[serde(default)]
+    background: Option<bool>,
+}
+
+pub struct RunCommandTool {
+    commands: Arc<CommandExecution>,
+}
+
+impl RunCommandTool {
+    pub fn new(commands: Arc<CommandExecution>) -> Self {
+        Self { commands }
+    }
+}
+
+#[async_trait]
+impl Tool for RunCommandTool {
+    fn name(&self) -> &'static str {
+        "run_command"
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a program with an explicit argument array (no shell) in the \
+         workspace: {\"program\": \"cargo\", \"args\": [\"test\"]}. There is no \
+         `cmd` field — a whole shell command line goes to shell_command. \
+         Returns exit code, stdout and stderr. Use for formatters, \
+         builds, and tests. The result starts with `exit: N`; `exit: 0` means \
+         the program succeeded. Judge pass/fail from that exit code — do not \
+         pipe the command through `grep`/`tail`, which discards the real exit \
+         code and can hide a failure. Write temporary files inside the \
+         workspace or under `$TMPDIR`; the system `/tmp` is not writable in \
+         the sandbox. For npm/yarn/pnpm package scripts, call the package \
+         manager script form such as npm run test -- args; do not use npx run \
+         for package scripts. In a Node project, prefer the repo-local binary \
+         at node_modules/.bin/<tool> (e.g. node_modules/.bin/vitest, \
+         node_modules/.bin/tsc) over npx: npx and a fresh npm/pnpm/yarn install \
+         fetch from the network and fail offline (and may rewrite lockfiles). \
+         Do not run a dependency install unless the task requires it. \
+         Set background=true for long-running processes; then use \
+         get_task/wait_task/kill_task with the returned task_id."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        super::schema_of::<Input>()
+    }
+
+    /// The registry's schema gate rejects a program-less call before
+    /// `execute` runs; this phrases that refusal. Two shapes, two messages —
+    /// and the input is never repaired into the other tool.
+    fn invalid_input_guidance(&self, input: &serde_json::Value) -> Option<String> {
+        let program_ok = input
+            .get("program")
+            .and_then(|v| v.as_str())
+            .is_some_and(|p| !p.trim().is_empty());
+        if program_ok {
+            return None; // some other schema violation: the raw error is right
+        }
+        if let Some(cmd) = input.get("cmd").and_then(|v| v.as_str()) {
+            return Some(cmd_shape_guidance(cmd));
+        }
+        let args: Vec<String> = input
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(missing_program_guidance(&args))
+    }
+
+    fn risk(&self) -> RiskLevel {
+        RiskLevel::WorkspaceWrite
+    }
+
+    fn runs_command(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        // shell_command's `cmd` field on run_command is a distinct mistake from
+        // a missing program: the caller wants shell semantics from the argv
+        // tool. Detect it on the raw payload (the typed Input has no such
+        // field) so the refusal can name what was actually sent. Never
+        // silently convert one tool into the other — their execution and
+        // security semantics differ.
+        let cmd_shape = input.get("cmd").and_then(|v| v.as_str()).map(str::to_owned);
+        let input: Input = super::parse_input(self.name(), input)?;
+        // The frequent mixup: the model hands run_command a whole shell string
+        // (or shell_command's `cmd` field) instead of program+args. Steer it to
+        // the right tool rather than surfacing a bare "program is a required
+        // field" schema note. `program` is schema-optional (see `Input`) so a
+        // missing/blank value lands here instead of being rejected upstream.
+        let Some(program) = input
+            .program
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            if let Some(cmd) = cmd_shape {
+                return Ok(ToolOutput::error(cmd_shape_guidance(&cmd)));
+            }
+            // Two different mistakes reach here and they need different advice.
+            // A real argument array with no executable is not a shell string;
+            // sending it to shell_command would be wrong advice, and the caller
+            // would keep making the same mistake.
+            return Ok(ToolOutput::error(missing_program_guidance(&input.args)));
+        };
+        let args = normalize_args(program, input.args);
+        // Same product semantics as the workspace layer: read_file(".env") is
+        // Denied, so `cat .env` via argv must not be the workaround. Applies to
+        // background commands too.
+        if let Some(reason) = super::shell_guard::refuse_sensitive_args(&args) {
+            return Ok(ToolOutput::error(reason));
+        }
+        if input.background.unwrap_or(false) {
+            return self
+                .commands
+                .start_background(program, args, input.cwd.as_deref(), context)
+                .await;
+        }
+        // Close the `sh -c 'python app.py & …'` bypass of shell_command guards.
+        if let Some(reason) = super::shell_guard::refuse_run_command_shell_bypass(program, &args) {
+            return Ok(ToolOutput::error(reason));
+        }
+        self.commands
+            .run_foreground(
+                program,
+                args,
+                input.cwd.as_deref(),
+                input.timeout_seconds,
+                context,
+                cancellation,
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+mod hang_guard_tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext};
+    use crate::tools::shell_guard::HANG_ANTI_PATTERN;
+    use leveler_execution::{PermissionProfile, Workspace};
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn sh_c_anti_pattern_refused_instantly() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-hang-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, PermissionProfile::Assisted);
+        let start = Instant::now();
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", HANG_ANTI_PATTERN],
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.is_error, "must refuse bypass: {out:?}");
+        // The job-control (`&`) guard is Unix-only; on Windows the same
+        // anti-pattern is refused by the `#`-comment guard instead. Either way
+        // the shell bypass is caught before spawn.
+        #[cfg(not(windows))]
+        assert!(out.content.contains("background=true"), "{out:?}");
+        #[cfg(windows)]
+        assert!(out.content.contains("comment"), "{out:?}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "must not hang, took {elapsed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// What to tell a caller that supplied no `program`.
+///
+/// The executable is never guessed from `args`: `{"args":["test","./..."]}`
+/// most likely means `go test`, but running argv[0] would launch
+/// `/usr/bin/test` instead — a different program, silently. Naming the missing
+/// field is honest; inferring it is a coin flip with side effects.
+/// The caller sent shell_command's `cmd` field to run_command. Nothing is
+/// executed: run_command runs one executable under argv semantics, and a
+/// shell line silently re-routed (either direction) would run under the
+/// wrong execution and security model.
+fn cmd_shape_guidance(cmd: &str) -> String {
+    let shown = if cmd.chars().count() > 120 {
+        let head: String = cmd.chars().take(120).collect();
+        format!("{head}\u{2026}")
+    } else {
+        cmd.to_string()
+    };
+    // A line with no shell syntax splits into argv exactly; show that call.
+    let needs_shell = cmd.chars().any(|c| {
+        matches!(
+            c,
+            '|' | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '*'
+                | '?'
+                | '~'
+                | '\''
+                | '"'
+                | '\\'
+                | '\n'
+        )
+    });
+    let words: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+    match words.split_first() {
+        Some((program, args)) if !needs_shell => format!(
+            "run_command does not take a `cmd` field — nothing was executed. \
+             run_command runs one executable with an argument array; this line is \
+             {}. Use shell_command with `cmd` only for a command line that needs a \
+             shell (pipes, $(), redirection, &&).",
+            retry_call(program, args)
+        ),
+        _ => format!(
+            "run_command does not take a `cmd` field — nothing was executed. \
+             run_command runs one executable: {{\"program\": \"go\", \"args\": \
+             [\"test\", \"./...\"]}}. For a whole shell command line like `{shown}` \
+             (pipes, $(), redirection, &&), call shell_command with its `cmd` field."
+        ),
+    }
+}
+
+fn missing_program_guidance(args: &[String]) -> String {
+    let Some((first, rest)) = args.split_first() else {
+        return "run_command needs a `program` (the executable) and an optional \
+                `args` array — it does not take a shell string. To run a whole \
+                command line (e.g. `./admin-server`, or one with pipes / $() / \
+                redirection / &&), use shell_command with its `cmd` field instead."
+            .to_string();
+    };
+    // A first argument that is a path names a file to run, so the retry can
+    // use it. A bare word (`test`) stays unguessed: running argv[0] could be a
+    // different program entirely.
+    if first.contains('/') || first.contains('\\') {
+        return format!(
+            "run_command is missing `program` — nothing was executed. To run \
+             `{first}`, the call is {}. Use shell_command only for a whole command \
+             line with pipes, $(), redirection or &&.",
+            retry_call(first, rest)
+        );
+    }
+    format!(
+        "run_command is missing `program`: the executable that runs `{}`. \
+         `args` is correct as an array — it just has nothing to run. Repeat the \
+         call with `program` set, e.g. {{\"program\": \"go\", \"args\": {}}}. \
+         Use shell_command only for a whole command line with pipes, $(), \
+         redirection or &&.",
+        args.join(" "),
+        serde_json::to_string(args).unwrap_or_else(|_| "[…]".into()),
+    )
+}
+
+/// `{"program": "<program>", "args": [...]}` as the model should send it.
+fn retry_call(program: &str, args: &[String]) -> String {
+    format!(
+        "{{\"program\": {}, \"args\": {}}}",
+        serde_json::to_string(program).unwrap_or_else(|_| "\"…\"".into()),
+        serde_json::to_string(args).unwrap_or_else(|_| "[…]".into()),
+    )
+}
+
+fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
+    let Some(first) = args.first() else {
+        return args;
+    };
+    let program_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|p| p.to_str())
+        .unwrap_or(program);
+    if first == program || first == program_name {
+        args.remove(0);
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::tools::command_execution::{
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
+        sandbox_denial_hint, truncate_or_spill,
+    };
+    #[allow(unused_imports)]
+    use std::time::Duration;
+
+    /// Late-bound ownership depends on this: a child that has claimed NOTHING
+    /// yet gets `Some(vec![])`, and an empty allowlist must deny every command
+    /// write (the violation path restores the snapshot), never read as "no
+    /// constraint". `None` alone means unconstrained.
+    #[test]
+    fn an_empty_command_allowlist_allows_no_path() {
+        let allow: Vec<String> = Vec::new();
+        for modified in ["src/main.rs", "a.txt", "nested/deep/file.rs"] {
+            assert!(
+                !allow.iter().any(|a| path_allows(a, modified)),
+                "{modified} must fall outside an empty allowlist"
+            );
+        }
+        // And a non-empty one still covers its own subtree.
+        let allowed = "src/output";
+        assert!(path_allows(allowed, "src/output/json.rs"));
+        assert!(!path_allows(allowed, "src/input.rs"));
+    }
+
+    // ── R004 F3: workspace read boundary for shell/argv (T4) ────────────────
+
+    #[cfg(not(windows))]
+    struct HomeSecret {
+        dir: std::path::PathBuf,
+        file: std::path::PathBuf,
+    }
+
+    #[cfg(not(windows))]
+    impl HomeSecret {
+        fn create(tag: &str) -> Self {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let dir = home.join(format!(
+                ".leveler-r004-t4-{tag}-{}",
+                u64::from(std::process::id()) * 31 + super::super::test_ordinal()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("secret.txt");
+            std::fs::write(&file, "HIDDEN_CONTROL_CONTENT").unwrap();
+            Self { dir, file }
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for HomeSecret {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn t4_workspace(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-t4-{tag}-{}",
+            u64::from(std::process::id()) * 37 + super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// PR 3: reads need no authorization. A command may read any path — a
+    /// foreign HOME tree, through a symlink, inside a nested `sh -c`, via
+    /// `shell_command` or `run_command` argv. Only writes are confined.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn commands_may_read_any_path() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("read");
+        let dir = t4_workspace("read");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&secret.dir, &link).unwrap();
+        for cmd in [
+            format!("cat {}", secret.file.display()),
+            format!("cat {}/secret.txt", link.display()),
+            format!("sh -c 'cat {}'", secret.file.display()),
+        ] {
+            let ws = leveler_execution::Workspace::new(&dir).unwrap();
+            let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+            let out =
+                super::super::shell_command::ShellCommandTool::new(crate::tools::test_commands())
+                    .execute(
+                        serde_json::json!({"cmd": cmd}),
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            assert!(!out.is_error, "{cmd}: {out:?}");
+            assert!(
+                out.content.contains("HIDDEN_CONTROL_CONTENT"),
+                "{cmd}: {out:?}"
+            );
+        }
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({
+                    "program": "cat",
+                    "args": [secret.file.to_string_lossy()],
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "argv read: {out:?}");
+        assert!(out.content.contains("HIDDEN_CONTROL_CONTENT"), "{out:?}");
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn workspace_and_system_paths_stay_readable() {
+        use crate::tool::{Tool, ToolContext};
+        let dir = t4_workspace("ro");
+        std::fs::write(dir.join("inside.txt"), "WS_OK").unwrap();
+        for (cmd, expect) in [
+            (format!("cat {}", dir.join("inside.txt").display()), "WS_OK"),
+            ("head -1 /etc/hosts".to_string(), ""),
+        ] {
+            let ws = leveler_execution::Workspace::new(&dir).unwrap();
+            let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+            let out =
+                super::super::shell_command::ShellCommandTool::new(crate::tools::test_commands())
+                    .execute(
+                        serde_json::json!({"cmd": cmd}),
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            assert!(!out.is_error, "{cmd}: {out:?}");
+            assert!(out.content.contains(expect), "{cmd}: {out:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_timeout_defaults_zero_and_clamps_huge() {
+        assert_eq!(
+            resolve_timeout(None),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        // Zero would expire instantly — fall back to the default instead.
+        assert_eq!(
+            resolve_timeout(Some(0)),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(resolve_timeout(Some(45)), Duration::from_secs(45));
+        assert_eq!(
+            resolve_timeout(Some(u64::MAX)),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+    }
+
+    /// Only a failure to reach the network is read as needing the network; a
+    /// failing test, a compile error or a write denial is the command's own.
+    #[test]
+    fn only_network_failures_read_as_needing_the_network() {
+        for reached in [
+            "curl: (6) Could not resolve host: example.com",
+            "curl: (7) Failed to connect to 127.0.0.1 port 80 after 0 ms: Couldn't connect to server",
+            "Error: getaddrinfo ENOTFOUND registry.npmjs.org",
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
+            "urllib.error.URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
+            "internal/config/config.go:6:2: github.com/spf13/viper@v1.21.0: Get \"https://goproxy.cn/github.com/spf13/viper/@v/v1.21.0.zip\": proxyconnect tcp: dial tcp 127.0.0.1:7898: connect: operation not permitted",
+            "go: github.com/x/y@v1.0.0: Get \"https://proxy.golang.org/x\": dial tcp: lookup proxy.golang.org: no such host",
+            // macOS denies a loopback listener too: a test's local server.
+            "panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: bind: operation not permitted",
+            "Error: listen EPERM: operation not permitted 127.0.0.1",
+        ] {
+            assert!(
+                crate::tools::command_execution::network_failure_in(reached),
+                "{reached}"
+            );
+        }
+        for own in [
+            "exit: 101\n--- stdout ---\ntest tests::adds ... FAILED\nassertion failed: left == right",
+            "error[E0425]: cannot find value `x` in this scope",
+            "mkdir /Users/x/.config: operation not permitted",
+            "cannot create .git/x: Read-only file system",
+        ] {
+            assert!(
+                !crate::tools::command_execution::network_failure_in(own),
+                "{own}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_denial_gets_a_hint_only_when_relevant() {
+        let denied = "exit: 1\n--- stderr ---\nmkdir /Users/x/.config: operation not permitted\n";
+        // sandboxed + failed + OS write-denial → hint.
+        let hint = sandbox_denial_hint(true, false, denied).expect("hint");
+        // The denied command carries its own one-round retry; steering it
+        // back through a separate `request_permissions` spends a round trip
+        // on the same approval prompt.
+        assert!(hint.contains("escalate"), "{hint}");
+        assert!(!hint.contains("request_permissions"), "{hint}");
+        assert!(hint.contains("[recoverable]"));
+        assert!(
+            sandbox_denial_hint(true, false, "cannot create .git/x: Read-only file system")
+                .is_some()
+        );
+        assert!(sandbox_denial_hint(true, false, "mkdir: Permission denied").is_some());
+        // not sandboxed → no hint (real failure, no sandbox to blame).
+        assert!(sandbox_denial_hint(false, false, denied).is_none());
+        // succeeded → no hint.
+        assert!(sandbox_denial_hint(true, true, denied).is_none());
+        // failed for an unrelated reason → no hint.
+        assert!(sandbox_denial_hint(true, false, "exit: 1\ncompile error").is_none());
+    }
+
+    #[test]
+    fn description_warns_against_npx_run_for_package_scripts() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        let description = tool.description();
+
+        assert!(description.contains("npm/yarn/pnpm package scripts"));
+        assert!(description.contains("npm run test -- args"));
+        assert!(description.contains("do not use npx run"));
+    }
+
+    #[test]
+    fn description_steers_node_projects_to_the_local_binary() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        let description = tool.description();
+        // The dogfood friction: the model reaches for npx / a fresh install,
+        // which fails offline and rewrites lockfiles. Steer it to the local
+        // binary and away from installs.
+        assert!(description.contains("node_modules/.bin/"));
+        assert!(description.contains("fail offline"));
+        assert!(description.contains("Do not run a dependency install"));
+    }
+
+    /// SH-E2 RC-1: the model must read the command's own exit code instead of
+    /// piping verification through grep/tail, which discards it (and, before
+    /// TERM=dumb, re-introduced ANSI that broke the grep). The temp-file
+    /// guidance keeps the model out of the sandbox-blocked `/tmp`.
+    #[test]
+    fn description_states_the_verification_exit_code_contract() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        let description = tool.description();
+
+        assert!(description.contains("exit: 0"));
+        assert!(description.contains("do not"));
+        assert!(description.contains("grep"));
+        assert!(description.contains("discards the real exit"));
+        assert!(description.contains("$TMPDIR"));
+        assert!(description.contains("/tmp"));
+    }
+
+    #[test]
+    fn truncate_or_spill_keeps_head_and_tail() {
+        // Errors land at the end of build/test output; truncation must keep the
+        // tail, not just the head.
+        let big = format!("HEAD{}TAIL", "z".repeat(MAX_OUTPUT));
+        let (shown, locator) = truncate_or_spill("stdout", &big, None);
+        assert!(locator.is_none(), "no store, no locator");
+        assert!(shown.len() < big.len(), "must shrink");
+        assert!(shown.starts_with("HEAD"), "keeps the head");
+        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(shown.contains("elided"), "marks the elision");
+    }
+
+    #[test]
+    fn truncate_or_spill_with_store_keeps_tail_and_references_artifact() {
+        let big = format!("HEAD{}TAIL", "z".repeat(MAX_OUTPUT));
+        let root = std::env::temp_dir().join(format!(
+            "leveler-spill-tail-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let store = leveler_execution::ArtifactStore::new(&root);
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
+        assert!(shown.starts_with("HEAD"), "keeps the head");
+        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(
+            locator
+                .as_deref()
+                .is_some_and(|l| l.contains(&format!("full output: {}", root.display()))),
+            "must reference the artifact path: {locator:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn truncate_or_spill_writes_full_output_and_references_it() {
+        let big = "x".repeat(MAX_OUTPUT + 5000);
+        let root = std::env::temp_dir().join(format!(
+            "leveler-spill-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let store = leveler_execution::ArtifactStore::new(&root);
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
+
+        assert!(shown.len() < big.len(), "the shown output must be capped");
+        let locator = locator.expect("spill must yield a locator");
+        assert!(
+            locator.contains(&format!("full output: {}", root.display())),
+            "must reference the artifact path: {locator}"
+        );
+        assert!(shown.contains(&format!("of {} bytes", big.len())));
+        // The referenced file holds the FULL, untruncated output.
+        let path_line = locator
+            .lines()
+            .find(|l| l.contains("full output:"))
+            .unwrap();
+        let path = path_line
+            .split("full output: ")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), big);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_output_cap_does_not_erase_the_artifact_recovery_link() {
+        let big = format!("HEAD{}TAIL", "x".repeat(MAX_OUTPUT + 5000));
+        let root = std::env::temp_dir().join(format!(
+            "leveler-double-cap-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let store = leveler_execution::ArtifactStore::new(&root);
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
+        // The execute path appends locators at the absolute end of the body.
+        let body = format!("{shown}\n{}", locator.expect("spilled"));
+        let capped = crate::registry::cap_output_with(&body, 4 * 1024);
+
+        assert!(
+            capped.contains(&format!("full output: {}", root.display())),
+            "the central cap must preserve the only way to recover full output: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// HCH-FIX-3 matrix: a successfully spilled stream's recovery locator
+    /// must survive every later model-facing cap — previews are disposable,
+    /// locators are not. Exercises the REAL tool execute path (both streams
+    /// produced by a real process), then the registry-shaped final cap.
+    async fn run_dual_stream(
+        out_lines: usize,
+        err_lines: usize,
+        root: &std::path::Path,
+        budget: usize,
+    ) -> String {
+        let dir = root.join("ws");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let store = leveler_execution::ArtifactStore::new(root.join("artifacts"));
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let commands = std::sync::Arc::new(crate::tools::CommandExecution::new(
+            crate::tools::test_capabilities().background_tasks,
+            Some(std::sync::Arc::new(store)),
+        ));
+        // Mirror the real chain: the registry cap and the tool's own policy
+        // budget are the SAME resolved value.
+        ctx.policy.tool_output_budget = budget;
+        let (program, args) = leveler_test_support::dual_stream_command(out_lines, err_lines);
+        let out = RunCommandTool::new(commands)
+            .execute(
+                serde_json::json!({"program": program, "args": args}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        out.content
+    }
+
+    fn locator_count(text: &str) -> usize {
+        text.matches("full output:").count()
+    }
+
+    #[tokio::test]
+    async fn spilled_stdout_locator_survives_the_final_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-a-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(2000, 3, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(locator_count(&content), 1, "stdout spilled: {content}");
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            1,
+            "locator lost under cap: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn spilled_stderr_locator_survives_the_final_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-b-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(3, 2000, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(locator_count(&content), 1, "stderr spilled: {content}");
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            1,
+            "locator lost under cap: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn dual_spilled_locators_survive_the_default_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-c-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(2000, 2000, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(
+            locator_count(&content),
+            2,
+            "both streams spilled: {content}"
+        );
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            2,
+            "a spilled stream lost its only recovery handle: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The clamp permits per-model budgets down to 1 KiB; locators must
+    /// survive the SMALLEST legal budget, not just the 48 KiB default.
+    #[tokio::test]
+    async fn dual_spilled_locators_survive_a_small_model_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-d-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        for budget in [16 * 1024, 4 * 1024, crate::registry::MIN_TOOL_OUTPUT] {
+            let sub = root.join(format!("b{budget}"));
+            let content = run_dual_stream(2000, 2000, &sub, budget).await;
+            assert_eq!(locator_count(&content), 2, "budget {budget}: {content}");
+            let capped = crate::registry::cap_output_with(&content, budget);
+            assert!(capped.len() <= budget, "cap must stay bounded at {budget}");
+            assert_eq!(
+                locator_count(&capped),
+                2,
+                "budget {budget}: a spilled stream lost its locator: {capped}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn truncate_or_spill_without_a_store_falls_back_to_marker() {
+        let big = "y".repeat(MAX_OUTPUT + 100);
+        let (shown, locator) = truncate_or_spill("stdout", &big, None);
+        assert!(shown.contains("elided"));
+        assert!(locator.is_none());
+        assert!(!shown.contains("full output:"));
+    }
+
+    /// Dogfood: `{"args": ["./scripts/soak.sh"]}` was told to retry with
+    /// `{"program": "go", "args": ["./scripts/soak.sh"]}` — an example that
+    /// would run the wrong program. The retry shape uses the caller's own
+    /// words, without executing a guess.
+    #[test]
+    fn missing_program_guidance_shows_the_callers_own_retry() {
+        let one = missing_program_guidance(&["./scripts/soak.sh".to_string()]);
+        assert!(
+            one.contains(r#"{"program": "./scripts/soak.sh", "args": []}"#),
+            "{one}"
+        );
+        assert!(!one.contains(r#""go""#), "{one}");
+        let with_args = missing_program_guidance(&["bin/tool".into(), "--fast".into()]);
+        assert!(
+            with_args.contains(r#"{"program": "bin/tool", "args": ["--fast"]}"#),
+            "{with_args}"
+        );
+        // A bare word is never promoted to the program.
+        let bare = missing_program_guidance(&["test".into(), "./...".into()]);
+        assert!(!bare.contains(r#"{"program": "test""#), "{bare}");
+    }
+
+    /// A plain command line sent as `cmd` gets the run_command call that runs
+    /// it; one that needs a shell keeps pointing at shell_command.
+    #[test]
+    fn cmd_guidance_shows_the_argv_call_for_a_plain_command_line() {
+        let plain = cmd_shape_guidance("cargo test -q");
+        assert!(
+            plain.contains(r#"{"program": "cargo", "args": ["test","-q"]}"#),
+            "{plain}"
+        );
+        let piped = cmd_shape_guidance("cargo test | tail -5");
+        assert!(!piped.contains(r#""args": ["test","|""#), "{piped}");
+        assert!(piped.contains("shell_command"), "{piped}");
+    }
+
+    #[test]
+    fn description_shows_the_call_shape() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        assert!(
+            tool.description()
+                .contains(r#"{"program": "cargo", "args": ["test"]}"#),
+            "{}",
+            tool.description()
+        );
+    }
+
+    /// A loopback server that answers one HTTP request and reports whether
+    /// anything ever connected — the proof a command did or did not reach the
+    /// network, independent of what the client printed.
+    #[cfg(unix)]
+    fn one_shot_http_server() -> (u16, std::sync::mpsc::Receiver<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = tx.send(());
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        (port, rx)
+    }
+
+    #[cfg(unix)]
+    fn have(program: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {program}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[cfg(unix)]
+    async fn run_under(
+        mode: leveler_execution::PermissionProfile,
+        grant_network: bool,
+        program: &str,
+        args: Vec<String>,
+    ) -> ToolOutput {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-net-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let mut ctx = ToolContext::new(ws, mode);
+        if grant_network {
+            ctx.policy.grant_network();
+        }
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": program, "args": args, "timeout_seconds": 20}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    /// 请求批准: curl, a Python socket and a Node socket are all stopped by
+    /// the sandbox — nothing connects — and the result says the command needs
+    /// network permission, whatever program asked for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_approval_blocks_every_client_and_names_the_network_permission() {
+        let clients: Vec<(&str, Box<dyn Fn(u16) -> Vec<String>>)> = vec![
+            (
+                "curl",
+                Box::new(|port| {
+                    vec![
+                        "-sS".into(),
+                        "--noproxy".into(),
+                        "*".into(),
+                        format!("http://127.0.0.1:{port}/"),
+                    ]
+                }),
+            ),
+            (
+                "python3",
+                Box::new(|port| {
+                    vec![
+                        "-c".into(),
+                        format!(
+                            "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=3)"
+                        ),
+                    ]
+                }),
+            ),
+            (
+                "node",
+                Box::new(|port| {
+                    vec![
+                        "-e".into(),
+                        format!(
+                            "require('net').connect({port}, '127.0.0.1').on('connect', () => process.exit(0)).on('error', e => {{ console.error(e.message); process.exit(3) }})"
+                        ),
+                    ]
+                }),
+            ),
+        ];
+        for (program, args) in clients {
+            if !have(program) {
+                continue;
+            }
+            let (port, connected) = one_shot_http_server();
+            let out = run_under(
+                leveler_execution::PermissionProfile::RequestApproval,
+                false,
+                program,
+                args(port),
+            )
+            .await;
+            assert!(out.is_error, "{program}: {}", out.content);
+            assert!(
+                connected
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "{program} reached the network: {}",
+                out.content
+            );
+            assert!(
+                out.content
+                    .starts_with(crate::recoverable::NETWORK_PERMISSION_REQUIRED),
+                "{program}: {}",
+                out.content
+            );
+            assert!(out.content.contains("escalate"), "{}", out.content);
+        }
+    }
+
+    /// 完全访问, or 请求批准 once the user granted the network: the same
+    /// client connects.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_access_or_a_network_grant_reaches_the_network() {
+        if !have("curl") {
+            return;
+        }
+        for (mode, grant) in [
+            (leveler_execution::PermissionProfile::FullAccess, false),
+            (leveler_execution::PermissionProfile::RequestApproval, true),
+        ] {
+            let (port, connected) = one_shot_http_server();
+            let out = run_under(
+                mode,
+                grant,
+                "curl",
+                vec![
+                    "-sS".into(),
+                    "--noproxy".into(),
+                    "*".into(),
+                    format!("http://127.0.0.1:{port}/"),
+                ],
+            )
+            .await;
+            assert!(
+                connected
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok(),
+                "{mode:?} grant={grant}: {}",
+                out.content
+            );
+            assert!(!out.is_error, "{mode:?}: {}", out.content);
+            assert!(
+                !out.content
+                    .contains(crate::recoverable::NETWORK_PERMISSION_REQUIRED),
+                "{}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_program_guides_to_shell_command() {
+        // The common mixup: the model passes a whole command line (or uses the
+        // shell_command `cmd` field) to run_command, which needs program+args.
+        // The error must steer it to shell_command instead of a raw serde note.
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-run-noprog-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"cmd": "./admin-server"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "missing program must be an error");
+        assert!(
+            out.content.contains("shell_command"),
+            "must steer to shell_command: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("program"),
+            "must name the missing field: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Invokes bare Unix coreutils (`echo`) as a program; Windows has no such
+    // executable (it is a shell builtin). Windows exec is covered by
+    // `shell_command_runs_echo` and the `windows_` canaries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_echo() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "echo", "args": ["hi"]}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("hi"));
+        assert!(!out.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drops_duplicate_program_from_first_arg() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-dupe-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "echo", "args": ["echo", "hi"]}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("hi"));
+        assert!(
+            !out.content.contains("echo hi"),
+            "duplicate program should not be passed as an argument: {}",
+            out.content
+        );
+        assert!(!out.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Invokes bare Unix `pwd`; Git's pwd.exe fails to initialize under the
+    // Windows sandbox (STATUS_DLL_INIT_FAILED). cwd handling on Windows is
+    // covered by the windows_ canaries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn honors_custom_cwd() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-cwd-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        // FullAccess: seatbelt can refuse `pwd` on some macOS temp layouts under
+        // WorkspaceWrite; this test only checks that cwd is honored.
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "pwd", "cwd": "subdir"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("subdir"),
+            "expected subdir in pwd output: {}",
+            out.content
+        );
+        assert!(!out.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Invokes bare Unix `false`; no such executable on Windows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_nonzero_exit_as_error() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-err-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "false"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("exit: 1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_request_fills_sandbox_fields_for_assisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-bg-sandbox-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let root = ws.root().to_path_buf();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx = ctx.with_sandbox(true);
+        let req = crate::tools::CommandExecution::background_process_request(
+            "sleep",
+            vec!["1".into()],
+            root.clone(),
+            &ctx,
+        );
+        assert_eq!(req.write_scope.root(), Some(root.as_path()));
+        assert!(req.deny_network);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_request_unrestricted_under_full_access() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-bg-full-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let root = ws.root().to_path_buf();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess);
+        let req = crate::tools::CommandExecution::background_process_request(
+            "sleep",
+            vec!["1".into()],
+            root,
+            &ctx,
+        );
+        assert!(!req.write_scope.confines());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_request_unrestricted_when_turn_fs_elevated() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-bg-elev-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let root = ws.root().to_path_buf();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.policy.grant_unrestricted_fs();
+        let req = crate::tools::CommandExecution::background_process_request(
+            "sleep",
+            vec!["1".into()],
+            root,
+            &ctx,
+        );
+        assert!(!req.write_scope.confines());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::tool::Tool;
+    #[allow(unused_imports)]
+    use crate::tools::command_execution::{
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
+        sandbox_denial_hint, truncate_or_spill,
+    };
+    use leveler_execution::PermissionProfile;
+    #[cfg(unix)]
+    use leveler_test_support::git::{run, scratch_repo};
+    #[allow(unused_imports)]
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        super::super::test_ctx_in(dir, PermissionProfile::Assisted)
+    }
+
+    /// A context whose commands may write `.git`. Workspace confinement
+    /// write-protects the `.git` tree, so every repository operation
+    /// (`switch`, `pull`, `reset`) runs only after the user approves an
+    /// unrestricted elevation — which is the shape these tests reproduce.
+    #[cfg(unix)]
+    fn git_ctx(dir: &std::path::Path) -> ToolContext {
+        super::super::test_ctx_in(dir, PermissionProfile::FullAccess)
+    }
+
+    // The git/coreutils rollback assertions below exercise Unix-shell-driven
+    // mutations; Windows rollback is not driven through `sh -c` here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_mutations_are_reported_as_modified_files() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "echo x > created.txt && rm a.txt"]}),
+                ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let modified: Vec<String> = out
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            modified.contains(&"created.txt".to_string())
+                && modified.contains(&"a.txt".to_string()),
+            "command mutations must surface as modified_files: {modified:?}"
+        );
+        assert!(
+            dir.path()
+                .join(".git/leveler/last-command-snapshot")
+                .is_file(),
+            "the pre-command snapshot must be persisted for crash recovery"
+        );
+        assert!(
+            out.metadata
+                .get("workspace_snapshot")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "tool metadata must identify the snapshot for turn/tool-call persistence"
+        );
+    }
+
+    #[cfg(unix)]
+    fn modified_of(out: &crate::tool::ToolOutput) -> Vec<String> {
+        let mut v: Vec<String> = out
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Two branches, then switch: every file that differs between them changes
+    /// on disk, but the run wrote none of them. Reporting them as modified is
+    /// what hung a `cargo test` obligation on a plain `git switch`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_head_move_is_not_an_authored_modification() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        run(dir.path(), &["switch", "-qc", "feat"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "feat"]);
+        run(dir.path(), &["switch", "-q", "main"]);
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "git", "args": ["switch", "feat"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            modified_of(&out).is_empty(),
+            "a branch switch authored nothing: {:?}",
+            modified_of(&out)
+        );
+    }
+
+    /// …but a command that moves HEAD *and* writes still reports the write.
+    /// The move explains only what it left matching the new HEAD.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_alongside_a_head_move_is_still_reported() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        run(dir.path(), &["switch", "-qc", "feat"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "feat"]);
+        run(dir.path(), &["switch", "-q", "main"]);
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c",
+                    "git switch -q feat && echo edited > a.txt && echo x > d.txt"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            modified_of(&out),
+            vec!["a.txt".to_string(), "d.txt".to_string()],
+            "the move explains c.txt only; a.txt was rewritten and d.txt created"
+        );
+    }
+
+    /// The reported case: `git pull` fast-forwards, every pulled file changes
+    /// on disk, and the run authored none of them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fast_forward_pull_authors_nothing() {
+        let upstream = scratch_repo();
+        std::fs::write(upstream.path().join("a.txt"), "one\n").unwrap();
+        run(upstream.path(), &["add", "-A"]);
+        run(upstream.path(), &["commit", "-qm", "init"]);
+
+        let dir = scratch_repo();
+        run(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &upstream.path().display().to_string(),
+            ],
+        );
+        run(dir.path(), &["fetch", "-q", "origin"]);
+        run(dir.path(), &["reset", "-q", "--hard", "origin/HEAD"]);
+
+        std::fs::write(upstream.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(upstream.path().join("b.txt"), "added\n").unwrap();
+        run(upstream.path(), &["add", "-A"]);
+        run(upstream.path(), &["commit", "-qm", "more"]);
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "git", "args": ["pull", "--ff-only", "origin", "HEAD"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.is_error,
+            "the pull itself must succeed: {}",
+            out.content
+        );
+        assert!(
+            modified_of(&out).is_empty(),
+            "a fast-forward pull authored nothing: {:?}",
+            modified_of(&out)
+        );
+    }
+
+    /// A command that WRITES a file and commits it in the same invocation also
+    /// moves HEAD, and the new content then matches the new HEAD exactly — the
+    /// same shape a pull leaves behind. Tree state alone cannot tell the two
+    /// apart, so the write must not disappear: a source change that skipped the
+    /// project's gate is the false-verified case this whole change exists to
+    /// avoid creating.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_committed_by_the_same_command_is_still_reported() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c",
+                    "echo written > x.rs && git add -A && git commit -qm mine"]}),
+                git_ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            modified_of(&out),
+            vec!["x.rs".to_string()],
+            "committing a write does not make it someone else's: {}",
+            out.content
+        );
+    }
+
+    /// A pre-claim child must still be able to OBSERVE: exploring the code is
+    /// exactly what it has to do before it can know which scope to claim.
+    /// Blanket-refusing every command made that impossible (P3 evidence: a
+    /// `head … && grep …` pipeline was refused). The boundary belongs at the
+    /// filesystem — the process runs with the workspace read-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_zero_scope_child_can_still_observe_the_workspace() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("keep.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let context =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "ls && cat keep.txt"]}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("original"),
+            "a pre-claim child must be able to read the workspace: {}",
+            out.content
+        );
+    }
+
+    /// RO5/RO7: a scripting language cannot escape the boundary (the effect is
+    /// enforced, not the program name), and once a scope IS claimed the very
+    /// same write succeeds inside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_read_only_boundary_holds_for_scripts_and_lifts_after_a_claim() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("allowed")).unwrap();
+        std::fs::write(dir.path().join("allowed/x.txt"), "before\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        // Zero scope: a shell script write is denied by the kernel.
+        let zero =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let _ = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "printf tampered > allowed/x.txt"]
+                }),
+                zero,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed/x.txt")).unwrap(),
+            "before\n",
+            "a zero-scope script must not rewrite a workspace file"
+        );
+
+        // With the scope claimed, the same write goes through.
+        let claimed = ctx(dir.path()).with_command_write_constraints(
+            Some(vec!["allowed".to_string()]),
+            None,
+            Vec::new(),
+        );
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "printf after > allowed/x.txt"]
+                }),
+                claimed,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed/x.txt")).unwrap(),
+            "after",
+            "a claimed scope must allow the write: {}",
+            out.content
+        );
+    }
+
+    /// PB_B_ORCH_1 root cause. A child that has claimed NOTHING gets an EMPTY
+    /// write allowlist — it holds no write authority at all. Enforcing that by
+    /// diffing a git snapshot AFTER the command is not enough: git does not
+    /// track empty directories, so `rmdir` mutated the workspace invisibly and
+    /// no violation fired (production evidence: an unclaimed child removed
+    /// test/cases/verb-fieldlen/0003 with exit 0). With zero claimed paths a
+    /// mutation-capable command must be refused BEFORE it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_zero_scope_command_is_refused_before_it_can_mutate() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("victim")).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "hi\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        // An unclaimed child: constrained, with an EMPTY allowlist.
+        let context =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "rmdir victim"]}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dir.path().join("victim").is_dir(),
+            "a zero-scope child must not be able to remove a directory: {}",
+            out.content
+        );
+        // The denial now comes from the OS (the workspace is read-only for a
+        // zero-scope child), not from a tool-layer refusal string: the effect
+        // is enforced, whatever program attempts it.
+        assert!(
+            out.content.contains("not permitted") || out.content.contains("denied"),
+            "the mutation must fail at the filesystem boundary: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_workspace_notes_unrecoverable_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "echo x > created.txt"]}),
+                ctx(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("cannot be rolled back"),
+            "the non-git degradation must be explicit: {}",
+            out.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn out_of_scope_command_mutations_are_rolled_back() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        let constrained = ctx(dir.path()).with_command_write_constraints(
+            Some(vec!["src".to_string()]),
+            None,
+            Vec::new(),
+        );
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "echo bad > outside.txt"]}),
+                constrained,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "scope violation must fail the tool call");
+        assert!(
+            out.content.contains("outside allowed paths"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !dir.path().join("outside.txt").exists(),
+            "violation must be rolled back"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_file_budget_violation_is_rolled_back() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("base.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+        let constrained = ctx(dir.path()).with_command_write_constraints(None, Some(1), Vec::new());
+
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "echo a > a.txt; echo b > b.txt"]}),
+                constrained,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "budget violation must fail the tool call");
+        assert!(out.content.contains("file budget"), "{}", out.content);
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("b.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod command_gate_tests {
+    use super::*;
+    use crate::tool::ToolContext;
+    #[allow(unused_imports)]
+    use crate::tools::command_execution::{
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
+        sandbox_denial_hint, truncate_or_spill,
+    };
+    use leveler_execution::PermissionProfile;
+    #[allow(unused_imports)]
+    use std::time::Duration;
+    use std::time::Instant;
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        super::super::test_ctx_in(dir, PermissionProfile::FullAccess)
+    }
+
+    /// Parallel workers own disjoint files but share one working tree and one
+    /// build directory. Two commands running at once means one agent's test can
+    /// observe another's half-finished edit — a result that looks authoritative
+    /// and is not. The gate serializes them; it is shared through the cloned
+    /// `ToolContext`, which is exactly how a sub-agent inherits it.
+    #[tokio::test]
+    async fn concurrent_commands_are_serialized_across_cloned_contexts() {
+        let dir = std::env::temp_dir().join(format!("leveler-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = ctx(&dir);
+        // A sub-agent gets a clone — the gate must still be the same gate.
+        let a = parent.clone();
+        let b = parent.clone();
+
+        let call = |c: ToolContext| async move {
+            RunCommandTool::new(crate::tools::test_commands())
+                .execute(
+                    serde_json::json!({"program": "sh", "args": ["-c", "sleep 0.4"]}),
+                    c,
+                    CancellationToken::new(),
+                )
+                .await
+        };
+
+        let started = Instant::now();
+        let (ra, rb) = tokio::join!(call(a), call(b));
+        let elapsed = started.elapsed();
+        ra.unwrap();
+        rb.unwrap();
+
+        assert!(
+            elapsed.as_millis() >= 800,
+            "two 0.4s commands ran concurrently ({}ms) — the gate did not hold",
+            elapsed.as_millis()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single agent must not pay for the gate.
+    #[tokio::test]
+    async fn one_command_is_not_slowed_by_the_gate() {
+        let dir = std::env::temp_dir().join(format!("leveler-gate-solo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = Instant::now();
+        RunCommandTool::new(crate::tools::test_commands())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "sleep 0.2"]}),
+                ctx(&dir),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed().as_millis() < 900,
+            "uncontended gate must be ~free"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::tool::Tool;
+    #[allow(unused_imports)]
+    use crate::tools::command_execution::{
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
+        sandbox_denial_hint, truncate_or_spill,
+    };
+    #[allow(unused_imports)]
+    use std::time::Duration;
+
+    /// The doc comment on `program` becomes the JSON Schema description the
+    /// model reads. It must state the contract, not explain the runtime's
+    /// internals — a field documented as "kept schema-optional" reads as
+    /// permission to omit it, and a real session did exactly that twice.
+    #[test]
+    fn the_program_field_does_not_tell_the_model_it_is_optional() {
+        let schema = RunCommandTool::new(crate::tools::test_commands()).input_schema();
+        let description = schema
+            .pointer("/properties/program/description")
+            .and_then(|d| d.as_str())
+            .expect("program has a description")
+            .to_lowercase();
+        for leak in [
+            "schema-optional",
+            "optional so",
+            "reaches the tool",
+            "registry",
+        ] {
+            assert!(
+                !description.contains(leak),
+                "implementation rationale leaked into the model-facing schema: {description}"
+            );
+        }
+        assert!(
+            description.contains("required"),
+            "the model must be told this is required: {description}"
+        );
+    }
+
+    /// Prose is not a contract. A strict-function-calling provider enforces
+    /// the `required` array and nothing else, so a field the tool cannot work
+    /// without must appear there — regardless of how the Rust type spells it.
+    ///
+    /// Asserted against `ToolRegistry::definitions()` — the exact value handed
+    /// to a provider — not against the local type's schema. If a registry
+    /// transform, adapter or normalisation step ever drops `required`, the
+    /// contract breaks there and a type-local test would still pass.
+    #[test]
+    fn the_published_schema_requires_program() {
+        let registry = crate::registry::default_registry();
+        let def = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "run_command")
+            .expect("run_command is registered");
+        let required: Vec<&str> = def
+            .input_schema
+            .pointer("/required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"program"),
+            "the schema published to providers must require `program`; it lists {required:?}"
+        );
+    }
+
+    /// The fallback must survive the schema fix. A provider that does not
+    /// enforce `required` still reaches the runtime, and the runtime must
+    /// still refuse — a strong contract at the first gate does not remove the
+    /// need for the last one.
+    #[tokio::test]
+    async fn an_empty_program_is_refused_by_the_runtime() {
+        for blank in ["", "   ", "\t"] {
+            let out = run(serde_json::json!({"program": blank, "args": ["x"]})).await;
+            assert!(
+                out.contains("is_error: true"),
+                "a blank program must be refused, not run: {out}"
+            );
+        }
+    }
+
+    /// A well-formed call is untouched by any of this.
+    #[tokio::test]
+    async fn a_valid_call_still_runs() {
+        let (program, args) = leveler_test_support::echo_command("contract-ok");
+        let out = run(serde_json::json!({"program": program, "args": args})).await;
+        assert!(out.contains("contract-ok"), "{out}");
+        assert!(!out.contains("is_error: true"), "{out}");
+    }
+
+    /// The observed failure: a valid argument array with the executable simply
+    /// missing. Telling it to use `shell_command` is wrong advice — the fix is
+    /// to supply `program`.
+    #[tokio::test]
+    async fn a_missing_program_with_real_args_names_the_missing_field() {
+        let out = run(serde_json::json!({"args": ["test", "./..."], "cwd": "."})).await;
+        // The fix must be the FIRST thing said: supply `program`. Mentioning
+        // shell_command afterwards is fine — it is the boundary between the
+        // two tools — but it must not be the headline, because the args array
+        // was already correct and switching tools is not the repair.
+        let program_at = out.find("program").expect("names the missing field");
+        let shell_at = out.find("shell_command").unwrap_or(usize::MAX);
+        assert!(
+            program_at < shell_at,
+            "the repair is to supply `program`, not to switch tools: {out}"
+        );
+        assert!(
+            out.contains("\\\"program\\\": \\\"go\\\""),
+            "a concrete corrected call is worth more than a rule: {out}"
+        );
+    }
+
+    /// shell_command's `cmd` field on run_command is refused BY NAME, and the
+    /// command inside it is never executed. run_command and shell_command have
+    /// different security/execution semantics — a silent conversion would run
+    /// a shell line under argv semantics (or the reverse); an explicit error
+    /// is the only honest response.
+    #[tokio::test]
+    async fn a_cmd_shape_call_is_refused_naming_the_cmd_field() {
+        let marker = "leveler-cmd-shape-must-not-run";
+        let out = run(serde_json::json!({"cmd": format!("touch {marker}")})).await;
+        assert!(out.contains("error") || out.contains("Error"), "{out}");
+        assert!(out.contains("cmd"), "names the field it saw: {out}");
+        assert!(
+            out.contains("shell_command"),
+            "steers to the right tool: {out}"
+        );
+        assert!(
+            !std::path::Path::new(marker).exists(),
+            "the shell line must never execute"
+        );
+    }
+
+    /// The other shape, unchanged: a whole command line crammed into `program`
+    /// really does belong in `shell_command`.
+    #[tokio::test]
+    async fn a_shell_string_is_still_steered_to_shell_command() {
+        let out = run(serde_json::json!({"program": "  "})).await;
+        assert!(out.contains("shell_command"), "{out}");
+    }
+
+    async fn run(input: serde_json::Value) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-run-command-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(workspace, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool::new(crate::tools::test_commands())
+            .execute(input, ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        format!("{out:?}")
+    }
+}

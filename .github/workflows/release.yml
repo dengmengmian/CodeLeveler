@@ -1,0 +1,143 @@
+name: Release
+
+# Tag `vX.Y.Z` → build the `leveler` binary for the four supported targets,
+# package each with its sha256, and attach everything to a draft GitHub
+# release. Publishing the draft (a human step) is what makes
+# `leveler upgrade --check` see the new version.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Cross-compile the Intel binary on the Apple Silicon runner: the
+          # macos-13 (Intel) runners queue for tens of minutes and stall the
+          # whole release. Apple's toolchain builds x86_64 from arm64 natively.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked -p leveler-cli --target ${{ matrix.target }}
+
+      # Windows confines a command's writes by running it through this
+      # launcher, which `leveler.exe` looks for beside itself. A package
+      # without it fails closed, so it ships in the same archive.
+      - name: Build Windows write-confinement launcher
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p leveler-win-confine --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="leveler-v${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/leveler" "dist/${name}/"
+          cp README.md LICENSE-APACHE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $name = "leveler-v$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/leveler.exe" "dist/$name/"
+          Copy-Item "target/${{ matrix.target }}/release/leveler-confine.exe" "dist/$name/"
+          Copy-Item README.md,LICENSE-APACHE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: leveler-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout first: a later checkout would wipe downloaded artifacts.
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A tag with a SemVer pre-release part (`v1.0.0-beta.1`) is a GitHub
+      # pre-release, so `releases/latest` stays on the last stable tag.
+      # install.sh and Homebrew follow that; a beta is installed only when
+      # asked for by tag (`LEVELER_VERSION=v…`).
+      - name: Compose bilingual release notes
+        run: |
+          set -euo pipefail
+          # Tag is the heading. Skip each file's title and the cross-language link.
+          notes() {
+            awk 'NR==1 && /^# / { next } /^Chinese:/ { next } /^英文版：/ { next } { print }' "$1"
+          }
+          {
+            echo "# CodeLeveler ${GITHUB_REF_NAME}"
+            echo
+            echo "## English"
+            echo
+            notes docs/RELEASE.md
+            echo
+            echo "## 中文"
+            echo
+            notes docs/RELEASE.zh-CN.md
+          } > /tmp/release-body.md
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: false
+          body_path: /tmp/release-body.md
+          files: dist/*

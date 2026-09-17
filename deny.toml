@@ -1,0 +1,62 @@
+# cargo-deny configuration for CodeLeveler.
+# Run in CI: `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every entry needs an expiry date and a reachability check reproducible from
+# this file. Re-run the quoted `cargo tree` command when an entry expires: an
+# empty result means the crate is lockfile-only, a non-empty one means the
+# advisory now applies to a linked dependency and must be re-evaluated.
+ignore = [
+    # NOTE: RUSTSEC-2023-0071 (rsa, Marvin attack) was removed on 2026-08-22.
+    # cargo-deny resolves advisories against the dependency *graph*, and `rsa` is
+    # not in it on any target (`cargo tree --target all -i rsa` prints nothing),
+    # so the entry only produced `advisory-not-detected`. It stays in the
+    # lockfile as an optional sqlx-mysql edge, which is why `cargo audit` — which
+    # reads the lockfile, not the graph — still ignores it in CI.
+    # bincode 1.x — `informational = "unmaintained"`, not a vulnerability.
+    # Expires 2027-01-01. Reached at runtime, but only through syntect's
+    # syntax-definition loading in the TUI; no safe direct upgrade exists
+    # (syntect 5.x pins bincode 1.x).
+    #   $ cargo tree --target all -i bincode
+    #   bincode v1.3.3 └── syntect v5.3.0 └── leveler-tui └── leveler-cli
+    "RUSTSEC-2025-0141",
+    # paste — `informational = "unmaintained"`, not a vulnerability.
+    # Expires 2027-01-01. Build-time only (proc-macro), so it contributes no
+    # runtime code to any shipped binary. Comes in via ratatui.
+    #   $ cargo tree --target all -i paste
+    #   paste v1.0.15 (proc-macro) └── ratatui v0.29.0 └── leveler-tui └── leveler-cli
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSL-1.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

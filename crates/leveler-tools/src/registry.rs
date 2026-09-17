@@ -1,0 +1,1258 @@
+//! The tool registry: registration, schema validation, and dispatch (spec §18.2).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use leveler_core::{ceil_char_boundary, floor_char_boundary};
+use leveler_execution::RiskLevel;
+use leveler_model::ToolDefinition;
+
+use crate::capabilities::Capabilities;
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+
+/// The canonical observe-class (read-only) tool list. This is THE single
+/// source for "may run without a plan / read-only subset" decisions — the
+/// R006 incident came from a second, narrower copy of this list drifting
+/// (git_status missing) and the plan gate refusing a read-only tool.
+pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
+    "blast_radius",
+    "diagnostics",
+    "expand_tools",
+    "find_files",
+    "find_references",
+    "find_symbol",
+    "get_task",
+    "git_diff",
+    "git_status",
+    "grep",
+    "list_files",
+    "load_skill",
+    "memory",
+    "read_file",
+    "read_symbol",
+    "update_plan",
+    "view_image",
+];
+
+/// Every tool name [`model_surface`] can build with every pack on and every
+/// handle present. The vocabulary a declarative agent definition may narrow
+/// its toolset to; harness controls are not in it.
+pub const MODEL_SURFACE_TOOLS: &[&str] = &[
+    "apply_patch",
+    "blast_radius",
+    "browser_act",
+    "browser_inspect",
+    "browser_tab",
+    "diagnostics",
+    "find_files",
+    "find_references",
+    "find_symbol",
+    "forget",
+    "get_task",
+    "git_diff",
+    "git_status",
+    "grep",
+    "kill_task",
+    "list_files",
+    "load_skill",
+    "memory",
+    "read_file",
+    "read_symbol",
+    "remember",
+    "run_command",
+    "shell_command",
+    "view_image",
+    "wait_task",
+    "web_fetch",
+    "web_search",
+    "write_file",
+];
+
+/// True when `name` is in the canonical observe-class list.
+pub fn is_observe_class_tool(name: &str) -> bool {
+    OBSERVE_CLASS_TOOLS.contains(&name)
+}
+
+/// Holds the available tools and validates arguments before dispatching.
+#[derive(Default)]
+pub struct ToolRegistry {
+    tools: BTreeMap<String, Arc<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a tool. A later registration with the same name replaces it.
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Look up a tool by name.
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
+    }
+
+    /// Whether `name` is a registered tool that edits workspace files.
+    /// See [`Tool::mutates_files`]. Unknown names are `false` — an unroutable
+    /// call is refused before it could mutate anything.
+    pub fn mutates_files(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.mutates_files())
+    }
+
+    /// Whether `name` is a registered tool that executes a shell command.
+    /// See [`Tool::runs_command`]. Unknown names are `false`.
+    /// Whether re-running this tool after a crash is guaranteed to have no
+    /// external effect (see [`Tool::replay_is_side_effect_free`]). An UNKNOWN
+    /// tool answers `false`: recovery must never auto-replay something this
+    /// build cannot ask about.
+    pub fn replay_is_side_effect_free(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|t| t.replay_is_side_effect_free())
+    }
+
+    pub fn runs_command(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.runs_command())
+    }
+
+    /// A registry containing only pure read-only tools — search, read, symbol
+    /// lookup, git status/diff, plan. Used to build an `explorer` sub-agent
+    /// that physically cannot modify the workspace: the write tools aren't
+    /// present, so a forbidden edit fails as "unknown tool" rather than
+    /// relying on the model to obey a prompt.
+    ///
+    /// An explicit allowlist, NOT derived from `risk() == Safe`: the Safe label
+    /// admits side effects that break the subset's guarantee (create_checkpoint
+    /// resets the rollback baseline; wait_task consumes a background task's
+    /// one-time settlement report). A newly added Safe tool stays out until
+    /// listed here.
+    /// The subset named by `allowed`, intersected with what this registry
+    /// actually has.
+    ///
+    /// An empty `allowed` means "inherit everything" — a caller that wants to
+    /// hand an agent nothing must say so some other way, because an empty
+    /// allowlist is far more often a config typo than a deliberate lockout.
+    /// Names that match nothing are ignored here; the caller validates them.
+    pub fn named_subset(&self, allowed: &[String]) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        if allowed.is_empty() {
+            for tool in self.tools.values() {
+                subset.register(tool.clone());
+            }
+            return subset;
+        }
+        for tool in self.tools.values() {
+            if allowed.iter().any(|a| a == tool.name()) {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
+    /// Every tool except MCP proxies. A delegated agent gets this: an MCP
+    /// server runs in its own unsandboxed process, outside any claimed write
+    /// scope, so its effect cannot be bounded to a child's. Filtering the
+    /// registry keeps the tool from being advertised at all — admission
+    /// refuses it too, but offering a tool that can only ever be refused just
+    /// burns the child's rounds.
+    pub fn without_mcp_tools(&self) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        for tool in self.tools.values() {
+            if !tool.name().starts_with("mcp__") {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
+    /// Every tool except those named.
+    pub fn without_named(&self, names: &[&str]) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        for tool in self.tools.values() {
+            if !names.contains(&tool.name()) {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
+    pub fn read_only_subset(&self) -> ToolRegistry {
+        const READ_ONLY_TOOLS: &[&str] = OBSERVE_CLASS_TOOLS;
+        let mut subset = ToolRegistry::new();
+        for tool in self.tools.values() {
+            // Belt and braces: allowlisted AND still Safe-risk, so a future
+            // risk bump on a listed tool drops it out automatically.
+            if READ_ONLY_TOOLS.contains(&tool.name()) && tool.risk() == RiskLevel::Safe {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
+    /// The tool definitions to advertise to the model (sorted by name).
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .values()
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })
+            .collect()
+    }
+
+    /// Normalize and schema-validate the arguments, then dispatch. Invalid
+    /// JSON is never guessed (spec §10.4).
+    ///
+    /// NO POLICY LIVES HERE. Whether this call may happen at all — the
+    /// permission profile, the read-only overlay, an owned write scope, the
+    /// permission rules, approval — is decided ONCE by the ToolHost, which is
+    /// the only thing that can produce the admitted call that reaches this
+    /// method. The registry used to re-decide three of those, so a build had
+    /// three authorization owners that had to agree; when they disagreed the
+    /// one nobody was looking at won.
+    pub async fn execute(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let tool = self
+            .get(name)
+            .ok_or_else(|| ToolError::NotFound(name.to_string()))?
+            .clone();
+
+        let input = tool.normalize_input(input);
+        // A structural rejection is final either way; the tool may only
+        // choose the wording. run_command turns "\"program\" is a required
+        // property" into guidance naming the exact mistake — the only
+        // feedback loop a provider that ignores `required` ever sees.
+        if let Err(schema_error) = validate_schema(name, &tool.input_schema(), &input) {
+            if let Some(guidance) = tool.invalid_input_guidance(&input) {
+                return Ok(ToolOutput::error(guidance));
+            }
+            return Err(schema_error);
+        }
+
+        let budget = context.policy.tool_output_budget;
+        let mut output = tool.execute(input, context, cancellation).await?;
+        // The ONE model-facing result bound: no single tool result may flood
+        // the context window, whatever the tool's own intrinsic limits are
+        // (some search tools have none). Keep the head and the tail — errors
+        // and test failures often land at the end.
+        //
+        // This is a mechanical runtime guarantee about what the MODEL sees,
+        // not a policy: it is applied to every dispatch, it cannot be granted
+        // away, and a tool cannot opt out of it.
+        output.content = cap_output_with(&output.content, budget);
+        Ok(output)
+    }
+}
+
+/// Default hard ceiling on any single tool result (~12k tokens). Bytes, not
+/// chars. Per-model budgets (`ModelLimits::max_tool_output_bytes`) may lower
+/// it via [`ToolContext::tool_output_budget`].
+pub const MAX_TOOL_OUTPUT: usize = 48 * 1024;
+/// Smallest configured result budget. Below this, even a useful truncation
+/// marker and one diagnostic line cannot be preserved.
+pub const MIN_TOOL_OUTPUT: usize = 1024;
+
+/// [`cap_output_with`] at the default budget.
+///
+/// Public because this is the ONE tool-result cap: `execute` applies it to
+/// every registry tool, and the executor reuses it for content that bypasses
+/// the registry (sub-agent results).
+pub fn cap_output(s: &str) -> String {
+    cap_output_with(s, MAX_TOOL_OUTPUT)
+}
+
+/// Truncate `s` to `budget` bytes, keeping the head (½ budget) and tail
+/// (¼ budget) with an elision marker between. Slices only on UTF-8 boundaries.
+pub fn cap_output_with(s: &str, budget: usize) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let largest_marker = format!(
+        "… [{} bytes (~{} tokens) elided to fit the context] …",
+        s.len(),
+        approx_tokens(s.len())
+    );
+    let framing = largest_marker.len() + 2;
+    if framing >= budget {
+        return s[..floor_char_boundary(s, budget)].to_string();
+    }
+
+    let keep = budget - framing;
+    let head_budget = keep * 2 / 3;
+    let tail_budget = keep - head_budget;
+    let head = floor_char_boundary(s, head_budget);
+    let tail = ceil_char_boundary(s, s.len() - tail_budget);
+    let marker = format!(
+        "… [{} bytes (~{} tokens) elided to fit the context] …",
+        tail - head,
+        approx_tokens(tail - head)
+    );
+    let output = format!("{}\n{marker}\n{}", &s[..head], &s[tail..]);
+    if output.len() <= budget {
+        output
+    } else {
+        // UTF-8 boundary rounding and a changing digit count should only save
+        // space, but keep the hard invariant even if the marker format evolves.
+        s[..floor_char_boundary(s, budget)].to_string()
+    }
+}
+
+/// ~2.5 bytes/token heuristic for TOOL OUTPUT, matching the fold
+/// accountant's weighting (`estimate_tokens` charges tool bytes at 2/5 —
+/// calibrated against measured provider usage). The old bytes/4 figure
+/// under-reported elided cost by ~60%, making a re-read look cheaper than
+/// the context accountant would charge for it.
+pub(crate) fn approx_tokens(bytes: usize) -> usize {
+    (bytes * 2).div_ceil(5)
+}
+
+/// Validate `instance` against `schema`, returning a readable error listing the
+/// schema violations.
+fn validate_schema(
+    tool: &str,
+    schema: &serde_json::Value,
+    instance: &serde_json::Value,
+) -> Result<(), ToolError> {
+    let validator = jsonschema::validator_for(schema).map_err(|e| ToolError::InvalidArguments {
+        tool: tool.to_string(),
+        message: format!("tool schema is itself invalid: {e}"),
+    })?;
+
+    let errors: Vec<String> = validator
+        .iter_errors(instance)
+        .map(|e| format!("{} (at {})", e, e.instance_path))
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidArguments {
+            tool: tool.to_string(),
+            message: errors.join("; "),
+        })
+    }
+}
+
+/// A set of optional capability packs.
+///
+/// The same shape answers three DIFFERENT questions, and keeping them apart is
+/// the point:
+///
+/// - **AVAILABLE** — can this machine provide the capability at all? A browser
+///   runtime installed, a search key configured, `git` on PATH, a model that
+///   accepts an image. Mechanical facts, nothing else.
+/// - **ENABLED** — does the current product mode / session ask for it?
+/// - **EXPOSED** — what the model actually sees, which is
+///   [`Self::intersect`] of the two.
+///
+/// A capability being AVAILABLE is not a reason to advertise it. `Economy`
+/// enables no optional pack, so a machine with a browser runtime still shows a
+/// plain coding turn zero browser tools.
+///
+/// None of the three is ever a judgement about the task or about the model's
+/// ability (`docs/ARCHITECTURE.md` §1.1): the surface never grows because a
+/// task looks hard or shrinks because a model looks weak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilityPacks {
+    /// Symbol navigation over a language server.
+    pub code_intelligence: bool,
+    /// Repository inspection.
+    pub vcs: bool,
+    /// Fetching a URL. Needs network.
+    pub web_fetch: bool,
+    /// Searching the web. Needs a configured search key.
+    pub web_search: bool,
+    /// Showing the model an image. Needs a model that accepts one.
+    pub media: bool,
+    /// Durable project memory.
+    pub memory: bool,
+    /// Skill loading.
+    pub skills: bool,
+    /// The browser. Needs a browser this machine can actually drive: the
+    /// selected product installed, and for Safari, Remote Automation on.
+    pub browser: bool,
+}
+
+impl CapabilityPacks {
+    /// No optional capability: the primitives and the protocol, nothing else.
+    pub const NONE: Self = Self {
+        code_intelligence: false,
+        vcs: false,
+        web_fetch: false,
+        web_search: false,
+        media: false,
+        memory: false,
+        skills: false,
+        browser: false,
+    };
+
+    /// Every pack. The composition a host reaches when each capability is both
+    /// enabled and available; also what tests use so a tool is never missing
+    /// for an environmental reason.
+    pub const ALL: Self = Self {
+        code_intelligence: true,
+        vcs: true,
+        web_fetch: true,
+        web_search: true,
+        media: true,
+        memory: true,
+        skills: true,
+        browser: true,
+    };
+
+    /// EXPOSED = ENABLED ∩ AVAILABLE.
+    ///
+    /// The one operator that turns the two independent answers into a surface.
+    /// Neither side can widen the other: a capability the product did not ask
+    /// for stays off however capable the machine is, and one the machine
+    /// cannot provide stays off however much the product wants it.
+    pub const fn intersect(self, other: Self) -> Self {
+        Self {
+            code_intelligence: self.code_intelligence && other.code_intelligence,
+            vcs: self.vcs && other.vcs,
+            web_fetch: self.web_fetch && other.web_fetch,
+            web_search: self.web_search && other.web_search,
+            media: self.media && other.media,
+            memory: self.memory && other.memory,
+            skills: self.skills && other.skills,
+            browser: self.browser && other.browser,
+        }
+    }
+}
+
+/// The Core Primitive Foundation, plus the lifecycle the command primitive
+/// entails.
+///
+/// `read`, `ls`, `find`, `grep`, `edit`, `write` and `bash` are here because
+/// they express fundamental coding operations (§6.3). `get_task` / `wait_task`
+/// / `kill_task` are here because `run_command` can start a background task,
+/// and a task the caller cannot observe or stop is an orphan — they are that
+/// primitive's lifecycle, not an optional capability.
+///
+/// Harness CONTROLS (`update_plan`, `update_goal`, `request_user_input`,
+/// `request_permissions`, `spawn_agent`, `claim_write_scope`,
+/// `report_finding`) are not here and never were a capability: they steer the
+/// harness rather than touch the world, and the coding harness registers them
+/// (`leveler_agent::register_harness_controls`).
+pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
+    use crate::tools;
+    let commands = Arc::new(tools::CommandExecution::new(
+        capabilities.background_tasks.clone(),
+        capabilities.artifact_store.clone(),
+    ));
+    let mut registry = ToolRegistry::new();
+    // read / ls / find / grep
+    registry.register(Arc::new(tools::ReadFileTool));
+    registry.register(Arc::new(tools::ListFilesTool));
+    registry.register(Arc::new(tools::FindFilesTool));
+    registry.register(Arc::new(tools::GrepTool));
+    // edit / write
+    registry.register(Arc::new(tools::ApplyPatchTool));
+    registry.register(Arc::new(tools::WriteFileTool));
+    // bash, and the background lifecycle it creates
+    registry.register(Arc::new(tools::RunCommandTool::new(commands.clone())));
+    registry.register(Arc::new(tools::ShellCommandTool::new(commands)));
+    let tasks = &capabilities.background_tasks;
+    registry.register(Arc::new(tools::GetTaskTool::new(tasks.clone())));
+    registry.register(Arc::new(tools::WaitTaskTool::new(tasks.clone())));
+    registry.register(Arc::new(tools::KillTaskTool::new(tasks.clone())));
+    registry
+}
+
+/// The model-visible surface: the core primitives plus the packs this host has
+/// been asked for AND can provide.
+///
+/// This is the whole composition. There is no dynamic expansion and no
+/// model-controlled discovery: the harness decides what exists, once, before
+/// the turn starts. `packs` is the EXPOSED set — see
+/// [`CapabilityPacks::intersect`] — and `capabilities` carries the handles the
+/// tools of each exposed pack are constructed from.
+pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> ToolRegistry {
+    use crate::tools;
+    let mut registry = core_surface(capabilities);
+    if packs.code_intelligence {
+        let lsp = &capabilities.lsp;
+        registry.register(Arc::new(tools::FindSymbolTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::ReadSymbolTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::FindReferencesTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::DiagnosticsTool::new(lsp.clone())));
+        registry.register(Arc::new(tools::BlastRadiusTool::new(lsp.clone())));
+    }
+    if packs.vcs {
+        registry.register(Arc::new(tools::GitStatusTool));
+        registry.register(Arc::new(tools::GitDiffTool));
+    }
+    if packs.web_fetch {
+        registry.register(Arc::new(tools::WebFetchTool));
+    }
+    // The search pack needs BOTH halves and there is no stand-in for the
+    // missing one: the flag says the product asked for search, the key is what
+    // a search actually takes. A key-less `WebSearchTool` would be a tool whose
+    // every call is a 401, so it is not built — and because it is never built,
+    // `execute` has no "am I configured" branch to carry.
+    if packs.web_search
+        && let Some(key) = &capabilities.search_api_key
+    {
+        registry.register(Arc::new(tools::WebSearchTool::new(key.clone())));
+    }
+    if packs.media {
+        registry.register(Arc::new(tools::ViewImageTool));
+    }
+    if packs.memory {
+        let root = tools::MemoryRoot::new(capabilities.memory_root.clone());
+        registry.register(Arc::new(tools::MemoryTool::new(root.clone())));
+        registry.register(Arc::new(tools::RememberTool::new(root.clone())));
+        registry.register(Arc::new(tools::ForgetTool::new(root)));
+    }
+    if packs.skills {
+        registry.register(Arc::new(tools::LoadSkillTool));
+    }
+    // Like `web_search`, the browser pack needs BOTH halves: the flag says the
+    // product asked for a browser, the handle is what a browser actually takes.
+    // A handle-less browser tool could only ever report that it has no browser,
+    // so it is not built — and because it is never built, `execute` carries no
+    // "is there a browser" branch.
+    if packs.browser
+        && let Some(browser) = &capabilities.browser
+    {
+        registry.register(Arc::new(tools::BrowserTabTool::new(browser.clone())));
+        registry.register(Arc::new(tools::BrowserActTool::new(browser.clone())));
+        registry.register(Arc::new(tools::BrowserInspectTool::new(browser.clone())));
+    }
+    registry
+}
+
+/// Every pack on, over in-process capability handles. The entry point tests
+/// use; production composes packs from what the host was asked for and can
+/// actually do, and hands over the services it owns (see `leveler-app`).
+///
+/// One pack cannot be composed here: `web_search` takes a provider key, and a
+/// constructor that needs nothing from a host has nowhere honest to get one.
+/// It is therefore absent from this registry — see
+/// [`model_surface`] with a keyed [`Capabilities`] for the full surface.
+pub fn default_registry() -> ToolRegistry {
+    model_surface(
+        CapabilityPacks::ALL,
+        &Capabilities::in_process(Arc::new(leveler_core::environment().clone())),
+    )
+}
+
+#[cfg(test)]
+mod navigation_tool_contract {
+    //! The tool table is what an eval measures navigation against, so the
+    //! parts a benchmark depends on are pinned here: `read_file`'s range is
+    //! optional, and its description states plainly what each form returns.
+    //! C2.3B's behavioural wording was removed after A/B showed it cost more
+    //! than it bought; what stays is capability, not advice.
+
+    #[test]
+    fn read_file_takes_an_optional_range_and_says_what_each_form_returns() {
+        let registry = crate::default_registry();
+        let read = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "read_file")
+            .expect("read_file registered");
+
+        let props = read.input_schema["properties"]
+            .as_object()
+            .expect("object schema");
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
+        let required = read.input_schema["required"].as_array().expect("required");
+        assert_eq!(
+            required.len(),
+            1,
+            "only `path` may be required: {required:?}"
+        );
+        assert_eq!(required[0], "path");
+
+        assert!(
+            read.description
+                .contains("omitting both returns the whole file"),
+            "both read shapes must be discoverable from the tool alone: {}",
+            read.description
+        );
+        // Descriptions state capability. Steering belongs in the prompt, where
+        // it can be measured and reverted; C2.3B is the reason that matters.
+        for advisory in [
+            "first thing to reach for",
+            "where to start reading",
+            "token",
+        ] {
+            assert!(
+                !read.description.to_lowercase().contains(advisory),
+                "tool descriptions must not carry navigation advice: {advisory:?}"
+            );
+        }
+    }
+
+    /// The three localisation tools must stay distinguishable, or a navigation
+    /// eval cannot tell "used the wrong tool" from "did not look".
+    #[test]
+    fn localisation_tools_stay_distinguishable() {
+        let registry = crate::default_registry();
+        let by_name: std::collections::HashMap<_, _> = registry
+            .definitions()
+            .into_iter()
+            .map(|d| (d.name.clone(), d.description))
+            .collect();
+        assert!(by_name["grep"].contains("pattern"));
+        assert!(by_name["find_symbol"].contains("DEFINED"));
+        assert!(by_name["find_references"].contains("call sites"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model-visible surface, named. A normal turn does not receive
+    /// "whatever the registry happens to contain": it receives the core
+    /// primitives plus the packs this host can actually offer.
+    #[test]
+    fn the_core_surface_is_the_primitives_and_what_they_entail() {
+        let names: Vec<String> = core_surface(&crate::tools::test_capabilities())
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        let mut expected = vec![
+            // read / ls / find / grep
+            "read_file",
+            "list_files",
+            "find_files",
+            "grep",
+            // edit / write
+            "apply_patch",
+            "write_file",
+            // bash, and the background lifecycle run_command can create
+            "run_command",
+            "shell_command",
+            "get_task",
+            "wait_task",
+            "kill_task",
+        ];
+        expected.sort_unstable();
+        let mut got: Vec<&str> = names.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// A pack is all-or-nothing and adds only its own tools.
+    #[test]
+    fn each_pack_adds_exactly_its_own_tools() {
+        let capabilities = configured_test_capabilities();
+        let core = core_surface(&capabilities).definitions().len();
+        for (packs, added) in [
+            (
+                CapabilityPacks {
+                    code_intelligence: true,
+                    ..CapabilityPacks::NONE
+                },
+                5,
+            ),
+            (
+                CapabilityPacks {
+                    vcs: true,
+                    ..CapabilityPacks::NONE
+                },
+                2,
+            ),
+            (
+                CapabilityPacks {
+                    memory: true,
+                    ..CapabilityPacks::NONE
+                },
+                3,
+            ),
+            (
+                CapabilityPacks {
+                    browser: true,
+                    ..CapabilityPacks::NONE
+                },
+                3,
+            ),
+            (
+                CapabilityPacks {
+                    skills: true,
+                    ..CapabilityPacks::NONE
+                },
+                1,
+            ),
+            (
+                CapabilityPacks {
+                    media: true,
+                    ..CapabilityPacks::NONE
+                },
+                1,
+            ),
+        ] {
+            assert_eq!(
+                model_surface(packs, &capabilities).definitions().len(),
+                core + added,
+                "{packs:?}"
+            );
+        }
+    }
+
+    /// No pack means no pack. `Economy` composes exactly the core surface.
+    #[test]
+    fn no_packs_is_the_core_surface() {
+        assert_eq!(
+            model_surface(CapabilityPacks::NONE, &crate::tools::test_capabilities())
+                .definitions()
+                .len(),
+            core_surface(&crate::tools::test_capabilities())
+                .definitions()
+                .len()
+        );
+    }
+
+    /// Every pack on is the widest surface a host can offer. Composed over
+    /// handles that carry a search key, because `default_registry` has none
+    /// and a pack without its handle is not composed.
+    #[test]
+    fn every_pack_on_is_the_widest_surface() {
+        let names: Vec<String> =
+            model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+        for present in [
+            "read_file",
+            "write_file",
+            "find_files",
+            "apply_patch",
+            "shell_command",
+            "find_symbol",
+            "git_status",
+            "web_fetch",
+            "web_search",
+            "view_image",
+            "memory",
+            "remember",
+            "forget",
+            "load_skill",
+            "browser_tab",
+            "browser_act",
+            "browser_inspect",
+        ] {
+            assert!(names.iter().any(|n| n == present), "missing {present}");
+        }
+        // core 11 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
+        // + browser 3 = 28. The harness controls (`update_plan` and the
+        // injected ones) are not in this count: they are not a capability the
+        // host composes, so `leveler_agent::register_harness_controls` adds
+        // them on top.
+        assert_eq!(names.len(), 28);
+    }
+
+    /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
+    /// validated against, so it must be exactly the widest surface: a tool
+    /// added to a pack but not to the list would be refused as unknown, and a
+    /// listed name no pack builds would validate and then never exist.
+    #[test]
+    fn the_known_tool_list_is_exactly_the_widest_surface() {
+        let mut built: Vec<String> =
+            model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+        built.sort();
+        let mut known: Vec<String> = MODEL_SURFACE_TOOLS.iter().map(|s| s.to_string()).collect();
+        known.sort();
+        assert_eq!(known, built);
+    }
+
+    /// In-process handles plus the two a configured host would have found: a
+    /// search key and a browser. Both are placeholders — every test that uses
+    /// them asserts on composition, never on a request or a live browser.
+    fn configured_test_capabilities() -> crate::capabilities::Capabilities {
+        crate::tools::test_capabilities()
+            .with_search_api_key(Some("tvly-test-value".to_string()))
+            .with_browser(std::sync::Arc::new(leveler_browser::Browser::new(
+                leveler_core::environment().clone(),
+                std::env::temp_dir().join("leveler-registry-test-profile"),
+                None,
+            )))
+    }
+
+    /// The mirror of the test above: a pack without the handle it is built
+    /// from composes nothing. Two packs work this way — search needs a key,
+    /// the browser needs a browser — and `default_registry` has neither, so
+    /// this is also what every test entry point sees.
+    #[test]
+    fn a_pack_without_its_handle_composes_nothing() {
+        let configured = model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
+            .definitions()
+            .len();
+        let bare = model_surface(CapabilityPacks::ALL, &crate::tools::test_capabilities())
+            .definitions()
+            .len();
+        assert_eq!(
+            bare,
+            configured - 4,
+            "web_search plus the three browser tools moved"
+        );
+        let names: Vec<String> = default_registry()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for absent in [
+            "web_search",
+            "browser_tab",
+            "browser_act",
+            "browser_inspect",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "a host without the handle must not carry {absent}"
+            );
+        }
+    }
+
+    /// Tools the model no longer chooses. Each left for its own reason, and
+    /// none of them because a model looked weak (`docs/ARCHITECTURE.md` §1.1):
+    /// two were deleted, four belong to the runtime or the user.
+    #[test]
+    fn the_model_surface_excludes_what_the_model_does_not_own() {
+        let names: Vec<String> = default_registry()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for absent in [
+            // Deleted: it could never work — nothing consumed its request and
+            // the registry it claimed to grow is immutable mid-turn.
+            "expand_tools",
+            // Deleted: overlapped edit + write, and went unused through the
+            // patch failures it was built to absorb.
+            "replace",
+            // The runtime already checkpoints before every write and owns
+            // rollback and crash recovery.
+            "create_checkpoint",
+            "restore_checkpoint",
+            // Memory-subsystem maintenance, not a coding capability.
+            "consolidate_memory",
+            // System customization: the user makes skills, the model loads them.
+            "create_skill",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "{absent} must not be on the model surface"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_subset_is_an_explicit_allowlist_without_side_effect_tools() {
+        let subset = default_registry().read_only_subset();
+        // Pure lookups stay in.
+        for name in ["read_file", "grep", "list_files", "git_status", "git_diff"] {
+            assert!(subset.get(name).is_some(), "{name} must be in the subset");
+        }
+        // Safe-labeled tools with side effects must NOT ride in on the label:
+        // create_checkpoint resets the rollback baseline; wait_task consumes
+        // a background task's one-time settlement report.
+        for name in ["create_checkpoint", "wait_task"] {
+            assert!(
+                subset.get(name).is_none(),
+                "{name} must not be in the subset"
+            );
+        }
+        // Belt and braces: everything included is still Safe-risk.
+        for def in subset.definitions() {
+            let tool = subset.get(&def.name).unwrap();
+            assert_eq!(tool.risk(), RiskLevel::Safe, "{}", def.name);
+        }
+    }
+
+    #[test]
+    fn cap_output_leaves_small_content_untouched() {
+        assert_eq!(cap_output("hello"), "hello");
+    }
+
+    /// HCH: the model-facing elision marker must charge tool bytes at the
+    /// SAME rate as the fold accountant (2/5 tokens per byte), so a re-read
+    /// never looks ~60% cheaper than the context accountant will charge.
+    #[test]
+    fn elision_marker_token_figure_matches_the_fold_accountant() {
+        assert_eq!(approx_tokens(1000), 400, "2/5 per byte, not 1/4");
+        let big = "y".repeat(100 * 1024);
+        let capped = cap_output_with(&big, 10 * 1024);
+        let marker_tokens: usize = capped
+            .split("(~")
+            .nth(1)
+            .and_then(|rest| rest.split(" tokens").next())
+            .and_then(|n| n.parse().ok())
+            .expect("marker carries a token figure");
+        let elided_bytes: usize = capped
+            .split("… [")
+            .nth(1)
+            .and_then(|rest| rest.split(" bytes").next())
+            .and_then(|n| n.parse().ok())
+            .expect("marker carries a byte figure");
+        assert_eq!(marker_tokens, (elided_bytes * 2).div_ceil(5));
+    }
+
+    #[test]
+    fn cap_output_truncates_and_keeps_head_and_tail() {
+        let big = format!("HEAD{}TAIL", "x".repeat(MAX_TOOL_OUTPUT));
+        let out = cap_output(&big);
+        assert!(out.len() < big.len(), "should shrink");
+        assert!(out.starts_with("HEAD"), "keeps the head");
+        assert!(out.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(out.contains("elided"), "marks the elision");
+    }
+
+    #[test]
+    fn cap_output_slices_on_utf8_boundaries() {
+        // A multibyte-char payload past the limit must not panic mid-codepoint.
+        let big = "\u{4e2d}".repeat(MAX_TOOL_OUTPUT); // each char is 3 bytes
+        let out = cap_output(&big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("elided"));
+    }
+
+    #[test]
+    fn cap_output_never_exceeds_even_a_tiny_budget() {
+        let input = "头部".repeat(100);
+        for budget in 0..128 {
+            let out = cap_output_with(&input, budget);
+            assert!(
+                out.len() <= budget,
+                "budget={budget}, output={} bytes: {out:?}",
+                out.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_context_budget_caps_tool_output() {
+        // A model-specific budget on the context must shrink what a tool
+        // returns. It used to be the central cap that did the shrinking, and
+        // this asserted its "elided" marker. `read_file` now pages at the same
+        // budget itself, so the cap has nothing left to chop and the marker is
+        // the tool's own — which is the point of that change: the central
+        // cap's marker carried a `start_line` past the middle it had just
+        // removed, so the model paged over lines it never saw.
+        //
+        // The obligation is unchanged and still asserted: the budget binds,
+        // and the truncation says so. This fixture is one 16 KB line, so it
+        // takes the within-a-line branch, which deliberately points at grep
+        // rather than at a next line that does not exist — the paging pointer
+        // itself is covered where it applies, in `read_file`'s own tests.
+        let dir = std::env::temp_dir().join(format!("leveler-reg-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.txt"), "x".repeat(16 * 1024)).unwrap();
+        let reg = default_registry();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.policy.tool_output_budget = 4 * 1024;
+        let out = reg
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "big.txt"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.len() < 5 * 1024,
+            "output must respect the per-context budget, got {} bytes",
+            out.content.len()
+        );
+        assert!(
+            out.content.contains("truncated"),
+            "a truncated result must say so: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_tool() {
+        let reg = default_registry();
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let err = reg
+            .execute("nope", serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn validates_schema_errors() {
+        let reg = default_registry();
+        let dir =
+            std::env::temp_dir().join(format!("leveler-schema-{}", crate::tools::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        // `args` must be an array of strings; a string fails schema validation.
+        let err = reg
+            .execute(
+                "run_command",
+                serde_json::json!({"program": "echo", "args": "hi"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a `run_command` call missing `program` must reach the tool and
+    /// return actionable guidance (steer to `shell_command`), not be rejected
+    /// upstream by schema validation with a bare "program is a required field".
+    /// This exercises the full registry path (schema validation → dispatch),
+    /// unlike the unit test that calls `RunCommandTool::execute` directly.
+    /// The production gate for the shape a real session produced: a correct
+    /// args array with no executable. The refusal must lead with the repair
+    /// (supply `program`), not steer to a different tool.
+    #[tokio::test]
+    async fn run_command_args_only_gets_targeted_guidance_through_the_registry() {
+        let reg = default_registry();
+        let dir =
+            std::env::temp_dir().join(format!("leveler-argsonly-{}", crate::tools::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = reg
+            .execute(
+                "run_command",
+                serde_json::json!({"args": ["test", "./...", "-count=1"], "timeout_seconds": 120}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a friendly tool error, not a schema rejection");
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("missing `program`"),
+            "the repair leads: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("\"program\": \"go\""),
+            "a concrete corrected call is shown: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_command_missing_program_steers_to_shell_command() {
+        let reg = default_registry();
+        let dir =
+            std::env::temp_dir().join(format!("leveler-noprog-{}", crate::tools::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = reg
+            .execute(
+                "run_command",
+                serde_json::json!({"cmd": "./admin-server --port 3001"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("missing program should be a friendly tool error, not a schema rejection");
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("shell_command") && out.content.contains("program"),
+            "must steer to shell_command and name program: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_returns_registered_tool() {
+        let reg = default_registry();
+        assert!(reg.get("read_file").is_some());
+        assert!(reg.get("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn register_replaces_existing_tool() {
+        let mut reg = ToolRegistry::new();
+        let tool = Arc::new(crate::tools::ReadFileTool);
+        reg.register(tool.clone());
+        assert!(reg.get("read_file").is_some());
+        reg.register(tool);
+        assert_eq!(reg.definitions().len(), 1);
+    }
+
+    /// The agent loop classifies calls through these two predicates instead of
+    /// matching tool names, so this registry is the single source of truth for
+    /// "does this call edit files / run a command". A built-in that silently
+    /// stops declaring its class would quietly drop out of the file and command
+    /// budgets, so pin both directions.
+    #[test]
+    fn builtin_tools_declare_their_effect_class() {
+        let reg = default_registry();
+        for name in ["apply_patch", "write_file"] {
+            assert!(reg.mutates_files(name), "{name} must declare mutates_files");
+            assert!(!reg.runs_command(name), "{name} does not run a command");
+        }
+        for name in ["run_command", "shell_command"] {
+            assert!(reg.runs_command(name), "{name} must declare runs_command");
+            assert!(
+                !reg.mutates_files(name),
+                "{name} does not edit files itself"
+            );
+        }
+        for name in ["read_file", "grep", "list_files", "update_plan"] {
+            assert!(!reg.mutates_files(name), "{name} must not claim mutation");
+            assert!(!reg.runs_command(name), "{name} must not claim command");
+        }
+        // An unroutable name is refused before it can do anything.
+        assert!(!reg.mutates_files("no_such_tool"));
+        assert!(!reg.runs_command("no_such_tool"));
+    }
+}
+
+#[cfg(test)]
+mod dynamic_metadata_tests {
+    use super::*;
+    /// A tool whose name/description exist only at runtime — the MCP /
+    /// extension shape. Its metadata must be ownable without leaking.
+    struct DynamicTool {
+        name: String,
+        description: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DynamicTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.description
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Safe
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("dynamic-ok"))
+        }
+    }
+
+    fn dynamic(name: &str) -> Arc<dyn Tool> {
+        Arc::new(DynamicTool {
+            name: name.to_string(),
+            description: format!("runtime-discovered tool {name}"),
+        })
+    }
+
+    #[test]
+    fn runtime_created_tool_registers_looks_up_and_defines() {
+        let mut registry = ToolRegistry::new();
+        registry.register(dynamic("mcp__demo__inspect"));
+        assert!(registry.get("mcp__demo__inspect").is_some());
+        let defs = registry.definitions();
+        let def = defs
+            .iter()
+            .find(|d| d.name == "mcp__demo__inspect")
+            .expect("definition generated");
+        assert!(def.description.contains("runtime-discovered"));
+    }
+
+    #[test]
+    fn dropped_and_recreated_dynamic_tools_do_not_accumulate() {
+        // Reconnect shape: registries built repeatedly with fresh metadata
+        // must not require the strings to live forever.
+        for round in 0..3 {
+            let mut registry = ToolRegistry::new();
+            registry.register(dynamic(&format!("mcp__srv__tool{round}")));
+            assert!(registry.get(&format!("mcp__srv__tool{round}")).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_executes_through_the_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(dynamic("mcp__demo__run"));
+        let dir = std::env::temp_dir().join(format!("leveler-dyn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let context = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = registry
+            .execute(
+                "mcp__demo__run",
+                serde_json::json!({}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("dynamic tool executes");
+        assert!(out.content.contains("dynamic-ok"));
+    }
+}
+
+#[cfg(test)]
+mod schema_budget {
+    /// The advertised tool schema is a FIXED cost on every model request of a
+    /// session — it sits in the cached prefix, so it is cheap per request, but
+    /// it is paid uncached once per session and it is pure prefix growth.
+    /// Measured 2026-09-09: core 13.1 KB / 14 tools, full 28.8 KB / 43 tools.
+    ///
+    /// These bounds are a tripwire, not a target: a tool whose schema doubles
+    /// the surface should be a decision, not a surprise.
+    #[test]
+    fn the_advertised_tool_surface_stays_within_its_measured_budget() {
+        let bytes = |reg: &super::ToolRegistry| {
+            reg.definitions()
+                .iter()
+                .map(|d| serde_json::to_string(d).expect("schema serializes").len())
+                .sum::<usize>()
+        };
+        let core = super::core_surface(&crate::tools::test_capabilities());
+        let full = super::default_registry();
+        let (core_bytes, full_bytes) = (bytes(&core), bytes(&full));
+        assert!(
+            core_bytes < 20_000,
+            "core tool schema grew to {core_bytes} bytes over {} tools",
+            core.definitions().len()
+        );
+        assert!(
+            full_bytes < 40_000,
+            "full tool schema grew to {full_bytes} bytes over {} tools",
+            full.definitions().len()
+        );
+        assert!(
+            core_bytes < full_bytes,
+            "core must stay a subset of full: {core_bytes} vs {full_bytes}"
+        );
+    }
+}

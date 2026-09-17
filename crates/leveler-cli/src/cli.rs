@@ -1,0 +1,1367 @@
+//! Command-line argument definitions (clap derive).
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+/// CodeLeveler — a model-agnostic coding agent CLI.
+#[derive(Debug, Parser)]
+// Build provenance IS the version string: an official binary must be traceable
+// to a commit, and one built from a dirty tree must say so rather than let a
+// reader assume it IS that commit. Handing it to clap rather than intercepting
+// `--version` before clap runs is what keeps `leveler upgrade --version <TAG>`
+// working — clap knows that flag belongs to the subcommand; a scan of the raw
+// argument list does not.
+#[command(name = "leveler", version = crate::build_provenance_static(), about, long_about = None)]
+pub struct Cli {
+    /// Repository root (defaults to the current directory).
+    #[arg(long, global = true)]
+    pub repo: Option<PathBuf>,
+
+    /// Config bundle directory (defaults to $LEVELER_CONFIG_DIR or <repo>/configs).
+    #[arg(long, global = true)]
+    pub config_dir: Option<PathBuf>,
+
+    /// Increase log verbosity (-v, -vv).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Subcommand to run. With no subcommand, `leveler` opens the interactive
+    /// terminal UI (equivalent to `leveler tui`).
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Open the interactive terminal UI (the default with no subcommand).
+    Tui {
+        /// Model reference (defaults to the configured default).
+        #[arg(long)]
+        model: Option<String>,
+        /// Permission profile: request-approval | assisted | full-access.
+        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
+        mode: RunMode,
+        /// Approve risky actions automatically (no approval overlay). Required
+        /// for unattended PTY/expect driving of the interactive UI.
+        #[arg(long)]
+        auto_approve: bool,
+        /// Force the runtime to stay in the TUI process instead of reusing an
+        /// existing `leveler serve` daemon.
+        #[arg(long)]
+        in_process: bool,
+        /// Override the per-repository Unix socket path.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        /// Reopen an existing session (continue chat history) instead of creating
+        /// a new one. Prefer this over `leveler resume` for interactive TUI chats.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+
+    /// Run the long-lived local runtime daemon for this repository.
+    Serve {
+        /// Default model for newly created sessions.
+        #[arg(long)]
+        model: Option<String>,
+        /// Default permission profile: request-approval | assisted | full-access.
+        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
+        mode: RunMode,
+        /// Auto-approve risky actions for sessions owned by this daemon.
+        #[arg(long)]
+        auto_approve: bool,
+        /// Deny network access to run_command processes.
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
+        /// Override the per-repository Unix socket path.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        /// Also expose the daemon over loopback TCP at this address (e.g.
+        /// `127.0.0.1:7878`) for external / WebUI clients. The per-repo Unix
+        /// socket is still bound (ownership lock + token-less local clients).
+        /// The bearer token comes from LEVELER_DAEMON_TOKEN when set, else a
+        /// fresh one is generated with the OS CSPRNG and printed once.
+        #[arg(long, value_name = "ADDR")]
+        tcp: Option<SocketAddr>,
+        /// Write a machine-readable readiness JSON ({pid, socket, addr, token})
+        /// to this path once bound. Used by the supervising WebUI aggregator.
+        #[arg(long, value_name = "PATH")]
+        ready_json: Option<PathBuf>,
+    },
+
+    /// Diagnose the environment, tooling, and configuration.
+    Doctor,
+
+    /// Start the browser WebUI server for this repository.
+    Web {
+        /// Bind address (loopback only; defaults to an ephemeral port).
+        #[arg(long, default_value = "127.0.0.1:0")]
+        addr: SocketAddr,
+        /// Connect to an existing `leveler serve --tcp` daemon at this address
+        /// instead of running the runtime in-process.
+        #[arg(long, value_name = "ADDR")]
+        connect: Option<SocketAddr>,
+        /// Bearer token. Required with --connect (the daemon's token, reused as
+        /// the WebUI token); without --connect a fresh token is generated.
+        #[arg(long)]
+        token: Option<String>,
+        /// Default model for newly created sessions (in-process runtime only).
+        #[arg(long)]
+        model: Option<String>,
+        /// Default permission profile: request-approval | assisted | full-access.
+        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
+        mode: RunMode,
+        /// Auto-approve risky actions for sessions owned by this runtime
+        /// (in-process runtime only).
+        #[arg(long)]
+        auto_approve: bool,
+        /// Deny network access to run_command processes (in-process runtime only).
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
+    },
+
+    /// Manage project-scoped durable memory (approved conclusions / preferences).
+    #[command(subcommand)]
+    Memory(MemoryCommand),
+
+    /// Manage durable permission rules (`.leveler/permissions.yaml`).
+    #[command(subcommand)]
+    Permissions(PermissionsCommand),
+    /// Trust this repository's in-repo `.leveler/hooks.yaml` /
+    /// `.leveler/permissions.yaml`. Both are ignored until trusted, and trust
+    /// is keyed to the file contents — editing one drops it back to untrusted.
+    #[command(subcommand_negates_reqs = true)]
+    Trust {
+        #[command(subcommand)]
+        command: Option<TrustCommand>,
+    },
+
+    /// Manage remote control from a paired mobile device (provisional).
+    #[command(subcommand)]
+    Remote(RemoteCommand),
+
+    /// Inspect configuration.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
+    /// Inspect TUI semantic themes (preview palettes; no live session).
+    #[command(subcommand)]
+    Theme(ThemeCommand),
+
+    /// Manage configured models.
+    #[command(subcommand)]
+    Models(ModelsCommand),
+
+    /// List and inspect agent definitions (project, user, built-in).
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+
+    /// Probe a model's text and streaming behavior.
+    Model(ModelCommand),
+
+    /// Manage sessions.
+    #[command(subcommand)]
+    Sessions(SessionsCommand),
+
+    /// Inspect durable runtime observation (EventLog + model requests).
+    Trace {
+        /// Session id (defaults to the most recently updated session).
+        session: Option<String>,
+        /// Center the event window on this sequence.
+        #[arg(long)]
+        seq: Option<i64>,
+        #[arg(long, default_value_t = 20)]
+        before: u32,
+        #[arg(long, default_value_t = 80)]
+        after: u32,
+        /// Machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run an agent task: the model uses tools to investigate and edit the repo.
+    Run {
+        /// The natural-language task. Omit only with `--resume`.
+        task: Option<String>,
+        /// Resume an interrupted non-interactive run by session id (headless,
+        /// streams events). For interactive chat use `leveler resume <id>`.
+        #[arg(long, value_name = "ID")]
+        resume: Option<String>,
+        /// Model reference (defaults to the only configured model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Permission profile: request-approval | assisted | full-access.
+        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
+        mode: RunMode,
+        /// Approve risky actions automatically (no prompts).
+        #[arg(long)]
+        auto_approve: bool,
+        /// With `--resume`, acknowledge a crash-recovery stop: you have
+        /// inspected the workspace; close the interrupted tool call(s) and
+        /// proceed. Ignored without `--resume`.
+        #[arg(long)]
+        confirm_recovery: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
+        /// After a successful run, commit the changes.
+        #[arg(long)]
+        commit: bool,
+        /// Branch to create for the change (implies a dedicated branch).
+        #[arg(long)]
+        branch: Option<String>,
+        /// After a successful run, push the branch (implies --commit).
+        #[arg(long)]
+        push: bool,
+        /// After a successful run, open a pull request via `gh` (implies --push).
+        #[arg(long)]
+        pr: bool,
+        /// Base branch for the pull request.
+        #[arg(long)]
+        pr_base: Option<String>,
+        /// Deny network access to run_command processes (OS sandbox).
+        #[arg(long = "deny-network", alias = "sandbox")]
+        deny_network: bool,
+        /// Work profile: economy | balanced (default balanced).
+        #[arg(long, default_value = "balanced")]
+        work_mode: String,
+        /// Task round budget for this run: default 200, a hard stop
+        /// (`budget_limited`) at N model rounds; `0` runs until the goal is
+        /// resolved with no round budget.
+        #[arg(long, value_name = "N")]
+        max_rounds: Option<u32>,
+        /// Collaboration axis: chat | plan | goal.
+        /// Default **chat** (ordinary turns). Use `goal` for
+        /// long runs that must call update_goal to finish.
+        #[arg(long, default_value = "chat")]
+        collaboration: String,
+        /// Run N agents concurrently in isolated worktrees and integrate the
+        /// results (>=2 enables parallel multi-agent editing).
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
+    },
+
+    /// Run the evaluation harness.
+    #[command(subcommand)]
+    Eval(EvalCommand),
+
+    /// Query a language server (LSP) for a file's symbols and diagnostics.
+    Lsp {
+        /// Source file to inspect (relative to the repo).
+        file: PathBuf,
+        /// Also wait for and print diagnostics.
+        #[arg(long)]
+        diagnostics: bool,
+    },
+
+    /// Manage MCP (Model Context Protocol) servers in the global config.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+
+    /// Reopen a session in the interactive TUI. With no id, lists recent
+    /// sessions to pick from. (Headless task recovery moved to `run --resume`.)
+    Resume {
+        /// Session id to reopen. Omit to list recent sessions.
+        id: Option<String>,
+    },
+
+    /// Create the global config (~/.leveler/config.toml) interactively.
+    /// Refuses to overwrite an existing config; prints a template when not a TTY.
+    Init,
+
+    /// Store an API key for a provider in `~/.leveler/config.toml`.
+    ///
+    /// Prompts for the key without echoing it and tightens the config to
+    /// owner-only. An exported `*_API_KEY` still takes precedence, so this
+    /// never silently shadows an environment variable.
+    Login {
+        /// Provider id. Omit to pick from the configured providers.
+        provider: Option<String>,
+    },
+
+    /// Remove a provider's stored API key (the `api_key_env` fallback stays).
+    Logout {
+        /// Provider id.
+        provider: String,
+    },
+
+    /// Print a shell completion script on stdout.
+    ///
+    /// Source it from your shell rc, e.g.
+    /// `leveler completions zsh > ~/.zfunc/_leveler` (with `~/.zfunc` on
+    /// `$fpath`), or `eval "$(leveler completions bash)"`.
+    Completions {
+        /// Target shell.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
+
+    /// Check for or install a newer CodeLeveler release from GitHub.
+    ///
+    /// Prefers a matching prebuilt asset for this host. When no asset is
+    /// published, falls back to `cargo install --git … --locked --force`.
+    /// Override the repository with `LEVELER_GITHUB_REPO=owner/name`.
+    Upgrade {
+        /// Only report whether an update is available (exit 2 if yes).
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when already on the requested version.
+        #[arg(long)]
+        force: bool,
+        /// Install a specific release tag (`0.1.0` or `v0.1.0`).
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+    },
+}
+
+/// Durable permission rules (`~/.leveler/permissions.yaml` + project
+/// `.leveler/permissions.yaml`). Written by interactive **Always** approvals
+/// and by hand-editing the YAML files; evaluated before the permission profile.
+#[derive(Debug, Subcommand)]
+pub enum PermissionsCommand {
+    /// List global and project permission rules.
+    List,
+    /// Remove all project rules (delete `<repo>/.leveler/permissions.yaml`).
+    /// Global `~/.leveler/permissions.yaml` is left untouched.
+    Clear,
+}
+
+/// In-repo config trust (`<repo>/.leveler/hooks.yaml`, `permissions.yaml`).
+///
+/// With no subcommand, `leveler trust` lists what is untrusted and asks to
+/// confirm — the same as `leveler trust allow`.
+/// Remote control surface: enable the host, enroll it with a relay, pair a
+/// phone, and run the agent that serves it.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Create this machine's remote identity and point it at a relay.
+    Enable {
+        /// Base URL of the relay, e.g. https://relay.example
+        #[arg(long, value_name = "URL")]
+        relay_url: String,
+        /// What the phone shows for this machine. Defaults to the hostname.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Register this machine's public key with the relay.
+    ///
+    /// Needs the relay operator's enrollment secret, read from
+    /// `LEVELER_RELAY_ENROLLMENT_SECRET` or stdin — never from the command
+    /// line, where it would land in shell history and the process table.
+    Enroll,
+    /// Start a pairing and print the payload a phone scans or pastes.
+    Pair {
+        /// `interactive` (default) or `observe` for a read-only device.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
+    /// Show the device waiting to pair, without deciding anything.
+    ///
+    /// Separate from `confirm` because looking and accepting are different
+    /// acts: a script (or a careful person) needs to see who is waiting
+    /// without that glance counting as a yes.
+    Pending,
+    /// Accept or reject the device waiting to pair, after comparing its
+    /// fingerprint with the one on the phone's screen.
+    Confirm {
+        /// Reject instead of accepting.
+        #[arg(long)]
+        reject: bool,
+        /// Skip the interactive prompt. Refuses to run without a terminal
+        /// otherwise, because accepting is a decision, not a default.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List the projects a paired phone can reach, with their daemon status.
+    Projects,
+    /// Run the remote agent: connect out to the relay and serve paired devices.
+    Agent,
+    /// Show whether remote control is configured on this machine.
+    Status,
+    /// List paired devices with the fingerprint the user confirmed.
+    Devices,
+    /// Withdraw trust in a device. Takes effect on its next frame.
+    Revoke {
+        /// The device id, as shown by `leveler remote devices`.
+        device_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustCommand {
+    /// Trust the current contents of this repository's gated files.
+    Allow {
+        /// Skip the confirmation prompt (required when stdin is not a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show what is trusted, untrusted, or absent for this repository.
+    Show,
+    /// Drop every trust record for this repository.
+    Revoke,
+}
+
+/// Project memory commands (`~/.leveler/projects/<repo>/memory/`).
+///
+/// Agent `remember`/`forget` still require interactive approval (K36). These
+/// CLI commands are user-authoritative: the human is writing/archiving.
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// List active memories.
+    List {
+        /// Also list archived (forgotten) entries.
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Lexical search over active memories.
+    Search {
+        /// Query string (BM25 over title/body/tags).
+        query: String,
+        /// Max hits.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show one active memory by id (or title slug).
+    Show {
+        /// Memory id.
+        id: String,
+    },
+    /// Archive (soft-delete) an active memory by id.
+    Forget {
+        /// Memory id.
+        id: String,
+    },
+    /// Create a new active memory (user-authoritative write; no model round).
+    ///
+    /// Never overwrites: saving the same title again with different text keeps
+    /// both, so nothing you wrote earlier disappears.
+    Remember {
+        /// Short title.
+        title: String,
+        /// Body text.
+        body: String,
+        /// How it reaches the model. `preference` is injected into every turn;
+        /// `decision` and `note` are found by relevance or by title.
+        #[arg(long, value_enum, default_value_t = MemoryKindArg::Note)]
+        kind: MemoryKindArg,
+        /// Optional tags (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List pending memory candidates (awaiting accept/reject).
+    Pending,
+    /// Accept a pending candidate into active durable memory (user consent).
+    Accept {
+        /// Pending candidate id.
+        id: String,
+    },
+    /// Reject a pending candidate and suppress re-prompt for that signal.
+    Reject {
+        /// Pending candidate id.
+        id: String,
+    },
+    /// Extract candidates from text (no active write).
+    Propose {
+        /// Explicit user text (e.g. "记住：用 pnpm").
+        #[arg(long)]
+        text: String,
+    },
+}
+
+/// The `--kind` values `leveler memory remember` accepts.
+///
+/// `note` is the CLI default deliberately: a scripted or ad-hoc write should
+/// not silently become something injected into every future turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryKindArg {
+    Preference,
+    Decision,
+    Note,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// List configured MCP servers.
+    List,
+
+    /// Add a stdio MCP server: `leveler mcp add <name> [--env K=V]... -- <command> [args...]`.
+    ///
+    /// `--env` stores environment **name references** only (never secret values).
+    /// Use `KEY=KEY`, `KEY=`, or `KEY=$OTHER_ENV`; cleartext tokens are rejected.
+    Add {
+        /// Name for the server (its tools appear as `mcp__<name>__*`).
+        name: String,
+        /// Env var name references to forward into the server process (repeatable).
+        /// Value must be an env **name** (`KEY=KEY`, `KEY=`, or `KEY=$OTHER`), not a secret.
+        #[arg(long, value_parser = parse_env_pair, value_name = "KEY=VALUE")]
+        env: Vec<(String, String)>,
+        /// The launch command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+
+    /// Remove an MCP server by name.
+    Remove {
+        /// The server name to remove.
+        name: String,
+    },
+}
+
+/// Parse a `KEY=VALUE` pair for `--env`.
+///
+/// On failure, do not echo the raw input (may contain a pasted secret).
+fn parse_env_pair(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(
+            "expected KEY=VALUE (value is an env name reference such as KEY= or KEY=$OTHER, not a secret)"
+                .into(),
+        ),
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvalCommand {
+    /// Run all cases with one model and report metrics.
+    ///
+    /// Capability path: `--cases evals/cases/smoke` (default).
+    /// Framework path: `--suite adoption --experiment m3-baseline`.
+    Run {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider prefix for framework runs (`provider/model` when model has no `/`).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Eval framework suite (`adoption` | `capability` | `safety` | `multi_agent`).
+        #[arg(long)]
+        suite: Option<String>,
+        /// Experiment id under `evals/configs/<suite>/` (requires `--suite`).
+        #[arg(long)]
+        experiment: Option<String>,
+        /// Experiment arm for `--suite multi_agent`.
+        /// MA-VALUE-001: `single` | `multi` (`agents.delegation`).
+        /// MA-VALUE-REVIEWER-PILOT: `self` | `reviewer` (`agents.independent_review`).
+        /// Isolated home only. Does not change spawn runtime or reviewer permissions.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Report directory for framework runs (`evals/reports/<suite>/<experiment>`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/smoke")]
+        cases: PathBuf,
+        /// Accepted for backward compatibility; eval always uses the direct
+        /// tool loop (the multi-phase orchestrate path was removed).
+        #[arg(long)]
+        direct: bool,
+        /// Ablation: run WITHOUT the post-edit verification gate, so the
+        /// model's own "done" is final. The case still passes or fails on the
+        /// independent `expect` command.
+        #[arg(long)]
+        no_verify_gate: bool,
+        /// Repeat every case to expose run-to-run variance (`--runs` is the same flag).
+        #[arg(long, visible_alias = "runs", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Write a durable JSON baseline (report + meta) to this path.
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Run cases with two models and report the capability gap.
+    Compare {
+        /// First model.
+        model_a: String,
+        /// Second model.
+        model_b: String,
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/hard")]
+        cases: PathBuf,
+        /// Repeat every case for each model under the same conditions.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Write a durable JSON baseline (both reports + gap + meta) to this path.
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Quick tier (spec §2, L1): the fast pre-commit gate — `evals/cases/smoke`.
+    /// Aim: under 5 minutes, core loop + tools + a simple edit.
+    Quick {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        /// Repeat every case to expose run-to-run variance.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Write a durable JSON baseline (report + score + meta) to this path.
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Daily tier (spec §2, L2): the regression gate — `evals/cases/core` + `evals/cases/hard`.
+    /// Broader debug/feature/refactor/multi-file coverage.
+    Daily {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Release tier (spec §2, L3): the full gate over the default case directories.
+    Release {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Version-over-version trend: read a directory of run baselines and render
+    /// a Markdown quality-trend table + regression flags (spec §6).
+    Trend {
+        /// Directory of baseline JSON files written by `--json-out`
+        /// (e.g. `evals/history`).
+        #[arg(long, default_value = "evals/history")]
+        history: PathBuf,
+        /// Write the report here (e.g. `evals/REGRESSION_REPORT.md`).
+        /// Without it, the report prints to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Single-knob ablation: run the SAME model twice — knob as configured
+    /// (control) vs flipped (ablated) — and report what the knob is worth.
+    /// Run once per model to measure whether the mechanism helps or hurts it.
+    Ablate {
+        /// The resolver input to flip: explicit_plan,
+        /// repeated_read_guard / progress_guards (legacy require_* names accepted).
+        knob: String,
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
+        #[arg(long, default_value = "evals/cases/hard")]
+        cases: PathBuf,
+        /// Accepted for backward compatibility; eval always uses the direct
+        /// tool loop.
+        #[arg(long)]
+        direct: bool,
+        /// Repeat every case under both arms to expose run-to-run variance.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Write a durable JSON baseline (both reports + meta) to this path.
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Minute-scale delegation-adoption observer. Does not change product
+    /// spawn/claim/ownership/settlement behaviour. KEEP is a first-class outcome.
+    #[command(subcommand)]
+    AdoptionMicro(AdoptionMicroCommand),
+}
+
+/// `leveler eval adoption-micro` — EventLog observer over `evals/suites/adoption`.
+#[derive(Debug, Subcommand)]
+pub enum AdoptionMicroCommand {
+    /// Run the decision benchmark (isolated LEVELER_HOME).
+    Run {
+        /// Model id, or name when `--provider` is set.
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider prefix; combined as `provider/model` when model has no `/`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Single task id (default: the full 15-task suite).
+        #[arg(long)]
+        task: Option<String>,
+        /// Filter catalog shape: parallel | boundary | single.
+        #[arg(long)]
+        shape: Option<String>,
+        /// Repeat every selected task.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Unified batch JSON (full schema + compact records).
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+        /// Markdown report path.
+        #[arg(long, value_name = "PATH")]
+        md_out: Option<PathBuf>,
+    },
+    /// Render a Markdown report from a batch.json produced by `run`.
+    Report {
+        #[arg(long)]
+        batch: PathBuf,
+        #[arg(long)]
+        md: Option<PathBuf>,
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
+}
+
+/// Progress output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable text.
+    Text,
+    /// One JSON object per line (for tools/CI).
+    Jsonl,
+}
+
+/// CLI-facing three-tier permission profile.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+pub enum RunMode {
+    /// 请求批准 — always ask for external edits and network.
+    RequestApproval,
+    /// 替我审批 — default; only risky ops need approval.
+    #[default]
+    Assisted,
+    /// 完全访问 — unrestricted FS + network (use with care).
+    FullAccess,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show the resolved configuration (secrets are never printed).
+    Show,
+}
+
+/// TUI theme inspection.
+#[derive(Debug, Subcommand)]
+pub enum ThemeCommand {
+    /// Print a semantic-token preview. Omit the id to show dark, light, and
+    /// high-contrast.
+    Preview {
+        /// Palette: auto | dark | light | high-contrast
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentsCommand {
+    /// List the agents this project resolves, with status and shadowing.
+    List {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one agent's full definition.
+    Show {
+        /// Agent name, e.g. `security-reviewer`.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelsCommand {
+    /// List configured models.
+    List,
+    /// Show a model's profile (capabilities, limits, reasoning).
+    Show {
+        /// Model reference, e.g. `deepseek/deepseek-v4-pro`.
+        model: String,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ModelCommand {
+    #[command(subcommand)]
+    pub command: ModelSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelSubcommand {
+    /// Send a basic text + streaming probe to the model.
+    Probe {
+        /// Model reference, e.g. `deepseek/deepseek-v4-pro`.
+        model: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsCommand {
+    /// List stored sessions.
+    List,
+    /// Show a session by id: its config, turns, token usage and event log.
+    Show {
+        id: String,
+        /// Print the raw session record as JSON instead of the readable view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a session by id.
+    Delete { id: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("args must parse")
+    }
+
+    #[test]
+    fn no_subcommand_defaults_to_tui() {
+        let cli = parse(&["leveler"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.verbose, 0);
+    }
+
+    #[test]
+    fn run_parses_task_and_workflow_flags() {
+        let cli = parse(&[
+            "leveler",
+            "run",
+            "fix the bug",
+            "--model",
+            "deepseek/v4",
+            "--commit",
+            "--push",
+            "--pr",
+            "--branch",
+            "fix/bug",
+            "--parallel",
+            "3",
+        ]);
+        match cli.command {
+            Some(Command::Run {
+                task,
+                model,
+                commit,
+                push,
+                pr,
+                branch,
+                parallel,
+                ..
+            }) => {
+                assert_eq!(task.as_deref(), Some("fix the bug"));
+                assert_eq!(model.as_deref(), Some("deepseek/v4"));
+                assert!(commit && push && pr);
+                assert_eq!(branch.as_deref(), Some("fix/bug"));
+                assert_eq!(parallel, 3);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_flags_apply_after_subcommand() {
+        let cli = parse(&["leveler", "doctor", "--repo", "/tmp/x", "-vv"]);
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+        assert_eq!(cli.repo.as_deref(), Some(std::path::Path::new("/tmp/x")));
+        assert_eq!(cli.verbose, 2);
+    }
+
+    #[test]
+    fn run_parses_collaboration_axis() {
+        let cli = parse(&[
+            "leveler",
+            "run",
+            "plan the feature",
+            "--collaboration",
+            "plan",
+            "--work-mode",
+            "balanced",
+        ]);
+        match cli.command {
+            Some(Command::Run {
+                collaboration,
+                work_mode,
+                ..
+            }) => {
+                assert_eq!(collaboration, "plan");
+                assert_eq!(work_mode, "balanced");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_max_rounds() {
+        let cli = Cli::parse_from(["leveler", "run", "fix it", "--max-rounds", "40"]);
+        match cli.command {
+            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, Some(40)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let cli = Cli::parse_from(["leveler", "run", "fix it"]);
+        match cli.command {
+            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_list_parses() {
+        let cli = parse(&["leveler", "memory", "list", "--archived"]);
+        match cli.command {
+            Some(Command::Memory(MemoryCommand::List { archived })) => assert!(archived),
+            other => panic!("expected Memory::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_search_parses() {
+        let cli = parse(&["leveler", "memory", "search", "workspace", "--limit", "3"]);
+        match cli.command {
+            Some(Command::Memory(MemoryCommand::Search { query, limit })) => {
+                assert_eq!(query, "workspace");
+                assert_eq!(limit, 3);
+            }
+            other => panic!("expected Memory::Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_takes_command_after_double_dash_and_env_pairs() {
+        let cli = parse(&[
+            "leveler",
+            "mcp",
+            "add",
+            "fs",
+            "--env",
+            "TOKEN=abc",
+            "--",
+            "npx",
+            "-y",
+            "server",
+        ]);
+        match cli.command {
+            Some(Command::Mcp(McpCommand::Add { name, env, command })) => {
+                assert_eq!(name, "fs");
+                assert_eq!(env, vec![("TOKEN".to_string(), "abc".to_string())]);
+                assert_eq!(command, vec!["npx", "-y", "server"]);
+            }
+            other => panic!("expected Mcp Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_rejects_malformed_env() {
+        let err = Cli::try_parse_from([
+            "leveler",
+            "mcp",
+            "add",
+            "fs",
+            "--env",
+            "no-equals",
+            "--",
+            "x",
+        ]);
+        assert!(err.is_err(), "KEY=VALUE validation must reject `no-equals`");
+    }
+
+    #[test]
+    fn run_rejects_unknown_mode() {
+        let err = Cli::try_parse_from(["leveler", "run", "t", "--permission", "nope"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn plan_and_discuss_are_not_product_subcommands() {
+        // Multi-phase orchestrate stack removed: these must not parse as top-level
+        // commands (they used to be frozen product surface in STABILITY drafts).
+        assert!(
+            Cli::try_parse_from(["leveler", "plan", "do something"]).is_err(),
+            "plan must not be a subcommand"
+        );
+        assert!(
+            Cli::try_parse_from(["leveler", "discuss", "topic"]).is_err(),
+            "discuss must not be a subcommand"
+        );
+    }
+
+    #[test]
+    fn eval_run_parses_json_out_and_direct() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "run",
+            "--model",
+            "deepseek/v4",
+            "--cases",
+            "evals/cases/smoke",
+            "--direct",
+            "--repetitions",
+            "3",
+            "--json-out",
+            "evals/baselines/run.json",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run {
+                model,
+                cases,
+                direct,
+                no_verify_gate,
+                repetitions,
+                json_out,
+                suite,
+                experiment,
+                ..
+            })) => {
+                assert!(suite.is_none());
+                assert!(experiment.is_none());
+                assert!(!no_verify_gate, "the ablation is opt-in");
+                assert_eq!(model.as_deref(), Some("deepseek/v4"));
+                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
+                assert!(direct);
+                assert_eq!(repetitions, 3);
+                assert_eq!(
+                    json_out.as_deref(),
+                    Some(std::path::Path::new("evals/baselines/run.json"))
+                );
+            }
+            other => panic!("expected Eval Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_compare_parses_json_out() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "compare",
+            "model-a",
+            "model-b",
+            "--repetitions",
+            "2",
+            "--json-out",
+            "out.json",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Compare {
+                model_a,
+                model_b,
+                cases,
+                repetitions,
+                json_out,
+            })) => {
+                assert_eq!(model_a, "model-a");
+                assert_eq!(model_b, "model-b");
+                assert_eq!(cases, PathBuf::from("evals/cases/hard"));
+                assert_eq!(repetitions, 2);
+                assert_eq!(json_out.as_deref(), Some(std::path::Path::new("out.json")));
+            }
+            other => panic!("expected Eval Compare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_run_parses_suite_experiment_runs_and_output() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "run",
+            "--suite",
+            "adoption",
+            "--experiment",
+            "m3-baseline",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "--runs",
+            "3",
+            "--output",
+            "evals/reports/adoption/m3-baseline",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run {
+                suite,
+                experiment,
+                provider,
+                model,
+                repetitions,
+                output,
+                ..
+            })) => {
+                assert_eq!(suite.as_deref(), Some("adoption"));
+                assert_eq!(experiment.as_deref(), Some("m3-baseline"));
+                assert_eq!(provider.as_deref(), Some("deepseek"));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(repetitions, 3);
+                assert_eq!(
+                    output.as_deref(),
+                    Some(std::path::Path::new("evals/reports/adoption/m3-baseline"))
+                );
+            }
+            other => panic!("expected Eval Run suite mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_run_parses_multi_agent_mode() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "run",
+            "--suite",
+            "multi_agent",
+            "--experiment",
+            "MA-VALUE-001",
+            "--mode",
+            "single",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run {
+                suite,
+                experiment,
+                mode,
+                ..
+            })) => {
+                assert_eq!(suite.as_deref(), Some("multi_agent"));
+                assert_eq!(experiment.as_deref(), Some("MA-VALUE-001"));
+                assert_eq!(mode.as_deref(), Some("single"));
+            }
+            other => panic!("expected Eval Run multi_agent mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_adoption_micro_run_parses_model_task_provider() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "adoption-micro",
+            "run",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "--task",
+            "a01-independent-modules",
+            "--shape",
+            "parallel",
+            "--repetitions",
+            "2",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::AdoptionMicro(AdoptionMicroCommand::Run {
+                model,
+                provider,
+                task,
+                shape,
+                repetitions,
+                json_out,
+                md_out,
+            }))) => {
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(provider.as_deref(), Some("deepseek"));
+                assert_eq!(task.as_deref(), Some("a01-independent-modules"));
+                assert_eq!(shape.as_deref(), Some("parallel"));
+                assert_eq!(repetitions, 2);
+                assert!(json_out.is_none());
+                assert!(md_out.is_none());
+            }
+            other => panic!("expected AdoptionMicro Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_run_defaults_to_smoke_suite() {
+        let cli = parse(&["leveler", "eval", "run"]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run { cases, direct, .. })) => {
+                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
+                assert!(!direct);
+            }
+            other => panic!("expected Eval Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_parses_auto_approve_for_unattended_interactive() {
+        let cli = parse(&[
+            "leveler",
+            "tui",
+            "--model",
+            "deepseek/v4",
+            "--permission",
+            "assisted",
+            "--auto-approve",
+            "--in-process",
+        ]);
+        match cli.command {
+            Some(Command::Tui {
+                model,
+                mode,
+                auto_approve,
+                in_process,
+                socket,
+                session,
+            }) => {
+                assert_eq!(model.as_deref(), Some("deepseek/v4"));
+                assert!(matches!(mode, RunMode::Assisted));
+                assert!(auto_approve);
+                assert!(in_process);
+                assert!(socket.is_none());
+                assert!(session.is_none());
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_local_runtime_options() {
+        let cli = parse(&[
+            "leveler",
+            "serve",
+            "--model",
+            "deepseek/v4",
+            "--permission",
+            "full-access",
+            "--deny-network",
+            "--socket",
+            "/tmp/leveler.sock",
+        ]);
+        match cli.command {
+            Some(Command::Serve {
+                model,
+                mode,
+                auto_approve,
+                deny_network,
+                socket,
+                tcp,
+                ready_json,
+            }) => {
+                assert_eq!(model.as_deref(), Some("deepseek/v4"));
+                assert!(matches!(mode, RunMode::FullAccess));
+                assert!(!auto_approve);
+                assert!(deny_network);
+                assert_eq!(socket, Some(PathBuf::from("/tmp/leveler.sock")));
+                assert!(tcp.is_none(), "no --tcp given → Unix-only daemon");
+                assert!(ready_json.is_none());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    /// PR 6: the flag says what it does. The old spelling keeps working for
+    /// scripts that still pass it.
+    #[test]
+    fn deny_network_flag_and_its_legacy_sandbox_alias_both_parse() {
+        for flag in ["--deny-network", "--sandbox"] {
+            let cli = parse(&["leveler", "run", "do it", flag]);
+            match cli.command {
+                Some(Command::Run { deny_network, .. }) => assert!(deny_network, "{flag}"),
+                other => panic!("expected Run, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_parses_tcp_and_ready_json() {
+        let cli = parse(&[
+            "leveler",
+            "serve",
+            "--tcp",
+            "127.0.0.1:0",
+            "--ready-json",
+            "/tmp/leveler-ready.json",
+        ]);
+        match cli.command {
+            Some(Command::Serve {
+                tcp, ready_json, ..
+            }) => {
+                assert_eq!(tcp, Some("127.0.0.1:0".parse().unwrap()));
+                assert_eq!(ready_json, Some(PathBuf::from("/tmp/leveler-ready.json")));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_parses_addr_connect_and_token() {
+        let cli = parse(&[
+            "leveler",
+            "web",
+            "--addr",
+            "127.0.0.1:9000",
+            "--connect",
+            "127.0.0.1:7878",
+            "--token",
+            "abc123",
+        ]);
+        match cli.command {
+            Some(Command::Web {
+                addr,
+                connect,
+                token,
+                ..
+            }) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:9000");
+                assert_eq!(
+                    connect.map(|addr| addr.to_string()).as_deref(),
+                    Some("127.0.0.1:7878")
+                );
+                assert_eq!(token.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected Web, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_defaults_to_ephemeral_loopback_in_process() {
+        let cli = parse(&["leveler", "web"]);
+        match cli.command {
+            Some(Command::Web {
+                addr,
+                connect,
+                token,
+                ..
+            }) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:0");
+                assert!(connect.is_none());
+                assert!(token.is_none(), "no --connect → token is generated");
+            }
+            other => panic!("expected Web, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_parses_optional_id() {
+        let with_id = parse(&["leveler", "resume", "sess-42"]);
+        match with_id.command {
+            Some(Command::Resume { id }) => assert_eq!(id.as_deref(), Some("sess-42")),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+        let no_id = parse(&["leveler", "resume"]);
+        match no_id.command {
+            Some(Command::Resume { id }) => assert_eq!(id, None),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_resume_id() {
+        let cli = parse(&["leveler", "run", "--resume", "sess-9"]);
+        match cli.command {
+            Some(Command::Run { task, resume, .. }) => {
+                assert_eq!(task, None);
+                assert_eq!(resume.as_deref(), Some("sess-9"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_parses_session_id() {
+        let cli = parse(&[
+            "leveler",
+            "tui",
+            "--session",
+            "79c12757-d3ad-4899-ab90-52a4997b8832",
+        ]);
+        match cli.command {
+            Some(Command::Tui { session, .. }) => {
+                assert_eq!(
+                    session.as_deref(),
+                    Some("79c12757-d3ad-4899-ab90-52a4997b8832")
+                );
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "leveler-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Agent Skills: discover, load, and author SKILL.md procedural-knowledge packs."
+
+[dependencies]
+leveler-core = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }

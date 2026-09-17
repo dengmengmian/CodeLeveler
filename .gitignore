@@ -1,0 +1,45 @@
+# Build
+/target/
+**/*.rs.bk
+
+# Shared Cargo target for git worktrees (see scripts/shared-target.sh)
+/.codeleveler-target/
+
+# Local runtime state. `.leveler/config.yaml` is tracked: it is this
+# repository's agent verification contract.
+*.db
+*.db-wal
+*.db-shm
+.leveler/state/
+.leveler/sessions.db*
+.leveler/permissions.yaml
+.leveler/hooks.yaml
+.leveler/media/
+.leveler/drafts/
+.local-leveler/
+
+# Local editor / agent scratch
+.omc/
+.pi/
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Packaging output
+dist/
+
+# Execution-test leftovers
+crates/leveler-execution/leveler-ac-*/
+crates/leveler-execution/leveler-tool-cache/
+
+# /export conversation dumps
+leveler-chat-*.md
+
+# Screenshot scratch
+.shots*/

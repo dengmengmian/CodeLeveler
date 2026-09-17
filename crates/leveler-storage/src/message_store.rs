@@ -1,0 +1,494 @@
+//! The `MessageStore` and `ModelRequestStore` ports: the transcript seams the
+//! engine's turn runner depends on.
+//!
+//! `MessageStore` covers exactly what the engine needs — ordered, turn-stamped
+//! append (the durable-transcript barrier behind `TurnSink`) and whole-session
+//! load (`RawTranscript`). App-side conveniences on
+//! [`crate::MessageRepository`] (truncation, checkpoint rewrite, counting, UI
+//! projections) stay concrete.
+//!
+//! `ModelRequestStore` is separate on purpose: a model-request row is
+//! telemetry about one upstream call, not part of the conversation transcript.
+
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
+use leveler_core::{SessionId, Timestamp, TurnId};
+
+use crate::{Database, MessageRepository, ModelRequestRecord, StorageError};
+
+/// The engine-facing transcript persistence contract.
+#[async_trait]
+pub trait MessageStore: Send + Sync {
+    /// Append `payloads` in order, stamped with `turn_id`. An error means the
+    /// transcript is NOT durable — callers must propagate, never continue as
+    /// if it were. Secrets are redacted on write.
+    async fn append_in_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), StorageError>;
+
+    /// The session's full transcript payloads, in append order.
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError>;
+
+    /// Total bytes of the session's stored payloads.
+    ///
+    /// A size the caller can decide on without deserializing anything. The
+    /// token estimator charges at least one token per four bytes for every
+    /// kind of content, so `bytes / 4` is a lower bound on the estimate — a
+    /// caller that only needs to know "is this provably over the fold
+    /// threshold" can answer it with this instead of a full load.
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        Ok(self
+            .load(session_id)
+            .await?
+            .iter()
+            .map(|p| p.len() as u64)
+            .sum())
+    }
+
+    /// Payloads at ordinal `from` and later, in append order.
+    ///
+    /// A caller that already knows a durable watermark — a context snapshot's
+    /// `through_ordinal` — needs only what came after it, and on a long
+    /// session that is the difference between reading the whole transcript
+    /// every turn and reading a handful of rows. The default keeps every
+    /// implementation correct by slicing a full load; a store backed by an
+    /// ordered table overrides it with a query.
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        let all = self.load(session_id).await?;
+        Ok(all.into_iter().skip(from as usize).collect())
+    }
+
+    /// Fenced append: the ownership check and the inserts share one atomic
+    /// persistence boundary. A stale runtime cannot extend the transcript.
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError>;
+
+    /// Ensure a crashed turn's initiating user message exists in the
+    /// transcript. The existence check and optional insert share one fenced
+    /// transaction and use `turn_id` as identity; message text is never used
+    /// for deduplication. Returns `true` when recovery inserted the row.
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError>;
+}
+
+/// The engine-facing model-request telemetry contract.
+#[async_trait]
+pub trait ModelRequestStore: Send + Sync {
+    /// Record one upstream model call.
+    async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError>;
+
+    /// Durable request diagnostics for one session, oldest first.
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError>;
+}
+
+/// The production SQLite adapters.
+#[async_trait]
+impl MessageStore for Database {
+    async fn append_in_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        MessageRepository::new(self)
+            .append_in_turn(session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
+        MessageRepository::new(self).load(session_id).await
+    }
+
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        MessageRepository::new(self)
+            .load_from(session_id, from)
+            .await
+    }
+
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        MessageRepository::new(self).total_bytes(session_id).await
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        MessageRepository::new(self)
+            .append_in_turn_owned(token, session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError> {
+        MessageRepository::new(self)
+            .ensure_initiating_message_owned(token, session_id, turn_id, payload, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl ModelRequestStore for Database {
+    async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
+        crate::ModelRequestRepository::new(self)
+            .insert(record)
+            .await
+    }
+
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        crate::ModelRequestRepository::new(self)
+            .load_for_session(session_id)
+            .await
+    }
+}
+
+/// An in-memory [`MessageStore`] honoring the same contract: ordered append,
+/// per-session isolation, and write-time secret redaction.
+#[derive(Default)]
+pub struct MemoryMessageStore {
+    /// `(session_id, turn_id, payload)` in append order.
+    rows: Mutex<Vec<(String, String, String)>>,
+    ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
+}
+
+impl MemoryMessageStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Couple to the shared ownership authority for fenced appends.
+    pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
+        let _ = self.ownership.set(state);
+        self
+    }
+
+    fn append_records(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+    ) -> Result<(), StorageError> {
+        // Redact+validate every payload BEFORE touching the rows, so a refused
+        // message can never leave a partial batch behind (R007 F2).
+        let redacted: Vec<String> = payloads
+            .iter()
+            .map(|p| {
+                crate::redact_json_payload_for_session(
+                    "session message",
+                    p,
+                    Some(session_id.as_str()),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let mut rows = self.rows.lock().unwrap();
+        for payload in redacted {
+            rows.push((
+                session_id.as_str().to_string(),
+                turn_id.as_str().to_string(),
+                payload,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MessageStore for MemoryMessageStore {
+    async fn append_in_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        _now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.append_records(session_id, turn_id, payloads)
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        _now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory message store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || self.append_records(session_id, turn_id, payloads))
+            .and_then(|r| r.map_err(crate::OwnershipError::Storage))
+    }
+
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        _now: Timestamp,
+    ) -> Result<bool, crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory message store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let redacted = crate::redact_json_payload_for_session(
+                    "session message",
+                    payload,
+                    Some(session_id.as_str()),
+                )?;
+                let mut rows = self.rows.lock().unwrap();
+                if rows
+                    .iter()
+                    .any(|(stored_session, stored_turn, stored_payload)| {
+                        stored_session == session_id.as_str()
+                            && stored_turn == turn_id.as_str()
+                            && serde_json::from_str::<serde_json::Value>(stored_payload)
+                                .ok()
+                                .and_then(|value| value.get("role").cloned())
+                                .and_then(|role| role.as_str().map(str::to_owned))
+                                .as_deref()
+                                == Some("user")
+                    })
+                {
+                    return Ok(false);
+                }
+                rows.push((
+                    session_id.as_str().to_string(),
+                    turn_id.as_str().to_string(),
+                    redacted,
+                ));
+                Ok(true)
+            })
+            .and_then(|r| r.map_err(crate::OwnershipError::Storage))
+    }
+
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _, _)| s == session_id.as_str())
+            .map(|(_, _, p)| p.clone())
+            .collect())
+    }
+
+    async fn load_from(
+        &self,
+        session_id: &SessionId,
+        from: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, _, _)| sid == session_id.as_str())
+            .skip(from as usize)
+            .map(|(_, _, payload)| payload.clone())
+            .collect())
+    }
+
+    /// Summed without cloning a payload: a size question answered as one.
+    async fn total_bytes(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, _, _)| sid == session_id.as_str())
+            .map(|(_, _, payload)| payload.len() as u64)
+            .sum())
+    }
+}
+
+/// An in-memory [`ModelRequestStore`].
+#[derive(Default)]
+pub struct MemoryModelRequestStore {
+    rows: Mutex<Vec<ModelRequestRecord>>,
+}
+
+impl MemoryModelRequestStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Test hook: how many requests were recorded.
+    pub fn len(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+
+    /// Test hook: whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait]
+impl ModelRequestStore for MemoryModelRequestStore {
+    async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
+        self.rows.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SessionRecord, SessionRepository, TurnRepository};
+
+    /// One contract against both implementations: append order is load order,
+    /// sessions are isolated, and secrets never come back out.
+    async fn assert_message_store_contract(
+        store: &dyn MessageStore,
+        session_a: &SessionId,
+        turn_a: &TurnId,
+        session_b: &SessionId,
+        turn_b: &TurnId,
+    ) {
+        assert!(store.load(session_a).await.unwrap().is_empty());
+        store
+            .append_in_turn(
+                session_a,
+                turn_a,
+                &[r#""one""#.to_string(), r#""two""#.to_string()],
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_in_turn(
+                session_b,
+                turn_b,
+                &[r#"{"api_key":"super-secret-value"}"#.to_string()],
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_in_turn(
+                session_a,
+                turn_a,
+                &[r#""three""#.to_string()],
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load(session_a).await.unwrap(),
+            vec![r#""one""#, r#""two""#, r#""three""#],
+            "append order must be load order"
+        );
+        let b = store.load(session_b).await.unwrap();
+        assert_eq!(b.len(), 1, "sessions must be isolated");
+        assert!(
+            !b[0].contains("super-secret-value"),
+            "secrets must be redacted on write: {b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_honors_the_contract() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let a = SessionRecord::new("/repo", "a", "mock/m", leveler_core::now());
+        let b = SessionRecord::new("/repo", "b", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&a).await.unwrap();
+        SessionRepository::new(&db).create(&b).await.unwrap();
+        let session_a = SessionId::new(a.id);
+        let session_b = SessionId::new(b.id);
+        let turn_a = TurnRepository::new(&db)
+            .start(&session_a, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_b = TurnRepository::new(&db)
+            .start(&session_b, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        assert_message_store_contract(
+            &db,
+            &session_a,
+            &TurnId::new(turn_a.id),
+            &session_b,
+            &TurnId::new(turn_b.id),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn memory_store_honors_the_contract() {
+        let store = MemoryMessageStore::new();
+        assert_message_store_contract(
+            &store,
+            &SessionId::generate(),
+            &TurnId::new("t-a"),
+            &SessionId::generate(),
+            &TurnId::new("t-b"),
+        )
+        .await;
+    }
+}
