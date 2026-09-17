@@ -10,7 +10,7 @@ use leveler_core::SessionId;
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{OwnershipStore, TaskOwner, TaskStore, TurnRepository};
+use leveler_storage::{MessageRepository, OwnershipStore, TaskOwner, TaskStore, TurnRepository};
 
 fn isolate_global_config() {
     use std::sync::OnceLock;
@@ -91,6 +91,27 @@ async fn turn_statuses(app: &Application, session: &SessionId) -> Vec<String> {
         .into_iter()
         .map(|turn| turn.status)
         .collect()
+}
+
+/// Wait until `needle` is readable from the session's transcript.
+///
+/// The `running` turn row and the user's message row are two writes by the
+/// SPAWNED turn, not by the `SubmitMessage` that returned: accepting the command
+/// only stages the turn. A read that straddles the second write sees a session
+/// whose transcript is still empty — ubuntu CI run 35239415660 read the sibling
+/// snapshot in exactly that window — so the test has to observe the row before
+/// asserting on it.
+async fn wait_for_message(app: &Application, session: &SessionId, needle: &str) {
+    let db = app.open_database().await.unwrap();
+    let repo = MessageRepository::new(&db);
+    for _ in 0..200 {
+        let payloads = repo.load(session).await.unwrap();
+        if payloads.iter().any(|p| p.contains(needle)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{needle:?} never reached the transcript");
 }
 
 /// Boot A runs a turn. Boot B — another host on the same repository, with the
@@ -180,6 +201,11 @@ async fn live_sibling() -> LiveSibling {
         .await
         .expect("turn accepted");
     assert_eq!(turn_statuses(&app_a, &session).await, ["running"]);
+    // The user's row is written by the spawned turn, not by the command that
+    // returned above: a sibling reading the snapshot before it lands sees an
+    // empty transcript. Settle it once here so every test built on this
+    // fixture compares a session that has stopped moving.
+    wait_for_message(&app_a, &session, "keep working").await;
     let owner_before = task_owner(&app_a, &session).await;
 
     let app_b = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
