@@ -3,6 +3,8 @@
 //! Presentation only. Lifecycle stays on the runtime events already applied
 //! to [`AppState`]. This module does not schedule, cancel, or persist work.
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::i18n::UiText;
 use crate::multi_agent::ChildStatus;
 use crate::render::truncate_display;
@@ -169,9 +171,14 @@ pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usiz
     };
     let prefix = if selected { "→ " } else { "  " };
     let suffix = format!(" {dur} ↗");
-    let budget = width
-        .saturating_sub(prefix.len() + glyph.len() + 1 + suffix.len())
-        .max(8);
+    // Display columns, not UTF-8 bytes: `◌`/`↗`/`→` are 3 bytes and 1 cell.
+    // Byte arithmetic steals four columns and ellipsizes the reason the row
+    // exists to show (Windows CI: `extract` became `extrac…` at width 80).
+    let chrome = UnicodeWidthStr::width(prefix)
+        + UnicodeWidthStr::width(glyph)
+        + UnicodeWidthStr::width(" ")
+        + UnicodeWidthStr::width(suffix.as_str());
+    let budget = width.saturating_sub(chrome).max(8);
     let title = truncate_display(&title, budget);
     format!("{prefix}{glyph} {title}{suffix}")
 }
@@ -397,6 +404,10 @@ mod tests {
         });
         let rows = summaries(&state);
         let line = compact_row(&rows[0], false, 80);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(line.as_str()) <= 80,
+            "compact_row must budget display columns, not bytes: {line}"
+        );
         assert!(!line.contains("/private/tmp"), "{line}");
         assert!(
             line.contains("example-etl"),
