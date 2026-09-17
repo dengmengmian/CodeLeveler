@@ -66,6 +66,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::state::{AppState, WorkbenchFocus};
 
+/// Widest the item's text runs. A queue item is its own surface, so its text
+/// stops at a readable measure instead of stretching toward the terminal's
+/// right edge — which is what pushed the actions away from what they act on.
+const ITEM_TEXT_MAX_WIDTH: usize = 72;
+
+/// Blank cells between the text and its actions. Fixed, so the gap does not
+/// grow with the terminal the way a terminal-right-edge alignment does.
+const ITEM_ACTION_GAP: usize = 3;
+
 /// How many item rows the area may show at terminal height `height`: enough
 /// to act on a few, never enough to crowd out the conversation or composer.
 fn visible_cap(height: u16) -> usize {
@@ -149,14 +158,15 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             muted
         };
         let first_line = item.text.lines().next().unwrap_or("");
-        let text_w = width.saturating_sub(2 + right_w + 2).max(1);
+        let text_w = width
+            .saturating_sub(2 + ITEM_ACTION_GAP + right_w)
+            .clamp(1, ITEM_TEXT_MAX_WIDTH);
         let text = crate::render::truncate_display(first_line, text_w);
         let used = 2 + UnicodeWidthStr::width(text.as_str());
-        let gap = width.saturating_sub(used + right_w).max(1);
         let mut spans = vec![
             Span::styled("› ", marker_style),
             Span::styled(text, Style::default().fg(theme.text.primary)),
-            Span::raw(" ".repeat(gap)),
+            Span::raw(" ".repeat(ITEM_ACTION_GAP)),
         ];
         let mut hit = PendingInputHit {
             row,
@@ -165,7 +175,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             delete: None,
         };
         if actions {
-            let x = area.x + (used + gap) as u16;
+            let x = area.x + (used + ITEM_ACTION_GAP) as u16;
             let send_w = UnicodeWidthStr::width(t.pending_input_send) as u16;
             let sep_w = UnicodeWidthStr::width(" · ") as u16;
             let delete_w = UnicodeWidthStr::width(t.pending_input_delete) as u16;
@@ -207,4 +217,75 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
     }
     frame.render_widget(Paragraph::new(lines), area);
     state.pending_hits = hits;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_client_protocol::SessionId;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Render one selected item at `width` and return where its actions land.
+    fn actions_at(text: &str, width: u16) -> PendingInputHit {
+        let mut state = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.pending_inputs.push(PendingInput {
+            text: text.into(),
+            state: PendingInputState::Waiting,
+        });
+        state.workbench_focus = WorkbenchFocus::Pending;
+        state.pending_selected = 0;
+        let area = Rect::new(0, 0, width, 4);
+        let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+        terminal
+            .draw(|frame| render(frame, area, &mut state, 4))
+            .unwrap();
+        state.pending_hits[0]
+    }
+
+    #[test]
+    fn actions_do_not_follow_the_terminal_right_edge() {
+        let narrow = actions_at("hi", 80);
+        let wide = actions_at("hi", 320);
+        assert_eq!(
+            narrow.send, wide.send,
+            "the action column must not move when the terminal grows"
+        );
+        let (x, _) = wide.send.expect("the selected item shows its actions");
+        assert!(
+            x < 40,
+            "short text keeps the actions near the text, got column {x}"
+        );
+    }
+
+    #[test]
+    fn long_text_caps_before_the_actions_and_hides_none_of_them() {
+        let long = "x".repeat(400);
+        let hit = actions_at(&long, 320);
+        let (x, end) = hit.send.expect("the selected item shows its actions");
+        assert_eq!(
+            usize::from(x),
+            2 + ITEM_TEXT_MAX_WIDTH + ITEM_ACTION_GAP,
+            "text stops at the readable measure, then the fixed gap"
+        );
+        assert!(end < 320, "the actions stay inside the terminal");
+        assert!(
+            hit.delete.is_some_and(|(_, de)| de <= x + 40),
+            "delete stays part of the same bounded cluster"
+        );
+    }
 }
