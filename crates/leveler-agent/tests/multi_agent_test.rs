@@ -3371,43 +3371,54 @@ async fn child_completed_without_findings_is_distinguishable_from_failure() {
 /// learned must reach the parent, marked partial.
 #[tokio::test]
 async fn budget_limited_child_preserves_its_partial_findings() {
-    let (dir, runtime, tool_context) = child_result_harness(
-        "child-result-c",
-        303,
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"task": "audit Headers"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Child round 1: says what it found so far, then keeps working.
-            assistant_with(
-                vec![
-                    ContentPart::Text {
-                        text: "so far: Headers.vue sets the header in two places".to_string(),
-                    },
-                    tool_call_part(
-                        "c1",
-                        "run_command",
-                        serde_json::json!({"program": "echo", "args": ["still reading"]}),
-                    ),
-                ],
-                FinishReason::ToolCalls,
-            ),
-            // Child round 2 is slow; the budget (cancellation) lands during it.
-            assistant_text("never delivered"),
-            assistant_text("parent unused"),
-        ],
-        Duration::from_millis(80),
-    );
+    let dir = tmp("child-result-c", 303);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let token = CancellationToken::new();
     let cancel = token.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(220)).await;
-        cancel.cancel();
-    });
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "audit Headers"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Child round 1: says what it found so far, then keeps working.
+                assistant_with(
+                    vec![
+                        ContentPart::Text {
+                            text: "so far: Headers.vue sets the header in two places".to_string(),
+                        },
+                        tool_call_part(
+                            "c1",
+                            "run_command",
+                            serde_json::json!({"program": "echo", "args": ["still reading"]}),
+                        ),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                // Child round 2 is where the budget lands, before it delivers.
+                assistant_text("never delivered"),
+                assistant_text("parent unused"),
+            ],
+            Duration::from_millis(80),
+        )
+        // Streams: 0 = parent spawn, 1 = the child's round that says what it
+        // found and runs its command, 2 = the child's next round. Cancel on
+        // stream 2 deterministically: a wall-clock timer races the child's own
+        // rounds on a loaded runner, and Windows CI run 35231808522 cancelled
+        // before the child had said anything — which this test then correctly
+        // read as "no result", failing on a scheduling accident rather than on
+        // the behaviour it exists to pin.
+        .with_stream_hook(move |index| {
+            if index == 2 {
+                cancel.cancel();
+            }
+        }),
+    );
     let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
