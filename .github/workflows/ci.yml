@@ -8,10 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
     name: fmt · clippy · test (${{ matrix.os }})
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +48,10 @@ jobs:
 
       # Windows confines writes with its own backend; tests assert fail-closed
       # filesystem behavior and honest capability probes.
+      # rustfmt is platform-agnostic; running it on every OS triples queue
+      # time for the same check. Linux is the required copy.
       - name: Format
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       - name: Clippy
@@ -194,7 +199,9 @@ jobs:
           command: check
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: cargo-audit
         # Expires 2026-10-01. rsa is only an unreachable sqlx-mysql lockfile
         # edge; this workspace enables sqlite only (`cargo tree --target all

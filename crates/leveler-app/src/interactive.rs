@@ -534,6 +534,18 @@ impl InProcessRuntimeClient {
         self
     }
 
+    /// Whether this process currently holds a main-turn or context-op lease
+    /// for `session_id`.
+    ///
+    /// Distinct from a durable `turns.status = running` row: EventBridge
+    /// releases the lease *after* the terminal client event is enqueued, so
+    /// the row can commit while this is still true. A follow-up command
+    /// (`RestoreCheckpoint`, `SubmitMessage`, compact) that admits the same
+    /// session must wait for this to go false, not only for `list_running`.
+    pub fn has_live_turn(&self, session_id: &SessionId) -> bool {
+        self.active.is_running(session_id)
+    }
+
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
     /// interactive TUI sessions.
     pub fn new_with_options(

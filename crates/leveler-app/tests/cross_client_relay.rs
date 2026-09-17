@@ -126,7 +126,7 @@ async fn cancel_inflight_turn(h: &Harness, session: &SessionId) {
         .await
         .unwrap();
     for _ in 0..400 {
-        if repo.list_running(None).await.unwrap().is_empty() {
+        if repo.list_running(None).await.unwrap().is_empty() && !h.runtime.has_live_turn(session) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

@@ -787,7 +787,11 @@ async fn socket_clients_receive_only_their_session_events() {
 /// and a test that leaks a task is a test whose next failure is unexplainable.
 ///
 /// Cancel is a request, not a completion, so this waits on the turn's terminal
-/// row rather than on the send returning.
+/// row rather than on the send returning. It also waits for the in-memory
+/// admit lease: EventBridge releases that lease after the terminal client
+/// event is enqueued, so the durable row can commit while `has_live_turn`
+/// is still true. Windows CI loses that race — a follow-up `RestoreCheckpoint`
+/// then fails with "already has an active turn".
 async fn settle_background_turns(
     app: &Arc<Application>,
     client: &Arc<InProcessRuntimeClient>,
@@ -814,12 +818,21 @@ async fn settle_background_turns(
             .unwrap();
     }
     for _ in 0..400 {
-        if repo.list_running(None).await.unwrap().is_empty() {
+        let durable_idle = repo.list_running(None).await.unwrap().is_empty();
+        let lease_idle = submitted_to
+            .iter()
+            .all(|session| !client.has_live_turn(session));
+        if durable_idle && lease_idle {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     let stuck = repo.list_running(None).await.unwrap();
+    let live: Vec<&str> = submitted_to
+        .iter()
+        .filter(|session| client.has_live_turn(session))
+        .map(|session| session.as_str())
+        .collect();
     let mut diag = String::new();
     for turn in &stuck {
         let session = SessionId::new(turn.session_id.clone());
@@ -837,7 +850,31 @@ async fn settle_background_turns(
             turn.id, turn.session_id, turn.status
         ));
     }
-    panic!("a background turn never reached a terminal state after cancellation:{diag}");
+    panic!(
+        "a background turn never reached a terminal state after cancellation:\
+         live leases {live:?}{diag}"
+    );
+}
+
+/// Collect `Notification` events until one contains `needle`, or the deadline.
+async fn wait_for_notification(
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    needle: &str,
+) -> Vec<String> {
+    let mut said = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(RuntimeEvent::Notification { message, .. })) => {
+                said.push(message);
+                if said.iter().any(|m| m.contains(needle)) {
+                    return said;
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => return said,
+        }
+    }
 }
 
 /// The first real message names a placeholder interactive session: the goal
@@ -1241,18 +1278,9 @@ async fn a_restored_checkpoint_says_where_it_landed() {
             checkpoint_id: checkpoint,
         })
         .await
-        .unwrap();
+        .expect("restore after the previous turn has settled");
 
-    let mut said = Vec::new();
-    for _ in 0..24 {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
-            Ok(Ok(leveler_client_protocol::RuntimeEvent::Notification { message, .. })) => {
-                said.push(message)
-            }
-            Ok(Ok(_)) => {}
-            _ => break,
-        }
-    }
+    let said = wait_for_notification(&mut events, "已回退到检查点").await;
     assert!(
         said.iter().any(|m| m.contains("已回退到检查点")),
         "a completed restore names where it landed: {said:?}"
@@ -1285,16 +1313,7 @@ async fn a_forked_session_tells_the_session_it_was_forked_from() {
         .await
         .unwrap();
 
-    let mut said = Vec::new();
-    for _ in 0..24 {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
-            Ok(Ok(leveler_client_protocol::RuntimeEvent::Notification { message, .. })) => {
-                said.push(message)
-            }
-            Ok(Ok(_)) => {}
-            _ => break,
-        }
-    }
+    let said = wait_for_notification(&mut events, "分叉").await;
     assert!(
         said.iter().any(|m| m.contains("分叉")),
         "the session that was forked hears about it: {said:?}"
