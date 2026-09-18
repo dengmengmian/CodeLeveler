@@ -417,6 +417,10 @@ pub struct InProcessRuntimeClient {
     /// Cancelled to retire the process once work has drained. `None` for an
     /// in-process runtime, which has no process of its own to retire.
     process_shutdown: Option<CancellationToken>,
+    /// Attached local UI count, shared with the transport's RAII guard so a
+    /// dropped client decrements it even after an abrupt disconnect. `None`
+    /// for an in-process runtime, which has no transport to count.
+    client_presence: Option<leveler_local_transport::LocalWaiters>,
     /// A daemon must not emit its wire ACK until a fresh turn's write-ahead
     /// input is durable. Embedded callers keep the historical dispatch-only
     /// return so current-thread runtimes never wait on their own worker.
@@ -586,6 +590,63 @@ impl InProcessRuntimeClient {
         self
     }
 
+    /// Share the transport's attached-UI counter with this runtime, so idle
+    /// eviction can tell `no client` from `a client is watching`.
+    pub fn with_client_presence(mut self, waiters: leveler_local_transport::LocalWaiters) -> Self {
+        self.client_presence = Some(waiters);
+        self
+    }
+
+    /// Retire the process once there is no attached client and nothing is
+    /// owed, for `idle_timeout`.
+    ///
+    /// This is resource reclamation, NOT generation handover: a daemon exists
+    /// to outlive the TUI that started its work, so the countdown only starts
+    /// when `active_turns == 0`, `active_background_tasks == 0`, and no local
+    /// UI is attached. Any of those becoming true again resets it. A runtime
+    /// already retiring (`ShutdownWhenIdle`) or quitting owns shutdown, so
+    /// this supervisor stands down rather than racing it.
+    ///
+    /// A runtime with no process token or no client counter (the embedded
+    /// path) has nothing to evict and this is a no-op.
+    pub fn spawn_idle_eviction(&self, idle_timeout: std::time::Duration) {
+        let Some(token) = self.process_shutdown.clone() else {
+            return;
+        };
+        let Some(clients) = self.client_presence.clone() else {
+            return;
+        };
+        let active = self.active.clone();
+        let background = self.app.background_tasks().clone();
+        let shutting_down = self.shutting_down.clone();
+        tokio::spawn(async move {
+            // Probe often enough that the timeout is honoured closely, without
+            // a busy loop when the timeout is long.
+            let poll = (idle_timeout / 5).max(std::time::Duration::from_millis(20));
+            let mut idle_since = tokio::time::Instant::now();
+            loop {
+                // Retiring/Quit own the shutdown; never race them.
+                if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let quiescence = runtime_quiescence(&active, &background).await;
+                if quiescence.quiescent() && clients.count() == 0 {
+                    if idle_since.elapsed() >= idle_timeout {
+                        tracing::info!(
+                            idle_secs = idle_timeout.as_secs(),
+                            "no clients and no work; retiring the idle runtime"
+                        );
+                        token.cancel();
+                        return;
+                    }
+                } else {
+                    idle_since = tokio::time::Instant::now();
+                }
+                tokio::time::sleep(poll).await;
+            }
+        });
+    }
+
     /// Enable the daemon transport's durable ACK boundary. Set only by the
     /// `serve` composition root; this is not a user-selectable policy.
     pub fn with_durable_wire_ack(mut self) -> Self {
@@ -650,6 +711,7 @@ impl InProcessRuntimeClient {
             shutting_down: shutting_down.clone(),
             retiring_reason: std::sync::Mutex::new(None),
             process_shutdown: None,
+            client_presence: None,
             durable_wire_ack: false,
             in_flight,
         }

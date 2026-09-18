@@ -711,6 +711,16 @@ mod unix {
             path: impl AsRef<Path>,
             runtime: Arc<dyn LocalRuntimeService>,
         ) -> Result<Self, TransportError> {
+            Self::bind_with_waiters(path, runtime, LocalWaiters::new()).await
+        }
+
+        /// [`Self::bind`] with a caller-owned client-presence counter, so the
+        /// runtime can see the SAME count the transport maintains.
+        pub async fn bind_with_waiters(
+            path: impl AsRef<Path>,
+            runtime: Arc<dyn LocalRuntimeService>,
+            local_waiters: LocalWaiters,
+        ) -> Result<Self, TransportError> {
             let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -751,7 +761,7 @@ mod unix {
                 socket_inode: metadata.ino(),
                 listener,
                 runtime,
-                local_waiters: LocalWaiters::new(),
+                local_waiters,
                 _lock: lock,
             })
         }
@@ -1403,6 +1413,17 @@ mod unix {
             token: impl Into<String>,
             runtime: Arc<dyn LocalRuntimeService>,
         ) -> Result<Self, TransportError> {
+            Self::bind_with_waiters(addr, token, runtime, LocalWaiters::new()).await
+        }
+
+        /// [`Self::bind`] with a caller-owned client-presence counter. See
+        /// [`LocalSocketServer::bind_with_waiters`].
+        pub async fn bind_with_waiters(
+            addr: SocketAddr,
+            token: impl Into<String>,
+            runtime: Arc<dyn LocalRuntimeService>,
+            local_waiters: LocalWaiters,
+        ) -> Result<Self, TransportError> {
             let token = token.into();
             if token.is_empty() {
                 return Err(TransportError::Unavailable(
@@ -1414,7 +1435,7 @@ mod unix {
                 listener,
                 runtime,
                 token: Arc::from(token),
-                local_waiters: LocalWaiters::new(),
+                local_waiters,
             })
         }
 

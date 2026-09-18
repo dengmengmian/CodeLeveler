@@ -22,6 +22,7 @@ use leveler_client_protocol::{
 use leveler_execution::PermissionProfile;
 use leveler_local_transport::{
     CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
+    LocalWaiters,
 };
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -779,4 +780,265 @@ async fn a_running_turn_holds_the_handover_open() {
     );
 
     model_stop.cancel();
+}
+
+// ── Idle eviction: a daemon retires itself only when nobody is watching and
+//    nothing is owed. Generation handover (Retiring) is a different path. ──
+
+struct EvictionHarness {
+    _tmp: tempfile::TempDir,
+    app: Arc<Application>,
+    runtime: Arc<InProcessRuntimeClient>,
+    socket: std::path::PathBuf,
+    token: CancellationToken,
+    waiters: LocalWaiters,
+    serve: tokio::task::JoinHandle<Result<(), leveler_local_transport::TransportError>>,
+}
+
+impl EvictionHarness {
+    async fn shutdown(self) {
+        self.token.cancel();
+        let _ = self.serve.await;
+    }
+}
+
+async fn eviction_harness(base_url: &str, timeout: std::time::Duration) -> EvictionHarness {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = CancellationToken::new();
+    let waiters = LocalWaiters::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone())
+        .with_client_presence(waiters.clone()),
+    );
+    let socket = tmp.path().join("daemon.sock");
+    let server = LocalSocketServer::bind_with_waiters(&socket, runtime.clone(), waiters.clone())
+        .await
+        .unwrap();
+    let serve = tokio::spawn(server.serve(token.clone()));
+    runtime.spawn_idle_eviction(timeout);
+    EvictionHarness {
+        _tmp: tmp,
+        app,
+        runtime,
+        socket,
+        token,
+        waiters,
+        serve,
+    }
+}
+
+/// Wait for the transport's RAII count to reach `want`.
+async fn wait_for_clients(h: &EvictionHarness, want: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.waiters.count() != want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attached clients never reached {want} (now {})",
+            h.waiters.count()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_attached_client_prevents_idle_eviction() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "a runtime somebody is watching must not evict itself"
+    );
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_last_client_leaving_evicts_an_idle_runtime() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    drop(client);
+    wait_for_clients(&h, 0).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("an idle runtime with no clients retires after its timeout");
+    let _ = h.serve.await;
+}
+
+#[tokio::test]
+async fn active_work_blocks_idle_eviction() {
+    let (base_url, model_stop) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    let session = client
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "hold the daemon".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "work forever".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_turn_running(&h.runtime, &session).await;
+    drop(client);
+    wait_for_clients(&h, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "a running turn must keep the daemon alive with no clients attached"
+    );
+    h.runtime
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session,
+        })
+        .await
+        .ok();
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("once the turn ends, the idle daemon retires");
+    let _ = h.serve.await;
+    model_stop.cancel();
+}
+
+#[tokio::test]
+async fn a_background_task_blocks_idle_eviction() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    let task = h
+        .app
+        .background_tasks()
+        .spawn(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".to_string()],
+                h._tmp.path().to_path_buf(),
+            ),
+            None,
+        )
+        .await
+        .expect("background task starts");
+    drop(client);
+    wait_for_clients(&h, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "a background task outliving its turn must keep the daemon alive"
+    );
+    h.app.background_tasks().kill(&task).await.ok();
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("once the background work settles, the idle daemon retires");
+    let _ = h.serve.await;
+}
+
+#[tokio::test]
+async fn a_reconnect_before_the_timeout_keeps_the_runtime() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(600)).await;
+    let first = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    drop(first);
+    wait_for_clients(&h, 0).await;
+    // Reconnect inside the window: the countdown must reset.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let second = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "a reconnect must stop the pending idle eviction"
+    );
+    drop(second);
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("after the last client leaves, idleness starts again");
+    let _ = h.serve.await;
+}
+
+#[tokio::test]
+async fn a_second_attached_client_prevents_eviction() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let a = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    let b = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 2).await;
+    drop(a);
+    wait_for_clients(&h, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "one remaining client must keep the daemon alive"
+    );
+    drop(b);
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("the last client leaving starts the countdown");
+    let _ = h.serve.await;
+}
+
+#[tokio::test]
+async fn retiring_ignores_client_presence() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_secs(30)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    h.runtime
+        .send(ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+    // Retirement is a generation handover: an attached client does not hold it
+    // open (only turns and background work do).
+    tokio::time::timeout(std::time::Duration::from_secs(3), h.token.cancelled())
+        .await
+        .expect("a quiescent retiring runtime exits even while a client is attached");
+    let _ = h.serve.await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn explicit_quit_does_not_trigger_idle_eviction() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, std::time::Duration::from_millis(250)).await;
+    let client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+    wait_for_clients(&h, 1).await;
+    h.runtime.send(ClientCommand::Quit).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !h.token.is_cancelled(),
+        "Quit is handled by the host's shutdown path; idle eviction stands down"
+    );
+    drop(client);
+    h.shutdown().await;
 }

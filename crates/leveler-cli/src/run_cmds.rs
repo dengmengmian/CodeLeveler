@@ -234,6 +234,26 @@ async fn connect_default_runtime(
 #[cfg(unix)]
 const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a daemon with NO attached client and NO work waits before it
+/// retires its own process.
+///
+/// This is resource reclamation, not generation handover: the daemon exists to
+/// outlive a TUI that started work, so the countdown only starts once nothing
+/// is owed and nobody is watching. Override for dogfood/tests with
+/// `LEVELER_DAEMON_IDLE_TIMEOUT_SECS` (a positive number of seconds).
+#[cfg(unix)]
+const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+#[cfg(unix)]
+fn daemon_idle_timeout() -> Duration {
+    std::env::var("LEVELER_DAEMON_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DAEMON_IDLE_TIMEOUT)
+}
+
 /// The client-side daemon revival hook: when the daemon dies mid-session,
 /// the transport calls back here to run the SAME discover-or-start flow the
 /// TUI used at startup. The connected probe client is dropped immediately —
@@ -1085,12 +1105,17 @@ async fn bind_daemon_transports(
     tcp: Option<SocketAddr>,
     token: Option<String>,
     service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+    local_waiters: leveler_local_transport::LocalWaiters,
 ) -> anyhow::Result<BoundServers> {
-    let unix = LocalSocketServer::bind(socket_path, service.clone()).await?;
+    let unix =
+        LocalSocketServer::bind_with_waiters(socket_path, service.clone(), local_waiters.clone())
+            .await?;
     let tcp = match tcp {
         Some(addr) => {
             let token = token.unwrap_or_else(generate_daemon_token);
-            let server = TcpRuntimeServer::bind(addr, token.clone(), service).await?;
+            let server =
+                TcpRuntimeServer::bind_with_waiters(addr, token.clone(), service, local_waiters)
+                    .await?;
             Some((server, token))
         }
         None => None,
@@ -1140,6 +1165,9 @@ pub(crate) async fn cmd_serve(
     // drains (ShutdownWhenIdle); the signal handlers below cancel the same
     // token, so there is one shutdown path rather than two.
     let shutdown = CancellationToken::new();
+    // One client-presence counter, shared by both transports and the runtime:
+    // the daemon's idle eviction reads exactly what the transport counts.
+    let local_waiters = leveler_local_transport::LocalWaiters::new();
     let runtime = Arc::new(
         InProcessRuntimeClient::new_with_options(
             app.clone(),
@@ -1149,6 +1177,7 @@ pub(crate) async fn cmd_serve(
             auto_approve,
         )
         .with_process_shutdown(shutdown.clone())
+        .with_client_presence(local_waiters.clone())
         .with_durable_wire_ack(),
     );
     let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
@@ -1165,7 +1194,10 @@ pub(crate) async fn cmd_serve(
     // this repo, so afterwards startup may classify old `running` rows as
     // crash leftovers. TCP mode binds the socket too (ownership lock + local
     // token-less clients); an ephemeral TCP port alone proves nothing.
-    let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
+    let bound = bind_daemon_transports(&socket_path, tcp, token, service, local_waiters).await?;
+    // Only a real daemon process evicts itself; the token/handle are absent
+    // for the embedded runtime, where this is a no-op.
+    runtime.spawn_idle_eviction(daemon_idle_timeout());
 
     let runtime_id = app.runtime_id()?;
     // Recovery is an authoritative write, performed as this runtime's boot.
@@ -2232,6 +2264,7 @@ mod daemon_bind_tests {
             Some("127.0.0.1:0".parse().unwrap()),
             Some("bridge-token".to_string()),
             upstream.clone(),
+            leveler_local_transport::LocalWaiters::new(),
         )
         .await
         .expect("daemon transports bind");
@@ -2304,6 +2337,7 @@ mod daemon_bind_tests {
             Some("127.0.0.1:0".parse().unwrap()),
             Some("test-token".to_string()),
             test_service(),
+            leveler_local_transport::LocalWaiters::new(),
         )
         .await
         .expect("binds");
@@ -2321,9 +2355,15 @@ mod daemon_bind_tests {
     async fn local_socket_client_feeds_the_shared_web_binder() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("daemon.sock");
-        let mut bound = bind_daemon_transports(&sock, None, None, test_service())
-            .await
-            .expect("unix daemon");
+        let mut bound = bind_daemon_transports(
+            &sock,
+            None,
+            None,
+            test_service(),
+            leveler_local_transport::LocalWaiters::new(),
+        )
+        .await
+        .expect("unix daemon");
         let unix = bound.unix.take().expect("unix listener");
         let daemon_shutdown = CancellationToken::new();
         let daemon_task = tokio::spawn(unix.serve(daemon_shutdown.clone()));
@@ -2349,14 +2389,21 @@ mod daemon_bind_tests {
     async fn second_daemon_on_the_same_socket_fails_fast() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("daemon.sock");
-        let _first = bind_daemon_transports(&sock, None, None, test_service())
-            .await
-            .expect("first daemon binds");
+        let _first = bind_daemon_transports(
+            &sock,
+            None,
+            None,
+            test_service(),
+            leveler_local_transport::LocalWaiters::new(),
+        )
+        .await
+        .expect("first daemon binds");
         let second = bind_daemon_transports(
             &sock,
             Some("127.0.0.1:0".parse().unwrap()),
             None,
             test_service(),
+            leveler_local_transport::LocalWaiters::new(),
         )
         .await;
         assert!(
