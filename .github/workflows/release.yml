@@ -1,9 +1,10 @@
 name: Release
 
 # Tag `vX.Y.Z` → build the `leveler` binary for the four supported targets,
-# package each with its sha256, and attach everything to a draft GitHub
-# release. Publishing the draft (a human step) is what makes
-# `leveler upgrade --check` see the new version.
+# package each with its sha256, attach everything to a draft GitHub release,
+# and publish it once every asset is uploaded. Publishing is what makes
+# `leveler update --check` see the new version, so it is the last step: a
+# release is never public with an asset missing.
 on:
   push:
     tags: ["v*"]
@@ -133,7 +134,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: draft release
+    name: publish release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -199,3 +200,18 @@ jobs:
               exit 1
             fi
           done
+
+      # Only after all assets are attached: the updater reads the latest
+      # published release and would otherwise find it without its archive.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          expected=$(ls dist | wc -l)
+          attached=$(gh release view "$GITHUB_REF_NAME" --json assets -q '.assets | length')
+          if [ "$attached" -ne "$expected" ]; then
+            echo "::error::release has $attached assets, expected $expected; not publishing"
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false
