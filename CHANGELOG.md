@@ -19,6 +19,10 @@ First stable release. From here CodeLeveler follows Semantic Versioning.
 
 - Release assets now follow the frozen `leveler-v<version>-<target>.tar.gz|zip` contract, each with a `.sha256` sibling; the release workflow refuses a tag that disagrees with the workspace version
 
+### Fixed
+
+- A long session with many tool calls could fail every later turn with `HTTP 400 invalid_request` ("Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"). Context assembly now keeps each tool call with its results, a context snapshot that lost that pairing is ignored in favour of the saved transcript, and a request that still breaks it is refused before sending and reported as an internal conversation protocol error
+
 ## [0.1.0-beta.1] - 2026-09-17
 
 Public beta for macOS, Linux, and Windows.

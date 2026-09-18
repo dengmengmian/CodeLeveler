@@ -19,6 +19,10 @@
 
 - 发布产物固定为 `leveler-v<version>-<target>.tar.gz|zip` 及其 `.sha256`；发布工作流拒绝与工作区版本不一致的 tag
 
+### 修复
+
+- 工具调用较多的长会话可能在之后每一轮都失败，报 `HTTP 400 invalid_request`（"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"）。上下文组装现在始终让工具调用与其结果成对；丢失配对的上下文快照会被忽略，改用已保存的会话记录；仍违反配对的请求在发送前被拒绝，并报告为内部会话协议错误
+
 ## [0.1.0-beta.1] - 2026-09-17
 
 面向 macOS、Linux 和 Windows 的公开 beta。
