@@ -683,8 +683,7 @@ fn a_command_is_not_stoppable_without_a_live_turn() {
     assert_eq!(call(&s, "c1").stop, StopRequest::None);
 }
 
-/// A finished command leaves the STOP candidate set: `x` can no longer reach
-/// it. It stays focusable — Enter still reopens its output.
+/// A finished command leaves the candidate set: `x` can no longer reach it.
 #[test]
 fn a_finished_command_leaves_the_candidate_set() {
     let mut s = state();
@@ -692,7 +691,7 @@ fn a_finished_command_leaves_the_candidate_set() {
     focus_command(&mut s);
     complete(&mut s, "c1", true, 10, Some(0), None);
     assert!(s.stoppable_commands().is_empty());
-    assert_eq!(s.focused_command(), Some(&ToolCallId::new("c1")));
+    assert!(s.focused_command().is_none());
     let effects = key(&mut s, KeyCode::Char('x'));
     assert!(effects.is_empty(), "{effects:?}");
 }
@@ -994,41 +993,4 @@ fn clicking_a_headerless_mixed_group_still_opens_it() {
     );
     // Presentation only: both calls are still two calls.
     assert_eq!(s.transcript.tool_calls().len(), 2);
-}
-
-/// A settled command is still reachable from the keyboard: Tab reaches the
-/// Command focus, Enter opens the output the row folded away, and `x` has
-/// nothing to stop.
-#[test]
-fn enter_opens_a_settled_commands_output() {
-    let mut s = state();
-    start(&mut s, "c1");
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::ToolCallCompleted {
-            id: ToolCallId::new("c1"),
-            ok: false,
-            preview: "exit: 1\n--- stderr ---\nerror: rate limited\nretry later".into(),
-            duration_ms: 2_000,
-            applied_diff: None,
-            exit_code: Some(1),
-            stop: None,
-        }),
-    );
-    s.status = RuntimeStatus::Idle;
-    assert!(
-        row_with(&s, "retry later").is_none(),
-        "settled output is folded"
-    );
-
-    focus_command(&mut s);
-    key(&mut s, KeyCode::Enter);
-    assert!(call(&s, "c1").expanded);
-    assert!(row_with(&s, "retry later").is_some(), "{:?}", plain(&s));
-
-    assert!(
-        key(&mut s, KeyCode::Char('x')).is_empty(),
-        "nothing to stop"
-    );
-    assert_eq!(call(&s, "c1").stop, StopRequest::None);
 }

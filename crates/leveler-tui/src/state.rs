@@ -624,35 +624,12 @@ impl AppState {
     /// stoppable running command. `None` clears the marker for any stale
     /// selection, so a finished row never keeps wearing it.
     pub fn focused_command(&self) -> Option<&leveler_client_protocol::ToolCallId> {
-        if self.workbench_focus != WorkbenchFocus::Command {
+        if self.workbench_focus != WorkbenchFocus::Command || !self.can_stop_commands() {
             return None;
         }
         let id = self.command_selected.as_ref()?;
-        self.focusable_commands()
-            .iter()
-            .any(|(_, _, c)| c == id)
-            .then_some(id)
-    }
-
-    /// Every command call on screen, in transcript order, as `(item, call,
-    /// id)`: the Command focus walks these. A settled one collapsed to its
-    /// summary row, so Enter is how the keyboard reopens its output; only the
-    /// running ones in [`Self::stoppable_commands`] answer `x`.
-    pub fn focusable_commands(&self) -> Vec<(usize, usize, leveler_client_protocol::ToolCallId)> {
-        let mut out = Vec::new();
-        for (item, entry) in self.transcript.items().iter().enumerate() {
-            let crate::transcript::TranscriptItem::ToolGroup(group) = entry else {
-                continue;
-            };
-            for (call, block) in group.calls.iter().enumerate() {
-                if matches!(block.name.as_str(), "run_command" | "shell_command")
-                    && crate::activity_stream::is_conversation_visible(block)
-                {
-                    out.push((item, call, block.id.clone()));
-                }
-            }
-        }
-        out
+        let (item, call) = self.command_location(id)?;
+        self.command_is_stoppable(item, call).then_some(id)
     }
 
     /// The running commands this client may stop, in transcript order, as

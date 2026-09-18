@@ -1027,7 +1027,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
                 WorkbenchFocus::Conversation => {
-                    if !state.focusable_commands().is_empty() {
+                    if !state.stoppable_commands().is_empty() {
                         ensure_command_selection(state);
                         WorkbenchFocus::Command
                     } else {
@@ -1265,7 +1265,7 @@ fn ensure_activity_focus(state: &mut AppState) -> WorkbenchFocus {
 /// Keep the Command focus on a command that still exists: the current pick if
 /// it is still a candidate, otherwise the first one.
 fn ensure_command_selection(state: &mut AppState) {
-    let candidates = state.focusable_commands();
+    let candidates = state.stoppable_commands();
     if candidates.is_empty() {
         state.command_selected = None;
         return;
@@ -1275,21 +1275,13 @@ fn ensure_command_selection(state: &mut AppState) {
         .as_ref()
         .is_none_or(|id| !candidates.iter().any(|(_, _, c)| c == id))
     {
-        // Land on what the user most likely wants: a command still running
-        // (it can be stopped), else the latest one.
-        let first = state
-            .stoppable_commands()
-            .into_iter()
-            .next()
-            .map(|(_, _, id)| id)
-            .unwrap_or_else(|| candidates[candidates.len() - 1].2.clone());
-        state.command_selected = Some(first);
+        state.command_selected = Some(candidates[0].2.clone());
     }
 }
 
 /// Move the Command focus by one command, clamped to the candidate list.
 fn select_command_delta(state: &mut AppState, delta: isize) {
-    let candidates = state.focusable_commands();
+    let candidates = state.stoppable_commands();
     if candidates.is_empty() {
         state.command_selected = None;
         return;

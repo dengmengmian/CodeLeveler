@@ -633,21 +633,12 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
             format!("Tab {}", t.pending_inputs_hint)
         }
     } else if state.workbench_focus == crate::state::WorkbenchFocus::Command
-        && let Some(focused) = state.focused_command()
+        && !state.stoppable_commands().is_empty()
     {
-        // The focused command owns the row: Enter toggles its output, and a
-        // running one also answers `x`, which stops exactly that execution.
-        // Takes precedence over the generic interrupt hint, which is still
-        // reachable (Esc/Ctrl+C are global).
-        if state
-            .stoppable_commands()
-            .iter()
-            .any(|(_, _, id)| id == focused)
-        {
-            t.command_focus_hint.to_string()
-        } else {
-            t.command_focus_settled_hint.to_string()
-        }
+        // The focused running command owns the row: Enter toggles its output,
+        // `x` stops exactly that execution. Takes precedence over the generic
+        // interrupt hint, which is still reachable (Esc/Ctrl+C are global).
+        t.command_focus_hint.to_string()
     } else if state.workbench_focus == crate::state::WorkbenchFocus::Activity
         && !crate::activity::summaries(state).is_empty()
     {
