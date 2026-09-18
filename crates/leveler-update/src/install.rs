@@ -231,7 +231,7 @@ pub fn install_from_archive(
         let confine = format!("leveler-confine{}", std::env::consts::EXE_SUFFIX);
         if let Some(source) = extracted
             .iter()
-            .find(|p| p.file_name().is_some_and(|n| n == confine))
+            .find(|p| p.file_name().is_some_and(|n| n == confine.as_str()))
         {
             replace_file(source, &install_dir.join(&confine), install_dir)?;
         }
