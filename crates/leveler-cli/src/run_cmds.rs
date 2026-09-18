@@ -406,13 +406,19 @@ fn retiring_status(health: &leveler_client_protocol::RuntimeHealth) -> String {
     )
 }
 
-/// Observe a retiring runtime until it releases its socket.
+/// Observe a retiring runtime until it is gone and replaced (or simply gone).
 ///
 /// There is NO deadline here on purpose. The former 10s bail turned "the old
 /// runtime is still working" into "the new TUI cannot start", which is the
-/// deadlock this closes. A generation handover therefore waits for the old
-/// runtime's own drain: it never interrupts the work, never kills the
-/// process, and never starts a second daemon for the same repository.
+/// deadlock this closes. A generation handover waits for the old runtime's own
+/// drain: it never interrupts the work, never kills the process, and never
+/// starts a second daemon for the same repository.
+///
+/// `observed_pid` is the retiring runtime's pid. It is how the wait tells
+/// "still draining" from "already replaced": a concurrent client's reviver
+/// can spawn the replacement on the same socket before this wait ends, and
+/// waiting for a socket that is now served by a *different* healthy runtime
+/// would hang forever.
 ///
 /// `interval` only paces how often progress is re-stated.
 #[cfg(unix)]
@@ -420,13 +426,21 @@ async fn observe_retiring_runtime(
     client: &LocalSocketRuntimeClient,
     socket_path: &Path,
     reason: leveler_client_protocol::RestartReason,
+    observed_pid: Option<u32>,
     interval: Duration,
 ) {
     let mut last = String::new();
     loop {
         let status = match leveler_local_transport::LocalRuntimeService::runtime_info(client).await
         {
-            Ok(info) => retiring_status(&info.health),
+            Ok(info) => {
+                if observed_pid.is_some_and(|pid| info.pid != pid) {
+                    // A replacement runtime is already serving this socket:
+                    // the old generation is gone and the handover is done.
+                    return;
+                }
+                retiring_status(&info.health)
+            }
             Err(_) => {
                 if tokio::net::UnixStream::connect(socket_path).await.is_err() {
                     // The request path failed AND the socket no longer answers:
@@ -463,11 +477,22 @@ async fn retire_runtime(
     socket_path: &Path,
     reason: leveler_client_protocol::RestartReason,
 ) -> anyhow::Result<()> {
+    let observed_pid = leveler_local_transport::LocalRuntimeService::runtime_info(client)
+        .await
+        .ok()
+        .map(|info| info.pid);
     client
         .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle { reason })
         .await
         .map_err(|e| anyhow::anyhow!("could not ask the local runtime to retire: {e}"))?;
-    observe_retiring_runtime(client, socket_path, reason, HANDOVER_STATUS_INTERVAL).await;
+    observe_retiring_runtime(
+        client,
+        socket_path,
+        reason,
+        observed_pid,
+        HANDOVER_STATUS_INTERVAL,
+    )
+    .await;
     Ok(())
 }
 
@@ -1896,6 +1921,10 @@ compatibility:
         assert_eq!(health.active_background_tasks, 1);
         assert!(!health.quiescent());
         assert!(health.shutting_down);
+        let observed_pid = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
+            .await
+            .unwrap()
+            .pid;
 
         tokio::time::timeout(
             Duration::from_secs(15),
@@ -1903,6 +1932,7 @@ compatibility:
                 &client,
                 &socket,
                 leveler_client_protocol::RestartReason::BuildMismatch,
+                Some(observed_pid),
                 Duration::from_millis(25),
             ),
         )
