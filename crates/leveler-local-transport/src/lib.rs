@@ -1550,6 +1550,14 @@ mod unsupported {
             ))
         }
 
+        pub async fn bind_with_waiters(
+            path: impl AsRef<Path>,
+            runtime: Arc<dyn LocalRuntimeService>,
+            _local_waiters: LocalWaiters,
+        ) -> Result<Self, TransportError> {
+            Self::bind(path, runtime).await
+        }
+
         pub fn path(&self) -> &Path {
             Path::new("")
         }
@@ -1645,6 +1653,15 @@ mod unsupported {
             Err(TransportError::Unavailable(
                 "the TCP daemon is not supported on this platform".to_string(),
             ))
+        }
+
+        pub async fn bind_with_waiters(
+            addr: std::net::SocketAddr,
+            token: impl Into<String>,
+            runtime: Arc<dyn LocalRuntimeService>,
+            _local_waiters: LocalWaiters,
+        ) -> Result<Self, TransportError> {
+            Self::bind(addr, token, runtime).await
         }
 
         pub fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {

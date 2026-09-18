@@ -241,10 +241,8 @@ const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// outlive a TUI that started work, so the countdown only starts once nothing
 /// is owed and nobody is watching. Override for dogfood/tests with
 /// `LEVELER_DAEMON_IDLE_TIMEOUT_SECS` (a positive number of seconds).
-#[cfg(unix)]
 const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[cfg(unix)]
 fn daemon_idle_timeout() -> Duration {
     std::env::var("LEVELER_DAEMON_IDLE_TIMEOUT_SECS")
         .ok()
