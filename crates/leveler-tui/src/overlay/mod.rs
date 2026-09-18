@@ -431,6 +431,66 @@ fn clarification_tab_rows(
     )
 }
 
+/// Digit column width of the largest 1-based index in an option list of
+/// `total`. Every row reserves this many columns, so `9.` and `10.` keep their
+/// labels in one vertical line.
+fn option_number_width(total: usize) -> usize {
+    total.max(1).to_string().len()
+}
+
+/// `" 1."` / `"10."` — the right-aligned, stable number half of an option
+/// row. Callers add their own separator and label.
+fn option_number(index: usize, total: usize) -> String {
+    format!("{:>width$}.", index + 1, width = option_number_width(total))
+}
+
+/// The width-stable text columns every numbered option row opens with: focus
+/// marker, number, and (for a multi-choice) the selection box.
+///
+/// The focus column is always reserved, so moving the cursor never shifts the
+/// label; the number column is padded from the option count, so 9 and 10 align;
+/// the selection box keeps this project's existing `[x]` / `[ ]` vocabulary.
+/// Styles are the row's own: the focus glyph wears the accent, the focused
+/// number brightens with its label, and an unfocused number sits one step below
+/// the label instead of competing with it.
+fn option_prefix_spans(
+    index: usize,
+    total: usize,
+    focused: bool,
+    marker: &str,
+    state: Option<&str>,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let focus = if focused {
+        marker.to_string()
+    } else {
+        " ".repeat(UnicodeWidthStr::width(marker))
+    };
+    let focus_style = if focused {
+        Style::default().fg(theme.accent.primary)
+    } else {
+        Style::default()
+    };
+    let number_style = if focused {
+        Style::default()
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text.secondary)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{focus} "), focus_style),
+        Span::styled(format!("{} ", option_number(index, total)), number_style),
+    ];
+    if let Some(state) = state {
+        spans.push(Span::styled(
+            format!("{state} "),
+            Style::default().fg(theme.text.secondary),
+        ));
+    }
+    spans
+}
+
 /// Push one list row, wrapping its label to the space left after `prefix` and
 /// indenting the continuation under the label rather than under the margin.
 fn push_wrapped_row(
@@ -572,23 +632,13 @@ fn clarification_content(
             Some(crate::overlay::clarification::Answer::Picks(picks)) => picks.first().copied(),
             _ => None,
         };
+        let total = active.options.len() + usize::from(active.allow_other);
         for (i, option) in active.options.iter().enumerate() {
             let focused = i == active.cursor;
-            let marker = if focused { "❯ " } else { "  " };
-            let marker_style = if focused {
-                Style::default().fg(theme.accent.primary)
-            } else {
-                Style::default()
-            };
-            let prefix = if active.is_multi() {
-                let box_ = if active.selected[i] { "[x] " } else { "[ ] " };
-                vec![
-                    Span::styled(marker, marker_style),
-                    Span::styled(box_, Style::default().fg(theme.text.secondary)),
-                ]
-            } else {
-                vec![Span::styled(marker, marker_style)]
-            };
+            let state = active
+                .is_multi()
+                .then(|| if active.selected[i] { "[x]" } else { "[ ]" });
+            let prefix = option_prefix_spans(i, total, focused, "❯", state, theme);
             let label_style = if focused {
                 Style::default()
                     .fg(theme.text.primary)
@@ -604,12 +654,12 @@ fn clarification_content(
         }
         if active.allow_other {
             let focused = active.on_other_row();
-            let marker = if focused { "❯ " } else { "  " };
-            let marker_style = if focused {
-                Style::default().fg(theme.accent.primary)
-            } else {
-                Style::default()
-            };
+            let prefix =
+                option_prefix_spans(active.options.len(), total, focused, "❯", None, theme);
+            let prefix_w: usize = prefix
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             let label_style = if focused {
                 Style::default()
                     .fg(theme.text.primary)
@@ -619,13 +669,11 @@ fn clarification_content(
             };
             let row = lines.len();
             let text = active.text.clone();
-            let spans = vec![
-                Span::styled(marker, marker_style),
-                Span::styled(format!("{} ", t.clarify_other), label_style),
-                Span::raw(text.clone()),
-            ];
+            let mut spans = prefix;
+            spans.push(Span::styled(format!("{} ", t.clarify_other), label_style));
+            spans.push(Span::raw(text.clone()));
             if focused {
-                let col = 2
+                let col = prefix_w
                     + UnicodeWidthStr::width(t.clarify_other)
                     + 1
                     + UnicodeWidthStr::width(text.as_str());
@@ -694,12 +742,17 @@ fn selection_content(
         lines.push(Line::from(""));
     }
 
-    for (pos, (_, opt, is_cursor)) in model.visible_rows().into_iter().enumerate() {
-        let prefix = if is_cursor { "▸ " } else { "  " };
+    let visible = model.visible_rows();
+    let total = visible.len();
+    for (pos, (_, opt, is_cursor)) in visible.into_iter().enumerate() {
+        let focus = if is_cursor { "▸" } else { " " };
+        // A searchable list types digits into the query, so it stays
+        // unnumbered; every other picker numbers its rows from the count so a
+        // two-digit row never shifts the label.
         let number = if model.is_searchable() {
             String::new()
         } else {
-            format!("{}. ", pos + 1)
+            format!("{} ", option_number(pos, total))
         };
         let base = if opt.is_enabled() {
             if is_cursor {
@@ -712,7 +765,7 @@ fn selection_content(
         } else {
             Style::default().fg(theme.text.secondary)
         };
-        let mut spans = vec![Span::styled(format!("{prefix}{number}{}", opt.label), base)];
+        let mut spans = vec![Span::styled(format!("{focus} {number}{}", opt.label), base)];
         if opt.recommended {
             spans.push(Span::styled(
                 t.picker_recommended,
@@ -796,8 +849,10 @@ fn approval_content(
             Style::default().fg(theme.status.warning),
         )));
     }
-    for (i, (label, is_cursor)) in ov.options(t).into_iter().enumerate() {
-        let text = format!("{}. {label}", i + 1);
+    let options = ov.options(t);
+    let total = options.len();
+    for (i, (label, is_cursor)) in options.into_iter().enumerate() {
+        let text = format!("{} {label}", option_number(i, total));
         if is_cursor {
             // The focused row is reversed end to end, so the eye lands on the
             // choice rather than hunting for a marker.
@@ -836,9 +891,13 @@ fn help_line(theme: &Theme, text: &str) -> Line<'static> {
 mod layout_tests {
     use super::*;
     use crate::overlay::approval::ApprovalOverlay;
-    use leveler_client_protocol::{ApprovalId, UiApprovalRequest};
+    use leveler_client_protocol::{
+        ApprovalId, ClarificationId, UiApprovalRequest, UiClarificationQuestion,
+        UiClarificationRequest,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn overlay(summary: &str) -> Overlay {
         Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
@@ -1055,5 +1114,119 @@ mod layout_tests {
         })));
         let screen = frame_of(&ov, 110, 32).join("\n");
         assert!(screen.contains("记住用户偏好"), "frame:\n{screen}");
+    }
+
+    // ── Numbered option rows ────────────────────────────────────────────────
+
+    fn clarification_rows(ov: &ClarificationOverlay) -> Vec<String> {
+        let overlay = Overlay::Clarification(Box::new(ov.clone()));
+        let (_, lines, _) =
+            content_lines(&overlay, &Theme::no_color(), 100, crate::i18n::Locale::Zh);
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn single_choice(options: &[&str]) -> ClarificationOverlay {
+        ClarificationOverlay::new(UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "选哪个？",
+            options.iter().map(|s| (*s).to_string()).collect(),
+        ))
+    }
+
+    /// Display column where a label starts in its rendered row.
+    fn label_col(rows: &[String], needle: &str) -> usize {
+        let row = rows
+            .iter()
+            .find(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle}: {rows:#?}"));
+        let byte = row.find(needle).unwrap();
+        UnicodeWidthStr::width(&row[..byte])
+    }
+
+    /// The label starts in the same column whether or not the row is focused:
+    /// a focus marker that appears/disappears must not shift the text.
+    #[test]
+    fn single_choice_options_are_numbered_under_a_stable_focus_column() {
+        let rows = clarification_rows(&single_choice(&["Go", "TypeScript", "Python", "Rust"]));
+        assert!(rows.iter().any(|r| r.contains("❯ 1. Go")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("  2. TypeScript")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("  4. Rust")), "{rows:#?}");
+        assert_eq!(label_col(&rows, "Go"), label_col(&rows, "Python"));
+        assert_eq!(label_col(&rows, "Go"), label_col(&rows, "Rust"));
+    }
+
+    #[test]
+    fn a_single_option_still_gets_a_number() {
+        let rows = clarification_rows(&single_choice(&["Only"]));
+        assert!(rows.iter().any(|r| r.contains("❯ 1. Only")), "{rows:#?}");
+    }
+
+    /// 9 → 10 must not shift the label: the number column is padded from the
+    /// option count, not from the row's own digit count.
+    #[test]
+    fn two_digit_options_keep_every_label_in_one_column() {
+        let labels: Vec<String> = (1..=12).map(|i| format!("Opt{i:02}")).collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let rows = clarification_rows(&single_choice(&refs));
+        assert!(rows.iter().any(|r| r.contains(" 9. Opt09")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("10. Opt10")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("11. Opt11")), "{rows:#?}");
+        assert_eq!(label_col(&rows, "Opt01"), label_col(&rows, "Opt09"));
+        assert_eq!(label_col(&rows, "Opt09"), label_col(&rows, "Opt10"));
+        assert_eq!(label_col(&rows, "Opt10"), label_col(&rows, "Opt12"));
+    }
+
+    /// 99 / 100 options: the column widens once, so every label still lines up.
+    #[test]
+    fn the_number_column_widens_with_the_option_count() {
+        assert_eq!(option_number(0, 9), "1.");
+        assert_eq!(option_number(8, 9), "9.");
+        assert_eq!(option_number(9, 10), "10.");
+        assert_eq!(option_number(0, 100), "  1.");
+        assert_eq!(option_number(98, 99), "99.");
+        assert_eq!(option_number(99, 100), "100.");
+        assert_eq!(option_number_width(100), 3);
+    }
+
+    /// A multi-choice keeps this project's `[x]` / `[ ]` vocabulary and puts
+    /// the stable number before it; focus and selection stay separate marks.
+    #[test]
+    fn multi_choice_numbers_sit_before_the_selection_box() {
+        let mut ov = ClarificationOverlay::new(UiClarificationRequest {
+            id: ClarificationId::new("c1"),
+            question: "选哪些？".into(),
+            options: Vec::new(),
+            questions: vec![UiClarificationQuestion {
+                header: "范围".into(),
+                question: "选哪些？".into(),
+                kind: ClarificationQuestionKind::Multi,
+                options: vec!["Go".into(), "Python".into()],
+                allow_other: false,
+                min_choices: 0,
+                max_choices: None,
+            }],
+        });
+        ov.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()));
+        ov.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        let rows = clarification_rows(&ov);
+        assert!(rows.iter().any(|r| r.contains("  1. [x] Go")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("❯ 2. [ ] Python")),
+            "{rows:#?}"
+        );
+    }
+
+    /// The free-text `其他…` row is part of the same list, so it numbers with
+    /// it instead of floating unanchored under the options.
+    #[test]
+    fn the_other_row_is_numbered_like_an_option() {
+        let rows = clarification_rows(&single_choice(&["Go", "Python"]));
+        assert!(rows.iter().any(|r| r.contains("  3. 其他…")), "{rows:#?}");
     }
 }

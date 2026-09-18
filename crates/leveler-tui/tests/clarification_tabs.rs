@@ -226,7 +226,7 @@ fn arrows_move_only_the_current_questions_cursor() {
     let scroll_before = s.conv.scroll;
     reduce(&mut s, key(KeyCode::Down));
     let frame = rendered(&mut s, 100, 30);
-    assert!(frame.contains("❯ 删除全部 mock"), "{frame}");
+    assert!(frame.contains("❯ 2. 删除全部 mock"), "{frame}");
     assert_eq!(
         s.conv.scroll, scroll_before,
         "the transcript must not scroll under an open interaction"
@@ -537,4 +537,56 @@ fn an_answered_question_can_be_reopened_and_changed() {
         chosen[0].contains("删除全部 mock"),
         "the changed answer replaced the old one: {frame}"
     );
+}
+
+/// Options carry a stable number and the label column does not move when the
+/// count crosses a digit boundary. This is the whole point of the numbering:
+/// the list is scannable and 9 → 10 does not jog the text sideways.
+#[test]
+fn options_are_numbered_and_a_two_digit_row_keeps_the_label_column() {
+    let mut s = state();
+    let options: Vec<String> = (1..=12).map(|i| format!("选项{i:02}")).collect();
+    let mut request = three_questions();
+    request.questions[0].options = options;
+    open(&mut s, request);
+    let frame = rendered(&mut s, 100, 40);
+    assert!(frame.contains("❯  1. 选项01"), "{frame}");
+    assert!(frame.contains(" 9. 选项09"), "{frame}");
+    assert!(frame.contains("10. 选项10"), "{frame}");
+    let col = |needle: &str| {
+        let row = frame.lines().find(|r| r.contains(needle)).expect(needle);
+        let byte = row.find(needle).unwrap();
+        UnicodeWidthStr::width(&row[..byte])
+    };
+    assert_eq!(col("选项09"), col("选项10"), "{frame}");
+    assert_eq!(col("选项01"), col("选项12"), "{frame}");
+}
+
+/// Focus and selection are separate marks on a multi-choice row, and the number
+/// sits in front of the box so the rows still read as one numbered list.
+#[test]
+fn multi_choice_rows_number_before_the_checkbox() {
+    let mut s = state();
+    open(&mut s, three_questions());
+    reduce(&mut s, key(KeyCode::Tab)); // 验证范围 (multi)
+    reduce(&mut s, key(KeyCode::Char(' '))); // select row 0
+    reduce(&mut s, key(KeyCode::Down)); // focus row 1
+    let frame = rendered(&mut s, 100, 30);
+    assert!(frame.contains("  1. [x] 单元测试"), "{frame}");
+    assert!(frame.contains("❯ 2. [ ] TUI 测试"), "{frame}");
+}
+
+/// A narrow terminal still numbers the options and never panics mid-number.
+#[test]
+fn a_narrow_terminal_still_renders_numbered_options() {
+    let mut s = state();
+    open(&mut s, three_questions());
+    for (w, h) in [(44u16, 24u16), (30, 24), (20, 24), (12, 24)] {
+        let frame = rendered(&mut s, w, h);
+        assert!(frame.contains('❯'), "focus survives at {w}x{h}:\n{frame}");
+        assert!(
+            frame.contains("1."),
+            "the number survives at {w}x{h}:\n{frame}"
+        );
+    }
 }

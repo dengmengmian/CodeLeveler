@@ -2122,11 +2122,18 @@ mod tests {
         let rows: Vec<String> = lines.iter().map(line_str).collect();
         let marked: Vec<&String> = rows.iter().filter(|r| r.starts_with('❯')).collect();
         assert_eq!(marked.len(), 1, "exactly one row is focused: {rows:#?}");
-        assert!(marked[0].contains("替换"), "the cursor moved: {rows:#?}");
+        assert!(
+            marked[0].starts_with("❯ 2. 替换"),
+            "the cursor moved to the second numbered row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.starts_with("  1. 保留")),
+            "the first row keeps its number and focus column: {rows:#?}"
+        );
         assert!(
             !rows
                 .iter()
-                .any(|r| r.starts_with("  保留") && r.contains('❯')),
+                .any(|r| r.starts_with("  1. 保留") && r.contains('❯')),
             "focus is not color-only: {rows:#?}"
         );
     }
