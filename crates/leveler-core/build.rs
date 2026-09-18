@@ -36,8 +36,47 @@ fn main() {
         // No git available: say so rather than claim a clean tree.
         None => true,
     };
+    // A deterministic digest of the SOURCE this binary was built from: the
+    // revision plus the exact working-tree delta. `dirty` is metadata — it
+    // says "uncommitted work exists" — but it cannot identify the artifact:
+    // running the SAME dirty binary twice must read as one generation, and a
+    // rebuilt one from different source must not. Two runs of the same file
+    // share this digest because it is compiled in; a rebuild whose build
+    // script re-ran hashes the new delta and differs.
+    let fingerprint = git_fingerprint(&commit);
     println!("cargo:rustc-env=LEVELER_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=LEVELER_BUILD_DIRTY={dirty}");
+    println!("cargo:rustc-env=LEVELER_BUILD_FINGERPRINT={fingerprint}");
+}
+
+/// `revision-<stable hash of the working-tree delta>`, or `unknown` when git
+/// is unavailable. A stable (non-randomized) hash keeps this reproducible for
+/// an unchanged tree; only a real delta moves it.
+fn git_fingerprint(commit: &str) -> String {
+    if commit == "unknown" {
+        return "unknown".to_string();
+    }
+    let diff = git(&["diff", "HEAD", "--no-color"]).unwrap_or_default();
+    let status = git(&["status", "--porcelain"]).unwrap_or_default();
+    let mut buf = String::with_capacity(commit.len() + diff.len() + status.len() + 4);
+    buf.push_str(commit);
+    buf.push('\u{0}');
+    buf.push_str(&status);
+    buf.push('\u{0}');
+    buf.push_str(&diff);
+    format!("{commit}-{:016x}", fnv1a(buf.as_bytes()))
+}
+
+/// FNV-1a 64-bit. Stable across builds and platforms (unlike
+/// `DefaultHasher`), with no build dependency, which is all a provenance
+/// digest needs.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn git(args: &[&str]) -> Option<String> {

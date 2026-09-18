@@ -2435,6 +2435,16 @@ mod runtime_consistency_tests {
             version: version.into(),
             revision: revision.into(),
             dirty,
+            fingerprint: String::new(),
+        }
+    }
+
+    fn with_fingerprint(revision: &str, dirty: bool, fingerprint: &str) -> BuildIdentity {
+        BuildIdentity {
+            version: "0.2.0-beta.1".into(),
+            revision: revision.into(),
+            dirty,
+            fingerprint: fingerprint.into(),
         }
     }
 
@@ -2518,9 +2528,9 @@ mod runtime_consistency_tests {
         ));
     }
 
-    /// The dirty matrix. A modified tree is not identified by the commit it
-    /// was modified from, so it matches nothing — not a clean build of that
-    /// commit, and not another dirty build of it either.
+    /// The dirty matrix for a LEGACY runtime with no fingerprint: a modified
+    /// tree is not identified by the commit it was modified from, so it
+    /// matches nothing.
     #[test]
     fn dirty_builds_are_outdated_in_every_direction() {
         let dirty = build("0.2.0-beta.1", "abc123", true);
@@ -2535,9 +2545,34 @@ mod runtime_consistency_tests {
                     classify_runtime(Some(reported), expected),
                     RuntimeConsistency::Outdated { .. }
                 ),
-                "a dirty build must never be reused: {reported:?} vs {expected:?}"
+                "a fingerprint-less dirty build must never be reused: {reported:?} vs {expected:?}"
             );
         }
+    }
+
+    /// A dirty development build recognizes its OWN artifact: the same
+    /// executable launched twice is one generation, whatever uncommitted work
+    /// it was built from.
+    #[test]
+    fn a_dirty_build_with_its_own_fingerprint_is_current() {
+        let me = with_fingerprint("abc123", true, "abc123-deadbeef");
+        let same_artifact = with_fingerprint("abc123", true, "abc123-deadbeef");
+        assert!(matches!(
+            classify_runtime(Some(&same_artifact), &me),
+            RuntimeConsistency::Current
+        ));
+    }
+
+    /// A rebuild from different source is a new generation and still triggers
+    /// the handover.
+    #[test]
+    fn a_rebuilt_dirty_build_is_outdated() {
+        let me = with_fingerprint("abc123", true, "abc123-deadbeef");
+        let rebuilt = with_fingerprint("abc123", true, "abc123-0badcafe");
+        assert!(matches!(
+            classify_runtime(Some(&rebuilt), &me),
+            RuntimeConsistency::Outdated { .. }
+        ));
     }
 }
 
@@ -2551,6 +2586,7 @@ mod replacement_verification_tests {
             version: "0.2.0-beta.1".into(),
             revision: revision.into(),
             dirty,
+            fingerprint: String::new(),
         }
     }
 
