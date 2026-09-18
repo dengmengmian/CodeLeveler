@@ -341,6 +341,39 @@ struct BtwSession {
 /// because a detached answer worker clears its own handle on completion.
 type BtwThreads = Arc<Mutex<HashMap<SessionId, BtwSession>>>;
 
+/// One runtime-quiescence reading.
+///
+/// The retire drain and `runtime_info` both build it from [`runtime_quiescence`],
+/// so "the runtime is idle" means exactly one thing: no main turn and no
+/// background task left. A count of turns alone is not idle — a background
+/// build can outlive the turn that started it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeQuiescence {
+    pub(crate) active_turns: u32,
+    pub(crate) active_background_tasks: u32,
+}
+
+impl RuntimeQuiescence {
+    pub(crate) fn quiescent(self) -> bool {
+        self.active_turns == 0 && self.active_background_tasks == 0
+    }
+}
+
+/// The ONE runtime-quiescence computation. `runtime_info` (what a client
+/// reads) and the retire drain (what the process waits on) both go through
+/// this, so a client can never be told "idle" by an accounting the drain
+/// disagrees with.
+async fn runtime_quiescence(
+    active: &ActiveTurns,
+    background: &leveler_execution::BackgroundTaskRegistry,
+) -> RuntimeQuiescence {
+    let (turns, _) = active.load();
+    RuntimeQuiescence {
+        active_turns: turns as u32,
+        active_background_tasks: background.alive_count().await as u32,
+    }
+}
+
 /// An in-process runtime client backed by an [`Application`].
 pub struct InProcessRuntimeClient {
     app: Arc<Application>,
@@ -377,6 +410,10 @@ pub struct InProcessRuntimeClient {
     /// Set when the runtime owner begins an explicit shutdown (Quit);
     /// reported in health and never bypasses ownership fencing.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Why this runtime is retiring, when a client asked it to hand over. Set
+    /// once alongside `shutting_down`; read by `runtime_info` so a waiting
+    /// client can say WHICH generation change asked for the handover.
+    retiring_reason: std::sync::Mutex<Option<leveler_client_protocol::RestartReason>>,
     /// Cancelled to retire the process once work has drained. `None` for an
     /// in-process runtime, which has no process of its own to retire.
     process_shutdown: Option<CancellationToken>,
@@ -611,6 +648,7 @@ impl InProcessRuntimeClient {
             btw: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
             shutting_down: shutting_down.clone(),
+            retiring_reason: std::sync::Mutex::new(None),
             process_shutdown: None,
             durable_wire_ack: false,
             in_flight,
@@ -3432,6 +3470,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // the replacement never happens.
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                *self
+                    .retiring_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
                 tracing::info!(?reason, "runtime retiring once work drains");
                 if let Some(token) = self.process_shutdown.clone() {
                     let active = self.active.clone();
@@ -3440,10 +3482,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         // Idle means nothing is still owed: no turn running and
                         // no background task alive. A turn ending is not
                         // enough — a background build outliving its turn is
-                        // exactly the work a replacement would destroy.
+                        // exactly the work a replacement would destroy. The
+                        // SAME reading `runtime_info` reports, so a client that
+                        // keeps asking sees the drain reach zero.
                         loop {
-                            let (turns, _) = active.load();
-                            if turns == 0 && background.alive_count().await == 0 {
+                            if runtime_quiescence(&active, &background).await.quiescent() {
                                 break;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3954,6 +3997,14 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let (active, capacity) = self.active.load();
         let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
+        let retiring_reason = self
+            .retiring_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .to_owned();
+        // The SAME reading the drain waits on: a client's view of "idle" is
+        // never a second accounting.
+        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await;
         Ok(leveler_client_protocol::RuntimeInfo {
             runtime_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3966,9 +4017,12 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 // Health is admission state, never authority: task writes
                 // still require a current OwnershipToken regardless.
                 accepting_work: !shutting_down && active < capacity,
-                active_turns: active as u32,
+                active_turns: quiescence.active_turns,
+                active_background_tasks: quiescence.active_background_tasks,
+                quiescent: quiescence.quiescent(),
                 turn_capacity: Some(capacity as u32),
                 shutting_down,
+                retiring_reason,
             },
         })
     }

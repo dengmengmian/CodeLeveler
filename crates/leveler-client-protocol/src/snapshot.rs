@@ -269,13 +269,45 @@ pub struct RuntimeHealth {
     /// Main turns currently executing.
     #[serde(default)]
     pub active_turns: u32,
+    /// Background tasks (dev servers, builds) still alive across the whole
+    /// runtime. `active_turns == 0` alone is NOT idle: a `cargo check` can
+    /// outlive its turn, and a retire that ignored this would throw that work
+    /// away. Reported so a client can see WHY a retiring runtime has not gone.
+    #[serde(default)]
+    pub active_background_tasks: u32,
+    /// The runtime can exit now: no main turn and no background task left.
+    /// Computed by the runtime from the SAME two counters, so a client can
+    /// never be told "idle" by an accounting the drain disagrees with.
+    #[serde(default)]
+    pub quiescent: bool,
     /// The concurrent main-turn admission limit, when one exists. This is
     /// the real ActiveTurns capacity, not an invented number.
     #[serde(default)]
     pub turn_capacity: Option<u32>,
-    /// The runtime has begun an explicit shutdown.
+    /// The runtime has begun a shutdown. Two reasons share this commit point:
+    /// an explicit `Quit`, and retirement for a generation handover — the
+    /// second carries `retiring_reason`.
     #[serde(default)]
     pub shutting_down: bool,
+    /// Why the runtime is retiring, when it is doing so for a generation
+    /// handover (`BuildMismatch` / `ConfigChanged`). `None` for a plain
+    /// `Quit` and for a runtime that is still serving.
+    #[serde(default)]
+    pub retiring_reason: Option<crate::RestartReason>,
+}
+
+impl RuntimeHealth {
+    /// Whether the runtime may exit now. The one predicate shared by the
+    /// client-side handover wait and the runtime's own drain.
+    pub fn quiescent(&self) -> bool {
+        self.active_turns == 0 && self.active_background_tasks == 0
+    }
+
+    /// Whether the runtime is retiring for a generation handover (as opposed
+    /// to an explicit `Quit`).
+    pub fn retiring(&self) -> bool {
+        self.shutting_down && self.retiring_reason.is_some()
+    }
 }
 
 /// Coarse runtime state, surfaced in the status line .

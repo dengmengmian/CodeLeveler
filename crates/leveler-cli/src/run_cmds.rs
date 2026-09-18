@@ -371,25 +371,104 @@ async fn runtime_is_current(
     ))
 }
 
-/// Wait for the retiring runtime to release its socket. Bounded: a runtime
-/// that will not go must be reported, never waited on forever — and never
-/// escalated to a kill, which is the active work this whole path protects.
+/// How often the handover wait re-states a retiring runtime's progress.
+///
+/// This is an observation cadence, NEVER a deadline. A runtime still
+/// finishing the work it already owns is not a startup failure; the only
+/// thing this interval decides is how often the user is told what is still
+/// owed.
 #[cfg(unix)]
-async fn wait_for_runtime_exit(socket_path: &Path) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
-    loop {
-        if tokio::net::UnixStream::connect(socket_path).await.is_err() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "the previous local runtime did not finish its work within {}s; \
-                 it is still running and was not interrupted — try again once it is idle",
-                DAEMON_ENSURE_TIMEOUT.as_secs()
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+const HANDOVER_STATUS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Human wording for a handover reason.
+#[cfg(unix)]
+fn restart_reason_label(reason: leveler_client_protocol::RestartReason) -> &'static str {
+    use leveler_client_protocol::RestartReason;
+    match reason {
+        RestartReason::BuildMismatch => "build mismatch",
+        RestartReason::ConfigChanged => "configuration changed",
+        RestartReason::UpdateReady => "a newer build is installed",
     }
+}
+
+/// The lifecycle line a retiring runtime reports: exactly the two things the
+/// drain waits for, so a user can see WHY it has not exited yet.
+#[cfg(unix)]
+fn retiring_status(health: &leveler_client_protocol::RuntimeHealth) -> String {
+    let phase = if health.quiescent() {
+        "quiescent, exiting"
+    } else {
+        "finishing existing work"
+    };
+    format!(
+        "turns {} · background tasks {} · {phase}",
+        health.active_turns, health.active_background_tasks
+    )
+}
+
+/// Observe a retiring runtime until it releases its socket.
+///
+/// There is NO deadline here on purpose. The former 10s bail turned "the old
+/// runtime is still working" into "the new TUI cannot start", which is the
+/// deadlock this closes. A generation handover therefore waits for the old
+/// runtime's own drain: it never interrupts the work, never kills the
+/// process, and never starts a second daemon for the same repository.
+///
+/// `interval` only paces how often progress is re-stated.
+#[cfg(unix)]
+async fn observe_retiring_runtime(
+    client: &LocalSocketRuntimeClient,
+    socket_path: &Path,
+    reason: leveler_client_protocol::RestartReason,
+    interval: Duration,
+) {
+    let mut last = String::new();
+    loop {
+        let status = match leveler_local_transport::LocalRuntimeService::runtime_info(client).await
+        {
+            Ok(info) => retiring_status(&info.health),
+            Err(_) => {
+                if tokio::net::UnixStream::connect(socket_path).await.is_err() {
+                    // The request path failed AND the socket no longer answers:
+                    // the previous runtime has released it. Handover complete.
+                    return;
+                }
+                // Still alive but not answering the handshake (an older
+                // generation): say so once, then keep waiting rather than
+                // failing the startup on a runtime we cannot read.
+                "state unobservable (the old runtime does not answer the handshake)".to_string()
+            }
+        };
+        if status != last {
+            eprintln!(
+                "Runtime update pending: the previous local runtime is retiring ({}).\n  \
+                 {status}\n  \
+                 Existing work will not be interrupted.",
+                restart_reason_label(reason),
+            );
+            last = status;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Ask a different-generation runtime to retire, then wait for it to go.
+///
+/// The runtime owns the drain — it keeps the work it already owns and exits
+/// once that work is done. Replacing a binary on disk is not an update; this
+/// is.
+#[cfg(unix)]
+async fn retire_runtime(
+    client: &LocalSocketRuntimeClient,
+    socket_path: &Path,
+    reason: leveler_client_protocol::RestartReason,
+) -> anyhow::Result<()> {
+    client
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle { reason })
+        .await
+        .map_err(|e| anyhow::anyhow!("could not ask the local runtime to retire: {e}"))?;
+    observe_retiring_runtime(client, socket_path, reason, HANDOVER_STATUS_INTERVAL).await;
+    Ok(())
 }
 
 /// Discover the repository's local runtime, starting one if none is running.
@@ -426,35 +505,23 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
                     expected = %expected.short(),
                     "local runtime is a different build; asking it to retire"
                 );
-                // The runtime owns the drain. We do not kill it, and we do not
-                // poll it for idleness: it stops taking new work, finishes what
-                // it already owns, and exits. Replacing a binary on disk is not
-                // an update — this is.
-                client
-                    .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
-                        reason: leveler_client_protocol::RestartReason::BuildMismatch,
-                    })
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("could not ask the local runtime to retire: {e}")
-                    })?;
-                drop(client);
-                wait_for_runtime_exit(&socket_path).await?;
+                retire_runtime(
+                    &client,
+                    &socket_path,
+                    leveler_client_protocol::RestartReason::BuildMismatch,
+                )
+                .await?;
             }
             RuntimeConsistency::ConfigChanged => {
                 tracing::info!(
                     "local runtime loaded a different configuration generation; asking it to retire"
                 );
-                client
-                    .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
-                        reason: leveler_client_protocol::RestartReason::ConfigChanged,
-                    })
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("could not ask the local runtime to retire: {e}")
-                    })?;
-                drop(client);
-                wait_for_runtime_exit(&socket_path).await?;
+                retire_runtime(
+                    &client,
+                    &socket_path,
+                    leveler_client_protocol::RestartReason::ConfigChanged,
+                )
+                .await?;
             }
         }
     }
@@ -1724,6 +1791,129 @@ mod tui_runtime_selection_tests {
         ));
 
         assert!(connect_default_runtime(&socket).await.unwrap().is_none());
+    }
+
+    /// A runtime that is still finishing work is NOT a startup failure.
+    ///
+    /// The defect this pins: the handover used to bail after 10s with
+    /// "did not finish its work", so a busy old generation dead-ended the new
+    /// TUI. It must instead wait for the runtime's own drain — here a
+    /// background task outlives several observation intervals — and return
+    /// only once the socket is released.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_retiring_runtime_is_waited_on_not_failed() {
+        use leveler_app::{Application, InProcessRuntimeClient};
+        use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
+        use leveler_model::ModelRef;
+        use leveler_project::Layout;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = tmp.path().join("configs");
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(config.join("providers")).unwrap();
+        std::fs::create_dir_all(config.join("models")).unwrap();
+        std::fs::write(
+            config.join("providers/mock.yaml"),
+            "id: mock\nprotocol: openai_chat\nbase_url: http://127.0.0.1:9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("models/m.yaml"),
+            r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: false
+  vision: false
+limits:
+  context_window: 8192
+  reliable_context: 4096
+  max_output_tokens: 1024
+  max_tool_schema_bytes: 8192
+  max_parallel_tool_calls: 1
+compatibility:
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+"#,
+        )
+        .unwrap();
+        let layout = Layout::from_parts(repo.clone(), config, home.join("state"));
+        let app = Arc::new(Application::assemble(layout).unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime: Arc<dyn leveler_local_transport::LocalRuntimeService> = Arc::new(
+            InProcessRuntimeClient::new(
+                app.clone(),
+                ModelRef::new("mock", "m"),
+                leveler_execution::PermissionProfile::Assisted,
+                false,
+            )
+            .with_process_shutdown(shutdown.clone()),
+        );
+        let socket = tmp.path().join("handover.sock");
+        let server = LocalSocketServer::bind(&socket, runtime).await.unwrap();
+        let serve_shutdown = shutdown.clone();
+        let serve = tokio::spawn(async move { server.serve(serve_shutdown).await });
+        let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
+
+        // A background task that outlives several observation intervals, so the
+        // wait genuinely sees a non-quiescent runtime before it drains.
+        let task = app
+            .background_tasks()
+            .spawn(
+                leveler_execution::ProcessRequest::new(
+                    "sleep",
+                    vec!["1".to_string()],
+                    repo.clone(),
+                ),
+                None,
+            )
+            .await
+            .expect("background task starts");
+
+        client
+            .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+                reason: leveler_client_protocol::RestartReason::BuildMismatch,
+            })
+            .await
+            .unwrap();
+        let health = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
+            .await
+            .unwrap()
+            .health;
+        assert_eq!(health.active_turns, 0);
+        assert_eq!(health.active_background_tasks, 1);
+        assert!(!health.quiescent());
+        assert!(health.shutting_down);
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            observe_retiring_runtime(
+                &client,
+                &socket,
+                leveler_client_protocol::RestartReason::BuildMismatch,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("the handover completes once the work drains, without a startup failure");
+
+        // The drain's own token fired, so the process would exit and the
+        // socket is gone; the replacement could now bind.
+        assert!(shutdown.is_cancelled());
+        serve.await.unwrap().unwrap();
+        drop(task);
     }
 
     #[test]

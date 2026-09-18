@@ -934,6 +934,12 @@ async fn health_reports_identity_and_admission() {
     );
     assert!(info.health.accepting_work, "an idle daemon accepts work");
     assert_eq!(info.health.active_turns, 0);
+    assert_eq!(info.health.active_background_tasks, 0);
+    assert!(
+        info.health.quiescent(),
+        "an idle daemon reports the same quiescence the drain waits on"
+    );
+    assert!(info.health.retiring_reason.is_none());
     assert!(info.health.turn_capacity.unwrap_or(0) > 0, "real capacity");
     assert!(!info.health.shutting_down);
 

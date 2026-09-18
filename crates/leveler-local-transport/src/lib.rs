@@ -1787,8 +1787,11 @@ mod tests {
                 health: leveler_client_protocol::RuntimeHealth {
                     accepting_work: true,
                     active_turns: 0,
+                    active_background_tasks: 0,
+                    quiescent: true,
                     turn_capacity: Some(4),
                     shutting_down: false,
+                    retiring_reason: None,
                 },
             })
         }

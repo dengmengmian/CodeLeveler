@@ -394,6 +394,13 @@ async fn an_idle_runtime_retires_itself_when_asked() {
 
     // Nothing is running, so the drain is immediate and the process is asked
     // to end.
+    let retiring = runtime.runtime_info().await.unwrap().health;
+    assert!(retiring.quiescent(), "an idle runtime is quiescent");
+    assert_eq!(
+        retiring.retiring_reason,
+        Some(leveler_client_protocol::RestartReason::BuildMismatch),
+        "a handover request records why it is retiring"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
         .await
         .expect("an idle runtime retires promptly");
@@ -469,7 +476,23 @@ async fn a_live_background_task_holds_the_handover_open() {
         .unwrap();
 
     // No turn is running, so a turn-only idea of idleness would retire here.
-    assert_eq!(runtime.runtime_info().await.unwrap().health.active_turns, 0);
+    // The health a client reads must agree with the drain: `active_turns == 0`
+    // is NOT quiescent while background work is alive.
+    let health = runtime.runtime_info().await.unwrap().health;
+    assert_eq!(health.active_turns, 0);
+    assert_eq!(health.active_background_tasks, 1);
+    assert!(
+        !health.quiescent(),
+        "a live background task is not idle, whatever the turn count says"
+    );
+    assert!(
+        !health.accepting_work,
+        "a retiring runtime reports that it takes no new work"
+    );
+    assert_eq!(
+        health.retiring_reason,
+        Some(leveler_client_protocol::RestartReason::BuildMismatch)
+    );
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(3), token.cancelled())
             .await
@@ -477,11 +500,97 @@ async fn a_live_background_task_holds_the_handover_open() {
         "a runtime with live background work has not finished; it must not retire"
     );
 
+    // A second retire request (two clients racing the same handover) is
+    // harmless: the drain is already committed and still waits for the SAME
+    // work, never cut short by the duplicate.
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::ConfigChanged,
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), token.cancelled())
+            .await
+            .is_err(),
+        "a duplicate retire request must not end the drain early"
+    );
+
     // The work settles, and only then does the handover proceed.
     app.background_tasks().kill(&task_id).await.ok();
     tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
         .await
         .expect("once nothing is left running, the runtime retires");
+}
+
+/// The client's idea of "idle" and the drain's are the SAME reading.
+///
+/// The defect this pins: `RuntimeHealth` used to expose only `active_turns`,
+/// so a runtime with a live background task and no turn looked idle to any
+/// client while the drain knew it was not. The counters and the derived
+/// `quiescent` flag now come from one computation.
+#[tokio::test]
+async fn health_reports_the_same_quiescence_the_drain_waits_on() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+
+    let idle = runtime.runtime_info().await.unwrap().health;
+    assert!(idle.quiescent(), "an idle runtime is quiescent");
+    assert_eq!(idle.active_turns, 0);
+    assert_eq!(idle.active_background_tasks, 0);
+    assert!(idle.retiring_reason.is_none());
+
+    let task = app
+        .background_tasks()
+        .spawn(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".to_string()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+        )
+        .await
+        .expect("background task starts");
+
+    let busy = runtime.runtime_info().await.unwrap().health;
+    assert_eq!(busy.active_turns, 0, "no turn is running");
+    assert_eq!(busy.active_background_tasks, 1);
+    assert!(
+        !busy.quiescent(),
+        "a background task alone keeps the runtime from being idle"
+    );
+    assert_eq!(
+        busy.quiescent(),
+        busy.active_turns == 0 && busy.active_background_tasks == 0,
+        "quiescent must be derived from exactly the two counters"
+    );
+
+    app.background_tasks().kill(&task).await.ok();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if runtime.runtime_info().await.unwrap().health.quiescent() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the settled background task must make the runtime quiescent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// A real registry spawn/settlement is projected onto the owning session's
@@ -617,6 +726,20 @@ async fn a_running_turn_holds_the_handover_open() {
         .unwrap();
     assert_turn_running(&runtime, &session).await;
 
+    // A second, idle session created before retirement: after retirement
+    // starts, a turn submitted for it must be refused, not silently admitted.
+    let other = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "must not start during retirement".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+
     runtime
         .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
             reason: leveler_client_protocol::RestartReason::BuildMismatch,
@@ -639,6 +762,20 @@ async fn a_running_turn_holds_the_handover_open() {
     assert!(
         !runtime.runtime_info().await.unwrap().health.accepting_work,
         "a retiring runtime does not take new work"
+    );
+    let refused = runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: other,
+            content: "must not start".to_string(),
+            attachments: vec![],
+        })
+        .await;
+    assert!(
+        refused
+            .expect_err("a retiring runtime must refuse a new turn")
+            .to_string()
+            .contains("retiring"),
+        "the refusal must say the runtime is retiring"
     );
 
     model_stop.cancel();
