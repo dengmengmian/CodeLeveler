@@ -315,6 +315,22 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
         "request_user_input" | "ask_user" => user_input_summary(&v, t),
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
         "find_files" => s("pattern"),
+        // A browser call acts on a URL, an element ref, a key or a tab. The
+        // generic field walk below never reaches those keys, so the row would
+        // otherwise have no target at all.
+        "browser_tab" => {
+            let url = s("url");
+            if url.is_empty() { s("tab") } else { url }
+        }
+        "browser_act" => {
+            let element = s("ref");
+            if element.is_empty() {
+                s("key")
+            } else {
+                element
+            }
+        }
+        "browser_inspect" => s("tab"),
         "update_plan" => s("explanation"),
         "update_goal" => update_goal_summary_text(&v, t),
         "task" => {
@@ -632,6 +648,17 @@ pub(crate) fn tool_action_label(name: &str) -> String {
 /// Localized presentation label for a tool name.
 pub(crate) fn tool_action_label_for(name: &str, locale: crate::i18n::Locale) -> String {
     crate::tool_taxonomy::presentation_label(name, locale)
+}
+
+/// Localized presentation label for one CALL. Tools whose arguments choose
+/// among several jobs (browser tab/act/inspect) name the job; every other tool
+/// keeps its own label. A visible row must never be reduced to elapsed time
+/// because the tool's single label was suppressed under a run head.
+pub(crate) fn tool_call_label(name: &str, arguments: &str, locale: crate::i18n::Locale) -> String {
+    if let Some(label) = crate::tool_taxonomy::call_action_label(name, arguments, locale) {
+        return label.to_string();
+    }
+    tool_action_label_for(name, locale)
 }
 
 /// Compact one-line tool heading text (glyph + presentation + summary).
@@ -1279,6 +1306,70 @@ mod m1_tests {
         );
         assert_eq!(tool_action_label_for("run_command", Locale::Zh), "执行命令");
         assert_eq!(tool_action_label_for("apply_patch", Locale::Zh), "编辑文件");
+    }
+
+    /// A browser call's action is chosen by its arguments, so the tool label
+    /// (浏览网页) is not enough to say what the call did. The call label names
+    /// the job; the target names what it ran on.
+    #[test]
+    fn browser_calls_name_their_own_action_and_target() {
+        assert_eq!(
+            crate::tool_cell::tool_call_label(
+                "browser_tab",
+                r#"{"action":"navigate","url":"http://x"}"#,
+                Locale::Zh
+            ),
+            "打开页面"
+        );
+        assert_eq!(
+            crate::tool_cell::tool_call_label(
+                "browser_tab",
+                r#"{"action":"snapshot"}"#,
+                Locale::Zh
+            ),
+            "读取页面"
+        );
+        assert_eq!(
+            crate::tool_cell::tool_call_label(
+                "browser_act",
+                r#"{"action":"click","ref":"e1"}"#,
+                Locale::Zh
+            ),
+            "点击"
+        );
+        assert_eq!(
+            crate::tool_cell::tool_call_label(
+                "browser_inspect",
+                r#"{"what":"console"}"#,
+                Locale::En
+            ),
+            "Read console"
+        );
+        // A tool with one job keeps its own label.
+        assert_eq!(
+            crate::tool_cell::tool_call_label("read_file", r#"{"path":"a.rs"}"#, Locale::Zh),
+            "读取文件"
+        );
+        assert_eq!(
+            tool_summary_for(
+                "browser_tab",
+                r#"{"action":"navigate","url":"http://localhost:3000"}"#,
+                Locale::Zh.text()
+            ),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            tool_summary_for(
+                "browser_act",
+                r#"{"action":"press","key":"Enter"}"#,
+                Locale::Zh.text()
+            ),
+            "Enter"
+        );
+        assert!(
+            tool_summary_for("browser_tab", r#"{"action":"snapshot"}"#, Locale::Zh.text())
+                .is_empty()
+        );
     }
 
     /// The gutter number carried by each row, in order, for one patch.

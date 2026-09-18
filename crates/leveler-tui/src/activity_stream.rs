@@ -144,6 +144,7 @@ pub(crate) fn render_group_rows(
                     call,
                     theme,
                     width,
+                    locale,
                     t,
                     group.expanded,
                     now_elapsed_secs,
@@ -229,6 +230,7 @@ pub(crate) fn render_group_rows(
                             call,
                             theme,
                             width,
+                            locale,
                             t,
                             group.expanded,
                             now_elapsed_secs,
@@ -767,7 +769,7 @@ fn unit_lines(
     let action = if call.name == "task" {
         t.unsupported_task_action.to_string()
     } else {
-        tool_action_label_for(&call.name, locale)
+        crate::tool_cell::tool_call_label(&call.name, &call.arguments, locale)
     };
 
     // Trailing status marker: a running call shows its live elapsed time so a
@@ -811,12 +813,6 @@ fn unit_lines(
             Style::default().fg(glyph_color),
         ));
     }
-    if show_action {
-        head.push(Span::styled(
-            action.clone(),
-            Style::default().fg(body_ink(call.status, theme)),
-        ));
-    }
 
     // The head carries the one-line target inline (text color; `$` highlighted
     // for shell). Width budget reserves the tail plus a small margin.
@@ -830,21 +826,34 @@ fn unit_lines(
     {
         summary = file;
     }
-    if !summary.is_empty() && summary != "{}" {
+    let has_summary = !summary.is_empty() && summary != "{}";
+    // A visible tool row must say WHAT ran. A run child may omit its action
+    // when the run head already carries the tool's own label AND the target
+    // differs; anything else — a more specific action, or no target at all —
+    // would leave elapsed time and a line count standing alone.
+    let render_action =
+        show_action || !has_summary || action != tool_action_label_for(&call.name, locale);
+    if render_action {
+        head.push(Span::styled(
+            action.clone(),
+            Style::default().fg(body_ink(call.status, theme)),
+        ));
+    }
+    if has_summary {
         let shell = is_shell_call(call)
             && crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
         let used: usize = head
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum::<usize>()
-            + usize::from(show_action) * 2
+            + usize::from(render_action) * 2
             + usize::from(shell) * 2;
         let avail = width
             .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
             .max(8);
         // The label needs a gap before its target; a branch or anchor already
         // ended in one.
-        if show_action {
+        if render_action {
             head.push(Span::raw("  "));
         }
         if shell {
@@ -1266,6 +1275,7 @@ fn command_unit_lines(
     call: &ToolCallBlock,
     theme: &Theme,
     width: usize,
+    locale: Locale,
     t: &UiText,
     group_expanded: bool,
     now_elapsed_secs: u64,
@@ -1285,7 +1295,13 @@ fn command_unit_lines(
             .unwrap_or_else(|| format!("{TOOL_ANCHOR} "))
     };
     let prompt = crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
-    let command = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    let mut command = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    // A shell call the runtime refused can carry no renderable command line.
+    // Duration and exit code would then be the whole row, so name the tool:
+    // every visible row must say what ran.
+    if command.trim().is_empty() {
+        command = crate::tool_cell::tool_action_label_for(&call.name, locale);
+    }
     let facts: String = head.facts.iter().map(|f| format!(" \u{b7} {f}")).collect();
 
     let mut spans = vec![
@@ -2974,6 +2990,125 @@ mod tests {
             !lines[1].contains("读取文件"),
             "a child must not repeat the tool: {lines:?}"
         );
+    }
+
+    /// No visible unit head may render as opener plus metadata only.
+    ///
+    /// A unit head wears the `›` anchor (or a `├─`/`└─` branch inside a run)
+    /// and must carry a span in a body ink — the ink reserved for a call's own
+    /// words. Elapsed time, line counts and status glyphs use chrome inks, so
+    /// a row wearing only those says nothing about what ran. Result rows
+    /// (`  └ N 行`) ride under such a head and are exempt: their account is
+    /// the head itself.
+    fn assert_no_metadata_only_rows(group: &ToolGroupBlock, theme: &Theme) {
+        let lines = render_group(group, theme, 100, Locale::Zh, Locale::Zh.text(), 0, None);
+        for line in &lines {
+            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let trimmed = raw.trim_start();
+            let is_unit_head = trimmed.starts_with(TOOL_ANCHOR)
+                || trimmed.starts_with("\u{251c}\u{2500}")
+                || trimmed.starts_with("\u{2514}\u{2500}");
+            if !is_unit_head {
+                continue;
+            }
+            let primary = line.spans.iter().any(|s| {
+                !s.content.trim().is_empty()
+                    && matches!(
+                        s.style.fg,
+                        Some(c) if c == theme.ink(Ink::Active)
+                            || c == theme.ink(Ink::Settled)
+                            || c == theme.ink(Ink::Prose)
+                    )
+            });
+            assert!(
+                primary,
+                "a visible tool head carries only metadata: {raw:?}"
+            );
+        }
+    }
+
+    /// Found in a real dogfood: a browser run printed `› 浏览网页` and then
+    /// two children carrying only `· 7.8s · 4 行` and `· 66+ 行`. The run head
+    /// named the tool once, the child had no target, and the child suppressed
+    /// its own action label — so nothing on the row said what actually ran.
+    /// The child must name its action, and the browser's per-call action is
+    /// more specific than the tool label.
+    #[test]
+    fn a_browser_run_child_names_the_action_it_took() {
+        let navigate = call(
+            "browser_tab",
+            r#"{"action":"navigate","url":"http://localhost:3000"}"#,
+            ToolStatus::Ok,
+        );
+        let snapshot = call("browser_tab", r#"{"action":"snapshot"}"#, ToolStatus::Ok);
+        let g = group(vec![navigate, snapshot]);
+        assert_no_metadata_only_rows(&g, &Theme::dark());
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[0].starts_with("\u{203a} 浏览网页"),
+            "the run head still names the tool once: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("打开页面") && l.contains("http://localhost:3000")),
+            "the navigate child names its action and target: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("读取页面")),
+            "the snapshot child names its action: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.trim_start().starts_with('\u{b7}')),
+            "no child is left as bare metadata: {lines:?}"
+        );
+    }
+
+    /// The invariant is not about the browser: any run whose child has no
+    /// renderable target must still name what ran instead of showing elapsed
+    /// time alone.
+    #[test]
+    fn a_run_child_without_a_target_still_names_its_action() {
+        let a = call("mystery_tool", r#"{"opaque":1}"#, ToolStatus::Ok);
+        let b = call("mystery_tool", r#"{"opaque":2}"#, ToolStatus::Ok);
+        let g = group(vec![a, b]);
+        assert_no_metadata_only_rows(&g, &Theme::dark());
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.iter().any(|l| l.contains("mystery_tool")),
+            "a child with no target falls back to its action label: {lines:?}"
+        );
+    }
+
+    /// The invariant covers every shape a tool row can take: runs, batches,
+    /// edits and single calls across the taxonomy and MCP pseudo-tools.
+    #[test]
+    fn every_kind_of_tool_row_keeps_a_primary() {
+        let theme = Theme::dark();
+        let cases: &[(&str, &str)] = &[
+            ("read_file", r#"{"path":"src/main.rs"}"#),
+            ("grep", r#"{"pattern":"foo"}"#),
+            ("find_files", r#"{"pattern":"*.rs"}"#),
+            ("apply_patch", r#"{"path":"a.rs"}"#),
+            ("write_file", r#"{"path":"a.rs","content":"x"}"#),
+            ("run_command", r#"{"program":"cargo","args":["test"]}"#),
+            ("run_command", r#"{"program":""}"#),
+            ("shell_command", r#"{"cmd":""}"#),
+            ("browser_tab", r#"{"action":"navigate","url":"http://x"}"#),
+            ("browser_tab", r#"{"action":"snapshot"}"#),
+            ("browser_act", r#"{"action":"click","ref":"e1"}"#),
+            ("browser_inspect", r#"{"what":"console"}"#),
+            ("web_fetch", r#"{"url":"http://x"}"#),
+            ("mcp__server__thing", r#"{"arg":1}"#),
+            ("mystery_tool", r#"{"opaque":1}"#),
+        ];
+        for (name, args) in cases {
+            let g = group(vec![
+                call(name, args, ToolStatus::Ok),
+                call(name, args, ToolStatus::Ok),
+            ]);
+            assert_no_metadata_only_rows(&g, &theme);
+        }
     }
 
     /// Opening a run prints each child's output under THAT child. Found by

@@ -542,6 +542,106 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
     }
 }
 
+/// Browser parity: the per-call action label (`打开页面`, `读取页面`) is
+/// presentation derived from the call's own arguments, so history must rebuild
+/// it exactly as the live turn showed it. A real dogfood caught the live run
+/// printing `├─ · 7.8s · 4 行`; this keeps the fix on both paths.
+#[test]
+fn a_browser_run_reads_the_same_live_and_replayed() {
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "确认真实页面"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("b1"),
+            name: "browser_tab".into(),
+            arguments: r#"{"action":"navigate","url":"http://localhost:3000"}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("b1"),
+            ok: true,
+            preview: "navigated: true\n".into(),
+            duration_ms: 7800,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("b2"),
+            name: "browser_tab".into(),
+            arguments: r#"{"action":"snapshot"}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("b2"),
+            ok: true,
+            preview: "heading: Hello\nbutton: Submit\n".into(),
+            duration_ms: 40,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+        RuntimeEvent::TurnAnswered,
+    ];
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(&mut replayed, vec![message(UiRole::User, "确认真实页面")]);
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let shape = |s: &AppState| -> Vec<String> {
+        crate::conversation::build::build_conversation_lines(s, 100)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.starts_with("\u{2500}\u{2500}"))
+            .collect()
+    };
+    let live_lines = shape(&live);
+    let replayed_lines = shape(&replayed);
+    assert!(
+        live_lines
+            .iter()
+            .any(|l| l.contains("打开页面") && l.contains("http://localhost:3000")),
+        "the navigate child names its action and target: {live_lines:#?}"
+    );
+    assert!(
+        live_lines.iter().any(|l| l.contains("读取页面")),
+        "the snapshot child names its action: {live_lines:#?}"
+    );
+    for l in &live_lines {
+        let t = l.trim_start();
+        let is_run_child = t.starts_with("\u{251c}\u{2500}") || t.starts_with("\u{2514}\u{2500}");
+        assert!(
+            !is_run_child || t.contains("打开页面") || t.contains("读取页面"),
+            "a browser child is never bare metadata: {l:?}"
+        );
+    }
+    assert_eq!(
+        replayed_lines, live_lines,
+        "history must read exactly as it ran"
+    );
+}
+
 fn read_started(id: &str, path: &str) -> RuntimeEvent {
     RuntimeEvent::ToolCallStarted {
         id: ToolCallId::new(id),

@@ -590,6 +590,57 @@ pub fn presentation_label(name: &str, locale: Locale) -> String {
     name.to_string()
 }
 
+/// A call's own action label when its arguments choose among distinct jobs.
+///
+/// Some tools are one name over several jobs: `browser_tab navigate` moves the
+/// page while `browser_tab snapshot` reads it. The tool label (浏览网页) names
+/// the tool, not the job, so a row that only ever shows the tool label cannot
+/// say what the call did. `None` when the tool has one job — its own label
+/// already says it.
+///
+/// This is presentation vocabulary keyed by (tool, arguments), the same shape
+/// as the summary table; it is not a second registry and the domain layer
+/// never sees it.
+pub fn call_action_label(name: &str, arguments: &str, locale: Locale) -> Option<&'static str> {
+    let key = match name {
+        "browser_tab" | "browser_act" => "action",
+        "browser_inspect" => "what",
+        _ => return None,
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let value = parsed.get(key)?.as_str()?;
+    browser_action_label(name, value, locale)
+}
+
+/// The bilingual label for one browser sub-action. Values are the wire enum
+/// names from the browser tools' own schemas.
+fn browser_action_label(tool: &str, value: &str, locale: Locale) -> Option<&'static str> {
+    let (en, zh) = match (tool, value) {
+        ("browser_tab", "navigate") => ("Open page", "打开页面"),
+        ("browser_tab", "snapshot") => ("Read page", "读取页面"),
+        ("browser_tab", "screenshot") => ("Screenshot", "页面截图"),
+        ("browser_tab", "reload") => ("Reload page", "刷新页面"),
+        ("browser_tab", "list_tabs") => ("List tabs", "列出标签页"),
+        ("browser_tab", "new_tab") => ("New tab", "新建标签页"),
+        ("browser_tab", "select_tab") => ("Select tab", "切换标签页"),
+        ("browser_tab", "close_tab") => ("Close tab", "关闭标签页"),
+        ("browser_act", "click") => ("Click", "点击"),
+        ("browser_act", "fill") => ("Fill", "填写"),
+        ("browser_act", "type") => ("Type", "输入"),
+        ("browser_act", "press") => ("Press", "按键"),
+        ("browser_act", "select") => ("Select", "选择"),
+        ("browser_act", "scroll") => ("Scroll", "滚动"),
+        ("browser_inspect", "console") => ("Read console", "读取控制台"),
+        ("browser_inspect", "page_errors") => ("Read page errors", "读取页面错误"),
+        ("browser_inspect", "network") => ("Read network", "读取网络请求"),
+        _ => return None,
+    };
+    Some(match locale {
+        Locale::Zh => zh,
+        Locale::En => en,
+    })
+}
+
 /// Compact one-line tool row: `glyph presentation summary` (no duration/ellipsis).
 pub fn compact_tool_line(
     status_glyph: &str,
