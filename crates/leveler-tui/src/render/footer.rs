@@ -889,10 +889,11 @@ mod p1_tests {
     fn a_held_input_keeps_its_key_after_the_turn_ends() {
         let mut s = state();
         s.status = leveler_client_protocol::RuntimeStatus::Idle;
-        s.pending_inputs.push(crate::pending_inputs::PendingInput {
-            text: "结果如何？".into(),
-            state: crate::pending_inputs::PendingInputState::Waiting,
-        });
+        s.pending_inputs
+            .push(crate::pending_inputs::PendingInput::queued(
+                "结果如何？",
+                leveler_client_protocol::SessionId::new("s1"),
+            ));
         assert!(hints(&s).contains("Tab 待发送"), "{}", hints(&s));
     }
 
@@ -901,10 +902,11 @@ mod p1_tests {
     fn held_inputs_name_their_keys() {
         let mut s = state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
-        s.pending_inputs.push(crate::pending_inputs::PendingInput {
-            text: "结果如何？".into(),
-            state: crate::pending_inputs::PendingInputState::Waiting,
-        });
+        s.pending_inputs
+            .push(crate::pending_inputs::PendingInput::queued(
+                "结果如何？",
+                leveler_client_protocol::SessionId::new("s1"),
+            ));
         assert!(hints(&s).contains("Tab 待发送"), "{}", hints(&s));
         s.workbench_focus = crate::state::WorkbenchFocus::Pending;
         let focused = hints(&s);

@@ -2,38 +2,63 @@
 //!
 //! Bottom control state, never conversation truth. An item leaves this list in
 //! exactly two ways: the runtime admits it (and it becomes a user message in
-//! the conversation), or the user deletes it while it is still unsent. Sending
-//! reuses the ordinary turn-input delivery (`pending_submissions`, one
-//! `CommandId`, at-least-once retries); nothing here is a second delivery path.
+//! the conversation), or the user deletes it while it is still unsent. The
+//! list is a FIFO continuation queue: once the runtime is ready for the next
+//! turn its head is submitted automatically, oldest first, one at a time
+//! (`reducer::submit::drain_pending_input`). Sending reuses the ordinary
+//! turn-input delivery (`pending_submissions`, one `CommandId`, at-least-once
+//! retries); nothing here is a second delivery path.
 
-use leveler_client_protocol::CommandId;
+use leveler_client_protocol::{CommandId, SessionId};
 
 /// One staged input and where its delivery stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInput {
     pub text: String,
     pub state: PendingInputState,
+    /// The session this was written for. The 待发送 area is shared bottom
+    /// control state, so an item staged for one session must never be sent —
+    /// manually or by the automatic drain — into whichever session is on
+    /// screen now.
+    pub session_id: SessionId,
 }
 
+/// Where a staged input stands.
+///
+/// The list is a continuation queue, not a draft box: an item written while a
+/// turn ran is `Queued`, and the runtime's next ready moment turns it into the
+/// next user turn (see `reducer::submit::drain_pending_input`). Only a delivery
+/// the client actually attempted can leave this item's outcome unknown; merely
+/// waiting in the queue is a known state and must never render as unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingInputState {
-    /// Written, not sent.
-    Waiting,
+    /// Written, not sent. The only state the automatic drain may take.
+    Queued,
     /// Sent under this id; the runtime has not answered yet.
-    Sending(CommandId),
+    Submitting(CommandId),
     /// Sent, and the first attempt got no answer. Retries carry the same id;
     /// it may already be in the runtime, so it can be neither resent nor
-    /// deleted until the runtime answers.
-    Unconfirmed(CommandId),
+    /// deleted until the runtime answers. This is the only "状态未知" state:
+    /// a delivery was attempted and its outcome cannot be determined.
+    DeliveryUnknown(CommandId),
     /// The runtime refused it. Still unsent: the user may send or delete it.
     Failed(String),
 }
 
 impl PendingInput {
+    /// Stage `text` for `session_id`: queued and unsent.
+    pub fn queued(text: impl Into<String>, session_id: SessionId) -> Self {
+        Self {
+            text: text.into(),
+            state: PendingInputState::Queued,
+            session_id,
+        }
+    }
+
     /// The id this item is out under, while it is out.
     pub fn command_id(&self) -> Option<&CommandId> {
         match &self.state {
-            PendingInputState::Sending(id) | PendingInputState::Unconfirmed(id) => Some(id),
+            PendingInputState::Submitting(id) | PendingInputState::DeliveryUnknown(id) => Some(id),
             _ => None,
         }
     }
@@ -42,8 +67,16 @@ impl PendingInput {
     pub fn is_unsent(&self) -> bool {
         matches!(
             self.state,
-            PendingInputState::Waiting | PendingInputState::Failed(_)
+            PendingInputState::Queued | PendingInputState::Failed(_)
         )
+    }
+
+    /// Queued for the next turn: written, never sent, still deleteable. The
+    /// automatic drain takes exactly this state, so a delivery already in
+    /// flight (`Submitting` / `DeliveryUnknown`) or refused (`Failed`) cannot
+    /// be queued up a second time.
+    pub fn is_queued(&self) -> bool {
+        matches!(self.state, PendingInputState::Queued)
     }
 }
 
@@ -144,9 +177,11 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             )
         } else {
             let label = match &item.state {
-                PendingInputState::Waiting => "",
-                PendingInputState::Sending(_) => t.pending_input_sending,
-                PendingInputState::Unconfirmed(_) => t.pending_input_unknown,
+                // The section header already says 待发送; a queued item has no
+                // outcome to report yet, so it gets no status column at all.
+                PendingInputState::Queued => "",
+                PendingInputState::Submitting(_) => t.pending_input_sending,
+                PendingInputState::DeliveryUnknown(_) => t.pending_input_unknown,
                 PendingInputState::Failed(_) => t.pending_input_failed,
             };
             (label.to_string(), false)
@@ -189,7 +224,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             spans.push(Span::styled(t.pending_input_delete.to_string(), muted));
         } else {
             let color = match item.state {
-                PendingInputState::Unconfirmed(_) | PendingInputState::Failed(_) => {
+                PendingInputState::DeliveryUnknown(_) | PendingInputState::Failed(_) => {
                     theme.status.warning
                 }
                 _ => theme.text.muted,
@@ -243,10 +278,9 @@ mod tests {
                 reasoning_effort: None,
             },
         );
-        state.pending_inputs.push(PendingInput {
-            text: text.into(),
-            state: PendingInputState::Waiting,
-        });
+        state
+            .pending_inputs
+            .push(PendingInput::queued(text, SessionId::new("s1")));
         state.workbench_focus = WorkbenchFocus::Pending;
         state.pending_selected = 0;
         let area = Rect::new(0, 0, width, 4);

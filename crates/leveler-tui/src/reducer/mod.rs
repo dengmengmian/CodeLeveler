@@ -24,8 +24,8 @@ use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
 use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, toggle_screen};
 use submit::{
-    complete_file_mention, complete_skill_mention, complete_slash, request_file_candidates, submit,
-    touch_slash_filter,
+    complete_file_mention, complete_skill_mention, complete_slash, drain_pending_input,
+    request_file_candidates, submit, touch_slash_filter,
 };
 
 const QUIT_CONFIRM_MESSAGE: &str = "再按一次 Ctrl+C 退出";
@@ -49,7 +49,22 @@ pub(crate) fn reconcile_images(state: &mut AppState) {
 }
 
 /// Fold an action into state, returning side effects for the event loop.
+///
+/// This is the single authority for every `AppState` transition, so it is also
+/// where the 待发送 queue drains: after the action has been applied, one queued
+/// item may be submitted when the runtime is ready for it. Keeping the drain
+/// here (rather than in an event-loop callback or a `TurnCompleted` handler)
+/// means no second path can observe the same ready state and submit the item
+/// again.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
+    let mut effects = reduce_action(state, action);
+    if let Some(advance) = drain_pending_input(state) {
+        effects.push(advance);
+    }
+    effects
+}
+
+fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
         Action::Runtime(event) => {
             let refresh = state.active_screen == Screen::Trace
@@ -305,7 +320,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 });
             }
             if let Some(item) = pending_input_for(state, &command_id) {
-                item.state = crate::pending_inputs::PendingInputState::Unconfirmed(command_id);
+                item.state = crate::pending_inputs::PendingInputState::DeliveryUnknown(command_id);
             }
         }
         EffectCompletion::SubmissionDelivered {

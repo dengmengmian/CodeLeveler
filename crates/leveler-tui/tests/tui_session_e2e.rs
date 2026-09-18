@@ -666,3 +666,116 @@ fn tui_trace_ignores_legacy_observability_loaded_without_query_id() {
         "1.5 uncorrelated payload must not populate a current /trace"
     );
 }
+
+/// A message written while a turn runs is held in 待发送, and the moment that
+/// turn reaches its terminal event it becomes the next turn on its own — with
+/// no keystroke, and without ever reading as `状态未知` while it only waited.
+#[test]
+fn a_queued_message_continues_as_the_next_turn_when_the_runtime_is_ready() {
+    let mut s = opened();
+
+    // First turn: submitted, optimistically busy, then admitted by the runtime.
+    typed(&mut s, "重构 HTTP 层");
+    let first: Vec<Effect> = enter(&mut s);
+    let first_id = match first.as_slice() {
+        [Effect::Submit { command_id, .. }] => command_id.clone(),
+        other => panic!("the first message must be submitted: {other:?}"),
+    };
+    assert!(s.is_busy());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: leveler_client_protocol::UiMessage {
+                id: MessageId::new("u1"),
+                role: leveler_client_protocol::UiRole::User,
+                text: "重构 HTTP 层".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::EffectCompleted(leveler_tui::action::EffectCompletion::SubmissionDelivered {
+            command_id: first_id,
+            snapshot: None,
+        }),
+    );
+
+    // While it runs, the user writes the follow-up.
+    typed(&mut s, "完事之后提交远端。");
+    assert!(
+        enter(&mut s).is_empty(),
+        "a busy turn holds the follow-up, it does not send it"
+    );
+    let held = screen(&mut s);
+    let row = held
+        .lines()
+        .find(|line| line.contains("完事之后提交远端。"))
+        .unwrap_or_else(|| panic!("the queued row is on screen: {held}"));
+    assert!(
+        !row.contains("状态未知"),
+        "a queued item has a known state: {row:?}"
+    );
+
+    // The running turn ends. Nothing else happens: the queue advances.
+    let advances = reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    let advance_id = match advances.as_slice() {
+        [Effect::Submit { command, command_id }] => {
+            assert!(
+                matches!(command, ClientCommand::SubmitMessage { content, .. } if content == "完事之后提交远端。"),
+                "the queued message starts the next turn: {command:?}"
+            );
+            command_id.clone()
+        }
+        // The terminal event may also issue a history query; the submission is
+        // the effect that matters.
+        other => other
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Submit { command, command_id } => {
+                    assert!(
+                        matches!(command, ClientCommand::SubmitMessage { content, .. } if content == "完事之后提交远端。"),
+                        "the queued message starts the next turn: {command:?}"
+                    );
+                    Some(command_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the queued message must be submitted: {other:?}")),
+    };
+
+    // Admitted: out of 待发送, and it is the newest user turn.
+    reduce(
+        &mut s,
+        Action::EffectCompleted(leveler_tui::action::EffectCompletion::SubmissionDelivered {
+            command_id: advance_id,
+            snapshot: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: leveler_client_protocol::UiMessage {
+                id: MessageId::new("u2"),
+                role: leveler_client_protocol::UiRole::User,
+                text: "完事之后提交远端。".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    assert!(s.pending_inputs.is_empty(), "accepted leaves 待发送");
+    let after = screen(&mut s);
+    assert!(
+        !after.contains("待发送 · 1"),
+        "the 待发送 area is gone once admitted: {after}"
+    );
+    assert!(
+        after.contains("完事之后提交远端。"),
+        "the message is now a user turn: {after}"
+    );
+    assert!(s.is_busy(), "its own turn is under way");
+}

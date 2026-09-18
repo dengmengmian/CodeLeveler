@@ -101,15 +101,17 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     if state.is_busy() {
         // Hold it in 待发送 rather than sending it: the user decides which
         // input steers the running turn, and when. Nothing unsent is shown in
-        // the conversation.
+        // the conversation. Once this turn reaches its terminal event and the
+        // runtime is ready again, `drain_pending_input` sends it as the next
+        // turn — the queue is a continuation queue, not a draft box.
         let text = state.composer.take().trim().to_string();
         if !text.is_empty() {
             state
                 .pending_inputs
-                .push(crate::pending_inputs::PendingInput {
+                .push(crate::pending_inputs::PendingInput::queued(
                     text,
-                    state: crate::pending_inputs::PendingInputState::Waiting,
-                });
+                    state.session_id.clone(),
+                ));
             state.pending_selected = state.pending_inputs.len() - 1;
         }
         return Vec::new();
@@ -166,6 +168,11 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     if !item.is_unsent() {
         return Vec::new();
     }
+    // The list is shared bottom-control state; an item written for another
+    // session is not this session's to send.
+    if item.session_id != state.session_id {
+        return Vec::new();
+    }
     let content = item.text.clone();
     if turn_input_held(state) {
         return Vec::new();
@@ -188,9 +195,55 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     let effects = submit_turn_input(state, command);
     if let Some(Effect::Submit { command_id, .. }) = effects.first() {
         state.pending_inputs[index].state =
-            crate::pending_inputs::PendingInputState::Sending(command_id.clone());
+            crate::pending_inputs::PendingInputState::Submitting(command_id.clone());
     }
     effects
+}
+
+/// Take the head of the 待发送 queue when the runtime is genuinely ready for
+/// the next turn, and submit it as that turn.
+///
+/// This is the only automatic drain, and it lives here because `reduce` is the
+/// single authority over `AppState`: every action — a terminal runtime event, an
+/// idle snapshot, a reconnect, an effect completion, a keystroke — runs through
+/// `reduce`, which calls this once at its tail. A second event in the same ready
+/// window therefore cannot send the same item twice: the first call moved the
+/// item to `Submitting`, emptied `pending_submissions`, and made the status
+/// `Busy`, and any of those three alone is enough to stop the next call.
+///
+/// Ready means the runtime's own state, not a presentation event: connected,
+/// not `Busy`, no turn input still in flight, and nothing blocking on the user
+/// (an overlay / pending interaction). The runtime status is the authority — a
+/// `TurnCompleted` presentation event is never the trigger by itself.
+///
+/// Only the FIFO head is considered, and only while it is still `Queued`. An
+/// in-flight head (`Submitting` / `DeliveryUnknown`) is already a pending
+/// submission, so the in-flight check stops the drain; a `Failed` head pauses
+/// the queue until the user decides, because retrying it automatically would
+/// loop and skipping past it would reorder the user's own messages.
+pub(super) fn drain_pending_input(state: &mut AppState) -> Option<Effect> {
+    if !state.runtime_connected || state.is_busy() {
+        return None;
+    }
+    // A question the runtime is blocked on means it is not ready for a new
+    // turn, whatever the coarse status says.
+    if state.overlay.is_some() || !state.pending_interactions.is_empty() {
+        return None;
+    }
+    // An earlier turn input has not been answered yet and may already be
+    // running; starting a turn behind it would double-drive the runtime.
+    if !state.pending_submissions.is_empty() {
+        return None;
+    }
+    if !state
+        .pending_inputs
+        .first()
+        .is_some_and(|item| item.is_queued() && item.session_id == state.session_id)
+    {
+        return None;
+    }
+    // Not busy by the checks above, so this submits a new turn (never a steer).
+    send_pending_input(state, 0).into_iter().next()
 }
 
 /// Delete one unsent 待发送 item. Local only: it never reached the runtime.

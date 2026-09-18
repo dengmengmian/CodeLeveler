@@ -1085,10 +1085,10 @@ mod tests {
         for i in 1..=9 {
             state
                 .pending_inputs
-                .push(crate::pending_inputs::PendingInput {
-                    text: format!("note {i}"),
-                    state: crate::pending_inputs::PendingInputState::Waiting,
-                });
+                .push(crate::pending_inputs::PendingInput::queued(
+                    format!("note {i}"),
+                    state.session_id.clone(),
+                ));
         }
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
         terminal
