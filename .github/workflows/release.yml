@@ -97,7 +97,10 @@ jobs:
           # The asset contract the updater depends on: a top-level `<name>/`
           # directory holding an executable `leveler`. Verify it here so a
           # broken archive fails the release, not every user's update.
-          tar -tzf "dist/${name}.tar.gz" | grep -qx "${name}/leveler" \
+          # `grep -q` would exit at the first match and GNU tar, still
+          # listing, dies on EPIPE — under pipefail that failed v1.0.0's first
+          # attempt. Let grep read the whole listing.
+          tar -tzf "dist/${name}.tar.gz" | grep -x "${name}/leveler" >/dev/null \
             || { echo "::error::archive is missing ${name}/leveler"; exit 1; }
           test -x "dist/${name}/leveler" \
             || { echo "::error::${name}/leveler is not executable"; exit 1; }
