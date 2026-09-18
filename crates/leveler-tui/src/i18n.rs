@@ -185,10 +185,10 @@ pub struct UiText {
     pub summary_plan: &'static str,
     /// Long-command heartbeat: the command's own name and elapsed.
     pub running_command: &'static str,
-    /// Live reconnect status: "正在重连 · {attempt}/{max}".
+    /// Live reconnect status: "正在重连 · {attempt}/{max} · {secs}s".
     pub reconnecting: &'static str,
-    /// Waiting for the network after the retry budget: "等待网络".
-    pub waiting_network: &'static str,
+    /// Brief confirmation once a retry attempt starts again: "已重连".
+    pub reconnected: &'static str,
     /// Footer gauges: context window in use, and prefix-cache hit rate.
     pub footer_context: &'static str,
     pub footer_cache: &'static str,
@@ -483,6 +483,8 @@ pub struct UiText {
     pub context_title: &'static str,
     pub context_loading: &'static str,
     pub context_empty: &'static str,
+    /// Context Inspector footer: only the keys this view really answers.
+    pub context_footer_hint: &'static str,
     pub context_hint: &'static str,
     pub context_estimated: &'static str,
     pub context_window_unknown: &'static str,
@@ -691,11 +693,8 @@ pub struct UiText {
     pub btw_failed: &'static str,
     /// Side-thread turn that is still streaming its answer.
     pub btw_answering: &'static str,
-    /// Side-thread header label: how to return to the main surface.
-    pub btw_back_main: &'static str,
-    /// Role labels inside a side-thread turn.
-    pub btw_you: &'static str,
-    pub btw_assistant: &'static str,
+    /// Side-thread surface identity for the shared Secondary Surface header.
+    pub btw_surface_title: &'static str,
     /// Empty side thread.
     pub btw_empty: &'static str,
     /// A side answer the user stopped before it finished.
@@ -708,6 +707,18 @@ pub struct UiText {
     pub btw_footer_hint_stop: &'static str,
     /// Refusal when a second side question arrives before the first finished.
     pub btw_busy: &'static str,
+
+    // `/update` panel
+    pub update_panel_title: &'static str,
+    pub update_current: &'static str,
+    pub update_latest: &'static str,
+    pub update_checking: &'static str,
+    pub update_downloading: &'static str,
+    pub update_verifying: &'static str,
+    pub update_installing: &'static str,
+    pub update_installed_restarting: &'static str,
+    pub update_up_to_date: &'static str,
+    pub update_failed: &'static str,
 
     // Final status (turn closeout)
     pub final_completed: &'static str,
@@ -735,6 +746,11 @@ pub struct UiText {
     pub failure_code_label: &'static str,
     pub failure_request_id_label: &'static str,
     pub failure_reason_label: &'static str,
+    /// How many automatic retries were spent before the failure was surfaced:
+    /// "已重试 {n} 次". Only shown when the count is non-zero.
+    pub failure_retried: &'static str,
+    /// Disclosure label for the same count.
+    pub failure_retries_label: &'static str,
 
     // Turn end / completion report
     pub turn_end_completed: &'static str,
@@ -905,6 +921,8 @@ pub struct SlashText {
     pub theme: &'static str,
     pub new: &'static str,
     pub help: &'static str,
+    /// `/update` — install the latest stable release.
+    pub update: &'static str,
     /// `/remote`
     pub remote: &'static str,
     /// `/remote-loc`
@@ -994,8 +1012,8 @@ static ZH: UiText = UiText {
     summary_verify_advisory_failed: "{} 未通过（不阻断）",
     summary_plan: "计划 {}/{}",
     running_command: "运行 {}",
-    reconnecting: "正在重连 · {attempt}/{max}",
-    waiting_network: "等待网络",
+    reconnecting: "正在重连 · {attempt}/{max} · {secs}s",
+    reconnected: "已重连",
     footer_context: "上下文 {}/{}",
     footer_cache: "缓存 {}%",
     recap_label: "回顾",
@@ -1219,6 +1237,7 @@ static ZH: UiText = UiText {
     context_title: "上下文观测",
     context_loading: "查询中…",
     context_empty: "尚未组装模型请求 — 先发送一条消息",
+    context_footer_hint: "↑↓ 选择 · Enter 展开/折叠 · PgUp/PgDn 滚动 · Esc 返回",
     context_hint: "↑↓ 移动  Enter 展开/收起  Esc 返回",
     context_estimated: "估算 token",
     context_window_unknown: "窗口未知",
@@ -1331,6 +1350,7 @@ static ZH: UiText = UiText {
         theme: "选择配色主题（auto / dark / light / high-contrast）",
         new: "开始新对话（当前这段保留在 /sessions）",
         help: "查看帮助",
+        update: "升级到最新的稳定版本（会自动重启）",
     },
     slash_brief: SlashText {
         model: "切换模型",
@@ -1359,6 +1379,7 @@ static ZH: UiText = UiText {
         theme: "切换主题",
         new: "新对话",
         help: "查看帮助",
+        update: "检查更新",
     },
     slash_ghost: SlashGhost {
         btw: "<问题>",
@@ -1433,15 +1454,23 @@ static ZH: UiText = UiText {
     btw_usage: "用法: /btw <问题>",
     btw_failed: "临时提问失败",
     btw_answering: "回答中…",
-    btw_back_main: "← 返回主线程",
-    btw_you: "你",
-    btw_assistant: "助手",
+    btw_surface_title: "btw · 旁路线程",
     btw_empty: "还没有提问。输入问题开始旁路对话，主任务不受影响。",
     btw_cancelled: "已停止",
     btw_main_idle: "空闲",
-    btw_footer_hint: "Enter 发送 · Esc 返回主线程 · Ctrl+C 停止回答",
-    btw_footer_hint_stop: "回答中… · Enter 发送 · Esc 返回主线程 · Ctrl+C 停止回答",
+    btw_footer_hint: "Esc 返回主线程 · Enter 发送 · ↑↓ 滚动",
+    btw_footer_hint_stop: "Esc 返回主线程 · Ctrl+C 停止回答 · ↑↓ 滚动",
     btw_busy: "上一条旁问还在回答，先等它结束或按 Ctrl+C 停止",
+    update_panel_title: "CodeLeveler 更新",
+    update_current: "当前",
+    update_latest: "最新",
+    update_checking: "检查更新…",
+    update_downloading: "下载中…",
+    update_verifying: "校验中…",
+    update_installing: "安装中…",
+    update_installed_restarting: "✓ 已更新，正在重启…",
+    update_up_to_date: "✓ 已是最新版本",
+    update_failed: "✗ 更新失败",
     final_completed: "已完成",
     final_completed_warnings: "已完成，但有警告",
     final_waiting_confirmation: "等待确认",
@@ -1459,6 +1488,8 @@ static ZH: UiText = UiText {
     failure_code_label: "错误码",
     failure_request_id_label: "请求 ID",
     failure_reason_label: "原因",
+    failure_retried: "已重试 {n} 次",
+    failure_retries_label: "重试",
     turn_end_completed: "任务已完成",
     turn_no_final_answer: "执行已结束，但未提交最终回答",
     completion_files_changed: "修改 {} 个文件",
@@ -1625,8 +1656,8 @@ static EN: UiText = UiText {
     summary_verify_advisory_failed: "{} failed (non-blocking)",
     summary_plan: "plan {}/{}",
     running_command: "Running {}",
-    reconnecting: "Reconnecting · {attempt}/{max}",
-    waiting_network: "Waiting for network",
+    reconnecting: "Reconnecting · {attempt}/{max} · {secs}s",
+    reconnected: "Reconnected",
     footer_context: "Context {}/{}",
     footer_cache: "cache {}%",
     recap_label: "recap",
@@ -1850,6 +1881,7 @@ static EN: UiText = UiText {
     context_title: "Context Inspector",
     context_loading: "Loading…",
     context_empty: "No model request assembled — send a message first",
+    context_footer_hint: "↑↓ select · Enter expand/collapse · PgUp/PgDn scroll · Esc back",
     context_hint: "↑↓ move  Enter expand/collapse  Esc back",
     context_estimated: "Estimated tokens",
     context_window_unknown: "window unknown",
@@ -1962,6 +1994,7 @@ static EN: UiText = UiText {
         theme: "choose theme (auto / dark / light / high-contrast)",
         new: "start a new conversation (this one stays in /sessions)",
         help: "show help",
+        update: "install the latest stable release (restarts automatically)",
     },
     slash_brief: SlashText {
         model: "Switch model",
@@ -1990,6 +2023,7 @@ static EN: UiText = UiText {
         theme: "switch theme",
         new: "new chat",
         help: "View help",
+        update: "check for updates",
     },
     slash_ghost: SlashGhost {
         btw: "<question>",
@@ -2064,15 +2098,23 @@ static EN: UiText = UiText {
     btw_usage: "usage: /btw <question>",
     btw_failed: "btw failed",
     btw_answering: "Answering…",
-    btw_back_main: "← Main",
-    btw_you: "You",
-    btw_assistant: "Assistant",
+    btw_surface_title: "btw · side thread",
     btw_empty: "No side questions yet. Ask something — the main run is unaffected.",
     btw_cancelled: "stopped",
     btw_main_idle: "idle",
-    btw_footer_hint: "Enter send · Esc Main · Ctrl+C stop reply",
-    btw_footer_hint_stop: "Answering… · Enter send · Esc Main · Ctrl+C stop reply",
+    btw_footer_hint: "Esc Main · Enter send · ↑↓ scroll",
+    btw_footer_hint_stop: "Esc Main · Ctrl+C stop reply · ↑↓ scroll",
     btw_busy: "the previous side answer is still streaming — wait or press Ctrl+C",
+    update_panel_title: "CodeLeveler update",
+    update_current: "current",
+    update_latest: "latest",
+    update_checking: "Checking…",
+    update_downloading: "Downloading…",
+    update_verifying: "Verifying…",
+    update_installing: "Installing…",
+    update_installed_restarting: "✓ Updated — restarting…",
+    update_up_to_date: "✓ Already up to date",
+    update_failed: "✗ Update failed",
     final_completed: "Completed",
     final_completed_warnings: "Completed with warnings",
     final_waiting_confirmation: "Waiting for confirmation",
@@ -2090,6 +2132,8 @@ static EN: UiText = UiText {
     failure_code_label: "Code",
     failure_request_id_label: "Request ID",
     failure_reason_label: "Reason",
+    failure_retried: "Retried {n} times",
+    failure_retries_label: "Retries",
     turn_end_completed: "Task completed",
     turn_no_final_answer: "run ended without a final answer",
     completion_files_changed: "{} files changed",

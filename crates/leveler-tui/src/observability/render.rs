@@ -12,6 +12,7 @@ use crate::status_line::fmt_tokens_compact;
 use super::model::TraceTab;
 
 pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let t = state.t();

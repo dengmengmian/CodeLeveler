@@ -335,30 +335,25 @@ fn failure_lines(
     }
 }
 
-fn turn_end_lines(
+/// The turn-end marker's label and colour.
+///
+/// Single source for the wording: the transcript divider and a Secondary
+/// Surface header both read it, so the verdict cannot diverge between them.
+pub(crate) fn turn_end_marker(
     block: &TurnEndBlock,
     theme: &Theme,
-    width: usize,
-    out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
-) {
+) -> (String, ratatui::style::Color) {
     let detail_token = block.detail.as_deref().map(str::trim);
     let no_code_changes = block.status == TurnEndStatus::Unverified
         && detail_token == Some(leveler_client_protocol::REASON_NO_CODE_CHANGES);
     let no_auto_verify = block.status == TurnEndStatus::Unverified
         && detail_token == Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION);
-    // The marker reads as `symbol + status word` (colored by outcome) followed
-    // by muted stats. Soft unverified (no gate / no edits) is a calm finish,
-    // not a warning, so it keeps its own low-key wording.
-    let (label, color) = match block.status {
+    match block.status {
         TurnEndStatus::Completed | TurnEndStatus::Answered => {
             (format!("✓ {}", t.turn_end_completed), theme.status.success)
         }
-        TurnEndStatus::CompletedWithWarnings => (
-            format!("⚠ {}", t.final_completed_warnings),
-            theme.status.warning,
-        ),
-        TurnEndStatus::Truncated => (
+        TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Truncated => (
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
         ),
@@ -399,7 +394,25 @@ fn turn_end_lines(
         TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.status.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
         TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.text.secondary),
-    };
+    }
+}
+
+fn turn_end_lines(
+    block: &TurnEndBlock,
+    theme: &Theme,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+    t: &crate::i18n::UiText,
+) {
+    let detail_token = block.detail.as_deref().map(str::trim);
+    let no_code_changes = block.status == TurnEndStatus::Unverified
+        && detail_token == Some(leveler_client_protocol::REASON_NO_CODE_CHANGES);
+    let no_auto_verify = block.status == TurnEndStatus::Unverified
+        && detail_token == Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION);
+    // The marker reads as `symbol + status word` (colored by outcome) followed
+    // by muted stats. Soft unverified (no gate / no edits) is a calm finish,
+    // not a warning, so it keeps its own low-key wording.
+    let (label, color) = turn_end_marker(block, theme, t);
     let mut stats = String::new();
     if matches!(
         block.status,

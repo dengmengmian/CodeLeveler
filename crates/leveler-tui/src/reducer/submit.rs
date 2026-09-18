@@ -480,6 +480,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "new" => new_conversation(state),
         "help" => toggle_screen(state, Screen::Help),
+        "update" => start_update(state),
         other => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
@@ -616,6 +617,14 @@ fn build_export_markdown(state: &AppState) -> String {
         }
     }
     out
+}
+
+/// Start `/update`: open the panel and hand the work to the event loop, which
+/// spawns the shared update service. The busy gate in `handle_slash` is what
+/// keeps this from running under an active task.
+fn start_update(state: &mut AppState) -> Vec<Effect> {
+    state.update = Some(crate::update::UpdateView::new());
+    vec![Effect::StartUpdate]
 }
 
 fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {

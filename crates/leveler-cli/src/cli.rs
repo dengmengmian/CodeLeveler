@@ -297,19 +297,19 @@ pub enum Command {
         shell: clap_complete::Shell,
     },
 
-    /// Check for or install a newer CodeLeveler release from GitHub.
+    /// Update CodeLeveler to the latest stable release.
     ///
-    /// Prefers a matching prebuilt asset for this host. When no asset is
-    /// published, falls back to `cargo install --git … --locked --force`.
-    /// Override the repository with `LEVELER_GITHUB_REPO=owner/name`.
-    Upgrade {
+    /// Prefers a matching prebuilt asset for this host. Override the
+    /// repository with `LEVELER_GITHUB_REPO=owner/name`.
+    #[command(visible_alias = "upgrade")]
+    Update {
         /// Only report whether an update is available (exit 2 if yes).
         #[arg(long)]
         check: bool,
         /// Reinstall even when already on the requested version.
         #[arg(long)]
         force: bool,
-        /// Install a specific release tag (`0.1.0` or `v0.1.0`).
+        /// Install a specific release tag (`1.0.0` or `v1.0.0`).
         #[arg(long, value_name = "TAG")]
         version: Option<String>,
     },

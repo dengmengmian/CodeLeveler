@@ -635,6 +635,10 @@ pub(crate) async fn cmd_tui(
     session: Option<String>,
     config_overridden: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // Best-effort start-up self-update, before the terminal is taken over. A
+    // successful install replaces this process in place (preserving argv); any
+    // failure is logged and the current version starts normally.
+    crate::upgrade_cmd::run_startup_update().await;
     if in_process && socket.is_some() {
         anyhow::bail!("--socket cannot be combined with --in-process");
     }
@@ -813,7 +817,7 @@ pub(crate) async fn cmd_tui(
             web_shutdown.clone(),
         );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
-        leveler_tui::run(
+        let exit = leveler_tui::run(
             client,
             Some(web_launcher),
             Some(make_url_opener()),
@@ -823,6 +827,11 @@ pub(crate) async fn cmd_tui(
         .await?;
         // Stop the TUI-owned HTTP server; the local daemon keeps running.
         web_shutdown.cancel();
+        // `/update` installed a new binary: replace this process, preserving
+        // the original invocation. The daemon keeps serving either way.
+        if exit == leveler_tui::TuiExit::Restart {
+            crate::upgrade_cmd::restart_after_update();
+        }
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -932,7 +941,7 @@ pub(crate) async fn cmd_tui(
         ),
     );
 
-    leveler_tui::run(
+    let exit = leveler_tui::run(
         client,
         Some(web_launcher),
         Some(make_url_opener()),
@@ -941,6 +950,15 @@ pub(crate) async fn cmd_tui(
     )
     .await?;
     web_shutdown.cancel();
+    if exit == leveler_tui::TuiExit::Restart {
+        // The idle `/update` path: shut the in-process runtime down so its
+        // background work is not abandoned mid-flight, then replace the
+        // process. The new binary starts a fresh runtime.
+        let _ = quit_client
+            .send(leveler_client_protocol::ClientCommand::Quit)
+            .await;
+        crate::upgrade_cmd::restart_after_update();
+    }
     // Drop-based reapers never run past `std::process::exit`; shut the
     // runtime down explicitly (background tasks + browser tree, R004 F7).
     let _ = quit_client

@@ -1,7 +1,11 @@
 //! Workbench layout: fixed Header / Plan / Input / Footer + scrollable Conversation.
 //!
 //! Layout (top → bottom):
-//! Header · Conversation (scroll) · gap · Status? · Plan · gap? · Input · gap · Footer
+//! Header · Conversation (scroll) · gap · Notice? · Status? · Plan · gap? · Input ·
+//! Hint+usage+clock footer
+//!
+//! `Notice` is the global Notice Surface: user-action feedback (busy refusal,
+//! copied, model switched). It owns a real layout row — never a floating toast.
 //!
 //! `/btw` is a floating card over the Conversation bottom — not main history.
 
@@ -143,9 +147,13 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // takes a row when it has content so we do not stack two empty strips
     // when idle.
     let gap_rows: u16 = 1;
-    // Notifications are painted as a floating toast (see
-    // `render_notification_toast`) so they never grow this strip and reflow
-    // the Conversation under a live text selection / copy.
+    // Global Notice Surface: transient feedback for a user action. It claims a
+    // real layout row so it can never float over content or drift to the
+    // Conversation's bottom-right; with no notice it costs zero rows and the
+    // transcript keeps its full height.
+    let notice_rows: u16 = u16::from(state.notification.is_some());
+    // Runtime status (spinner / elapsed / tokens) is persistent execution
+    // state — a separate strip, never merged with the transient notice.
     let status_block = status_lines(state, area.width as usize);
     let status_rows: u16 = if status_block
         .iter()
@@ -168,10 +176,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         .saturating_add(attach_rows)
         .saturating_add(pending_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
-    // The hint row replaces the blank below the composer rather than adding to
-    // it, so hints appearing and disappearing never reflow the transcript.
-    let hints = crate::render::key_hint_line(state, workspace_inner.width as usize);
-    let post_composer_gap: u16 = 1;
 
     // One breathing row between the Context footer and the roster, so the
     // process list reads as its own surface rather than a second footer.
@@ -183,12 +187,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let reserved = header_rows
         .saturating_add(MIN_CONVERSATION_ROWS)
         .saturating_add(gap_rows)
+        .saturating_add(notice_rows)
         .saturating_add(status_rows)
         .saturating_add(attach_rows)
         .saturating_add(pending_rows)
         .saturating_add(pre_composer_gap)
         .saturating_add(composer_rows)
-        .saturating_add(post_composer_gap)
         .saturating_add(footer_rows)
         .saturating_add(team_gap)
         .saturating_add(team_rows)
@@ -199,13 +203,13 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(header_rows),
         Constraint::Min(MIN_CONVERSATION_ROWS), // conversation viewport
         Constraint::Length(gap_rows),
+        Constraint::Length(notice_rows), // Notice Surface (0 rows when idle)
         Constraint::Length(status_rows),
         Constraint::Length(plan_rows),
         Constraint::Length(attach_rows),
         Constraint::Length(pending_rows),
         Constraint::Length(pre_composer_gap),
         Constraint::Length(composer_rows),
-        Constraint::Length(post_composer_gap),
         Constraint::Length(footer_rows),
         // The agent runtime roster lives BELOW the composer/status chrome:
         // above the composer is the work (plan, conversation), the composer is
@@ -219,9 +223,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     .split(area);
 
     let pending_slot =
-        crate::layout::horizontal_inset(chunks[6], crate::layout::WORKSPACE_GUTTER_X);
-    let input_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
-    let hint_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+        crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
+    let input_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
     let footer_slot =
         crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
 
@@ -232,8 +235,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         state.theme.paint_surface(frame, input_slot, input_bg);
     }
     // chunks[2] = gap (leave blank)
+    render_notice(frame, chunks[3], state);
     if status_rows > 0 {
-        frame.render_widget(Paragraph::new(status_block.clone()), chunks[3]);
+        frame.render_widget(Paragraph::new(status_block.clone()), chunks[4]);
         let activity_rows =
             crate::activity::status_activity_lines(state, area.width as usize, state.t());
         let headline = status_block
@@ -247,33 +251,27 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
             .filter_map(|(i, row)| {
                 row.id
                     .clone()
-                    .map(|id| (chunks[3].y + (headline + i) as u16, id))
+                    .map(|id| (chunks[4].y + (headline + i) as u16, id))
             })
             .collect();
     } else {
         state.activity_hits.clear();
     }
-    render_plan_panel(frame, chunks[4], state);
-    render_attachments(frame, chunks[5], state);
+    render_plan_panel(frame, chunks[5], state);
+    render_attachments(frame, chunks[6], state);
     crate::pending_inputs::render(frame, pending_slot, state, area.height);
-    // chunks[7] = pre_composer_gap (leave blank)
+    // chunks[8] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
         None => render_input(frame, input_slot, state),
     }
-    // chunks[9]: the key hints when there are any, otherwise the blank gap.
-    if let Some(line) = hints.into_iter().next() {
-        frame.render_widget(Paragraph::new(line), hint_slot);
-    }
     render_footer(frame, footer_slot, state);
     // chunks[11] = breathing row; the roster docks under the footer.
     render_team_panel(frame, chunks[12], state);
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
-    // Toast over conversation bottom — must not change vertical layout.
-    render_notification_toast(frame, chunks[1], state);
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
         render_slash_popup(frame, chunks[1], input_slot, state);
@@ -712,47 +710,29 @@ fn overflow_line(text: &str, theme: &crate::theme::Theme, width: usize) -> Line<
     ))
 }
 
-// ── Floating notification toast (over Conversation bottom) ──────────────────
+// ── Notice Surface (global user-action feedback) ────────────────────────────
 
-fn render_notification_toast(frame: &mut Frame, conv: Rect, state: &AppState) {
+/// One fixed, left-aligned row for the current notice.
+///
+/// The row is already reserved by the caller's layout (`notice_rows`), so this
+/// only paints. A too-narrow terminal truncates instead of wrapping: the strip
+/// never grows and never shifts the transcript underneath it.
+fn render_notice(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(note) = state.notification.as_ref() else {
         return;
     };
-    if conv.height == 0 || conv.width < 8 {
+    if area.height == 0 || area.width < 4 {
         return;
     }
     let theme = &state.theme;
-    let color = match note.level {
-        leveler_client_protocol::NotificationLevel::Info => theme.accent.primary,
-        leveler_client_protocol::NotificationLevel::Warning => theme.status.warning,
-        leveler_client_protocol::NotificationLevel::Error => theme.status.error,
+    let (icon, color) = match note.level {
+        leveler_client_protocol::NotificationLevel::Info => ("ℹ", theme.accent.primary),
+        leveler_client_protocol::NotificationLevel::Warning => ("⚠", theme.status.warning),
+        leveler_client_protocol::NotificationLevel::Error => ("✕", theme.status.error),
     };
-    // One-line toast, bottom of conversation, right-aligned margin — no layout slot.
-    let msg = truncate(
-        format!(" {} ", note.message),
-        conv.width.saturating_sub(2) as usize,
-    );
-    let w = (UnicodeWidthStr::width(msg.as_str()) as u16)
-        .max(1)
-        .min(conv.width.saturating_sub(2).max(1));
-    let x = conv
-        .x
-        .saturating_add(conv.width.saturating_sub(w).saturating_sub(1));
-    let y = conv.y.saturating_add(conv.height.saturating_sub(1));
-    let area = Rect {
-        x,
-        y,
-        width: w,
-        height: 1,
-    };
+    let text = truncate(format!("{icon} {}", note.message), area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            msg,
-            Style::default()
-                .fg(color)
-                .bg(theme.surface.elevated)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
         area,
     );
 }
@@ -779,19 +759,83 @@ fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
 // ── Footer ──────────────────────────────────────────────────────────────────
 
+/// The single bottom status row: key hints (left), usage chips and the wall
+/// clock (right).
+///
+/// The clock is the row's highest-priority cell — the persistent anchor — so it
+/// is placed first at the far right and never wraps to a line of its own. Usage
+/// chips yield to it, and hints (lowest) simply truncate into whatever the
+/// right-hand block leaves. The row is always one physical row, so hints
+/// appearing or disappearing never reflow the transcript.
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
-    let muted = Style::default().fg(theme.text.secondary);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let width = area.width as usize;
+    let dim = Style::default().fg(state.theme.text.secondary);
+    // Breathing room between the hints, the usage chips, and the clock.
+    const GAP: usize = 2;
 
-    // Footer: Context + optional cache hit rate + local wall clock. The clock
-    // is dropped by the builder before it would be clipped. Shortcuts live in
-    // /help · Ctrl+?.
-    let text = match crate::status_line::footer_status_line(state, width) {
-        Some(line) => crate::render::truncate_display(&line, width),
-        None => String::new(),
+    let clock = state.clock_label.as_str();
+    let clock_w = UnicodeWidthStr::width(clock);
+    let clock_shown = clock_w > 0 && clock_w <= width;
+    let clock_start = width.saturating_sub(clock_w);
+
+    let usage = crate::status_line::footer_usage_line(state);
+    let usage_w = usage.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
+    let usage_limit = if clock_shown {
+        clock_start.saturating_sub(GAP)
+    } else {
+        width
     };
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, muted))), area);
+    let usage_shown = usage_w > 0 && usage_w <= usage_limit;
+    let usage_start = usage_limit.saturating_sub(usage_w);
+
+    let left_limit = if usage_shown {
+        usage_start.saturating_sub(GAP)
+    } else if clock_shown {
+        clock_start.saturating_sub(GAP)
+    } else {
+        width
+    };
+
+    if left_limit > 0
+        && let Some(line) = crate::render::key_hint_line(state, left_limit)
+            .into_iter()
+            .next()
+    {
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: left_limit as u16,
+                height: 1,
+            },
+        );
+    }
+    if usage_shown && let Some(text) = usage {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, dim))),
+            Rect {
+                x: area.x + usage_start as u16,
+                y: area.y,
+                width: usage_w as u16,
+                height: 1,
+            },
+        );
+    }
+    if clock_shown {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(clock.to_string(), dim))),
+            Rect {
+                x: area.x + clock_start as u16,
+                y: area.y,
+                width: clock_w as u16,
+                height: 1,
+            },
+        );
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1471,29 +1515,29 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut state))
             .unwrap();
         let buf = terminal.backend().buffer();
-        // Probe the chip's own first character, whatever the locale calls it —
-        // a bare "C" also matches the key hints two rows up.
-        let head = state
-            .t()
-            .footer_context
-            .chars()
-            .next()
-            .expect("the context chip has a label")
-            .to_string();
-        let mut context_x = None;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                if buf.cell((x, y)).is_some_and(|c| c.symbol() == head) && y + 3 >= buf.area.height
-                {
-                    context_x = Some(x);
-                    break;
-                }
-            }
-        }
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+        // The usage chips now sit far-right; the row's left content is the key
+        // hints. That left content still starts on the workspace gutter.
+        let footer_row = lines
+            .iter()
+            .position(|l| l.contains("15k/1M") || l.contains("15k"))
+            .unwrap_or_else(|| panic!("footer context line missing:\n{}", lines.join("\n")));
+        let first = lines[footer_row].find(|c: char| !c.is_whitespace());
         assert_eq!(
-            context_x,
-            Some(crate::layout::WORKSPACE_GUTTER_X),
-            "footer text must sit on the workspace gutter"
+            first,
+            Some(crate::layout::WORKSPACE_GUTTER_X as usize),
+            "footer left content must sit on the workspace gutter: {:?}",
+            lines[footer_row]
         );
         let last = buf.area.height.saturating_sub(1);
         for x in 0..buf.area.width {
@@ -1505,8 +1549,8 @@ mod tests {
         }
     }
 
-    /// The clock is drawn on the footer row, after the runtime chips — never
-    /// right-aligned to the terminal edge and never a second row.
+    /// The clock is a far-right anchor on the shared bottom row: it ends at the
+    /// workspace gutter with a gap before the usage chips, never glued to them.
     #[test]
     fn footer_renders_the_local_wall_clock_after_the_runtime_chips() {
         use ratatui::Terminal;
@@ -1540,12 +1584,165 @@ mod tests {
             .iter()
             .find(|l| l.contains("254k/1M"))
             .unwrap_or_else(|| panic!("footer context line missing:\n{}", lines.join("\n")));
-        // Clock rides the shared ` · ` separator right after the cache chip,
-        // so it is never padded out to the terminal's right edge.
+        assert!(footer.contains("99%"), "usage chips stay visible: {footer}");
+        // The clock anchors the right edge and is separated from the chips.
         assert!(
-            footer.contains("99% · 22:22"),
-            "clock must follow the cache chip with the shared separator: {footer}"
+            footer.trim_end().ends_with("22:22"),
+            "clock anchors the right edge: {footer:?}"
         );
+        assert!(
+            !footer.contains("99% · 22:22"),
+            "clock is its own cell, not glued to the chips: {footer:?}"
+        );
+    }
+
+    /// Render the workbench with a clock, optional usage and optional busy run.
+    fn render_clock_case(
+        width: u16,
+        height: u16,
+        clock: &str,
+        usage: bool,
+        busy: bool,
+    ) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.clock_label = clock.into();
+        if usage {
+            state.context_tokens = 18_400;
+            state.token_input = 18_400;
+            state.token_cached = 2_000;
+        }
+        if busy {
+            state.status = leveler_client_protocol::RuntimeStatus::Busy;
+            state.elapsed_secs = 12;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Case 1 — empty session: the clock shares the hint row and is never a
+    /// line of its own below it (the "empty transcript item" the user saw).
+    #[test]
+    fn clock_shares_the_bottom_row_with_the_hints() {
+        let lines = render_clock_case(100, 30, "09:30", false, false);
+        let clock_row = row_of(&lines, "09:30");
+        let hint_row = row_of(&lines, "Shift+Tab");
+        assert_eq!(
+            clock_row,
+            hint_row,
+            "clock and hints share one row:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().filter(|l| l.contains("09:30")).count() == 1,
+            "the clock is not repeated on another row:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    /// Case 1 — the clock is the far-right anchor of the row: it ends exactly
+    /// at the workspace gutter on the right edge, never padded mid-row.
+    #[test]
+    fn clock_is_right_aligned_on_the_bottom_row() {
+        let lines = render_clock_case(100, 30, "09:30", false, false);
+        let clock_row = row_of(&lines, "09:30");
+        let col = col_of(&lines[clock_row], "09:30").expect("clock present");
+        assert_eq!(
+            col + 5,
+            100 - crate::layout::WORKSPACE_GUTTER_X as usize,
+            "clock anchors the right gutter: {:?}",
+            lines[clock_row]
+        );
+    }
+
+    /// Case 3 — a narrow row keeps the clock whole, clips the hints, and never
+    /// wraps the clock onto a second line.
+    #[test]
+    fn narrow_row_keeps_the_clock_and_truncates_hints() {
+        let lines = render_clock_case(40, 24, "09:30", false, false);
+        let clock_row = row_of(&lines, "09:30");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("09:30")).count(),
+            1,
+            "clock must not wrap to a second line:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines[clock_row].contains('…'),
+            "hints clip before the clock: {:?}",
+            lines[clock_row]
+        );
+        let col = col_of(&lines[clock_row], "09:30").expect("clock present");
+        assert_eq!(col + 5, 40 - crate::layout::WORKSPACE_GUTTER_X as usize);
+    }
+
+    /// Case 2/3 — usage chips ride next to the clock when there is room, and
+    /// yield to it when the row is narrow. The clock always survives.
+    #[test]
+    fn usage_chips_yield_to_the_clock_when_the_row_is_narrow() {
+        let wide = render_clock_case(100, 24, "09:30", true, false);
+        let wide_row = row_of(&wide, "09:30");
+        assert!(
+            wide[wide_row].contains("18k"),
+            "usage shown when wide: {:?}",
+            wide[wide_row]
+        );
+
+        let narrow = render_clock_case(24, 24, "09:30", true, false);
+        let nrow = row_of(&narrow, "09:30");
+        assert!(
+            !narrow[nrow].contains("18k"),
+            "usage yields on a narrow row: {:?}",
+            narrow[nrow]
+        );
+        assert_eq!(narrow.iter().filter(|l| l.contains("09:30")).count(), 1);
+    }
+
+    /// Case 4 — the running-state status strip and the clock are different
+    /// rows: the footer work must not touch the runtime status.
+    #[test]
+    fn clock_merge_keeps_the_running_status_strip() {
+        let lines = render_clock_case(100, 30, "09:37", true, true);
+        let status_row = lines
+            .iter()
+            .position(|l| l.contains("12s"))
+            .unwrap_or_else(|| panic!("busy status missing:\n{}", lines.join("\n")));
+        let clock_row = row_of(&lines, "09:37");
+        assert!(
+            status_row < clock_row,
+            "runtime status stays above the bottom row"
+        );
+        assert!(lines[status_row].contains("12s"));
     }
 
     #[test]
@@ -2719,5 +2916,224 @@ mod tests {
         assert_eq!(plan_panel_height(&state, 0), 1, "the header survives");
         state.plan_collapsed = true;
         assert_eq!(plan_panel_height(&state, 40), 1);
+    }
+
+    // ── Notice Surface ─────────────────────────────────────────────────────
+
+    /// Full-workbench render with an optional Notice and optional scrollback.
+    fn render_notice_case(
+        width: u16,
+        height: u16,
+        notice: Option<(leveler_client_protocol::NotificationLevel, &str)>,
+        history: usize,
+    ) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 24;
+        if let Some((level, message)) = notice {
+            state.notification = Some(crate::state::Notification {
+                level,
+                message: message.to_string(),
+            });
+        }
+        for i in 0..history {
+            state.transcript.push_user(format!("ROW{i}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The Notice Surface owns a real, left-aligned row directly above the
+    /// runtime status strip — never a bottom-right toast over the Conversation.
+    #[test]
+    fn notice_owns_a_left_aligned_row_above_the_runtime_status() {
+        let lines = render_notice_case(
+            80,
+            24,
+            Some((
+                leveler_client_protocol::NotificationLevel::Warning,
+                "Agent is running · Wait or cancel",
+            )),
+            0,
+        );
+        let notice_row = row_of(&lines, "⚠");
+        assert_eq!(col_of(&lines[notice_row], "⚠"), Some(0), "left-aligned");
+        assert!(
+            lines[notice_row].contains("Agent is running"),
+            "the notice text is on its own row: {:?}",
+            lines[notice_row]
+        );
+        assert!(
+            notice_row < row_of(&lines, "Type a message"),
+            "the notice is a fixed strip, not floating in the composer"
+        );
+    }
+
+    /// A notice is accounted in layout: the row comes out of the Conversation
+    /// viewport, so the chrome below keeps its exact position.
+    #[test]
+    fn a_notice_costs_exactly_one_layout_row() {
+        let base = render_notice_case(80, 24, None, 0);
+        let with = render_notice_case(
+            80,
+            24,
+            Some((leveler_client_protocol::NotificationLevel::Info, "ready")),
+            0,
+        );
+        assert!(
+            base.iter().all(|l| !l.contains('ℹ')),
+            "no notice → no notice row"
+        );
+        assert_eq!(
+            row_of(&with, "Type a message"),
+            row_of(&base, "Type a message"),
+            "the notice must not push the composer"
+        );
+        let status_row = row_of(&with, "24s");
+        assert_eq!(
+            row_of(&with, "ℹ") + 1,
+            status_row,
+            "the notice sits directly above the runtime status strip"
+        );
+        assert_eq!(
+            row_of(&base, "24s"),
+            status_row,
+            "the runtime status stays where it was"
+        );
+    }
+
+    /// The row the notice takes is the Conversation's: the viewport is exactly
+    /// one row shorter with a notice than without one.
+    #[test]
+    fn a_notice_shrinks_the_conversation_viewport_by_one_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn conv_height(notice: bool) -> u16 {
+            let mut s = test_state();
+            s.status = leveler_client_protocol::RuntimeStatus::Busy;
+            s.elapsed_secs = 24;
+            if notice {
+                s.notification = Some(crate::state::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: "ready".into(),
+                });
+            }
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| crate::render::render(f, &mut s)).unwrap();
+            s.conv.rect.expect("conversation viewport rendered").3
+        }
+
+        assert_eq!(
+            conv_height(false) - conv_height(true),
+            1,
+            "the notice takes exactly one row from the transcript"
+        );
+    }
+
+    /// Scrollback does not move a notice: the row sits below the fixed-height
+    /// Conversation viewport, not inside it.
+    #[test]
+    fn notice_stays_fixed_when_the_transcript_scrolls() {
+        let empty = render_notice_case(
+            80,
+            24,
+            Some((
+                leveler_client_protocol::NotificationLevel::Warning,
+                "watch out",
+            )),
+            0,
+        );
+        let full = render_notice_case(
+            80,
+            24,
+            Some((
+                leveler_client_protocol::NotificationLevel::Warning,
+                "watch out",
+            )),
+            40,
+        );
+        assert_eq!(
+            row_of(&empty, "⚠"),
+            row_of(&full, "⚠"),
+            "transcript length must not move the notice row"
+        );
+    }
+
+    /// On a narrow terminal the notice truncates to a single row — it never
+    /// wraps and grows the strip.
+    #[test]
+    fn a_long_notice_truncates_to_one_row() {
+        let lines = render_notice_case(
+            28,
+            24,
+            Some((
+                leveler_client_protocol::NotificationLevel::Warning,
+                "Agent is running · Wait for the current task to finish or cancel it first",
+            )),
+            0,
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains('⚠')).count(),
+            1,
+            "exactly one notice row, no wrap: {lines:#?}"
+        );
+        let notice_row = row_of(&lines, "⚠");
+        assert!(
+            lines[notice_row].trim_end().ends_with('…'),
+            "a clipped notice ends in an ellipsis: {:?}",
+            lines[notice_row]
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("cancel it first")),
+            "the truncated tail must not spill onto another row"
+        );
+    }
+
+    /// The surface holds one current fact: a second notice replaces the first
+    /// (the reducer always overwrites the single slot).
+    #[test]
+    fn a_new_notice_replaces_the_previous_one() {
+        let mut s = test_state();
+        s.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "first".into(),
+        });
+        s.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: "second".into(),
+        });
+        assert_eq!(s.notification.as_ref().unwrap().message, "second");
     }
 }

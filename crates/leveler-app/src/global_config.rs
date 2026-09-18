@@ -23,6 +23,10 @@
 //! [vcs]
 //! co_author = true             # optional; append the CodeLeveler/model commit trailer
 //!
+//! [update]
+//! auto_update = true           # optional; check + install stable releases at start-up
+//! check_interval_hours = 1     # optional; hours between successful checks
+//!
 //! [providers.deepseek]
 //! base_url = "https://api.deepseek.com"
 //! api_key_env = "DEEPSEEK_API_KEY"
@@ -90,6 +94,35 @@ pub struct GlobalConfig {
     /// The `/develop` workflow's settings.
     #[serde(default)]
     develop: GlobalDevelop,
+    /// Self-update preferences.
+    #[serde(default)]
+    update: GlobalUpdate,
+}
+
+/// `[update]`. Whether CodeLeveler keeps itself current, and how often it
+/// checks. Two fields, no channel: only the stable GitHub release is tracked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalUpdate {
+    /// Check for (and install) a newer stable release at start-up.
+    #[serde(default = "default_true")]
+    auto_update: bool,
+    /// Hours between successful checks (clamped to at least one).
+    #[serde(default = "default_check_interval_hours")]
+    check_interval_hours: u64,
+}
+
+impl Default for GlobalUpdate {
+    fn default() -> Self {
+        Self {
+            auto_update: true,
+            check_interval_hours: 1,
+        }
+    }
+}
+
+fn default_check_interval_hours() -> u64 {
+    1
 }
 
 /// `[develop]`. One key: which model reads the code.
@@ -482,6 +515,16 @@ impl GlobalConfig {
             .map(|(_, name)| name)
             .unwrap_or(model);
         self.models.get(id)?.context_window
+    }
+
+    /// `[update].auto_update` — whether start-up checks and installs by itself.
+    pub fn update_auto(&self) -> bool {
+        self.update.auto_update
+    }
+
+    /// `[update].check_interval_hours`, clamped to at least one.
+    pub fn update_check_interval_hours(&self) -> u64 {
+        self.update.check_interval_hours.max(1)
     }
 }
 
@@ -1138,6 +1181,28 @@ completion_judge_timeout_seconds = 180
     #[test]
     fn a_typo_in_the_develop_section_is_rejected() {
         assert!(GlobalConfig::from_toml_str("[develop]\nmdoel = \"a/b\"\n").is_err());
+    }
+
+    #[test]
+    fn the_update_section_defaults_to_auto_hourly_and_is_configurable() {
+        let default = GlobalConfig::from_toml_str("").unwrap();
+        assert!(default.update_auto());
+        assert_eq!(default.update_check_interval_hours(), 1);
+
+        let off = GlobalConfig::from_toml_str("[update]\nauto_update = false\n").unwrap();
+        assert!(!off.update_auto());
+
+        let hourly = GlobalConfig::from_toml_str("[update]\ncheck_interval_hours = 6\n").unwrap();
+        assert_eq!(hourly.update_check_interval_hours(), 6);
+
+        // A zero interval is clamped rather than becoming a check per start.
+        let zero = GlobalConfig::from_toml_str("[update]\ncheck_interval_hours = 0\n").unwrap();
+        assert_eq!(zero.update_check_interval_hours(), 1);
+    }
+
+    #[test]
+    fn a_typo_in_the_update_section_is_rejected() {
+        assert!(GlobalConfig::from_toml_str("[update]\nauto_updates = true\n").is_err());
     }
 
     #[test]

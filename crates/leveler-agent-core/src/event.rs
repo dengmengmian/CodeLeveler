@@ -24,20 +24,18 @@ pub enum AgentEvent {
     ContextUsage(ContextAccounting),
     /// A model round is about to retry the same request. Transient: a
     /// connectivity fact for a live status line, never a transcript item and
-    /// never an executor outcome.
+    /// never an executor outcome. This is the ONE retry lifecycle for a model
+    /// request; the provider transport's fast pre-delivery retry is not
+    /// counted here.
     ModelRetrying {
-        /// Failures so far on this lane (1-based): the retry about to happen.
+        /// The retry about to happen (1-based). `attempt == max_attempts` is
+        /// the last one before the round fails terminally.
         attempt: u32,
-        /// The bound for this lane, so a client can say `2/3`.
+        /// The retry budget, so a client can say `3/10`.
         max_attempts: u32,
         /// How long the loop will wait before the next attempt.
         delay_ms: u64,
     },
-    /// The retry budget is spent on a `Safe` failure, so the round is waiting,
-    /// low-frequency, for the network to come back instead of failing the task.
-    /// Transient, like [`AgentEvent::ModelRetrying`]. `elapsed_ms` is how long
-    /// this wait has lasted so far.
-    ModelWaitingForNetwork { elapsed_ms: u64 },
     /// A tool call is about to execute. `id` pairs it with the matching
     /// [`AgentEvent::ToolCallFinished`].
     ToolCallStarted {

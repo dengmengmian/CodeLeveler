@@ -439,9 +439,6 @@ impl<'a> Drive<'a> {
                 max_attempts,
                 delay_ms,
             },
-            Kernel::ModelWaitingForNetwork { elapsed_ms } => {
-                AgentEvent::ModelWaitingForNetwork { elapsed_ms }
-            }
             Kernel::ToolCallStarted { .. } | Kernel::ToolCallFinished { .. } => return,
         };
         (self.observer)(projected);

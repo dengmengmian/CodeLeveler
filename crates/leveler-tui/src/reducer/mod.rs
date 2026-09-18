@@ -150,6 +150,25 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Action::UpdateStep(step) => {
+            state
+                .update
+                .get_or_insert_with(crate::update::UpdateView::new)
+                .apply(step);
+            Vec::new()
+        }
+        Action::UpdateFinished(outcome) => {
+            if let Some(view) = state.update.as_mut() {
+                view.finish(outcome);
+                if view.wants_restart() {
+                    // The binary on disk is already the new one; the CLI will
+                    // replace this process after the terminal is restored.
+                    state.restart_requested = true;
+                    state.running = false;
+                }
+            }
+            Vec::new()
+        }
         Action::Paste(text) => {
             state.disarm_ctrlc();
             // Only a truly empty payload is treated as a clipboard image
@@ -742,6 +761,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let btw = state.surface == SurfaceFocus::Btw;
+
+    // A finished `/update` panel is the narrowest thing on screen: Esc closes
+    // it before anything else. While the update is still in flight there is
+    // nothing to dismiss, so Esc falls through as usual.
+    if key.code == KeyCode::Esc && state.update.as_ref().is_some_and(|view| view.is_terminal()) {
+        state.update = None;
+        state.notification = None;
+        return Vec::new();
+    }
 
     // Ctrl+C is the one key that reads (and advances) the escalation state.
     if is_ctrl_c(&key) {

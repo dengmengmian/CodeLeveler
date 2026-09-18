@@ -3,7 +3,9 @@
 //! Layout contract (matches the product screenshot target):
 //!
 //! - **Header** (1 line): branch · repo path (muted; identity only)
-//! - **Status** (1 line): live activity only (empty when idle; toasts float)
+//! - **Notice** (1 line): the transient Notice Surface for user-action feedback
+//!   (only when there is one; see `workbench::render_notice`)
+//! - **Status** (1 line): live activity only (empty when idle)
 //! - **Input border**: `{model} [(effort)] · work-mode · permission · session`
 //! - **Footer** (1 line): runtime context + local wall clock — `Context 8k/1M · 22:22`
 //!
@@ -235,13 +237,12 @@ pub(crate) fn footer_cache_chip(state: &AppState) -> Option<String> {
     Some(state.t().footer_cache.replace("{}", &pct.to_string()))
 }
 
-/// Full footer status: `Context 21k/1M · cache 42% · 22:22` — each part optional.
+/// Footer usage line: `Context 21k/1M · cache 42%` — each chip optional.
 ///
-/// The wall clock is the lowest-priority cell on this row. It is appended last
-/// and, when `max_width` cannot hold it, dropped whole rather than clipped: a
-/// half-drawn `22:2…` is worse than no clock. Context and cache keep their
-/// existing render-time truncation.
-pub(crate) fn footer_status_line(state: &AppState, max_width: usize) -> Option<String> {
+/// Hidden until real usage is known. The wall clock is a separate cell placed
+/// by the row's owner (`workbench::render_footer`), which owns the width budget
+/// and the clock's priority; this only reports the usage chips.
+pub(crate) fn footer_usage_line(state: &AppState) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ctx) = footer_ctx_chip(state) {
         parts.push(ctx);
@@ -249,23 +250,7 @@ pub(crate) fn footer_status_line(state: &AppState, max_width: usize) -> Option<S
     if let Some(cache) = footer_cache_chip(state) {
         parts.push(cache);
     }
-    let base = parts.join(" · ");
-    if state.clock_label.is_empty() {
-        return (!base.is_empty()).then_some(base);
-    }
-    let clocked = if base.is_empty() {
-        state.clock_label.clone()
-    } else {
-        format!("{base} · {}", state.clock_label)
-    };
-    if UnicodeWidthStr::width(clocked.as_str()) <= max_width {
-        Some(clocked)
-    } else if base.is_empty() {
-        // Nothing else is on the row; a clipped clock reads as a wrong time.
-        None
-    } else {
-        Some(base)
-    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn truncate_to_width(s: &str, width: usize) -> String {
@@ -395,8 +380,9 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
         }
         StatusPhase::Busy | StatusPhase::Idle => {}
     }
-    // Notifications are floating toasts in the workbench; never put them in
-    // the layout status strip (that reflows Conversation under a selection).
+    // Notices live on their own Notice Surface row above this strip (see
+    // `workbench::render_notice`); never fold them into the status strip, so a
+    // transient notice and persistent execution state stay separate rows.
     match state.status {
         RuntimeStatus::Busy => busy_status_lines(state, width),
         RuntimeStatus::Error | RuntimeStatus::Idle => {
@@ -439,21 +425,6 @@ fn live_plan_step_chip(state: &AppState, t: &crate::i18n::UiText) -> Option<Stri
 fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     let t = state.t();
-    // Waiting for the network owns the line: the retry budget is spent and the
-    // task is NOT failed, which is the one fact the user needs.
-    if let Some(since) = state.waiting_for_network_since {
-        let secs = since.elapsed().as_secs();
-        return vec![Line::from(vec![
-            Span::styled(
-                format!("{WAIT_MARKER} "),
-                Style::default().fg(theme.status.warning),
-            ),
-            Span::styled(
-                format!("{} · {secs}s", t.waiting_network),
-                Style::default().fg(theme.text.secondary),
-            ),
-        ])];
-    }
     let wait = crate::wait_status::project(state);
     if let Some(view) = wait.as_ref()
         && !matches!(
@@ -478,23 +449,37 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
         // Only that word is replaced — a running command still owns the line.
         None => {
             // A reconnect owns the line: the generic "waiting for model" would
-            // hide the one fact the user needs during a network blip.
-            if let Some((attempt, max_attempts)) = state.reconnecting {
+            // hide the one fact the user needs during a network blip. The
+            // countdown is the runtime's OWN announced delay, not a guess.
+            if let Some(rc) = state.reconnecting {
                 t.reconnecting
-                    .replace("{attempt}", &attempt.to_string())
-                    .replace("{max}", &max_attempts.to_string())
+                    .replace("{attempt}", &rc.attempt.to_string())
+                    .replace("{max}", &rc.max_attempts.to_string())
+                    .replace("{secs}", &rc.remaining_secs().to_string())
             } else {
                 let waiting_on_model = match wait.as_ref() {
                     Some(view) => view.kind == crate::wait_status::WaitKind::Model,
                     None => state.activity.is_none(),
                 };
-                match (waiting_on_model, state.live_reasoning.is_empty()) {
-                    (true, false) => t.thinking.to_string(),
-                    (true, true) => t.waiting_model.to_string(),
-                    (false, _) => state
-                        .activity
-                        .clone()
-                        .unwrap_or_else(|| t.waiting_model.to_string()),
+                // The transport accepted a fresh attempt after a retry. Brief
+                // confirmation, then the normal streaming status returns. It
+                // only stands in for the GENERIC model wait: a running command
+                // or tool is the more specific fact and keeps the line.
+                if waiting_on_model
+                    && state
+                        .reconnected_until
+                        .is_some_and(|at| at > std::time::Instant::now())
+                {
+                    t.reconnected.to_string()
+                } else {
+                    match (waiting_on_model, state.live_reasoning.is_empty()) {
+                        (true, false) => t.thinking.to_string(),
+                        (true, true) => t.waiting_model.to_string(),
+                        (false, _) => state
+                            .activity
+                            .clone()
+                            .unwrap_or_else(|| t.waiting_model.to_string()),
+                    }
                 }
             }
         }
@@ -781,15 +766,12 @@ mod tests {
         state.context_window_tokens = 1_048_576;
         assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 41k/1M"));
         assert_eq!(footer_cache_chip(&state), None);
-        assert_eq!(
-            footer_status_line(&state, 120).as_deref(),
-            Some("上下文 41k/1M")
-        );
+        assert_eq!(footer_usage_line(&state).as_deref(), Some("上下文 41k/1M"));
         state.token_input = 1000;
         state.token_cached = 420;
         assert_eq!(footer_cache_chip(&state).as_deref(), Some("缓存 42%"));
         assert_eq!(
-            footer_status_line(&state, 120).as_deref(),
+            footer_usage_line(&state).as_deref(),
             Some("上下文 41k/1M · 缓存 42%")
         );
     }
@@ -803,8 +785,10 @@ mod tests {
         assert_eq!(fmt_clock(at(23, 59, 0)), "23:59");
     }
 
+    /// The clock is no longer glued to the usage chips: the row's owner places
+    /// the clock as its own far-right cell. Usage is just the chips.
     #[test]
-    fn footer_appends_the_clock_after_the_runtime_chips() {
+    fn footer_usage_line_reports_the_runtime_chips_only() {
         let mut state = test_state();
         state.context_tokens = 254_000;
         state.context_window_tokens = 1_048_576;
@@ -812,38 +796,18 @@ mod tests {
         state.token_cached = 990;
         state.clock_label = "22:22".into();
         assert_eq!(
-            footer_status_line(&state, 120).as_deref(),
-            Some("上下文 254k/1M · 缓存 99% · 22:22")
-        );
-    }
-
-    /// The clock is the first part dropped when the row narrows; context and
-    /// cache survive it.
-    #[test]
-    fn footer_drops_the_clock_whole_before_the_runtime_chips() {
-        let mut state = test_state();
-        state.context_tokens = 254_000;
-        state.context_window_tokens = 1_048_576;
-        state.token_input = 1000;
-        state.token_cached = 990;
-        state.clock_label = "22:22".into();
-        let full = "上下文 254k/1M · 缓存 99% · 22:22";
-        let width = UnicodeWidthStr::width(full);
-        assert_eq!(footer_status_line(&state, width).as_deref(), Some(full));
-        assert_eq!(
-            footer_status_line(&state, width - 1).as_deref(),
+            footer_usage_line(&state).as_deref(),
             Some("上下文 254k/1M · 缓存 99%")
         );
     }
 
-    /// A session with no usage keeps the clock; the runtime chips stay hidden.
+    /// A session with no usage has no usage row at all; the clock is placed
+    /// independently by `workbench::render_footer`.
     #[test]
-    fn footer_keeps_the_clock_alone_with_no_usage() {
+    fn footer_usage_line_is_hidden_without_usage() {
         let mut state = test_state();
         state.clock_label = "09:07".into();
-        assert_eq!(footer_status_line(&state, 120).as_deref(), Some("09:07"));
-        // Too narrow even for the clock alone: hidden, never half-drawn.
-        assert_eq!(footer_status_line(&state, 4), None);
+        assert_eq!(footer_usage_line(&state), None);
     }
 
     #[test]
@@ -1244,14 +1208,38 @@ mod tests {
     }
 
     /// A live reconnect is the one fact that must survive the busy status line:
-    /// the generic "waiting for model" would hide it.
+    /// the generic "waiting for model" would hide it. The trailing number is
+    /// the runtime's OWN announced delay, counted down from it.
     #[test]
     fn a_reconnect_owns_the_status_line_over_the_model_wait() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        state.reconnecting = Some((2, 3));
+        state.reconnecting = Some(crate::state::Reconnecting {
+            attempt: 2,
+            max_attempts: 10,
+            delay: std::time::Duration::from_secs(4),
+            retry_at: std::time::Instant::now() + std::time::Duration::from_secs(4),
+        });
         let text = status_text(&state);
-        assert!(text.contains("正在重连 · 2/3"), "{text}");
+        assert!(text.contains("正在重连 · 2/10 · "), "{text}");
+        assert!(text.contains('s'), "the countdown is shown: {text}");
         assert!(!text.contains("等待模型"), "{text}");
+    }
+
+    /// The brief "Reconnected" confirmation owns the line after a retry
+    /// attempt starts again, then yields to the normal streaming status.
+    #[test]
+    fn a_brief_reconnected_confirmation_yields_to_streaming() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.reconnected_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        assert!(status_text(&state).contains("已重连"));
+
+        // Once the confirmation window passes, the line is the normal pending
+        // model status — a stale "Reconnected" must not linger.
+        state.reconnected_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(!status_text(&state).contains("已重连"));
     }
 }

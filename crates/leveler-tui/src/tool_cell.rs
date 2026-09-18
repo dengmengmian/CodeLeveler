@@ -1805,6 +1805,7 @@ fn preview_lines(preview: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let t = state.t();
     let filter = state.tools_screen.filter;

@@ -295,6 +295,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // Self-update. `IdleOnly`: replacing the running binary under an active
+    // task would strand it, so the busy gate refuses first.
+    slash(
+        "/update",
+        &["/upgrade"],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
 ];
 
 /// All tokens (primary + aliases) that parse as local slash commands.
@@ -385,6 +394,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/theme" => s.theme,
         "/new" => s.new,
         "/help" => s.help,
+        "/update" | "/upgrade" => s.update,
         _ => "",
     }
 }
@@ -656,6 +666,7 @@ mod surface_tests {
                 "/remote",
                 "/remote-loc",
                 "/help",
+                "/update",
             ]
         );
     }

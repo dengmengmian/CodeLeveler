@@ -146,6 +146,36 @@ impl BackgroundTaskChrome {
     }
 }
 
+/// An active model-round retry, held while the runtime waits out its backoff.
+///
+/// The runtime owns the decision and the delay; this is only the live view of
+/// it. `retry_at` is the wall-clock instant the next attempt will start, so the
+/// status line can count down to the ACTUAL delay the scheduler is using —
+/// never a second, guessed number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reconnecting {
+    /// The retry about to happen (1-based).
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// The backoff the runtime announced for this retry.
+    pub delay: std::time::Duration,
+    /// When the next attempt starts (`now + delay` at event time).
+    pub retry_at: std::time::Instant,
+}
+
+impl Reconnecting {
+    /// Whole seconds until the next attempt starts, saturating at zero.
+    pub fn remaining_secs(&self) -> u64 {
+        self.retry_at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+    }
+}
+
+/// How long the brief "Reconnected" confirmation owns the status line after a
+/// retry attempt starts again.
+pub const RECONNECTED_NOTICE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct AppState {
@@ -283,20 +313,26 @@ pub struct AppState {
     /// place of the turn's elapsed, so one running command reads as one
     /// duration. `None` for every activity that has no clock but the turn's.
     pub activity_elapsed_secs: Option<u64>,
-    /// `(attempt, max_attempts)` while a model round is retrying. Transient
-    /// connectivity: it owns the status line ahead of the generic model wait,
-    /// and is cleared the moment a fresh attempt starts. Never a transcript
+    /// The active model-round retry, while the runtime waits out its backoff.
+    /// Transient connectivity: it owns the status line ahead of the generic
+    /// model wait and is cleared the moment a fresh attempt starts. Never a
+    /// transcript item.
+    pub reconnecting: Option<Reconnecting>,
+    /// Set when a fresh attempt begins after at least one retry; the brief
+    /// "Reconnected" confirmation expires at this instant. Never a transcript
     /// item.
-    pub reconnecting: Option<(u32, u32)>,
-    /// Set while the runtime is waiting for the network after its retry budget
-    /// (transient). Owns the status line ahead of the model wait; cleared when a
-    /// fresh attempt starts or the turn ends. Never a transcript item.
-    pub waiting_for_network_since: Option<std::time::Instant>,
+    pub reconnected_until: Option<std::time::Instant>,
     pub notification: Option<Notification>,
 
     /// The running embedded Web UI URL (with token), once `/web` has started it.
     /// `Some` also guards against launching a second server.
     pub web_url: Option<String>,
+    /// The `/update` panel, while a self-update is in flight or just finished.
+    /// Presentation only: the update itself belongs to `leveler-update`.
+    pub update: Option<crate::update::UpdateView>,
+    /// Set when an installed update requires replacing this process. The event
+    /// loop exits and the CLI restarts into the new binary.
+    pub restart_requested: bool,
     /// True while `/web`'s server is starting (guards against double-launch).
     pub web_starting: bool,
     /// The invite `/remote` produced, and who is waiting on it. Present only
@@ -469,9 +505,11 @@ impl AppState {
             activity: None,
             activity_elapsed_secs: None,
             reconnecting: None,
-            waiting_for_network_since: None,
+            reconnected_until: None,
             notification: None,
             web_url: None,
+            update: None,
+            restart_requested: false,
             web_starting: false,
             remote: None,
             available_models: Vec::new(),

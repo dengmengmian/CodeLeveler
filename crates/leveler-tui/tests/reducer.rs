@@ -1366,6 +1366,56 @@ fn turn_failed_records_error_and_status() {
 }
 
 #[test]
+fn an_exhausted_failure_states_how_many_retries_were_spent() {
+    use leveler_client_protocol::{
+        FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+    };
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "network".into(),
+            failure: Some(UiFailure {
+                category: FailureCategory::Network,
+                source: FailureSource::Provider,
+                provider: Some("deepseek".into()),
+                model: None,
+                provider_code: None,
+                request_id: None,
+                status: None,
+                retries: Some(10),
+                retryability: FailureRetryability::Safe,
+                delivery: FailureDelivery::NotSent,
+                summary: "无法连接模型服务。".into(),
+                detail: "connection closed".into(),
+            }),
+        }),
+    );
+    let failure = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Failure(f) => Some(f),
+            _ => None,
+        })
+        .expect("a failure block");
+    assert!(
+        failure.summary.contains("已重试 10 次"),
+        "the terminal line must state the spent retries: {:?}",
+        failure.summary
+    );
+}
+
+/// Retry is ephemeral runtime state: a fresh state (a reopened session) never
+/// resumes a stale "Reconnecting" indicator.
+#[test]
+fn reconnecting_never_survives_a_fresh_state() {
+    assert!(state().reconnecting.is_none());
+    assert!(state().reconnected_until.is_none());
+}
+
+#[test]
 fn model_retrying_is_ephemeral_not_a_transcript_item() {
     let mut s = state();
     s.status = RuntimeStatus::Busy;
@@ -1373,11 +1423,13 @@ fn model_retrying_is_ephemeral_not_a_transcript_item() {
         &mut s,
         Action::Runtime(RuntimeEvent::ModelRetrying {
             attempt: 2,
-            max_attempts: 3,
+            max_attempts: 10,
             delay_ms: 1400,
         }),
     );
-    assert_eq!(s.reconnecting, Some((2, 3)));
+    let rc = s.reconnecting.expect("the retry is live");
+    assert_eq!((rc.attempt, rc.max_attempts), (2, 10));
+    assert_eq!(rc.delay, std::time::Duration::from_millis(1400));
     assert!(
         !s.transcript
             .items()
@@ -1385,12 +1437,16 @@ fn model_retrying_is_ephemeral_not_a_transcript_item() {
             .any(|item| matches!(item, TranscriptItem::Failure(_) | TranscriptItem::Error(_))),
         "reconnect is ephemeral status, never a transcript item"
     );
-    // A fresh attempt clears it.
+    // A fresh attempt clears the retry and briefly confirms the reconnect.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AssistantAttemptReset { message_id: None }),
     );
     assert_eq!(s.reconnecting, None);
+    assert!(
+        s.reconnected_until.is_some(),
+        "a retry that starts again confirms the reconnect"
+    );
 }
 
 /// §11 end to end: a real `ApprovalRequested` naming a running call makes that
@@ -8681,4 +8737,165 @@ fn deleting_the_middle_image_drops_the_middle_attachment() {
         }
         other => panic!("expected SubmitMessage, got {other:?}"),
     }
+}
+
+// ---- /update ---------------------------------------------------------------
+
+fn update_step(s: &mut AppState, step: leveler_update::UpdateStep) {
+    reduce(s, Action::UpdateStep(step));
+}
+
+#[test]
+fn update_is_refused_while_a_turn_is_running() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.composer.replace("/update");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "an update under an active task must not start: {effects:?}"
+    );
+    assert!(s.update.is_none());
+    assert!(s.notification.is_some(), "the refusal must be visible");
+}
+
+#[test]
+fn update_idle_starts_the_shared_service() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(effects.as_slice(), [Effect::StartUpdate]),
+        "{effects:?}"
+    );
+    assert!(s.update.is_some());
+    assert!(!s.restart_requested);
+}
+
+#[test]
+fn update_progress_and_install_requests_a_restart() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    update_step(
+        &mut s,
+        leveler_update::UpdateStep::Available {
+            current: leveler_update::parse_version("1.0.0").unwrap(),
+            latest: leveler_update::parse_version("1.0.1").unwrap(),
+        },
+    );
+    update_step(
+        &mut s,
+        leveler_update::UpdateStep::Downloading {
+            asset: "a.tar.gz".into(),
+            received: 50,
+            total: Some(100),
+        },
+    );
+    let view = s.update.as_ref().unwrap();
+    assert_eq!(view.received, 50);
+
+    update_step(
+        &mut s,
+        leveler_update::UpdateStep::Installed {
+            from: leveler_update::parse_version("1.0.0").unwrap(),
+            to: leveler_update::parse_version("1.0.1").unwrap(),
+        },
+    );
+    reduce(
+        &mut s,
+        Action::UpdateFinished(Ok(leveler_update::UpdateOutcome::Installed {
+            from: leveler_update::parse_version("1.0.0").unwrap(),
+            to: leveler_update::parse_version("1.0.1").unwrap(),
+        })),
+    );
+    assert!(s.restart_requested, "an install must ask for a restart");
+    assert!(
+        !s.running,
+        "the loop must end so the CLI can replace the process"
+    );
+}
+
+#[test]
+fn update_already_current_does_not_restart() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    reduce(&mut s, key(KeyCode::Enter));
+    update_step(
+        &mut s,
+        leveler_update::UpdateStep::UpToDate {
+            current: leveler_update::parse_version("1.0.0").unwrap(),
+        },
+    );
+    reduce(
+        &mut s,
+        Action::UpdateFinished(Ok(leveler_update::UpdateOutcome::UpToDate {
+            current: leveler_update::parse_version("1.0.0").unwrap(),
+        })),
+    );
+    assert!(!s.restart_requested);
+    assert!(s.running, "an up-to-date check is not an exit");
+}
+
+#[test]
+fn update_failure_keeps_the_session_and_shows_the_reason() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    reduce(&mut s, key(KeyCode::Enter));
+    reduce(
+        &mut s,
+        Action::UpdateFinished(Err("checksum verification failed".into())),
+    );
+    assert!(!s.restart_requested);
+    assert!(s.running);
+    let view = s.update.as_ref().unwrap();
+    assert_eq!(view.phase, leveler_tui::update::UpdatePhase::Failed);
+    assert_eq!(view.error.as_deref(), Some("checksum verification failed"));
+}
+
+#[test]
+fn the_upgrade_alias_reaches_the_same_command() {
+    let mut s = opened();
+    s.composer.replace("/upgrade");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(effects.as_slice(), [Effect::StartUpdate]),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn esc_dismisses_a_finished_update_panel() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    reduce(&mut s, key(KeyCode::Enter));
+    reduce(
+        &mut s,
+        Action::UpdateFinished(Err("checksum verification failed".into())),
+    );
+    assert!(s.update.is_some());
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.update.is_none(), "Esc must close the finished panel");
+}
+
+#[test]
+fn esc_does_not_dismiss_an_update_in_flight() {
+    let mut s = opened();
+    s.composer.replace("/update");
+    reduce(&mut s, key(KeyCode::Enter));
+    update_step(
+        &mut s,
+        leveler_update::UpdateStep::Downloading {
+            asset: "a.tar.gz".into(),
+            received: 1,
+            total: Some(100),
+        },
+    );
+    reduce(&mut s, key(KeyCode::Esc));
+    assert!(
+        s.update.is_some(),
+        "Esc must not hide an update that is still running"
+    );
 }

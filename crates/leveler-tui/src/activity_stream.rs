@@ -808,7 +808,7 @@ fn unit_lines(
     if show_action {
         head.push(Span::styled(
             action.clone(),
-            Style::default().fg(theme.accent.secondary),
+            Style::default().fg(body_ink(call.status, theme)),
         ));
     }
 
@@ -849,7 +849,7 @@ fn unit_lines(
         }
         head.push(Span::styled(
             truncate_display(&summary, avail),
-            Style::default().fg(theme.text.primary),
+            Style::default().fg(body_ink(call.status, theme)),
         ));
     }
     if !tail.is_empty() {
@@ -923,6 +923,13 @@ fn push_run(
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     out: &mut Vec<Line<'static>>,
 ) {
+    // A run is active while any of its calls is; once all are settled the head
+    // recedes with them. The children carry the per-call state either way.
+    let run_ink = if calls.iter().any(|c| c.status == ToolStatus::Running) {
+        theme.text.primary
+    } else {
+        theme.text.secondary
+    };
     let mut head = vec![
         Span::styled(
             format!("{TOOL_ANCHOR} "),
@@ -930,7 +937,7 @@ fn push_run(
         ),
         Span::styled(
             tool_action_label_for(&calls[0].name, locale),
-            Style::default().fg(theme.accent.secondary),
+            Style::default().fg(run_ink),
         ),
     ];
     if let Some(stretch) = stretch {
@@ -1240,7 +1247,7 @@ fn command_unit_lines(
     ));
     head.push(Span::styled(
         action,
-        Style::default().fg(theme.accent.secondary),
+        Style::default().fg(body_ink(call.status, theme)),
     ));
     head.push(Span::styled(format!(" · {state}"), muted));
     let mut out = vec![Line::from(head)];
@@ -1275,7 +1282,7 @@ fn command_unit_lines(
         .sum();
     line2.push(Span::styled(
         truncate_display(&summary, width.saturating_sub(used + 1).max(8)),
-        Style::default().fg(theme.text.primary),
+        Style::default().fg(body_ink(call.status, theme)),
     ));
     out.push(Line::from(line2));
 
@@ -1370,6 +1377,24 @@ fn is_user_decision_call(call: &ToolCallBlock) -> bool {
 /// lookup. Derived from the taxonomy, never a second tool-name registry.
 fn is_exploratory(call: &ToolCallBlock) -> bool {
     crate::tool_taxonomy::activity_class(&call.name) == crate::tool_taxonomy::ActivityClass::Explore
+}
+
+/// The ink for a call's own words — its action label and the target or command
+/// it ran on.
+///
+/// Brightness states the row's LIFECYCLE, not its tool category: work still in
+/// flight keeps the primary ink, while a settled trace recedes to the secondary
+/// ink so a long session's accumulated reads, searches and commands never
+/// compete with the agent's current prose. A failure or an unresolved call
+/// keeps the primary ink — it is still asking for attention, and its status
+/// glyph carries the colour. The muted ink stays reserved for chrome (anchor,
+/// rail, elapsed, counts), so metadata reads quieter than the row it belongs to
+/// at either tier. This is a real foreground token, never `Modifier::DIM`.
+fn body_ink(status: ToolStatus, theme: &Theme) -> ratatui::style::Color {
+    match status {
+        ToolStatus::Running | ToolStatus::Failed | ToolStatus::Unknown => theme.text.primary,
+        ToolStatus::Ok | ToolStatus::Cancelled => theme.text.secondary,
+    }
 }
 
 /// The glyph for one call, weighted by what its success actually PROVES.
@@ -1620,7 +1645,10 @@ fn edit_unit_lines(
     };
     let mut head = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-        Span::styled(action.clone(), Style::default().fg(theme.accent.secondary)),
+        Span::styled(
+            action.clone(),
+            Style::default().fg(body_ink(first.status, theme)),
+        ),
     ];
     // The touched file(s) ride inline on the head row.
     let files = edit_target_files(first).replace('\u{1}', ", ");
@@ -1632,7 +1660,7 @@ fn edit_unit_lines(
         head.push(Span::raw("  "));
         head.push(Span::styled(
             truncate_display(&files, avail),
-            Style::default().fg(theme.text.primary),
+            Style::default().fg(body_ink(first.status, theme)),
         ));
     }
     if !tail.is_empty() {
@@ -2087,6 +2115,104 @@ mod tests {
             open: true,
             expanded: false,
         }
+    }
+
+    /// The ink of the span carrying `needle` — the row's own target/command
+    /// text, as opposed to its muted chrome or its status glyph.
+    fn body_fg(lines: &[Line<'static>], needle: &str) -> Option<ratatui::style::Color> {
+        lines.iter().find_map(|line| {
+            line.spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .and_then(|s| s.style.fg)
+        })
+    }
+
+    fn styled_group(calls: Vec<ToolCallBlock>, theme: &Theme) -> Vec<Line<'static>> {
+        render_group(
+            &group(calls),
+            theme,
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            3,
+            None,
+        )
+    }
+
+    // ── Brightness hierarchy: lifecycle, not tool category ──────────────────
+
+    /// A call in flight owns the primary ink; the same call once settled
+    /// recedes to the secondary ink, so accumulated history cannot out-shine
+    /// the agent's current prose. The status glyph and any semantic colour are
+    /// separate channels and stay untouched.
+    #[test]
+    fn a_settled_tool_recedes_and_a_running_one_does_not() {
+        let theme = Theme::dark();
+        let running = styled_group(
+            vec![call(
+                "read_file",
+                r#"{"path":"target.rs"}"#,
+                ToolStatus::Running,
+            )],
+            &theme,
+        );
+        assert_eq!(
+            body_fg(&running, "target.rs"),
+            Some(theme.text.primary),
+            "work in flight stays primary: {running:?}"
+        );
+        let settled = styled_group(
+            vec![call("read_file", r#"{"path":"target.rs"}"#, ToolStatus::Ok)],
+            &theme,
+        );
+        assert_eq!(
+            body_fg(&settled, "target.rs"),
+            Some(theme.text.secondary),
+            "finished history recedes: {settled:?}"
+        );
+    }
+
+    /// The hierarchy never overrides a failure: a failed call keeps the
+    /// primary ink and its error glyph, so "what broke" stays findable.
+    #[test]
+    fn failure_keeps_the_primary_ink_and_the_error_glyph() {
+        let theme = Theme::dark();
+        let lines = styled_group(
+            vec![call(
+                "read_file",
+                r#"{"path":"broken.rs"}"#,
+                ToolStatus::Failed,
+            )],
+            &theme,
+        );
+        assert_eq!(body_fg(&lines, "broken.rs"), Some(theme.text.primary));
+        assert!(
+            lines.iter().any(|l| l
+                .spans
+                .iter()
+                .any(|s| s.content.contains('\u{2717}') && s.style.fg == Some(theme.status.error))),
+            "a failure keeps its error mark: {lines:?}"
+        );
+    }
+
+    /// A finished command recedes on its command line exactly like any other
+    /// tool body; the `$` marker and the duration stay quiet chrome.
+    #[test]
+    fn a_settled_command_line_recedes() {
+        let theme = Theme::dark();
+        let lines = styled_group(
+            vec![call(
+                "run_command",
+                r#"{"program":"codeleveler-marker"}"#,
+                ToolStatus::Ok,
+            )],
+            &theme,
+        );
+        assert_eq!(
+            body_fg(&lines, "codeleveler-marker"),
+            Some(theme.text.secondary)
+        );
     }
 
     // ── Activity weight: what a success actually proves ─────────────────────

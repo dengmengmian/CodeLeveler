@@ -2,9 +2,22 @@
 
 Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
-First public beta. Later releases will be listed here.
-
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
+
+## [1.0.0] - 2026-09-18
+
+First stable release. From here CodeLeveler follows Semantic Versioning.
+
+### Added
+
+- Self-update: CodeLeveler checks the latest **stable** GitHub release at start-up, verifies its SHA-256, replaces the running binary, and restarts. Failures never block start-up
+- `leveler update` (alias `upgrade`) to check and install manually, with `--check`, `--force`, and `--version <tag>`
+- `/update` in the TUI, refused while a task is running
+- `[update]` in `~/.leveler/config.toml`: `auto_update`, `check_interval_hours`
+
+### Changed
+
+- Release assets now follow the frozen `leveler-v<version>-<target>.tar.gz|zip` contract, each with a `.sha256` sibling; the release workflow refuses a tag that disagrees with the workspace version
 
 ## [0.1.0-beta.1] - 2026-09-17
 

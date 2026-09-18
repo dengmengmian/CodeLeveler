@@ -996,7 +996,7 @@ impl InProcessRuntimeClient {
             Err(crate::active_turns::TurnAdmissionError::Busy(_)) => {
                 self.notify_error(
                     &session_id,
-                    "Agent 正在运行,请等待当前任务结束或先取消".to_string(),
+                    "Agent 正在运行 · 等待完成或先取消当前任务".to_string(),
                 );
                 return Ok(());
             }

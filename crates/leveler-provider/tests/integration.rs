@@ -363,15 +363,15 @@ async fn exhausted_provider_retries_are_terminal_for_outer_layers() {
 
     assert_eq!(server.request_count(), 3);
     // R006 R6-P3: a 429 stays `Safe` to retry (an explicit "come back later") —
-    // the exhausted budget is signalled separately so outer layers switch to
-    // the slow lane instead of being silently forbidden to retry at all.
+    // the exhausted fast budget is signalled separately so the outer logical
+    // retry is not silently forbidden to retry at all.
     assert!(
         err.is_safe_to_retry(),
         "a rate limit must survive provider exhaustion as Safe: {err:?}"
     );
     assert!(
         err.provider_retries_exhausted,
-        "the exhausted fast budget must be flagged for the outer slow lane"
+        "the exhausted fast budget must be flagged as diagnostic"
     );
 }
 

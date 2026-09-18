@@ -299,11 +299,11 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 
 /// Provider-level retries own the FAST retry budget for request-start
-/// failures. Once they are exhausted, the error is flagged so an outer layer
-/// switches to its slow, small budget instead of multiplying N provider
-/// attempts into N×M identical fast waits. `retryable` stays kind-derived:
-/// destroying it here silently made every request-start timeout terminal for
-/// the whole goal (R006 R6-P3 — a continuation window died on one timeout).
+/// failures. Once they are exhausted, the error is flagged so a diagnostic
+/// can tell the two budgets apart; the logical retry lifecycle above keeps
+/// its own, independent budget. `retryable` stays kind-derived: destroying it
+/// here silently made every request-start timeout terminal for the whole goal
+/// (R006 R6-P3 — a continuation window died on one timeout).
 fn exhausted(mut error: ModelError) -> ModelError {
     error.provider_retries_exhausted = true;
     error

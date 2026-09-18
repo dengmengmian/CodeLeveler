@@ -264,16 +264,13 @@ pub enum RuntimeEvent {
     /// A model round is about to retry the same request (transient). Belongs in
     /// ephemeral status, NOT the transcript: a brief network blip must not
     /// spam the conversation. `attempt` is 1-based (the retry about to happen)
-    /// and `max_attempts` the lane's bound.
+    /// and `max_attempts` the retry budget; once `attempt == max_attempts`
+    /// fails the turn is surfaced, not hidden behind an unbounded wait.
     ModelRetrying {
         attempt: u32,
         max_attempts: u32,
         delay_ms: u64,
     },
-    /// The retry budget is spent on a `Safe` failure and the runtime is waiting
-    /// for the network rather than failing the task (transient). Ephemeral
-    /// status only. `elapsed_ms` is how long the wait has lasted.
-    ModelWaitingForNetwork { elapsed_ms: u64 },
     /// Project behavior constraints loaded for this turn. Sources are
     /// workspace-relative paths; instruction contents never enter UI chrome.
     ProjectRulesLoaded { sources: Vec<String> },
@@ -1285,6 +1282,7 @@ mod tests {
                     provider_code: None,
                     request_id: None,
                     status: Some(400),
+                    retries: None,
                     retryability: crate::failure::FailureRetryability::Never,
                     delivery: crate::failure::FailureDelivery::Responded,
                     summary: "模型服务拒绝了当前请求。".into(),

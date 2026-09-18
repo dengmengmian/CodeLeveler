@@ -136,9 +136,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             if let Some(message_id) = message_id {
                 state.transcript.reset_assistant_attempt(&message_id);
             }
-            // A fresh attempt began: any reconnect/wait is over.
-            state.reconnecting = None;
-            state.waiting_for_network_since = None;
+            // A fresh attempt began. If it follows a retry, the transport is
+            // reachable again: confirm that briefly, then the normal streaming
+            // status takes over. The retry decision stays the runtime's.
+            if state.reconnecting.take().is_some() {
+                state.reconnected_until =
+                    Some(std::time::Instant::now() + crate::state::RECONNECTED_NOTICE);
+            }
             seal_analysis_segment(state);
         }
         RuntimeEvent::AssistantTextDelta { message_id, delta } => {
@@ -180,30 +184,25 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::ModelRetrying {
             attempt,
             max_attempts,
-            ..
+            delay_ms,
         } => {
             // Connectivity belongs in ephemeral status, NOT the transcript: a
             // brief network blip must not spam the conversation. The retry
-            // controller owns the decision; this only reflects it. Whatever
-            // streamed before the blip is discarded by the retry's
-            // `AssistantAttemptReset`, so no stale text lingers.
+            // controller owns the decision; this only reflects it, including
+            // the exact delay it announced, so the countdown cannot disagree
+            // with what the scheduler actually waits. Whatever streamed before
+            // the blip is discarded by the retry's `AssistantAttemptReset`, so
+            // no stale text lingers.
             mark_turn_busy(state);
-            state.reconnecting = Some((attempt, max_attempts));
+            let delay = std::time::Duration::from_millis(delay_ms);
+            state.reconnecting = Some(crate::state::Reconnecting {
+                attempt,
+                max_attempts,
+                delay,
+                retry_at: std::time::Instant::now() + delay,
+            });
+            state.reconnected_until = None;
             state.activity_elapsed_secs = None;
-            state.waiting_for_network_since = None;
-        }
-        RuntimeEvent::ModelWaitingForNetwork { elapsed_ms } => {
-            // The retry budget is spent and the runtime is waiting for the
-            // network. Ephemeral status, never a transcript item.
-            mark_turn_busy(state);
-            state.reconnecting = None;
-            if state.waiting_for_network_since.is_none() {
-                state.waiting_for_network_since = Some(
-                    std::time::Instant::now()
-                        .checked_sub(std::time::Duration::from_millis(elapsed_ms))
-                        .unwrap_or_else(std::time::Instant::now),
-                );
-            }
         }
         RuntimeEvent::ProjectRulesLoaded { sources } => {
             mark_turn_busy(state);
@@ -401,7 +400,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 match &failure {
                     Some(f) => crate::transcript::FailureBlock {
                         title: t.failure_title.to_string(),
-                        summary: f.summary.clone(),
+                        summary: failure_summary(f, t),
                         subtitle: failure_subtitle(f),
                         detail: failure_detail_text(f, t),
                         expanded: false,
@@ -1058,6 +1057,23 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
     )
 }
 
+/// The always-visible failure line. When the runtime spent automatic retries
+/// before giving up, the count rides here: a terminal network failure must
+/// show how long it tried, not read like an instant error.
+fn failure_summary(
+    failure: &leveler_client_protocol::UiFailure,
+    t: &crate::i18n::UiText,
+) -> String {
+    match failure.retries.filter(|n| *n > 0) {
+        Some(n) => format!(
+            "{} · {}",
+            failure.summary,
+            t.failure_retried.replace("{n}", &n.to_string())
+        ),
+        None => failure.summary.clone(),
+    }
+}
+
 /// Muted machine subtitle for a failure: `provider · category_code` and the
 /// HTTP status when there was one (`kimi · invalid_request · HTTP 400`). The
 /// status is the first thing a provider report needs, so it rides on the
@@ -1115,6 +1131,9 @@ fn failure_detail_text(
         t.failure_request_id_label,
         failure.request_id.as_deref().unwrap_or(""),
     );
+    if let Some(n) = failure.retries.filter(|n| *n > 0) {
+        field(t.failure_retries_label, &n.to_string());
+    }
     field(t.failure_reason_label, &failure.detail);
     lines.join("\n")
 }
@@ -1214,7 +1233,7 @@ fn clear_activity(state: &mut AppState) {
     state.activity = None;
     state.activity_elapsed_secs = None;
     state.reconnecting = None;
-    state.waiting_for_network_since = None;
+    state.reconnected_until = None;
 }
 
 pub(super) fn start_turn(state: &mut AppState) {

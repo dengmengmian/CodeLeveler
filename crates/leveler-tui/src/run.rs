@@ -90,6 +90,16 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
+/// Why the TUI event loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiExit {
+    /// The user quit. The process should exit normally.
+    Quit,
+    /// `/update` installed a new binary. The caller replaces the process once
+    /// the terminal is restored.
+    Restart,
+}
+
 /// Run the interactive terminal UI against a runtime client until the user
 /// quits. Restores the terminal on any exit path.
 pub async fn run(
@@ -98,7 +108,7 @@ pub async fn run(
     url_opener: Option<UrlOpener>,
     remote_launcher: Option<crate::action::RemoteLauncher>,
     boot: Boot,
-) -> Result<(), TuiError> {
+) -> Result<TuiExit, TuiError> {
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
     execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
 
@@ -414,10 +424,19 @@ pub async fn run(
     }
 
     let session_id = state.session_id.clone();
+    // A completed `/update` installed a new binary; the CLI replaces this
+    // process once the terminal is back. Everything else is a normal quit.
+    let exit = if state.restart_requested {
+        TuiExit::Restart
+    } else {
+        TuiExit::Quit
+    };
     guard.restore();
-    // After raw mode is off: print full resume command so the user can reconnect.
-    println!("{}", session_exit_hint(session_id.as_str()));
-    Ok(())
+    if exit == TuiExit::Quit {
+        // After raw mode is off: print full resume command so the user can reconnect.
+        println!("{}", session_exit_hint(session_id.as_str()));
+    }
+    Ok(exit)
 }
 
 /// Text printed when the TUI exits (full copy-paste command to reopen chat).
@@ -719,6 +738,25 @@ fn dispatch_effects(
                 // the TUI, and painting over an active editor would corrupt both.
                 let result = run_external_editor(alt, stdout, &text);
                 let _ = completion_tx.send(Action::EditorFinished(result));
+            }
+            Effect::StartUpdate => {
+                // Detached: the update is network-bound and must not block the
+                // event loop. Progress and the terminal outcome come back as
+                // `Action`s on the completion channel. The reducer only emits
+                // this while idle, so no task is running under the swap.
+                let tx = completion_tx.clone();
+                tokio::spawn(async move {
+                    let outcome = match leveler_update::UpdateService::production() {
+                        Ok(service) => service
+                            .run(false, |step| {
+                                let _ = tx.send(Action::UpdateStep(step));
+                            })
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = tx.send(Action::UpdateFinished(outcome));
+                });
             }
             Effect::Quit => state.running = false,
         }

@@ -53,44 +53,43 @@ impl ModelRound {
     }
 }
 
-/// Delay before retrying a failed model round. `attempt` is the 1-based count
-/// of failures so far.
+/// Automatic retries after the first attempt fails transiently. The logical
+/// request is therefore attempted at most `1 + MAX_RETRIES` times.
 ///
-/// Rate limits clear on second scales: a provider-advertised `Retry-After`
-/// wins (capped), otherwise exponential seconds. Transient stream/transport
-/// drops usually recover immediately, so they keep fast sub-second retries.
-pub(crate) fn retry_backoff_delay(error: &ModelError, attempt: u32) -> Duration {
+/// This is the ONE owner of a model request's retry lifecycle. The provider
+/// transport still performs a single *fast* pre-delivery retry (a connect
+/// failure is cheap and common); that is a transport optimization invisible to
+/// this lifecycle, and its attempts are not counted here — so the two layers
+/// never multiply into `MAX_RETRIES` distinct logical waits.
+pub const MAX_RETRIES: u32 = 10;
+
+/// Backoff before retry `retry` (1-based). Quick first recoveries, then a
+/// steady 30s rate so a real outage is not hammered; a provider-advertised
+/// `Retry-After` (capped) overrides the schedule entirely.
+fn scheduled_backoff(retry: u32) -> Duration {
+    const SCHEDULE_MS: [u64; MAX_RETRIES as usize] = [
+        1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000, 30_000, 30_000, 30_000,
+    ];
+    let idx = (retry as usize)
+        .saturating_sub(1)
+        .min(SCHEDULE_MS.len() - 1);
+    Duration::from_millis(SCHEDULE_MS[idx])
+}
+
+/// Delay before retry `retry` (1-based). A provider-advertised `Retry-After`
+/// wins (capped); otherwise the fixed exponential schedule. Never returns a
+/// value the presented countdown would disagree with: the loop waits exactly
+/// this long.
+pub(crate) fn retry_backoff_delay(error: &ModelError, retry: u32) -> Duration {
     const MAX_ADVERTISED: Duration = Duration::from_secs(120);
-    const MAX_RATE_LIMIT: Duration = Duration::from_secs(30);
     if let Some(ms) = error.retry_after_ms {
         return Duration::from_millis(ms).min(MAX_ADVERTISED);
     }
-    match error.kind {
-        ModelErrorKind::RateLimit => {
-            let exp = 1u64 << attempt.saturating_sub(1).min(6);
-            Duration::from_secs(exp).min(MAX_RATE_LIMIT)
-        }
-        _ => Duration::from_millis(200 * attempt.min(10) as u64),
-    }
+    scheduled_backoff(retry)
 }
 
-/// Slow-lane schedule for request-start failures whose provider-level fast
-/// retries are already exhausted: re-firing 200 ms after a 4-attempt transport
-/// wipeout is a guaranteed second wipeout. Seconds-scale, bounded.
-pub(crate) fn exhausted_backoff_delay(error: &ModelError, attempt: u32) -> Duration {
-    const MAX_ADVERTISED: Duration = Duration::from_secs(120);
-    if let Some(ms) = error.retry_after_ms {
-        return Duration::from_millis(ms).min(MAX_ADVERTISED);
-    }
-    match attempt {
-        0 | 1 => Duration::from_secs(2),
-        2 => Duration::from_secs(8),
-        _ => Duration::from_secs(20),
-    }
-}
-
-/// Cheap ±0–20% jitter (no `rand` dependency) so N concurrent runs hitting
-/// the same rate limit do not retry in lockstep.
+/// Cheap 0–20% jitter (no `rand` dependency) so N concurrent runs hitting the
+/// same outage do not retry in lockstep.
 fn jittered(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,13 +98,40 @@ fn jittered(base: Duration) -> Duration {
     base + base.mul_f64((nanos % 200) as f64 / 1000.0)
 }
 
-/// One logical model request is attempted at most this many times before the
-/// round gives up its fast/slow retry budget. Small on purpose: the transport
-/// layer already retries a provably pre-delivery failure once, so this is the
-/// OUTER logical budget — the two layers must not multiply into a large
-/// HTTP-attempt count. After it is spent on a `Safe` failure, the round waits
-/// for the network instead of failing the task.
-pub const MAX_ROUND_ATTEMPTS: u32 = 3;
+/// How many retries a round may spend, and how long it waits between them.
+/// Production uses the real time schedule; a test injects a zero-delay policy
+/// so a ten-retry exhaustion is exercised without waiting out the backoff.
+#[derive(Clone, Copy)]
+pub(crate) struct RetryPolicy {
+    pub max_retries: u32,
+    /// Multiplies every computed delay. `0.0` makes retries immediate.
+    pub delay_scale: f64,
+}
+
+impl RetryPolicy {
+    pub(crate) fn production() -> Self {
+        Self {
+            max_retries: MAX_RETRIES,
+            delay_scale: 1.0,
+        }
+    }
+
+    fn delay(&self, error: &ModelError, retry: u32) -> Duration {
+        if self.delay_scale <= 0.0 {
+            return Duration::ZERO;
+        }
+        let base = retry_backoff_delay(error, retry);
+        // A provider-advertised wait is honored exactly: jitter must never
+        // retry BEFORE the window the server named. Only our own schedule is
+        // jittered, to spread concurrent recoveries.
+        let delay = if error.retry_after_ms.is_some() {
+            base
+        } else {
+            jittered(base)
+        };
+        delay.mul_f64(self.delay_scale)
+    }
+}
 
 /// Stream one round, retrying the SAME request on a retryable error
 /// (rate-limit, timeout, mid-stream interruption). Non-retryable errors and
@@ -118,17 +144,44 @@ pub async fn run_model_round(
     cancellation: &CancellationToken,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
 ) -> Result<ModelRound, AgentCoreError> {
-    const MAX_ATTEMPTS: u32 = MAX_ROUND_ATTEMPTS;
-    let mut attempt = 0u32;
-    let mut exhausted_attempts = 0u32;
+    run_model_round_with(
+        runtime,
+        request,
+        cancellation,
+        on_event,
+        RetryPolicy::production(),
+    )
+    .await
+}
+
+/// The retry budget is a parameter so a test can exercise the full ten-retry
+/// lifecycle without waiting out the real backoff. Production always passes
+/// [`RetryPolicy::production`].
+async fn run_model_round_with(
+    runtime: &dyn ModelRuntime,
+    request: ModelRequest,
+    cancellation: &CancellationToken,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    policy: RetryPolicy,
+) -> Result<ModelRound, AgentCoreError> {
+    let mut retries = 0u32;
     let started = std::time::Instant::now();
     loop {
-        attempt += 1;
         on_event(AgentEvent::StreamAttemptStarted);
         let error = match stream_round(runtime, request.clone(), cancellation, on_event).await {
             Ok(mut value) => {
-                value.retry_count = attempt.saturating_sub(1);
+                value.retry_count = retries;
                 value.latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                if retries > 0 {
+                    // The recovery half of the lifecycle, so a support log can
+                    // tell a blip that healed from one that did not.
+                    tracing::info!(
+                        request_id = %request.request_id,
+                        retries,
+                        elapsed_ms = value.latency_ms,
+                        "model round recovered after retries"
+                    );
+                }
                 return Ok(value);
             }
             // Cancellation is surfaced as its own error, never retried.
@@ -144,123 +197,50 @@ pub async fn run_model_round(
         if error.retryability() != Retryability::Safe {
             return Err(AgentCoreError::Model(error));
         }
-        if attempt < MAX_ATTEMPTS {
-            let (wait, retry_attempt, retry_max) = if error.provider_retries_exhausted {
-                exhausted_attempts += 1;
-                (
-                    jittered(exhausted_backoff_delay(&error, exhausted_attempts)),
-                    exhausted_attempts,
-                    MAX_ATTEMPTS,
-                )
-            } else {
-                (
-                    jittered(retry_backoff_delay(&error, attempt)),
-                    attempt,
-                    MAX_ATTEMPTS,
-                )
-            };
-            // The retry controller emits this; presentation must never drive it.
-            on_event(AgentEvent::ModelRetrying {
-                attempt: retry_attempt,
-                max_attempts: retry_max,
-                delay_ms: wait.as_millis() as u64,
-            });
-            // A silent retry re-sends the whole (often huge) request and looks
-            // identical to a hang from the outside. Name it.
+        if retries >= policy.max_retries {
+            // The budget is spent. Surface the last failure instead of hiding
+            // it behind an unbounded wait: whether to try again is the
+            // person's decision, and the count travels with the error.
+            let mut error = error;
+            error.retry_attempts = Some(retries);
             tracing::warn!(
-                attempt,
+                request_id = %request.request_id,
+                retries,
                 kind = ?error.kind,
                 delivery = ?error.delivery_state,
-                wait_ms = wait.as_millis() as u64,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 error = %error,
-                "model round retrying"
+                "model round retries exhausted"
             );
-            // Cancellable: a user Ctrl+C during a long rate-limit wait must not
-            // hang until the timer fires.
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled),
-                _ = tokio::time::sleep(wait) => {}
-            }
-            continue;
+            return Err(AgentCoreError::Model(error));
         }
-        // The fast/slow budget is spent, and the failure is `Safe` — the
-        // request provably did no provider-side work. That is exactly the
-        // operation that may WAIT for the network instead of failing the
-        // task. `Caution`/`Unknown` never reach here.
-        return wait_for_network(
-            runtime,
-            request,
-            cancellation,
-            on_event,
-            started,
-            attempt,
-            WAIT_INTERVAL,
-        )
-        .await;
-    }
-}
-
-/// How often a waiting round re-attempts the transport. Deliberately low: a
-/// reconnect storm is worse than the outage, and this only ever re-sends a
-/// request that provably did no provider-side work. It is a parameter (not a
-/// hard-coded sleep) so a test can exercise the wait without waiting seconds.
-const WAIT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Wait, at a low frequency, for a `Safe` request to become deliverable again.
-///
-/// The failure that got here is one that provably did no provider-side work
-/// (a pre-delivery connect failure, a 429/5xx, or a stream that produced
-/// nothing), so re-attempting is a reconnect, never a replay. A reconnect
-/// storm is worse than the outage, so attempts are seconds apart. Cancellation
-/// stops the wait at once — no request is sent after a cancel. A later failure
-/// that is no longer provably `Safe` ends the wait as a surfaced error rather
-/// than becoming a blind replay.
-async fn wait_for_network(
-    runtime: &dyn ModelRuntime,
-    request: ModelRequest,
-    cancellation: &CancellationToken,
-    on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    started: std::time::Instant,
-    attempt: u32,
-    interval: Duration,
-) -> Result<ModelRound, AgentCoreError> {
-    let waiting_since = std::time::Instant::now();
-    let mut wait_attempt = attempt;
-    loop {
-        on_event(AgentEvent::ModelWaitingForNetwork {
-            elapsed_ms: waiting_since.elapsed().as_millis() as u64,
+        retries += 1;
+        let wait = policy.delay(&error, retries);
+        // The retry controller emits this; presentation must never drive it.
+        on_event(AgentEvent::ModelRetrying {
+            attempt: retries,
+            max_attempts: policy.max_retries,
+            delay_ms: wait.as_millis() as u64,
         });
-        // Cancellable wait: the timer is abandoned the moment the caller cancels.
+        // A silent retry re-sends the whole (often huge) request and looks
+        // identical to a hang from the outside. Name it.
+        tracing::warn!(
+            request_id = %request.request_id,
+            retry = retries,
+            max_retries = policy.max_retries,
+            kind = ?error.kind,
+            delivery = ?error.delivery_state,
+            wait_ms = wait.as_millis() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "model round retrying"
+        );
+        // Cancellable: a user Ctrl+C during a long backoff must not hang until
+        // the timer fires.
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled),
-            _ = tokio::time::sleep(interval) => {}
-        }
-        wait_attempt += 1;
-        on_event(AgentEvent::StreamAttemptStarted);
-        match stream_round(runtime, request.clone(), cancellation, on_event).await {
-            Ok(mut value) => {
-                value.retry_count = wait_attempt.saturating_sub(1);
-                value.latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                return Ok(value);
-            }
-            Err(e) if cancellation.is_cancelled() => return Err(e),
-            Err(AgentCoreError::Model(e)) => {
-                // Still unreachable (Safe) means keep waiting truthfully.
-                // Anything else (Caution/Unknown/Never) must be surfaced.
-                if e.retryability() != Retryability::Safe {
-                    return Err(AgentCoreError::Model(e));
-                }
-                tracing::warn!(
-                    kind = ?e.kind,
-                    delivery = ?e.delivery_state,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "still waiting for network"
-                );
-            }
-            Err(e) => return Err(e),
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }
@@ -491,46 +471,35 @@ mod backoff_tests {
         ModelError::new(kind, "x")
     }
 
+    /// The schedule is a fixed, bounded function of the retry number: quick
+    /// first recoveries, then a steady 30s rate. The presented countdown is
+    /// this value, so it must not grow without bound.
     #[test]
-    fn rate_limit_backs_off_in_seconds_not_milliseconds() {
-        // 200ms after a 429 is a guaranteed second 429; rate limits clear on
-        // second scales.
-        let d1 = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 1);
-        let d2 = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 2);
-        assert!(d1 >= Duration::from_secs(1), "attempt 1: {d1:?}");
-        assert!(d2 >= d1 * 2, "attempt 2 must grow exponentially: {d2:?}");
+    fn schedule_climbs_then_caps_at_thirty_seconds() {
+        let expected = [1, 2, 4, 8, 15, 30, 30, 30, 30, 30];
+        for (i, secs) in expected.iter().enumerate() {
+            let retry = (i + 1) as u32;
+            assert_eq!(
+                retry_backoff_delay(&err(ModelErrorKind::Transport), retry),
+                Duration::from_secs(*secs),
+                "retry {retry}"
+            );
+        }
+        // Any retry beyond the budget keeps the cap rather than growing.
+        assert_eq!(
+            retry_backoff_delay(&err(ModelErrorKind::Transport), 50),
+            Duration::from_secs(30)
+        );
+        assert_eq!(MAX_RETRIES, 10, "the budget the schedule is sized for");
     }
 
     #[test]
-    fn rate_limit_honors_provider_advertised_delay() {
+    fn provider_advertised_delay_wins_and_is_capped() {
         let e = err(ModelErrorKind::RateLimit).with_retry_after_ms(5_000);
         assert_eq!(retry_backoff_delay(&e, 1), Duration::from_secs(5));
         // …but a hostile/buggy value is capped.
         let e = err(ModelErrorKind::RateLimit).with_retry_after_ms(3_600_000);
-        assert!(retry_backoff_delay(&e, 1) <= Duration::from_secs(120));
-    }
-
-    #[test]
-    fn transient_stream_errors_keep_fast_retries() {
-        // A dropped stream is usually recoverable immediately; seconds-scale
-        // waits would add pure latency.
-        for kind in [
-            ModelErrorKind::StreamInterrupted,
-            ModelErrorKind::Transport,
-            ModelErrorKind::Timeout,
-        ] {
-            let d = retry_backoff_delay(&err(kind), 1);
-            assert!(
-                d <= Duration::from_millis(500),
-                "{kind:?} attempt 1 should stay fast: {d:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rate_limit_backoff_is_capped() {
-        let d = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 10);
-        assert!(d <= Duration::from_secs(30), "uncapped: {d:?}");
+        assert_eq!(retry_backoff_delay(&e, 1), Duration::from_secs(120));
     }
 }
 
@@ -538,8 +507,8 @@ mod backoff_tests {
 mod retry_decision_tests {
     //! The retry decision is a function of delivery truth, not of the kind or
     //! the message alone. These tests pin the boundary: only a failure that
-    //! provably did no provider-side work may be re-sent automatically, and
-    //! once the budget is spent a `Safe` failure WAITS for the network.
+    //! provably did no provider-side work may be re-sent automatically, at most
+    //! `MAX_RETRIES` times, after which the last failure is surfaced.
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -678,6 +647,15 @@ mod retry_decision_tests {
         )
     }
 
+    /// A retry policy that performs no real wait, so a full ten-retry
+    /// exhaustion costs no wall-clock time. Production uses the real schedule.
+    fn instant_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: MAX_RETRIES,
+            delay_scale: 0.0,
+        }
+    }
+
     async fn run(
         error: ModelError,
         fail_times: u32,
@@ -690,7 +668,14 @@ mod retry_decision_tests {
             fail_times,
             calls: calls.clone(),
         };
-        let result = run_model_round(&runtime, request(), cancellation, &mut |e| out.push(e)).await;
+        let result = run_model_round_with(
+            &runtime,
+            request(),
+            cancellation,
+            &mut |e| out.push(e),
+            instant_policy(),
+        )
+        .await;
         let n = *calls.lock().unwrap();
         (result, n)
     }
@@ -794,41 +779,7 @@ mod retry_decision_tests {
             .collect();
         assert_eq!(retries.len(), 1, "exactly one retry is announced");
         assert_eq!(retries[0].0, 1, "the first retry is 1-based");
-        assert_eq!(
-            retries[0].1, MAX_ROUND_ATTEMPTS,
-            "the bound travels with it"
-        );
-    }
-
-    /// P0-3: a `Safe` failure whose budget is spent WAITS for the network
-    /// instead of failing the task, announcing the wait as it goes.
-    #[tokio::test]
-    async fn a_spent_safe_budget_waits_for_the_network() {
-        let cancel = CancellationToken::new();
-        let mut events = Vec::new();
-        // Always unreachable; cancel from another task shortly after to end the wait.
-        let calls = Arc::new(Mutex::new(0));
-        let runtime = FlakyRuntime {
-            error: not_sent(),
-            fail_times: 100,
-            calls: calls.clone(),
-        };
-        let canceller = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-            canceller.cancel();
-        });
-        let result = run_model_round(&runtime, request(), &cancel, &mut |e| events.push(e)).await;
-        assert!(
-            matches!(result, Err(AgentCoreError::Cancelled)),
-            "cancelling the wait must end it as Cancelled: {result:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ModelWaitingForNetwork { .. })),
-            "the wait must be announced"
-        );
+        assert_eq!(retries[0].1, MAX_RETRIES, "the bound travels with it");
     }
 
     /// P0-4: nothing is requested after a cancel.
@@ -855,74 +806,187 @@ mod retry_decision_tests {
         );
     }
 
-    /// P0-5: once the fast budget is spent, a `Safe` failure WAITS; when the
-    /// transport returns, the SAME request resumes — no new turn, no user
-    /// action, and nothing that had output is replayed.
+    /// One retry succeeds on the next physical attempt: the retry is announced
+    /// as `1/MAX_RETRIES`, the round resumes with no user action, and the round
+    /// reports what it spent.
     #[tokio::test]
-    async fn a_safe_wait_resumes_when_the_transport_returns() {
-        // The whole fast budget fails `Safe`, then the wait's attempt succeeds.
-        let runtime = ScriptedRuntime::new(vec![not_sent(), not_sent(), not_sent()], 0);
-        let cancel = CancellationToken::new();
+    async fn a_single_retry_recovers_and_reports_its_count() {
         let mut events = Vec::new();
-        let result = wait_for_network(
-            &runtime,
-            request(),
-            &cancel,
-            &mut |e| events.push(e),
-            std::time::Instant::now(),
-            MAX_ROUND_ATTEMPTS,
-            Duration::from_millis(20),
-        )
-        .await;
-        assert!(
-            result.is_ok(),
-            "the wait must resume once the transport returns: {result:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ModelWaitingForNetwork { .. })),
-            "the wait is announced before the resume"
-        );
-        assert_eq!(
-            *runtime.calls.lock().unwrap(),
-            4,
-            "three failures then the resuming attempt: no duplicate request"
-        );
+        let (result, calls) = run(not_sent(), 1, &CancellationToken::new(), &mut events).await;
+        let round = result.expect("the second attempt succeeds");
+        assert_eq!(calls, 2, "one retry then success");
+        assert_eq!(round.retry_count, 1, "the round reports the retry it spent");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ModelRetrying { attempt: 1, max_attempts, .. }
+                if *max_attempts == MAX_RETRIES
+        )));
     }
 
-    /// P0-5: a wait never becomes a blind replay. A later failure that is no
-    /// longer provably `Safe` (delivery became unknown) ends the wait as a
-    /// surfaced error instead of re-POSTing the whole request.
+    /// Three failures then success: the count is three, not two or four.
     #[tokio::test]
-    async fn a_wait_ends_on_an_unknown_delivery_instead_of_replaying() {
-        let unknown = ModelError::new(ModelErrorKind::Timeout, "read timed out")
-            .with_delivery_state(DeliveryState::SentNoResponse);
-        let runtime = ScriptedRuntime::new(vec![not_sent(), not_sent(), not_sent(), unknown], 0);
+    async fn three_failures_then_success_counts_three_retries() {
+        let mut events = Vec::new();
+        let (result, calls) = run(not_sent(), 3, &CancellationToken::new(), &mut events).await;
+        let round = result.expect("the fourth attempt succeeds");
+        assert_eq!(calls, 4);
+        assert_eq!(round.retry_count, 3);
+    }
+
+    /// The budget is exactly `MAX_RETRIES`: a `Safe` failure that never recovers
+    /// is attempted `1 + MAX_RETRIES` times and then surfaced, with the spent
+    /// count travelling on the error.
+    #[tokio::test]
+    async fn ten_retries_then_a_terminal_failure() {
+        let mut events = Vec::new();
+        let (result, calls) = run(not_sent(), 1_000, &CancellationToken::new(), &mut events).await;
+        assert_eq!(
+            calls,
+            1 + MAX_RETRIES,
+            "exactly ten retries, never nine or eleven"
+        );
+        let retries: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ModelRetrying {
+                    attempt,
+                    max_attempts,
+                    ..
+                } => Some((*attempt, *max_attempts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retries.len() as u32, MAX_RETRIES, "one event per retry");
+        assert_eq!(retries.first(), Some(&(1, MAX_RETRIES)));
+        assert_eq!(retries.last(), Some(&(MAX_RETRIES, MAX_RETRIES)));
+        match result {
+            Err(AgentCoreError::Model(e)) => {
+                assert_eq!(
+                    e.retry_attempts,
+                    Some(MAX_RETRIES),
+                    "the count travels on the error"
+                );
+                assert_eq!(e.retryability(), Retryability::Safe);
+            }
+            other => panic!("expected a terminal model failure: {other:?}"),
+        }
+    }
+
+    /// A permanent failure is never turned into a retry budget.
+    #[tokio::test]
+    async fn permanent_failures_are_not_retried() {
+        for error in [
+            ModelError::from_status(401, "bad key"),
+            ModelError::from_status(400, "bad request"),
+            ModelError::from_status(404, "no model"),
+        ] {
+            let mut events = Vec::new();
+            let (result, calls) =
+                run(error.clone(), 100, &CancellationToken::new(), &mut events).await;
+            assert!(result.is_err(), "{error:?} must fail");
+            assert_eq!(calls, 1, "{error:?} must be sent once, not retried");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::ModelRetrying { .. })),
+                "{error:?} must not announce a retry"
+            );
+        }
+    }
+
+    /// Transient gateway statuses are retried.
+    #[tokio::test]
+    async fn transient_statuses_are_retried() {
+        for error in [
+            ModelError::from_status(429, "slow down"),
+            ModelError::from_status(500, "boom"),
+            ModelError::from_status(503, "down"),
+        ] {
+            let mut events = Vec::new();
+            let (result, calls) =
+                run(error.clone(), 1, &CancellationToken::new(), &mut events).await;
+            assert!(result.is_ok(), "{error:?} should be retried: {result:?}");
+            assert_eq!(calls, 2, "{error:?} gets one retry");
+        }
+    }
+
+    /// A `Retry-After` the provider advertised is the delay the loop actually
+    /// waits, so the presented countdown cannot disagree with the scheduler.
+    #[tokio::test]
+    async fn advertised_retry_after_is_the_announced_delay() {
+        let error = ModelError::from_status(429, "slow").with_retry_after_ms(120);
+        let mut events = Vec::new();
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = FlakyRuntime {
+            error,
+            fail_times: 1,
+            calls: calls.clone(),
+        };
+        let policy = RetryPolicy {
+            max_retries: MAX_RETRIES,
+            delay_scale: 1.0,
+        };
+        let result = run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+            policy,
+        )
+        .await;
+        assert!(result.is_ok());
+        let delay = events.iter().find_map(|e| match e {
+            AgentEvent::ModelRetrying { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        });
+        assert_eq!(delay, Some(120), "the announced delay is the provider's");
+    }
+
+    /// Cancelling during the backoff stops the timer and every later retry at
+    /// once: no request is sent after the cancel.
+    #[tokio::test]
+    async fn cancel_during_backoff_stops_retries() {
         let cancel = CancellationToken::new();
         let mut events = Vec::new();
-        let result = wait_for_network(
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = FlakyRuntime {
+            error: not_sent(),
+            fail_times: 1_000,
+            calls: calls.clone(),
+        };
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        // The real schedule's first backoff is 1s, so the cancel lands inside it.
+        let result = run_model_round_with(
             &runtime,
             request(),
             &cancel,
             &mut |e| events.push(e),
-            std::time::Instant::now(),
-            MAX_ROUND_ATTEMPTS,
-            Duration::from_millis(20),
+            RetryPolicy {
+                max_retries: MAX_RETRIES,
+                delay_scale: 1.0,
+            },
         )
         .await;
         assert!(
-            matches!(
-                result,
-                Err(AgentCoreError::Model(ref e))
-                    if e.delivery_state == DeliveryState::SentNoResponse
-            ),
-            "an unknown delivery must end the wait as a surfaced failure: {result:?}"
+            matches!(result, Err(AgentCoreError::Cancelled)),
+            "a cancelled backoff surfaces as Cancelled: {result:?}"
         );
         assert_eq!(
-            *runtime.calls.lock().unwrap(),
-            4,
-            "one wait attempt, then stop — never a blind replay"
+            *calls.lock().unwrap(),
+            1,
+            "no attempt is made after the cancel"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ModelRetrying { .. }))
+                .count(),
+            1,
+            "the retry is announced, then cancelled before it runs"
         );
     }
 
@@ -934,7 +998,14 @@ mod retry_decision_tests {
         let runtime = ScriptedRuntime::new(vec![not_sent(), not_sent(), not_sent()], 20);
         let cancel = CancellationToken::new();
         let mut events = Vec::new();
-        let result = run_model_round(&runtime, request(), &cancel, &mut |e| events.push(e)).await;
+        let result = run_model_round_with(
+            &runtime,
+            request(),
+            &cancel,
+            &mut |e| events.push(e),
+            instant_policy(),
+        )
+        .await;
         assert!(result.is_ok(), "the round resumes: {result:?}");
         assert_eq!(
             *runtime.max_in_flight.lock().unwrap(),

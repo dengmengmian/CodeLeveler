@@ -16,14 +16,13 @@
 //! ```
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::composer::Composer;
 use crate::state::AppState;
-use crate::status_line::{StatusPhase, status_lines, status_phase};
 
 /// Which conversation surface owns the viewport and the composer.
 ///
@@ -132,105 +131,70 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let composer_rows = crate::render::composer_visible_rows(state, area.width as usize) as u16;
-    // header(1) + gap(1) + body(Min) + composer + hint(1)
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(composer_rows),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    // Header: how to get back, plus the main run's canonical status. Reusing
-    // `status_lines` / the last turn-end marker means this is a projection of
-    // the main state, never a second copy that can drift.
-    let mut header: Vec<Span<'static>> = vec![Span::styled(
-        format!("{}  ", state.t().btw_back_main),
-        Style::default()
-            .fg(state.theme.accent.secondary)
-            .add_modifier(Modifier::BOLD),
-    )];
-    header.extend(main_status_spans(state, area.width as usize));
-    frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
-
-    let body_area = chunks[2];
-    let lines = body_lines(state, body_area.width as usize);
-    let view = window(&lines, body_area.height as usize, state.btw.scroll);
-    frame.render_widget(Paragraph::new(view), body_area);
-
-    // Composer: the same box the main surface uses.
-    state.input_rect = Some((chunks[3].x, chunks[3].y, chunks[3].width, chunks[3].height));
-    let (box_lines, (cx, cy)) = crate::render::composer_box_lines(state, chunks[3].width as usize);
-    let shown: Vec<Line> = box_lines
-        .into_iter()
-        .take(chunks[3].height as usize)
-        .collect();
-    frame.render_widget(Paragraph::new(shown), chunks[3]);
-    let x = chunks[3].x + cx;
-    let y = chunks[3].y + cy;
-    if x < chunks[3].x + chunks[3].width && y < chunks[3].y + chunks[3].height {
-        frame.set_cursor_position(ratatui::layout::Position::new(x, y));
-    }
-
-    let hint = if state.btw.generating {
-        state.t().btw_footer_hint_stop
-    } else {
-        state.t().btw_footer_hint
+    let inner_width = area
+        .width
+        .saturating_sub(crate::secondary::PADDING_X.saturating_mul(2));
+    let composer_rows = crate::render::composer_visible_rows(state, inner_width as usize) as u16;
+    let page = crate::secondary::SecondaryPage {
+        title: state.t().btw_surface_title,
+        // The main run's canonical status, a projection of the same shared
+        // strip the workbench paints — never a second copy that can drift.
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: if state.btw.generating {
+            state.t().btw_footer_hint_stop
+        } else {
+            state.t().btw_footer_hint
+        },
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                " {}",
-                crate::render::truncate_display(hint, area.width as usize)
-            ),
-            Style::default().fg(state.theme.text.muted),
-        ))),
-        chunks[4],
-    );
-}
+    let layout = crate::secondary::layout(area, composer_rows);
+    crate::secondary::draw_header(frame, &layout, &page, &state.theme);
 
-/// The main run's live status, as spans. Busy / awaiting-user come straight
-/// from the shared status strip; an idle surface shows the last turn's own
-/// terminal marker, so "Completed" / "Failed" are the runtime's words.
-fn main_status_spans(state: &AppState, width: usize) -> Vec<Span<'static>> {
-    if (state.is_busy() || status_phase(state) == StatusPhase::AwaitingUser)
-        && let Some(line) = status_lines(state, width).into_iter().next()
-    {
-        return line.spans;
-    }
-    if state.status == leveler_client_protocol::RuntimeStatus::Error {
-        return vec![Span::styled(
-            format!("✗ {}", state.t().final_failed),
-            Style::default().fg(state.theme.status.error),
-        )];
-    }
-    if let Some(block) = state.transcript.last_turn_end() {
-        let item = crate::transcript::TranscriptItem::TurnEnd(block.clone());
-        let lines = crate::render::item_render(&item, &state.theme, width, false, state.t());
-        if let Some(line) = lines.into_iter().next() {
-            return line.spans;
+    let lines = body_lines(state, layout.content.width as usize);
+    let view = window(&lines, layout.content.height as usize, state.btw.scroll);
+    frame.render_widget(Paragraph::new(view), layout.content);
+
+    // Composer: the same box the main surface uses, inside the page padding.
+    let composer = layout.composer;
+    if composer.height > 0 {
+        state.input_rect = Some((composer.x, composer.y, composer.width, composer.height));
+        let (box_lines, (cx, cy)) =
+            crate::render::composer_box_lines(state, composer.width as usize);
+        let shown: Vec<Line> = box_lines
+            .into_iter()
+            .take(composer.height as usize)
+            .collect();
+        frame.render_widget(Paragraph::new(shown), composer);
+        let x = composer.x + cx;
+        let y = composer.y + cy;
+        if x < composer.x + composer.width && y < composer.y + composer.height {
+            frame.set_cursor_position(ratatui::layout::Position::new(x, y));
         }
     }
-    vec![Span::styled(
-        state.t().btw_main_idle,
-        Style::default().fg(state.theme.text.muted),
-    )]
+
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+}
+
+/// Role marker for a user turn.
+const USER_MARKER: char = '›';
+/// Role marker for an assistant turn.
+const ASSISTANT_MARKER: char = '●';
+/// The marker glyph plus the one-cell gap after it. Continuation text aligns
+/// under this many columns.
+const MARKER_PREFIX: usize = 2;
+
+fn marker_style(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 /// Conversation body lines, oldest first.
+///
+/// Roles are carried by a light marker — `›` for the user, `●` for the
+/// assistant — plus spacing, never by a "You"/"Assistant" title. Wrapped
+/// continuation lines align under the message text so one message reads as one
+/// block, and wrapping is by terminal cell width (CJK-safe).
 fn body_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     let t = state.t();
-    let label = |s: &'static str| {
-        Line::from(Span::styled(
-            s,
-            Style::default()
-                .fg(theme.text.muted)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
     let mut out: Vec<Line<'static>> = Vec::new();
     if state.btw.is_empty() {
         out.push(Line::from(""));
@@ -240,57 +204,157 @@ fn body_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
         )));
         return out;
     }
-    let inner = width.saturating_sub(2).max(8);
+    let body = Style::default().fg(theme.text.primary);
     for (index, turn) in state.btw.turns.iter().enumerate() {
         if index > 0 {
             out.push(Line::from(""));
         }
-        out.push(label(t.btw_you));
-        for line in crate::render::text::wrap(&turn.question, inner) {
-            out.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(theme.text.primary),
-            )));
-        }
+        out.extend(marked_wrapped(
+            USER_MARKER,
+            theme.accent.primary,
+            &turn.question,
+            width,
+            body,
+        ));
         out.push(Line::from(""));
-        out.push(label(t.btw_assistant));
         match turn.state {
             BtwTurnState::Streaming if turn.answer.is_empty() => {
-                out.push(Line::from(Span::styled(
-                    t.btw_answering.to_string(),
+                out.extend(marked_wrapped(
+                    ASSISTANT_MARKER,
+                    theme.accent.secondary,
+                    t.btw_answering,
+                    width,
                     Style::default().fg(theme.text.secondary),
-                )));
+                ));
             }
-            BtwTurnState::Streaming => {
-                out.extend(crate::markdown::MdDoc::parse(&turn.answer).to_lines(inner, theme));
+            BtwTurnState::Streaming | BtwTurnState::Done => {
+                out.extend(marked_markdown(
+                    ASSISTANT_MARKER,
+                    theme.accent.secondary,
+                    &turn.answer,
+                    width,
+                    theme,
+                ));
             }
             BtwTurnState::Failed => {
-                out.push(Line::from(Span::styled(
-                    t.btw_failed.to_string(),
+                out.extend(marked_wrapped(
+                    ASSISTANT_MARKER,
+                    theme.accent.secondary,
+                    t.btw_failed,
+                    width,
                     Style::default().fg(theme.status.error),
-                )));
+                ));
                 if !turn.answer.is_empty() {
-                    for line in crate::render::text::wrap(&turn.answer, inner) {
-                        out.push(Line::from(Span::styled(
-                            line,
-                            Style::default().fg(theme.status.error),
-                        )));
-                    }
+                    out.extend(marked_markdown(
+                        ASSISTANT_MARKER,
+                        theme.accent.secondary,
+                        &turn.answer,
+                        width,
+                        theme,
+                    ));
                 }
             }
             BtwTurnState::Cancelled => {
                 if !turn.answer.is_empty() {
-                    out.extend(crate::markdown::MdDoc::parse(&turn.answer).to_lines(inner, theme));
+                    out.extend(marked_markdown(
+                        ASSISTANT_MARKER,
+                        theme.accent.secondary,
+                        &turn.answer,
+                        width,
+                        theme,
+                    ));
                 }
-                out.push(Line::from(Span::styled(
-                    t.btw_cancelled.to_string(),
-                    Style::default().fg(theme.text.muted),
-                )));
-            }
-            BtwTurnState::Done => {
-                out.extend(crate::markdown::MdDoc::parse(&turn.answer).to_lines(inner, theme));
+                out.push(marked_note(
+                    ASSISTANT_MARKER,
+                    theme.accent.secondary,
+                    t.btw_cancelled,
+                    theme,
+                ));
             }
         }
+    }
+    out
+}
+
+/// A marker plus plain text, wrapped to the pane and aligned under the text.
+fn marked_wrapped(
+    marker: char,
+    marker_color: Color,
+    text: &str,
+    width: usize,
+    body: Style,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(MARKER_PREFIX).max(1);
+    let wrapped = crate::render::text::wrap(text, inner);
+    if wrapped.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(format!("{marker} "), marker_style(marker_color)),
+            Span::styled(String::new(), body),
+        ])];
+    }
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(wrapped.len());
+    for (i, segment) in wrapped.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+        if i == 0 {
+            spans.push(Span::styled(
+                format!("{marker} "),
+                marker_style(marker_color),
+            ));
+        } else {
+            spans.push(Span::raw(" ".repeat(MARKER_PREFIX)));
+        }
+        spans.push(Span::styled(segment, body));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// A marker plus a markdown answer, indented under the marker.
+fn marked_markdown(
+    marker: char,
+    marker_color: Color,
+    text: &str,
+    width: usize,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(MARKER_PREFIX).max(1);
+    let blocks = crate::markdown::MdDoc::parse(text).to_lines(inner, theme);
+    indent_under_marker(marker, marker_color, blocks)
+}
+
+/// A single marked line (status word), no wrapping.
+fn marked_note(
+    marker: char,
+    marker_color: Color,
+    text: &str,
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{marker} "), marker_style(marker_color)),
+        Span::styled(text.to_string(), Style::default().fg(theme.text.muted)),
+    ])
+}
+
+/// Indent pre-built lines under the marker: the first line carries the glyph,
+/// every later line is padded so the block stays aligned.
+fn indent_under_marker(
+    marker: char,
+    marker_color: Color,
+    blocks: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(blocks.len());
+    for (i, line) in blocks.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+        if i == 0 {
+            spans.push(Span::styled(
+                format!("{marker} "),
+                marker_style(marker_color),
+            ));
+        } else {
+            spans.push(Span::raw(" ".repeat(MARKER_PREFIX)));
+        }
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
     }
     out
 }

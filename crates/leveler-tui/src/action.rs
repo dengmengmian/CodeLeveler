@@ -108,6 +108,10 @@ pub enum Action {
     /// means the user deleted everything and meant it), `Err(message)` is why
     /// it could not run.
     EditorFinished(Result<String, String>),
+    /// One step of a `/update` in flight.
+    UpdateStep(leveler_update::UpdateStep),
+    /// `/update` ended: installed, already current, or failed with a reason.
+    UpdateFinished(Result<leveler_update::UpdateOutcome, String>),
 }
 
 /// A side effect for the event loop to carry out.
@@ -150,6 +154,11 @@ pub enum Effect {
     /// the result back as [`Action::EditorFinished`]. The composer is a poor
     /// place to write a long prompt; this is the standard way out of it.
     OpenExternalEditor { text: String },
+    /// Run a self-update (`/update`). The event loop spawns it and folds
+    /// progress back as [`Action::UpdateStep`] / [`Action::UpdateFinished`].
+    /// The reducer only emits this while idle, so it cannot replace the binary
+    /// under a running task.
+    StartUpdate,
     /// Tear down the UI and exit.
     Quit,
 }

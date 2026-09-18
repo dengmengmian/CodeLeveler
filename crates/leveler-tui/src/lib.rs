@@ -38,6 +38,7 @@ mod presentation;
 pub mod reducer;
 pub mod render;
 pub mod screen;
+mod secondary;
 mod selection;
 mod splash;
 pub mod state;
@@ -52,6 +53,7 @@ mod tool_result;
 pub mod tool_taxonomy;
 pub mod transcript;
 pub mod unfinished_goals;
+pub mod update;
 mod url_link;
 mod wait_status;
 mod workbench;
@@ -63,7 +65,7 @@ pub use action::{
     WebLauncher,
 };
 pub use i18n::Locale;
-pub use run::{TuiError, run};
+pub use run::{TuiError, TuiExit, run};
 pub use state::Boot;
 pub use theme::{Theme, ThemeId, preview_theme};
 pub use theme_config::{load_theme_id, save_theme_id};

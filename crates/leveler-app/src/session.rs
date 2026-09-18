@@ -165,9 +165,6 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             max_attempts,
             delay_ms,
         },
-        EngineEvent::ModelWaitingForNetwork { elapsed_ms } => {
-            AgentEvent::ModelWaitingForNetwork { elapsed_ms }
-        }
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }

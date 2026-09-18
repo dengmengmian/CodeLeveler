@@ -32,16 +32,38 @@ leveler run "找出失败的测试并修好"
 - 提供显式的 `/develop` 工作流：分析 → 编码 → 验证 → 评审。
 - 可选支持浏览器自动化、网页搜索、自定义 Agent 和并行候选 worktree。
 
-## 从源码安装
+## 安装
 
-新仓库发布正式构建产物前，从源码构建是当前支持的安装方式。克隆本仓库后，安装 Rust 1.90+ 和 Git，然后运行：
+### 发布包
+
+每个 release 都会为支持的平台发布带 SHA-256 校验的压缩包：
+
+| 平台 | 压缩包 |
+| --- | --- |
+| macOS（Apple Silicon） | `leveler-v<version>-aarch64-apple-darwin.tar.gz` |
+| macOS（Intel） | `leveler-v<version>-x86_64-apple-darwin.tar.gz` |
+| Linux（x86_64） | `leveler-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows（x86_64） | `leveler-v<version>-x86_64-pc-windows-msvc.zip` |
+
+从[发布页](https://github.com/dengmengmian/CodeLeveler/releases)下载对应平台的压缩包和它的 `.sha256` 文件，校验后解压 `leveler` 并放入 `PATH`：
+
+```sh
+shasum -a 256 -c leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf leveler-v1.0.0-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin && mv leveler-v1.0.0-aarch64-apple-darwin/leveler ~/.local/bin/
+leveler --version
+```
+
+Windows 请解压 `.zip`，并保持 `leveler.exe` 与 `leveler-confine.exe` 在同一目录。
+
+### 从源码
+
+安装 Rust 1.90+ 和 Git 后：
 
 ```sh
 cargo install --path crates/leveler-cli --locked
 leveler --version
 ```
-
-不要使用旧仓库的发布包、Homebrew formula 或升级地址。它们指向旧版本，不是这个仓库的分发渠道。
 
 Linux 在运行智能体命令前需要安装 `bubblewrap`：
 
@@ -50,6 +72,36 @@ sudo apt install bubblewrap
 ```
 
 不安装时 CodeLeveler 可以启动，但需要 Linux 隔离的命令会直接失败，不会降级成无沙箱执行。运行 `leveler doctor` 可以查看当前机器实际具备的能力。
+
+## 更新
+
+CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时最多每 `check_interval_hours` 检查一次；发现新版本后会下载、校验 SHA-256、替换当前二进制并重启。检查失败不会阻止启动：当前版本正常运行，失败原因写入日志。
+
+手动更新：
+
+```sh
+leveler update            # 安装最新稳定版
+leveler update --check    # 有更新时退出码为 2
+leveler update --version v1.0.1
+```
+
+在 TUI 中：
+
+```
+/update
+```
+
+任务运行期间 `/update` 会被拒绝，不会在有任务执行时替换二进制。
+
+配置（`~/.leveler/config.toml`）：
+
+```toml
+[update]
+auto_update = true           # false 关闭启动自动检查；手动更新仍可用
+check_interval_hours = 1     # 成功检查之间的间隔小时数（最小 1）
+```
+
+只追踪稳定版。预发布版本只在显式指定 `--version` 时安装。
 
 ## 第一次使用
 
@@ -128,7 +180,7 @@ Coding Harness 解析定义，能力准入和 Host Authority 强制执行边界�
 - [文档目录](docs/README.zh-CN.md)
 - [安全策略](SECURITY.md)
 
-运行 `leveler --help` 查看完整命令列表。项目仍处于 1.0 之前，`eval`、`remote` 和其他实验接口仍可能变化。
+运行 `leveler --help` 查看完整命令列表。保持最新版本见[更新](#更新)。
 
 安全漏洞请使用 [SECURITY.md](SECURITY.md) 中的非公开流程，不要提交公开 issue。
 

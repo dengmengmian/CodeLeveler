@@ -2,9 +2,22 @@
 
 英文版：[`CHANGELOG.md`](CHANGELOG.md)
 
-第一次公开 beta。之后的版本会写在这里。
-
 发布说明：[`docs/RELEASE.zh-CN.md`](docs/RELEASE.zh-CN.md)。
+
+## [1.0.0] - 2026-09-18
+
+第一个稳定版。从这版起 CodeLeveler 遵循语义化版本。
+
+### 新增
+
+- 自升级：启动时检查最新的**稳定版** GitHub Release，校验 SHA-256，替换当前二进制并重启。失败不会阻止启动
+- `leveler update`（别名 `upgrade`）手动检查与安装，支持 `--check`、`--force`、`--version <tag>`
+- TUI 中的 `/update`，任务运行期间会被拒绝
+- `~/.leveler/config.toml` 新增 `[update]`：`auto_update`、`check_interval_hours`
+
+### 变更
+
+- 发布产物固定为 `leveler-v<version>-<target>.tar.gz|zip` 及其 `.sha256`；发布工作流拒绝与工作区版本不一致的 tag
 
 ## [0.1.0-beta.1] - 2026-09-17
 

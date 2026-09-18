@@ -378,12 +378,6 @@ pub enum EngineEvent {
         max_attempts: u32,
         delay_ms: u64,
     },
-    /// TRANSIENT: the retry budget is spent on a `Safe` failure and the round
-    /// is waiting, low-frequency, for the network. A live status hint only —
-    /// never persisted, never a transcript item, never an outcome.
-    ModelWaitingForNetwork {
-        elapsed_ms: u64,
-    },
     /// The model replaced its structured plan (update_plan tool). Full list,
     /// not a delta; step text derives from the task/model output.
     PlanUpdated {
@@ -735,7 +729,6 @@ impl EngineEvent {
                 | EngineEvent::SubAgentActivity { .. }
                 | EngineEvent::RunFinished { .. }
                 | EngineEvent::ModelRetrying { .. }
-                | EngineEvent::ModelWaitingForNetwork { .. }
         )
     }
 
@@ -838,7 +831,6 @@ impl EngineEvent {
             | EngineEvent::AdvisoryStarted { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::ModelRetrying { .. }
-            | EngineEvent::ModelWaitingForNetwork { .. }
             // User shell facts carry the raw command line and its output —
             // local-sensitive by construction.
             | EngineEvent::UserShellStarted { .. }
@@ -1015,7 +1007,6 @@ impl EngineEvent {
             | EngineEvent::UserShellFinished { .. }
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ModelRetrying { .. }
-            | EngineEvent::ModelWaitingForNetwork { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::ContextUsage { .. } => return None,
         })

@@ -14,11 +14,19 @@ use super::text::{sanitize_terminal_line, truncate_display, wrap};
 pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let t = state.t();
-    let mut lines: Vec<Line> = vec![screen_title(t.help_title, theme), Line::from("")];
-    lines.push(Line::from(Span::styled(
+    let page = crate::secondary::SecondaryPage {
+        title: t.help_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.help_scroll,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         t.help_commands.to_string(),
         Style::default().fg(theme.text.secondary),
-    )));
+    ))];
     for (cat, cmds) in crate::screen::slash_commands_grouped(t) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -76,12 +84,7 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
             Span::raw(d.to_string()),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        t.help_scroll.to_string(),
-        Style::default().fg(theme.text.secondary),
-    )));
-    render_scrolled(frame, area, state, lines);
+    render_scrolled(frame, layout.content, state, lines);
 }
 
 pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
@@ -94,6 +97,9 @@ pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
 }
 
 pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    // Split panes with their own pane titles: the single-header shell does not
+    // fit, so this view keeps the legacy app frame.
+    let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let t = state.t();
     // Wipe the whole split first so a shorter file/list can't leave ghosts
@@ -206,7 +212,16 @@ fn session_status_dot(status: &str, theme: &Theme) -> (&'static str, ratatui::st
 pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let t = state.t();
-    let mut lines: Vec<Line> = vec![screen_title(t.screen_sessions, theme), Line::from("")];
+    let page = crate::secondary::SecondaryPage {
+        title: t.screen_sessions,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.sessions_footer_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+
+    let mut lines: Vec<Line> = Vec::new();
     if state.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             t.sessions_empty,
@@ -232,11 +247,5 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
             Span::styled(s.model.clone(), Style::default().fg(theme.text.secondary)),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        t.sessions_footer_hint,
-        Style::default().fg(theme.text.secondary),
-    )));
-    // +2 for the title and blank line that precede the session rows.
-    render_list_focused(frame, area, lines, state.sessions_selected + 2, theme);
+    render_list_focused(frame, layout.content, lines, state.sessions_selected, theme);
 }

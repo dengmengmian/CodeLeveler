@@ -141,13 +141,20 @@ pub struct ModelError {
     /// must prefer this over their own backoff schedule when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
-    /// The provider transport already spent its own retry budget on this
-    /// request-start failure. Outer layers may still retry a `Safe` failure,
-    /// but must use a slower, smaller budget (R006 R6-P3: this used to be
-    /// encoded by destroying retryability, which silently made every
-    /// request-start timeout terminal for the whole goal).
+    /// The provider transport already spent its own fast retry budget on this
+    /// request-start failure. Diagnostic: the logical retry lifecycle above
+    /// keeps its own, independent budget, so a `Safe` failure is still
+    /// retryable regardless of this flag (R006 R6-P3: this used to be encoded
+    /// by destroying retryability, which silently made every request-start
+    /// timeout terminal for the whole goal).
     #[serde(default)]
     pub provider_retries_exhausted: bool,
+    /// How many automatic retries the logical retry lifecycle spent on this
+    /// request before giving up. `None` when the failure never reached a
+    /// retry loop. Presentation reads it to state the count on a terminal
+    /// failure; retry policy never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_attempts: Option<u32>,
     /// What the transport could prove about delivery. Defaults to
     /// [`DeliveryState::Unknown`] so a construction site that never decided
     /// cannot accidentally claim a safer state than it has evidence for.
@@ -171,6 +178,7 @@ impl ModelError {
             diagnostics: None,
             retry_after_ms: None,
             provider_retries_exhausted: false,
+            retry_attempts: None,
             delivery_state: DeliveryState::Unknown,
             provider: None,
         }
@@ -230,6 +238,14 @@ impl ModelError {
 
     pub fn with_retry_after_ms(mut self, ms: u64) -> Self {
         self.retry_after_ms = Some(ms);
+        self
+    }
+
+    /// Record how many automatic retries were spent before this failure became
+    /// terminal. Set by the logical retry lifecycle when it exhausts its
+    /// budget; the count is diagnostic and never feeds retry policy.
+    pub fn with_retry_attempts(mut self, retries: u32) -> Self {
+        self.retry_attempts = Some(retries);
         self
     }
 

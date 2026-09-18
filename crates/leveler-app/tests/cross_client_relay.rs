@@ -106,10 +106,10 @@ async fn harness() -> Harness {
 /// Cancel the in-flight turn on `session` and wait until none are running.
 ///
 /// These tests use an unreachable model on purpose: they assert transport
-/// and relay facts, never model output. A `Safe` connect failure now waits
-/// for the network instead of emitting `TurnFailed`, so waiting for a
-/// terminal event hangs forever on `ModelWaitingForNetwork` heartbeats.
-/// Cancel is the way a test that does not own the model round must drain it.
+/// and relay facts, never model output. A `Safe` connect failure retries with
+/// backoff before it emits `TurnFailed`, so waiting for a terminal event would
+/// take the whole retry budget. Cancel is the way a test that does not own the
+/// model round drains it.
 async fn cancel_inflight_turn(h: &Harness, session: &SessionId) {
     let db = h.app.open_database().await.unwrap();
     let repo = TurnRepository::new(&db);
@@ -224,8 +224,8 @@ async fn a_session_survives_its_first_client_and_carries_to_the_next() {
     let _ = task_a.await;
 
     // The task fact outlives the client that created it. The unreachable
-    // model now waits for the network rather than failing the turn; cancel
-    // that wait so B can start a new turn on the same session.
+    // model retries with backoff rather than failing the turn immediately;
+    // cancel that retry so B can start a new turn on the same session.
     let db = h.app.open_database().await.unwrap();
     let after_disconnect = MessageRepository::new(&db).load(&session).await.unwrap();
     assert!(
@@ -373,8 +373,8 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
     // ubuntu CI run 35229563806 read the same two snapshots across
     // created→running.
     //
-    // Do not wait for a terminal: the unreachable model waits for the network
-    // now, so the live turn parks in running.
+    // Do not wait for a terminal: the unreachable model retries with backoff,
+    // so the live turn parks in running until the test cancels it.
     wait_for_message(
         &h.app,
         &session,

@@ -21,8 +21,7 @@ use ratatui::text::{Line, Span};
 use crate::context_grid::{self, GridShape};
 use crate::i18n::UiText;
 use crate::render::{
-    pad_display, pad_line_to_width, render_list_focused, render_scrolled, screen_title,
-    truncate_display,
+    pad_display, pad_line_to_width, render_list_focused, render_scrolled, truncate_display,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -158,25 +157,36 @@ pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let t = state.t();
 
+    // Shared Secondary Surface chrome: identity + parent status on top, hints
+    // at the bottom, padded content in between. This page owns only its body.
+    let page = crate::secondary::SecondaryPage {
+        title: t.context_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.context_footer_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+
     let Some(acc) = state.context.loaded.as_ref() else {
         let msg = if state.context.pending_query_id.is_some() {
             t.context_loading
         } else {
             t.context_empty
         };
-        let lines = vec![
-            screen_title(t.context_title, theme),
-            Line::from(""),
-            Line::from(Span::styled(msg, Style::default().fg(theme.text.secondary))),
-        ];
-        render_scrolled(frame, area, state, lines);
+        let lines = vec![Line::from(Span::styled(
+            msg,
+            Style::default().fg(theme.text.secondary),
+        ))];
+        render_scrolled(frame, body, state, lines);
         return;
     };
 
-    let screen = context_screen(acc, &state.context, area.width as usize, theme, t);
+    let screen = context_screen(acc, &state.context, body.width as usize, theme, t);
     match screen.focus {
-        Some(focus) => render_list_focused(frame, area, screen.lines, focus, theme),
-        None => render_scrolled(frame, area, state, screen.lines),
+        Some(focus) => render_list_focused(frame, body, screen.lines, focus, theme),
+        None => render_scrolled(frame, body, state, screen.lines),
     }
 }
 
@@ -195,8 +205,6 @@ fn context_screen(
     let window = acc.context_window_tokens.filter(|w| *w > 0);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(screen_title(t.context_title, theme));
-    lines.push(Line::from(""));
 
     // Header: the model, the real numbers, and the runtime-derived pressure.
     let used = fmt_tokens(acc.used_tokens);

@@ -228,9 +228,6 @@ async fn main() {
         } => {
             println!("[retry] {attempt}/{max_attempts}")
         }
-        AgentEvent::ModelWaitingForNetwork { elapsed_ms } => {
-            println!("[waiting] network {elapsed_ms}ms")
-        }
     });
 
     let stop = agent

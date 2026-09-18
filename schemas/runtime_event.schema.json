@@ -358,7 +358,7 @@
       }
     },
     {
-      "description": "A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the lane's bound.",
+      "description": "A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the retry budget; once `attempt == max_attempts` fails the turn is surfaced, not hidden behind an unbounded wait.",
       "type": "object",
       "required": [
         "attempt",
@@ -386,27 +386,6 @@
           "type": "string",
           "enum": [
             "model_retrying"
-          ]
-        }
-      }
-    },
-    {
-      "description": "The retry budget is spent on a `Safe` failure and the runtime is waiting for the network rather than failing the task (transient). Ephemeral status only. `elapsed_ms` is how long the wait has lasted.",
-      "type": "object",
-      "required": [
-        "elapsed_ms",
-        "type"
-      ],
-      "properties": {
-        "elapsed_ms": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "model_waiting_for_network"
           ]
         }
       }
@@ -2965,7 +2944,7 @@
           }
         },
         {
-          "description": "A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the lane's bound.",
+          "description": "A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the retry budget; once `attempt == max_attempts` fails the turn is surfaced, not hidden behind an unbounded wait.",
           "type": "object",
           "required": [
             "attempt",
@@ -2993,27 +2972,6 @@
               "type": "string",
               "enum": [
                 "model_retrying"
-              ]
-            }
-          }
-        },
-        {
-          "description": "The retry budget is spent on a `Safe` failure and the runtime is waiting for the network rather than failing the task (transient). Ephemeral status only. `elapsed_ms` is how long the wait has lasted.",
-          "type": "object",
-          "required": [
-            "elapsed_ms",
-            "type"
-          ],
-          "properties": {
-            "elapsed_ms": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0.0
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "model_waiting_for_network"
               ]
             }
           }
@@ -5410,6 +5368,15 @@
             "string",
             "null"
           ]
+        },
+        "retries": {
+          "description": "Automatic retries the runtime spent before this became terminal. Absent when the failure never went through a retry loop.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
         },
         "retryability": {
           "$ref": "#/definitions/FailureRetryability"

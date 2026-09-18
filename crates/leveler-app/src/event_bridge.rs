@@ -124,6 +124,7 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
         provider_code: error.provider_code().map(str::to_string),
         request_id: error.request_id().map(str::to_string),
         status: error.status,
+        retries: error.retry_attempts,
         retryability,
         delivery,
         summary,
@@ -880,11 +881,6 @@ impl EventBridge {
                     delay_ms,
                 });
             }
-            EngineEvent::ModelWaitingForNetwork { elapsed_ms } => {
-                let _ = self
-                    .events
-                    .send(RuntimeEvent::ModelWaitingForNetwork { elapsed_ms });
-            }
             // Supervisor control state. Durable for recovery, not for display:
             // the window count and the guards behind it are how the runtime
             // decides, and the user already sees the decision.
@@ -1240,6 +1236,26 @@ mod bridge_tests {
             "the summary is product copy, not the raw body: {}",
             failure.summary
         );
+    }
+
+    /// The retry count the logical lifecycle spent rides on the failure, so a
+    /// client can state how long the runtime tried before giving up.
+    #[test]
+    fn a_terminal_failure_carries_the_spent_retry_count() {
+        use leveler_model::{ModelError, ModelErrorKind};
+        let error = ModelError::new(ModelErrorKind::Transport, "connection closed")
+            .with_provider("deepseek")
+            .with_retry_attempts(10);
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(
+            failure.retries,
+            Some(10),
+            "an exhausted retry loop reports how many it spent"
+        );
+        // An error that never reached a retry loop states no count rather than
+        // inventing a zero.
+        let direct = ui_failure_from_model(&ModelError::new(ModelErrorKind::Other, "x"));
+        assert_eq!(direct.retries, None);
     }
 
     /// The vendor's own code, the model addressed, and the correlation id are

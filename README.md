@@ -32,16 +32,38 @@ leveler run "find the failing tests and fix them"
 - Provides an explicit `/develop` workflow for Analyze → Coding → Verify → Review.
 - Offers optional browser automation, web search, custom agents, and parallel candidate worktrees.
 
-## Install from source
+## Install
 
-Until release artifacts are published from the new repository, building from source is the supported installation path. After cloning this repository, install Rust 1.90+ and Git, then run:
+### Release archive
+
+Every release publishes signed-checksummed archives for the supported platforms:
+
+| Platform | Archive |
+| --- | --- |
+| macOS (Apple Silicon) | `leveler-v<version>-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `leveler-v<version>-x86_64-apple-darwin.tar.gz` |
+| Linux (x86_64) | `leveler-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows (x86_64) | `leveler-v<version>-x86_64-pc-windows-msvc.zip` |
+
+Download the archive for your platform from the [releases page](https://github.com/dengmengmian/CodeLeveler/releases), download its `.sha256` sibling, verify it, extract `leveler`, and put it on your `PATH`:
+
+```sh
+shasum -a 256 -c leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf leveler-v1.0.0-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin && mv leveler-v1.0.0-aarch64-apple-darwin/leveler ~/.local/bin/
+leveler --version
+```
+
+On Windows, extract the `.zip` and keep `leveler.exe` and `leveler-confine.exe` in the same directory.
+
+### From source
+
+With Rust 1.90+ and Git:
 
 ```sh
 cargo install --path crates/leveler-cli --locked
 leveler --version
 ```
-
-Do not use release assets, the Homebrew formula, or upgrade URLs from the previous repository. They refer to older releases and are not the distribution channel for this repository.
 
 On Linux, install `bubblewrap` before running agent commands:
 
@@ -50,6 +72,36 @@ sudo apt install bubblewrap
 ```
 
 CodeLeveler can start without it, but commands that require Linux isolation fail closed instead of running unsandboxed. Run `leveler doctor` to inspect the capabilities available on the current machine.
+
+## Updates
+
+CodeLeveler keeps itself on the latest **stable** GitHub release. At start-up it checks at most once per `check_interval_hours`, and when a newer release exists it downloads it, verifies its SHA-256, replaces the running binary, and restarts. A failed check never blocks start-up: the current version runs normally and the reason is logged.
+
+Manual update:
+
+```sh
+leveler update            # install the latest stable release
+leveler update --check    # exit 2 when an update exists
+leveler update --version v1.0.1
+```
+
+Inside the TUI:
+
+```
+/update
+```
+
+`/update` is refused while a task is running, so the binary is never replaced under active work.
+
+Configuration, in `~/.leveler/config.toml`:
+
+```toml
+[update]
+auto_update = true           # false disables start-up checks; manual update still works
+check_interval_hours = 1     # hours between successful checks (minimum 1)
+```
+
+Only stable releases are tracked. Pre-releases are installed only when named explicitly with `--version`.
 
 ## First run
 
@@ -128,7 +180,7 @@ Remote control sends session traffic through the configured relay. Messages are 
 - [Documentation index](docs/README.md)
 - [Security policy](SECURITY.md)
 
-Run `leveler --help` for the complete command list. The project is pre-1.0: `eval`, `remote`, and other experimental interfaces may change.
+Run `leveler --help` for the complete command list. See [Updates](#updates) for staying current.
 
 Security vulnerabilities belong in the private process documented in [SECURITY.md](SECURITY.md), not in a public issue.
 

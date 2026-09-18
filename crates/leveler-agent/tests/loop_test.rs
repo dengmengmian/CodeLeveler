@@ -6233,8 +6233,8 @@ async fn observe_tools_including_git_status_run_without_a_plan() {
 // ── R006 R6-P3: request-start timeout after provider exhaustion retries ─────
 
 /// The R006 accident: a continuation window's FIRST model request failed with
-/// a provider-exhausted Timeout and the whole goal died. The executor must
-/// retry such errors on its slow lane and succeed.
+/// a provider-exhausted Timeout and the whole goal died. The model round's
+/// own retry lifecycle must retry such a `Safe` error and succeed.
 struct ExhaustedTimeoutRuntime {
     fails_left: Mutex<u32>,
     kind: leveler_model::ModelErrorKind,
@@ -6262,8 +6262,8 @@ impl ModelRuntime for ExhaustedTimeoutRuntime {
                 let mut err = ModelError::new(self.kind, "error sending request for url");
                 // The transport could not send the request: it never left this
                 // process, so delivery is provably `NotSent` and the error is
-                // `Safe` to retry (on the slow lane once the provider's own
-                // fast budget is exhausted).
+                // `Safe` to retry (the logical retry lifecycle keeps its own
+                // budget independent of the provider's fast retries).
                 err.delivery_state = leveler_model::DeliveryState::NotSent;
                 err.provider_retries_exhausted = true;
                 return Err(err);
@@ -6288,7 +6288,7 @@ impl ModelRuntime for ExhaustedTimeoutRuntime {
 }
 
 #[tokio::test]
-async fn exhausted_request_start_timeout_is_retried_on_the_slow_lane() {
+async fn exhausted_request_start_timeout_is_retried() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-exhausted-retry-{}",
         std::process::id() as u64 * 139 + 3

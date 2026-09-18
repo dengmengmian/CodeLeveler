@@ -360,11 +360,11 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Completions { shell } => completions_cmd::cmd_completions(shell),
         Command::Login { provider } => login_cmd::cmd_login(provider).await,
         Command::Logout { provider } => login_cmd::cmd_logout(provider),
-        Command::Upgrade {
+        Command::Update {
             check,
             force,
             version,
-        } => upgrade_cmd::cmd_upgrade(check, force, version).await,
+        } => upgrade_cmd::cmd_update(check, force, version).await,
     }
 }
 
@@ -436,30 +436,33 @@ mod provenance_tests {
     }
 
     /// The regression this replaced: `--version` after a subcommand belongs to
-    /// that subcommand. `upgrade --version <TAG>` is the documented way to
-    /// install a specific release, and the only way to install a pre-release.
+    /// that subcommand. `update --version <TAG>` is the documented way to
+    /// install a specific release.
     #[test]
-    fn upgrade_owns_its_own_version_flag() {
-        let cli = Cli::try_parse_from([
-            "leveler",
-            "upgrade",
-            "--check",
-            "--version",
-            "v0.2.0-beta.1",
-        ])
-        .expect("upgrade --version names a release tag, it is not a version query");
+    fn update_owns_its_own_version_flag() {
+        let cli =
+            Cli::try_parse_from(["leveler", "update", "--check", "--version", "v1.1.0-beta.1"])
+                .expect("update --version names a release tag, it is not a version query");
         match cli.command {
-            Some(Command::Upgrade {
+            Some(Command::Update {
                 check,
                 force,
                 version,
             }) => {
                 assert!(check);
                 assert!(!force);
-                assert_eq!(version.as_deref(), Some("v0.2.0-beta.1"));
+                assert_eq!(version.as_deref(), Some("v1.1.0-beta.1"));
             }
-            other => panic!("expected upgrade, got {other:?}"),
+            other => panic!("expected update, got {other:?}"),
         }
+    }
+
+    /// `upgrade` stays accepted for users whose muscle memory predates the
+    /// rename; it routes to the same command.
+    #[test]
+    fn upgrade_is_an_alias_for_update() {
+        let cli = Cli::try_parse_from(["leveler", "upgrade"]).expect("upgrade must still parse");
+        assert!(matches!(cli.command, Some(Command::Update { .. })));
     }
 
     /// A clean build names its commit and claims nothing more.

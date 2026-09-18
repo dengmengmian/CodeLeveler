@@ -89,9 +89,6 @@ impl From<AgentEvent> for EngineEvent {
                 max_attempts,
                 delay_ms,
             },
-            A::ModelWaitingForNetwork { elapsed_ms } => {
-                EngineEvent::ModelWaitingForNetwork { elapsed_ms }
-            }
             A::CommandProgress { label, elapsed_ms } => {
                 EngineEvent::CommandProgress { label, elapsed_ms }
             }

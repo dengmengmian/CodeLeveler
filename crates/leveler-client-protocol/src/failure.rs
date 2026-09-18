@@ -166,6 +166,10 @@ pub struct UiFailure {
     /// HTTP status, when the failure had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Automatic retries the runtime spent before this became terminal.
+    /// Absent when the failure never went through a retry loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
     pub retryability: FailureRetryability,
     pub delivery: FailureDelivery,
     /// A short, provider-agnostic one-line product explanation for the primary

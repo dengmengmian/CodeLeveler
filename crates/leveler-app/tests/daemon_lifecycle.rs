@@ -301,10 +301,9 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
         })
         .await
         .unwrap();
-    // Dispatch is the activity. An unreachable model no longer emits
-    // TurnFailed: it waits for the network and heartbeats
-    // ModelWaitingForNetwork, which resets a per-recv timeout forever and
-    // hung Ubuntu/macOS CI on `cargo test --workspace`.
+    // Dispatch is the activity. An unreachable model retries with backoff
+    // before it emits TurnFailed, so a terminal event is far away; wait only
+    // for the submit to become visible and let the test cancel the turn.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match b_events.recv().await {

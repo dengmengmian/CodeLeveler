@@ -406,9 +406,6 @@ pub enum AgentEvent {
         max_attempts: u32,
         delay_ms: u64,
     },
-    /// The retry budget is spent on a `Safe` failure and the round is waiting
-    /// for the network (transient). Emitted by the retry controller.
-    ModelWaitingForNetwork { elapsed_ms: u64 },
     /// Heartbeat for a long-running command tool (spec: runtime observability).
     /// Emitted every few seconds while a `run_command`/`shell_command` is still
     /// executing, so the UI shows "运行 cargo test" with a live elapsed instead

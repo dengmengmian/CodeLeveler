@@ -2,20 +2,20 @@
 //! the composer. Layout degrades on narrow terminals .
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::screen::Screen;
 use crate::state::AppState;
-use crate::status_line::{header_line, status_line_content};
 use crate::tool_cell::render_tools_screen;
 
 /// Shell Details: one user shell execution — status, live runtime, source,
 /// cwd, the user's exact command (never the `sh -c` wrapper), and the
 /// bounded output tail. Esc backs out; `x` stops a running one.
 fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
+    let area = crate::secondary::legacy_frame(frame, area, state);
     use crate::transcript::UserShellStatus;
     let theme = &state.theme;
     let t = state.t();
@@ -179,6 +179,7 @@ fn child_stopped_at_a_bound(state: &AppState, id: &crate::activity::ActivityId) 
 
 /// Activity Detail: observational overlay-as-screen. Does not cancel work.
 fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
+    let area = crate::secondary::legacy_frame(frame, area, state);
     use crate::activity::{ActivityId, ActivityStatus, summaries};
     let theme = &state.theme;
     let t = state.t();
@@ -392,7 +393,7 @@ pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
 };
-pub(crate) use transcript_lines::{sub_agent_detail, user_shell_lines};
+pub(crate) use transcript_lines::{sub_agent_detail, turn_end_marker, user_shell_lines};
 
 pub(crate) use panes::pad_line_to_width;
 pub(crate) use panes::{render_list_focused, render_scrolled};
@@ -424,40 +425,32 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         } else {
             crate::workbench::render_workbench(frame, state);
         }
+        // A `/update` in flight owns the foreground until it finishes; drawn
+        // over the workbench so the user can still see the task behind it.
+        if let Some(view) = &state.update {
+            crate::update::render_panel(frame, area, view, &state.theme, state.t());
+        }
         return;
     }
 
-    // Non-conversation screens: header + body + status. No composer — these
-    // views answer every key themselves (Esc, x, j/k), so an input box here
-    // would take a whole typed task with no echo and no submit. The draft is
-    // kept and comes back with the conversation.
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    frame.render_widget(
-        Paragraph::new(header_line(state, area.width as usize)),
-        chunks[0],
-    );
+    // Non-conversation screens own their own chrome over the full area — the
+    // shared Secondary Surface shell, or the legacy app frame for views that do
+    // not fit it yet. No composer: these views answer every key themselves
+    // (Esc, x, j/k), so an input box here would take a whole typed task with no
+    // echo and no submit. The draft is kept and comes back with the
+    // conversation.
     match state.active_screen {
         Screen::Conversation => unreachable!(),
-        Screen::Tools => render_tools_screen(frame, chunks[1], state),
-        Screen::Diff => render_diff_screen(frame, chunks[1], state),
-        Screen::Sessions => render_sessions_screen(frame, chunks[1], state),
-        Screen::Remote => render_remote_screen(frame, chunks[1], state),
-        Screen::Shell => render_shell_screen(frame, chunks[1], state),
-        Screen::Activity => render_activity_screen(frame, chunks[1], state),
-        Screen::Help => render_help_screen(frame, chunks[1], state),
-        Screen::Trace => crate::observability::render_trace_screen(frame, chunks[1], state),
-        Screen::Context => crate::context::render_context_screen(frame, chunks[1], state),
+        Screen::Tools => render_tools_screen(frame, area, state),
+        Screen::Diff => render_diff_screen(frame, area, state),
+        Screen::Sessions => render_sessions_screen(frame, area, state),
+        Screen::Remote => render_remote_screen(frame, area, state),
+        Screen::Shell => render_shell_screen(frame, area, state),
+        Screen::Activity => render_activity_screen(frame, area, state),
+        Screen::Help => render_help_screen(frame, area, state),
+        Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
+        Screen::Context => crate::context::render_context_screen(frame, area, state),
     }
-    frame.render_widget(
-        Paragraph::new(status_line_content(state, area.width as usize)),
-        chunks[2],
-    );
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);
     }
@@ -469,6 +462,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 /// the waiting/paste copy or the pending y/n decision. Footer always reminds
 /// Esc returns to the conversation without cancelling the invite.
 fn render_remote_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let t = state.t();
     let width = area.width as usize;
@@ -2175,6 +2169,7 @@ mod tests {
                     provider_code: None,
                     request_id: None,
                     status: Some(400),
+                    retries: None,
                     retryability: FailureRetryability::Never,
                     delivery: FailureDelivery::Responded,
                     summary: "模型服务拒绝了当前请求。".into(),
@@ -2236,6 +2231,7 @@ mod tests {
                     provider_code: Some("invalid_request".into()),
                     request_id: Some("req_live_1".into()),
                     status: Some(400),
+                    retries: None,
                     retryability: FailureRetryability::Never,
                     delivery: FailureDelivery::Responded,
                     summary: "模型服务拒绝了当前请求。".into(),

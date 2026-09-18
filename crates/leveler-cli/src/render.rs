@@ -32,13 +32,6 @@ fn render_event_text(event: AgentEvent) {
                 console::style("[network]").dim()
             );
         }
-        AgentEvent::ModelWaitingForNetwork { elapsed_ms } => {
-            eprintln!(
-                "{} waiting for network ({}s)",
-                console::style("[network]").dim(),
-                elapsed_ms / 1000
-            );
-        }
         // A durable accounting row, intercepted by the drive loop. The child's
         // running totals reach the screen as SubAgentProgress instead.
         AgentEvent::SubAgentModelRequest { .. } => {}
@@ -287,10 +280,6 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "delay_ms": delay_ms,
-        }),
-        AgentEvent::ModelWaitingForNetwork { elapsed_ms } => serde_json::json!({
-            "type": "model_waiting_for_network",
-            "elapsed_ms": elapsed_ms,
         }),
         AgentEvent::ToolOutput { id, stream, text } => serde_json::json!({
             "type": "tool_output",
