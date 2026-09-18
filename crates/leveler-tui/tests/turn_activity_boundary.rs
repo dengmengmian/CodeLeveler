@@ -699,3 +699,44 @@ fn reopening_and_replaying_never_make_a_settled_child_current_activity() {
         "replay must not turn history into current activity"
     );
 }
+
+/// A session switch must not carry the previous session's open Activity Detail
+/// into a session that never had that task.
+#[test]
+fn switching_sessions_drops_the_previous_activity_detail() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-2".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        }),
+    );
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.active_screen = leveler_tui::screen::Screen::Activity;
+
+    let mut other = snapshot();
+    other.id = SessionId::new("s2");
+    other.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
+        task_id: "bg-2".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        elapsed_ms: 1_000,
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: other }),
+    );
+
+    assert_eq!(s.session_id, SessionId::new("s2"));
+    assert!(
+        s.activity_open.is_none(),
+        "the previous session's detail must not stay open"
+    );
+    assert!(
+        s.activity_selected.is_none(),
+        "the previous session's selection must not stay"
+    );
+}

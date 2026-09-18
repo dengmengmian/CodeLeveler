@@ -639,6 +639,13 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         // `x` stops exactly that execution. Takes precedence over the generic
         // interrupt hint, which is still reachable (Esc/Ctrl+C are global).
         t.command_focus_hint.to_string()
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Activity
+        && !crate::activity::summaries(state).is_empty()
+    {
+        // The selected activity owns the row: Enter opens its detail. No `x`
+        // here — stopping belongs to the object's own detail page, and a
+        // background task has no client cancel contract to advertise.
+        t.activity_focus_hint.to_string()
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.text().starts_with('!') {
@@ -768,6 +775,22 @@ mod p1_tests {
         let text = hint_text(&en, 120);
         assert!(text.contains("/ commands"), "{text}");
         assert!(text.contains("! Shell"), "{text}");
+    }
+
+    /// The Activity strip's own row: Enter opens the selected activity's
+    /// detail. No `x` — a background task has no client cancel contract, and
+    /// the row must not advertise a stop that does nothing.
+    #[test]
+    fn activity_focus_advertises_enter_to_open() {
+        let mut s = state();
+        s.background_task_labels.insert(
+            "bg-1".into(),
+            crate::state::BackgroundTaskChrome::running("cargo test --workspace", 0),
+        );
+        s.workbench_focus = crate::state::WorkbenchFocus::Activity;
+        let text = hint_text(&s, 120);
+        assert!(text.contains("Enter 查看"), "{text}");
+        assert!(!text.contains("x 停止"), "no fake cancel hint: {text}");
     }
 
     /// Narrow widths stay bounded via the existing truncation rule, and the

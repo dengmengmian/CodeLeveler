@@ -848,26 +848,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,
-            duration_ms: _,
+            duration_ms,
             ok,
         } => {
             let t = state.t();
-            // Terminal is history, never active chrome. Retained registry
-            // records remain available to `get`/`wait`, but the TUI's active
-            // projection removes the task on the authoritative exit event.
-            let label = state
-                .background_task_labels
-                .remove(&task_id)
-                .map(|chrome| chrome.label)
-                .unwrap_or_else(|| t.background_task_generic.to_string());
-            if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(open)) if open == &task_id)
-            {
-                state.activity_selected = None;
-            }
-            if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(open)) if open == &task_id)
-            {
-                state.activity_open = None;
-            }
+            // Terminal is history, but the TUI keeps the entry so the Activity
+            // row and its detail stay reopenable until the next turn boundary.
+            // The registry record is the runtime's; this is only the view.
+            let label = match state.background_task_labels.get_mut(&task_id) {
+                Some(chrome) => {
+                    chrome.ok = Some(ok);
+                    chrome.exit_code = exit_code;
+                    chrome.duration_ms = Some(duration_ms);
+                    chrome.label.clone()
+                }
+                // An exit for a task this session never saw start: report it in
+                // the transcript, but do not invent a chrome entry with no label
+                // or start clock for the Activity list.
+                None => t.background_task_generic.to_string(),
+            };
+            crate::activity::bound_terminal_background(state);
             let message = if ok {
                 t.background_task_done.replace("{}", &label)
             } else {
@@ -1221,15 +1221,12 @@ fn replace_active_background_tasks(
     tasks: &[leveler_client_protocol::UiActiveBackgroundTask],
 ) {
     let still_active = |id: &str| tasks.iter().any(|task| task.task_id == id);
-    if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(id)) if !still_active(id))
-    {
-        state.activity_selected = None;
-    }
-    if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(id)) if !still_active(id))
-    {
-        state.activity_open = None;
-    }
-    state.background_task_labels.clear();
+    // The runtime is authoritative for what is still running: a running entry
+    // it no longer lists is gone (its exit was lost in the lag), so drop it.
+    // Terminal entries are the TUI's own retained history and stay.
+    state
+        .background_task_labels
+        .retain(|id, chrome| !chrome.is_running() || still_active(id));
     for task in tasks {
         let label = crate::render::tool_summary_for(
             "run_command",
@@ -1249,6 +1246,15 @@ fn replace_active_background_tasks(
             ),
         );
     }
+    let known = |id: &str| state.background_task_labels.contains_key(id);
+    if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(id)) if !known(id))
+    {
+        state.activity_selected = None;
+    }
+    if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(id)) if !known(id))
+    {
+        state.activity_open = None;
+    }
 }
 
 fn archive_active_plan(state: &mut AppState) {
@@ -1263,6 +1269,9 @@ pub(super) fn start_turn(state: &mut AppState) {
     // rendering as work in flight. A child still open at the boundary stays:
     // the runtime continues or settles it in a later turn.
     state.team.retire_settled(state.elapsed_secs);
+    // The previous turn's finished background tasks retire the same way. A
+    // still-running one (a dev server) is not finished work and stays.
+    crate::activity::retire_terminal_background_tasks(state);
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
     state.finalization_stage = None;
@@ -1493,6 +1502,11 @@ fn apply_session_with(
         state.command_selected = None;
         // Another session's children are not this session's.
         state.team = crate::multi_agent::TaskTeamView::default();
+        // Nor is its open Activity: a detail page must not survive into a
+        // session that never had that task.
+        state.activity_open = None;
+        state.activity_selected = None;
+        state.activity_view = crate::activity::ActivityView::default();
         // A side thread is scoped to the run it observed: leaving it behind
         // would let a follow-up reference a conversation this session never
         // had. Return to Main and drop it (the main draft is swapped back in).

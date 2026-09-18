@@ -236,7 +236,7 @@ fn child_task_line(summary: &ActivitySummary, width: usize) -> Option<String> {
     ))
 }
 
-fn activity_glyph(status: ActivityStatus) -> &'static str {
+pub(crate) fn activity_glyph(status: ActivityStatus) -> &'static str {
     match status {
         ActivityStatus::Running => "●",
         ActivityStatus::Waiting => "◌",
@@ -334,6 +334,8 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
     state.activity_selected = Some(id.clone());
     state.active_screen = crate::screen::Screen::Activity;
     state.screen_scroll = 0;
+    // Opening starts at the newest output, following it.
+    state.activity_view = ActivityView::default();
     match id {
         ActivityId::Child(child_id) => {
             let already = state
@@ -361,6 +363,153 @@ pub(crate) fn close(state: &mut AppState) {
     state.activity_open = None;
     state.active_screen = crate::screen::Screen::Conversation;
     state.screen_scroll = 0;
+    state.activity_view = ActivityView::default();
+}
+
+/// The Activity Detail viewport. Mirrors the conversation viewport's follow
+/// semantics: auto-follow sticks to the newest output, scrolling back pauses
+/// it and counts what arrived, and jumping to the bottom resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityView {
+    /// Offset (in content lines) from the top while the user reads back.
+    pub scroll: usize,
+    /// Stick to the newest output while true.
+    pub follow: bool,
+    /// Content lines that arrived while follow was paused.
+    pub unread: usize,
+    /// Last measured content line count, to detect growth while paused.
+    pub last_len: usize,
+    /// Last measured maximum scroll, published by the renderer each frame.
+    pub max_scroll: usize,
+    /// Last measured viewport height in rows, for page-sized scrolls.
+    pub viewport_height: usize,
+}
+
+impl Default for ActivityView {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            follow: true,
+            unread: 0,
+            last_len: 0,
+            max_scroll: 0,
+            viewport_height: 0,
+        }
+    }
+}
+
+/// Publish this frame's measured geometry and track growth while the user is
+/// reading back. Called by the renderer, which is the only place the content
+/// height is known. Returns true when a repaint is due.
+pub(crate) fn sync_view(state: &mut AppState, total: usize, height: usize) -> bool {
+    let max_scroll = total.saturating_sub(height);
+    let view = &mut state.activity_view;
+    let mut changed = false;
+    if view.viewport_height != height {
+        view.viewport_height = height;
+        changed = true;
+    }
+    if view.max_scroll != max_scroll {
+        view.max_scroll = max_scroll;
+        changed = true;
+    }
+    if view.follow {
+        if view.scroll != max_scroll {
+            view.scroll = max_scroll;
+            changed = true;
+        }
+        if view.unread != 0 {
+            view.unread = 0;
+            changed = true;
+        }
+    } else if total > view.last_len {
+        view.unread = view.unread.saturating_add(total - view.last_len);
+        changed = true;
+    }
+    if view.last_len != total {
+        view.last_len = total;
+        changed = true;
+    }
+    changed
+}
+
+/// Scroll the Activity Detail by `delta` lines (negative = up). Scrolling up
+/// leaves follow; reaching the bottom resumes it and clears the unread count.
+pub(crate) fn scroll_lines(state: &mut AppState, delta: isize) {
+    let view = &mut state.activity_view;
+    if delta < 0 {
+        view.follow = false;
+        view.scroll = view
+            .scroll
+            .saturating_sub(delta.unsigned_abs())
+            .min(view.max_scroll);
+    } else {
+        view.scroll = (view.scroll + delta as usize).min(view.max_scroll);
+        if view.scroll >= view.max_scroll {
+            view.follow = true;
+            view.unread = 0;
+        }
+    }
+}
+
+/// Page the Activity Detail. Empty viewports still advance by one row so a
+/// page key never becomes a no-op.
+pub(crate) fn scroll_page(state: &mut AppState, direction: isize) {
+    let page = state.activity_view.viewport_height.saturating_sub(1).max(1);
+    scroll_lines(state, direction * page as isize);
+}
+
+/// `Home` / `g`: jump to the first line and stop following.
+pub(crate) fn to_top(state: &mut AppState) {
+    state.activity_view.follow = false;
+    state.activity_view.scroll = 0;
+}
+
+/// `End` / `G`: jump to the newest line and resume following.
+pub(crate) fn to_bottom(state: &mut AppState) {
+    state.activity_view.follow = true;
+    state.activity_view.unread = 0;
+    state.activity_view.scroll = state.activity_view.max_scroll;
+}
+
+/// Retire terminal background tasks at a turn boundary, the same way settled
+/// children retire: the previous turn's finished work is history, and the
+/// transcript keeps it. A still-running task (a dev server) stays.
+pub(crate) fn retire_terminal_background_tasks(state: &mut AppState) -> bool {
+    let before = state.background_task_labels.len();
+    state.background_task_labels.retain(|_, c| c.is_running());
+    before != state.background_task_labels.len()
+}
+
+/// Cap on terminal background tasks kept reopenable within a turn. Live tasks
+/// are bounded by the runtime's concurrency limit; terminal ones would
+/// otherwise accumulate over a long turn with many sequential commands.
+const MAX_TERMINAL_BACKGROUND: usize = 8;
+
+/// Drop the oldest terminal entries past the cap so a long turn cannot grow the
+/// projection without bound. Ordered by start time, which is monotonic on the
+/// turn clock. A dropped entry that is still open falls back to the stale view.
+pub(crate) fn bound_terminal_background(state: &mut AppState) {
+    let mut terminal: Vec<(String, u64)> = state
+        .background_task_labels
+        .iter()
+        .filter(|(_, c)| !c.is_running())
+        .map(|(id, c)| (id.clone(), c.started_elapsed_secs))
+        .collect();
+    let excess = terminal.len().saturating_sub(MAX_TERMINAL_BACKGROUND);
+    if excess == 0 {
+        return;
+    }
+    terminal.sort_by_key(|(_, started)| *started);
+    for (id, _) in terminal.into_iter().take(excess) {
+        state.background_task_labels.remove(&id);
+        if matches!(&state.activity_open, Some(ActivityId::Background(open)) if open == &id) {
+            state.activity_open = None;
+        }
+        if matches!(&state.activity_selected, Some(ActivityId::Background(sel)) if sel == &id) {
+            state.activity_selected = None;
+        }
+    }
 }
 
 pub(crate) fn ensure_selection(state: &mut AppState) {
@@ -1002,5 +1151,140 @@ second line ignored"
         );
         assert!(crate::wait_status::project(&state).is_none());
         assert_eq!(summaries(&state)[0].status, ActivityStatus::Running);
+    }
+
+    /// The viewport follows the tail until the user leaves the bottom, then
+    /// freezes where they are reading and counts what arrived behind them.
+    #[test]
+    fn the_detail_viewport_follows_then_freezes_where_the_user_scrolled() {
+        let mut state = test_state();
+        assert!(sync_view(&mut state, 100, 10));
+        assert!(state.activity_view.follow);
+        assert_eq!(state.activity_view.scroll, 90, "following sits at the tail");
+
+        // New output while following keeps the viewport pinned to the tail.
+        sync_view(&mut state, 103, 10);
+        assert_eq!(state.activity_view.scroll, 93);
+        assert_eq!(state.activity_view.unread, 0);
+
+        // One key up leaves follow and pins the position.
+        scroll_lines(&mut state, -1);
+        assert!(!state.activity_view.follow);
+        assert_eq!(state.activity_view.scroll, 92);
+
+        // New output while paused must not move the viewport.
+        sync_view(&mut state, 110, 10);
+        assert_eq!(state.activity_view.scroll, 92, "paused viewport is frozen");
+        assert_eq!(
+            state.activity_view.unread, 7,
+            "the reader is told what arrived"
+        );
+
+        // End jumps to the newest line and resumes follow.
+        to_bottom(&mut state);
+        assert!(state.activity_view.follow);
+        assert_eq!(state.activity_view.unread, 0);
+        assert_eq!(state.activity_view.scroll, 100);
+    }
+
+    #[test]
+    fn home_and_page_keys_move_the_detail_viewport() {
+        let mut state = test_state();
+        sync_view(&mut state, 100, 10);
+        assert_eq!(state.activity_view.max_scroll, 90);
+        to_top(&mut state);
+        assert!(!state.activity_view.follow);
+        assert_eq!(state.activity_view.scroll, 0);
+        scroll_page(&mut state, 1);
+        assert_eq!(state.activity_view.scroll, 9);
+        scroll_page(&mut state, -1);
+        assert_eq!(state.activity_view.scroll, 0);
+        // Page-down past the bottom resumes follow.
+        scroll_page(&mut state, 1);
+        scroll_page(&mut state, 1);
+        assert_eq!(state.activity_view.scroll, 18);
+        to_bottom(&mut state);
+        scroll_page(&mut state, 1);
+        assert!(state.activity_view.follow);
+    }
+
+    /// A finished task stays in the Activity projection so its row — and the
+    /// detail behind it — remain reopenable, but it is not counted as running.
+    #[test]
+    fn a_terminal_background_task_stays_reopenable_but_is_not_running() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-done".into(),
+            BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(8_000),
+                output: "test result: ok\n".into(),
+            },
+        );
+        assert_eq!(running_background_count(&state), 0);
+        let rows = summaries(&state);
+        assert!(
+            rows.iter()
+                .any(|r| r.id == ActivityId::Background("bg-done".into()))
+        );
+        assert_eq!(rows[0].status, ActivityStatus::Completed);
+        assert!(compact_row(&rows[0], false, 80).contains('↗'));
+    }
+
+    /// Terminal tasks retire at the turn boundary; running ones (a dev server)
+    /// are not finished work and stay.
+    #[test]
+    fn a_terminal_background_task_retires_at_the_turn_boundary() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-server".into(),
+            BackgroundTaskChrome::running("npm run dev", 0),
+        );
+        state.background_task_labels.insert(
+            "bg-done".into(),
+            BackgroundTaskChrome {
+                label: "cargo test".into(),
+                started_elapsed_secs: 0,
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(1_000),
+                output: String::new(),
+            },
+        );
+        assert!(retire_terminal_background_tasks(&mut state));
+        assert!(state.background_task_labels.contains_key("bg-server"));
+        assert!(!state.background_task_labels.contains_key("bg-done"));
+    }
+
+    /// The retained terminal set is bounded so a long turn with many sequential
+    /// commands cannot grow the projection without limit.
+    #[test]
+    fn bounded_terminal_background_drops_the_oldest() {
+        let mut state = test_state();
+        for i in 0..(MAX_TERMINAL_BACKGROUND + 2) {
+            state.background_task_labels.insert(
+                format!("bg-{i}"),
+                BackgroundTaskChrome {
+                    label: format!("cmd {i}"),
+                    started_elapsed_secs: i as u64,
+                    ok: Some(true),
+                    exit_code: Some(0),
+                    duration_ms: Some(1_000),
+                    output: String::new(),
+                },
+            );
+        }
+        bound_terminal_background(&mut state);
+        assert_eq!(
+            state.background_task_labels.len(),
+            MAX_TERMINAL_BACKGROUND,
+            "oldest terminal entries are dropped"
+        );
+        assert!(!state.background_task_labels.contains_key("bg-0"));
+        assert!(!state.background_task_labels.contains_key("bg-1"));
+        assert!(state.background_task_labels.contains_key("bg-2"));
     }
 }

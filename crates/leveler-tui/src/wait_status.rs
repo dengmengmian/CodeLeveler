@@ -29,7 +29,8 @@ pub(crate) enum WaitKind {
 }
 
 /// Lifecycle of a disclosed dependency. Failed/cancelled work is not shown
-/// as running — those entries leave the live map on `BackgroundTaskExited`.
+/// as running: `BackgroundTaskExited` marks the entry terminal, and the wait
+/// projection only discloses entries that are still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetLifecycle {
     Running,

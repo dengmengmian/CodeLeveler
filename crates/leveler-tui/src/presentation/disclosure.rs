@@ -29,6 +29,11 @@ pub struct DisclosurePresentation {
     pub needs_permission_suffix: Option<String>,
     /// Open (`▾`) or folded (`▸`).
     pub expanded: bool,
+    /// This row opens an independent detail surface instead of expanding
+    /// inline. A drill-down renders `↗` (the shared drill-down marker) and
+    /// ignores `expanded`, because there is no inline form to fold. A tool
+    /// group keeps `▸/▾`.
+    pub drill_down: bool,
     /// Authoritative runtime-supplied duration. The adapter must only set
     /// this when it IS authoritative (a single execution) — this renderer
     /// will show whatever it is given.
@@ -41,7 +46,16 @@ pub struct DisclosurePresentation {
 /// The header row: `▸ label · 1.2s`, `▾ ✗ label · 2 failed`. The whole row is
 /// a click target (hit-tested by the conversation build).
 pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> Line<'static> {
-    let glyph = if p.expanded { "▾" } else { "▸" };
+    // `↗` is the one marker that means "this opens its own detail surface".
+    // An inline disclosure keeps `▸/▾`, so the two affordances never wear the
+    // same glyph.
+    let glyph = if p.drill_down {
+        "↗"
+    } else if p.expanded {
+        "▾"
+    } else {
+        "▸"
+    };
     let failed = p.failed > 0;
     let attention = failed || p.needs_permission_suffix.is_some();
     let mut spans = vec![

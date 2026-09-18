@@ -386,14 +386,20 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     match state.status {
         RuntimeStatus::Busy => busy_status_lines(state, width),
         RuntimeStatus::Error | RuntimeStatus::Idle => {
-            if let Some(label) = &state.activity {
+            let mut lines = if let Some(label) = &state.activity {
                 vec![Line::from(Span::styled(
                     format!("… {label}"),
                     Style::default().fg(theme.text.secondary),
                 ))]
             } else {
                 vec![Line::from("")]
-            }
+            };
+            // A background process outlives the turn that started it. Its
+            // activity row — and a finished one kept for reopening — must stay
+            // visible while Main is idle, or the only way back to its detail
+            // would be a still-running turn.
+            append_activity_rows(&mut lines, state, width, theme);
+            lines
         }
     }
 }
@@ -1202,6 +1208,37 @@ mod tests {
         );
         let text = status_text(&state);
         assert!(text.contains("正在汇总审计结果"), "{text}");
+        assert!(text.contains("cargo test --workspace"), "{text}");
+        assert!(text.contains('↗'), "{text}");
+        assert!(!text.contains("等待后台任务"), "{text}");
+    }
+
+    /// A background process outlives its turn, so its row stays reachable while
+    /// Main is idle — both a still-running one and a finished one kept for
+    /// reopening. Without this, the detail would only be openable mid-turn.
+    #[test]
+    fn an_idle_strip_keeps_background_activities_reachable() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.status = RuntimeStatus::Idle;
+        state.activity = None;
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            BackgroundTaskChrome::running("npm run dev", 0),
+        );
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(1_000),
+                output: String::new(),
+            },
+        );
+        let text = status_text(&state);
+        assert!(text.contains("npm run dev"), "{text}");
         assert!(text.contains("cargo test --workspace"), "{text}");
         assert!(text.contains('↗'), "{text}");
         assert!(!text.contains("等待后台任务"), "{text}");

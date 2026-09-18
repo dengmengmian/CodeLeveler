@@ -180,7 +180,7 @@ fn child_stopped_at_a_bound(state: &AppState, id: &crate::activity::ActivityId) 
 /// Activity Detail: observational overlay-as-screen. Does not cancel work.
 fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
     let area = crate::secondary::legacy_frame(frame, area, state);
-    use crate::activity::{ActivityId, ActivityStatus, summaries};
+    use crate::activity::{ActivityId, ActivityKind, ActivityStatus, summaries};
     let theme = &state.theme;
     let t = state.t();
     let dim = Style::default().fg(theme.text.muted);
@@ -199,6 +199,12 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         frame.render_widget(Paragraph::new(lines), area);
         return;
     };
+    let detail_title = match summary.kind {
+        ActivityKind::BackgroundTask => t.activity_title_background,
+        ActivityKind::ChildAgent => t.activity_title_child,
+    };
+    lines.push(screen_title(&format!("‹ {detail_title}"), theme));
+    lines.push(Line::from(""));
     let status_text = match summary.status {
         ActivityStatus::Running => t.wait_target_running,
         ActivityStatus::Waiting => t.sub_agent_waiting,
@@ -265,6 +271,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
     lines.push(Line::from(Span::styled(meta, status_style)));
     lines.push(Line::from(""));
 
+    let mut background_output = false;
     match &id {
         ActivityId::Background(task_id) => {
             lines.push(Line::from(Span::styled(
@@ -280,6 +287,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
                     dim,
                 )));
             } else {
+                background_output = true;
                 let width = area.width.saturating_sub(2) as usize;
                 for raw in output.lines() {
                     let line = sanitize_terminal_line(raw);
@@ -360,17 +368,57 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
             summary.status,
             ActivityStatus::Running | ActivityStatus::Waiting
         );
-    let footer = if running_child {
-        format!("{} · {}", t.activity_esc, t.activity_cancel_child)
+    // The follow chip belongs to a background task that actually has output to
+    // follow: a tail state on an empty page would describe nothing.
+    if background_output {
+        let glyph = crate::activity::activity_glyph(summary.status);
+        let chip = if state.activity_view.follow {
+            t.activity_follow_on.to_string()
+        } else if state.activity_view.unread > 0 {
+            format!(
+                "{} · {}",
+                t.activity_follow_paused,
+                t.activity_new_lines
+                    .replace("{}", &state.activity_view.unread.to_string())
+            )
+        } else {
+            t.activity_follow_paused.to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{glyph} {} · {} · {chip}",
+                status_text,
+                crate::status_line::fmt_elapsed(summary.duration_secs)
+            ),
+            status_style,
+        )));
+        lines.push(Line::from(""));
+    }
+    let height = area.height as usize;
+    // The footer advertises scrolling only when the page can actually scroll,
+    // so a short detail does not promise keys that do nothing.
+    let can_scroll = lines.len().saturating_add(1) > height;
+    let scroll_hint = if can_scroll {
+        format!(" · {}", t.activity_hint_scroll)
     } else {
-        t.activity_esc.to_string()
+        String::new()
+    };
+    let footer = if running_child {
+        format!(
+            "{} · {}{}",
+            t.activity_esc, t.activity_cancel_child, scroll_hint
+        )
+    } else {
+        format!("{}{}", t.activity_esc, scroll_hint)
     };
     lines.push(Line::from(Span::styled(footer, dim)));
 
-    let height = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(height);
-    let scroll = state.screen_scroll.min(max_scroll);
-    let offset = max_scroll.saturating_sub(scroll);
+    let total = lines.len();
+    crate::activity::sync_view(state, total, height);
+    let offset = state
+        .activity_view
+        .scroll
+        .min(state.activity_view.max_scroll);
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
@@ -1211,6 +1259,63 @@ mod tests {
                 "{screen:?} draws a composer that swallows every key:\n{text}"
             );
         }
+    }
+
+    /// A background Activity Detail shows the real command, its retained
+    /// output, and the viewport's follow state — the same surface the child
+    /// detail uses, not a second background-specific screen.
+    #[test]
+    fn background_detail_shows_command_output_and_follow_state() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            crate::state::BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+                ok: None,
+                exit_code: None,
+                duration_ms: None,
+                output: "Compiling leveler-core ...\ntest result: ok\n".into(),
+            },
+        );
+        state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
+        state.active_screen = Screen::Activity;
+        let text = render_text(&mut state, 90, 30);
+        assert!(text.contains("Background Task"), "{text}");
+        assert!(text.contains("$ cargo test --workspace"), "{text}");
+        assert!(text.contains("Compiling leveler-core"), "{text}");
+        assert!(text.contains("Follow ON"), "{text}");
+
+        // Scrolling back pauses follow and says so; the content stays put.
+        crate::activity::scroll_lines(&mut state, -1);
+        let text = render_text(&mut state, 90, 30);
+        assert!(text.contains("Follow PAUSED"), "{text}");
+        assert!(!text.contains("Follow ON"), "{text}");
+    }
+
+    /// A terminal background task keeps its detail: the row is not deletable
+    /// just because the process exited, and the page switches to the terminal
+    /// status instead of closing.
+    #[test]
+    fn a_finished_background_detail_stays_readable() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            crate::state::BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(133_000),
+                output: "test result: ok. 428 passed\n".into(),
+            },
+        );
+        state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
+        state.active_screen = Screen::Activity;
+        let text = render_text(&mut state, 90, 30);
+        assert!(text.contains("Background Task"), "{text}");
+        assert!(text.contains("test result: ok"), "{text}");
+        assert!(text.contains("exit 0"), "{text}");
     }
 
     /// A child that was stopped and a child that finished are not the same

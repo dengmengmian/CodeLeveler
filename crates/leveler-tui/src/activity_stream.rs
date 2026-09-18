@@ -447,6 +447,7 @@ fn disclosure_presentation(
                 .replace("{}", &needs_network.to_string())
         }),
         expanded,
+        drill_down: false,
         duration_ms,
         first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
     }

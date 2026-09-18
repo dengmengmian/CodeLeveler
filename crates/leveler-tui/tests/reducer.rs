@@ -4623,13 +4623,15 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
     assert!(!msg.contains("bg-7f3a"), "{msg}");
     assert!(
         s.background_task_labels
-            .get("bg-91c2")
-            .is_some_and(|c| c.is_running()),
-        "the still-running task keeps its label"
+            .get("bg-7f3a")
+            .is_some_and(|c| !c.is_running() && c.ok == Some(true)),
+        "a settled task is retained as terminal so its detail stays reopenable"
     );
     assert!(
-        !s.background_task_labels.contains_key("bg-7f3a"),
-        "a settled task is history, not active chrome"
+        s.background_task_labels
+            .get("bg-91c2")
+            .is_some_and(|c| c.is_running()),
+        "the still-running task is still live chrome"
     );
     assert!(
         s.transcript
@@ -4674,6 +4676,100 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
     let msg = s.notification.as_ref().unwrap().message.clone();
     assert!(!msg.contains("bg-unknown"), "{msg}");
     assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
+}
+
+#[test]
+fn x_on_a_background_detail_is_inert_without_a_cancel_contract() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-2".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        }),
+    );
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.active_screen = Screen::Activity;
+    let effects = reduce(&mut s, raw_char('x'));
+    assert!(
+        effects.is_empty(),
+        "no client command stops a background task, so x must not fake one: {effects:?}"
+    );
+    assert!(
+        s.background_task_labels
+            .get("bg-2")
+            .is_some_and(|c| c.is_running()),
+        "the background task keeps running"
+    );
+}
+
+/// A task that finishes while its detail is open keeps the detail open and
+/// switches it to the terminal state; the row stays reopenable afterwards.
+#[test]
+fn a_finished_background_task_keeps_its_detail_and_reopens_from_the_row() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-2".into(),
+            program: "cargo".into(),
+            args: vec!["test".into(), "--workspace".into()],
+        }),
+    );
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.active_screen = Screen::Activity;
+    s.background_task_labels
+        .get_mut("bg-2")
+        .unwrap()
+        .output
+        .push_str("test result: ok\n");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-2".into(),
+            exit_code: Some(0),
+            duration_ms: 8_000,
+            ok: true,
+        }),
+    );
+    assert_eq!(
+        s.active_screen,
+        Screen::Activity,
+        "exit must not close the viewer"
+    );
+    assert_eq!(
+        s.activity_open,
+        Some(leveler_tui::activity::ActivityId::Background("bg-2".into()))
+    );
+    assert!(
+        s.background_task_labels
+            .get("bg-2")
+            .is_some_and(|c| c.ok == Some(true) && !c.is_running()),
+        "the entry is terminal but retained"
+    );
+
+    // Esc only closes the viewer; the task is still reopenable.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    assert!(s.activity_open.is_none());
+    assert!(s.background_task_labels.contains_key("bg-2"));
+
+    // The row is still in the projection, so Enter opens the retained detail.
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
+    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Activity;
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "opening a finished task sends nothing: {effects:?}"
+    );
+    assert_eq!(s.active_screen, Screen::Activity);
+    let frame = render_screen_text(&mut s);
+    assert!(frame.contains("Background Task"), "{frame}");
+    assert!(frame.contains("test result: ok"), "{frame}");
 }
 
 #[test]

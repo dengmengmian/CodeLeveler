@@ -111,12 +111,13 @@ pub struct RemoteState {
     pub outcome: Option<String>,
 }
 
-/// Live background-process chrome derived from `BackgroundTaskStarted`.
+/// Background-process chrome derived from `BackgroundTaskStarted`.
 ///
 /// `started_elapsed_secs` is the turn clock when the TUI applied the start
 /// event — a projection timestamp, not a process clock, and never refreshed
-/// by redraws. Terminal events remove their entry immediately; historical
-/// completion belongs to the transcript, not this active projection.
+/// by redraws. A terminal event marks the entry terminal in place so its
+/// Activity row and detail stay reopenable; the entry retires at the next turn
+/// boundary. Historical completion also belongs to the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundTaskChrome {
     pub label: String,
@@ -198,12 +199,13 @@ pub struct AppState {
     /// start, turn end). Raw reasoning is not conversation content, and there
     /// is deliberately no historical representation of it at all.
     pub live_reasoning: String,
-    /// Background task id → live chrome, remembered from the start event so
-    /// the status line can name what is running and its exit can name what
-    /// finished. The exit event carries only the id. Entries are removed on
-    /// exit and cleared on session switch, so the map holds only tasks
-    /// currently in flight. Presentation-only; the runtime remains the
-    /// lifecycle authority.
+    /// Background task id → chrome, remembered from the start event so the
+    /// status line can name what is running and its exit can name what
+    /// finished. The exit event carries only the id. A terminal entry is kept
+    /// until the next turn boundary so its Activity row and detail stay
+    /// reopenable; running entries are pruned when the authoritative active
+    /// set excludes them, and the whole map is cleared on session switch.
+    /// Presentation-only; the runtime remains the lifecycle authority.
     pub background_task_labels: HashMap<String, BackgroundTaskChrome>,
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
@@ -355,6 +357,10 @@ pub struct AppState {
     pub activity_open: Option<crate::activity::ActivityId>,
     /// Keyboard selection into [`crate::activity::summaries`], stable by id.
     pub activity_selected: Option<crate::activity::ActivityId>,
+    /// Activity Detail viewport: follows the newest output until the user
+    /// scrolls back. Owned here like `conv`; the renderer publishes the
+    /// measured viewport each frame and the reducer maps scroll intents.
+    pub activity_view: crate::activity::ActivityView,
     /// Last-painted status-strip hits: (row y, activity). Mouse open uses this.
     pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
     /// The running command row under the Command workbench focus, by the
@@ -517,6 +523,7 @@ impl AppState {
             shell_screen_item: None,
             activity_open: None,
             activity_selected: None,
+            activity_view: crate::activity::ActivityView::default(),
             activity_hits: Vec::new(),
             command_selected: None,
             plan_collapsed: false,

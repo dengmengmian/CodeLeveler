@@ -1166,6 +1166,10 @@ pub(crate) fn user_shell_lines(
             .map(|code| format!("exit {code}")),
         needs_permission_suffix: None,
         expanded: shell.expanded,
+        // A user shell row opens Shell Details (its own screen) rather than
+        // expanding inline, so it carries the drill-down marker, not the
+        // inline `▸/▾`.
+        drill_down: true,
         duration_ms: shell.duration_ms,
         first_error: (!shell.expanded && failed)
             .then(|| {
@@ -1239,6 +1243,32 @@ mod tests {
             .collect();
         assert!(row.contains("状态未知"), "{row:?}");
         assert!(!row.contains('✗') && !row.contains("已取消"), "{row:?}");
+    }
+
+    /// A user shell row opens its own Details screen, so it carries the
+    /// drill-down marker `↗`, not the inline `▸/▾` a tool group expands with.
+    /// The same glyph must not mean two different things.
+    #[test]
+    fn a_user_shell_row_advertises_drill_down_not_inline_expand() {
+        use crate::transcript::{UserShellBlock, UserShellStatus};
+        let shell = UserShellBlock {
+            id: leveler_core::UserShellId::new("ush-2"),
+            command: "cargo test".into(),
+            cwd: "/repo".into(),
+            status: UserShellStatus::Success,
+            output: "ok".into(),
+            output_truncated: false,
+            exit_code: Some(0),
+            duration_ms: Some(1_000),
+            started_elapsed_secs: 0,
+            expanded: false,
+        };
+        let row: String = user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(row.contains('↗'), "{row:?}");
+        assert!(!row.contains('▸') && !row.contains('▾'), "{row:?}");
     }
 
     // ---- Assistant prose is communication: never folded ----

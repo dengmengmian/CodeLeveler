@@ -183,10 +183,18 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                         },
                     )];
                 }
+                // A background task has no cancel contract from the client, so
+                // `x` is deliberately inert here rather than faking a stop.
             }
-            _ => {
-                scroll_screen_key(state, &key, true);
-            }
+            // Follow the newest output until the user scrolls back; reaching
+            // the bottom resumes. Home/End and g/G jump to the ends.
+            KeyCode::Up | KeyCode::Char('k') => crate::activity::scroll_lines(state, -1),
+            KeyCode::Down | KeyCode::Char('j') => crate::activity::scroll_lines(state, 1),
+            KeyCode::PageUp => crate::activity::scroll_page(state, -1),
+            KeyCode::PageDown => crate::activity::scroll_page(state, 1),
+            KeyCode::Home | KeyCode::Char('g') => crate::activity::to_top(state),
+            KeyCode::End | KeyCode::Char('G') => crate::activity::to_bottom(state),
+            _ => {}
         },
         Screen::Help => {
             if key.code == KeyCode::Esc {

@@ -347,6 +347,9 @@ pub struct UiText {
     /// The contextual hint while a running command row holds the keyboard
     /// focus: enter toggles its output, `x` stops that execution.
     pub command_focus_hint: &'static str,
+    /// The contextual hint while the Activity strip holds the keyboard focus:
+    /// Enter opens the selected activity's detail.
+    pub activity_focus_hint: &'static str,
     /// Expanded output that dropped its head: "前 {} 行未显示".
     pub command_output_hidden: &'static str,
     /// 待发送 area: "待发送 · {}", actions, per-item delivery labels, overflow.
@@ -816,6 +819,12 @@ pub struct UiText {
     pub activity_current: &'static str,
     pub activity_steps: &'static str,
     pub activity_result: &'static str,
+    pub activity_title_background: &'static str,
+    pub activity_title_child: &'static str,
+    pub activity_follow_on: &'static str,
+    pub activity_follow_paused: &'static str,
+    pub activity_new_lines: &'static str,
+    pub activity_hint_scroll: &'static str,
     /// Collapsed row for a finished batch: "{} 个工具 · Ctrl+O".
     pub batch_done: &'static str,
     /// Appended when some of them failed: "{} 个失败".
@@ -1130,6 +1139,7 @@ static ZH: UiText = UiText {
     question_unattended: "无人回答（非交互运行）",
     question_skipped: "已跳过",
     command_focus_hint: "Enter 展开 · x 停止",
+    activity_focus_hint: "Enter 查看",
     command_output_hidden: "前 {} 行未显示",
     pending_inputs_title: "待发送 · {}",
     pending_input_send: "发送",
@@ -1534,6 +1544,12 @@ static ZH: UiText = UiText {
     activity_current: "当前",
     activity_steps: "执行",
     activity_result: "结果",
+    activity_title_background: "Background Task",
+    activity_title_child: "Sub-agent",
+    activity_follow_on: "Follow ON",
+    activity_follow_paused: "Follow PAUSED",
+    activity_new_lines: "↓ {} 新行",
+    activity_hint_scroll: "↑↓ 滚动 · PgUp/PgDn 翻页 · g/G 首尾",
     disclosure_shell_one: "执行了 1 个命令",
     disclosure_shell_many: "执行了 {} 个命令",
     disclosure_read_one: "读取 1 个文件",
@@ -1774,6 +1790,7 @@ static EN: UiText = UiText {
     question_unattended: "nobody to answer (unattended run)",
     question_skipped: "skipped",
     command_focus_hint: "Enter expand · x stop",
+    activity_focus_hint: "Enter open",
     command_output_hidden: "{} earlier lines hidden",
     pending_inputs_title: "Not sent · {}",
     pending_input_send: "send",
@@ -2178,6 +2195,12 @@ static EN: UiText = UiText {
     activity_current: "Current",
     activity_steps: "Activity",
     activity_result: "Result",
+    activity_title_background: "Background Task",
+    activity_title_child: "Sub-agent",
+    activity_follow_on: "Follow ON",
+    activity_follow_paused: "Follow PAUSED",
+    activity_new_lines: "↓ {} new lines",
+    activity_hint_scroll: "↑↓ scroll · PgUp/PgDn page · g/G ends",
     disclosure_shell_one: "Ran 1 shell command",
     disclosure_shell_many: "Ran {} shell commands",
     disclosure_read_one: "Read 1 file",
