@@ -32,7 +32,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::i18n::{Locale, UiText};
 use crate::render::truncate_display;
-use crate::theme::Theme;
+use crate::theme::{Ink, Theme};
 use crate::tool_cell::{tool_action_label_for, tool_summary_pub};
 use crate::tool_taxonomy::{ActivityVisibility, activity_visibility};
 use crate::transcript::{StopRequest, ToolCallBlock, ToolGroupBlock, ToolStatus};
@@ -149,7 +149,6 @@ pub(crate) fn render_group_rows(
                     now_elapsed_secs,
                     None,
                     awaits(call, awaiting_approval),
-                    locale,
                     focused_command,
                 );
                 push_command_rows(rows, at, index_of(call), stoppable, lines.len());
@@ -211,14 +210,14 @@ pub(crate) fn render_group_rows(
                 let (glyph, color) = if running {
                     ("\u{25cc} ", theme.accent.primary)
                 } else {
-                    ("\u{b7} ", theme.text.muted)
+                    ("\u{b7} ", theme.ink(Ink::Subtle))
                 };
                 let label = t.parallel_header.replace("{}", &calls.len().to_string());
                 out.push(Line::from(vec![
                     Span::styled(glyph, Style::default().fg(color)),
                     Span::styled(
                         truncate_display(&label, width.saturating_sub(2).max(1)),
-                        Style::default().fg(theme.text.muted),
+                        Style::default().fg(theme.ink(Ink::Meta)),
                     ),
                 ]));
                 let last = calls.len() - 1;
@@ -235,7 +234,6 @@ pub(crate) fn render_group_rows(
                             now_elapsed_secs,
                             Some(branch),
                             awaits(call, awaiting_approval),
-                            locale,
                             focused_command,
                         );
                         push_command_rows(rows, at, index_of(call), stoppable, lines.len());
@@ -260,7 +258,14 @@ pub(crate) fn render_group_rows(
                 }
             }
             StreamUnit::EditMerge(calls) => {
-                out.extend(edit_unit_lines(&calls, theme, width, locale, t));
+                out.extend(edit_unit_lines(
+                    &calls,
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    group.expanded,
+                ));
             }
             StreamUnit::FailMerge(calls) => {
                 let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
@@ -795,7 +800,7 @@ fn unit_lines(
         branch
             .map(str::to_string)
             .unwrap_or_else(|| format!("{TOOL_ANCHOR} ")),
-        Style::default().fg(theme.text.muted),
+        Style::default().fg(theme.ink(Ink::Subtle)),
     ));
     // The muted `·` was a bullet, not a fact: it marked a successful read the
     // same way a blank would. The anchor opens the row now, so only glyphs
@@ -845,7 +850,7 @@ fn unit_lines(
         if shell {
             head.push(Span::styled(
                 "$ ",
-                Style::default().fg(theme.accent.secondary),
+                Style::default().fg(theme.ink(Ink::Meta)),
             ));
         }
         head.push(Span::styled(
@@ -854,7 +859,10 @@ fn unit_lines(
         ));
     }
     if !tail.is_empty() {
-        head.push(Span::styled(tail, Style::default().fg(theme.text.muted)));
+        head.push(Span::styled(
+            tail,
+            Style::default().fg(theme.ink(Ink::Meta)),
+        ));
     }
     // Collapsed, a finished success is one row: the size of what came back
     // rides on the head instead of claiming a row of its own. Failures keep
@@ -871,7 +879,7 @@ fn unit_lines(
             let at_least = if preview_truncated(call) { "+" } else { "" };
             head.push(Span::styled(
                 format!(" · {pre}{n}{at_least}{post}"),
-                Style::default().fg(theme.text.muted),
+                Style::default().fg(theme.ink(Ink::Meta)),
             ));
         }
         return vec![Line::from(head)];
@@ -927,14 +935,14 @@ fn push_run(
     // A run is active while any of its calls is; once all are settled the head
     // recedes with them. The children carry the per-call state either way.
     let run_ink = if calls.iter().any(|c| c.status == ToolStatus::Running) {
-        theme.text.primary
+        theme.ink(Ink::Active)
     } else {
-        theme.text.secondary
+        theme.ink(Ink::Settled)
     };
     let mut head = vec![
         Span::styled(
             format!("{TOOL_ANCHOR} "),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(theme.ink(Ink::Subtle)),
         ),
         Span::styled(
             tool_action_label_for(&calls[0].name, locale),
@@ -944,7 +952,7 @@ fn push_run(
     if let Some(stretch) = stretch {
         head.push(Span::styled(
             format!(" \u{b7} {stretch}"),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(theme.ink(Ink::Meta)),
         ));
     }
     // A count of children is what the children already show; a count of
@@ -1001,7 +1009,10 @@ fn indent_onto_rail(lines: &mut [Line<'static>], rail: &str, theme: &Theme) {
     for line in lines {
         line.spans.insert(
             0,
-            Span::styled(rail.to_string(), Style::default().fg(theme.text.muted)),
+            Span::styled(
+                rail.to_string(),
+                Style::default().fg(theme.ink(Ink::Subtle)),
+            ),
         );
     }
 }
@@ -1097,120 +1108,159 @@ fn push_command_rows(
 /// Most output rows an expanded command shows; the rest is named, not drawn.
 const COMMAND_OUTPUT_ROWS: usize = 20;
 
+/// Output rows a RUNNING command shows under its row: enough to see it move.
+pub(crate) const LIVE_TAIL_ROWS: usize = 6;
+
+/// Diff rows a settled edit keeps on screen before the rest is counted.
+pub(crate) const DIFF_PREVIEW_ROWS: usize = 24;
+
 /// Rows a resolved clarification's answer may take in the transcript before
 /// the rest is folded. A multi-question answer is one row per question, and
 /// the whole set is the record of what the user decided.
 const ANSWER_SUMMARY_ROWS: usize = 6;
 
-/// A command's lifecycle, as a row states it: a status glyph, what it is doing
-/// or how it ended, and for how long. Every word comes from a runtime fact or
-/// this client's own stop request — never from reading the output.
+/// A command's lifecycle, as its row states it: a status glyph and the facts
+/// that follow the command — how long, how it ended, how much it printed.
+/// Every fact comes from the runtime or this client's own stop request, never
+/// from reading the output: stderr on a success is still a success.
+struct CommandHead {
+    glyph: &'static str,
+    glyph_color: ratatui::style::Color,
+    /// Rendered after the command as ` · a · b`, in order.
+    facts: Vec<String>,
+    stoppable: bool,
+}
+
 fn command_head(
     call: &ToolCallBlock,
     theme: &Theme,
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: bool,
-) -> (&'static str, ratatui::style::Color, String, bool) {
-    let duration = || {
-        call.duration_ms
-            .map(|ms| {
-                if ms < 60_000 {
-                    format!(" · {:.1}s", ms as f64 / 1000.0)
-                } else {
-                    format!(" · {}", crate::status_line::fmt_elapsed(ms / 1000))
-                }
-            })
-            .unwrap_or_default()
+) -> CommandHead {
+    let duration = call.duration_ms.map(|ms| {
+        if ms < 60_000 {
+            format!("{:.1}s", ms as f64 / 1000.0)
+        } else {
+            crate::status_line::fmt_elapsed(ms / 1000)
+        }
+    });
+    let head = |glyph, glyph_color, facts: Vec<Option<String>>, stoppable| CommandHead {
+        glyph,
+        glyph_color,
+        facts: facts.into_iter().flatten().collect(),
+        stoppable,
     };
     match call.status {
-        ToolStatus::Running if awaiting_approval => (
+        // Announced, not authorised: a clock would say it is taking a while
+        // when it has not started.
+        ToolStatus::Running if awaiting_approval => head(
             "\u{26a0}",
             theme.status.warning,
-            t.approval_pending.to_string(),
+            vec![Some(t.approval_pending.to_string())],
             false,
         ),
         ToolStatus::Running => match call.stop {
-            StopRequest::Sent => (
+            StopRequest::Sent => head(
                 "\u{25cc}",
                 theme.accent.primary,
-                t.command_stopping.to_string(),
+                vec![Some(t.command_stopping.to_string())],
                 false,
             ),
-            StopRequest::Uncertain => (
+            StopRequest::Uncertain => head(
                 "?",
                 theme.status.warning,
-                t.command_stop_unknown.to_string(),
+                vec![Some(t.command_stop_unknown.to_string())],
                 true,
             ),
-            StopRequest::None => (
+            StopRequest::None => head(
                 "\u{25cc}",
                 theme.accent.primary,
-                format!(
-                    "{} · {}",
-                    t.command_running,
-                    crate::status_line::fmt_elapsed(call.running_secs(now_elapsed_secs))
-                ),
+                vec![Some(crate::status_line::fmt_elapsed(
+                    call.running_secs(now_elapsed_secs),
+                ))],
                 true,
             ),
         },
         // A backgrounded command was STARTED, not finished: the call returns
-        // the moment the process detaches, and painting "已完成 · 0.0s" over a
-        // process that will run for five minutes is the row lying about the
-        // only thing it is there to say.
-        ToolStatus::Ok if started_in_background(call) => (
-            "\u{2713}",
-            theme.status.success,
-            t.command_backgrounded.to_string(),
+        // the moment the process detaches. `↗` is the mark the activity strip
+        // already gives a background process; its detail lives there.
+        ToolStatus::Ok if started_in_background(call) => head(
+            "\u{2197}",
+            theme.accent.primary,
+            vec![Some(t.command_backgrounded.to_string())],
             false,
         ),
-        ToolStatus::Ok => (
+        ToolStatus::Ok => head(
             "\u{2713}",
             theme.status.success,
-            format!("{}{}", t.command_done, duration()),
+            vec![duration, command_output_count(call, t)],
             false,
         ),
-        ToolStatus::Failed if needs_network_permission(call) => (
+        ToolStatus::Failed if needs_network_permission(call) => head(
             "\u{26a0}",
             theme.status.warning,
-            t.command_needs_network.to_string(),
+            vec![Some(t.command_needs_network.to_string())],
             false,
         ),
-        ToolStatus::Failed => {
-            let exit = call
-                .exit_code
-                .filter(|code| *code != 0)
-                .map(|code| format!(" · exit {code}"))
-                .unwrap_or_default();
-            (
-                "\u{2717}",
-                theme.status.error,
-                format!("{}{}{exit}", t.command_failed, duration()),
-                false,
-            )
-        }
-        ToolStatus::Cancelled => (
+        ToolStatus::Failed if call_timed_out(call) => head(
+            "\u{2717}",
+            theme.status.error,
+            vec![
+                duration,
+                Some(t.result_timeout.trim_start_matches(" · ").to_string()),
+            ],
+            false,
+        ),
+        ToolStatus::Failed => head(
+            "\u{2717}",
+            theme.status.error,
+            vec![
+                duration,
+                call.exit_code
+                    .filter(|code| *code != 0)
+                    .map(|code| format!("exit {code}")),
+            ],
+            false,
+        ),
+        ToolStatus::Cancelled => head(
             "\u{2298}",
             theme.text.muted,
-            format!("{}{}", t.command_stopped, duration()),
+            vec![Some(t.command_stopped.to_string()), duration],
             false,
         ),
-        ToolStatus::Unknown => (
+        ToolStatus::Unknown => head(
             "?",
             theme.status.warning,
-            t.command_unknown.to_string(),
+            vec![Some(t.command_unknown.to_string())],
             false,
         ),
     }
 }
 
-/// One command call: a lifecycle head, the command line under it, and — when
-/// its row is opened or its group is expanded — its output. Returns the lines
+/// `137 行` for a finished command's output: counted, never poured into the
+/// transcript. `+` marks a count taken from a preview the runtime capped.
+fn command_output_count(call: &ToolCallBlock, t: &UiText) -> Option<String> {
+    let streamed = call.output.lines().filter(|l| !l.trim().is_empty()).count();
+    let previewed = preview_body_lines(call).len();
+    let n = streamed.max(previewed);
+    if n == 0 {
+        return None;
+    }
+    let capped = streamed < previewed && preview_truncated(call) || call.output_truncated;
+    let (pre, post) = split_placeholder(t.tool_output_lines);
+    Some(format!("{pre}{n}{}{post}", if capped { "+" } else { "" }))
+}
+
+/// One command call: ONE summary row — opener, status glyph, the command,
+/// then its facts — and, when its row is opened or its group expanded, its
+/// output. A failure keeps one quiet line naming what broke. Returns the lines
 /// and whether the call is stoppable right now.
 ///
-/// The head carries NO permanent stop label: stopping is a contextual action
-/// on the focused row (see the Command workbench focus). The focused row's
-/// opener becomes the selection marker, the same one the activity strip uses.
+/// The command is the flexible cell and the facts are fixed: a long command is
+/// cut before its duration or exit code is. The head carries NO permanent stop
+/// label: stopping is a contextual action on the focused row, whose opener
+/// becomes the selection marker the activity strip uses.
 #[allow(clippy::too_many_arguments)]
 fn command_unit_lines(
     call: &ToolCallBlock,
@@ -1221,73 +1271,52 @@ fn command_unit_lines(
     now_elapsed_secs: u64,
     branch: Option<&str>,
     awaiting_approval: bool,
-    locale: Locale,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
 ) -> (Vec<Line<'static>>, bool) {
-    let (glyph, glyph_color, state, stoppable) =
-        command_head(call, theme, t, now_elapsed_secs, awaiting_approval);
-    let action = tool_action_label_for(&call.name, locale);
-    let muted = Style::default().fg(theme.text.muted);
-    let focused = focused_command == Some(&call.id);
-    let mut head = Vec::new();
-    // Same opener as every other tool row: a tree child wears its branch, a
-    // standalone command wears the execution anchor. A command holding the
-    // keyboard focus wears the selection marker instead, so the focused row is
-    // obvious among several running ones.
-    let opener = if focused {
+    let head = command_head(call, theme, t, now_elapsed_secs, awaiting_approval);
+    let subtle = Style::default().fg(theme.ink(Ink::Subtle));
+    let meta = Style::default().fg(theme.ink(Ink::Meta));
+    let body = Style::default().fg(body_ink(call.status, theme));
+    let opener = if focused_command == Some(&call.id) {
         "\u{2192} ".to_string()
     } else {
         branch
             .map(str::to_string)
             .unwrap_or_else(|| format!("{TOOL_ANCHOR} "))
     };
-    head.push(Span::styled(opener, muted));
-    head.push(Span::styled(
-        format!("{glyph} "),
-        Style::default().fg(glyph_color),
-    ));
-    head.push(Span::styled(
-        action,
-        Style::default().fg(body_ink(call.status, theme)),
-    ));
-    head.push(Span::styled(format!(" · {state}"), muted));
-    let mut out = vec![Line::from(head)];
-
-    // Children of a batch keep the tree's rail on their continuation rows.
-    let rail = match branch {
-        Some(b) if b.starts_with('\u{251c}') => "\u{2502} ",
-        Some(_) => "  ",
-        None => "",
-    };
-    let open = call.expanded || group_expanded;
-    let finished = call.status != ToolStatus::Running;
-    let has_output = !call.output.is_empty() || (finished && !preview_body_lines(call).is_empty());
-    let mut line2 = vec![Span::styled(format!("{rail}  "), muted)];
-    if has_output {
-        line2.push(Span::styled(
-            if open { "\u{25be} " } else { "\u{25b8} " },
-            muted,
-        ));
-    }
-    let summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
     let prompt = crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
+    let command = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    let facts: String = head.facts.iter().map(|f| format!(" \u{b7} {f}")).collect();
+
+    let mut spans = vec![
+        Span::styled(opener, subtle),
+        Span::styled(
+            format!("{} ", head.glyph),
+            Style::default().fg(head.glyph_color),
+        ),
+    ];
     if prompt {
-        line2.push(Span::styled(
-            "$ ",
-            Style::default().fg(theme.accent.secondary),
-        ));
+        spans.push(Span::styled("$ ", meta));
     }
-    let used: usize = line2
+    let used: usize = spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    line2.push(Span::styled(
-        truncate_display(&summary, width.saturating_sub(used + 1).max(8)),
-        Style::default().fg(body_ink(call.status, theme)),
-    ));
-    out.push(Line::from(line2));
+    let room = width.saturating_sub(used + UnicodeWidthStr::width(facts.as_str()));
+    spans.push(Span::styled(truncate_display(&command, room.max(1)), body));
+    if !facts.is_empty() {
+        spans.push(Span::styled(facts, meta));
+    }
+    let mut out = vec![clip_line(spans, width)];
 
+    // Continuation rows ride the tree's rail when this call is a child.
+    let rail = match branch {
+        Some(b) if b.trim_start().starts_with('\u{251c}') => child_rail(Some(b)),
+        Some(b) => " ".repeat(UnicodeWidthStr::width(b)),
+        None => String::new(),
+    };
     let body_indent = format!("{rail}    ");
+    let open = call.expanded || group_expanded;
     if open {
         // Live output while it streamed; a call seen only finished (history,
         // replay) has just the runtime's preview.
@@ -1298,39 +1327,128 @@ fn command_unit_lines(
         };
         let hidden = logical.len().saturating_sub(COMMAND_OUTPUT_ROWS);
         if hidden > 0 || call.output_truncated {
-            out.push(Line::from(Span::styled(
-                format!(
-                    "{body_indent}{}",
-                    t.command_output_hidden
-                        .replace("{}", &hidden.max(1).to_string())
-                ),
-                muted,
-            )));
+            out.push(clip_line(
+                vec![Span::styled(
+                    format!(
+                        "{body_indent}{}",
+                        t.command_output_hidden
+                            .replace("{}", &hidden.max(1).to_string())
+                    ),
+                    meta,
+                )],
+                width,
+            ));
         }
         let avail = width
             .saturating_sub(UnicodeWidthStr::width(body_indent.as_str()))
-            .max(8);
+            .max(1);
         for line in &logical[hidden..] {
-            out.push(Line::from(Span::styled(
-                format!("{body_indent}{}", truncate_display(line, avail)),
-                Style::default().fg(theme.text.secondary),
-            )));
+            out.push(clip_line(
+                vec![Span::styled(
+                    format!("{body_indent}{}", truncate_display(line, avail)),
+                    Style::default().fg(theme.ink(Ink::Settled)),
+                )],
+                width,
+            ));
+        }
+    } else if call.status == ToolStatus::Running
+        && crate::tool_taxonomy::result_lifetime(&call.name)
+            == crate::tool_taxonomy::ResultLifetime::Transient
+    {
+        // Live: the last few lines it printed, so the user sees it move. The
+        // tail is PROCESS — it leaves the moment the call settles (the branch
+        // above no longer matches), and the full output stays one Enter away.
+        let logical: Vec<&str> = call
+            .output
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let hidden = logical.len().saturating_sub(LIVE_TAIL_ROWS);
+        let stem = format!("{rail}  \u{2514} ");
+        let indent = " ".repeat(UnicodeWidthStr::width(stem.as_str()));
+        let room = width
+            .saturating_sub(UnicodeWidthStr::width(stem.as_str()))
+            .max(1);
+        let mut first = true;
+        let mut lead = || {
+            let lead = if first { stem.clone() } else { indent.clone() };
+            first = false;
+            lead
+        };
+        if hidden > 0 {
+            out.push(clip_line(
+                vec![
+                    Span::styled(lead(), subtle),
+                    Span::styled(
+                        format!(
+                            "\u{2026} {}",
+                            t.command_output_hidden.replace("{}", &hidden.to_string())
+                        ),
+                        meta,
+                    ),
+                ],
+                width,
+            ));
+        }
+        for line in &logical[hidden..] {
+            out.push(clip_line(
+                vec![
+                    Span::styled(lead(), subtle),
+                    Span::styled(
+                        truncate_display(line, room),
+                        Style::default().fg(theme.ink(Ink::Settled)),
+                    ),
+                ],
+                width,
+            ));
         }
     } else if call.status == ToolStatus::Failed
+        && !call_timed_out(call)
         && let Some(note) = failed_one_line_summary(call, t)
     {
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("{rail}  \u{2514} "),
-                Style::default().fg(theme.text.secondary),
-            ),
-            Span::styled(
-                truncate_display(&note, width.saturating_sub(6).max(1)),
-                Style::default().fg(theme.text.secondary),
-            ),
-        ]));
+        let stem = format!("{rail}  \u{2514} ");
+        let room = width.saturating_sub(UnicodeWidthStr::width(stem.as_str()));
+        out.push(clip_line(
+            vec![
+                Span::styled(stem, subtle),
+                Span::styled(
+                    truncate_display(&note, room.max(1)),
+                    Style::default().fg(theme.ink(Ink::Settled)),
+                ),
+            ],
+            width,
+        ));
     }
-    (out, stoppable)
+    (out, head.stoppable)
+}
+
+/// Cut a row at `width` display cells, span by span, so no cell is written
+/// past the edge whatever a narrow terminal leaves for the fixed parts.
+fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut used = 0;
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let w = UnicodeWidthStr::width(span.content.as_ref());
+        if used + w <= width {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let mut cut = String::new();
+        for ch in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > width {
+                break;
+            }
+            used += cw;
+            cut.push(ch);
+        }
+        if !cut.is_empty() {
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    Line::from(out)
 }
 
 /// Recover the target file of a failed patch from its error preview
@@ -1393,8 +1511,8 @@ fn is_exploratory(call: &ToolCallBlock) -> bool {
 /// at either tier. This is a real foreground token, never `Modifier::DIM`.
 fn body_ink(status: ToolStatus, theme: &Theme) -> ratatui::style::Color {
     match status {
-        ToolStatus::Running | ToolStatus::Failed | ToolStatus::Unknown => theme.text.primary,
-        ToolStatus::Ok | ToolStatus::Cancelled => theme.text.secondary,
+        ToolStatus::Running | ToolStatus::Failed | ToolStatus::Unknown => theme.ink(Ink::Active),
+        ToolStatus::Ok | ToolStatus::Cancelled => theme.ink(Ink::Settled),
     }
 }
 
@@ -1461,10 +1579,10 @@ fn result_lines_for(
             0
         };
         let mut spans = vec![
-            Span::styled(stem.clone(), Style::default().fg(theme.text.secondary)),
+            Span::styled(stem.clone(), Style::default().fg(theme.ink(Ink::Subtle))),
             Span::styled(
                 truncate_display(&note, width.saturating_sub(stem_w + retry_w).max(1)),
-                Style::default().fg(theme.text.secondary),
+                Style::default().fg(theme.ink(Ink::Settled)),
             ),
         ];
         if !expanded && !guard_denial {
@@ -1475,14 +1593,14 @@ fn result_lines_for(
                         " {}",
                         t.fold_more_lines_short.replace("{}", &more.to_string())
                     ),
-                    Style::default().fg(theme.text.muted),
+                    Style::default().fg(theme.ink(Ink::Meta)),
                 ));
             }
         }
         if repeat > 1 {
             spans.push(Span::styled(
                 format!(" ×{repeat}"),
-                Style::default().fg(theme.text.muted),
+                Style::default().fg(theme.ink(Ink::Meta)),
             ));
         }
         return vec![Line::from(spans)];
@@ -1512,27 +1630,27 @@ fn result_lines_for(
         for (i, line) in rows.iter().take(ANSWER_SUMMARY_ROWS).enumerate() {
             let lead = if i == 0 { stem.clone() } else { indent.clone() };
             out.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(theme.text.secondary)),
+                Span::styled(lead, Style::default().fg(theme.ink(Ink::Subtle))),
                 Span::styled(
                     truncate_display(line, width.saturating_sub(stem_w + 1).max(8)),
-                    Style::default().fg(theme.text.primary),
+                    Style::default().fg(theme.ink(Ink::Prose)),
                 ),
             ]));
         }
         if rows.len() > ANSWER_SUMMARY_ROWS {
             out.push(Line::from(vec![
-                Span::styled(indent, Style::default().fg(theme.text.secondary)),
+                Span::styled(indent, Style::default().fg(theme.ink(Ink::Subtle))),
                 Span::styled(
                     t.fold_more_lines_short
                         .replace("{}", &(rows.len() - ANSWER_SUMMARY_ROWS).to_string()),
-                    Style::default().fg(theme.text.muted),
+                    Style::default().fg(theme.ink(Ink::Meta)),
                 ),
             ]));
         }
         if out.is_empty() {
             out.push(Line::from(Span::styled(
                 stem,
-                Style::default().fg(theme.text.secondary),
+                Style::default().fg(theme.ink(Ink::Subtle)),
             )));
         }
         return out;
@@ -1549,7 +1667,7 @@ fn result_lines_for(
     };
     let mut spans = vec![Span::styled(
         stem.clone(),
-        Style::default().fg(theme.text.secondary),
+        Style::default().fg(theme.ink(Ink::Subtle)),
     )];
     if let Some(first) = first {
         let count_w = UnicodeWidthStr::width(pre)
@@ -1559,16 +1677,16 @@ fn result_lines_for(
         let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
         spans.push(Span::styled(
             truncate_display(&first, avail),
-            Style::default().fg(theme.text.secondary),
+            Style::default().fg(theme.ink(Ink::Settled)),
         ));
         spans.push(Span::styled(
             " · ".to_string(),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(theme.ink(Ink::Meta)),
         ));
     }
     spans.push(Span::styled(
         pre.to_string(),
-        Style::default().fg(theme.text.secondary),
+        Style::default().fg(theme.ink(Ink::Meta)),
     ));
     spans.push(Span::styled(
         if preview_truncated(call) {
@@ -1576,16 +1694,16 @@ fn result_lines_for(
         } else {
             n.to_string()
         },
-        Style::default().fg(theme.text.muted),
+        Style::default().fg(theme.ink(Ink::Meta)),
     ));
     spans.push(Span::styled(
         post.to_string(),
-        Style::default().fg(theme.text.secondary),
+        Style::default().fg(theme.ink(Ink::Meta)),
     ));
     if call_timed_out(call) {
         spans.push(Span::styled(
             t.result_timeout.to_string(),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(theme.ink(Ink::Meta)),
         ));
     }
     vec![Line::from(spans)]
@@ -1626,6 +1744,8 @@ fn edit_unit_lines(
     width: usize,
     locale: Locale,
     t: &UiText,
+    // The group was opened: show the whole diff instead of its preview.
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     let Some(first) = calls.first() else {
         return Vec::new();
@@ -1665,7 +1785,10 @@ fn edit_unit_lines(
         ));
     }
     if !tail.is_empty() {
-        head.push(Span::styled(tail, Style::default().fg(theme.text.muted)));
+        head.push(Span::styled(
+            tail,
+            Style::default().fg(theme.ink(Ink::Meta)),
+        ));
     }
     let mut out = vec![Line::from(head)];
 
@@ -1686,18 +1809,36 @@ fn edit_unit_lines(
     let edits = if hunks == 0 { calls.len() } else { hunks };
     let (pre, post) = split_placeholder(t.edit_merge_summary);
     out.push(Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme.text.secondary)),
-        Span::styled(pre.to_string(), Style::default().fg(theme.text.secondary)),
-        Span::styled(edits.to_string(), Style::default().fg(theme.text.muted)),
-        Span::styled(post.to_string(), Style::default().fg(theme.text.secondary)),
-        Span::styled(" · ".to_string(), Style::default().fg(theme.text.secondary)),
+        Span::styled("  └ ", Style::default().fg(theme.ink(Ink::Subtle))),
+        Span::styled(pre.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+        Span::styled(edits.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+        Span::styled(post.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+        Span::styled(" · ".to_string(), Style::default().fg(theme.ink(Ink::Meta))),
         Span::styled(
             format!("+{added} −{removed}"),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(theme.ink(Ink::Meta)),
         ),
     ]));
 
+    // An edit is a durable result: its diff stays after the call settles.
+    // A large one is a PREVIEW — the first rows and a count of the rest — not
+    // a fold; opening the group shows every row.
+    let start = out.len();
     crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out);
+    let hidden = (out.len() - start).saturating_sub(DIFF_PREVIEW_ROWS);
+    if !expanded && hidden > 0 {
+        out.truncate(start + DIFF_PREVIEW_ROWS);
+        out.push(clip_line(
+            vec![
+                Span::styled("    ", Style::default().fg(theme.ink(Ink::Subtle))),
+                Span::styled(
+                    t.fold_more_lines.replace("{}", &hidden.to_string()),
+                    Style::default().fg(theme.ink(Ink::Meta)),
+                ),
+            ],
+            width,
+        ));
+    }
     out
 }
 
@@ -2143,9 +2284,9 @@ mod tests {
 
     // ── Brightness hierarchy: lifecycle, not tool category ──────────────────
 
-    /// A call in flight owns the primary ink; the same call once settled
-    /// recedes to the secondary ink, so accumulated history cannot out-shine
-    /// the agent's current prose. The status glyph and any semantic colour are
+    /// A call in flight wears the live ink; the same call once settled recedes
+    /// to the settled ink, so accumulated history cannot out-shine the agent's
+    /// current prose — and neither ever wears prose's own ink. The status glyph and any semantic colour are
     /// separate channels and stay untouched.
     #[test]
     fn a_settled_tool_recedes_and_a_running_one_does_not() {
@@ -2160,8 +2301,8 @@ mod tests {
         );
         assert_eq!(
             body_fg(&running, "target.rs"),
-            Some(theme.text.primary),
-            "work in flight stays primary: {running:?}"
+            Some(theme.ink(Ink::Active)),
+            "work in flight wears the live ink: {running:?}"
         );
         let settled = styled_group(
             vec![call("read_file", r#"{"path":"target.rs"}"#, ToolStatus::Ok)],
@@ -2169,15 +2310,15 @@ mod tests {
         );
         assert_eq!(
             body_fg(&settled, "target.rs"),
-            Some(theme.text.secondary),
+            Some(theme.ink(Ink::Settled)),
             "finished history recedes: {settled:?}"
         );
     }
 
-    /// The hierarchy never overrides a failure: a failed call keeps the
-    /// primary ink and its error glyph, so "what broke" stays findable.
+    /// The hierarchy never buries a failure: a failed call keeps the live ink
+    /// and its error glyph, so "what broke" stays findable among settled rows.
     #[test]
-    fn failure_keeps_the_primary_ink_and_the_error_glyph() {
+    fn failure_keeps_the_live_ink_and_the_error_glyph() {
         let theme = Theme::dark();
         let lines = styled_group(
             vec![call(
@@ -2187,7 +2328,7 @@ mod tests {
             )],
             &theme,
         );
-        assert_eq!(body_fg(&lines, "broken.rs"), Some(theme.text.primary));
+        assert_eq!(body_fg(&lines, "broken.rs"), Some(theme.ink(Ink::Active)));
         assert!(
             lines.iter().any(|l| l
                 .spans
@@ -2212,7 +2353,7 @@ mod tests {
         );
         assert_eq!(
             body_fg(&lines, "codeleveler-marker"),
-            Some(theme.text.secondary)
+            Some(theme.ink(Ink::Settled))
         );
     }
 
@@ -3095,7 +3236,7 @@ mod tests {
         let lines = render_group_awaiting(&open_group(vec![gated, other]), Some(&id));
         let gated_row = lines
             .iter()
-            .find(|l| l.contains("执行命令"))
+            .find(|l| l.contains("$ rm -rf stale"))
             .expect("gated row");
         let other_row = lines
             .iter()
@@ -3691,8 +3832,8 @@ mod tests {
         assert!(lines[0].contains('✗'), "failure stays visible: {lines:?}");
     }
 
-    /// A long multi-line shell script stays one compact running unit — its
-    /// lifecycle row and one command line — current work earns focus, not
+    /// A long multi-line shell script stays one compact running row — the
+    /// status and the command on one line — current work earns focus, not
     /// screen area.
     #[test]
     fn a_long_multi_line_script_renders_one_compact_running_row() {
@@ -3700,9 +3841,8 @@ mod tests {
         let args = serde_json::json!({ "cmd": script }).to_string();
         let g = group(vec![call("shell_command", &args, ToolStatus::Running)]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 2, "lifecycle + command line: {lines:?}");
-        assert!(lines[0].contains('◌'), "{lines:?}");
-        assert!(lines[1].contains("$ echo start"), "{lines:?}");
+        assert_eq!(lines.len(), 1, "one row: {lines:?}");
+        assert!(lines[0].contains("◌ $ echo start"), "{lines:?}");
     }
 
     #[test]
@@ -4252,14 +4392,14 @@ mod tests {
         c.preview = Some("warning: unused import\nexit: 0".into());
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 2, "lifecycle + command line: {lines:?}");
+        assert_eq!(lines.len(), 1, "one row: {lines:?}");
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✓")) && lines[1].contains("$ cargo test"),
-            "the unit names the command it ran: {lines:?}"
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✓ $ cargo test")),
+            "the row names the command it ran: {lines:?}"
         );
         assert!(
-            lines[1].contains('▸'),
-            "its output is one click away: {lines:?}"
+            lines[0].ends_with("1 行"),
+            "how much it printed is counted on the row: {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l.contains("unused import")),
@@ -4314,17 +4454,13 @@ mod tests {
         let g = group(vec![c]);
         assert!(!g.expanded);
         let lines = render_group_text(&g, 120, Locale::Zh);
-        assert_eq!(
-            lines.len(),
-            3,
-            "one call: lifecycle, command and its error: {lines:?}"
+        assert_eq!(lines.len(), 2, "one call: its row and its error: {lines:?}");
+        assert!(
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✗ $ cargo test")),
+            "the row names the failure and the command: {lines:?}"
         );
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✗")) && lines[1].contains("$ cargo test"),
-            "the unit names the failure and the command: {lines:?}"
-        );
-        assert!(
-            lines[2].starts_with("  └ ") && lines[2].contains("error: no such command"),
+            lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
             "result row carries the first error line: {lines:?}"
         );
         assert!(
@@ -4472,11 +4608,7 @@ mod tests {
         )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ◌")),
-            "{lines:?}"
-        );
-        assert!(
-            lines[1].contains("$ ") && lines[1].contains("cargo build"),
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} ◌ $ cargo build")),
             "{lines:?}"
         );
     }
@@ -4672,5 +4804,469 @@ mod tests {
             lines.iter().any(|l| l.contains("ok")),
             "expanded detail shows the output body: {lines:?}"
         );
+    }
+}
+
+/// One `run_command` call is one summary row: the command itself, then what
+/// the runtime said about it. The row used to be a "执行命令 · 已完成" head
+/// over a `$ command` line — the same call named twice, two rows per command.
+#[cfg(test)]
+mod compact_command_tests {
+    use super::*;
+    use crate::theme::Ink;
+    use leveler_client_protocol::ToolCallId;
+    use unicode_width::UnicodeWidthStr;
+
+    fn cmd(args: &str, status: ToolStatus) -> ToolCallBlock {
+        ToolCallBlock {
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
+            id: ToolCallId::new("c1"),
+            name: "run_command".into(),
+            arguments: args.into(),
+            status,
+            preview: None,
+            duration_ms: None,
+            parallel: false,
+            batch: None,
+            started_elapsed_secs: 0,
+            applied_diff: None,
+        }
+    }
+
+    const SED: &str = r#"{"program":"sed","args":["-n","897,978p","docs/foo.md"]}"#;
+
+    fn lines_at(call: ToolCallBlock, theme: &Theme, width: usize, now: u64) -> Vec<Line<'static>> {
+        render_group(
+            &ToolGroupBlock {
+                calls: vec![call],
+                open: false,
+                expanded: false,
+            },
+            theme,
+            width,
+            Locale::Zh,
+            Locale::Zh.text(),
+            now,
+            None,
+        )
+    }
+
+    fn text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn rows(call: ToolCallBlock) -> Vec<String> {
+        text(&lines_at(call, &Theme::no_color(), 100, 0))
+    }
+
+    fn fg_of(lines: &[Line<'static>], needle: &str) -> Option<ratatui::style::Color> {
+        lines.iter().find_map(|l| {
+            l.spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .and_then(|s| s.style.fg)
+        })
+    }
+
+    #[test]
+    fn a_finished_command_is_one_row_that_leads_with_the_command() {
+        let mut c = cmd(SED, ToolStatus::Ok);
+        c.duration_ms = Some(200);
+        let rows = rows(c);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0],
+            "\u{203a} \u{2713} $ sed -n 897,978p docs/foo.md · 0.2s"
+        );
+        assert!(!rows[0].contains("执行命令") && !rows[0].contains("已完成"));
+    }
+
+    #[test]
+    fn a_chained_shell_line_is_still_one_row() {
+        let mut c = cmd(
+            r#"{"cmd":"echo === && grep -rn TODO src | head && find . -name '*.rs'"}"#,
+            ToolStatus::Ok,
+        );
+        c.name = "shell_command".into();
+        c.duration_ms = Some(300);
+        let rows = rows(c);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("$ echo === && grep"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_running_command_is_one_row_with_its_live_elapsed() {
+        let mut c = cmd(
+            r#"{"program":"go","args":["build","./cmd/..."]}"#,
+            ToolStatus::Running,
+        );
+        c.started_elapsed_secs = 10;
+        let rows = text(&lines_at(c, &Theme::no_color(), 100, 16));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].starts_with("\u{203a} \u{25cc} $ go build ./cmd/..."),
+            "{rows:?}"
+        );
+        assert!(rows[0].ends_with(" · 6s"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_failed_command_keeps_duration_and_exit_on_its_row() {
+        let mut c = cmd(
+            r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#,
+            ToolStatus::Failed,
+        );
+        c.duration_ms = Some(11_400);
+        c.exit_code = Some(101);
+        c.preview = Some("exit: 101\ntest activity_stream::tests::x ... FAILED".into());
+        let rows = rows(c);
+        assert!(
+            rows.len() <= 2,
+            "one row plus an optional error line: {rows:?}"
+        );
+        assert_eq!(
+            rows[0],
+            "\u{203a} \u{2717} $ cargo test -p leveler-tui · 11.4s · exit 101"
+        );
+        assert!(!rows.iter().any(|r| r.contains("执行命令")));
+    }
+
+    #[test]
+    fn a_large_output_is_counted_on_the_row_not_poured_into_it() {
+        let mut c = cmd(
+            r#"{"program":"rg","args":["TODO","crates/"]}"#,
+            ToolStatus::Ok,
+        );
+        c.duration_ms = Some(400);
+        c.preview = Some((0..137).map(|i| format!("hit {i}\n")).collect());
+        let rows = rows(c);
+        assert_eq!(
+            rows,
+            vec!["\u{203a} \u{2713} $ rg TODO crates/ · 0.4s · 137 行"]
+        );
+    }
+
+    #[test]
+    fn stderr_on_a_success_does_not_make_it_a_failure() {
+        let mut c = cmd(SED, ToolStatus::Ok);
+        c.duration_ms = Some(200);
+        c.preview = Some("--- stderr ---\nwarning: unused variable".into());
+        let rows = rows(c);
+        assert!(
+            rows[0].contains('\u{2713}') && !rows[0].contains('\u{2717}'),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn every_terminal_state_is_one_row_that_says_which() {
+        let t = Locale::Zh.text();
+        let mut timed = cmd(r#"{"program":"cargo","args":["test"]}"#, ToolStatus::Failed);
+        timed.preview = Some("[timed out]".into());
+        let mut stopped = cmd(
+            r#"{"program":"npm","args":["run","dev"]}"#,
+            ToolStatus::Cancelled,
+        );
+        stopped.duration_ms = Some(32_600);
+        let unknown = cmd(r#"{"program":"./deploy.sh"}"#, ToolStatus::Unknown);
+        let mut background = cmd(
+            r#"{"program":"pnpm","args":["dev"],"background":true}"#,
+            ToolStatus::Ok,
+        );
+        background.duration_ms = Some(40);
+        for (call, glyph, word) in [
+            (timed, "\u{2717}", t.result_timeout.trim()),
+            (stopped, "\u{2298}", t.command_stopped),
+            (unknown, "?", t.command_unknown),
+            (background, "\u{2197}", t.command_backgrounded),
+        ] {
+            let rows = rows(call);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(
+                rows[0].contains(&format!("{glyph} $ ")),
+                "{glyph}: {rows:?}"
+            );
+            assert!(rows[0].contains(word), "{word}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_held_for_approval_does_not_read_as_running() {
+        let c = cmd(
+            r#"{"program":"curl","args":["https://example.com"]}"#,
+            ToolStatus::Running,
+        );
+        let id = c.id.clone();
+        let rows: Vec<String> = text(&render_group(
+            &ToolGroupBlock {
+                calls: vec![c],
+                open: true,
+                expanded: false,
+            },
+            &Theme::no_color(),
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            5,
+            Some(&id),
+        ));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].contains("\u{26a0} $ curl https://example.com"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].contains(Locale::Zh.text().approval_pending),
+            "{rows:?}"
+        );
+    }
+
+    /// A long command is cut, never its outcome: the duration and exit code
+    /// are fixed cells at the end of the row.
+    #[test]
+    fn a_long_command_is_cut_before_its_metadata_is() {
+        let long = r#"{"program":"cargo","args":["test","--package","leveler-tui","--test","integration_suite_with_a_very_long_name","--","--nocapture"]}"#;
+        let mut c = cmd(long, ToolStatus::Failed);
+        c.duration_ms = Some(8_200);
+        c.exit_code = Some(101);
+        for width in [40usize, 60, 80] {
+            let rows = text(&lines_at(c.clone(), &Theme::no_color(), width, 0));
+            let head = &rows[0];
+            assert!(head.ends_with(" · 8.2s · exit 101"), "{width}: {head:?}");
+            assert!(head.contains('\u{2026}'), "{width}: {head:?}");
+            assert!(
+                UnicodeWidthStr::width(head.as_str()) <= width,
+                "{width}: {head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cjk_command_fits_its_width() {
+        let mut c = cmd(
+            r#"{"program":"echo","args":["构建产物已经上传到对象存储并完成校验"]}"#,
+            ToolStatus::Ok,
+        );
+        c.duration_ms = Some(1_000);
+        for width in [20usize, 30, 44] {
+            let rows = text(&lines_at(c.clone(), &Theme::no_color(), width, 0));
+            assert!(
+                UnicodeWidthStr::width(rows[0].as_str()) <= width,
+                "{width}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_very_narrow_terminal_does_not_panic() {
+        let mut c = cmd(SED, ToolStatus::Failed);
+        c.exit_code = Some(2);
+        c.duration_ms = Some(900);
+        for width in 0..12 {
+            let _ = lines_at(c.clone(), &Theme::no_color(), width, 0);
+        }
+    }
+
+    // ── Live expanded, settled compact ──────────────────────────────────────
+
+    fn with_output(mut c: ToolCallBlock, n: usize) -> ToolCallBlock {
+        c.output = (1..=n).map(|i| format!("test case_{i} ... ok\n")).collect();
+        c
+    }
+
+    /// A command in flight shows what it is printing: the row, then the last
+    /// few output lines under it, with the rest counted, never poured in.
+    #[test]
+    fn a_running_command_shows_a_bounded_tail_of_its_live_output() {
+        let c = with_output(cmd(SED, ToolStatus::Running), 30);
+        let rows = text(&lines_at(c, &Theme::no_color(), 100, 4));
+        assert!(
+            rows[0].starts_with("\u{203a} \u{25cc} $ sed -n"),
+            "{rows:?}"
+        );
+        assert_eq!(rows.len(), 1 + 1 + LIVE_TAIL_ROWS, "{rows:?}");
+        assert!(
+            rows[1].contains('\u{2026}'),
+            "hidden lines are counted: {rows:?}"
+        );
+        assert!(
+            rows.last().unwrap().ends_with("test case_30 ... ok"),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("case_1 ")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_short_live_output_is_shown_whole() {
+        let c = with_output(cmd(SED, ToolStatus::Running), 2);
+        let rows = text(&lines_at(c, &Theme::no_color(), 100, 4));
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[1].ends_with("test case_1 ... ok"), "{rows:?}");
+    }
+
+    /// Settling is one transition: the tail leaves and the row drops from the
+    /// live ink to the settled one, in the same logical block.
+    #[test]
+    fn settling_collapses_the_tail_and_the_ink_together() {
+        let theme = Theme::dark();
+        let running = with_output(cmd(SED, ToolStatus::Running), 12);
+        let live = lines_at(running.clone(), &theme, 100, 4);
+        assert!(live.len() > 1);
+        assert_eq!(fg_of(&live, "sed -n"), Some(theme.ink(Ink::Active)));
+
+        let mut done = running;
+        done.status = ToolStatus::Ok;
+        done.duration_ms = Some(4_100);
+        let settled = lines_at(done, &theme, 100, 4);
+        assert_eq!(settled.len(), 1, "{:?}", text(&settled));
+        assert_eq!(fg_of(&settled, "sed -n"), Some(theme.ink(Ink::Settled)));
+        assert!(text(&settled)[0].contains("12 行"), "{:?}", text(&settled));
+    }
+
+    /// Every settled outcome leaves at most the row and one error line.
+    #[test]
+    fn every_settled_outcome_drops_the_live_tail() {
+        for status in [
+            ToolStatus::Failed,
+            ToolStatus::Cancelled,
+            ToolStatus::Unknown,
+        ] {
+            let mut c = with_output(cmd(SED, ToolStatus::Running), 12);
+            c.status = status;
+            c.exit_code = Some(1);
+            c.preview = Some("exit: 1\nerror: boom".into());
+            let rows = rows(c);
+            assert!(rows.len() <= 2, "{status:?}: {rows:?}");
+            assert!(
+                !rows.iter().any(|r| r.contains("case_")),
+                "{status:?}: {rows:?}"
+            );
+        }
+    }
+
+    /// Opened on purpose (Enter / click), a settled command shows its output.
+    #[test]
+    fn an_opened_settled_command_shows_its_output() {
+        let mut c = with_output(cmd(SED, ToolStatus::Ok), 3);
+        c.expanded = true;
+        let rows = rows(c);
+        assert!(
+            rows.iter().any(|r| r.ends_with("test case_3 ... ok")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_tail_in_a_narrow_cjk_terminal_fits() {
+        let mut c = cmd(SED, ToolStatus::Running);
+        c.output = "编译产物已经上传到对象存储并完成校验\n".repeat(9);
+        for width in [0usize, 6, 18, 30] {
+            for row in text(&lines_at(c.clone(), &Theme::no_color(), width, 4)) {
+                assert!(
+                    UnicodeWidthStr::width(row.as_str()) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    // ── Durable results persist, bounded ────────────────────────────────────
+
+    fn edit(lines: usize) -> ToolCallBlock {
+        let mut patch = String::from("--- a/src/theme.rs\n+++ b/src/theme.rs\n@@ -1,1 +1,{n} @@\n");
+        patch = patch.replace("{n}", &lines.to_string());
+        for i in 0..lines {
+            patch.push_str(&format!("+line {i}\n"));
+        }
+        let mut c = cmd(r#"{"path":"src/theme.rs"}"#, ToolStatus::Ok);
+        c.name = "apply_patch".into();
+        c.applied_diff = Some(patch);
+        c.duration_ms = Some(30);
+        c
+    }
+
+    #[test]
+    fn a_settled_edit_keeps_its_diff_on_screen() {
+        let rows = rows(edit(3));
+        assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
+    }
+
+    /// A large diff is a preview, not a fold: its first rows stay, the rest is
+    /// counted, and opening the group shows all of it.
+    #[test]
+    fn a_large_diff_is_truncated_not_collapsed() {
+        let rows = rows(edit(200));
+        assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
+        assert!(rows.len() <= 2 + DIFF_PREVIEW_ROWS + 1, "{}", rows.len());
+        assert!(rows.last().unwrap().contains("还有"), "{:?}", rows.last());
+
+        let opened = text(&render_group(
+            &ToolGroupBlock {
+                calls: vec![edit(200)],
+                open: false,
+                expanded: true,
+            },
+            &Theme::no_color(),
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            0,
+            None,
+        ));
+        assert!(
+            opened.iter().any(|r| r.contains("+ line 199")),
+            "{}",
+            opened.len()
+        );
+    }
+
+    // ── Luminance roles ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_command_row_speaks_in_distinct_roles() {
+        let theme = Theme::dark();
+        let mut c = cmd(SED, ToolStatus::Ok);
+        c.duration_ms = Some(200);
+        let lines = lines_at(c, &theme, 100, 0);
+        assert_eq!(fg_of(&lines, "sed -n"), Some(theme.ink(Ink::Settled)));
+        assert_eq!(fg_of(&lines, "0.2s"), Some(theme.ink(Ink::Meta)));
+        assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));
+        assert_eq!(fg_of(&lines, "\u{2713}"), Some(theme.status.success));
+    }
+
+    /// The same call reads as live while it runs and drops to the settled ink
+    /// the moment it finishes — lifecycle, not tool type, sets the weight.
+    #[test]
+    fn a_command_steps_down_from_active_to_settled_when_it_finishes() {
+        let theme = Theme::dark();
+        let running = lines_at(cmd(SED, ToolStatus::Running), &theme, 100, 3);
+        assert_eq!(fg_of(&running, "sed -n"), Some(theme.ink(Ink::Active)));
+        let mut done = cmd(SED, ToolStatus::Ok);
+        done.duration_ms = Some(200);
+        let done = lines_at(done, &theme, 100, 3);
+        assert_eq!(fg_of(&done, "sed -n"), Some(theme.ink(Ink::Settled)));
+    }
+
+    /// Every tool row shares the ladder: a settled read recedes like a
+    /// settled command, its metadata and anchor recede further.
+    #[test]
+    fn other_tool_rows_share_the_same_roles() {
+        let theme = Theme::dark();
+        let mut read = cmd(r#"{"path":"README.md"}"#, ToolStatus::Ok);
+        read.name = "read_file".into();
+        read.duration_ms = Some(200);
+        read.preview = Some("a\nb\n".into());
+        let lines = lines_at(read, &theme, 100, 0);
+        assert_eq!(fg_of(&lines, "README.md"), Some(theme.ink(Ink::Settled)));
+        assert_eq!(fg_of(&lines, "0.2s"), Some(theme.ink(Ink::Meta)));
+        assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));
     }
 }

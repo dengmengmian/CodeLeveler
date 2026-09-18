@@ -347,6 +347,8 @@ pub struct UiText {
     /// The contextual hint while a running command row holds the keyboard
     /// focus: enter toggles its output, `x` stops that execution.
     pub command_focus_hint: &'static str,
+    /// Command focus on a settled command: nothing to stop, output to open.
+    pub command_focus_settled_hint: &'static str,
     /// The contextual hint while the Activity strip holds the keyboard focus:
     /// Enter opens the selected activity's detail.
     pub activity_focus_hint: &'static str,
@@ -1139,6 +1141,7 @@ static ZH: UiText = UiText {
     question_unattended: "无人回答（非交互运行）",
     question_skipped: "已跳过",
     command_focus_hint: "Enter 展开 · x 停止",
+    command_focus_settled_hint: "Enter 展开 · ↑↓ 选择",
     activity_focus_hint: "Enter 查看",
     command_output_hidden: "前 {} 行未显示",
     pending_inputs_title: "待发送 · {}",
@@ -1790,6 +1793,7 @@ static EN: UiText = UiText {
     question_unattended: "nobody to answer (unattended run)",
     question_skipped: "skipped",
     command_focus_hint: "Enter expand · x stop",
+    command_focus_settled_hint: "Enter expand · ↑↓ select",
     activity_focus_hint: "Enter open",
     command_output_hidden: "{} earlier lines hidden",
     pending_inputs_title: "Not sent · {}",

@@ -530,7 +530,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
     // Folded by default: the call's own row, with its OUTPUT still hidden.
     let folded = render_at(100, 24, &mut state);
     assert!(
-        folded.contains("执行命令") && folded.contains("cargo"),
+        folded.contains("$ cargo test"),
         "the evidence row must name the command: {folded}"
     );
     assert!(!folded.contains("line-one"), "collapsed output leaked");
@@ -622,7 +622,7 @@ fn command_result_renders_as_important_activity_not_file_list() {
     assert!(!collapsed.contains("工具输出"), "{collapsed}");
     assert!(!collapsed.contains("摘要:"), "{collapsed}");
     assert!(
-        collapsed.contains("执行命令") && collapsed.contains("cargo test"),
+        collapsed.contains("$ cargo test"),
         "the finished run keeps a row naming what it ran: {collapsed}"
     );
     assert!(

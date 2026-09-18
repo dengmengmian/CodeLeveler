@@ -154,7 +154,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let notice_rows: u16 = u16::from(state.notification.is_some());
     // Runtime status (spinner / elapsed / tokens) is persistent execution
     // state — a separate strip, never merged with the transient notice.
-    let status_block = status_lines(state, area.width as usize);
+    // Every strip of bottom chrome sits on the composer's grid: the same
+    // workspace gutter, applied through `chrome_slot` below. The status text
+    // is laid out for that inner width, not the terminal's.
+    let status_block = status_lines(state, workspace_inner.width as usize);
     let status_rows: u16 = if status_block
         .iter()
         .any(|line| line.spans.iter().any(|span| !span.content.is_empty()))
@@ -222,11 +225,18 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     ])
     .split(area);
 
-    let pending_slot =
-        crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
-    let input_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
-    let footer_slot =
-        crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
+    // The one horizontal rule for the bottom chrome: notice, status,
+    // attachments, pending inputs, composer and footer all start on the
+    // composer's left edge. (The plan dock and the roster apply the same
+    // gutter inside their own renderers.)
+    let chrome_slot =
+        |slot: Rect| crate::layout::horizontal_inset(slot, crate::layout::WORKSPACE_GUTTER_X);
+    let notice_slot = chrome_slot(chunks[3]);
+    let status_slot = chrome_slot(chunks[4]);
+    let attach_slot = chrome_slot(chunks[6]);
+    let pending_slot = chrome_slot(chunks[7]);
+    let input_slot = chrome_slot(chunks[9]);
+    let footer_slot = chrome_slot(chunks[10]);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -235,11 +245,11 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         state.theme.paint_surface(frame, input_slot, input_bg);
     }
     // chunks[2] = gap (leave blank)
-    render_notice(frame, chunks[3], state);
+    render_notice(frame, notice_slot, state);
     if status_rows > 0 {
-        frame.render_widget(Paragraph::new(status_block.clone()), chunks[4]);
+        frame.render_widget(Paragraph::new(status_block.clone()), status_slot);
         let activity_rows =
-            crate::activity::status_activity_lines(state, area.width as usize, state.t());
+            crate::activity::status_activity_lines(state, status_slot.width as usize, state.t());
         let headline = status_block
             .len()
             .saturating_sub(activity_rows.len())
@@ -258,7 +268,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         state.activity_hits.clear();
     }
     render_plan_panel(frame, chunks[5], state);
-    render_attachments(frame, chunks[6], state);
+    render_attachments(frame, attach_slot, state);
     crate::pending_inputs::render(frame, pending_slot, state, area.height);
     // chunks[8] = pre_composer_gap (leave blank)
     match &state.overlay {
@@ -1499,6 +1509,60 @@ mod tests {
             Some(ix + 1 + crate::layout::INPUT_INTERNAL_PADDING_X),
             "prompt sits one inner pad after the border"
         );
+    }
+
+    /// Every strip stacked above the composer — the notice, the runtime
+    /// status, pending attachments — starts on the same column as the
+    /// composer's border: one grid, not chrome hanging off the terminal edge.
+    #[test]
+    fn strips_above_the_composer_share_its_left_edge() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for width in [80u16, 44, 12] {
+            let mut state = test_state();
+            state.theme = crate::theme::Theme::dark();
+            state.status = leveler_client_protocol::RuntimeStatus::Busy;
+            state.notification = Some(crate::state::Notification {
+                level: leveler_client_protocol::NotificationLevel::Warning,
+                message: "选择权限模式: 完全访问（免审批）".into(),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| crate::render::render(frame, &mut state))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let row = |needle: &str| -> Option<String> {
+                (0..buf.area.height)
+                    .map(|y| {
+                        (0..buf.area.width)
+                            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                            .collect::<String>()
+                    })
+                    .find(|l| l.contains(needle))
+            };
+            let first_col = |line: &str| line.chars().position(|c| !c.is_whitespace());
+            let gutter = Some(crate::layout::WORKSPACE_GUTTER_X as usize);
+            let notice = row("\u{26a0}").expect("notice row");
+            assert_eq!(first_col(&notice), gutter, "{width}: notice {notice:?}");
+            if width >= 44 {
+                // Wide glyphs occupy two cells, so match on the ASCII clock.
+                let status = row(" · 0s").expect("status row");
+                assert_eq!(first_col(&status), gutter, "{width}: status {status:?}");
+                // The composer is the LAST box on screen (the welcome card
+                // above it is a box too).
+                let border = (0..buf.area.height)
+                    .rev()
+                    .map(|y| {
+                        (0..buf.area.width)
+                            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                            .collect::<String>()
+                    })
+                    .find(|l| l.contains('\u{256d}'))
+                    .expect("composer border");
+                assert_eq!(first_col(&border), gutter, "{width}: composer {border:?}");
+            }
+        }
     }
 
     #[test]
@@ -2988,7 +3052,11 @@ mod tests {
             0,
         );
         let notice_row = row_of(&lines, "⚠");
-        assert_eq!(col_of(&lines[notice_row], "⚠"), Some(0), "left-aligned");
+        assert_eq!(
+            col_of(&lines[notice_row], "⚠"),
+            Some(crate::layout::WORKSPACE_GUTTER_X as usize),
+            "left-aligned on the composer's grid, not the terminal edge"
+        );
         assert!(
             lines[notice_row].contains("Agent is running"),
             "the notice text is on its own row: {:?}",

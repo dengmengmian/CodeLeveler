@@ -168,16 +168,14 @@ fn a_running_command_says_it_is_running_without_a_permanent_stop_label() {
     s.elapsed_secs = 3;
     start(&mut s, "c1");
     s.elapsed_secs = 45;
-    let (line, head) = row_with(&s, "执行命令").expect("command row");
-    assert!(head.contains("◌ 执行命令 · 运行中 · 42s"), "{head:?}");
+    let (_, head) = row_with(&s, "$ certbot").expect("command row");
+    assert!(
+        head.contains("◌ $ certbot renew --dry-run · 42s"),
+        "{head:?}"
+    );
     assert!(
         !head.contains("停止"),
         "the stop is contextual, never a permanent right-hand label: {head:?}"
-    );
-    assert!(
-        plain(&s)[line + 1].contains("$ certbot renew --dry-run"),
-        "{:?}",
-        plain(&s)
     );
 }
 
@@ -188,9 +186,17 @@ fn the_running_clock_advances_with_the_app_tick() {
     let mut s = state();
     start(&mut s, "c1");
     s.elapsed_secs = 10;
-    assert!(row_with(&s, "运行中 · 10s").is_some(), "{:?}", plain(&s));
+    assert!(
+        row_with(&s, "$ certbot renew --dry-run · 10s").is_some(),
+        "{:?}",
+        plain(&s)
+    );
     s.elapsed_secs = 11;
-    assert!(row_with(&s, "运行中 · 11s").is_some(), "{:?}", plain(&s));
+    assert!(
+        row_with(&s, "$ certbot renew --dry-run · 11s").is_some(),
+        "{:?}",
+        plain(&s)
+    );
 }
 
 #[test]
@@ -199,7 +205,7 @@ fn terminal_rows_name_how_the_command_ended() {
     start(&mut s, "ok");
     complete(&mut s, "ok", true, 18_200, Some(0), None);
     assert!(
-        row_with(&s, "✓ 执行命令 · 已完成 · 18.2s").is_some(),
+        row_with(&s, "✓ $ certbot renew --dry-run · 18.2s").is_some(),
         "{:?}",
         plain(&s)
     );
@@ -208,7 +214,7 @@ fn terminal_rows_name_how_the_command_ended() {
     start(&mut s, "bad");
     complete(&mut s, "bad", false, 18_200, Some(1), None);
     assert!(
-        row_with(&s, "✗ 执行命令 · 失败 · 18.2s · exit 1").is_some(),
+        row_with(&s, "✗ $ certbot renew --dry-run · 18.2s · exit 1").is_some(),
         "{:?}",
         plain(&s)
     );
@@ -225,7 +231,7 @@ fn terminal_rows_name_how_the_command_ended() {
     );
     assert_eq!(call(&s, "stopped").status, ToolStatus::Cancelled);
     assert!(
-        row_with(&s, "⊘ 执行命令 · 已停止 · 1.5s").is_some(),
+        row_with(&s, "⊘ $ certbot renew --dry-run · 已停止 · 1.5s").is_some(),
         "{:?}",
         plain(&s)
     );
@@ -266,7 +272,7 @@ fn a_network_denied_command_reads_as_needing_network_permission() {
     );
     let rows = plain(&s);
     assert!(
-        row_with(&s, "⚠ 执行命令 · 需要网络权限").is_some(),
+        row_with(&s, "⚠ $ certbot renew --dry-run · 需要网络权限").is_some(),
         "{rows:?}"
     );
     assert!(!rows.iter().any(|r| r.contains("✗")), "{rows:?}");
@@ -545,8 +551,11 @@ fn an_unconfirmed_stop_is_unknown_never_stopped_or_failed() {
         Some(UiCommandStop::Unconfirmed),
     );
     assert_eq!(call(&s, "c1").status, ToolStatus::Unknown);
-    let (_, head) = row_with(&s, "执行命令").unwrap();
-    assert!(head.contains("? 执行命令 · 状态未知"), "{head:?}");
+    let (_, head) = row_with(&s, "$ certbot").unwrap();
+    assert!(
+        head.contains("? $ certbot renew --dry-run · 状态未知"),
+        "{head:?}"
+    );
     assert!(
         !head.contains("已停止") && !head.contains("失败"),
         "{head:?}"
@@ -578,9 +587,11 @@ fn x_stops_the_focused_command_requesting_only_that_one() {
         })]
     );
     assert_eq!(call(&s, "c1").stop, StopRequest::Sent);
-    let (_, head) = row_with(&s, "执行命令").unwrap();
-    assert!(head.contains("正在停止…"), "{head:?}");
-    assert!(!head.contains("运行中"), "{head:?}");
+    let (_, head) = row_with(&s, "$ certbot").unwrap();
+    assert!(
+        head.ends_with("· 正在停止…"),
+        "no running clock once asked to stop: {head:?}"
+    );
 
     // Stopping is intent; only the runtime's terminal says it stopped.
     complete(
@@ -592,7 +603,7 @@ fn x_stops_the_focused_command_requesting_only_that_one() {
         Some(UiCommandStop::Confirmed),
     );
     assert!(
-        row_with(&s, "⊘ 执行命令 · 已停止").is_some(),
+        row_with(&s, "⊘ $ certbot renew --dry-run · 已停止").is_some(),
         "{:?}",
         plain(&s)
     );
@@ -605,13 +616,13 @@ fn only_the_focused_running_command_wears_the_selection_marker() {
     let mut s = state();
     start(&mut s, "c1");
     assert!(
-        !plain(&s).iter().any(|l| l.contains("→ ◌ 执行命令")),
+        !plain(&s).iter().any(|l| l.contains("→ ◌ $ certbot")),
         "unfocused rows keep the execution anchor: {:?}",
         plain(&s)
     );
     focus_command(&mut s);
     assert!(
-        plain(&s).iter().any(|l| l.contains("→ ◌ 执行命令")),
+        plain(&s).iter().any(|l| l.contains("→ ◌ $ certbot")),
         "the focused row takes the selection marker: {:?}",
         plain(&s)
     );
@@ -672,7 +683,8 @@ fn a_command_is_not_stoppable_without_a_live_turn() {
     assert_eq!(call(&s, "c1").stop, StopRequest::None);
 }
 
-/// A finished command leaves the candidate set: `x` can no longer reach it.
+/// A finished command leaves the STOP candidate set: `x` can no longer reach
+/// it. It stays focusable — Enter still reopens its output.
 #[test]
 fn a_finished_command_leaves_the_candidate_set() {
     let mut s = state();
@@ -680,7 +692,7 @@ fn a_finished_command_leaves_the_candidate_set() {
     focus_command(&mut s);
     complete(&mut s, "c1", true, 10, Some(0), None);
     assert!(s.stoppable_commands().is_empty());
-    assert!(s.focused_command().is_none());
+    assert_eq!(s.focused_command(), Some(&ToolCallId::new("c1")));
     let effects = key(&mut s, KeyCode::Char('x'));
     assert!(effects.is_empty(), "{effects:?}");
 }
@@ -721,7 +733,7 @@ fn a_stop_whose_delivery_is_unknown_says_so() {
         }),
     );
     assert_eq!(call(&s, "c1").stop, StopRequest::Uncertain);
-    let (_, head) = row_with(&s, "执行命令").unwrap();
+    let (_, head) = row_with(&s, "$ certbot").unwrap();
     assert!(head.contains("停止状态未知"), "{head:?}");
     assert!(!head.contains("已停止"), "{head:?}");
 }
@@ -744,19 +756,30 @@ fn a_refused_stop_returns_the_row_to_running() {
         }),
     );
     assert_eq!(call(&s, "c1").stop, StopRequest::None);
-    let (_, head) = row_with(&s, "执行命令").unwrap();
-    assert!(head.contains("运行中"), "{head:?}");
+    let (_, head) = row_with(&s, "$ certbot").unwrap();
+    assert!(head.contains("◌ $ certbot renew --dry-run · "), "{head:?}");
+    assert!(!head.contains("正在停止"), "{head:?}");
 }
 
+/// A running command shows the tail of what it prints without being asked;
+/// a click opens its whole output, a second click returns to the tail.
 #[test]
-fn clicking_the_row_shows_and_hides_its_live_output() {
+fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
     let mut s = state();
     start(&mut s, "c1");
     output(&mut s, "c1", "Processing /etc/letsencrypt/renewal\n");
-    output(&mut s, "c1", "Waiting for DNS propagation\n");
+    for i in 1..=10 {
+        output(&mut s, "c1", &format!("Waiting for DNS {i}\n"));
+    }
     assert!(
-        row_with(&s, "Waiting for DNS").is_none(),
-        "collapsed by default"
+        row_with(&s, "Waiting for DNS 10").is_some(),
+        "live tail: {:?}",
+        plain(&s)
+    );
+    assert!(
+        row_with(&s, "Processing /etc/letsencrypt").is_none(),
+        "only the tail: {:?}",
+        plain(&s)
     );
 
     let (_, row) = cell_of(&s, "$ certbot");
@@ -767,12 +790,34 @@ fn clicking_the_row_shows_and_hides_its_live_output() {
         "{:?}",
         plain(&s)
     );
-    assert!(row_with(&s, "Waiting for DNS").is_some(), "{:?}", plain(&s));
 
     let (_, row) = cell_of(&s, "$ certbot");
     click(&mut s, 6, row);
     assert!(!call(&s, "c1").expanded);
-    assert!(row_with(&s, "Waiting for DNS").is_none());
+    assert!(row_with(&s, "Processing /etc/letsencrypt").is_none());
+    assert!(row_with(&s, "Waiting for DNS 10").is_some());
+}
+
+/// The same logical block settles in place: the tail leaves, the row stays,
+/// and no second row for the finished command appears.
+#[test]
+fn a_command_settles_in_place_without_a_duplicate_row() {
+    let mut s = state();
+    start(&mut s, "c1");
+    output(&mut s, "c1", "Congratulations, all renewals succeeded\n");
+    assert!(row_with(&s, "Congratulations").is_some());
+    complete(&mut s, "c1", true, 14_200, Some(0), None);
+    let rows = plain(&s);
+    let command_rows = rows.iter().filter(|r| r.contains("$ certbot")).count();
+    assert_eq!(command_rows, 1, "{rows:?}");
+    assert!(
+        row_with(&s, "✓ $ certbot renew --dry-run · 14.2s").is_some(),
+        "{rows:?}"
+    );
+    assert!(
+        row_with(&s, "Congratulations").is_none(),
+        "settled output leaves: {rows:?}"
+    );
 }
 
 /// A chatty command cannot grow the conversation without bound.
@@ -813,7 +858,8 @@ fn parallel_commands_keep_independent_identity() {
     let lines = plain(&s);
     assert!(lines.iter().any(|l| l.contains("并行")), "{lines:?}");
     assert!(
-        lines.iter().any(|l| l.contains("运行中")) && lines.iter().any(|l| l.contains("已完成")),
+        lines.iter().any(|l| l.contains("◌ $ echo a"))
+            && lines.iter().any(|l| l.contains("✓ $ echo b · 2.0s")),
         "{lines:?}"
     );
     let (_, row) = cell_of(&s, "$ echo a");
@@ -871,7 +917,11 @@ fn a_reconnect_restores_the_running_clock_and_output() {
     );
     let call = call(&s, "c1");
     assert_eq!(call.output, "Processing renewal\n");
-    assert!(row_with(&s, "运行中 · 1m 30s").is_some(), "{:?}", plain(&s));
+    assert!(
+        row_with(&s, "$ certbot renew --dry-run · 1m 30s").is_some(),
+        "{:?}",
+        plain(&s)
+    );
     assert!(matches!(
         s.transcript.items().last(),
         Some(TranscriptItem::ToolGroup(_))
@@ -944,4 +994,41 @@ fn clicking_a_headerless_mixed_group_still_opens_it() {
     );
     // Presentation only: both calls are still two calls.
     assert_eq!(s.transcript.tool_calls().len(), 2);
+}
+
+/// A settled command is still reachable from the keyboard: Tab reaches the
+/// Command focus, Enter opens the output the row folded away, and `x` has
+/// nothing to stop.
+#[test]
+fn enter_opens_a_settled_commands_output() {
+    let mut s = state();
+    start(&mut s, "c1");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("c1"),
+            ok: false,
+            preview: "exit: 1\n--- stderr ---\nerror: rate limited\nretry later".into(),
+            duration_ms: 2_000,
+            applied_diff: None,
+            exit_code: Some(1),
+            stop: None,
+        }),
+    );
+    s.status = RuntimeStatus::Idle;
+    assert!(
+        row_with(&s, "retry later").is_none(),
+        "settled output is folded"
+    );
+
+    focus_command(&mut s);
+    key(&mut s, KeyCode::Enter);
+    assert!(call(&s, "c1").expanded);
+    assert!(row_with(&s, "retry later").is_some(), "{:?}", plain(&s));
+
+    assert!(
+        key(&mut s, KeyCode::Char('x')).is_empty(),
+        "nothing to stop"
+    );
+    assert_eq!(call(&s, "c1").stop, StopRequest::None);
 }

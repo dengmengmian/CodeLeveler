@@ -98,6 +98,33 @@ pub struct TextColors {
     pub muted: Color,
     pub disabled: Color,
     pub inverse: Color,
+    /// Live work the user is watching (a running command): just under prose.
+    pub active: Color,
+    /// Facts about a row (duration, line count, exit code): under its body.
+    pub meta: Color,
+    /// Structure, not content (the `›` anchor, tree rails): the faintest ink.
+    pub subtle: Color,
+}
+
+/// The transcript's luminance hierarchy, brightest first. Renderers pick a
+/// role; [`Theme::ink`] is the one place a role becomes a color, so the
+/// ladder cannot drift apart between live, replay and history.
+///
+/// Prose is what the user reads; the live action is what they watch; a
+/// settled tool call is evidence that should recede as it piles up; its
+/// metadata recedes further; connectors only give the rows their shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    /// Agent prose and anything the user must read now.
+    Prose,
+    /// A running / live activity row.
+    Active,
+    /// A finished tool call's body.
+    Settled,
+    /// Duration, counts, exit codes, state words beside a row.
+    Meta,
+    /// Anchors, rails, hints: structure only.
+    Subtle,
 }
 
 /// Chrome outlines. `normal` and `focus` are contrast-gated.
@@ -193,6 +220,9 @@ impl Theme {
                 muted: rgb(0x858C95),
                 disabled: rgb(0x636A73),
                 inverse: rgb(0x111315),
+                active: rgb(0xC9CDD3),
+                meta: rgb(0x6A717A),
+                subtle: rgb(0x50565E),
             },
             border: BorderColors {
                 subtle: rgb(0x292E35),
@@ -248,6 +278,9 @@ impl Theme {
                 muted: rgb(0x5C6570),
                 disabled: rgb(0x7A828C),
                 inverse: rgb(0xFFFFFF),
+                active: rgb(0x3A4048),
+                meta: rgb(0x7A828C),
+                subtle: rgb(0xA3A9B0),
             },
             border: BorderColors {
                 subtle: rgb(0xE2E5E9),
@@ -302,6 +335,9 @@ impl Theme {
                 muted: rgb(0xC8C8C8),
                 disabled: rgb(0xA0A0A0),
                 inverse: rgb(0x000000),
+                active: rgb(0xF0F0F0),
+                meta: rgb(0xA8A8A8),
+                subtle: rgb(0x8A8A8A),
             },
             border: BorderColors {
                 subtle: rgb(0x555555),
@@ -375,6 +411,9 @@ impl Theme {
                 muted: Color::Reset,
                 disabled: Color::Reset,
                 inverse: Color::Reset,
+                active: Color::Reset,
+                meta: Color::Reset,
+                subtle: Color::Reset,
             },
             border: BorderColors {
                 subtle: Color::Reset,
@@ -407,6 +446,19 @@ impl Theme {
                 primary: Color::Reset,
                 highlight: Color::Reset,
             },
+        }
+    }
+
+    /// The color for a role in the transcript's luminance hierarchy.
+    pub fn ink(&self, role: Ink) -> Color {
+        match role {
+            Ink::Prose => self.text.primary,
+            Ink::Active => self.text.active,
+            // A settled call reads at the level every other secondary fact
+            // in the UI already uses; it is `muted`, not a fourth grey.
+            Ink::Settled => self.text.muted,
+            Ink::Meta => self.text.meta,
+            Ink::Subtle => self.text.subtle,
         }
     }
 
@@ -623,6 +675,43 @@ mod tests {
             assert_ne!(t.text.muted, Color::Reset, "{id} muted");
             assert_ne!(t.accent.primary, Color::Reset, "{id} accent");
             assert_eq!(t.id, id);
+        }
+    }
+
+    /// Each rung of the hierarchy is strictly quieter than the one above it,
+    /// in every fixed palette: prose, then the live action, the settled call,
+    /// its metadata, and structure last. Measured as distance from the canvas,
+    /// so it holds for the light palette too.
+    #[test]
+    fn the_ink_ladder_descends_in_every_palette() {
+        use Ink::*;
+        for id in ThemeId::FIXED {
+            let theme = Theme::named(id);
+            let canvas = relative_luminance(theme.surface.canvas).unwrap();
+            let distance = |role| (relative_luminance(theme.ink(role)).unwrap() - canvas).abs();
+            let ladder = [Prose, Active, Settled, Meta, Subtle];
+            for pair in ladder.windows(2) {
+                assert!(
+                    distance(pair[0]) > distance(pair[1]),
+                    "{id}: {:?} must stand out more than {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    /// The quieter rungs stay legible: a live row and a settled one at body
+    /// contrast, metadata at the large-text bar, structure still visible.
+    #[test]
+    fn the_quiet_inks_stay_legible() {
+        for id in ThemeId::FIXED {
+            let theme = Theme::named(id);
+            let t = theme.text;
+            let s = theme.surface;
+            assert_min(t.active, s.canvas, 4.5, &format!("{id} active/canvas"));
+            assert_min(t.meta, s.canvas, 3.0, &format!("{id} meta/canvas"));
+            assert_min(t.subtle, s.canvas, 2.0, &format!("{id} subtle/canvas"));
         }
     }
 

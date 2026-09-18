@@ -399,6 +399,28 @@ pub fn lookup(name: &str) -> Option<&'static ToolTaxonomyEntry> {
     BUILTIN_TAXONOMY.iter().find(|e| e.name == name)
 }
 
+/// How long what a call produced deserves the screen.
+///
+/// Ephemeral execution collapses; durable results persist. A command's output,
+/// a search's hits and a read's contents are PROCESS: they matter while the
+/// call runs, and once it settles the row keeps only its outcome. An edit's
+/// diff, a written file and a user's answer are RESULTS the user is meant to
+/// read, so they stay on screen after the call settles — bounded by a preview,
+/// never folded away. Derived from the taxonomy's kind: the one rule both the
+/// live and the replayed transcript render from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultLifetime {
+    Transient,
+    Durable,
+}
+
+pub fn result_lifetime(name: &str) -> ResultLifetime {
+    match lookup(name).map(|e| e.kind) {
+        Some(ToolKind::Edit | ToolKind::Write | ToolKind::AskUser) => ResultLifetime::Durable,
+        _ => ResultLifetime::Transient,
+    }
+}
+
 /// What KIND of work a call is, for grouping it into one narrative activity.
 ///
 /// Thinner than [`ToolKind`] on purpose: the conversation does not care that a
@@ -587,6 +609,27 @@ pub fn compact_tool_line(
 
 #[cfg(test)]
 mod tests {
+    /// Process output recedes once a call settles; changes and answers stay.
+    #[test]
+    fn edits_writes_and_answers_are_durable_everything_else_is_process() {
+        use super::{ResultLifetime::*, result_lifetime};
+        for name in ["apply_patch", "edit_file", "write_file", "ask_user"] {
+            if super::lookup(name).is_some() {
+                assert_eq!(result_lifetime(name), Durable, "{name}");
+            }
+        }
+        for name in [
+            "run_command",
+            "shell_command",
+            "read_file",
+            "grep",
+            "glob",
+            "unknown_tool",
+        ] {
+            assert_eq!(result_lifetime(name), Transient, "{name}");
+        }
+    }
+
     use super::*;
 
     #[test]

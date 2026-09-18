@@ -659,3 +659,84 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
         assert_eq!(s.transcript.tool_calls().len(), 2);
     }
 }
+
+/// A command that streamed output while it ran settles into ONE compact row,
+/// live and replayed alike: the live tail was process, not history, and the
+/// same logical call never comes back as two blocks.
+#[test]
+fn a_settled_command_reads_as_one_row_live_and_replayed() {
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "跑测试"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["test","-p","leveler-update"]}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallOutput {
+            id: ToolCallId::new("t1"),
+            stream: "stdout".into(),
+            chunk: "running 27 tests\ntest select_latest_stable ... ok\n".into(),
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "exit: 0\n--- stdout ---\nrunning 27 tests\ntest select_latest_stable ... ok"
+                .into(),
+            duration_ms: 14_200,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        },
+        RuntimeEvent::TurnAnswered,
+    ];
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+    let mut replayed = state();
+    let effects = open(&mut replayed, vec![message(UiRole::User, "跑测试")]);
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries: events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+                .collect(),
+            omitted_turns: 0,
+        }),
+    );
+    let shape = |s: &AppState| -> Vec<String> {
+        crate::conversation::build::build_conversation_lines(s, 100)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.starts_with("\u{2500}\u{2500}"))
+            .collect()
+    };
+    let live_lines = shape(&live);
+    let rows: Vec<&String> = live_lines
+        .iter()
+        .filter(|l| l.contains("$ cargo test"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{live_lines:#?}");
+    assert!(
+        rows[0].contains("✓ $ cargo test -p leveler-update · 14.2s"),
+        "{live_lines:#?}"
+    );
+    assert!(
+        !live_lines.iter().any(|l| l.contains("running 27 tests")),
+        "{live_lines:#?}"
+    );
+    assert_eq!(
+        shape(&replayed),
+        live_lines,
+        "history must read exactly as it ran"
+    );
+}
